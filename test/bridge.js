@@ -71,10 +71,14 @@ const handled = new Set();
 // pty bookkeeping) in electron/terminal.js rather than in main.js.
 const mainSide = [main];
 for (const m of main.matchAll(/require\(\s*'\.\/([\w.-]+?)(?:\.js)?'\s*\)/g)) {
-  try {
-    mainSide.push(fs.readFileSync(path.join(root, 'electron', `${m[1]}.js`), 'utf8'));
-  } catch {
-    /* not a file of ours */
+  // `require('./mcp')` is a directory of modules with an index, not a file;
+  // its handlers count the same as any other.
+  for (const rel of [`${m[1]}.js`, path.join(m[1], 'index.js')]) {
+    try {
+      mainSide.push(fs.readFileSync(path.join(root, 'electron', rel), 'utf8'));
+    } catch {
+      /* not a file of ours */
+    }
   }
 }
 for (const text of mainSide) {

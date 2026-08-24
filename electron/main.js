@@ -53,11 +53,13 @@ const { listEntries, writeEntry, countEntries, coveredPaths } = require('./conte
 const { planRename, applyRename } = require('./contentRefs');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
 const { probeUrl } = require('./devProbe');
+const { selectionTrail, formatTrail } = require('./selectionTrail');
 const gitHistory = require('./gitHistory');
 const gitSnapshot = require('./gitSnapshot');
 const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
+const mcp = require('./mcp');
 
 let mainWindow = null;
 let devServer = null; // {proc, url, projectPath}
@@ -258,6 +260,13 @@ function buildMenu() {
           accelerator: 'Shift+CmdOrCtrl+W',
           click: () => send('menu:closeProject'),
         },
+        {
+          // Stacki runs a small read-only MCP server so a coding agent can see
+          // what is selected on the canvas. It is not hidden: this is where the
+          // endpoint, the token and any startup failure are shown.
+          label: 'AI Connection (MCP)…',
+          click: () => send('menu:mcp'),
+        },
         { type: 'separator' },
         { label: 'Check for Updates…', click: () => void checkForUpdatesFromMenu() },
         { type: 'separator' },
@@ -389,6 +398,13 @@ app.whenReady().then(() => {
   // Terminals open in the project the app has open — same reach as the asset
   // protocol, which is what `openProjectRoot` already scopes.
   registerTerminalHandlers({ send, projectRoot: () => openProjectRoot });
+  // The MCP endpoint. Started once, for the app rather than for a project —
+  // an agent's configuration should not have to change when a project does.
+  void mcp.startMcp({
+    getWindow: () => mainWindow,
+    version: app.getVersion(),
+    settings,
+  });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -412,6 +428,8 @@ ipcMain.handle('project:close', async (_e, next) => {
   // Nothing is open, so nothing is in reach: the asset protocol and the
   // terminals both scope themselves to this.
   openProjectRoot = null;
+  // And nothing is selected, so nothing should still be described as selected.
+  mcp.resetContext();
   // The window starts over. Done here rather than in the renderer because it
   // is the same act as the teardown above — the renderer holds a page, an undo
   // stack and forty pieces of state that belong to the project just closed, and
@@ -442,6 +460,8 @@ app.on('before-quit', () => stopAllServices());
 app.on('before-quit', () => stopAllPreviews());
 // A pty outlives the window that opened it unless it is killed.
 app.on('before-quit', () => cleanupTerminals());
+// A listening socket outlives it too, and the next launch wants the port back.
+app.on('before-quit', () => void mcp.stopMcp());
 
 // ---------------------------------------------------------------------------
 // Auto update
@@ -2925,32 +2945,13 @@ ipcMain.handle('page:rebaseImport', async (_e, { fromPagePath, toPagePath, spec 
 // stored here and nothing is written to the user's project.
 // ---------------------------------------------------------------------------
 
-// Turns "<file>#<path>" node keys into "<file>:<line>" / "<file>:<from>-<to>"
-// pointers, project-relative. Returns null when there's nothing to point at.
-function selectionTrail(state) {
-  if (!state || !state.projectPath || !Array.isArray(state.keys)) return null;
-  const root = path.resolve(state.projectPath);
-  const trail = [];
-  for (const key of state.keys) {
-    const hash = typeof key === 'string' ? key.indexOf('#') : -1;
-    if (hash === -1) continue;
-    // The key's file half is renderer input; keep it inside the project.
-    const abs = path.resolve(root, key.slice(0, hash));
-    if (abs !== root && !abs.startsWith(root + path.sep)) continue;
-    const at = locateSelection(abs, key.slice(hash + 1));
-    if (!at) continue;
-    const file = toPosix(path.relative(root, at.file));
-    if (at.startLine == null) trail.push(file);
-    else if (at.startLine === at.endLine) trail.push(`${file}:${at.startLine}`);
-    else trail.push(`${file}:${at.startLine}-${at.endLine}`);
-  }
-  return trail.length ? trail : null;
-}
-
+// Resolved by electron/selectionTrail.js, which the MCP server reads too — the
+// clipboard text and the structured trail an agent asks for are the same
+// answer in two spellings.
 ipcMain.handle('selection:copy', async (_e, state) => {
-  const trail = selectionTrail(state);
+  const trail = selectionTrail(state, locateSelection);
   if (!trail) return { ok: false };
-  clipboard.writeText(trail.join('\n'));
+  clipboard.writeText(formatTrail(trail));
   return { ok: true, count: trail.length };
 });
 
