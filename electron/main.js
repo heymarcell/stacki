@@ -1521,11 +1521,17 @@ handle('project:install', async (_e, projectPath) => {
 handle('project:scan', async (_e, projectPath) => {
   // Also set here, not just in watch:start — the Assets panel can render
   // thumbnails before the watcher starts, and they'd be refused.
-  openProjectRoot = path.resolve(projectPath);
-  // Refs an agent is holding were minted about the last project. Rotating the
-  // signing key here is what makes them stop resolving rather than quietly
-  // start meaning a path in this one.
-  mcp.projectChanged();
+  const opened = path.resolve(projectPath);
+  // Refs an agent is holding were minted about the LAST project, and a project
+  // that has changed has to invalidate them — a ref that survived would quietly
+  // start meaning the same position in a different tree.
+  //
+  // Only when it actually changed. This handler is also the app's ordinary
+  // rescan, which runs on every file change and every panel refresh; rotating
+  // there would expire an agent's refs several times a minute, between reading
+  // a target and editing it.
+  if (openProjectRoot !== opened) mcp.projectChanged();
+  openProjectRoot = opened;
   // And this project's reviews. Scoped to the folder the app has open, which
   // is why no renderer call ever names a review file: there is only ever one,
   // and the main process is the only thing that knows which.

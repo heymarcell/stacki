@@ -260,6 +260,13 @@ function findCollections(source, opts = {}) {
 // Serializing
 // ---------------------------------------------------------------------------
 
+// Where a record stops fitting on one line. Prettier's default, which is what
+// the two places below have always been written against — the constant itself
+// was never declared, so writing any collection holding an object threw
+// `WIDTH is not defined` before it reached the file. Nothing that reads these
+// files noticed, because reading never touches it.
+const WIDTH = 80;
+
 const quote = (s) =>
   `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
 

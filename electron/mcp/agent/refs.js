@@ -55,18 +55,26 @@ const KINDS = [
   'asset', // a file under public/ or src/
 ];
 
-let secret = crypto.randomBytes(32);
+// The signing key, made once per run and never rotated: it is what makes a
+// forged ref impossible, and it has to keep verifying the refs this run issued
+// or a stale one would come back as a forgery. Which is the wrong sentence —
+// "read the target again" is something an agent can act on, "that ref was not
+// issued by this Stacki" sends it looking for a bug.
+const secret = crypto.randomBytes(32);
+
+// Which opening of which project a ref belongs to. This IS rotated, and it is
+// what makes every ref about the last project stop resolving the moment
+// another one opens.
 let session = crypto.randomBytes(8).toString('base64url');
 
 /**
- * Start a new signing era.
+ * Start a new era.
  *
  * Called when a project opens or closes: refs minted about the last one must
  * not resolve against this one, and a ref that outlives its project is a ref
  * that names a path in somebody else's.
  */
 function rotate() {
-  secret = crypto.randomBytes(32);
   session = crypto.randomBytes(8).toString('base64url');
   return session;
 }

@@ -107,11 +107,11 @@ const OPERATIONS = {
   },
 
   source: {
-    read: { risk: 'read', via: 'main', summary: 'A project file as text, whole or by line range.', reuses: 'electron/main.js src:readText' },
+    read: { risk: 'read', via: 'main', direct: true, uses: ['src:readText'], summary: 'A project file as text, whole or by line range.', reuses: 'read here, so a line range and a digest come back in one answer' },
     read_symbol: { risk: 'read', via: 'main', channel: 'src:readSymbol', summary: 'The source an imported symbol is defined in.', reuses: 'electron/main.js src:readSymbol' },
     resolve_path: { risk: 'read', via: 'main', channel: 'src:resolvePath', summary: 'What an import specifier resolves to.', reuses: 'electron/main.js src:resolvePath' },
-    replace_range: { risk: 'write', via: 'main', summary: 'Replace a line range, against an expected digest.', reuses: 'electron/main.js src:writeText' },
-    write: { risk: 'write', via: 'main', summary: 'Replace a whole file, against an expected digest.', reuses: 'electron/main.js src:writeText' },
+    replace_range: { risk: 'write', via: 'main', direct: true, uses: ['src:writeText'], summary: 'Replace a line range, against an expected digest.', reuses: 'electron/main.js src:writeText' },
+    write: { risk: 'write', via: 'main', direct: true, uses: ['src:writeText'], summary: 'Replace a whole file, against an expected digest.', reuses: 'electron/main.js src:writeText' },
   },
 
   page: {
@@ -210,45 +210,43 @@ const OPERATIONS = {
 
 const EXCLUDED = [
   // Native chrome and the operating system.
-  { capability: 'project:openDialog', why: 'human-only', reason: 'A native folder picker. An agent cannot see it, and which project is open is the human’s choice.' },
-  { capability: 'project:newDialog', why: 'human-only', reason: 'Native dialog.' },
-  { capability: 'project:parentDialog', why: 'human-only', reason: 'Native dialog.' },
-  { capability: 'assets:pickUpload', why: 'human-only', reason: 'A native file picker over the whole filesystem — the one door that reaches outside the project.' },
-  { capability: 'assets:upload', why: 'human-only', reason: 'Copies files in from anywhere on the machine. Its input is a picker result, not a project path.' },
-  { capability: 'shell:openExternal', why: 'human-only', reason: 'Opens a browser. An agent that wants a URL read has its own fetch.' },
-  { capability: 'native:copy / native:paste / native:undo / native:redo', why: 'human-only', reason: 'The OS edit menu acting on the focused text field. project.undo is the editor’s own stack.' },
-  { capability: 'window bounds, application menu, updater, sounds', why: 'human-only', reason: 'Application chrome. Nothing about the project is in it.' },
-  { capability: 'getFilePath (drag and drop)', why: 'human-only', reason: 'Resolves a dropped DOM File to a path — meaningless without a person dropping something.' },
+  { channels: ['project:openDialog', 'project:newDialog', 'project:parentDialog'], why: 'human-only', reason: 'Native folder and file pickers. An agent cannot see one, and which project is open is the person’s decision to make.' },
+  { channels: ['assets:pickUpload'], why: 'human-only', reason: 'A native picker over the whole filesystem — the one door in Stacki that reaches outside the open project, and it opens only for a person.' },
+  { channels: ['assets:upload'], why: 'human-only', reason: 'Copies files in from anywhere on the machine. Its input is a picker result or a drag, neither of which an agent has.' },
+  { channels: ['shell:openExternal'], why: 'human-only', reason: 'Opens a browser on this machine. An agent that wants a page read has its own way to fetch one.' },
+  { channels: ['native:copy', 'native:paste', 'native:undo', 'native:redo'], why: 'human-only', reason: 'The operating system’s edit menu acting on whichever text field has focus. project.undo is the editor’s own stack, which is the one that means something here.' },
+  { channels: ['settings:get'], why: 'redundant', reason: 'Application preferences — the sound setting, and this API’s own permission mode, which get_capabilities already reports.' },
+  { channels: ['settings:setAgentMode'], why: 'human-only', reason: 'How much of Stacki an agent may move. An agent that could raise its own permission level would not have one.' },
 
   // A second shell is a second trust surface and no new ability.
-  { capability: 'terminal:start / input / resize / close', why: 'unsafe', reason: 'An agent connected to Stacki already has its own shell. A second one through this endpoint would widen what a stolen token is worth and buy nothing visual.' },
+  { channels: ['terminal:start', 'terminal:resize', 'terminal:close'], why: 'unsafe', reason: 'An agent connected to Stacki already has its own shell. A second one behind this endpoint would widen what a stolen token is worth and buy nothing visual.' },
 
   // Project creation and scaffolding.
-  { capability: 'project:scaffold / project:createAstro / project:createStarter', why: 'human-only', reason: 'Creating a project decides where it lives on disk and runs the Astro installer. The API acts on the project that is already open.' },
-  { capability: 'project:close', why: 'human-only', reason: 'Closes the project and reloads the window — it would pull the ground from under the agent’s own refs mid-call.' },
-  { capability: 'project:pending', why: 'redundant', reason: 'Internal handshake for a window that is reloading.' },
-  { capability: 'watch:start', why: 'redundant', reason: 'Started when a project opens; there is nothing for an agent to decide.' },
+  { channels: ['project:scaffold', 'project:createAstro', 'project:createStarter'], why: 'human-only', reason: 'Creating a project decides where it lives on disk and runs the Astro installer. This API acts on the project that is already open.' },
+  { channels: ['project:close'], why: 'human-only', reason: 'Closes the project and reloads the window — it would pull the ground out from under the agent’s own refs mid-call.' },
+  { channels: ['project:pending'], why: 'redundant', reason: 'The internal handshake for a window that is reloading onto another project.' },
+  { channels: ['watch:start'], why: 'redundant', reason: 'The file watcher starts when a project opens; there is nothing here for anybody to decide.' },
 
   // Recents and thumbnails.
-  { capability: 'recents:list / add / remove / refreshThumb', why: 'human-only', reason: 'The welcome screen’s own list. Not project state.' },
+  { channels: ['recents:list', 'recents:add', 'recents:remove', 'recents:refreshThumb'], why: 'human-only', reason: 'The welcome screen’s own list of projects and their pictures. Not project state, and not about the project that is open.' },
 
-  // Preview-of-an-old-commit.
-  { capability: 'preview:atCommit / preview:stop', why: 'human-only', reason: 'Points the canvas at a throwaway checkout and makes the editor read-only. An agent driving it would be an agent editing files that are about to be deleted.' },
+  // Previewing an old commit.
+  { channels: ['preview:atCommit', 'preview:stop'], why: 'human-only', reason: 'Points the canvas at a throwaway checkout and makes the editor read-only. An agent driving it would be an agent editing files that are about to be deleted.' },
 
   // Review administration — unchanged from Shared Reviews.
-  { capability: 'reviews:sharedEnable / sharedJoin / sharedDisable / sharedInvite', why: 'unsafe', reason: 'Creating a workspace, joining one or minting an invitation decides who can read somebody’s private comments. A person types the server and the invitation.' },
-  { capability: 'reviews:identity / setIdentity', why: 'unsafe', reason: 'Changing whose name is on a comment. An agent signs with its own.' },
-  { capability: 'reviews:editMessage / removeMessage', why: 'human-only', reason: 'Rewording and pruning are a person tidying their own notes. An agent that could rewrite the conversation is an agent whose record of it means nothing.' },
-  { capability: 'reviews:remove', why: 'unsafe', reason: 'Deleting feedback. An agent that disagrees resolves with its reasoning instead.' },
-  { capability: 'reviews:recolor', why: 'human-only', reason: 'The user’s own filing colour.' },
-  { capability: 'reviews:sync / syncAnchors', why: 'redundant', reason: 'Housekeeping the window does for itself; get_comments already reports the result.' },
-  { capability: 'reviews:list / act', why: 'exposed elsewhere', reason: 'These ARE get_comments and comment, which existed before this feature and are unchanged.' },
+  { channels: ['reviews:sharedEnable', 'reviews:sharedJoin', 'reviews:sharedDisable', 'reviews:sharedInvite'], why: 'unsafe', reason: 'Creating a workspace, joining one or minting an invitation decides who can read somebody’s private comments. A person types the server address and the invitation.' },
+  { channels: ['reviews:identity', 'reviews:setIdentity'], why: 'unsafe', reason: 'Changing whose name is on a comment. An agent signs with its own, and cannot sign with anybody else’s.' },
+  { channels: ['reviews:editMessage', 'reviews:removeMessage'], why: 'human-only', reason: 'Rewording and pruning are a person tidying their own notes. An agent that could rewrite the conversation is an agent whose record of it means nothing.' },
+  { channels: ['reviews:remove'], why: 'unsafe', reason: 'Deleting somebody’s feedback. An agent that disagrees resolves the thread with its reasoning, which leaves them able to disagree back.' },
+  { channels: ['reviews:recolor'], why: 'human-only', reason: 'The colour the user files a comment under. Their filing, not a state to act on.' },
+  { channels: ['reviews:sync', 'reviews:syncAnchors', 'reviews:shared'], why: 'redundant', reason: 'Housekeeping the window does for itself; get_comments already reports the result of all of it.' },
+  { channels: ['reviews:list', 'reviews:act'], why: 'exposed elsewhere', reason: 'These ARE get_comments and comment, which existed before this feature and are unchanged by it.' },
 
-  // Already the agent's own.
-  { capability: 'selection:copy', why: 'redundant', reason: 'Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data.' },
-  { capability: 'settings:get', why: 'redundant', reason: 'Application preferences — sound, and this API’s own mode, which get_capabilities reports.' },
-  { capability: 'page:write / page:writeRaw', why: 'exposed elsewhere', reason: 'The model writer. Reached through target edits and source writes, which go through the editor so undo and the preview follow.' },
-  { capability: 'mcp:publish / mcp:reply / mcp:status', why: 'redundant', reason: 'The wiring of this server to its own window.' },
+  // Served through something else.
+  { channels: ['selection:copy'], why: 'redundant', reason: 'Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data.' },
+  { channels: ['page:write', 'page:writeRaw'], why: 'exposed elsewhere', reason: 'The model and raw writers. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow.' },
+  { channels: ['style:listFiles', 'style:listAstroStyles'], why: 'exposed elsewhere', reason: 'The stylesheet scan the Style panel runs. style.read and style.list_sources answer from it, with the rules already matched against the element.' },
+  { channels: ['mcp:publish', 'mcp:reply', 'mcp:status'], why: 'redundant', reason: 'The wiring between this server and its own window. Nothing about the project is in any of it.' },
 ];
 
 // --- lookups -----------------------------------------------------------------
@@ -277,7 +275,19 @@ function list() {
 
 /** Every IPC channel an operation reuses. What the coverage test checks against. */
 function channels() {
-  return new Set(list().map((op) => op.channel).filter(Boolean));
+  const out = new Set();
+  for (const op of list()) {
+    if (op.channel) out.add(op.channel);
+    for (const also of op.uses || []) out.add(also);
+  }
+  return out;
 }
 
-module.exports = { OPERATIONS, EXCLUDED, DOMAINS, find, actionsOf, list, channels };
+/** Every channel that is deliberately not reachable, flattened. */
+function excludedChannels() {
+  const out = new Set();
+  for (const entry of EXCLUDED) for (const channel of entry.channels) out.add(channel);
+  return out;
+}
+
+module.exports = { OPERATIONS, EXCLUDED, DOMAINS, find, actionsOf, list, channels, excludedChannels };

@@ -205,6 +205,17 @@ const page = {
     args: (input, ctx) => {
       const at = rel(ctx, input.path, 'page path');
       if (at.error) return at;
+      // Only what Stacki parses as a document. The parser is forgiving enough
+      // to make a tree out of a JavaScript file, and the tree would be
+      // nonsense — an agent handed one would edit it and produce nonsense
+      // back. Everything else is the source domain, and saying so is more
+      // useful than a model nobody can trust.
+      if (!/\.(astro|md|mdx)$/i.test(at.rel)) {
+        return problem(
+          'unrepresentable',
+          `${at.rel} is not a page, a layout or a component — Stacki has no tree for it. Read it with the source domain.`
+        );
+      }
       return at.abs;
     },
     result: (raw, input) => ({

@@ -4305,11 +4305,20 @@ export default function App() {
         outcome = run;
         return run.ok ? run.model : m;
       }, true);
-      if (!outcome?.ok) return { ok: false, code: outcome?.code || 'failed', message: outcome?.message || 'That edit could not be applied.' };
-      if (outcome.selectId) setSelectedId(outcome.selectId);
-      // The model state has not committed yet — flushSave reads it through the
-      // ref, which React updates before effects run, so give it that turn.
+      // A turn of the loop before anything is read back.
+      //
+      // `setPageState`'s updater is where the operations actually run, and
+      // React decides when that is — sometimes inside the call above and
+      // sometimes after it. Reading `outcome` straight away was right about
+      // half the time, and the half it was wrong about reported a perfectly
+      // good edit as a failure while quietly leaving it applied. Waiting is
+      // also what lets flushSave see the new model, which it reads through the
+      // ref React updates before effects run.
       await new Promise((done) => setTimeout(done, 0));
+      if (!outcome?.ok) {
+        return { ok: false, code: outcome?.code || 'failed', message: outcome?.message || 'That edit could not be applied.' };
+      }
+      if (outcome.selectId) setSelectedId(outcome.selectId);
       await flushSave();
       return { ok: true, selectedId: outcome.selectId || null, label: label || null };
     },

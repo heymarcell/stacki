@@ -226,7 +226,15 @@ function loadMain() {
       },
     },
     dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
-    shell: { openExternal() {} },
+    // Deleting through Stacki puts a file in the trash rather than unlinking it,
+    // which is the right behaviour and is not available here. Removing it is
+    // near enough for a fixture in a temporary folder.
+    shell: {
+      openExternal() {},
+      trashItem: async (target) => {
+        fs.rmSync(target, { recursive: true, force: true });
+      },
+    },
     Menu: { setApplicationMenu() {}, buildFromTemplate: () => ({}) },
     protocol: { handle() {}, registerSchemesAsPrivileged() {} },
     net: { fetch: () => Promise.reject(new Error('the fixture has no network')) },

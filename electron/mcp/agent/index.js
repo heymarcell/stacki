@@ -191,28 +191,53 @@ function createAgentApi({
 
   // --- target ----------------------------------------------------------------
 
-  // Every single-operation action is the batch with one operation in it, so
-  // there is one code path through validation, atomicity and evidence.
-  const SINGLE = {
-    set_text: (a) => ({ type: 'set_text', value: a.text, replaceBinding: !!a.replaceBinding }),
-    set_prop: (a) => ({ type: 'set_prop', name: a.name, value: propValue(a) }),
-    remove_prop: (a) => ({ type: 'remove_prop', name: a.name }),
-    set_classes: (a) => ({ type: 'set_classes', classes: a.classes }),
-    add_class: (a) => ({ type: 'add_class', className: a.className }),
-    remove_class: (a) => ({ type: 'remove_class', className: a.className }),
-    insert_before: (a) => ({ type: 'insert_before', node: a.node }),
-    insert_after: (a) => ({ type: 'insert_after', node: a.node }),
-    append_child: (a) => ({ type: 'append_child', node: a.node }),
+  // What the editor's operations actually take.
+  //
+  // One normalizer, used by both doors. The single-operation actions are the
+  // batch with one operation in it, and every one of them goes through here on
+  // the way — a prop value written as `"3"` at the protocol and as
+  // `{type:'string', value:'3'}` in the model is exactly the sort of thing that
+  // is right on one path and `undefined` on the other.
+  const propValue = (o) =>
+    o.value === undefined || o.value === null
+      ? undefined
+      : { type: o.valueType === 'expr' ? 'expr' : 'string', value: String(o.value) };
+
+  const NORMALIZE = {
+    set_text: (o) => ({ type: 'set_text', value: String(o.value ?? ''), replaceBinding: !!o.replaceBinding }),
+    set_prop: (o) => ({ type: 'set_prop', name: o.name, value: propValue(o) }),
+    remove_prop: (o) => ({ type: 'remove_prop', name: o.name }),
+    set_classes: (o) => ({ type: 'set_classes', classes: o.classes }),
+    add_class: (o) => ({ type: 'add_class', className: o.className }),
+    remove_class: (o) => ({ type: 'remove_class', className: o.className }),
+    insert_before: (o) => ({ type: 'insert_before', node: o.node }),
+    insert_after: (o) => ({ type: 'insert_after', node: o.node }),
+    append_child: (o) => ({ type: 'append_child', node: o.node }),
+    prepend_child: (o) => ({ type: 'prepend_child', node: o.node }),
     remove: () => ({ type: 'remove' }),
     duplicate: () => ({ type: 'duplicate' }),
-    move: (a) => ({ type: 'move', target: a.to }),
-    set_tag: (a) => ({ type: 'set_tag', tag: a.tag }),
+    // The destination is a ref here and a node id in the renderer; the keys it
+    // carries are what crosses, and they are read below.
+    move: (o) => ({ type: 'move', to: o.to }),
+    set_tag: (o) => ({ type: 'set_tag', tag: o.tag }),
   };
 
-  const propValue = (a) =>
-    a.value === undefined || a.value === null
-      ? undefined
-      : { type: a.valueType === 'expr' ? 'expr' : 'string', value: String(a.value) };
+  // The single-operation actions, in their own argument names.
+  const SINGLE = {
+    set_text: (a) => NORMALIZE.set_text({ value: a.text, replaceBinding: a.replaceBinding }),
+    set_prop: (a) => NORMALIZE.set_prop(a),
+    remove_prop: (a) => NORMALIZE.remove_prop(a),
+    set_classes: (a) => NORMALIZE.set_classes(a),
+    add_class: (a) => NORMALIZE.add_class(a),
+    remove_class: (a) => NORMALIZE.remove_class(a),
+    insert_before: (a) => NORMALIZE.insert_before(a),
+    insert_after: (a) => NORMALIZE.insert_after(a),
+    append_child: (a) => NORMALIZE.append_child(a),
+    remove: () => NORMALIZE.remove({}),
+    duplicate: () => NORMALIZE.duplicate({}),
+    move: (a) => NORMALIZE.move({ to: a.to }),
+    set_tag: (a) => NORMALIZE.set_tag(a),
+  };
 
   async function target(action, args) {
     const ctx = context();
@@ -252,7 +277,15 @@ function createAgentApi({
       );
     }
 
-    const operations = action === 'edit' ? args.operations || [] : [SINGLE[action](args)];
+    let operations;
+    if (action === 'edit') {
+      const listed = args.operations || [];
+      const unknown = listed.find((op) => !NORMALIZE[op?.type]);
+      if (unknown) return no('bad_operation', `"${unknown.type}" is not an operation.`);
+      operations = listed.map((op) => NORMALIZE[op.type](op));
+    } else {
+      operations = [SINGLE[action](args)];
+    }
     if (!operations.length) return no('bad_request', 'edit needs at least one operation.');
 
     // A move names where it is going with a ref. The renderer works in node
@@ -542,11 +575,16 @@ function createAgentApi({
               ? 'Ordinary editing is allowed. Destructive and remote operations — git writes, deletes, dependency installs — are refused.'
               : 'Everything Stacki exposes, including destructive and remote git operations.',
       },
+      // What there is, and whether this level may run it. Deliberately without
+      // the per-action summaries: they are in the tool descriptions the client
+      // already has, and repeating a hundred and thirty of them would make the
+      // one call an agent makes to orient itself the most expensive call in
+      // the surface.
       domains: registry.DOMAINS.map((domain) => ({
         domain,
         actions: registry.actionsOf(domain).map((action) => {
           const op = registry.find(domain, action);
-          return { action, risk: op.risk, allowed: gate.allows(op.risk), summary: op.summary };
+          return { action, risk: op.risk, allowed: gate.allows(op.risk) };
         }),
       })),
       limits: [
