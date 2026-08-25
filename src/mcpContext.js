@@ -18,7 +18,11 @@
 
 // The visible words inside a node, as the page reads them. Deep enough to name
 // a section by its heading, shallow enough not to serialize a whole page.
-function textOf(node, depth = 0, out = []) {
+//
+// Exported because Visual Review's anchor resolver compares a node's words
+// against the ones a review recorded, and two ways of reading the same node
+// would disagree exactly where it matters.
+export function textOf(node, depth = 0, out = []) {
   if (!node || depth > 4 || out.join(' ').length > 400) return out;
   if (node.kind === 'text' && typeof node.value === 'string') {
     const text = node.value.trim();
@@ -39,7 +43,7 @@ function textOf(node, depth = 0, out = []) {
 }
 
 /** The tag a node renders as, or null for anything that isn't an element. */
-function tagOf(node) {
+export function tagOf(node) {
   if (!node) return null;
   if (node.kind === 'element' || node.kind === 'raw') return node.name || null;
   if (node.kind === 'component') return node.name || null;
@@ -56,6 +60,7 @@ function tagOf(node) {
  */
 export function buildMcpPayload({
   project,
+  branch,
   currentPage,
   pageRoute,
   editStack,
@@ -70,7 +75,10 @@ export function buildMcpPayload({
   canvas,
 }) {
   const payload = {
-    project: { root: project?.path || null },
+    // The branch rides along so a review can record which one it was written
+    // against. The MCP snapshot's normalizer builds its answer from named
+    // fields, so nothing here changes what get_context returns.
+    project: { root: project?.path || null, branch: branch || null },
     page: {
       route: pageRoute || null,
       // The page on the canvas, not the file being edited — drilling into a
@@ -100,6 +108,12 @@ export function buildMcpPayload({
     tag: tagOf(selectedNode),
     occurrence: canvas?.occurrence ?? null,
     occurrenceCount: canvas?.occurrenceCount ?? null,
+    // Which copy of the OUTERMOST component instance is being edited, when one
+    // is. A component inside a loop is on the page once per item; drilling into
+    // the third card narrows everything the canvas reports to that card, and a
+    // review that came back to the first one would be looking at the wrong
+    // instance of the right node.
+    instanceOccurrence: (editStack || []).length > 1 ? editStack[1]?.focusOcc ?? 0 : null,
     keys: selectionKeys || [],
     // The route an editor takes to reach this: the page, then each component
     // opened on the way down.

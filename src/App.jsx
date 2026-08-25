@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import WelcomeScreen from './panels/WelcomeScreen.jsx';
 import PagesPanel from './panels/PagesPanel.jsx';
 import PalettePanel from './panels/PalettePanel.jsx';
@@ -9,6 +9,20 @@ import { setSoundEnabled } from './ui/sound.js';
 import { createPreviewWatch } from './previewRecovery.js';
 import { queryCanvas, tellCanvas } from './canvasQuery.js';
 import { buildMcpPayload } from './mcpContext.js';
+import CommentsPanel from './panels/CommentsPanel.jsx';
+import { anchorSteps, checkAnchor, markerPathFor, resolveNode } from './reviewAnchor.js';
+import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
+import { pinnable } from './reviewPins.js';
+import {
+  initialReviewMode,
+  isCommentModeKey,
+  isCommenting,
+  isComposing,
+  isPinToggleKey,
+  isTextEntry,
+  reviewModeReducer,
+  wantsCanvasClick,
+} from './reviewMode.js';
 import { beginCapture, endCapture } from './mcpCanvas.js';
 import PropsPanel from './panels/PropsPanel.jsx';
 import StylePanel from './panels/StylePanel.jsx';
@@ -2054,6 +2068,7 @@ export default function App() {
             key: e.data.key,
             metaKey: !!e.data.meta,
             ctrlKey: !!e.data.meta,
+            shiftKey: !!e.data.shift,
             bubbles: true,
             cancelable: true,
           })
@@ -3817,21 +3832,30 @@ export default function App() {
   // canvas — see spacingBands.js.
   const [spacingHover, setSpacingHover] = useState(null);
 
-  const crumbs = [];
-  if (currentPage) crumbs.push({ id: null, label: currentPage.name.replace(/\.(astro|md)$/i, '') });
-  if (model && selectedId === 'frontmatter') {
-    crumbs.push({ id: 'frontmatter', label: 'Frontmatter' });
-  } else if (model && selectedId) {
-    const chain = ancestorChain(model.nodes, selectedId) || [];
-    // A then has no row in the navigator, so the trail doesn't name it either —
-    // "if command › then › hero-command" said "then" to no one (see
-    // branches.js).
-    crumbs.push(
-      ...chain
-        .filter((n, i) => n !== thenBranch(chain[i - 1]))
-        .map((n) => ({ id: n.id, label: crumbLabel(n) }))
-    );
-  }
+  // The trail to any node in the open file. Taken as a function rather than
+  // built for the selection alone because a comment is left on whatever was
+  // clicked, which is not necessarily what is selected — and its breadcrumbs
+  // have to be made the same way, or the review would record a description of
+  // its target that Stacki itself would not recognise later.
+  const crumbsFor = (id) => {
+    const out = [];
+    if (currentPage) out.push({ id: null, label: currentPage.name.replace(/\.(astro|md)$/i, '') });
+    if (model && id === 'frontmatter') {
+      out.push({ id: 'frontmatter', label: 'Frontmatter' });
+    } else if (model && id) {
+      const chain = ancestorChain(model.nodes, id) || [];
+      // A then has no row in the navigator, so the trail doesn't name it either —
+      // "if command › then › hero-command" said "then" to no one (see
+      // branches.js).
+      out.push(
+        ...chain
+          .filter((n, i) => n !== thenBranch(chain[i - 1]))
+          .map((n) => ({ id: n.id, label: crumbLabel(n) }))
+      );
+    }
+    return out;
+  };
+  const crumbs = crumbsFor(selectedId);
 
   // Canvas outlines: nodes are addressed by their index path in the tree
   // (matching the marker paths the dev server's plugin injects).
@@ -3934,23 +3958,30 @@ export default function App() {
   const relOf = (abs) =>
     abs && project?.path ? abs.replace(project.path + '/', '') : null;
   const openRel = relOf(currentPage?.path);
-  const leafTrail = model && selectedId ? pathOfNode(model.nodes, selectedId) : null;
-  selectionKeysRef.current = !openRel
+  // The doors on the way down: one key per component drilled into, in the file
+  // above it. The same for every node in the open file, so it is worked out
+  // once and the leaf is added per node.
+  const hostKeys = !openRel
     ? []
-    : [
-        ...editStack
-          .slice(1)
-          .map((entry, i) => {
-            const host = relOf(editStack[i].path);
-            return entry.hostKey && host ? `${host}#${trailOf(entry.hostKey).join('.')}` : null;
-          })
-          .filter(Boolean),
-        selectedId === 'frontmatter'
-          ? `${openRel}#frontmatter`
-          : leafTrail
-            ? `${openRel}#${leafTrail.join('.')}`
-            : `${openRel}#`,
-      ];
+    : editStack
+        .slice(1)
+        .map((entry, i) => {
+          const host = relOf(editStack[i].path);
+          return entry.hostKey && host ? `${host}#${trailOf(entry.hostKey).join('.')}` : null;
+        })
+        .filter(Boolean);
+  // Taken as a function of a node rather than of the selection, because Visual
+  // Review anchors a comment to what was CLICKED, and the one thing that must
+  // not happen is a review inventing its own idea of where a node is. Same
+  // keys, same builder, whether they end up on the clipboard, in an MCP
+  // snapshot or in a review anchor.
+  const keysFor = (id) => {
+    if (!openRel) return [];
+    if (id === 'frontmatter') return [...hostKeys, `${openRel}#frontmatter`];
+    const trail = model && id ? pathOfNode(model.nodes, id) : null;
+    return [...hostKeys, trail ? `${openRel}#${trail.join('.')}` : `${openRel}#`];
+  };
+  selectionKeysRef.current = keysFor(selectedId);
 
   // Position the Style/Settings highlight: on tab change, when the panel first
   // appears, and whenever the tab strip's width changes.
@@ -4011,6 +4042,10 @@ export default function App() {
   const mcpPayloadRef = useRef(null);
   mcpPayloadRef.current = buildMcpPayload({
     project,
+    // Which branch this is being said about. Carried on the payload rather
+    // than fetched where it is needed, so a review records the branch that was
+    // checked out at the moment it describes.
+    branch: gitInfo?.branch || null,
     currentPage,
     // A dynamic route is a pattern; the canvas is showing one entry of it.
     pageRoute: dynamicPaths[dynamicIndex]?.route || (editStack[0] || currentPage)?.route || null,
@@ -4035,6 +4070,10 @@ export default function App() {
     void window.avb.mcpPublish(mcpPayloadRef.current);
   });
 
+  // Answered by the Visual Review section below; declared here because the
+  // handler that reads it is registered above it.
+  const focusReviewRef = useRef(null);
+
   // The path the canvas knows the selection by, for the computed-style query.
   const mcpSelPathRef = useRef(null);
   mcpSelPathRef.current = pathFor(selectedId);
@@ -4056,6 +4095,10 @@ export default function App() {
       }
       if (kind === 'capture:begin') return beginCapture(params);
       if (kind === 'capture:end') return endCapture();
+      // An agent asking Stacki to go and look at one of the user's comments.
+      // Through a ref because this handler is bound once, long before the
+      // navigation it calls is in scope.
+      if (kind === 'review:focus') return focusReviewRef.current?.(params) ?? null;
       return null;
     };
     return window.avb.onMcpAsk(async (ask) => {
@@ -4068,6 +4111,561 @@ export default function App() {
       void window.avb.mcpReply({ id: ask?.id, value });
     });
   }, []);
+
+
+  // ----------------------------------------------------------------
+  // Visual Review — the comments left on the rendered page
+  //
+  // A comment is a review thread: a message, a workflow status, and an anchor
+  // to a source-backed node at a particular breakpoint. The ledger itself
+  // lives in the main process (electron/review), because it is persistent
+  // state and React is not a database. What lives here is everything that
+  // needs the live app: which node a review resolves to right now, where its
+  // pin sits, and — the operation the whole feature stands on — putting the
+  // editor back the way it was so somebody, or something, can look at it.
+  //
+  // Two rules run through all of it:
+  //
+  //   A review's identity is the app's identity. Its anchor is built from the
+  //   same payload the MCP snapshot is built from, its keys come from the same
+  //   keysFor() ⇧⌘C uses, its breadcrumbs from the same crumbLabel the
+  //   navigator draws with. There is no second idea of where a node is.
+  //
+  //   Nothing here guesses. When the anchor cannot be resolved the review says
+  //   orphaned and points at nothing, and focus reports what it could not
+  //   restore. A comment attached to the wrong element is worse than one
+  //   attached to none, because nobody ever notices it.
+  // ----------------------------------------------------------------
+
+  const [reviewFilter, setReviewFilter] = useState('open');
+  const [reviewScope, setReviewScope] = useState('project');
+  const [allReviews, setAllReviews] = useState([]);
+  const [reviewProblem, setReviewProblem] = useState(null);
+  const [reviewOpenId, setReviewOpenId] = useState(null);
+  const [reviewBusyId, setReviewBusyId] = useState(null);
+  const [reviewTick, setReviewTick] = useState(0);
+  const [pinsVisible, setPinsVisible] = useState(true);
+  const [pinsHidden, setPinsHidden] = useState(0);
+  // Which copy of a repeated node the canvas should light up. Sent as a
+  // request with a tick rather than as a value, because asking for the same
+  // copy a second time is a real ask (see PreviewPane).
+  const [occRequest, setOccRequest] = useState(null);
+  const [commentMode, commentDispatch] = useReducer(reviewModeReducer, initialReviewMode);
+  const [draftBody, setDraftBody] = useState('');
+
+  // The page the CANVAS is on, which is what a review is anchored to — drilling
+  // into a component does not change which page is on screen.
+  const reviewPageFile = relOf((editStack[0] || currentPage)?.path);
+  const reviewPageRoute =
+    dynamicPaths[dynamicIndex]?.route || (editStack[0] || currentPage)?.route || null;
+
+  // Everything, once. The filters below are a view of it, so switching from
+  // Open to All is instant and costs no round trip — and the pins, which are
+  // not the panel's filter, read from the same list rather than fetching a
+  // second one.
+  useEffect(() => {
+    if (!project) {
+      setAllReviews([]);
+      setReviewProblem(null);
+      return;
+    }
+    let alive = true;
+    void (async () => {
+      const result = await window.avb.reviewsList({ status: 'all', scope: 'project', detail: 'full', limit: 200 });
+      if (!alive) return;
+      setAllReviews(result?.reviews || []);
+      setReviewProblem(result?.problem || null);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [project, reviewTick]);
+
+  // The ledger changed — by this window, or by an agent through MCP. Both
+  // arrive here, so a comment an agent resolves goes grey in the panel while
+  // somebody is watching it.
+  useEffect(() => window.avb.onReviewsChanged(() => setReviewTick((n) => n + 1)), []);
+
+  const reviewById = useCallback((id) => allReviews.find((r) => r.id === id) || null, [allReviews]);
+
+  // Where each review's node is in the file that is open right now.
+  //
+  // Only for reviews whose leaf key is in THIS file: a review on a component's
+  // innards cannot be resolved from the page, and claiming either way about a
+  // tree nobody has read would be a guess. Recomputed when the model changes,
+  // which is what an edit, a reload or a drill-down already does — no polling,
+  // no watcher, nothing on a timer.
+  const reviewNodes = useMemo(() => {
+    const out = new Map();
+    if (!model || !openRel) return out;
+    for (const r of allReviews) {
+      const steps = anchorSteps(r.anchor);
+      const leaf = steps[steps.length - 1];
+      if (!leaf || leaf.file !== openRel) continue;
+      out.set(r.id, resolveNode(model.nodes, leaf.indexPath, r.anchor?.fingerprint, { labelOf: crumbLabel }));
+    }
+    return out;
+    // crumbLabel is rebuilt every render and is a pure function of the model
+    // and the layout name, both of which are already here.
+  }, [allReviews, model, openRel, currentLayoutName]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Tell the ledger what this file could and could not find. Only the changes,
+  // and only where the answer is actually known — the store ignores a repeat,
+  // so this settles after one pass instead of looping on its own notification.
+  const anchorSyncRef = useRef('');
+  useEffect(() => {
+    if (!project || !model || !openRel || !allReviews.length) return;
+    const updates = [];
+    for (const r of allReviews) {
+      const health = checkAnchor(r.anchor, { file: openRel, nodes: model.nodes, labelOf: crumbLabel });
+      if (health.state === 'unknown') continue;
+      // A node that moved is still the same node; writing its new position back
+      // is what keeps the anchor cheap and its reported file:line true.
+      const moved = health.keys && health.keys.join() !== (r.anchor?.keys || []).join();
+      if (health.state === r.anchorState && !moved) continue;
+      updates.push({ id: r.id, anchorState: health.state, ...(moved ? { keys: health.keys } : {}) });
+    }
+    const key = JSON.stringify(updates);
+    if (!updates.length || key === anchorSyncRef.current) return;
+    anchorSyncRef.current = key;
+    void window.avb.reviewsSyncAnchors(updates);
+  }, [project, model, openRel, allReviews]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Whether a review belongs to the page the canvas is showing.
+  const onReviewPage = (r) =>
+    (reviewPageRoute && r.anchor?.page?.route === reviewPageRoute) ||
+    (reviewPageFile && r.anchor?.page?.file === reviewPageFile);
+
+  // What PreviewPane draws. One entry per review that belongs to the open file,
+  // including the ones with nowhere to point — the panel says how many, and a
+  // pin count that quietly disagrees with a list count reads as a bug.
+  //
+  // Every review on the PAGE gets a pin, not only the ones in the file that
+  // happens to be open. The canvas renders the whole page — components and
+  // all — and marks each file's nodes in its own namespace, so a comment left
+  // three components deep is still addressable from here. Marking only what
+  // the open file owns meant a pin appeared when you drilled into its
+  // component and vanished again when you came out, which is the opposite of
+  // what a marker on a page is for.
+  //
+  // Where the file IS open the resolved position is used, because that one
+  // follows the node if it moved. Everywhere else the anchor's own key is the
+  // best available answer: if the node has since moved the page reports no box
+  // for it and it simply has no pin, which is where it was already.
+  const reviewItems = allReviews
+    .filter((r) => pinnable(r.status) && onReviewPage(r))
+    .map((r) => {
+      // Where the file IS open the resolved position is used, because that one
+      // follows the node if it moved. Everywhere else the anchor's own key is
+      // the best available answer: if the node has since moved the page reports
+      // no box for it and it simply has no pin — which is where it was already.
+      const found = reviewNodes.get(r.id);
+      const keys = r.anchor?.keys || [];
+      const path = found
+        ? found.id
+          ? pathFor(found.id)
+          : null
+        : markerPathFor(keys[keys.length - 1], reviewPageFile);
+      return {
+        id: r.id,
+        number: r.number ?? null,
+        color: r.color || 'blue',
+        path,
+        occurrence: Number.isInteger(r.anchor?.occurrence) ? r.anchor.occurrence : null,
+        pin: r.anchor?.pin || null,
+        status: r.status,
+        // Only a file that was actually read can call a review orphaned; one
+        // that was not is left as whatever the ledger last recorded.
+        anchorState: found && !found.id ? 'orphaned' : r.anchorState,
+      };
+    });
+
+  const reviewRows = allReviews
+    .filter((r) => (reviewFilter === 'all' ? true : r.status === reviewFilter))
+    .filter((r) => (reviewScope === 'page' ? onReviewPage(r) : true))
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+
+  // --- doing something to one ----------------------------------------------
+
+  const actOnReview = async (id, action, extra = {}) => {
+    setReviewBusyId(id);
+    try {
+      // The same door an agent goes through, with `human` on the message. One
+      // implementation of what "resolve" means, so the panel and MCP cannot
+      // drift apart.
+      const result = await window.avb.reviewsAct({ action, threadId: id, authorType: 'human', ...extra });
+      if (!result?.ok) showToast(result?.message || 'That comment could not be changed.', 'error');
+      setReviewTick((n) => n + 1);
+    } finally {
+      setReviewBusyId(null);
+    }
+  };
+
+  const recolorReview = async (id, color) => {
+    const result = await window.avb.reviewsRecolor({ threadId: id, color });
+    if (!result?.ok) showToast(result?.message || 'That colour could not be set.', 'error');
+    setReviewTick((n) => n + 1);
+  };
+
+  const deleteReview = async (id) => {
+    const result = await window.avb.reviewsRemove(id);
+    if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
+    if (reviewOpenId === id) setReviewOpenId(null);
+    setReviewTick((n) => n + 1);
+  };
+
+  // --- leaving one ----------------------------------------------------------
+
+  // A click on the canvas in comment mode. The selection, the open file and the
+  // panel all stay exactly where they were: leaving a note should never cost
+  // somebody the place they were working in.
+  const takeCommentTarget = (hit) => {
+    const node = hit?.path && model ? nodeAtPath(model.nodes, trailOf(hit.path)) : null;
+    if (!node) {
+      showToast(
+        hit?.outside
+          ? 'That belongs to another file — open it to comment on it.'
+          : 'Stacki can’t name that piece of the page. Click the element itself.',
+        'info'
+      );
+      return;
+    }
+    commentDispatch({
+      type: 'target',
+      target: {
+        id: node.id,
+        path: hit.path,
+        occurrence: hit.occurrence,
+        occurrenceCount: hit.occurrenceCount,
+        pin: hit.pin,
+        rect: hit.rect,
+        // The composer opens where the click landed — the same coordinates the
+        // pin will use once the comment exists, so the box appears on the thing
+        // it is about rather than in the corner of the canvas.
+        x: hit.point?.x,
+        y: hit.point?.y,
+        label: crumbLabel(node),
+      },
+    });
+    setDraftBody('');
+  };
+
+  const submitComment = async () => {
+    const target = commentMode.target;
+    const body = draftBody.trim();
+    if (!target || !body) return;
+    const node = model ? findNodeById(model.nodes, target.id) : null;
+    if (!node) {
+      commentDispatch({ type: 'context-lost' });
+      return;
+    }
+    // Built with the app's own payload builder, aimed at the clicked node
+    // rather than the selected one. Everything after this — the keys, the
+    // trail, the breadcrumbs, the clamps — is the same code path an agent's
+    // `comment create` goes down, which is the whole reason a review and
+    // get_context can never describe different things.
+    const payload = buildMcpPayload({
+      project,
+      branch: gitInfo?.branch || null,
+      currentPage,
+      pageRoute: reviewPageRoute,
+      editStack,
+      selectedId: target.id,
+      selectedNode: node,
+      selectionKeys: keysFor(target.id),
+      crumbs: crumbsFor(target.id),
+      selectedClasses: liveClassesById?.get(target.id) || null,
+      hidden: stateIds.hidden.has(target.id),
+      inert: stateIds.inert.has(target.id),
+      devStatus,
+      canvas: {
+        ...(canvasReport || {}),
+        rect: target.rect || null,
+        occurrence: target.occurrence ?? null,
+        occurrenceCount: target.occurrenceCount ?? null,
+      },
+    });
+    const result = await window.avb.reviewsAct({ action: 'create', message: body, pin: target.pin, payload });
+    if (!result?.ok) {
+      showToast(result?.message || 'That comment could not be saved.', 'error');
+      return;
+    }
+    commentDispatch({ type: 'submitted' });
+    setDraftBody('');
+    setReviewTick((n) => n + 1);
+    setReviewOpenId(result.review?.id || null);
+  };
+
+  // --- going back to one ----------------------------------------------------
+
+  /**
+   * Go somewhere, and wait until the app is really there.
+   *
+   * `openFile` sets the current file BEFORE it reads it and the model AFTER,
+   * so for one turn of the loop the app says it is showing a component while
+   * still holding the page's tree. Waiting only for the filename walked
+   * straight into that window: the drill was right, the file was right, and
+   * the node was looked up in the wrong model — which came back as "your
+   * element is gone" about an element that was plainly on screen.
+   *
+   * So the wait is for the file AND for a model that is not the one we left.
+   */
+  const goTo = async (rel, run) => {
+    const left = pageStateRef.current.pageState?.model || null;
+    await run();
+    for (let i = 0; i < 60; i++) {
+      const { currentPage: open, pageState: state } = pageStateRef.current;
+      if (open && relOf(open.path) === rel && state?.model && state.model !== left) return true;
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    return false;
+  };
+
+  /** The tree of the file that is open right now, if it is the one expected. */
+  const modelOf = (rel) => {
+    const { currentPage: open, pageState: state } = pageStateRef.current;
+    if (!open || relOf(open.path) !== rel) return null;
+    return state?.model || null;
+  };
+
+  // What the canvas last reported about the selection — read after a focus to
+  // find out whether the copy it was asked for is on the page at all.
+  const canvasReportRef = useRef(null);
+  canvasReportRef.current = canvasReport;
+  const settleOnOccurrence = async (want) => {
+    for (let i = 0; i < 20; i++) {
+      if (canvasReportRef.current?.occurrence === want) return true;
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    return false;
+  };
+
+  /**
+   * Put the editor back where this review was written, and say what could not
+   * be put back.
+   *
+   * Reuses the navigation a person uses — selectPage, openComponent,
+   * setSelectedId — rather than a second set of state that means the same
+   * thing. Everything it reports is something it actually did.
+   */
+  const focusReview = async ({ threadId, anchor }) => {
+    const restored = nothingRestored();
+    // Filled in as the walk goes, so the ledger can be told where things
+    // actually are now rather than where they were when the review was left.
+    const drillTrails = [];
+    let resolvedKeys = null;
+    const plan = focusPlan(anchor, {
+      pageFile: reviewPageFile,
+      device,
+      // Already inside a component: the page has to be reopened even when it is
+      // the right page, because that is what the drill walks from.
+      drilledIn: editStackRef.current.length > 1,
+      // Whether there is a rendered page to put in front of anybody at all.
+      previewReady: devStatus === 'on',
+    });
+    // Why a focus failed decides whether the ledger hears about it.
+    //
+    // "I could not identify the node" is a fact about the source and belongs on
+    // the review. "The file had not finished opening" and "the app navigated
+    // away underneath me" are facts about this moment — the preview starting,
+    // a project still loading — and recording those as `orphaned` would let
+    // merely LOOKING at a list of comments mark them all as lost. Reading must
+    // not damage what it reads.
+    const TRANSIENT = new Set(['not_open', 'moved_away']);
+    const done = (state, reason) => ({
+      anchorState: state,
+      transient: state !== 'attached' && TRANSIENT.has(reason),
+      restored,
+      keys: state === 'attached' ? resolvedKeys : null,
+      note: focusNote({ restored, anchorState: state, plan, reason }),
+    });
+
+    // 1 — the page, first, because a component drill is an index path into it.
+    if (plan.page.needed) {
+      const page = (scan.pages || []).find((p) => relOf(p.path) === plan.page.file);
+      if (!page) return done('orphaned', 'gone');
+      if (!(await goTo(plan.page.file, () => selectPage(page)))) return done('orphaned', 'not_open');
+    } else if (!modelOf(plan.page.file)) {
+      return done('orphaned', 'not_open');
+    }
+    restored.page = true;
+
+    // 2 — the breakpoint, before anything is measured. "Wrong on mobile" is a
+    // different sentence at 375 and at 1440.
+    if (plan.device.needed) setDevice(plan.device.key);
+    restored.breakpoint = !plan.device.key || plan.device.restorable;
+
+    // 3 — down through the components, each one resolved in the model that is
+    // actually loaded rather than in one read from disk: a fresh parse invents
+    // fresh ids, and the id has to be one this app is holding.
+    for (const [i, drill] of plan.drills.entries()) {
+      const host = modelOf(drill.hostFile);
+      if (!host) return done('orphaned', 'not_open');
+      const found = resolveNode(
+        host.nodes || [],
+        drill.indexPath,
+        // A door is checked against the component it should open, so a review
+        // does not survive its <Hero> being swapped for a <Banner>.
+        { nodeKind: 'component', tag: drill.opens },
+        { labelOf: crumbLabel }
+      );
+      if (!found.id) return done('orphaned', found.reason);
+      drillTrails.push(found.trail.join('.'));
+      const opened = await goTo(drill.componentFile, () =>
+        openComponent(
+          drill.opens,
+          hostPathFor(drill.hostFile, found.trail, drill.hostIsPage),
+          // Which copy of the outermost instance — the third card, not the first.
+          i === 0 ? anchor?.instanceOccurrence ?? 0 : 0,
+          drill.componentFile && project?.path ? `${project.path}/${drill.componentFile}` : null
+        )
+      );
+      if (!opened) return done('orphaned', 'not_open');
+    }
+    restored.component = true;
+
+    // 4 — the node itself.
+    if (!plan.leaf) return done('orphaned', 'no_path');
+    // Every drill above waited for the file it opened, so this is already the
+    // open one — but a file that never became it is a different failure from a
+    // node that is not in it, and an agent reading the note deserves to know
+    // which.
+    const leafModel = modelOf(plan.leaf.file);
+    if (!leafModel) return done('orphaned', 'not_open');
+    const leaf = resolveNode(leafModel.nodes || [], plan.leaf.indexPath, anchor?.fingerprint, {
+      labelOf: crumbLabel,
+    });
+    if (!leaf.id) return done('orphaned', leaf.reason);
+    // The positions this walk actually used. Any of them may have moved since
+    // the review was written, and the ledger takes the new ones.
+    resolvedKeys = [
+      ...plan.drills.map((d, i) => `${d.hostFile}#${drillTrails[i]}`),
+      `${plan.leaf.file}#${leaf.trail.join('.')}`,
+    ];
+    setSelectedId(leaf.id);
+    // The panel follows, so a person watching an agent work can see which
+    // comment it is on.
+    setLeftTab('comments');
+    restored.node = true;
+
+    // 5 — and which copy of it, scrolled into view. The marker path is built
+    // from the trail that was just resolved rather than from pathFor, which is
+    // a render behind at this point.
+    const trackPath = hostPathFor(plan.leaf.file, leaf.trail, plan.drills.length === 0);
+    setOccRequest({ path: trackPath, occ: plan.occurrence ?? 0, tick: Date.now() });
+    // The canvas answers with the copy it actually used. A node can report one
+    // box for several places, and a copy that is no longer on the page must
+    // not come back as restored — an agent that believed it would photograph
+    // the first card and call it the third.
+    // With no preview there is no box, nothing to scroll to and nothing to
+    // photograph — so the copy was not restored however the arithmetic looks.
+    restored.occurrence = !plan.previewReady
+      ? false
+      : plan.occurrence == null
+        ? true
+        : await settleOnOccurrence(plan.occurrence);
+
+    // And confirm it stuck. Opening a project ends with the app's own
+    // navigation — loadProject picks a page after the scan comes back — so a
+    // focus that lands while that is still in flight can be quietly undone a
+    // moment later. Reporting "restored" about a selection that has since been
+    // replaced is exactly the silent lie this whole operation is written to
+    // avoid, so it is checked rather than assumed.
+    await new Promise((done_) => setTimeout(done_, 200));
+    if (!modelOf(plan.leaf.file) || selectedIdRef.current !== leaf.id) {
+      restored.node = false;
+      restored.occurrence = false;
+      return done('orphaned', 'moved_away');
+    }
+
+    if (threadId) setReviewOpenId(threadId);
+    return done('attached', null);
+  };
+  focusReviewRef.current = focusReview;
+
+  // From the panel or a pin: the same operation, plus saying so when it could
+  // not be done — an agent gets that in its tool result, a person gets a toast.
+  const focusReviewFromUi = async (review) => {
+    const result = await focusReview({ threadId: review.id, anchor: review.anchor });
+    if (result.note) showToast(result.note, result.anchorState === 'attached' ? 'info' : 'error');
+    // Only a real resolution failure changes what the ledger believes.
+    if (!result.transient && result.anchorState && result.anchorState !== review.anchorState) {
+      void window.avb.reviewsSyncAnchors([{ id: review.id, anchorState: result.anchorState, keys: result.keys }]);
+      setReviewTick((n) => n + 1);
+    }
+  };
+
+  // --- the shortcuts --------------------------------------------------------
+
+  const commentModeRef = useRef(commentMode);
+  commentModeRef.current = commentMode;
+  const reviewOpenIdRef = useRef(reviewOpenId);
+  reviewOpenIdRef.current = reviewOpenId;
+  const canCommentRef = useRef(false);
+  canCommentRef.current = !!project && !!devUrl && !inPreview;
+
+  useEffect(() => {
+    const onKey = (e) => {
+      // Same guard the rest of the app uses, plus CodeMirror and the terminal:
+      // a `c` typed into a shell must not put the canvas into comment mode.
+      if (isTextEntry(e.target)) return;
+      if (isCommentModeKey(e)) {
+        if (!canCommentRef.current) return;
+        e.preventDefault();
+        // Turning it on shows the comments; turning it off leaves the panel
+        // where it is, because closing a panel is not what Escape-from-a-mode
+        // means.
+        if (commentModeRef.current.phase === 'off') setLeftTab('comments');
+        commentDispatch({ type: 'toggle' });
+        return;
+      }
+      if (isPinToggleKey(e)) {
+        if (!canCommentRef.current) return;
+        e.preventDefault();
+        setPinsVisible((v) => !v);
+        return;
+      }
+      if (e.key === 'Escape') {
+        // One rung at a time: not that element, then not commenting. A thread
+        // opened from its pin closes first, since that is what is in the way.
+        if (reviewOpenIdRef.current && commentModeRef.current.phase === 'off') {
+          e.preventDefault();
+          setReviewOpenId(null);
+        } else if (commentModeRef.current.phase !== 'off') {
+          e.preventDefault();
+          commentDispatch({ type: 'escape' });
+        }
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
+  // A composer floating over a page nobody is on any more is the sort of thing
+  // that only gets noticed by the person it happens to.
+  useEffect(() => {
+    commentDispatch({ type: 'context-lost' });
+    setReviewOpenId(null);
+  }, [reviewPageFile, project?.path]);
+
+  // Drilling into a component is not leaving the page — the canvas still shows
+  // it, and somebody who pressed C to comment on something deeper meant to
+  // stay in comment mode. Only a draft aimed at the file just left has to go.
+  useEffect(() => {
+    commentDispatch({ type: 'file-changed' });
+  }, [currentPage?.path]);
+
+  const reviewDraft = isComposing(commentMode)
+    ? {
+        x: commentMode.target.x,
+        y: commentMode.target.y,
+        label: commentMode.target.label,
+        breakpoint: canvasReport?.device || null,
+        occurrence: commentMode.target.occurrence,
+        occurrenceCount: commentMode.target.occurrenceCount,
+        body: draftBody,
+      }
+    : null;
 
   // ----------------------------------------------------------------
   // Render
@@ -4375,6 +4973,35 @@ export default function App() {
             {leftTab === 'variables' && (
               <VariablesPanel project={project} selected={varsGroup} onSelect={setVarsGroup} />
             )}
+            {leftTab === 'comments' && (
+              <CommentsPanel
+                reviews={reviewRows}
+                status={reviewFilter}
+                onStatus={setReviewFilter}
+                scope={reviewScope}
+                onScope={setReviewScope}
+                openId={reviewOpenId}
+                onOpen={(id) => {
+                  setReviewOpenId(id);
+                  // Choosing a comment from the list means "show me this" —
+                  // reading it and finding it are the same act. An orphan has
+                  // nowhere to go, so it just opens.
+                  const picked = id ? reviewRows.find((r) => r.id === id) : null;
+                  if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
+                }}
+                onAct={actOnReview}
+                onFocus={focusReviewFromUi}
+                onDelete={deleteReview}
+                onColor={recolorReview}
+                busyId={reviewBusyId}
+                problem={reviewProblem}
+                hiddenPins={pinsHidden}
+                pinsVisible={pinsVisible}
+                onTogglePins={() => setPinsVisible((v) => !v)}
+                commenting={isCommenting(commentMode)}
+                onToggleComment={() => commentDispatch({ type: 'toggle' })}
+              />
+            )}
             {leftTab === 'history' && (
               <HistoryPanel
                 project={project}
@@ -4552,6 +5179,24 @@ export default function App() {
             device={device}
             onDevice={setDevice}
             onCanvasReport={setCanvasReport}
+            commenting={wantsCanvasClick(commentMode)}
+            pinsVisible={pinsVisible}
+            reviewItems={reviewItems}
+            reviewOpenId={reviewOpenId}
+            reviewDraft={reviewDraft}
+            reviewBusyId={reviewBusyId}
+            reviewById={reviewById}
+            onReviewOpen={setReviewOpenId}
+            onReviewAct={actOnReview}
+            onReviewFocus={focusReviewFromUi}
+            onReviewDelete={deleteReview}
+            onReviewColor={recolorReview}
+            onReviewDraftChange={setDraftBody}
+            onReviewDraftSubmit={submitComment}
+            onReviewDraftCancel={() => commentDispatch({ type: 'escape' })}
+            onReviewHidden={setPinsHidden}
+            onCommentTarget={takeCommentTarget}
+            occRequest={occRequest}
             onSelectPath={(p, info) => {
               // What the click MEANT — see canvasClick.js. The canvas answers
               // with a path or with null, and null has two causes that want
@@ -4570,6 +5215,11 @@ export default function App() {
                 focusPath,
                 scope: editedRel ? `${editedRel}|` : '',
               });
+              // Picking something else means you are done with the comment
+              // that was open. Without this its panel stays over the canvas,
+              // swallowing the clicks that land on it — which reads as the
+              // editor having stopped selecting.
+              setReviewOpenId(null);
               if (kind === 'nothing') return;
               if (kind === 'close') { closeComponent(); return; }
               if (kind === 'layout') { reveal(model && findNodeById(model.nodes, 'layout')); return; }

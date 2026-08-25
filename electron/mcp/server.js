@@ -76,11 +76,19 @@ function createStackiMcpServer({
   instructions = INSTRUCTIONS,
   getContext,
   capture,
+  getComments,
+  comment,
   onError,
 } = {}) {
   if (!token || typeof token !== 'string') throw new Error('an MCP bearer token is required');
   if (typeof getContext !== 'function' || typeof capture !== 'function') {
     throw new Error('get_context and capture implementations are required');
+  }
+  // Required rather than optional: a Stacki that answered `get_comments` on one
+  // machine and not on another would be a client configuration problem nobody
+  // could diagnose from the outside.
+  if (typeof getComments !== 'function' || typeof comment !== 'function') {
+    throw new Error('get_comments and comment implementations are required');
   }
 
   const report = (err) => {
@@ -95,7 +103,7 @@ function createStackiMcpServer({
   // clients can hold this endpoint at once without sharing anything.
   const handler = createMcpHandler(() => {
     const server = new McpServer({ name, version }, { instructions });
-    registerTools(server, { getContext, capture });
+    registerTools(server, { getContext, capture, getComments, comment });
     return server;
   }, { onerror: report });
 

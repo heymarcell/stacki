@@ -1,24 +1,32 @@
-// The two things an agent can ask Stacki.
+// What an agent can ask Stacki, and the one thing it can change.
 //
 // The temptation with an editor that has an API is to expose the editor. That
 // would be the wrong shape: an agent already has a filesystem, a text editor
 // and a repository, and it is very good with all three. What it does not have
-// is eyes. So Stacki answers exactly two questions — what is selected and
-// where is it in source, and what does that actually look like — and nothing
-// here writes anything.
+// is eyes. So Stacki answers two questions — what is selected and where is it
+// in source, and what does that actually look like — and neither of them
+// writes anything.
 //
-// Both tools are read-only, idempotent and closed-world, and say so in their
-// annotations, so a client can call them without asking anybody's permission.
+// Beside them sit the review tools, in reviewTools.js. Those are the exception
+// and they earn it: a visual review is persistent state a person created for an
+// agent to act on, and a loop that cannot record "done, and here is the picture"
+// is not a loop. They still touch nothing but Stacki's own review file and
+// Stacki's own view — the source edits stay where they belong, in the agent's
+// hands.
 
 const z = require('zod');
 
+const { registerReviewTools } = require('./reviewTools');
+
 const INSTRUCTIONS = [
-  'Stacki exposes the live visual state of the Astro project currently open in the Stacki desktop application.',
-  'Use get_context whenever the user refers to "this", the selected element, this section, the current page,',
-  'the current breakpoint, or asks for a visual/UI change. Use capture when appearance matters or when visually',
-  'verifying a change. These tools are read-only. Modify project source using normal repository editing tools.',
-  'After visually relevant code changes, query Stacki again to verify the rendered result.',
-  'Stacki already owns the preview server; do not start another dev server.',
+  'Stacki exposes the live visual state, and the local visual-review threads, of the Astro project currently open',
+  'in the Stacki desktop application. Use get_context when the user refers to "this", the selected element, the',
+  'current page or breakpoint, or asks for a visual change, and capture when appearance matters. Use get_comments',
+  "to read the user's review feedback, and comment with action \"focus\" before acting on one so Stacki navigates to",
+  'its target — then get_context and capture describe and photograph that target. Modify project source with normal',
+  'repository tools, let Stacki refresh, then query and capture again to verify the result. Resolve a review only',
+  'after verifying it; defer one that is deliberately not being implemented, with a reason. Stacki already owns the',
+  'preview server; do not start another dev server.',
 ].join(' ');
 
 const READ_ONLY = {
@@ -128,13 +136,13 @@ const CaptureOutput = z.object({
 const MAX_PADDING = 256;
 
 /**
- * Put both tools on `server`.
+ * Put the tools on `server`.
  *
- * `getContext({ styleDetail })` and `capture({ target, paddingPx, format })`
- * are the app's own implementations — passed in so this file describes the
- * surface and nothing else.
+ * `getContext({ styleDetail })`, `capture({ target, paddingPx, format })` and
+ * the two review implementations are the app's own — passed in so this file
+ * describes the surface and nothing else.
  */
-function registerTools(server, { getContext, capture }) {
+function registerTools(server, { getContext, capture, getComments, comment }) {
   server.registerTool(
     'get_context',
     {
@@ -209,6 +217,8 @@ function registerTools(server, { getContext, capture }) {
       };
     }
   );
+
+  registerReviewTools(server, { getComments, comment });
 }
 
 module.exports = { registerTools, INSTRUCTIONS, READ_ONLY, ContextOutput, CaptureOutput, MAX_PADDING };

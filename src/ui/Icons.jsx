@@ -967,3 +967,64 @@ export const VariableIcon = ({ size = 24, className, style }) => (
     />
   </svg>
 );
+
+// ── Visual Review ───────────────────────────────────────────────────────────
+//
+// A comment left on the rendered page. The rail icon is on the 24px grid at
+// the same hairline weight as its neighbours; the rest are on the 16px grid
+// with the panel's other controls.
+
+export const ReviewIcon = (p) => (
+  <I24 {...p}>
+    <path
+      d="M5 4.5h14A1.5 1.5 0 0 1 20.5 6v9a1.5 1.5 0 0 1-1.5 1.5h-8.1l-3.4 3.1V16.5H5A1.5 1.5 0 0 1 3.5 15V6A1.5 1.5 0 0 1 5 4.5Z"
+      stroke="currentColor"
+      strokeWidth="1"
+      strokeLinejoin="round"
+    />
+    <path d="M7.5 8.75h9M7.5 11.75h5.5" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+  </I24>
+);
+
+// The marker itself: a pin, so it reads as "attached to this spot" rather than
+// as a button the site owns.
+export const PinIcon = (p) => (
+  <I {...p}>
+    <path d="M8 14.2V9.4" />
+    <path d="M5.1 2.2h5.8l-.7 3.1 1.8 2.2a.6.6 0 0 1-.46.98H4.46A.6.6 0 0 1 4 7.5l1.8-2.2-.7-3.1Z" />
+  </I>
+);
+
+// A decision was reached — not "correct", not "approved": done being discussed.
+export const ResolveIcon = (p) => (
+  <I {...p}>
+    <circle cx="8" cy="8" r="5.9" />
+    <path d="m5.4 8.1 1.9 1.9 3.4-3.9" />
+  </I>
+);
+
+// Valid, deliberately not now.
+export const DeferIcon = (p) => (
+  <I {...p}>
+    <circle cx="8" cy="8" r="5.9" />
+    <path d="M8 4.7v3.5l2.2 1.3" />
+  </I>
+);
+
+// Back to open.
+export const ReopenIcon = (p) => (
+  <I {...p}>
+    <path d="M13.4 8.6A5.5 5.5 0 1 1 12.2 4.4" />
+    <path d="M12.6 1.9v2.9H9.7" />
+  </I>
+);
+
+// Stacki can no longer find what this review was about. A broken link rather
+// than a warning triangle: nothing went wrong, the code simply moved on.
+export const OrphanIcon = (p) => (
+  <I {...p}>
+    <path d="M6.6 9.4 4.9 11.1a2.4 2.4 0 1 1-3.4-3.4l1.7-1.7" />
+    <path d="M9.4 6.6l1.7-1.7a2.4 2.4 0 1 1 3.4 3.4l-1.7 1.7" />
+    <path d="M6.2 6.2 9.8 9.8" />
+  </I>
+);

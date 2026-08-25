@@ -124,11 +124,17 @@ if (!process.isMainFrame) {
         // ⌘Enter jumps to the class field. The canvas is where the selection is
         // usually made, so it has to reach the app from in here too.
         const isClassJump = mod && !e.altKey && !e.shiftKey && e.key === 'Enter';
-        if (isDelete || isDuplicate || isClassJump) {
+        // C / ⇧C — comment mode, and whether the pins are shown. The canvas is
+        // where somebody IS when they decide to leave a comment on something,
+        // so of all the shortcuts these are the ones that most have to survive
+        // the click that put focus in this frame. Escape comes with them: a
+        // mode you cannot get out of from where you are standing is a trap.
+        const isReview = !mod && !e.altKey && (e.key === 'c' || e.key === 'C' || e.key === 'Escape');
+        if (isDelete || isDuplicate || isClassJump || isReview) {
           e.preventDefault();
           try {
             window.parent.postMessage(
-              { type: 'avb:shortcut', name: 'key', key: e.key, meta: mod },
+              { type: 'avb:shortcut', name: 'key', key: e.key, meta: mod, shift: e.shiftKey },
               '*'
             );
           } catch {
@@ -1455,8 +1461,28 @@ if (!process.isMainFrame) {
         // `outside` saying whether it landed on something the open file simply
         // doesn't own — which is what the app backs out of a component on.
         const { path: p, occurrence, outside } = nodeAtEvent(e);
+        // The clicked node's own boxes, measured here rather than looked up in
+        // the app. The app only holds boxes for paths it asked to track, and it
+        // asks for what is hovered — so a click with no hover before it (the
+        // first click after a re-render, or anything synthetic) would find
+        // nothing, and a comment would pin to the middle of its element instead
+        // of to the spot that was clicked. The page knows; it may as well say.
+        const boxes = p ? rectsForPath(p) || [] : [];
         window.parent.postMessage(
-          { type: 'avb:click-node', path: p || null, occurrence, outside: !!outside },
+          {
+            type: 'avb:click-node',
+            path: p || null,
+            occurrence,
+            outside: !!outside,
+            // Where in the page the click landed, in the same viewport
+            // coordinates the rects are reported in. Visual Review turns it
+            // into a position inside the element's own box, so a comment pin
+            // stays on the paragraph it was left on when the layout moves.
+            x: e.clientX,
+            y: e.clientY,
+            rect: boxes[occurrence] || boxes[0] || null,
+            occurrenceCount: boxes.length || null,
+          },
           '*'
         );
       },
@@ -1730,6 +1756,23 @@ contextBridge.exposeInMainWorld('avb', {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('mcp:ask', listener);
     return () => ipcRenderer.removeListener('mcp:ask', listener);
+  },
+
+  // Visual Review — the comments left on the rendered page.
+  //
+  // Deliberately narrow: nothing here takes a path. Which file the reviews
+  // live in is worked out by the main process from the project it has open, so
+  // this bridge cannot be talked into reading or writing anywhere else in the
+  // app's data directory. A review is named by its id or not at all.
+  reviewsList: invoke('reviews:list'),
+  reviewsAct: invoke('reviews:act'),
+  reviewsRemove: invoke('reviews:remove'),
+  reviewsRecolor: invoke('reviews:recolor'),
+  reviewsSyncAnchors: invoke('reviews:syncAnchors'),
+  onReviewsChanged: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('reviews:changed', listener);
+    return () => ipcRenderer.removeListener('reviews:changed', listener);
   },
 
   // CMS (JSON data under src/)

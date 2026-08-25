@@ -60,6 +60,7 @@ const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const mcp = require('./mcp');
+const reviews = require('./review');
 
 let mainWindow = null;
 let devServer = null; // {proc, url, projectPath}
@@ -405,6 +406,10 @@ app.whenReady().then(() => {
     version: app.getVersion(),
     settings,
   });
+  // Visual Review's ledger. Also for the app rather than for a project — the
+  // door is registered once, and which project's reviews are behind it moves
+  // with whatever is open (see project:scan below).
+  reviews.start({ userDataPath: app.getPath('userData'), send });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -430,6 +435,9 @@ ipcMain.handle('project:close', async (_e, next) => {
   openProjectRoot = null;
   // And nothing is selected, so nothing should still be described as selected.
   mcp.resetContext();
+  // The reviews are written and let go of — they belong to the project being
+  // closed, not to the window that is about to reload onto another one.
+  reviews.closeProject();
   // The window starts over. Done here rather than in the renderer because it
   // is the same act as the teardown above — the renderer holds a page, an undo
   // stack and forty pieces of state that belong to the project just closed, and
@@ -462,6 +470,8 @@ app.on('before-quit', () => stopAllPreviews());
 app.on('before-quit', () => cleanupTerminals());
 // A listening socket outlives it too, and the next launch wants the port back.
 app.on('before-quit', () => void mcp.stopMcp());
+// A review written a moment before quitting is still only scheduled.
+app.on('before-quit', () => reviews.flushSync());
 
 // ---------------------------------------------------------------------------
 // Auto update
@@ -1462,6 +1472,10 @@ ipcMain.handle('project:scan', async (_e, projectPath) => {
   // Also set here, not just in watch:start — the Assets panel can render
   // thumbnails before the watcher starts, and they'd be refused.
   openProjectRoot = path.resolve(projectPath);
+  // And this project's reviews. Scoped to the folder the app has open, which
+  // is why no renderer call ever names a review file: there is only ever one,
+  // and the main process is the only thing that knows which.
+  reviews.openProject(openProjectRoot);
   const src = path.join(projectPath, 'src');
   const pagesDir = path.join(src, 'pages');
   const layoutsDir = path.join(src, 'layouts');

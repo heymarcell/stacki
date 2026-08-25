@@ -21,6 +21,13 @@
 //   not decoration — and a guard that silently stops guarding looks exactly
 //   like a guard that is working.
 //
+// Since Visual Review there is a fourth: the mutation. `comment` is the only
+// tool in this server that writes anything, and the things that would be worst
+// about it are all shape rather than behaviour — an action enum that grew a
+// `delete`, an annotation claiming a create is idempotent, a `create` that
+// invented an anchor because nothing was selected. Those are checked here too;
+// the ledger underneath them is checked in review-store.js.
+//
 // What ends up inside the shipped app is checked next door, in packaging.js —
 // that is not a question about MCP.
 
@@ -43,6 +50,14 @@ const { captureRect, fitWidth } = require('../electron/mcp/captureRect.js');
 const { createCapture } = require('../electron/mcp/capture.js');
 const { createStackiMcpServer, tokenMatches, bearerOf, DEFAULT_PORT, ENDPOINT_PATH } = require('../electron/mcp/server.js');
 const { ContextOutput, CaptureOutput, INSTRUCTIONS } = require('../electron/mcp/tools.js');
+const {
+  ACTIONS: REVIEW_ACTIONS,
+  requirementProblem,
+  MUTATES,
+  READ_ONLY: REVIEW_READ_ONLY,
+} = require('../electron/mcp/reviewTools.js');
+const { createReviewStore, selectThreads, summarize, detail: reviewDetail } = require('../electron/review/store.js');
+const { anchorFrom } = require('../electron/review/anchor.js');
 const { selectionTrail, formatTrail } = require('../electron/selectionTrail.js');
 const { locateSelection } = require('../electron/astroParser.js');
 
@@ -419,9 +434,16 @@ const fakeTrail = (keys) =>
 
 {
   check('the server says what it is for', /live visual state/i.test(INSTRUCTIONS));
-  check('the server says the tools are read-only', /read-only/i.test(INSTRUCTIONS));
   check('the server says not to start another dev server', /do not start another dev server/i.test(INSTRUCTIONS));
-  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 900, `${INSTRUCTIONS.length} chars`);
+  check('the server says source is edited with normal tools', /normal\s*\n?\s*repository tools/i.test(INSTRUCTIONS) || /repository tools/i.test(INSTRUCTIONS));
+  // Visual Review's half: an agent that reads these has to come away knowing
+  // the comments exist, that focus comes first, and that resolving is
+  // something you do after looking rather than instead of looking.
+  check('the server says the review threads are there', /get_comments/.test(INSTRUCTIONS));
+  check('the server says to focus before acting', /focus/.test(INSTRUCTIONS));
+  check('the server says to verify before resolving', /verif/i.test(INSTRUCTIONS) && /[Rr]esolve/.test(INSTRUCTIONS));
+  check('the server says what deferring is for', /defer/i.test(INSTRUCTIONS));
+  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1200, `${INSTRUCTIONS.length} chars`);
 }
 
 // ── The door ────────────────────────────────────────────────────────────────
@@ -631,11 +653,73 @@ const rawPost = (hostHeader, body) =>
     }
   }
 
+  // A real ledger behind the review tools, in a temp file. Not a stub: the
+  // point of these checks is the whole path — schema, action enum, store,
+  // projection — and a fake in the middle is exactly where a mismatch would
+  // hide.
+  const reviewHome = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-mcp-reviews-'));
+  const reviewFile = path.join(reviewHome, 'reviews.json');
+  const ledger = createReviewStore({ file: reviewFile, projectPath: ROOT });
+  let livePayload = payload();
+  let focusAnswer = { anchorState: 'attached', restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true } };
+  let focusedWith = null;
+
+  const getComments = async ({ status, scope, detail: level, limit }) => {
+    const picked = selectThreads(ledger.all(), {
+      status,
+      scope,
+      limit,
+      page: { route: SNAPSHOT.page.route, file: SNAPSHOT.page.file },
+      keys: livePayload?.selection?.keys || null,
+    });
+    return {
+      ok: true,
+      revision: ledger.revision,
+      status,
+      scope,
+      total: picked.total,
+      truncated: picked.truncated,
+      reviews: picked.threads.map((t) => (level === 'full' ? reviewDetail(t, fakeTrail) : summarize(t))),
+    };
+  };
+  const comment = async (args) => {
+    if (args.action === 'focus') {
+      const thread = ledger.get(args.threadId);
+      if (!thread) return { ok: false, code: 'no_thread', message: 'No review with that id.', revision: ledger.revision, review: null };
+      focusedWith = thread.anchor;
+      if (!focusAnswer.transient) ledger.syncAnchors([{ id: args.threadId, anchorState: focusAnswer.anchorState }]);
+      return {
+        ok: focusAnswer.anchorState === 'attached',
+        code: focusAnswer.anchorState === 'attached' ? null : focusAnswer.transient ? 'not_ready' : 'orphaned',
+        restored: focusAnswer.restored,
+        note: focusAnswer.note || null,
+        revision: ledger.revision,
+        review: reviewDetail(ledger.get(args.threadId), fakeTrail),
+      };
+    }
+    if (args.action === 'create') {
+      const built = anchorFrom(livePayload);
+      if (!built.ok) {
+        return { ok: false, code: built.reason, message: 'Nothing to comment on.', revision: ledger.revision, review: null };
+      }
+      const made = ledger.apply({ action: 'create', message: args.message, authorType: 'agent', anchor: built.anchor, creationContext: built.creationContext });
+      return made.ok
+        ? { ok: true, revision: ledger.revision, review: reviewDetail(made.thread, fakeTrail), code: null, message: null }
+        : { ...made, revision: ledger.revision, review: null };
+    }
+    const done = ledger.apply({ ...args, authorType: 'agent' });
+    return done.ok
+      ? { ok: true, revision: ledger.revision, review: reviewDetail(done.thread, fakeTrail), code: null, message: null }
+      : { ...done, revision: ledger.revision, review: null };
+  };
+
   let captured = null;
   const server = createStackiMcpServer({
     port: PORT,
     token: TOKEN,
     version: '1.2.3',
+    getComments,
+    comment,
     getContext: async ({ styleDetail }) => {
       const snap = JSON.parse(JSON.stringify(SNAPSHOT));
       if (styleDetail === 'essential' || styleDetail === 'full') {
@@ -728,16 +812,36 @@ const rawPost = (hostHeader, body) =>
 
   const listed = await readBody(await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' }));
   const tools = listed.result?.tools || [];
-  check('exactly two tools are exposed', tools.length === 2, tools.map((t) => t.name).join(','));
-  check('they are get_context and capture', tools.map((t) => t.name).sort().join(',') === 'capture,get_context');
+  // Four, and no more. The pressure on a surface like this is always to add a
+  // verb — resolve_comment, reply_comment, focus_comment — and six tools that
+  // differ by one word cost a client six descriptions to use one of them.
+  check('exactly four tools are exposed', tools.length === 4, tools.map((t) => t.name).join(','));
+  check(
+    'they are the two that look and the two that review',
+    tools.map((t) => t.name).sort().join(',') === 'capture,comment,get_comments,get_context',
+    tools.map((t) => t.name).sort().join(',')
+  );
   check('nothing here can edit source', !tools.some((t) => /set_|write|edit|modify|move|change/i.test(t.name)));
+  check('nothing here can delete anything', !tools.some((t) => /delete|remove|destroy|clear/i.test(t.name)));
   for (const tool of tools) {
     const a = tool.annotations || {};
-    check(`${tool.name} is annotated read-only`, a.readOnlyHint === true && a.destructiveHint === false && a.idempotentHint === true && a.openWorldHint === false, JSON.stringify(a));
+    if (tool.name === 'comment') {
+      // The one tool that writes. Its annotations have to be true rather than
+      // tidy: a client that batches retries on the strength of an idempotent
+      // hint would leave duplicate comments on somebody's page, because
+      // `create` called twice creates twice.
+      check('comment is not annotated read-only', a.readOnlyHint === false, JSON.stringify(a));
+      check('comment is not annotated destructive — nothing it does removes anything', a.destructiveHint === false);
+      check('comment does not claim to be idempotent, because create is not', a.idempotentHint === undefined, JSON.stringify(a));
+      check('comment is closed-world — a local file and a local window', a.openWorldHint === false);
+    } else {
+      check(`${tool.name} is annotated read-only`, a.readOnlyHint === true && a.destructiveHint === false && a.idempotentHint === true && a.openWorldHint === false, JSON.stringify(a));
+    }
     check(`${tool.name} declares an input schema`, tool.inputSchema?.type === 'object');
     check(`${tool.name} declares an output schema`, tool.outputSchema?.type === 'object');
     check(`${tool.name} has a description`, typeof tool.description === 'string' && tool.description.length > 40);
   }
+  check('the annotation constants say the same thing the wire does', MUTATES.readOnlyHint === false && !('idempotentHint' in MUTATES) && REVIEW_READ_ONLY.readOnlyHint === true);
   const styleDetail = tools.find((t) => t.name === 'get_context').inputSchema.properties.styleDetail;
   check('styleDetail is an enum with a default', styleDetail.default === 'essential' && styleDetail.enum.join() === 'none,essential,full', JSON.stringify(styleDetail));
 
@@ -780,11 +884,278 @@ const rawPost = (hostHeader, body) =>
   const unknown = await readBody(await post({ jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'set_margin', arguments: {} } }));
   check('a tool nobody registered is an error, not a surprise', !!unknown.error || unknown.result?.isError === true);
 
+  // --- the review tools, over the wire --------------------------------------
+  //
+  // The full loop an agent is meant to run: list what is open, focus one so
+  // Stacki goes and looks at it, act on it, and find it has moved out of the
+  // open list and into the resolved one. Run against the real ledger, so a
+  // schema that disagrees with the store is a failure here rather than a
+  // surprise in somebody's terminal.
+
+  let rpc = 100;
+  const call = async (name, args) =>
+    readBody(await post({ jsonrpc: '2.0', id: rpc++, method: 'tools/call', params: { name, arguments: args } }));
+  const structured = (r) => r.result?.structuredContent;
+
+  {
+    const empty = structured(await call('get_comments', {}));
+    check('get_comments answers on an empty project', empty?.ok === true && empty.reviews.length === 0, JSON.stringify(empty));
+    check('and defaults to the open ones', empty.status === 'open' && empty.scope === 'project');
+
+    // No project open at all. An empty app is a status here as everywhere
+    // else — and it still has to answer in the shape the schema promises, or
+    // the client rejects its own validation and the user sees a protocol error
+    // instead of "nothing is open".
+    {
+      const closed = createStackiMcpServer({
+        port: PORT + 1,
+        token: TOKEN,
+        getContext: async () => SNAPSHOT,
+        capture: async () => ({ image: null, mimeType: null, meta: {} }),
+        getComments: async (args) => ({
+          ok: false,
+          code: 'no_project',
+          message: 'No project is open in Stacki.',
+          status: args.status,
+          scope: args.scope,
+          revision: 0,
+          total: 0,
+          truncated: false,
+          reviews: [],
+        }),
+        comment: async () => ({ ok: false, code: 'no_project', message: 'No project is open in Stacki.', revision: 0, review: null }),
+        onError: () => {},
+      });
+      await closed.start();
+      const res = await fetch(closed.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${TOKEN}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 500, method: 'tools/call', params: { name: 'get_comments', arguments: {} } }),
+      });
+      const body = await readBody(res);
+      check('with no project open the answer still validates', !/validation error/i.test(JSON.stringify(body)), JSON.stringify(body).slice(0, 200));
+      check('and says which empty state it is', body.result?.structuredContent?.code === 'no_project');
+      await closed.stop();
+    }
+
+    // create — against whatever Stacki has selected, and nothing else.
+    const made = await call('comment', { action: 'create', message: 'This pill is too tight at 375.' });
+    const first = structured(made);
+    check('comment create makes a review', first?.ok === true, JSON.stringify(first).slice(0, 300));
+    check('and answers with it in full', !!first.review?.id && first.review.messages.length === 1);
+    check('the agent is recorded as the author', first.review.messages[0].authorType === 'agent');
+    check('it starts open and attached', first.review.status === 'open' && first.review.anchorState === 'attached');
+    check('it is anchored to the live selection', first.review.anchor.keys.join() === 'src/pages/index.astro#0.1', JSON.stringify(first.review.anchor.keys));
+    check('it kept the breakpoint it was written at', first.review.anchor.breakpoint.device === 'desktop');
+    check('it kept which copy', first.review.occurrence === 0 && first.review.occurrenceCount === 1, JSON.stringify(first.review).slice(0, 200));
+    check('a full answer resolves the anchor to current lines', first.review.anchor.sourceTrail?.[0]?.startLine === 4);
+    const A = first.review.id;
+
+    // A review that cannot be anchored is a status, not a fabrication.
+    livePayload = payload({ selection: { present: false } });
+    const nothing = await call('comment', { action: 'create', message: 'about what?' });
+    check('create with nothing selected refuses', structured(nothing)?.ok === false, JSON.stringify(structured(nothing)));
+    check('and says which empty state it was', structured(nothing).code === 'no_selection', structured(nothing).code);
+    check('and the client is told it did not happen', nothing.result?.isError === true);
+    check('no floating review was created', ledger.size === 1, String(ledger.size));
+    livePayload = payload();
+
+    // The requirements each action has, checked before anything is applied.
+    check('create with no message refuses', structured(await call('comment', { action: 'create' }))?.code === 'no_message');
+    check('reply with no thread refuses', structured(await call('comment', { action: 'reply', message: 'x' }))?.code === 'no_thread_id');
+    check('reply with no message refuses', structured(await call('comment', { action: 'reply', threadId: A }))?.code === 'no_message');
+    check('resolve with no thread refuses', structured(await call('comment', { action: 'resolve' }))?.code === 'no_thread_id');
+    check('focus with no thread refuses', structured(await call('comment', { action: 'focus' }))?.code === 'no_thread_id');
+    check('create with a threadId refuses — it comments on the selection', structured(await call('comment', { action: 'create', message: 'x', threadId: A }))?.code === 'unexpected_thread_id');
+    check('an unknown review is a named refusal', structured(await call('comment', { action: 'reply', threadId: 'rt_nope', message: 'x' }))?.code === 'no_thread');
+    check('the requirement table is the same one the schema documents', requirementProblem({ action: 'reply', threadId: 'x', message: 'y' }) === null);
+
+    // The actions that are deliberately not there.
+    for (const gone of ['delete', 'remove', 'assign', 'close', 'approve']) {
+      const refused = await call('comment', { action: gone, threadId: A });
+      check(`"${gone}" is not an action the schema accepts`, refused.result?.isError === true, JSON.stringify(refused).slice(0, 160));
+    }
+    check('the action list is exactly the six', REVIEW_ACTIONS.join() === 'create,reply,focus,resolve,defer,reopen', REVIEW_ACTIONS.join());
+    check('and delete is not among them', !REVIEW_ACTIONS.includes('delete'));
+    check('the review survived every refusal', ledger.get(A).status === 'open' && ledger.size === 1);
+
+    // focus — the operation the loop stands on.
+    focusedWith = null;
+    const focused = structured(await call('comment', { action: 'focus', threadId: A }));
+    check('focus answers', focused?.ok === true, JSON.stringify(focused).slice(0, 300));
+    check('and sends Stacki to the review\\u2019s own anchor', focusedWith?.keys?.join() === 'src/pages/index.astro#0.1');
+    check('and says what it managed to restore', focused.restored?.page === true && focused.restored?.node === true);
+    check('and changes nothing about the review', focused.review.status === 'open' && focused.review.messages.length === 1);
+
+    // An orphan focus degrades honestly rather than selecting something near.
+    focusAnswer = {
+      anchorState: 'orphaned',
+      restored: { page: true, breakpoint: true, component: false, node: false, occurrence: false },
+      note: 'The page is open, but the component this review was written inside is no longer there.',
+    };
+    const lost = structured(await call('comment', { action: 'focus', threadId: A }));
+    check('focusing an orphan does not report success', lost?.ok === false, JSON.stringify(lost).slice(0, 200));
+    check('it says which rung it got to', lost.restored.page === true && lost.restored.node === false);
+    check('it says so in words as well', /no longer there/.test(lost.note || ''), lost.note);
+    check('and the review is marked orphaned rather than hidden', lost.review.anchorState === 'orphaned' && lost.review.status === 'open');
+    check('an orphan still carries what it was about', lost.review.creationContext.text === 'Hello world', JSON.stringify(lost.review.creationContext).slice(0, 200));
+    // Put it back to attached first — the orphan check above left it lost.
+    focusAnswer = { anchorState: 'attached', restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true } };
+    await call('comment', { action: 'focus', threadId: A });
+
+    // A preview that has not finished starting is not an orphan. Reporting it
+    // as one would have an agent give up on a review that was about to work —
+    // and, worse, would write that verdict onto somebody's comment.
+    focusAnswer = {
+      anchorState: 'orphaned',
+      transient: true,
+      restored: { page: true, breakpoint: false, component: false, node: false, occurrence: false },
+      note: 'The Stacki preview is not rendering yet.',
+    };
+    const notReady = structured(await call('comment', { action: 'focus', threadId: A }));
+    check('a focus that failed for timing is not called orphaned', notReady.code === 'not_ready', notReady.code);
+    check('and the review is left exactly as it was', ledger.get(A).anchorState === 'attached', ledger.get(A).anchorState);
+
+    focusAnswer = { anchorState: 'attached', restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true } };
+    await call('comment', { action: 'focus', threadId: A });
+
+    // reply, and then the loop's happy ending.
+    const replied = structured(await call('comment', { action: 'reply', threadId: A, message: 'Reduced the horizontal padding to 12px.' }));
+    check('reply adds to the thread', replied.review.messages.length === 2);
+    check('and leaves it open', replied.review.status === 'open');
+
+    const resolved = structured(await call('comment', { action: 'resolve', threadId: A, message: 'Implemented and visually verified.' }));
+    check('resolve closes it', resolved.review.status === 'resolved');
+    check('and keeps the closing note', resolved.review.messages[2].body === 'Implemented and visually verified.');
+
+    const stillOpen = structured(await call('get_comments', { status: 'open' }));
+    check('a resolved review is no longer open', !stillOpen.reviews.some((r) => r.id === A), JSON.stringify(stillOpen.reviews));
+    const asResolved = structured(await call('get_comments', { status: 'resolved' }));
+    check('and is in the resolved list', asResolved.reviews.some((r) => r.id === A));
+    check('the summary says what state it is in', asResolved.reviews[0].status === 'resolved' && asResolved.reviews[0].anchorState === 'attached');
+
+    // reopen — the only way back.
+    const back = structured(await call('comment', { action: 'reopen', threadId: A, message: 'Still wrong on a small phone.' }));
+    check('reopen puts it back to open', back.review.status === 'open');
+    check('and keeps everything said before', back.review.messages.length === 4);
+
+    // defer, with a reason and a reference the agent got from its own tooling.
+    const second = structured(await call('comment', { action: 'create', message: 'The card grid needs rethinking below 400px.' }));
+    const B = second.review.id;
+    const deferred = structured(
+      await call('comment', {
+        action: 'defer',
+        threadId: B,
+        reason: 'Needs a product decision between two and one column.',
+        externalRef: 'https://github.com/example/repo/issues/418',
+      })
+    );
+    check('defer sets the state', deferred.review.status === 'deferred');
+    check('and keeps the reason', /product decision/.test(deferred.review.deferredReason || ''));
+    check('and keeps the reference as plain text', deferred.review.externalRefs[0].endsWith('/418'));
+    // An external reference is a string Stacki stores and nothing else: no
+    // request, no client, no credentials. Checked against the source rather
+    // than by watching the network, because the failure to catch is somebody
+    // adding a "just validate the URL" fetch later.
+    const reviewSource = ['electron/mcp/reviewTools.js', 'electron/review/store.js', 'electron/review/index.js', 'electron/review/anchor.js']
+      .map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8'))
+      .join('\n');
+    check('nothing in Visual Review makes a request', !/\bfetch\s*\(|https?\.request|XMLHttpRequest|axios/.test(reviewSource));
+    check('nor requires a network client', !/require\('node:https'\)|require\('https'\)|require\('node:http'\)/.test(reviewSource));
+    check('nor has GitHub credentials anywhere near it', !/octokit|api\.github\.com|GITHUB_TOKEN|gh auth/i.test(reviewSource));
+    check('nor runs anything', !/child_process|execFile|spawn\(/.test(reviewSource));
+    const asDeferred = structured(await call('get_comments', { status: 'deferred' }));
+    check('a deferred review is in the deferred list', asDeferred.reviews.map((r) => r.id).join() === B);
+    check('and out of the open one', !structured(await call('get_comments', { status: 'open' })).reviews.some((r) => r.id === B));
+    check('all is all of them', structured(await call('get_comments', { status: 'all' })).reviews.length === 2);
+
+    // Scope.
+    check('project scope is everything', structured(await call('get_comments', { status: 'all', scope: 'project' })).reviews.length === 2);
+    check('page scope is the page on screen', structured(await call('get_comments', { status: 'all', scope: 'page' })).reviews.length === 2);
+    check(
+      'selection scope is the element selected',
+      structured(await call('get_comments', { status: 'all', scope: 'selection' })).reviews.length === 2
+    );
+    livePayload = payload({ selection: { keys: ['src/pages/index.astro#9.9'] } });
+    check(
+      'and nothing when something else is selected',
+      structured(await call('get_comments', { status: 'all', scope: 'selection' })).reviews.length === 0
+    );
+    livePayload = payload();
+
+    // Detail — the default has to stay small enough to survey a project with.
+    const summaryList = structured(await call('get_comments', { status: 'all' }));
+    const row = summaryList.reviews[0];
+    check('a summary carries no messages', !('messages' in row), Object.keys(row).join());
+    check('a summary carries no creation snapshot', !('creationContext' in row));
+    check('a summary still says everything needed to choose', !!row.id && !!row.status && !!row.message && !!row.page);
+    check('a summary carries the short number the user sees', Number.isInteger(row.number), JSON.stringify(row));
+    check('a summary row stays small', JSON.stringify(row).length < 600, `${JSON.stringify(row).length} chars`);
+    const fullList = structured(await call('get_comments', { status: 'all', detail: 'full' }));
+    check('a full read carries the messages', fullList.reviews[0].messages.length > 0);
+    check('and the anchor', fullList.reviews[0].anchor.keys.length > 0);
+    check('and the creation snapshot', !!fullList.reviews[0].creationContext);
+    check('and the user\u2019s own colour, which is filing rather than state', typeof fullList.reviews[0].color === 'string');
+    check('but no way for an agent to change it', !REVIEW_ACTIONS.some((a) => /colou?r/i.test(a)));
+
+    // Bounds, so one pathological review cannot cost an agent its context.
+    const huge = 'x'.repeat(9000);
+    check('a body past the schema limit is rejected at the door', (await call('comment', { action: 'create', message: huge })).result?.isError === true);
+    check('a limit outside the range is rejected', (await call('get_comments', { limit: 5000 })).result?.isError === true);
+    check('a status nobody defined is rejected', (await call('get_comments', { status: 'todo' })).result?.isError === true);
+    check('a scope nobody defined is rejected', (await call('get_comments', { scope: 'everything' })).result?.isError === true);
+    const limited = structured(await call('get_comments', { status: 'all', limit: 1 }));
+    check('a limit is obeyed', limited.reviews.length === 1);
+    check('and says the list was cut', limited.truncated === true && limited.total === 2);
+
+    // The review tools must not have changed what the other two answer.
+    const after = structured(await call('get_context', {}));
+    check('get_context is untouched by any of this', after.selection.tag === 'section' && after.selection.status === 'ready');
+    const stillShoots = await call('capture', {});
+    check('capture is untouched too', stillShoots.result?.content?.some((c) => c.type === 'image'));
+
+    // Reviews are local state, and the door in front of them is the same door.
+    const noToken = await fetch(server.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 900, method: 'tools/call', params: { name: 'get_comments', arguments: {} } }),
+    });
+    check('reading somebody\\u2019s reviews still needs the token', noToken.status === 401, String(noToken.status));
+    const badOrigin = await post(
+      { jsonrpc: '2.0', id: 901, method: 'tools/call', params: { name: 'comment', arguments: { action: 'create', message: 'from a web page' } } },
+      { origin: 'http://evil.example' }
+    );
+    check('a web page cannot write into them', badOrigin.status === 403, String(badOrigin.status));
+    check('a rebinding Host cannot either', (await rawPost('evil.example', { jsonrpc: '2.0', id: 902, method: 'tools/call', params: { name: 'get_comments', arguments: {} } })) === 403);
+    check('and none of that created anything', ledger.size === 2, String(ledger.size));
+
+    // "#1" is what a person reads off a pin and types at an agent. An agent
+    // that could only take the uuid would send them to look it up. Left until
+    // last, because it adds messages and the counts above are the point of
+    // several checks.
+    const numbered = structured(await call('get_comments', { status: 'all' })).reviews[0];
+    check('every review has a short number', Number.isInteger(numbered.number) && numbered.number > 0, JSON.stringify(numbered.number));
+    check('a review answers to its number', structured(await call('comment', { action: 'reply', threadId: `#${numbered.number}`, message: 'by number' }))?.ok === true);
+    check('with or without the hash', structured(await call('comment', { action: 'reply', threadId: String(numbered.number), message: 'bare number' }))?.ok === true);
+    check('and a number nobody has is still a named refusal', structured(await call('comment', { action: 'reply', threadId: '#9999', message: 'x' }))?.code === 'no_thread');
+    check('the numbers are distinct', new Set(structured(await call('get_comments', { status: 'all' })).reviews.map((r) => r.number)).size === 2);
+    check('and the schema says the tool takes one', /short number/.test(tools.find((t) => t.name === 'comment').inputSchema.properties.threadId.description));
+  }
+
+  await ledger.flush();
+  check('everything the agent did is on disk', JSON.parse(fs.readFileSync(reviewFile, 'utf8')).threads.length === 2);
+  check('and it is not in the project', !reviewFile.startsWith(ROOT));
+  try {
+    fs.rmSync(reviewHome, { recursive: true, force: true });
+  } catch {
+    /* a leftover temp folder is not a test failure */
+  }
+
   // --- the port ---
   await server.stop();
   check('stop() stops listening', server.listening === false);
 
-  const again = createStackiMcpServer({ port: PORT, token: TOKEN, getContext: async () => SNAPSHOT, capture: async () => ({ image: null, mimeType: null, meta: {} }), onError: () => {} });
+  const again = createStackiMcpServer({ port: PORT, token: TOKEN, getContext: async () => SNAPSHOT, capture: async () => ({ image: null, mimeType: null, meta: {} }), getComments, comment, onError: () => {} });
   await again.start();
   check('the port is free again straight after a stop', again.listening === true);
   await again.stop();
@@ -793,7 +1164,7 @@ const rawPost = (hostHeader, body) =>
   await new Promise((r) => squatter.listen(PORT, '127.0.0.1', r));
   let portError = null;
   try {
-    await createStackiMcpServer({ port: PORT, token: TOKEN, getContext: async () => SNAPSHOT, capture: async () => ({}), onError: () => {} }).start();
+    await createStackiMcpServer({ port: PORT, token: TOKEN, getContext: async () => SNAPSHOT, capture: async () => ({}), getComments, comment, onError: () => {} }).start();
   } catch (err) {
     portError = err;
   }
@@ -804,7 +1175,7 @@ const rawPost = (hostHeader, body) =>
 
   check('a server with no token refuses to exist', (() => {
     try {
-      createStackiMcpServer({ port: PORT, getContext: async () => ({}), capture: async () => ({}) });
+      createStackiMcpServer({ port: PORT, getContext: async () => ({}), capture: async () => ({}), getComments, comment });
       return false;
     } catch {
       return true;
@@ -813,6 +1184,17 @@ const rawPost = (hostHeader, body) =>
   check('a server with no tools refuses to exist', (() => {
     try {
       createStackiMcpServer({ port: PORT, token: TOKEN });
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+  // Half a surface is worse than none: a Stacki that answered get_context but
+  // not get_comments would be a client configuration problem nobody could
+  // diagnose from the outside.
+  check('a server with no review tools refuses to exist', (() => {
+    try {
+      createStackiMcpServer({ port: PORT, token: TOKEN, getContext: async () => ({}), capture: async () => ({}) });
       return false;
     } catch {
       return true;

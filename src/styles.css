@@ -5668,3 +5668,440 @@ textarea::selection {
   box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
 }
 .term-scroll-btn:hover:not(:disabled) { background: var(--bg-active); color: var(--text); }
+
+/* ------------------------------------------------------------------ */
+/* Visual Review — comments on the rendered page                       */
+/*                                                                     */
+/* All of this is editor chrome drawn OVER the canvas, never inside the */
+/* previewed page. PreviewPane takes it off for a screenshot the same   */
+/* way it takes the outlines off: a picture of the site with comment    */
+/* markers on it is a picture of Stacki.                               */
+/* ------------------------------------------------------------------ */
+
+/* Comment mode: the canvas says what a click will do now. */
+.frame-clip.commenting { cursor: crosshair; }
+.frame-clip.commenting::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
+}
+
+/* --- colour, and what it is NOT ------------------------------------ */
+/*
+   Colour is the person's own filing: it groups their notes and says nothing
+   about state. STATE is the shape — filled is open, hollow is deferred, a
+   dashed ring is an anchor Stacki can no longer find, a faint grey ring is
+   done. Keeping them apart is what lets a marker answer "is this finished"
+   at a glance without a legend, while still letting somebody colour a page's
+   worth of notes however they like.
+*/
+.c-blue { --pin: #0099ff; }
+.c-violet { --pin: #a855f7; }
+.c-teal { --pin: #14b8a6; }
+.c-green { --pin: #22c55e; }
+.c-amber { --pin: #f59e0b; }
+.c-rose { --pin: #f43f5e; }
+
+.review-palette { display: flex; gap: 6px; padding: 2px 0 2px; }
+.review-swatch {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  min-width: 0;
+  border-radius: 8px;
+  background: var(--pin);
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.review-swatch:hover:not(:disabled) { background: var(--pin); transform: scale(1.12); }
+.review-swatch.on { border-color: var(--text); }
+/* The dot is the handle for changing its own colour. */
+.review-dot-btn { padding: 2px; background: none; border-radius: 50%; flex-shrink: 0; }
+.review-dot-btn:hover:not(:disabled) { background: var(--bg-hover); }
+
+/* --- the pin ------------------------------------------------------- */
+
+.review-pin {
+  position: absolute;
+  z-index: 7;
+  overflow: visible;
+  /* The point is the tip, so the marker hangs off it rather than sitting
+     centred on it — a comment left on the top edge of a section should not
+     cover the line above it. */
+  transform: translate(-4px, -100%);
+  /* Grows with the number and nothing else: #7, #42 and #128 are all real
+     names and all have to be readable, but a marker that also carried a
+     cluster count inline got wide enough to cover the thing it points at. */
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
+  border: 1.5px solid #fff;
+  border-radius: 11px 11px 11px 3px;
+  background: var(--pin, var(--accent));
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  transition: transform 0.08s ease;
+}
+.review-pin:hover:not(:disabled) {
+  background: var(--pin, var(--accent));
+  transform: translate(-4px, -100%) scale(1.12);
+  filter: brightness(1.15);
+}
+/* Deliberately not being done now: hollow, in the same colour. Shape carries
+   the state so the colour can stay the person's own. */
+.review-pin.is-deferred {
+  background: var(--bg-panel-2);
+  color: var(--pin, var(--accent));
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px var(--pin, var(--accent));
+}
+.review-pin.is-deferred:hover:not(:disabled) { background: var(--bg-panel-2); }
+.review-pin.open { outline: 2px solid var(--pin, var(--accent)); outline-offset: 2px; }
+/* How many more are underneath — a badge in the corner rather than more
+   characters in the label, so a cluster is no wider than its number. */
+.review-pin-more {
+  position: absolute;
+  top: -6px;
+  right: -7px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: #1a1a1a;
+  color: #fff;
+  border: 1.5px solid #fff;
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* --- the box you type into, and the thread you open ---------------- */
+
+/* Fixed, not absolute: these are drawn in the window rather than in the
+   preview frame, so a comment near the edge of a 375px phone canvas still
+   opens a panel you can read instead of one the frame cuts in half. */
+.review-composer,
+.review-popover {
+  position: fixed;
+  z-index: 60;
+  width: 288px;
+  max-height: 70%;
+  overflow-y: auto;
+  /* Hanging off the point, clear of the pin that marks it. A box drawn over
+     its own marker hides the thing it is about. */
+  transform: translate(14px, 8px);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  padding: 10px;
+  cursor: default;
+}
+/* Near an edge of the WINDOW it opens inwards. */
+.review-composer.flip-x,
+.review-popover.flip-x { transform: translate(calc(-100% - 14px), 8px); }
+.review-composer.flip-y,
+.review-popover.flip-y { transform: translate(14px, calc(-100% - 8px)); }
+.review-composer.flip-x.flip-y,
+.review-popover.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 8px)); }
+.review-composer form { display: flex; flex-direction: column; gap: 8px; }
+/* The header is a handle: a comment opens on top of the thing it is about,
+   which is exactly where you cannot see it from. The PIN never moves — it is
+   the anchor — and the offset is forgotten when the thread closes. */
+.review-drag,
+.review-popover .review-thread-head { cursor: grab; user-select: none; }
+.review-drag:active,
+.review-popover .review-thread-head:active { cursor: grabbing; }
+.review-popover .review-thread-head button,
+.review-drag code { cursor: default; }
+.review-popover .review-thread-head .review-x { cursor: pointer; }
+/* Once moved, it is a panel rather than a bubble pointing at something. */
+.review-composer.moved,
+.review-popover.moved { box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55); }
+.review-composer-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.review-composer-target code {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.review-composer-target .dim { color: var(--text-faint); }
+.review-hint { font-size: 10px; color: var(--text-faint); margin-right: auto; }
+
+/* --- a thread, wherever it is read --------------------------------- */
+
+.review-thread { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.review-thread-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The name a person says out loud. Tabular so a column of them lines up. */
+.review-number {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.review-where {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-x { padding: 3px; background: none; color: var(--text-faint); flex-shrink: 0; border-radius: 4px; }
+.review-x:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); }
+/* Deleting is somebody's decision, not a thing to be nudged towards: muted
+   until it is being reached for. */
+.review-trash:hover:not(:disabled) { color: var(--red); }
+
+.review-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 5px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  background: var(--pin, var(--accent));
+  border: 1.5px solid transparent;
+}
+/* Hollow: valid, deliberately not now. */
+.review-dot.is-deferred { background: transparent; border-color: var(--pin, var(--accent)); }
+/* Done is done — a decision was reached, and that is a state rather than a
+   grouping, so it drops the colour. */
+.review-dot.is-resolved { background: transparent; border-color: var(--text-faint); }
+/* An anchor that no longer resolves is not a status — it is drawn on top of
+   whichever status the review is in, dashed, because it is not a decision
+   anybody made. */
+.review-dot.orphaned { background: transparent; border-style: dashed; border-color: var(--red); }
+
+.review-orphan {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(255, 69, 58, 0.1);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.review-orphan svg { color: var(--red); margin-top: 1px; flex-shrink: 0; }
+.review-orphan strong { color: var(--text); font-weight: 600; }
+
+.review-target {
+  display: flex;
+  align-items: baseline;
+  /* Stated, because the app's base button rule centres its contents — which
+     pushed the tag chip into the middle of the row and made the whole thing
+     read as a caption rather than as "this is what you commented on". */
+  justify-content: flex-start;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  min-width: 0;
+  width: 100%;
+  text-align: left;
+  padding: 5px 7px;
+  border-radius: 5px;
+  background: var(--bg-hover);
+}
+/* The line that says where it is, is also the way back to it. */
+.review-target.can-go { cursor: pointer; }
+.review-target.can-go:hover:not(:disabled) { background: var(--bg-active); color: var(--text-dim); }
+.review-target code {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--component-green);
+  flex-shrink: 0;
+}
+.review-target-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A thread is a conversation, and two messages that run together read as one
+   long one — especially when both are "You". Each gets a rule down its side in
+   its author's colour, so where one ends and the next begins is a shape rather
+   than a line of small grey text. */
+.review-messages { display: flex; flex-direction: column; gap: 12px; }
+.review-msg {
+  padding-left: 9px;
+  border-left: 2px solid var(--accent);
+  border-radius: 1px;
+}
+.review-msg.is-agent { border-left-color: var(--component-green); }
+.review-msg-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 3px; }
+.review-author {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.review-msg.is-agent .review-author { color: var(--component-green); }
+.review-time { font-size: 10px; color: var(--text-faint); }
+.review-body { color: var(--text); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.review-note {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: 6px;
+  padding: 6px 8px;
+  line-height: 1.4;
+}
+.review-note svg { color: var(--amber); margin-top: 1px; flex-shrink: 0; }
+.review-ref span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
+
+/* Set apart from the conversation above it: a box you type into should not
+   look like the next message in the thread. */
+.review-reply {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.review-defer { display: flex; flex-direction: column; gap: 6px; }
+/* One line, always. Three narrow buttons that wrap read as a broken panel,
+   and the panel is only 260px wide. */
+.review-actions { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+.review-actions .spacer { flex: 1; min-width: 0; }
+.review-actions button { font-size: 11px; padding: 4px 9px; white-space: nowrap; flex-shrink: 0; gap: 4px; }
+
+/* --- the panel ----------------------------------------------------- */
+
+.comments-head-actions { display: flex; gap: 2px; }
+.comments-head-actions .icon-btn {
+  padding: 4px;
+  background: none;
+  color: var(--text-faint);
+  border-radius: 5px;
+}
+.comments-head-actions .icon-btn.on { color: var(--accent); background: var(--accent-soft); }
+
+.comments-filters { padding: 0 8px 8px; display: flex; flex-direction: column; gap: 6px; }
+.comments-filters .seg {
+  display: flex;
+  background: var(--bg-input);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+.comments-filters .seg button {
+  flex: 1;
+  padding: 3px 4px;
+  font-size: 10.5px;
+  background: none;
+  color: var(--text-dim);
+  border-radius: 4px;
+}
+.comments-filters .seg button.on { background: var(--bg-active); color: var(--text); }
+
+.comments-problem {
+  margin: 0 8px 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(255, 214, 10, 0.1);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.comments-row {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.comments-row:hover:not(:disabled) { background: var(--bg-hover); }
+.comments-row .review-dot { margin-top: 5px; }
+.comments-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+/* Where it is and what it is called go ABOVE the words. Underneath, they read
+   as part of the comment; above, they read as its label. */
+.comments-row-top { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.comments-row-top .spacer { flex: 1; min-width: 4px; }
+.comments-row-top svg { color: var(--red); flex-shrink: 0; }
+.comments-excerpt {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.comments-count {
+  font-size: 9.5px;
+  color: var(--text-dim);
+  background: var(--bg-active);
+  border-radius: 7px;
+  padding: 1px 5px;
+}
+.comments-age { font-size: 10px; color: var(--text-faint); }
+
+.comments-open {
+  padding: 10px;
+  margin: 4px 0;
+  border-radius: 8px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+}
+
+.comments-empty { padding: 24px 12px; text-align: center; color: var(--text-dim); }
+.comments-empty svg { margin: 0 auto 8px; color: var(--text-faint); }
+.comments-empty p { margin: 0 0 6px; font-size: 12px; }
+.comments-empty .dim { color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+.comments-empty kbd {
+  font-family: var(--mono);
+  font-size: 10px;
+  background: var(--bg-active);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.comments-hidden-note {
+  margin-top: 10px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-hover);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.45;
+}

@@ -7,6 +7,7 @@ import {
   CmsIcon,
   VariableIcon,
   HistoryIcon,
+  ReviewIcon,
 } from './Icons.jsx';
 
 const TABS = [
@@ -17,6 +18,12 @@ const TABS = [
   { id: 'cms', title: 'CMS', shortcut: '⌥C', Icon: CmsIcon },
   { id: 'variables', title: 'Variables', shortcut: '⌥V', Icon: VariableIcon },
   { id: 'history', title: 'History', shortcut: '⌥H', Icon: HistoryIcon },
+  // C is comment mode rather than a panel toggle — but entering comment mode
+  // opens this panel, so the letter on the tooltip is true either way. The key
+  // itself is handled in App beside the rest of Visual Review; binding it here
+  // as well would toggle the panel shut on the second press while the mode was
+  // still on.
+  { id: 'comments', title: 'Comments', shortcut: 'C', Icon: ReviewIcon },
 ];
 
 const TOOLTIP_DELAY = 500;
