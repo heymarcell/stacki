@@ -4363,8 +4363,15 @@ export default function App() {
       }
       pushHistory(null); // its own step: a source rewrite is not a typing burst
       docRevRef.current += 1;
+      // Re-select the node at the same position, the way the file watcher does
+      // after somebody edits the open file elsewhere. A reparse invents fresh
+      // ids, so the old selection means nothing — but the POSITION still does,
+      // and dropping the selection leaves the person looking at a canvas with
+      // nothing chosen for a change they may not even have made.
+      const trail = state.editable && selectedIdRef.current ? pathOfNode(state.model.nodes, selectedIdRef.current) : null;
+      const landed = trail ? nodeAtPath(parsed.model?.nodes || [], trail)?.id ?? null : null;
       setPageState((s) => (s ? { ...s, ...parsed, file: page.path, dirty: true } : s));
-      setSelectedId(null);
+      setSelectedId(landed);
       await new Promise((done) => setTimeout(done, 0));
       await flushSave();
       return { ok: true, editable: true, undoable: true, restored: before.kind };
