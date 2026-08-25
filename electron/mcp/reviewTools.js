@@ -41,7 +41,30 @@ const MAX_REF = 500;
 const MAX_LIMIT = 200;
 
 const Status = z.enum(['open', 'resolved', 'deferred']);
-const AnchorState = z.enum(['attached', 'orphaned']);
+// `unknown` is what a review that arrived from another person's Stacki looks
+// like until something here has actually looked for its element. It is never
+// `attached` on somebody else's word — that would be a pin drawn on markup
+// this checkout may not even have.
+const AnchorState = z.enum(['attached', 'orphaned', 'unknown']);
+const ActorKind = z.enum(['human', 'agent']);
+
+/** Who said something. A uuid is the identity; the name is presentation. */
+const Actor = z.object({
+  actorId: nullableString,
+  actorKind: ActorKind,
+  // As it read when they wrote it — carried on the event, so a thread is
+  // readable on a machine that has never heard of the person who wrote it.
+  actorName: nullableString,
+});
+
+/** Where the source stood at some moment. Every field degrades to null. */
+const SourceStamp = z.object({
+  // Historical evidence, NOT identity: a squash, a rebase or a gc can make it
+  // unreachable, and nothing about reading a review may depend on it.
+  head: nullableString,
+  branch: nullableString,
+  dirty: z.boolean().nullable(),
+});
 
 const Summary = z.object({
   id: z.string(),
@@ -55,7 +78,10 @@ const Summary = z.object({
   anchorState: AnchorState,
   message: z.string(),
   replies: z.number().int(),
-  lastAuthor: z.enum(['human', 'agent']),
+  lastAuthor: ActorKind,
+  // Who left it. On a shared thread this is the difference between "your
+  // comment" and "Alice's comment".
+  author: Actor,
   page: nullableString,
   breakpoint: nullableString,
   source: nullableString,
@@ -71,7 +97,11 @@ const Full = Summary.extend({
   messages: z.array(
     z.object({
       id: z.string(),
-      authorType: z.enum(['human', 'agent']),
+      authorType: ActorKind,
+      // Who wrote this one. `authorType` is the same fact narrowed to
+      // human-or-agent, kept because everything already reads it.
+      actorId: nullableString,
+      actorName: nullableString,
       body: z.string(),
       createdAt: z.number().int(),
       // When a person rewrote their own words, if they did. Null otherwise.
@@ -107,6 +137,45 @@ const Full = Summary.extend({
     sourceTrail: z.array(SourceRef).nullable(),
   }),
   creationContext: z.looseObject({}),
+  // What the source looked like when the review was written. Null for every
+  // review from before this was recorded — never guessed at afterwards.
+  provenance: z
+    .object({
+      head: nullableString,
+      branch: nullableString,
+      dirty: z.boolean().nullable(),
+      // Project-relative file -> digest of its bytes at the time. The durable
+      // half of provenance: it needs no repository and survives a rebase.
+      files: z.record(z.string(), z.string()),
+    })
+    .nullable(),
+  // Where the source stood when somebody called it done, and who did. Both
+  // null unless the review is resolved right now.
+  resolvedAtSource: SourceStamp.nullable(),
+  resolvedBy: Actor.nullable(),
+  // How the review stands against THIS working copy — a different question
+  // from what the review says. This is what stops a shared "resolved" being
+  // read as "fixed on your screen".
+  checkout: z
+    .object({
+      branch: nullableString,
+      head: nullableString,
+      dirty: z.boolean().nullable(),
+      origin: SourceStamp.nullable(),
+      // Null when either side is unknown: "written somewhere else" and
+      // "nobody recorded where" are different things.
+      sameBranch: z.boolean().nullable(),
+      // present | behind | unknown — whether the commit the review was WRITTEN
+      // on is in this checkout's history. Null when it recorded no commit.
+      originIn: nullableString,
+      // same | changed | missing | unknown — the recorded file digests
+      // against the files that are here now.
+      source: z.string(),
+      // present | behind | unknown — whether the resolution's revision is in
+      // this checkout's history. Null while the review is not resolved.
+      resolution: nullableString,
+    })
+    .nullable(),
 });
 
 const Review = z.union([Full, Summary]);
@@ -128,6 +197,33 @@ const CommentsOutput = z.object({
   // unusable from a real MCP client while every local test passed.
   problem: z
     .object({ kind: z.string(), detail: z.string().nullable().optional(), movedTo: z.string().nullable().optional() })
+    .nullable()
+    .optional(),
+  // Whether this project's comments are shared with anybody, and how the last
+  // catch-up went. Always present; `enabled: false` is an ordinary project.
+  shared: z
+    .object({
+      enabled: z.boolean(),
+      workspace: z
+        .object({
+          id: z.string(),
+          server: nullableString,
+          displayName: nullableString,
+          actorId: nullableString,
+          repositoryHint: nullableString,
+          joinedAt: z.number().int().nullable(),
+        })
+        .nullable(),
+      lastSyncAt: z.number().int().nullable(),
+      problem: z.object({ kind: z.string(), detail: nullableString }).nullable(),
+      // Written here and not yet sent. The honest measure of "am I caught up".
+      pending: z.number().int(),
+      // Threads deliberately kept off the workspace.
+      private: z.number().int(),
+      syncing: z.boolean(),
+      identity: z.object({ actorId: z.string(), displayName: z.string() }).nullable(),
+      suggestion: z.looseObject({}).nullable(),
+    })
     .nullable()
     .optional(),
   code: z.string().nullable().optional(),
@@ -219,7 +315,7 @@ function requirementProblem({ action, threadId, message }) {
  * passed in for the same reason the other two are: this file describes the
  * surface and nothing else.
  */
-function registerReviewTools(server, { getComments, comment }) {
+function registerReviewTools(server, { getComments, comment, clientName = null }) {
   server.registerTool(
     'get_comments',
     {
@@ -229,9 +325,18 @@ function registerReviewTools(server, { getComments, comment }) {
         'rendered page. Each one is anchored to a source-backed element, at the breakpoint it was written at. ' +
         'Read this when asked to work through comments/feedback/review notes. ' +
         'Each has a short number, which is what the user sees on the pin and what they will call it — "fix #3". ' +
-        'anchorState "orphaned" means Stacki can no longer find that element in the current source; the review is ' +
-        'still readable and its creationContext says what it was about. ' +
-        'Use detail "summary" (the default) to survey, "full" for the messages and anchor of ones you will act on.',
+        'anchorState "orphaned" means Stacki can no longer find that element in the current source; "unknown" means ' +
+        'nothing has looked yet (usually a review that arrived from another person). The review is still readable ' +
+        'either way and its creationContext says what it was about. ' +
+        'Comments may be SHARED with other people: `author` says who wrote each one, and messages carry actorName. ' +
+        'A shared review describes source that may not be the source you have. In detail "full", `provenance` says ' +
+        'what the tree looked like when it was written and `checkout` says how that compares with the working copy ' +
+        'you are in — checkout.source "missing" or checkout.sameBranch false means the review may be about markup ' +
+        'that is not in front of you, and checkout.resolution "behind" means somebody resolved it on a revision ' +
+        'this checkout does not contain, so the fix is NOT here. Never treat status "resolved" as proof the code ' +
+        'in front of you is fixed. ' +
+        'Use detail "summary" (the default) to survey, "full" for the messages, anchor, provenance and checkout ' +
+        'state of ones you will act on.',
       inputSchema: z.object({
         status: Status.or(z.literal('all'))
           .default('open')
@@ -293,9 +398,13 @@ function registerReviewTools(server, { getComments, comment }) {
         'resolve — a decision was reached (implemented and visually verified, or keeping it as it is). ' +
         'defer — valid, but not being done now: give a reason, and an externalRef if you tracked it elsewhere. ' +
         'reopen — put a resolved or deferred review back to open. ' +
-        'This writes only to Stacki\'s own local review file and moves Stacki\'s view. It does not edit project ' +
-        'source, run commands or reach the network — make code changes with your normal repository tools. ' +
-        'Reviews cannot be deleted here: resolve one with your reasoning instead.',
+        'This writes only to Stacki\'s own review ledger and moves Stacki\'s view. It does not edit project ' +
+        'source, run commands, or manage sharing — make code changes with your normal repository tools. ' +
+        'When the project shares its comments, what you write here is synchronised to the other people in the ' +
+        'workspace, signed with your agent name; resolving records the revision the source was on, so somebody ' +
+        'whose checkout predates it is told rather than shown a tick. ' +
+        'Reviews cannot be deleted here: resolve one with your reasoning instead. Nothing here creates ' +
+        'workspaces, invitations or credentials — those are things a person does in the Stacki window.',
       inputSchema: z.object({
         action: z.enum(ACTIONS).describe('What to do. "focus" only moves Stacki; the rest change the review.'),
         threadId: z
@@ -335,7 +444,11 @@ function registerReviewTools(server, { getComments, comment }) {
       const problem = requirementProblem(args);
       const result = problem
         ? { ok: false, action: args.action, revision: 0, review: null, ...problem }
-        : await comment(args);
+        : // `client` is what the connected agent called itself at initialize, so
+          // its messages can be signed "Claude" rather than "AI Agent". A label,
+          // never a permission: the app decides what an agent may do, and an
+          // agent cannot become a person by choosing a name.
+          await comment({ ...args, client: typeof clientName === 'function' ? clientName() : null });
       const body = {
         ok: !!result.ok,
         action: args.action,

@@ -214,6 +214,11 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
   }
 
   async function comment(args) {
+    // Whatever the client called itself, so an agent's messages carry its own
+    // name in a shared thread rather than a generic one. Remembered rather
+    // than passed through, because the name arrives on whichever request
+    // happens to carry it.
+    if (args?.client) reviews.noteAgent(args.client);
     if (args?.action === 'focus') return reviews.focus(args.threadId);
     return reviews.act({ ...args, authorType: 'agent' });
   }

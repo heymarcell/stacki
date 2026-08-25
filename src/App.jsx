@@ -13,6 +13,7 @@ import CommentsPanel from './panels/CommentsPanel.jsx';
 import { anchorSteps, checkAnchor, markerPathFor, modelMatchesFile, peerPath, resolveNode } from './reviewAnchor.js';
 import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
 import { pinnable } from './reviewPins.js';
+import { mayPin } from './reviewCheckout.js';
 import {
   initialReviewMode,
   isCommentModeKey,
@@ -4165,6 +4166,12 @@ export default function App() {
   const [reviewOpenId, setReviewOpenId] = useState(null);
   const [reviewBusyId, setReviewBusyId] = useState(null);
   const [reviewTick, setReviewTick] = useState(0);
+  // Whether these comments are shared, with whom, and how the last catch-up
+  // went. It rides along on every list read rather than being fetched
+  // separately, so the panel and the reviews can never describe different
+  // moments.
+  const [reviewShared, setReviewShared] = useState(null);
+  const [reviewSyncing, setReviewSyncing] = useState(false);
   const [pinsVisible, setPinsVisible] = useState(true);
   const [pinsHidden, setPinsHidden] = useState(0);
   // Which copy of a repeated node the canvas should light up. Sent as a
@@ -4188,6 +4195,7 @@ export default function App() {
     if (!project) {
       setAllReviews([]);
       setReviewProblem(null);
+      setReviewShared(null);
       return;
     }
     let alive = true;
@@ -4196,6 +4204,7 @@ export default function App() {
       if (!alive) return;
       setAllReviews(result?.reviews || []);
       setReviewProblem(result?.problem || null);
+      setReviewShared(result?.shared || null);
     })();
     return () => {
       alive = false;
@@ -4279,6 +4288,14 @@ export default function App() {
   // follows the node if it moved. Everywhere else the anchor's own key is the
   // best available answer: if the node has since moved the page reports no box
   // for it and it simply has no pin, which is where it was already.
+  //
+  // And one rule on top of all of that, which is what Shared Reviews added:
+  // a marker is only drawn when the EVIDENCE for it travels. A review written
+  // on another branch, or about a file this checkout does not have, gets a pin
+  // only when the resolver identified its node by the marks it recorded —
+  // never on a position that merely held. See src/reviewCheckout.js: a pin on
+  // the wrong card is the one failure nobody ever notices.
+  const withheldPins = new Set(allReviews.map((r) => r.id));
   const reviewItems = allReviews
     .filter((r) => pinnable(r.status, reviewFilter) && onReviewPage(r))
     .map((r) => {
@@ -4288,11 +4305,21 @@ export default function App() {
       // no box for it and it simply has no pin — which is where it was already.
       const found = reviewNodes.get(r.id);
       const keys = r.anchor?.keys || [];
-      const path = found
-        ? found.id
-          ? pathFor(found.id)
-          : null
-        : markerPathFor(keys[keys.length - 1], reviewPageFile);
+      // What this tree can actually say. `unverified` is the honest word for
+      // "the file was never read"; the page reported a box at that key and
+      // nothing has checked whether the node there is the right one.
+      const confidence = found ? (found.id ? found.confidence : 'none') : 'unverified';
+      const path = !mayPin(r, confidence)
+        ? null
+        : found
+          ? found.id
+            ? pathFor(found.id)
+            : null
+          : markerPathFor(keys[keys.length - 1], reviewPageFile);
+      // A review has a marker on this render or it does not, and the thread is
+      // told which — so it never says "Stacki found the same element here"
+      // about a review whose page is not even open.
+      if (path) withheldPins.delete(r.id);
       return {
         id: r.id,
         number: r.number ?? null,
@@ -4380,6 +4407,73 @@ export default function App() {
     } finally {
       setReviewBusyId(null);
     }
+  };
+
+  // --- sharing --------------------------------------------------------------
+  //
+  // Three moments talk to a server and no others: opening a shared project
+  // (the main process does that one), pressing Sync, and coming back to the
+  // window after a while. There is no poll and no socket — see
+  // electron/review/sync.js for why that is a decision rather than a gap.
+  const syncReviews = useCallback(
+    async (reason = 'manual') => {
+      if (!window.avb.reviewsSync) return needsRestart();
+      setReviewSyncing(true);
+      try {
+        const result = await window.avb.reviewsSync({ reason });
+        if (result?.shared) setReviewShared(result.shared);
+        // A refusal that a person has to act on — a revoked credential, a
+        // workspace that is gone — is said out loud. Everything else is
+        // already in the panel's own line, where it belongs.
+        if (result && result.ok === false && (result.code === 'unauthorized' || result.code === 'not_found')) {
+          showToast(result.message || 'These shared comments could not be synchronised.', 'error');
+        }
+        setReviewTick((n) => n + 1);
+        return result;
+      } finally {
+        setReviewSyncing(false);
+      }
+    },
+    [showToast]
+  );
+
+  // Coming back to the window. Cheap and quiet: the main process throttles it,
+  // so two visits a minute apart are one request, and a project that shares
+  // nothing makes none at all.
+  useEffect(() => {
+    if (!project || !reviewShared?.enabled) return undefined;
+    const onFocus = () => void syncReviews('focus');
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [project, reviewShared?.enabled, syncReviews]);
+
+  const afterShareChange = (result) => {
+    if (result?.shared) setReviewShared(result.shared);
+    setReviewTick((n) => n + 1);
+    return result;
+  };
+
+  const shareEnable = async (args) => {
+    if (!window.avb.reviewsSharedEnable) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSharedEnable(args));
+  };
+  const shareJoin = async (args) => {
+    if (!window.avb.reviewsSharedJoin) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSharedJoin(args));
+  };
+  const shareDisable = async () => {
+    if (!window.avb.reviewsSharedDisable) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSharedDisable());
+  };
+  const shareInvite = async () => {
+    if (!window.avb.reviewsSharedInvite) return needsRestart();
+    return window.avb.reviewsSharedInvite({});
+  };
+  const renameSelf = async (displayName) => {
+    if (!window.avb.reviewsSetIdentity) return needsRestart();
+    const result = await window.avb.reviewsSetIdentity({ displayName });
+    setReviewTick((n) => n + 1);
+    return result;
   };
 
   const deleteReview = async (id) => {
@@ -5089,6 +5183,17 @@ export default function App() {
                 onDeleteMessage={deleteReviewMessage}
                 busyId={reviewBusyId}
                 problem={reviewProblem}
+                shared={reviewShared}
+                totalCount={allReviews.length}
+                actorId={reviewShared?.identity?.actorId || null}
+                withheldIds={withheldPins}
+                syncing={reviewSyncing}
+                onSync={syncReviews}
+                onShareEnable={shareEnable}
+                onShareJoin={shareJoin}
+                onShareDisable={shareDisable}
+                onShareInvite={shareInvite}
+                onRename={renameSelf}
                 hiddenPins={pinsHidden}
                 pinsVisible={pinsVisible}
                 onTogglePins={() => setPinsVisible((v) => !v)}

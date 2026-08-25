@@ -44,7 +44,8 @@ const check = (what, condition, detail) => {
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
 export { default as ReviewPins, ReviewSurface } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
 export { placePins } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
-export { default as ReviewThread } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
+export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
+export { SharedReviewsBar, SharedReviewsDialog, syncProblemText } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'SharedReviews.jsx'))};
 export { default as PreviewPane } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'PreviewPane.jsx'))};
 export { ConfirmHost } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ConfirmDialog.jsx'))};
 export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'mcpCanvas.js'))};
@@ -120,10 +121,14 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
       el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
     });
   };
+  // React installs its own `value` setter on the element, so writing to it
+  // directly is invisible to it; the native one on the prototype is what a
+  // real keystroke goes through. Which prototype depends on the field —
+  // textareas for a comment, plain inputs for a server address.
   const type = async (el, value) => {
     await act(async () => {
-      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(el, value);
+      const proto = el.tagName === 'INPUT' ? dom.window.HTMLInputElement.prototype : dom.window.HTMLTextAreaElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);
       el.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
     });
   };
@@ -860,6 +865,245 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     check('selecting on the canvas closes an open thread', /setReviewOpenId\(null\);\n\s+if \(kind === 'nothing'\) return;/.test(appSource));
     check('and every navigation goes through that wait', !/settleOnFile/.test(appSource) && /goTo\(plan\.page\.file/.test(appSource) && /goTo\(drill\.componentFile/.test(appSource));
     check('and nothing in the renderer names a review file', !/reviews\.json|userData/.test(appSource));
+  }
+
+  // ── Sharing, as a person sees it ────────────────────────────────────────
+  //
+  // One row at rest. The temptation with a feature like this is a settings
+  // screen inside a panel whose job is to show three sentences of feedback, so
+  // what is checked here is mostly what is NOT on screen.
+  {
+    const bar = (shared, extra = {}) =>
+      React.createElement(ui.SharedReviewsBar, { shared, onSync: () => {}, onSetUp: () => {}, onManage: () => {}, ...extra });
+
+    await render(bar(null));
+    check('a project with no sharing information shows nothing at all', !$('.shared-bar'));
+
+    await render(bar({ enabled: false, workspace: null, lastSyncAt: null, problem: null, pending: 0, private: 0, syncing: false, identity: null, suggestion: null }));
+    check('an unshared project says so in one line', !!$('.shared-bar') && /only on this computer/.test($('.shared-bar').textContent));
+    check('and offers to share', /Share/.test($('.shared-bar').textContent));
+    check('with no server, token or member list on screen', !$('.shared-bar input') && !$('.shared-bar code'));
+
+    const synced = { enabled: true, workspace: { id: 'w', server: 'http://x', displayName: 'lenuri-web' }, lastSyncAt: Date.now() - 120000, problem: null, pending: 0, private: 0, syncing: false, identity: { actorId: 'me', displayName: 'Alice' }, suggestion: null };
+    await render(bar(synced));
+    check('a shared project names the workspace', /lenuri-web/.test($('.shared-bar').textContent));
+    check('and says when it last caught up', /Synced 2m ago/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+    // No live indicator anywhere. This synchronises when there is a reason to,
+    // and a light that means "we spoke a minute ago" reads as "we are speaking
+    // now".
+    check('and shows no presence, no dot and nobody else\u2019s cursor', !/online|typing|present/i.test($('.shared-bar').textContent));
+
+    let synced_ = 0;
+    await render(bar(synced, { onSync: () => { synced_ += 1; } }));
+    await click($$('.shared-bar button').find((b) => /Sync/.test(b.textContent)));
+    check('pressing Sync asks for one', synced_ === 1);
+
+    // Unsent work is said out loud: in a system that does not stream, silence
+    // and being up to date look identical.
+    await render(bar({ ...synced, pending: 3 }));
+    check('anything unsent is counted on screen', /3 to send/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+
+    // The pair that has to hold together. "Synced just now" beside "can't
+    // reach the server" is a sentence contradicting itself, and it is read as
+    // "you are up to date" at the one moment that is untrue.
+    await render(bar({ ...synced, pending: 3, problem: { kind: 'offline', detail: null } }));
+    check('a failed sync does not claim to have synced', !/(^|[^t] )Synced /.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+    check('it says when the last one that worked was', /Last synced/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+    // And the count is shown ESPECIALLY then, rather than suppressed exactly
+    // when it is the thing somebody needs to see.
+    check('and unsent work is still counted while it is failing', /3 to send/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+
+    await render(bar({ ...synced, problem: { kind: 'offline', detail: null } }));
+    check('a problem gets a sentence, not a badge', !!$('.shared-problem'));
+    check('and one somebody can act on', /saved here/.test($('.shared-problem').textContent), $('.shared-problem').textContent);
+    check('a refused credential says what to do', /new invitation/.test(ui.syncProblemText({ kind: 'unauthorized' })));
+    check('and an unknown problem still says something', !!ui.syncProblemText({ kind: 'something-new', detail: 'x' }));
+    check('while no problem says nothing', ui.syncProblemText(null) === null);
+
+    await render(bar({ ...synced, syncing: true }));
+    check('a sync in flight says so', /Syncing/.test($('.shared-bar').textContent));
+  }
+
+  // ── Setting it up ───────────────────────────────────────────────────────
+
+  {
+    const calls = [];
+    const dialog = (shared, extra = {}) =>
+      React.createElement(ui.SharedReviewsDialog, {
+        shared,
+        localCount: 13,
+        onClose: () => calls.push(['close']),
+        onEnable: (a) => { calls.push(['enable', a]); return { ok: true, shared }; },
+        onJoin: (a) => { calls.push(['join', a]); return { ok: true, shared }; },
+        onDisable: () => ({ ok: true }),
+        onInvite: () => ({ ok: true, invite: 'stacki1.abc' }),
+        onRename: (n) => calls.push(['rename', n]),
+        ...extra,
+      });
+
+    const off = { enabled: false, workspace: null, lastSyncAt: null, problem: null, pending: 0, private: 0, syncing: false, identity: null, suggestion: null };
+    await render(dialog(off));
+    check('setting up offers both ways in', $$('.shared-body .seg button').length === 2);
+    check('starting one asks for a server and a token', $$('.shared-field').length === 3, String($$('.shared-field').length));
+    check('and says where to get them', /reviews:serve/.test($('.shared-body').textContent));
+
+    // The privacy decision, and the whole of it: it starts OFF.
+    const box = $('.shared-check input');
+    check('it asks about the comments already here', !!box && /13/.test($('.shared-check').textContent));
+    check('and the answer starts as no', box.checked === false);
+    check('saying so plainly', /stay on this computer/.test($('.shared-check').textContent));
+
+    const start = $$('.shared-actions button').find((b) => /Start sharing/.test(b.textContent));
+    check('and there is nothing to press until a server is given', start.disabled === true);
+
+    const [nameField, serverField, tokenField] = $$('.shared-field input');
+    await type(nameField, 'Alice');
+    await type(serverField, 'http://127.0.0.1:43822');
+    await type(tokenField, 'a-signup-token');
+    check('with both, it can be started', $$('.shared-actions button').find((b) => /Start sharing/.test(b.textContent)).disabled === false);
+    await click($$('.shared-actions button').find((b) => /Start sharing/.test(b.textContent)));
+    const enable = calls.find((c) => c[0] === 'enable');
+    check('starting passes what was typed', enable?.[1]?.server === 'http://127.0.0.1:43822', JSON.stringify(enable));
+    check('and the back catalogue is left behind unless asked for', enable[1].publishExisting === false);
+    check('and the name goes with it', calls.some((c) => c[0] === 'rename' && c[1] === 'Alice'));
+
+    calls.length = 0;
+    await render(dialog(off));
+    await click($$('.shared-body .seg button').find((b) => /Join/.test(b.textContent)));
+    check('joining asks for an invitation and nothing else', $$('.shared-field').length === 2);
+    await type($$('.shared-field input')[1], 'stacki1.abc');
+    await click($('.shared-check input'));
+    await click($$('.shared-actions button').find((b) => /Join/.test(b.textContent)));
+    const join = calls.find((c) => c[0] === 'join');
+    check('joining passes the invitation', join?.[1]?.invite === 'stacki1.abc', JSON.stringify(join));
+    check('and honours the box when it is ticked', join[1].publishExisting === true);
+
+    const on = { enabled: true, workspace: { id: 'w', server: 'http://x', displayName: 'lenuri-web' }, lastSyncAt: Date.now(), problem: null, pending: 0, private: 4, syncing: false, identity: { actorId: 'me', displayName: 'Alice' }, suggestion: null };
+    await render(dialog(on));
+    check('an established workspace shows what it is', /lenuri-web/.test($('.shared-body').textContent));
+    check('and how many comments were kept back', /4 comments stay/.test($('.shared-body').textContent), $('.shared-body').textContent);
+    check('and that stopping keeps everything', /keeps every comment/.test($('.shared-body').textContent));
+    await click($$('.shared-actions button').find((b) => /Invite/.test(b.textContent)));
+    check('an invitation can be made', !!$('.shared-invite code') && /stacki1\.abc/.test($('.shared-invite code').textContent));
+    check('and is described as the secret it is', /would send a password/.test($('.shared-invite').textContent), $('.shared-invite').textContent);
+    check('and as single-use', /works once/.test($('.shared-invite').textContent));
+  }
+
+  // ── Who said it, and against which tree ─────────────────────────────────
+
+  {
+    check('your own message is signed You', ui.authorLabel({ authorType: 'human', actorId: 'me', actorName: 'Alice' }, 'me') === 'You');
+    check('and somebody else\u2019s with their name', ui.authorLabel({ authorType: 'human', actorId: 'them', actorName: 'Bob' }, 'me') === 'Bob');
+    check('an agent is signed with its own', ui.authorLabel({ authorType: 'agent', actorName: 'Claude' }, 'me') === 'Claude');
+    check('an unnamed person is not called You', ui.authorLabel({ authorType: 'human', actorId: 'them', actorName: null }, 'me') === 'Someone');
+    check('and a message from before authorship was recorded is yours', ui.authorLabel({ authorType: 'human', actorId: null }, 'me') === 'You');
+
+    const shared = (over = {}) => ({
+      id: 'rt_1',
+      number: 7,
+      status: 'open',
+      anchorState: 'attached',
+      color: 'blue',
+      author: { actorId: 'them', actorKind: 'human', actorName: 'Alice' },
+      messages: [
+        { id: 'm1', authorType: 'human', actorId: 'them', actorName: 'Alice', body: 'This CTA is too close.', createdAt: Date.now(), editedAt: null },
+        { id: 'm2', authorType: 'human', actorId: 'me', actorName: 'Bob', body: 'Agreed.', createdAt: Date.now(), editedAt: null },
+      ],
+      creationContext: { tag: 'a', text: 'Get started' },
+      anchor: { keys: ['src/pages/index.astro#0.1'] },
+      externalRefs: [],
+      ...over,
+    });
+
+    const thread = (review, extra = {}) =>
+      React.createElement(
+        React.Fragment,
+        null,
+        React.createElement(ui.ReviewThread, {
+          review,
+          actorId: 'me',
+          onAct: () => {},
+          onEditMessage: () => {},
+          onDeleteMessage: () => {},
+          onDelete: () => {},
+          ...extra,
+        }),
+        React.createElement(ui.ConfirmHost)
+      );
+
+    await render(thread(shared()));
+    check('a shared thread names both people', /Alice/.test($$('.review-msg')[0].textContent) && /You/.test($$('.review-msg')[1].textContent));
+    const tools = (i) => $$('.review-msg')[i].querySelectorAll('.review-msg-tools button');
+    check('another person\u2019s message offers nothing to do to it', tools(0).length === 0, String(tools(0).length));
+    check('while your own offers both', tools(1).length === 2, String(tools(1).length));
+    check('and somebody else\u2019s review cannot be deleted from here', !$('.review-trash'));
+    await render(thread(shared({ author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' } })));
+    check('your own review can be', !!$('.review-trash'));
+
+    // The one that matters. A thread that says resolved over a checkout that
+    // does not contain the fix must never look like a tick.
+    const behind = shared({
+      status: 'resolved',
+      resolvedAtSource: { head: 'def4567abc', branch: 'main', dirty: false },
+      resolvedBy: { actorId: 'c', actorKind: 'agent', actorName: 'Claude' },
+      checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: 'behind' },
+    });
+    await render(thread(behind));
+    check('a resolution this checkout lacks is called out', !!$('.review-checkout.is-behind'));
+    check('naming who resolved it', /Claude/.test($('.review-checkout').textContent));
+    check('and the revision', /def4567/.test($('.review-checkout').textContent));
+    check('and saying what that means for what is on screen', /still be the old version/.test($('.review-checkout').textContent));
+
+    const unproven = shared({
+      status: 'resolved',
+      resolvedAtSource: { head: 'def4567abc', branch: 'main', dirty: false },
+      resolvedBy: { actorId: 'c', actorKind: 'agent', actorName: 'Claude' },
+      checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: 'unknown' },
+    });
+    await render(thread(unproven));
+    check('an unprovable resolution is shown as uncertainty', !!$('.review-checkout') && !$('.review-checkout.is-behind'));
+    check('saying so in as many words', /can\u2019t tell/.test($('.review-checkout').textContent), $('.review-checkout').textContent);
+    check('and adding the fact it can prove', /hasn\u2019t changed here/.test($('.review-checkout').textContent));
+
+    const elsewhere = shared({
+      provenance: { head: 'aaa', branch: 'feature-a', dirty: false, files: {} },
+      checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: { branch: 'feature-a', head: 'aaa', dirty: false }, sameBranch: false, originIn: 'behind', source: 'changed', resolution: null },
+    });
+    await render(thread(elsewhere, { pinned: false }));
+    check('a review from another branch says where it came from', /feature-a/.test($('.review-checkout').textContent));
+    check('and why there is no pin', /prove it is the same element/.test($('.review-checkout').textContent));
+    check('and is drawn as a warning, because something is withheld', !$('.review-checkout').classList.contains('is-note'));
+    await render(thread(elsewhere, { pinned: true }));
+    check('and says the opposite when there is one', /found the same element/.test($('.review-checkout').textContent));
+    // Context, not an alarm. In the warning colour it reads as a problem, and
+    // after a merge every review from the merged branch would carry a
+    // permanent yellow warning about nothing being wrong.
+    check('a review that DID pin is not dressed as a problem', $('.review-checkout').classList.contains('is-note'));
+
+    // Deleting a shared thread takes other people's words with it, on their
+    // machines. Somebody agreeing to that has a right to know they are.
+    {
+      const mine = shared({ author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' } });
+      await render(thread(mine, { onDelete: () => {} }));
+      await click($('.review-trash'));
+      const asked = $('.modal-body')?.textContent || '';
+      check('deleting a thread somebody else replied to names them', /Alice/.test(asked), asked);
+      check('and says it goes for everyone', /everyone in this workspace/.test(asked), asked);
+      await click($$('.modal-footer button').find((b) => /Cancel/i.test(b.textContent)));
+
+      const alone = shared({
+        author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' },
+        messages: [{ id: 'm1', authorType: 'human', actorId: 'me', actorName: 'Bob', body: 'Only mine.', createdAt: Date.now(), editedAt: null }],
+      });
+      await render(thread(alone, { onDelete: () => {} }));
+      await click($('.review-trash'));
+      const solo = $('.modal-body')?.textContent || '';
+      check('while a thread only you wrote in asks the plain question', !/everyone in this workspace/.test(solo), solo);
+      await click($$('.modal-footer button').find((b) => /Cancel/i.test(b.textContent)));
+    }
+
+    await render(thread(shared({ checkout: { branch: 'main', head: 'a', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: null } })));
+    check('an ordinary same-tree review says nothing about checkouts', !$('.review-checkout'));
   }
 
   if (failures.length) {

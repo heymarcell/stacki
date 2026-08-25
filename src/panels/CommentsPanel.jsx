@@ -1,5 +1,6 @@
 import React from 'react';
-import ReviewThread, { ReviewWhere, ReviewStatusDot } from '../ui/ReviewThread.jsx';
+import ReviewThread, { ReviewWhere, ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
+import { SharedReviewsBar, SharedReviewsDialog } from '../ui/SharedReviews.jsx';
 import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
 
 // The comments panel.
@@ -15,6 +16,13 @@ import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
 // of comments and a project's worth are both things somebody wants. No
 // assignees, no labels, no sort order, no columns — a bigger table would not
 // make a single comment easier to act on.
+//
+// Sharing adds exactly one row and one name. The row says who these comments
+// are shared with and when they last caught up; the name says who wrote each
+// one, because on a shared thread "You" is a different person depending on who
+// is reading. Everything else sharing could have brought — presence, unread
+// counts, avatars, activity — is not here, and the reason is the same reason
+// there are only two filters.
 
 const STATUS_TABS = [
   { id: 'open', label: 'Open' },
@@ -54,8 +62,24 @@ export default function CommentsPanel({
   onTogglePins,
   commenting = false,
   onToggleComment,
+  // Sharing. Absent on a project that has never been shared, which is every
+  // project until somebody says otherwise.
+  shared = null,
+  // Every review in the project, not the filtered view — the question "share
+  // the ones already here?" is about all of them.
+  totalCount = 0,
+  actorId = null,
+  withheldIds = null,
+  onSync,
+  onShareEnable,
+  onShareJoin,
+  onShareDisable,
+  onShareInvite,
+  onRename,
+  syncing = false,
 }) {
   const open = reviews.find((r) => r.id === openId) || null;
+  const [setUp, setSetUp] = React.useState(false);
 
   return (
     <div className="panel-section grow comments-panel">
@@ -78,6 +102,29 @@ export default function CommentsPanel({
           </button>
         </div>
       </div>
+
+      {shared && (
+        <SharedReviewsBar
+          shared={shared}
+          busy={syncing}
+          onSync={() => onSync?.('manual')}
+          onSetUp={() => setSetUp(true)}
+          onManage={() => setSetUp(true)}
+        />
+      )}
+
+      {setUp && shared && (
+        <SharedReviewsDialog
+          shared={shared}
+          localCount={totalCount}
+          onClose={() => setSetUp(false)}
+          onEnable={onShareEnable}
+          onJoin={onShareJoin}
+          onDisable={onShareDisable}
+          onInvite={onShareInvite}
+          onRename={onRename}
+        />
+      )}
 
       {/* The ledger itself went wrong. Rare, and worth a sentence rather than
           a silence — a panel that is simply empty because a file could not be
@@ -125,7 +172,9 @@ export default function CommentsPanel({
                 </p>
               </>
             ) : (
-              <p className="dim">No {status === 'all' ? '' : status} comments {scope === 'page' ? 'on this page' : 'in this project'}.</p>
+              <p className="dim">
+                No{status === 'all' ? '' : ` ${status}`} comments {scope === 'page' ? 'on this page' : 'in this project'}.
+              </p>
             )}
           </div>
         )}
@@ -135,6 +184,8 @@ export default function CommentsPanel({
             <div key={r.id} className="comments-open">
               <ReviewThread
                 review={r}
+                actorId={actorId}
+                pinned={!withheldIds?.has(r.id)}
                 busy={busyId === r.id}
                 onAct={(action, extra) => onAct(r.id, action, extra)}
                 onFocus={() => onFocus(r)}
@@ -151,6 +202,14 @@ export default function CommentsPanel({
               <span className="comments-row-main">
                 <span className="comments-row-top">
                   {r.number != null && <span className="review-number">#{r.number}</span>}
+                  {/* Who left it, but only when that is not obvious. On a
+                      project nobody shares, every comment is yours and a
+                      column of "You" is noise. */}
+                  {shared?.enabled && (
+                    <span className={`comments-row-author is-${r.author?.actorKind || 'human'}`}>
+                      {authorLabel(r.author, actorId)}
+                    </span>
+                  )}
                   <ReviewWhere review={r} compact />
                   <span className="spacer" />
                   {r.anchorState === 'orphaned' && <OrphanIcon size={11} />}
@@ -169,7 +228,7 @@ export default function CommentsPanel({
         {hiddenPins > 0 && pinsVisible && (
           <div className="comments-hidden-note">
             {hiddenPins} {hiddenPins === 1 ? 'comment has' : 'comments have'} no pin on this page — the element isn’t
-            rendered here, or Stacki can’t find it any more.
+            rendered here, Stacki can’t find it any more, or it was written against source this checkout doesn’t have.
           </div>
         )}
       </div>

@@ -14,6 +14,29 @@
 // been vandalised by its editor. The only files this feature ever writes into
 // a project are the ones a coding agent edits on purpose.
 //
+// WHAT IS ON DISK, AND WHY IT CHANGED. It used to be a list of threads, and a
+// thread was mutable. That works for exactly one writer. Two people sharing a
+// review cannot share a mutable blob — whoever writes last wins whole, and the
+// other person's reply is gone with nothing to say it was ever made. So the
+// file now holds an APPEND-ONLY SET OF EVENTS, and a thread is what you get
+// when you fold that set (see events.js for the order rule). The fold is
+// deterministic, so Alice's Stacki and Bob's produce the same threads from the
+// same events without either of them being in charge.
+//
+// Three things are LOCAL and stay out of the event set on purpose:
+//
+//   anchorState   whether the anchor still resolves. It is a fact about THIS
+//                 checkout — Bob's tree is not Alice's — so inheriting hers
+//                 would be how a review gets a pin on markup that is not there.
+//   the number    #17 is a nickname, allocated on first sight and never moved.
+//                 The creator's proposed number is carried on the event and
+//                 taken when it is free, so in the ordinary case everybody
+//                 says "#17" about the same review; two people creating
+//                 offline may end up with different nicknames for one thread,
+//                 and the uuid is what actually identifies it.
+//   sharing        which workspace this project belongs to, how far it has
+//                 synchronised, and what has not been sent yet.
+//
 // Branch scoping, decided once and written down: reviews are keyed by PROJECT,
 // never by branch, and the branch a review was written on is recorded on it.
 // The alternative — a file per branch — loses your review list the moment you
@@ -25,12 +48,9 @@
 // synchronised across branches.
 //
 // Writing: in memory is the truth, the file is a copy of it. Every mutation
-// updates memory, bumps a revision, and schedules a write; writes are
-// serialised through one promise chain, so two mutations arriving at once
-// (the panel and an agent, which is the ordinary case) cannot read the same
-// old JSON and overwrite each other. The write itself is tmp-then-rename, so a
-// quit in the middle of one leaves the previous file intact rather than half
-// of the new one.
+// appends events, reprojects, and writes before it answers; the write itself
+// is tmp-then-rename under a lock, so a quit in the middle of one leaves the
+// previous file intact rather than half of the new one.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -38,8 +58,24 @@ const crypto = require('node:crypto');
 
 const { str, int } = require('../mcp/contextStore');
 const { leafKey, fileOfKey } = require('./anchor');
+const {
+  EVENT_TYPES,
+  MAX_EVENTS,
+  compareEvents,
+  orderEvents,
+  unionEvents,
+  nextLamport,
+  reviveEvent,
+  makeEvent,
+  projectThreads,
+} = require('./events');
+const { uuidv5, legacyAgentActor, agentActor, DEFAULT_AGENT_NAME } = require('./actors');
+const { provenanceFor, sourceStamp } = require('./provenance');
 
-const VERSION = 1;
+// 1 was one mutable thread list per project. 2 is the event log. An older
+// Stacki refuses to touch a file it does not recognise (see loadFile), which
+// is what keeps a downgrade from silently erasing everything written since.
+const VERSION = 2;
 
 // Bounds. Every one of these is a user-controlled string that ends up in an
 // agent's context window, and one pathological review must not be able to cost
@@ -79,7 +115,12 @@ const STATUSES = ['open', 'resolved', 'deferred'];
 // else, and it has to answer it without a legend.
 const COLORS = ['blue', 'violet', 'teal', 'green', 'amber', 'rose'];
 const DEFAULT_COLOR = 'blue';
-const ANCHOR_STATES = ['attached', 'orphaned'];
+// `unknown` is new, and it is the whole of what makes a shared review honest.
+// A review that arrived from somebody else's machine has never been checked
+// against THIS checkout, and calling it attached because it was attached for
+// them is exactly the false pin this feature must never draw. It becomes
+// attached or orphaned the moment something actually looks.
+const ANCHOR_STATES = ['attached', 'orphaned', 'unknown'];
 const AUTHORS = ['human', 'agent'];
 const ACTIONS = ['create', 'reply', 'resolve', 'defer', 'reopen'];
 
@@ -117,7 +158,14 @@ const fileFor = (userDataPath, projectPath) =>
 
 // --- reading what is on disk ------------------------------------------------
 
-/** A thread from disk, checked field by field. Null for anything unusable. */
+/**
+ * A version-1 thread from disk, checked field by field. Null for anything
+ * unusable.
+ *
+ * Kept for exactly one purpose now: turning an old ledger into events. It is
+ * still exported because it is the definition of what an old file could
+ * legally contain, and the migration below is only as trustworthy as this is.
+ */
 function reviveThread(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = str(raw.id, 100);
@@ -165,6 +213,159 @@ function reviveThread(raw) {
 }
 
 /**
+ * Turn a version-1 ledger into events.
+ *
+ * Everything here is a restatement of what the old file already said. The one
+ * thing an old file does NOT say is who wrote a message: `authorType: 'human'`
+ * names a category, not a person. It is mapped to this installation's own
+ * actor, and that is safe for exactly one reason — a version-1 ledger is
+ * single-writer by construction. It lives in one machine's application-support
+ * directory, it was never shared with anybody, and the only human who could
+ * have written in it is the human sitting here. `agent` becomes a legacy agent
+ * actor with no name attached, because which agent it was is genuinely not
+ * recorded and inventing one would be inventing a fact.
+ *
+ * Every migrated event is marked `legacy: true` and carries `provenance: null`.
+ * Old reviews are never given guessed provenance: nobody knows what the source
+ * looked like on the day they were written, and a plausible-looking commit SHA
+ * is worse than an admitted absence.
+ *
+ * Event ids are DERIVED from the thread and message ids, so migrating the same
+ * file twice produces the same events. That matters: a union by id turns a
+ * repeated migration into a no-op instead of a doubled history.
+ */
+function eventsFromLegacy(threads, { human, agent = legacyAgentActor() } = {}) {
+  const events = [];
+  const numbers = {};
+  const anchors = {};
+  let lamport = 1;
+  const id = (kind, ...parts) => uuidv5(`stacki:migration:${kind}:${parts.join(':')}`);
+  const actorFor = (authorType) => (authorType === 'agent' ? agent : human);
+
+  const ordered = [...threads].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+  for (const t of ordered) {
+    if (t.number) numbers[t.id] = t.number;
+    if (t.anchorState) anchors[t.id] = { anchorState: t.anchorState, keys: null };
+    const opener = actorFor(t.messages[0].authorType);
+    events.push(
+      makeEvent({
+        id: id('thread', t.id),
+        type: 'thread.created',
+        threadId: t.id,
+        actor: opener,
+        lamport: lamport++,
+        at: t.createdAt,
+        payload: {
+          color: t.color,
+          anchor: t.anchor,
+          creationContext: t.creationContext,
+          provenance: null,
+          number: t.number || null,
+          legacy: true,
+        },
+      })
+    );
+    for (const m of t.messages) {
+      events.push(
+        makeEvent({
+          id: id('message', t.id, m.id),
+          type: 'message.created',
+          threadId: t.id,
+          actor: actorFor(m.authorType),
+          lamport: lamport++,
+          at: m.createdAt,
+          payload: { messageId: m.id, body: m.body },
+        })
+      );
+      if (m.editedAt) {
+        // The "edited" mark is part of the record — a message somebody replied
+        // to and then changed is a different thing from one nobody touched —
+        // so it is restated as the edit event that would have produced it.
+        events.push(
+          makeEvent({
+            id: id('edit', t.id, m.id),
+            type: 'message.edited',
+            threadId: t.id,
+            actor: actorFor(m.authorType),
+            lamport: lamport++,
+            at: m.editedAt,
+            payload: { messageId: m.id, body: m.body },
+          })
+        );
+      }
+    }
+    // A deferral reason and any external references live on defer events in
+    // the new model, so a thread that has either gets one — followed by
+    // whatever put it into the state it is actually in.
+    const hadDeferral = !!t.deferredReason || t.externalRefs.length > 0;
+    if (hadDeferral) {
+      events.push(
+        makeEvent({
+          id: id('defer', t.id),
+          type: 'thread.deferred',
+          threadId: t.id,
+          actor: opener,
+          lamport: lamport++,
+          at: t.updatedAt,
+          payload: { reason: t.deferredReason, externalRef: t.externalRefs[0] || null, refs: t.externalRefs },
+        })
+      );
+      for (let i = 1; i < t.externalRefs.length; i++) {
+        events.push(
+          makeEvent({
+            id: id('defer-ref', t.id, String(i)),
+            type: 'thread.deferred',
+            threadId: t.id,
+            actor: opener,
+            lamport: lamport++,
+            at: t.updatedAt,
+            payload: { reason: t.deferredReason, externalRef: t.externalRefs[i] },
+          })
+        );
+      }
+    }
+    const finalType =
+      t.status === 'resolved'
+        ? 'thread.resolved'
+        : t.status === 'deferred'
+          ? hadDeferral
+            ? null
+            : 'thread.deferred'
+          : hadDeferral
+            ? 'thread.reopened'
+            : null;
+    if (finalType) {
+      events.push(
+        makeEvent({
+          id: id('status', t.id),
+          type: finalType,
+          threadId: t.id,
+          actor: opener,
+          lamport: lamport++,
+          at: t.updatedAt,
+          // The source a migrated resolution landed on is not recorded
+          // anywhere, so it is null rather than today's HEAD.
+          payload: finalType === 'thread.resolved' ? { resolvedAtSource: null } : {},
+        })
+      );
+    }
+  }
+  return { events: events.filter(Boolean), numbers, anchors };
+}
+
+const EMPTY_SHARED = () => ({
+  workspaceId: null,
+  cursor: null,
+  lastSyncAt: null,
+  problem: null,
+  // Events written here that the workspace has not acknowledged. In order.
+  pending: [],
+  // Threads that existed before sharing was turned on and were deliberately
+  // NOT published. Their events never leave this machine.
+  excluded: [],
+});
+
+/**
  * Read the file, and be specific about what was wrong with it.
  *
  * Three outcomes that are not "here are your reviews", and each wants
@@ -182,56 +383,118 @@ function reviveThread(raw) {
 /** The fingerprint of a ledger's bytes. Null for "there is no file". */
 const digest = (text) => (text == null ? null : crypto.createHash('sha1').update(text).digest('hex'));
 
-function loadFile(file) {
+const emptyLedger = (over = {}) => ({
+  events: [],
+  numbers: {},
+  anchors: {},
+  shared: EMPTY_SHARED(),
+  nextNumber: 1,
+  digest: null,
+  writable: true,
+  problem: null,
+  migrated: false,
+  ...over,
+});
+
+const badFile = (detail) => emptyLedger({ problem: { kind: 'corrupt', detail, quarantine: true } });
+
+/**
+ * The person a version-1 ledger's `human` messages are attributed to when the
+ * caller did not say who is reading.
+ *
+ * The store always passes the real local actor. This exists so that `loadFile`
+ * on its own — a test, a repair tool — produces a complete, foldable event set
+ * rather than silently dropping every message it cannot attribute.
+ */
+const LEGACY_HUMAN = () => ({ id: uuidv5('human:legacy'), kind: 'human', displayName: null });
+
+function loadFile(file, { human = null } = {}) {
+  const reader = human || LEGACY_HUMAN();
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
   } catch (err) {
-    if (err.code === 'ENOENT') return { threads: [], nextNumber: 1, digest: null, writable: true, problem: null };
-    return { threads: [], nextNumber: 1, digest: null, writable: false, problem: { kind: 'unreadable', detail: err.message } };
+    if (err.code === 'ENOENT') return emptyLedger();
+    return emptyLedger({ writable: false, problem: { kind: 'unreadable', detail: err.message } });
   }
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: err.message, quarantine: true } };
+    return badFile(err.message);
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: 'not an object', quarantine: true } };
-  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return badFile('not an object');
   const version = Number(parsed.version);
-  if (!Number.isInteger(version) || version < 1) {
-    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: `version ${parsed.version}`, quarantine: true } };
-  }
+  if (!Number.isInteger(version) || version < 1) return badFile(`version ${parsed.version}`);
   if (version > VERSION) {
-    return {
-      threads: [],
-      nextNumber: 1,
-      digest: null,
+    return emptyLedger({
       writable: false,
       problem: { kind: 'newer', detail: `this file was written by a newer Stacki (version ${version})` },
+    });
+  }
+
+  const highWater = Number.isInteger(parsed.nextNumber) && parsed.nextNumber > 0 ? parsed.nextNumber : 1;
+
+  // --- version 1: a list of mutable threads ---------------------------------
+  if (version === 1) {
+    if (!Array.isArray(parsed.threads)) return badFile('threads is not a list');
+    const threads = parsed.threads.map(reviveThread).filter(Boolean);
+    const dropped = parsed.threads.length - threads.length;
+    const { events, numbers, anchors } = eventsFromLegacy(threads, { human: reader });
+    return emptyLedger({
+      events,
+      numbers,
+      anchors,
+      nextNumber: highWater,
+      // Deliberately NOT the digest of the file that was read: this ledger no
+      // longer describes those bytes, and the next write must be recognised as
+      // a rewrite of them rather than mistaken for an untouched file.
+      digest: digest(text),
+      migrated: true,
+      problem: dropped ? { kind: 'partial', detail: `${dropped} unreadable thread(s) dropped` } : null,
+    });
+  }
+
+  // --- version 2: the event log ---------------------------------------------
+  if (!Array.isArray(parsed.events)) return badFile('events is not a list');
+  const events = parsed.events.map(reviveEvent).filter(Boolean);
+  const dropped = parsed.events.length - events.length;
+  const local = parsed.local && typeof parsed.local === 'object' ? parsed.local : {};
+  const numbers = {};
+  for (const [threadId, n] of Object.entries(local.numbers || {})) {
+    if (Number.isInteger(n) && n > 0) numbers[str(threadId, 100)] = n;
+  }
+  const anchors = {};
+  for (const [threadId, state] of Object.entries(local.anchors || {})) {
+    if (!state || typeof state !== 'object') continue;
+    anchors[str(threadId, 100)] = {
+      anchorState: ANCHOR_STATES.includes(state.anchorState) ? state.anchorState : 'unknown',
+      keys: Array.isArray(state.keys) && state.keys.length ? state.keys.map((k) => str(k, 512)).filter(Boolean) : null,
     };
   }
-  if (!Array.isArray(parsed.threads)) {
-    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: 'threads is not a list', quarantine: true } };
-  }
-  const threads = parsed.threads.map(reviveThread).filter(Boolean);
-  const dropped = parsed.threads.length - threads.length;
-  return {
-    threads,
-    // What the file said when we read it. Any later write compares against
-    // this to find out whether another Stacki has been here since.
-    digest: digest(text),
-    // The high-water mark, as the last write left it. Deleting #3 must not free
-    // #3 up for the next comment — an agent told "fix #3" before a restart and
-    // acting after one would otherwise act on a different review. Derived from
-    // the surviving threads it would do exactly that, so it is written down.
-    nextNumber: Number.isInteger(parsed.nextNumber) && parsed.nextNumber > 0 ? parsed.nextNumber : 1,
-    writable: true,
-    // Some threads survived and some did not: worth saying, not worth
-    // refusing over. The readable ones are somebody's actual review.
-    problem: dropped ? { kind: 'partial', detail: `${dropped} unreadable thread(s) dropped` } : null,
+  const rawShared = parsed.shared && typeof parsed.shared === 'object' ? parsed.shared : {};
+  const shared = {
+    ...EMPTY_SHARED(),
+    workspaceId: str(rawShared.workspaceId, 100),
+    cursor: Number.isInteger(rawShared.cursor) && rawShared.cursor >= 0 ? rawShared.cursor : null,
+    lastSyncAt: int(rawShared.lastSyncAt) || null,
+    problem:
+      rawShared.problem && typeof rawShared.problem === 'object'
+        ? { kind: str(rawShared.problem.kind, 60) || 'unknown', detail: str(rawShared.problem.detail, 300) }
+        : null,
+    pending: (Array.isArray(rawShared.pending) ? rawShared.pending : []).map((v) => str(v, 100)).filter(Boolean),
+    excluded: (Array.isArray(rawShared.excluded) ? rawShared.excluded : []).map((v) => str(v, 100)).filter(Boolean),
   };
+
+  return emptyLedger({
+    events: orderEvents(events),
+    numbers,
+    anchors,
+    shared,
+    nextNumber: highWater,
+    digest: digest(text),
+    problem: dropped ? { kind: 'partial', detail: `${dropped} unreadable event(s) dropped` } : null,
+  });
 }
 
 /** Move a file out of the way under a name that says what it is. */
@@ -245,9 +508,6 @@ function quarantine(file, stamp) {
   }
 }
 
-// How long a lock may be held before it is presumed abandoned. A write is
-// microseconds; anything approaching this is a Stacki that died holding it, and
-// a ledger nobody can ever write to again is worse than a rare stolen lock.
 // How long a lock with nobody's name on it may sit before it is assumed to be
 // the leftovers of a process that died.
 const LOCK_STALE_MS = 10_000;
@@ -270,14 +530,6 @@ function pause(ms) {
   }
 }
 
-/**
- * Take the ledger's lock, or answer null.
- *
- * `mkdir` is the atomic primitive here: it either creates the directory or
- * fails with EEXIST, with no window between the two. That is what makes this a
- * lock rather than a check — two processes cannot both believe they hold it,
- * which is exactly the failure a stat-then-write has.
- */
 /** Whether a process is still there to be waited for. */
 function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -333,6 +585,14 @@ function reapable(lock) {
   return age > LOCK_ABANDONED_MS;
 }
 
+/**
+ * Take the ledger's lock, or answer null.
+ *
+ * `mkdir` is the atomic primitive here: it either creates the directory or
+ * fails with EEXIST, with no window between the two. That is what makes this a
+ * lock rather than a check — two processes cannot both believe they hold it,
+ * which is exactly the failure a stat-then-write has.
+ */
 function acquireLock(file) {
   const lock = `${file}.lock`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -400,13 +660,52 @@ function writeAtomic(file, text) {
  * Open (or start) the review ledger for one project.
  *
  * `now` and `newId` are injected so the whole of this file can be tested
- * against fixed timestamps and predictable ids.
+ * against fixed timestamps and predictable ids. So are `actor` — who this
+ * installation is — and `source`, which answers the two git questions
+ * provenance needs; both have defaults that work with nothing wired up, so a
+ * ledger can still be opened in a test with no identity file and no repository.
  */
-function createReviewStore({ file, projectPath = null, now = Date.now, newId, onChange } = {}) {
+function createReviewStore({
+  file,
+  projectPath = null,
+  now = Date.now,
+  newId,
+  onChange,
+  actor = null,
+  source = null,
+} = {}) {
   if (!file) throw new Error('a review store needs a file to live in');
   const id = newId || (() => crypto.randomUUID());
 
+  /**
+   * Who is writing.
+   *
+   * A function, so an installation that has not made an identity yet does not
+   * make one merely because somebody opened a project. The default is derived
+   * from the ledger's own path: stable across restarts, unique to this
+   * machine's copy of this project, and honest about being a placeholder —
+   * a Stacki that shares anything passes the real one in.
+   */
+  const localActor =
+    typeof actor === 'function'
+      ? actor
+      : actor && typeof actor === 'object'
+        ? () => actor
+        : () => ({ id: uuidv5(`local:${file}`), kind: 'human', displayName: 'You' });
+
+  const provenance = {
+    for: (files) => provenanceFor(projectPath, files),
+    stamp: () => sourceStamp(projectPath),
+    ...(source || {}),
+  };
+
+  let events = [];
   let threads = [];
+  // threadId -> the nickname this installation shows for it.
+  let numbers = {};
+  // threadId -> { anchorState, keys } as THIS checkout last found them.
+  let anchors = {};
+  let shared = EMPTY_SHARED();
   let writable = true;
   let problem = null;
   // The next short number.
@@ -423,6 +722,52 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   // Counts CHANGES, like the context store's does — so a UI can ask "is there
   // anything new" without diffing, and a read can never make one happen.
   let revision = 0;
+  let lamport = 1;
+
+  /**
+   * Fold the events into threads and hang this machine's own local facts on
+   * them: the nickname and whether the anchor still resolves here.
+   */
+  function reproject() {
+    const projected = projectThreads(events, {
+      bounds: { maxBody: MAX_BODY, maxReason: MAX_REASON, maxRef: MAX_REF, maxRefs: MAX_REFS, maxMessages: MAX_MESSAGES },
+    });
+    // Every number this ledger has ever handed out, including to reviews that
+    // have since been deleted. A deleted number stays dead: an agent told to
+    // fix #3 before a restart must not act on a different review after one.
+    const reserved = new Set(Object.values(numbers));
+    // And the ones in use by a review that still exists, in creation order —
+    // which is what makes a duplicate resolvable. "#3" has to name exactly one
+    // review, so if two claim it the older keeps it and the later is renamed.
+    const taken = new Set();
+    const out = [];
+    for (const t of projected) {
+      let number = numbers[t.id] || null;
+      if (number && taken.has(number)) number = null;
+      if (!number) {
+        // The creator's own nickname for it, if nobody here is using it. Two
+        // people who both wrote a review offline may have both called theirs
+        // #17; the second one to arrive gets the next free number here, keeps
+        // it forever, and is addressable by its id either way.
+        const wanted = t.proposedNumber;
+        number = wanted && !reserved.has(wanted) ? wanted : nextNumber;
+        while (reserved.has(number) || taken.has(number)) number += 1;
+        numbers[t.id] = number;
+      }
+      taken.add(number);
+      reserved.add(number);
+      nextNumber = Math.max(nextNumber, number + 1);
+      const local = anchors[t.id] || null;
+      out.push({
+        ...t,
+        number,
+        // A review nothing has looked at yet is `unknown`, never `attached`.
+        anchorState: local?.anchorState || 'unknown',
+        anchor: local?.keys && t.anchor ? { ...t.anchor, keys: local.keys } : t.anchor,
+      });
+    }
+    threads = out;
+  }
 
   /**
    * Become whatever the file says, discarding whatever was held before.
@@ -432,8 +777,11 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
    * a view of it.
    */
   function readFresh() {
-    const loaded = loadFile(file);
-    threads = loaded.threads;
+    const loaded = loadFile(file, { human: localActor() });
+    events = loaded.events;
+    numbers = loaded.numbers;
+    anchors = loaded.anchors;
+    shared = loaded.shared;
     writable = loaded.writable;
     problem = loaded.problem || null;
     owned = loaded.digest;
@@ -442,30 +790,29 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
       problem = { ...problem, movedTo: moved, quarantine: undefined };
     }
     // Whichever is higher: what the last write recorded, or one past the
-    // highest number still present. The recorded value is what makes a deleted
-    // number stay dead across a restart; the scan is the floor for a file
-    // written by an older Stacki, or one somebody edited by hand.
-    nextNumber = Math.max(loaded.nextNumber || 1, threads.reduce((max, t) => Math.max(max, t.number || 0), 0) + 1);
-    // A review written before numbering gets one now, oldest first, so the
-    // order people see matches the order they wrote them. A number that somehow
-    // appears twice is treated the same way: "#3" has to name exactly one
-    // review, so the later of the two is renumbered rather than left ambiguous.
-    const seen = new Set();
-    const needsOne = [];
-    for (const t of [...threads].sort((a, b) => a.createdAt - b.createdAt)) {
-      if (!t.number || seen.has(t.number)) needsOne.push(t);
-      else seen.add(t.number);
-    }
-    if (needsOne.length) {
-      for (const t of needsOne) t.number = nextNumber++;
-      threads = [...threads];
-    }
+    // highest nickname still in use. The recorded value is what makes a deleted
+    // number stay dead across a restart.
+    nextNumber = Math.max(loaded.nextNumber || 1, ...Object.values(numbers).map((n) => n + 1), 1);
+    lamport = nextLamport(events);
+    reproject();
+    // A migrated v1 file is written back in the new shape at the first
+    // opportunity, so the conversion happens once rather than on every launch.
+    if (loaded.migrated && writable) commit();
   }
 
-  readFresh();
-
   const snapshotText = () =>
-    JSON.stringify({ version: VERSION, projectPath, nextNumber, threads }, null, 2);
+    JSON.stringify(
+      {
+        version: VERSION,
+        projectPath,
+        nextNumber,
+        events,
+        local: { numbers, anchors },
+        shared,
+      },
+      null,
+      2
+    );
 
   /**
    * Put the current state on disk, unless somebody else got there first.
@@ -573,6 +920,36 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     return saved;
   }
 
+  /** Whether this thread's events go to the workspace at all. */
+  const isShared = (threadId) => !!shared.workspaceId && !shared.excluded.includes(threadId);
+
+  /**
+   * Append events, reproject, queue whatever is shareable, and save.
+   *
+   * One door, so there is exactly one place where the log grows and exactly one
+   * place that decides what leaves this machine.
+   */
+  function append(list) {
+    const made = list.filter(Boolean);
+    if (!made.length) return { ok: true };
+    if (events.length + made.length > MAX_EVENTS) {
+      return fail('too_much_history', `This project already has ${MAX_EVENTS} review events.`);
+    }
+    events = orderEvents([...events, ...made]);
+    lamport = nextLamport(events);
+    const outgoing = made.filter((e) => isShared(e.threadId)).map((e) => e.id);
+    if (outgoing.length) shared = { ...shared, pending: [...shared.pending, ...outgoing] };
+    reproject();
+    // A refused write re-reads the file, which puts every one of the fields
+    // above back to what is actually on disk. There is nothing to unwind by
+    // hand, and a hand-rolled undo here would be a second, weaker copy of that.
+    return changed();
+  }
+
+  /** The next event, stamped with this ledger's clock. */
+  const event = (type, threadId, actorFor, payload, at) =>
+    makeEvent({ id: `re_${id()}`, type, threadId, actor: actorFor, payload, lamport: lamport++, at });
+
   /**
    * A review by whatever it was called.
    *
@@ -591,13 +968,20 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     return threads.find((t) => t.number === n) || null;
   };
 
-  const message = (text, authorType, at) => ({
-    id: `rm_${id()}`,
-    authorType: authorOf(authorType),
-    body: text,
-    createdAt: at,
-    editedAt: null,
-  });
+  /** The actor a call is being made as. Defaults to the person at the keyboard. */
+  const actorOf = (given) => {
+    if (given && typeof given === 'object' && given.id && given.kind) return given;
+    if (given === 'agent') return agentActor(DEFAULT_AGENT_NAME);
+    return localActor();
+  };
+
+  const readOnly = () =>
+    fail(
+      'read_only',
+      problem?.kind === 'newer'
+        ? 'These reviews were written by a newer version of Stacki, so this one will not change them. Update Stacki.'
+        : 'The review file cannot be written.'
+    );
 
   /**
    * Every mutation an agent can make, and every one the panel makes, through
@@ -609,16 +993,9 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     if (!ACTIONS.includes(action)) {
       return fail('bad_action', `action must be one of ${ACTIONS.join(', ')}.`);
     }
-    if (!writable) {
-      return fail(
-        'read_only',
-        problem?.kind === 'newer'
-          ? 'These reviews were written by a newer version of Stacki, so this one will not change them. Update Stacki.'
-          : 'The review file cannot be written.'
-      );
-    }
+    if (!writable) return readOnly();
     const at = now();
-    const authorType = authorOf(req.authorType);
+    const who = actorOf(req.actor !== undefined ? req.actor : req.authorType);
 
     if (action === 'create') {
       const text = body(req.message, MAX_BODY);
@@ -629,76 +1006,97 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
       if (threads.length >= MAX_THREADS) {
         return fail('too_many', `This project already has ${MAX_THREADS} reviews.`);
       }
-      const thread = {
-        id: `rt_${id()}`,
-        number: nextNumber++,
-        color: COLORS.includes(req.color) ? req.color : DEFAULT_COLOR,
-        status: 'open',
-        // The human just pointed at it, so it is attached by definition. From
-        // here on the renderer's resolver owns this field.
-        anchorState: 'attached',
-        anchor: req.anchor,
-        creationContext: req.creationContext || {},
-        messages: [message(text, authorType, at)],
-        deferredReason: null,
-        externalRefs: [],
-        createdAt: at,
-        updatedAt: at,
-      };
-      threads = [...threads, thread];
-      // Only true once it is on disk. A refused write puts the ledger back to
-      // what the file says, so this thread no longer exists to return.
-      const saved = changed();
-      if (!saved.ok) return saved;
+      const threadId = `rt_${id()}`;
+      const messageId = `rm_${id()}`;
+      // What the source looked like at this moment, for whoever reads this
+      // review on a tree that is not this one. Never guessed and never
+      // backfilled: a review written before this existed simply has none.
+      const sourceFiles = [...new Set((req.anchor.keys || []).map(fileOfKey).filter(Boolean))];
+      const stamped = req.provenance !== undefined ? req.provenance : provenance.for(sourceFiles);
+      // The human just pointed at it, so it is attached by definition. Set
+      // before the write rather than after it, so a crash cannot leave a
+      // review this machine has never checked marked as unchecked.
+      anchors[threadId] = { anchorState: 'attached', keys: null };
+      const proposed = nextNumber;
+      const created = append([
+        event(
+          'thread.created',
+          threadId,
+          who,
+          {
+            color: COLORS.includes(req.color) ? req.color : DEFAULT_COLOR,
+            anchor: req.anchor,
+            creationContext: req.creationContext || {},
+            provenance: stamped || null,
+            // What the creator calls it. A hint for everybody else — see the
+            // note on nicknames at the top of this file.
+            number: proposed,
+          },
+          at
+        ),
+        event('message.created', threadId, who, { messageId, body: text }, at),
+      ]);
+      if (!created.ok) return created;
+      const thread = find(threadId);
+      if (!thread) return fail('write_failed', 'The comment was not saved.');
       return { ok: true, thread };
     }
 
     const thread = find(str(req.threadId, 100));
     if (!thread) return fail('no_thread', `No review called ${req.threadId || '(none)'}.`);
+    if (thread.messages.length >= MAX_MESSAGES && body(req.message, MAX_BODY)) {
+      return fail('too_many_messages', `This review already has ${MAX_MESSAGES} messages.`);
+    }
 
-    const say = (text) => {
-      if (!text) return true;
-      if (thread.messages.length >= MAX_MESSAGES) return false;
-      thread.messages = [...thread.messages, message(text, authorType, at)];
-      return true;
+    const said = body(req.message, MAX_BODY);
+    const list = [];
+    const say = () => {
+      if (said) list.push(event('message.created', thread.id, who, { messageId: `rm_${id()}`, body: said }, at));
     };
 
     if (action === 'reply') {
-      const text = body(req.message, MAX_BODY);
-      if (!text) return fail('no_message', 'A reply needs something written in it.');
-      if (!say(text)) return fail('too_many_messages', `This review already has ${MAX_MESSAGES} messages.`);
+      if (!said) return fail('no_message', 'A reply needs something written in it.');
+      say();
     } else if (action === 'resolve') {
-      if (!say(body(req.message, MAX_BODY))) {
-        return fail('too_many_messages', `This review already has ${MAX_MESSAGES} messages.`);
-      }
-      thread.status = 'resolved';
+      say();
+      list.push(
+        event(
+          'thread.resolved',
+          thread.id,
+          who,
+          {
+            // Which revision the fix landed on, so somebody whose checkout
+            // predates it is told rather than shown a tick. Absent outside a
+            // repository, which readers treat as "cannot tell".
+            resolvedAtSource: req.resolvedAtSource !== undefined ? req.resolvedAtSource : provenance.stamp(),
+          },
+          at
+        )
+      );
     } else if (action === 'defer') {
-      if (!say(body(req.message, MAX_BODY))) {
-        return fail('too_many_messages', `This review already has ${MAX_MESSAGES} messages.`);
-      }
-      thread.status = 'deferred';
-      const reason = body(req.reason, MAX_REASON);
-      if (reason) thread.deferredReason = reason;
+      say();
       const ref = body(req.externalRef, MAX_REF);
-      // Stored as a string and nothing else. Stacki does not fetch it, does
-      // not parse it, and has never heard of GitHub — the agent that made the
-      // issue is the one with the credentials, and it keeps them.
-      if (ref && !thread.externalRefs.includes(ref) && thread.externalRefs.length < MAX_REFS) {
-        thread.externalRefs = [...thread.externalRefs, ref];
-      }
+      list.push(
+        event(
+          'thread.deferred',
+          thread.id,
+          who,
+          {
+            reason: body(req.reason, MAX_REASON),
+            // Stored as a string and nothing else. Stacki does not fetch it,
+            // does not parse it, and has never heard of GitHub — the agent
+            // that made the issue is the one with the credentials.
+            externalRef: ref,
+          },
+          at
+        )
+      );
     } else if (action === 'reopen') {
-      if (!say(body(req.message, MAX_BODY))) {
-        return fail('too_many_messages', `This review already has ${MAX_MESSAGES} messages.`);
-      }
-      thread.status = 'open';
-      // The reason it was put off no longer applies; the message history still
-      // says it was, and why.
-      thread.deferredReason = null;
+      say();
+      list.push(event('thread.reopened', thread.id, who, {}, at));
     }
 
-    thread.updatedAt = at;
-    threads = threads.map((t) => (t.id === thread.id ? { ...thread } : t));
-    const saved = changed();
+    const saved = append(list);
     if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
@@ -712,14 +1110,13 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
    * having about. Not an edit either — the colour is not part of what was said,
    * so `updatedAt` stays where it is.
    */
-  function setColor(ref, color) {
-    if (!writable) return fail('read_only', 'The review file cannot be written.');
+  function setColor(ref, color, as = null) {
+    if (!writable) return readOnly();
     if (!COLORS.includes(color)) return fail('bad_color', `A colour must be one of ${COLORS.join(', ')}.`);
     const thread = find(str(ref, 100));
     if (!thread) return fail('no_thread', `No review called ${ref || '(none)'}.`);
     if (thread.color === color) return { ok: true, thread: { ...thread } };
-    threads = threads.map((t) => (t.id === thread.id ? { ...t, color } : t));
-    const saved = changed();
+    const saved = append([event('thread.color.changed', thread.id, actorOf(as), { color }, now())]);
     if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
@@ -728,40 +1125,40 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
    * Change the words of something already said.
    *
    * Deliberately not an `apply` action, for the same reason delete is not —
-   * and for one more. A thread is a record of a conversation between a person
-   * and an agent, and an agent rewriting what it said, or what somebody said
-   * to it, is the one edit that makes the record untrustworthy rather than
-   * merely wrong. So this is not reachable from MCP at all.
+   * and for one more. A thread is a record of a conversation between people and
+   * agents, and an agent rewriting what it said, or what somebody said to it,
+   * is the one edit that makes the record untrustworthy rather than merely
+   * wrong. So this is not reachable from MCP at all.
    *
-   * Only what a PERSON wrote can be rewritten. An agent's replies can be
-   * removed — see `removeMessage`, a thread nobody wants to read is a thread
-   * somebody should be able to prune — but they cannot be reworded while
-   * still saying "Agent". Taking words out is visible; putting different ones
-   * in somebody's mouth is not.
+   * Only what YOU wrote can be rewritten. Another person's message is not
+   * yours to reword, and an agent's reply can be removed — see `removeMessage`
+   * — but not made to say something else while still signed with its name.
+   * Taking words out is visible; putting different ones in somebody's mouth is
+   * not. The rule is enforced again when the thread is rebuilt, so an edit
+   * arriving from a peer that ignored it is dropped rather than trusted.
    */
-  function editMessage(threadId, messageId, text) {
-    if (!writable) return fail('read_only', 'The review file cannot be written.');
+  function editMessage(threadId, messageId, text, as = null) {
+    if (!writable) return readOnly();
     const thread = find(str(threadId, 100));
     if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
     const wanted = str(messageId, 100);
-    const message_ = thread.messages.find((m) => m.id === wanted);
-    if (!message_) return fail('no_message_id', 'That comment is not in this review.');
-    if (message_.authorType !== 'human') {
-      return fail('not_yours', 'Only what you wrote can be edited. An agent\u2019s reply can be deleted, not reworded.');
+    const message = thread.messages.find((m) => m.id === wanted);
+    if (!message) return fail('no_message_id', 'That comment is not in this review.');
+    const who = actorOf(as);
+    if (message.actorKind !== 'human') {
+      return fail('not_yours', 'Only what you wrote can be edited. An agent’s reply can be deleted, not reworded.');
+    }
+    if (who.kind !== 'human' || message.actorId !== who.id) {
+      return fail('not_yours', `Only ${message.actorName || 'the person who wrote it'} can reword that comment.`);
     }
     const body_ = body(text, MAX_BODY);
     if (!body_) return fail('no_message', 'A comment needs something written in it.');
-    if (body_ === message_.body) return { ok: true, thread: find(thread.id) };
-    const at = now();
-    const next = {
-      ...thread,
+    if (body_ === message.body) return { ok: true, thread: find(thread.id) };
+    const saved = append([
       // Said out loud, because a message that changed after somebody replied
       // to it is a different thing from one that did not.
-      messages: thread.messages.map((m) => (m.id === wanted ? { ...m, body: body_, editedAt: at } : m)),
-      updatedAt: at,
-    };
-    threads = threads.map((t) => (t.id === thread.id ? next : t));
-    const saved = changed();
+      event('message.edited', thread.id, who, { messageId: wanted, body: body_ }, now()),
+    ]);
     if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
@@ -769,29 +1166,31 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   /**
    * Take one message out of a thread.
    *
-   * Not an `apply` action either: pruning somebody's conversation is a person
-   * tidying their own notes, not a thing an agent gets an opinion about.
+   * Not an `apply` action either: pruning a conversation is a person tidying
+   * notes, not a thing an agent gets an opinion about. Your own words and an
+   * agent's replies; never somebody else's.
    *
-   * The last one cannot go. A review with nothing said in it is not a review —
-   * `reviveThread` drops it on the next read — so deleting the only message
-   * would be deleting the review by accident, on the way to something else.
-   * Deleting the review is its own decision, with its own confirmation.
+   * The last one cannot go. A review with nothing said in it is not a review,
+   * so deleting the only message would be deleting the review by accident, on
+   * the way to something else. Deleting the review is its own decision, with
+   * its own confirmation.
    */
-  function removeMessage(threadId, messageId) {
-    if (!writable) return fail('read_only', 'The review file cannot be written.');
+  function removeMessage(threadId, messageId, as = null) {
+    if (!writable) return readOnly();
     const thread = find(str(threadId, 100));
     if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
     const wanted = str(messageId, 100);
-    if (!thread.messages.some((m) => m.id === wanted)) {
-      return fail('no_message_id', 'That comment is not in this review.');
+    const message = thread.messages.find((m) => m.id === wanted);
+    if (!message) return fail('no_message_id', 'That comment is not in this review.');
+    const who = actorOf(as);
+    if (who.kind !== 'human') return fail('not_yours', 'An agent cannot delete what was said.');
+    if (message.actorKind === 'human' && message.actorId !== who.id) {
+      return fail('not_yours', `Only ${message.actorName || 'the person who wrote it'} can delete that comment.`);
     }
     if (thread.messages.length <= 1) {
       return fail('last_message', 'This is the only thing said in this review. Delete the review itself instead.');
     }
-    const at = now();
-    const next = { ...thread, messages: thread.messages.filter((m) => m.id !== wanted), updatedAt: at };
-    threads = threads.map((t) => (t.id === thread.id ? next : t));
-    const saved = changed();
+    const saved = append([event('message.deleted', thread.id, who, { messageId: wanted }, now())]);
     if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
@@ -802,14 +1201,19 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
    * Deliberately not an `apply` action, so the MCP surface cannot reach it by
    * passing a string. An agent that decides a comment is wrong should resolve
    * it with its reasoning, which leaves the human able to disagree; erasing
-   * their feedback is not a thing it gets to do.
+   * their feedback is not a thing it gets to do — and neither is erasing
+   * somebody else's, which is why this is the thread's own author only.
    */
-  function remove(threadId) {
-    if (!writable) return fail('read_only', 'The review file cannot be written.');
+  function remove(threadId, as = null) {
+    if (!writable) return readOnly();
     const thread = find(str(threadId, 100));
     if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
-    threads = threads.filter((t) => t.id !== thread.id);
-    const saved = changed();
+    const who = actorOf(as);
+    if (who.kind !== 'human') return fail('not_yours', 'An agent cannot delete a review.');
+    if (thread.author.actorKind === 'human' && thread.author.actorId !== who.id) {
+      return fail('not_yours', `This is ${thread.author.actorName || 'somebody else'}’s comment. Reply to it instead.`);
+    }
+    const saved = append([event('thread.deleted', thread.id, who, {}, now())]);
     if (!saved.ok) return saved;
     return { ok: true, thread };
   }
@@ -817,39 +1221,167 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   /**
    * Take the renderer's word for which anchors still resolve.
    *
-   * Only the renderer holds the parsed models, so only it can say. Applied in
-   * a batch and only where something actually differs, so a page load that
-   * confirms what was already known costs no revision and no write.
+   * Only the renderer holds the parsed models, so only it can say. LOCAL, and
+   * never an event: whether markup is still there is a fact about this
+   * checkout, and Bob's tree is not Alice's. Applied in a batch and only where
+   * something actually differs, so a page load that confirms what was already
+   * known costs no revision and no write.
    */
   function syncAnchors(list) {
     if (!Array.isArray(list) || !list.length) return { ok: true, changed: 0 };
+    if (!writable) return readOnly();
     let touched = 0;
-    const next = threads.map((t) => {
-      const update = list.find((u) => u && u.id === t.id);
-      if (!update) return t;
-      const state = ANCHOR_STATES.includes(update.anchorState) ? update.anchorState : t.anchorState;
+    const next = { ...anchors };
+    for (const update of list) {
+      const thread = update && update.id ? threads.find((t) => t.id === update.id) : null;
+      if (!thread) continue;
+      const held = anchors[thread.id] || { anchorState: 'unknown', keys: null };
+      const state = ANCHOR_STATES.includes(update.anchorState) ? update.anchorState : held.anchorState;
       // Re-anchoring. A node that moved — somebody added a section above it —
       // is still the same node, and the renderer has just found it at a new
       // position. Writing that back is what stops the review paying for the
       // search again on every read, and stops it reporting the file:line of
-      // whatever now sits where it used to be.
+      // whatever now sits where it used to be. Local, like the state: it is
+      // where the node is in THIS tree.
       const keys =
-        Array.isArray(update.keys) && update.keys.length && update.keys.join() !== (t.anchor?.keys || []).join()
+        Array.isArray(update.keys) && update.keys.length && update.keys.join() !== (held.keys || []).join()
           ? update.keys
           : null;
-      if (state === t.anchorState && !keys) return t;
+      if (state === held.anchorState && !keys) continue;
       touched++;
-      // Not an edit by anybody, so updatedAt does not move: an anchor going
-      // orphaned because somebody deleted a section is not the review being
-      // worked on, and sorting by "recently updated" should not say it was.
-      return { ...t, anchorState: state, anchor: keys ? { ...t.anchor, keys } : t.anchor };
-    });
+      next[thread.id] = { anchorState: state, keys: keys || held.keys };
+    }
     if (!touched) return { ok: true, changed: 0 };
-    threads = next;
+    anchors = next;
+    reproject();
+    // Not an edit by anybody, so nothing said here moves updatedAt: an anchor
+    // going orphaned because somebody deleted a section is not the review
+    // being worked on, and sorting by "recently updated" should not say it was.
     const saved = changed();
     if (!saved.ok) return saved;
     return { ok: true, changed: touched };
   }
+
+  // --- sharing --------------------------------------------------------------
+
+  /**
+   * Attach this project to a workspace.
+   *
+   * `publishExisting` is the whole of the privacy decision and it is made by a
+   * person, once. Review comments are candid — they are what somebody thinks
+   * about work, often somebody else's — and uploading a project's back
+   * catalogue because a checkbox defaulted to on is not a mistake that can be
+   * taken back. Off means every thread that exists right now stays on this
+   * machine forever; sharing starts from the next comment.
+   */
+  function enableShared({ workspaceId, publishExisting = false } = {}) {
+    if (!writable) return readOnly();
+    const wanted = str(workspaceId, 100);
+    if (!wanted) return fail('no_workspace', 'A workspace id is required.');
+    const existing = threads.map((t) => t.id);
+    shared = {
+      ...EMPTY_SHARED(),
+      workspaceId: wanted,
+      excluded: publishExisting ? [] : existing,
+    };
+    // Everything not excluded goes into the outbox, in ledger order, so a
+    // publish is an ordinary sync rather than a special upload path.
+    shared.pending = events.filter((e) => isShared(e.threadId)).map((e) => e.id);
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, shared: sharedState(), published: existing.length - shared.excluded.length };
+  }
+
+  /**
+   * Stop sharing, and keep everything.
+   *
+   * Local history is not touched: the events stay, the threads stay readable,
+   * and what was already published stays published — this machine simply stops
+   * talking to the workspace. Anything else would make turning it off a
+   * destructive act, which is not a choice anybody should have to weigh.
+   */
+  function disableShared() {
+    if (!writable) return readOnly();
+    shared = EMPTY_SHARED();
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, shared: sharedState() };
+  }
+
+  const sharedState = () => ({
+    workspaceId: shared.workspaceId,
+    cursor: shared.cursor,
+    lastSyncAt: shared.lastSyncAt,
+    problem: shared.problem,
+    pending: shared.pending.length,
+    excluded: shared.excluded.length,
+  });
+
+  /** The events waiting to be sent, oldest first, in bounded batches. */
+  function pendingEvents(limit = 200) {
+    const wanted = new Set(shared.pending);
+    return events.filter((e) => wanted.has(e.id)).slice(0, Math.max(1, Math.min(Number(limit) || 200, 500)));
+  }
+
+  /** The workspace has them. */
+  function ackPushed(ids) {
+    const done = new Set((Array.isArray(ids) ? ids : []).filter(Boolean));
+    if (!done.size) return { ok: true, changed: 0 };
+    const before = shared.pending.length;
+    shared = { ...shared, pending: shared.pending.filter((eventId) => !done.has(eventId)) };
+    if (shared.pending.length === before) return { ok: true, changed: 0 };
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, changed: before - shared.pending.length };
+  }
+
+  /**
+   * Take in events from the workspace.
+   *
+   * A union by id, so duplicate delivery is a no-op and out-of-order delivery
+   * does not matter: the fold sorts. Nothing local is dropped and nothing
+   * remote is dropped — the set only ever grows, which is the property that
+   * makes "no lost event" a fact about the data structure rather than a promise
+   * about the network code.
+   */
+  function receiveEvents(incoming, { cursor = null, at = null } = {}) {
+    if (!writable) return readOnly();
+    const clean = (Array.isArray(incoming) ? incoming : []).map(reviveEvent).filter(Boolean);
+    const { events: merged, added } = unionEvents(events, clean);
+    if (merged.length > MAX_EVENTS) {
+      return fail('too_much_history', `This project already has ${MAX_EVENTS} review events.`);
+    }
+    const movedCursor = Number.isInteger(cursor) && cursor !== shared.cursor;
+    if (!added && !movedCursor && at == null) return { ok: true, added: 0 };
+    events = merged;
+    lamport = nextLamport(events);
+    // An event that arrived from the workspace was, by definition, already
+    // there — it never goes into the outbox.
+    if (added) {
+      // Anything that came back from the workspace is, by definition, already
+      // there — it leaves the outbox even if this machine is what put it there.
+      const arrived = new Set(clean.map((e) => e.id));
+      shared = { ...shared, pending: shared.pending.filter((eventId) => !arrived.has(eventId)) };
+    }
+    if (movedCursor) shared = { ...shared, cursor };
+    if (at != null) shared = { ...shared, lastSyncAt: at, problem: null };
+    reproject();
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, added };
+  }
+
+  /** Why the last synchronisation did not work, for the panel to say out loud. */
+  function setSyncProblem(kind, detail = null) {
+    const next = kind ? { kind: String(kind).slice(0, 60), detail: detail ? String(detail).slice(0, 300) : null } : null;
+    if (JSON.stringify(next) === JSON.stringify(shared.problem)) return { ok: true };
+    shared = { ...shared, problem: next };
+    return changed();
+  }
+
+  // Everything above is a definition; this is the line that opens the ledger.
+  // It runs here rather than earlier because it calls half of them.
+  readFresh();
 
   return {
     file,
@@ -875,12 +1407,30 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     get size() {
       return threads.length;
     },
+    /** The whole log, in the one order. Copies. */
+    allEvents() {
+      return events.map((e) => JSON.parse(JSON.stringify(e)));
+    },
+    get actor() {
+      return localActor();
+    },
     apply,
     remove,
     setColor,
     editMessage,
     removeMessage,
     syncAnchors,
+    // sharing
+    get shared() {
+      return sharedState();
+    },
+    isShared,
+    enableShared,
+    disableShared,
+    pendingEvents,
+    ackPushed,
+    receiveEvents,
+    setSyncProblem,
     /**
      * Nothing is ever waiting: every mutation is on disk before it answers.
      *
@@ -912,6 +1462,16 @@ const excerptOf = (text) => {
   return line.length > EXCERPT ? `${line.slice(0, EXCERPT - 1)}…` : line;
 };
 
+/** An actor as it goes on the wire: every field present, always. */
+const wireActor = (who) =>
+  who && typeof who === 'object'
+    ? {
+        actorId: who.actorId ?? null,
+        actorKind: who.actorKind === 'agent' ? 'agent' : 'human',
+        actorName: who.actorName ?? null,
+      }
+    : null;
+
 /**
  * A review in one row.
  *
@@ -934,6 +1494,10 @@ function summarize(thread) {
     message: excerptOf(first?.body),
     replies: Math.max(0, thread.messages.length - 1),
     lastAuthor: last?.authorType || 'human',
+    // Who left it. On a shared thread this is the difference between "your
+    // comment" and "Alice's comment", which is most of what makes a shared
+    // thread readable at all.
+    author: wireActor(thread.author) || { actorId: null, actorKind: 'human', actorName: null },
     page: thread.anchor?.page?.route || thread.anchor?.page?.file || null,
     breakpoint: thread.anchor?.breakpoint?.device || null,
     source: fileOfKey(leafKey(thread.anchor?.keys)),
@@ -943,13 +1507,6 @@ function summarize(thread) {
   };
 }
 
-/**
- * Everything about one review.
- *
- * `resolveSource(keys)` answers with the CURRENT file:line trail for the
- * anchor — the same resolver ⇧⌘C and get_context use. Injected because it
- * costs a parse per file and only a full read is worth spending it on.
- */
 /**
  * The anchor as it goes on the wire: every field present, always.
  *
@@ -997,7 +1554,43 @@ function wireFingerprint(fp) {
   };
 }
 
-function detail(thread, resolveSource) {
+/** Provenance on the wire, every field present. Null when the review has none. */
+function wireProvenance(p) {
+  if (!p || typeof p !== 'object') return null;
+  const files = {};
+  for (const [file, hash] of Object.entries(p.files || {})) {
+    if (typeof file === 'string' && typeof hash === 'string') files[file] = hash;
+  }
+  return {
+    head: typeof p.head === 'string' ? p.head : null,
+    branch: typeof p.branch === 'string' ? p.branch : null,
+    dirty: typeof p.dirty === 'boolean' ? p.dirty : null,
+    files,
+  };
+}
+
+/** A recorded source position, every field present. Null when there is none. */
+const wireStamp = (s) =>
+  s && typeof s === 'object'
+    ? {
+        head: typeof s.head === 'string' ? s.head : null,
+        branch: typeof s.branch === 'string' ? s.branch : null,
+        dirty: typeof s.dirty === 'boolean' ? s.dirty : null,
+      }
+    : null;
+
+/**
+ * Everything about one review.
+ *
+ * `resolveSource(keys)` answers with the CURRENT file:line trail for the
+ * anchor — the same resolver ⇧⌘C and get_context use. Injected because it
+ * costs a parse per file and only a full read is worth spending it on.
+ *
+ * `checkout` says how this review stands against the tree that is actually
+ * here — see checkout.js. Injected for the same reason: it costs git calls,
+ * and a panel that is redrawing a filter does not need them.
+ */
+function detail(thread, resolveSource, checkoutOf = null) {
   const trail = (typeof resolveSource === 'function' ? resolveSource(thread.anchor?.keys) : null) || null;
   const all = thread.messages || [];
   const omitted = Math.max(0, all.length - MAX_DETAIL_MESSAGES);
@@ -1010,6 +1603,8 @@ function detail(thread, resolveSource) {
     messages: (omitted ? all.slice(-MAX_DETAIL_MESSAGES) : all).map((m) => ({
       id: m.id,
       authorType: m.authorType,
+      actorId: m.actorId ?? null,
+      actorName: m.actorName ?? null,
       body: m.body,
       createdAt: m.createdAt,
       editedAt: m.editedAt ?? null,
@@ -1021,6 +1616,13 @@ function detail(thread, resolveSource) {
     externalRefs: thread.externalRefs || [],
     anchor: wireAnchor(thread.anchor, trail),
     creationContext: thread.creationContext || {},
+    // What the source looked like when it was written. Null for every review
+    // from before this existed.
+    provenance: wireProvenance(thread.provenance),
+    // And where it stood when somebody called it done.
+    resolvedAtSource: wireStamp(thread.resolvedAtSource),
+    resolvedBy: wireActor(thread.resolvedBy),
+    checkout: (typeof checkoutOf === 'function' ? checkoutOf(thread) : null) || null,
   };
 }
 
@@ -1063,12 +1665,12 @@ function selectThreads(threads, { status = 'open', scope = 'project', page = nul
  * A caller that built the list itself would be a second implementation of the
  * answer, which is where the size cap would quietly stop applying.
  */
-function project(picked, { detail: level = 'summary', resolver = null } = {}) {
+function project(picked, { detail: level = 'summary', resolver = null, checkout = null } = {}) {
   const reviews = [];
   let bytes = 0;
   let overBudget = false;
   for (const thread of picked.threads) {
-    const one = level === 'full' ? detail(thread, resolver) : summarize(thread);
+    const one = level === 'full' ? detail(thread, resolver, checkout) : summarize(thread);
     bytes += JSON.stringify(one).length;
     // The first review always goes in, however large — an answer with nothing
     // in it would be worse than a big one.
@@ -1099,6 +1701,10 @@ module.exports = {
   loadFile,
   writeAtomic,
   reviveThread,
+  eventsFromLegacy,
+  wireProvenance,
+  wireStamp,
+  wireActor,
   VERSION,
   STATUSES,
   COLORS,
@@ -1106,12 +1712,14 @@ module.exports = {
   ANCHOR_STATES,
   ACTIONS,
   AUTHORS,
+  EVENT_TYPES,
   MAX_BODY,
   MAX_REASON,
   MAX_REF,
   MAX_REFS,
   MAX_MESSAGES,
   MAX_THREADS,
+  MAX_EVENTS,
   MAX_DETAIL_MESSAGES,
   MAX_RESPONSE_BYTES,
   EXCERPT,
