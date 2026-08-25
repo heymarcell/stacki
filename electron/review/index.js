@@ -2,21 +2,29 @@
 //
 // The store is a file and a list; this is the part that knows there is an app
 // around it — which project is open, which window to tell when something
-// changes, and how to ask the canvas to go and look at something.
+// changes, how to ask the canvas to go and look at something, and (since
+// Shared Reviews) which workspace this project belongs to and when to catch up
+// with it.
 //
 // It is one module with one live store because there is one window with one
-// project open in it. Two callers reach it: the renderer, over a small IPC
+// project open in it. Three callers reach it: the renderer, over a small IPC
 // surface that can only name a review by id (it never gets to name a file, so
-// no path from the renderer can read or write anywhere in userData), and the
-// MCP tools, over the same methods. Both go through the store's single `apply`,
-// so the panel and an agent cannot drift into meaning different things by
-// "resolve".
+// no path from the renderer can read or write anywhere in userData), the MCP
+// tools, over the same methods, and the syncer. All of them go through the
+// store's single `apply`, so the panel, an agent and another person's machine
+// cannot drift into meaning different things by "resolve".
 //
 // `focus` is the one operation that is not about stored state at all: it asks
 // the live app to navigate somewhere. That goes over the renderer round-trip
 // the MCP server already has, because the alternative — main-process code
 // reaching into React state — is the thing the existing architecture is
 // carefully not doing.
+//
+// WHAT AN AGENT CANNOT DO HERE, restated because sharing widens the blast
+// radius of getting it wrong: it cannot create a workspace, make an invitation,
+// join anything, change a server address, or read a credential. Those are
+// human actions in the app's own window. MCP gets the same five review verbs
+// it always had.
 
 const { ipcMain } = require('electron');
 
@@ -27,9 +35,22 @@ const {
   summarize,
   detail,
   fileFor,
+  scopeKey,
   MAX_RESPONSE_BYTES,
 } = require('./store');
 const { anchorFrom } = require('./anchor');
+const { createCheckout } = require('./checkout');
+const { localActor, setLocalName, suggestName, agentActor, displayName } = require('./actors');
+const { createWorkspaces } = require('./workspaces');
+const { createSyncer } = require('./sync');
+const {
+  createWorkspace: createRemoteWorkspace,
+  joinWorkspace: joinRemoteWorkspace,
+  createTransport,
+  packInvite,
+  unpackInvite,
+} = require('./transport');
+const { remoteHint, git } = require('./provenance');
 
 // Focusing a review can mean loading a page, drilling into two components and
 // waiting for the canvas to scroll. The context questions get 4 seconds; this
@@ -42,6 +63,18 @@ let userData = null;
 let projectPath = null;
 let sendToWindow = null;
 let registered = false;
+let checkout = null;
+let registry = null;
+let syncer = null;
+// This installation's own person, and the project's normalized remote. Both
+// cost a file read or a `git` call, and `list` runs on every notification and
+// every filter change — so they are worked out once per project rather than
+// once per read.
+let identityCache = null;
+let hintCache = null;
+// The workspace this project belongs to, credential and all. Never leaves the
+// main process: `publicOf` is what the renderer gets.
+let workspace = null;
 
 // Handed over by the MCP wiring, which already owns both.
 let ask = null;
@@ -58,6 +91,13 @@ function announce(revision) {
   }
 }
 
+/** This installation's own person, made on first need and then kept. */
+function me() {
+  if (!userData) return null;
+  if (!identityCache) identityCache = localActor(userData, { suggest: () => suggestName({ run: git, projectPath }) });
+  return identityCache;
+}
+
 /** The project's ledger, opened (or started) for the project now on screen. */
 function openProject(next) {
   const resolved = next || null;
@@ -66,12 +106,29 @@ function openProject(next) {
   // The previous project's last write must land before its store is dropped.
   store?.flushSync();
   projectPath = resolved;
+  checkout = createCheckout({ projectPath: resolved });
+  syncer?.reset();
+  // A hint and nothing else — see workspaces.js. Read once here rather than on
+  // every list, because it is two `git` calls.
+  hintCache = remoteHint(resolved);
+  workspace = registry ? registry.forProject(scopeKey(resolved)) : null;
+  const actor = me();
   store = createReviewStore({
     file: fileFor(userData, resolved),
     projectPath: resolved,
+    actor,
     onChange: announce,
   });
+  // The ledger and the registry can disagree — a workspace forgotten while the
+  // project was closed, say. The registry is the one holding the credential,
+  // so it decides, and the ledger is told to stop sharing rather than left
+  // queueing events nothing will ever send.
+  if (store.shared.workspaceId && !workspace) store.disableShared();
   announce(store.revision);
+  // Opening a shared project is one of the three moments this app talks to a
+  // server. It is deliberately not awaited: the panel shows what is on disk
+  // immediately and grows the rest when it arrives.
+  if (workspace) void syncNow('open');
   return store;
 }
 
@@ -80,6 +137,10 @@ function closeProject() {
   store?.flushSync();
   store = null;
   projectPath = null;
+  checkout = null;
+  workspace = null;
+  hintCache = null;
+  syncer?.reset();
   announce(0);
 }
 
@@ -109,7 +170,18 @@ function list({
   // by the client's own validation, which turns "no project is open" into an
   // unreadable protocol failure.
   if (!store) {
-    return { ...noProject(), status, scope, reviews: [], total: 0, returned: 0, truncated: false, revision: 0, problem: null };
+    return {
+      ...noProject(),
+      status,
+      scope,
+      reviews: [],
+      total: 0,
+      returned: 0,
+      truncated: false,
+      revision: 0,
+      problem: null,
+      shared: sharedStatus(),
+    };
   }
   const picked = selectThreads(store.all(), { status, scope, page, keys, limit });
   return {
@@ -121,7 +193,17 @@ function list({
     // file could not be read does not look like a project nobody has
     // commented on.
     problem: store.problem || null,
-    ...project(picked, { detail: level, resolver: withSource === false ? null : resolveTrail }),
+    // Whether this project is shared, with whom, and how the last catch-up
+    // went. Always present, so a client never has to ask twice.
+    shared: sharedStatus(),
+    ...project(picked, {
+      detail: level,
+      resolver: withSource === false ? null : resolveTrail,
+      // How each review stands against THIS working copy — a different
+      // question from what the review says, and the one that stops a shared
+      // "resolved" from being read as "fixed on your screen".
+      checkout: level === 'full' && checkout ? (thread) => checkout.forThread(thread) : null,
+    }),
   };
 }
 
@@ -136,9 +218,10 @@ function list({
  */
 function act(input = {}) {
   if (!store) return noProject();
+  const withActor = { ...input, actor: input.actor || (input.authorType === 'agent' ? agentActor(agentName()) : me()) };
   if (input.action !== 'create') {
-    const result = store.apply(input);
-    return result.ok ? { ...result, review: detail(result.thread, resolveTrail), revision: store.revision } : result;
+    const result = store.apply(withActor);
+    return result.ok ? { ...result, review: reviewOf(result.thread), revision: store.revision } : result;
   }
 
   // What the comment is about. An agent's `create` means the live selection,
@@ -164,43 +247,48 @@ function act(input = {}) {
   const result = store.apply({
     action: 'create',
     message: input.message,
-    authorType: input.authorType,
+    actor: withActor.actor,
     anchor: built.anchor,
     creationContext: built.creationContext,
   });
-  return result.ok ? { ...result, review: detail(result.thread, resolveTrail), revision: store.revision } : result;
+  return result.ok ? { ...result, review: reviewOf(result.thread), revision: store.revision } : result;
 }
+
+/** One review, in full, with everything this checkout can say about it. */
+const reviewOf = (thread) =>
+  thread ? detail(thread, resolveTrail, checkout ? (t) => checkout.forThread(t) : null) : null;
 
 /** A person colouring their own notes. Never reachable from MCP — see the store. */
 function recolor(threadId, color) {
   if (!store) return noProject();
-  const result = store.setColor(threadId, color);
-  return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
+  const result = store.setColor(threadId, color, me());
+  return result.ok ? { ok: true, review: reviewOf(result.thread), revision: store.revision } : result;
 }
 
 /**
  * A person rewording what they wrote. Never reachable from MCP — see the store.
  *
  * Only their own messages, and only from the panel: an agent that could
- * rewrite the conversation is an agent whose record of it means nothing.
+ * rewrite the conversation is an agent whose record of it means nothing, and
+ * one person rewriting another's is worse.
  */
 function editMessage({ threadId, messageId, message } = {}) {
   if (!store) return noProject();
-  const result = store.editMessage(threadId, messageId, message);
-  return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
+  const result = store.editMessage(threadId, messageId, message, me());
+  return result.ok ? { ok: true, review: reviewOf(result.thread), revision: store.revision } : result;
 }
 
 /** A person pruning their own thread. Never reachable from MCP — see the store. */
 function removeMessage({ threadId, messageId } = {}) {
   if (!store) return noProject();
-  const result = store.removeMessage(threadId, messageId);
-  return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
+  const result = store.removeMessage(threadId, messageId, me());
+  return result.ok ? { ok: true, review: reviewOf(result.thread), revision: store.revision } : result;
 }
 
 /** A human deleting their own note. Never reachable from MCP — see the store. */
 function remove(threadId) {
   if (!store) return noProject();
-  const result = store.remove(threadId);
+  const result = store.remove(threadId, me());
   return result.ok ? { ok: true, id: threadId, revision: store.revision } : result;
 }
 
@@ -208,6 +296,188 @@ function remove(threadId) {
 function syncAnchors(list_) {
   if (!store) return noProject();
   return { ...store.syncAnchors(list_), revision: store.revision };
+}
+
+// --- sharing -----------------------------------------------------------------
+
+/**
+ * Which agent is speaking.
+ *
+ * The MCP client says who it is at initialize, and in the stateless transport
+ * this server uses that happens on a different request from the tool call — so
+ * it is read when it is there and fallen back on when it is not. Never
+ * invented as a person: an unnamed agent is "AI Agent", not you.
+ */
+let agentNameHint = null;
+const agentName = () =>
+  displayName(agentNameHint || process.env.STACKI_AGENT_NAME || null, 'AI Agent');
+
+/** Whatever the MCP layer learned about who is connected. */
+function noteAgent(name) {
+  const shown = displayName(name, '');
+  if (shown) agentNameHint = shown;
+}
+
+/** What the panel shows in its Shared Reviews strip. Never a credential. */
+function sharedStatus() {
+  const ledger = store ? store.shared : null;
+  const who = userData ? me() : null;
+  return {
+    enabled: !!(ledger?.workspaceId && workspace),
+    workspace: registry && workspace ? registry.publicOf(workspace) : null,
+    lastSyncAt: ledger?.lastSyncAt ?? null,
+    problem: ledger?.problem ?? null,
+    // How much has not left this machine yet. The honest measure of "am I
+    // caught up", and the thing that makes offline visible rather than silent.
+    pending: ledger?.pending ?? 0,
+    // Threads deliberately kept off the workspace when sharing was enabled.
+    private: ledger?.excluded ?? 0,
+    syncing: !!syncer?.busy,
+    identity: who ? { actorId: who.id, displayName: who.displayName } : null,
+    // A workspace this repository might already belong to. A suggestion for a
+    // person to look at and nothing else — see workspaces.js.
+    suggestion: !ledger?.workspaceId && registry && projectPath ? registry.suggestFor(hintCache) : null,
+  };
+}
+
+/** Catch up with the workspace, if there is one. */
+async function syncNow(reason = 'manual') {
+  if (!store) return noProject();
+  if (!workspace || !store.shared.workspaceId) {
+    return { ok: true, skipped: 'not_shared', shared: sharedStatus() };
+  }
+  const result = await syncer.sync({ store, workspace, reason });
+  announce(store.revision);
+  return { ...result, shared: sharedStatus() };
+}
+
+/**
+ * Start a workspace for this project.
+ *
+ * `publishExisting` is the privacy question and it is asked, not assumed. See
+ * the store's `enableShared`: off means every comment written before this
+ * moment stays on this machine forever.
+ */
+async function enableShared({ server, signupToken, displayName: shown, publishExisting = false } = {}) {
+  if (!store || !projectPath) return noProject();
+  const actor = me();
+  if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to share as.' };
+  const hint = hintCache;
+  const made = await createRemoteWorkspace({
+    baseUrl: server,
+    signupToken,
+    displayName: shown || null,
+    repositoryHint: hint,
+    actor,
+  });
+  if (!made.ok) return made;
+  const remembered = registry.remember({
+    id: made.workspace.id,
+    server: made.server,
+    token: made.credential.token,
+    displayName: made.workspace.displayName,
+    memberId: made.credential.memberId,
+    actorId: made.credential.actorId,
+    repositoryHint: hint,
+  });
+  if (!remembered) return { ok: false, code: 'not_stored', message: 'Stacki could not store that workspace.' };
+  registry.link(scopeKey(projectPath), remembered.id);
+  workspace = remembered;
+  const turned = store.enableShared({ workspaceId: remembered.id, publishExisting });
+  if (!turned.ok) return turned;
+  const synced = await syncNow('enable');
+  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+}
+
+/** Accept an invitation to somebody else's workspace, for this project. */
+async function joinShared({ invite, publishExisting = false } = {}) {
+  if (!store || !projectPath) return noProject();
+  const actor = me();
+  if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to join as.' };
+  const unpacked = unpackInvite(invite);
+  if (!unpacked) return { ok: false, code: 'bad_invite', message: 'That invitation could not be read.' };
+  const joined = await joinRemoteWorkspace({ baseUrl: unpacked.server, invite: unpacked.invite, actor });
+  if (!joined.ok) return joined;
+  const remembered = registry.remember({
+    id: joined.workspace.id,
+    server: joined.server,
+    token: joined.credential.token,
+    displayName: joined.workspace.displayName,
+    memberId: joined.credential.memberId,
+    actorId: joined.credential.actorId,
+    repositoryHint: joined.workspace.repositoryHint,
+  });
+  if (!remembered) return { ok: false, code: 'not_stored', message: 'Stacki could not store that workspace.' };
+  registry.link(scopeKey(projectPath), remembered.id);
+  workspace = remembered;
+  const turned = store.enableShared({ workspaceId: remembered.id, publishExisting });
+  if (!turned.ok) return turned;
+  const synced = await syncNow('join');
+  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+}
+
+/**
+ * Stop sharing this project.
+ *
+ * The local review history is untouched — every comment stays readable, and
+ * what was already published stays published. Only the link and this project's
+ * outbox go. Anything else would make turning it off a destructive act.
+ */
+function disableShared() {
+  if (!store || !projectPath) return noProject();
+  registry.unlink(scopeKey(projectPath));
+  workspace = null;
+  const turned = store.disableShared();
+  if (!turned.ok) return turned;
+  return { ok: true, shared: sharedStatus() };
+}
+
+/** A single-use way in for one more person. A human action, never an MCP one. */
+async function createInvite({ ttlMs = null } = {}) {
+  if (!store || !workspace) {
+    return { ok: false, code: 'not_shared', message: 'This project is not sharing its comments.' };
+  }
+  const transport = createTransport({
+    kind: 'http',
+    baseUrl: workspace.server,
+    token: workspace.token,
+    workspaceId: workspace.id,
+  });
+  try {
+    const made = await transport.createInvite({ ttlMs });
+    if (!made.ok) return made;
+    // One string to paste, carrying the server it belongs to — so joining is
+    // never something Stacki works out from a git remote.
+    return { ok: true, invite: packInvite({ server: made.server, invite: made.invite }), expiresAt: made.expiresAt };
+  } finally {
+    transport.close();
+  }
+}
+
+/** Who this installation is, and what to call them. */
+function identity() {
+  const actor = me();
+  return actor
+    ? { ok: true, actorId: actor.id, displayName: actor.displayName, suggested: suggestName({ run: git, projectPath }) }
+    : { ok: false, code: 'no_identity', message: 'Stacki has nowhere to keep an identity.' };
+}
+
+/**
+ * Rename yourself.
+ *
+ * The id does not move. That is the whole point of having one: a name is
+ * presentation, and changing it must not orphan everything already signed with
+ * it. Events already written keep the name they were written under, which is
+ * the honest record of what a thread said at the time.
+ */
+function setIdentity({ displayName: shown } = {}) {
+  if (!userData) return { ok: false, code: 'no_identity', message: 'Stacki has nowhere to keep an identity.' };
+  me();
+  const renamed = setLocalName(userData, shown);
+  if (!renamed) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to rename.' };
+  identityCache = renamed;
+  announce(store?.revision || 0);
+  return { ok: true, actorId: renamed.id, displayName: renamed.displayName };
 }
 
 /**
@@ -245,9 +515,9 @@ async function focus(threadId) {
   // those down as `orphaned` would mean that merely looking at a review could
   // mark it lost, which is a read damaging what it read.
   if (answer.anchorState && !answer.transient) {
-    syncAnchors([{ id: threadId, anchorState: answer.anchorState, keys: answer.keys }]);
+    syncAnchors([{ id: thread.id, anchorState: answer.anchorState, keys: answer.keys }]);
   }
-  const after = store.get(threadId) || thread;
+  const after = store.get(thread.id) || thread;
   return {
     ok: answer.anchorState === 'attached',
     // A transient failure is not an orphan, and an agent that treated it as one
@@ -261,7 +531,7 @@ async function focus(threadId) {
       occurrence: !!answer.restored?.occurrence,
     },
     note: answer.note || null,
-    review: detail(after, resolveTrail),
+    review: reviewOf(after),
     revision: store.revision,
   };
 }
@@ -273,11 +543,14 @@ async function focus(threadId) {
  *
  * Deliberately narrow. Nothing here takes a path: the file a review lives in is
  * derived from the project the main process has open, so a renderer cannot ask
- * this to read or write anywhere else in userData.
+ * this to read or write anywhere else in userData. The sharing channels take a
+ * server address and an invitation, which are the two things a person types.
  */
 function start({ userDataPath, send }) {
   userData = userDataPath;
   sendToWindow = send || null;
+  registry = registry || createWorkspaces({ userDataPath });
+  syncer = syncer || createSyncer();
   if (registered) return;
   registered = true;
 
@@ -288,9 +561,18 @@ function start({ userDataPath, send }) {
   ipcMain.handle('reviews:editMessage', (_e, args) => editMessage(args || {}));
   ipcMain.handle('reviews:removeMessage', (_e, args) => removeMessage(args || {}));
   ipcMain.handle('reviews:syncAnchors', (_e, args) => syncAnchors(args));
+  // Sharing. Every one of these is something a person did in the window.
+  ipcMain.handle('reviews:shared', () => ({ ok: true, shared: sharedStatus() }));
+  ipcMain.handle('reviews:sync', (_e, args) => syncNow(args?.reason || 'manual'));
+  ipcMain.handle('reviews:sharedEnable', (_e, args) => enableShared(args || {}));
+  ipcMain.handle('reviews:sharedJoin', (_e, args) => joinShared(args || {}));
+  ipcMain.handle('reviews:sharedDisable', () => disableShared());
+  ipcMain.handle('reviews:sharedInvite', (_e, args) => createInvite(args || {}));
+  ipcMain.handle('reviews:identity', () => identity());
+  ipcMain.handle('reviews:setIdentity', (_e, args) => setIdentity(args || {}));
 }
 
-/** The MCP wiring, handing over the two things only it has. */
+/** The MCP wiring, handing over the things only it has. */
 function attach(parts = {}) {
   if (typeof parts.ask === 'function') ask = parts.ask;
   if (typeof parts.readPayload === 'function') readPayload = parts.readPayload;
@@ -316,6 +598,17 @@ module.exports = {
   syncAnchors,
   focus,
   flushSync,
+  // sharing
+  sharedStatus,
+  syncNow,
+  enableShared,
+  joinShared,
+  disableShared,
+  createInvite,
+  identity,
+  setIdentity,
+  noteAgent,
+  agentName,
   FOCUS_TIMEOUT_MS,
   MAX_RESPONSE_BYTES,
 };

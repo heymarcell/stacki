@@ -696,9 +696,38 @@ const rawPost = (hostHeader, body) =>
       status,
       scope,
       problem: ledger.problem || null,
-      ...projectReviews(picked, { detail: level, resolver: fakeTrail }),
+      // What the service always sends: whether these comments are shared, and
+      // how the last catch-up went. Present here so the declared schema is
+      // exercised with it rather than only without it.
+      shared: {
+        enabled: true,
+        workspace: { id: 'ws-1', server: 'http://127.0.0.1:43822', displayName: 'lenuri-web', actorId: 'a-1', repositoryHint: null, joinedAt: 1 },
+        lastSyncAt: 1700000000000,
+        problem: null,
+        pending: 0,
+        private: 0,
+        syncing: false,
+        identity: { actorId: 'a-1', displayName: 'Alice' },
+        suggestion: null,
+      },
+      ...projectReviews(picked, { detail: level, resolver: fakeTrail, checkout: () => CHECKOUT }),
     };
   };
+  // How this checkout stands against each review. A fixed answer here: the
+  // states themselves are checked against real repositories in
+  // test/review-checkout.js — what matters at this boundary is that the field
+  // is declared, sent and accepted.
+  const CHECKOUT = {
+    branch: 'main',
+    head: 'abc1234',
+    dirty: false,
+    origin: { branch: 'main', head: 'abc1234', dirty: false },
+    sameBranch: true,
+    originIn: 'present',
+    source: 'same',
+    resolution: null,
+  };
+
   const comment = async (args) => {
     if (args.action === 'focus') {
       const thread = ledger.get(args.threadId);
@@ -711,7 +740,7 @@ const rawPost = (hostHeader, body) =>
         restored: focusAnswer.restored,
         note: focusAnswer.note || null,
         revision: ledger.revision,
-        review: reviewDetail(ledger.get(args.threadId), fakeTrail),
+        review: reviewDetail(ledger.get(args.threadId), fakeTrail, () => CHECKOUT),
       };
     }
     if (args.action === 'create') {
@@ -721,12 +750,12 @@ const rawPost = (hostHeader, body) =>
       }
       const made = ledger.apply({ action: 'create', message: args.message, authorType: 'agent', anchor: built.anchor, creationContext: built.creationContext });
       return made.ok
-        ? { ok: true, revision: ledger.revision, review: reviewDetail(made.thread, fakeTrail), code: null, message: null }
+        ? { ok: true, revision: ledger.revision, review: reviewDetail(made.thread, fakeTrail, () => CHECKOUT), code: null, message: null }
         : { ...made, revision: ledger.revision, review: null };
     }
     const done = ledger.apply({ ...args, authorType: 'agent' });
     return done.ok
-      ? { ok: true, revision: ledger.revision, review: reviewDetail(done.thread, fakeTrail), code: null, message: null }
+      ? { ok: true, revision: ledger.revision, review: reviewDetail(done.thread, fakeTrail, () => CHECKOUT), code: null, message: null }
       : { ...done, revision: ledger.revision, review: null };
   };
 
@@ -1074,13 +1103,41 @@ const rawPost = (hostHeader, body) =>
     // request, no client, no credentials. Checked against the source rather
     // than by watching the network, because the failure to catch is somebody
     // adding a "just validate the URL" fetch later.
-    const reviewSource = ['electron/mcp/reviewTools.js', 'electron/review/store.js', 'electron/review/index.js', 'electron/review/anchor.js']
-      .map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8'))
-      .join('\n');
-    check('nothing in Visual Review makes a request', !/\bfetch\s*\(|https?\.request|XMLHttpRequest|axios/.test(reviewSource));
+    const reviewFiles = ['electron/mcp/reviewTools.js', 'electron/review/store.js', 'electron/review/index.js', 'electron/review/anchor.js', 'electron/review/events.js'];
+    const reviewSource = reviewFiles.map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8')).join('\n');
+    check('nothing on the review path makes a request', !/\bfetch\s*\(|https?\.request|XMLHttpRequest|axios/.test(reviewSource));
     check('nor requires a network client', !/require\('node:https'\)|require\('https'\)|require\('node:http'\)/.test(reviewSource));
     check('nor has GitHub credentials anywhere near it', !/octokit|api\.github\.com|GITHUB_TOKEN|gh auth/i.test(reviewSource));
     check('nor runs anything', !/child_process|execFile|spawn\(/.test(reviewSource));
+
+    // Since Shared Reviews there IS a network in this feature, and the shape
+    // of that is worth pinning down: exactly one module reaches one, it is
+    // reached only through the syncer, and the syncer refuses before it builds
+    // a transport when the project is not shared. So the guarantee "a project
+    // nobody shared makes no request" is a property of the code rather than a
+    // promise about it — test/shared-reviews.js counts the requests.
+    const transport = fs.readFileSync(path.join(__dirname, '..', 'electron', 'review', 'transport.js'), 'utf8');
+    check('exactly one review module talks to a network', /globalThis\.fetch/.test(transport));
+    const sync = fs.readFileSync(path.join(__dirname, '..', 'electron', 'review', 'sync.js'), 'utf8');
+    check('and it is only ever built by the syncer', /makeTransport = createTransport/.test(sync));
+    check('which refuses before building one at all', /if \(!store \|\| !store\.shared\?\.workspaceId \|\| !workspace\)/.test(sync));
+
+    // And none of it is reachable from MCP. An agent that could create a
+    // workspace, mint an invitation or point Stacki at another server would be
+    // an agent that could publish somebody's private comments.
+    const toolSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'mcp', 'reviewTools.js'), 'utf8');
+    for (const forbidden of ['enableShared', 'joinShared', 'disableShared', 'createInvite', 'syncNow', 'setIdentity']) {
+      check(`no MCP tool reaches ${forbidden}`, !new RegExp(`\\b${forbidden}\\b`).test(toolSource), forbidden);
+    }
+    // The surest form of it: this file is a description of a surface and takes
+    // its implementations as arguments, so it cannot reach the registry, the
+    // transport or the syncer whatever anybody writes into it later.
+    check(
+      'the MCP surface requires nothing from the review modules at all',
+      !/require\(\s*'[^']*review\//.test(toolSource),
+      (toolSource.match(/require\([^)]*\)/g) || []).join()
+    );
+    check('and the tool surface did not grow to make room for it', tools.length === 4, tools.map((t) => t.name).join());
     const asDeferred = structured(await call('get_comments', { status: 'deferred' }));
     check('a deferred review is in the deferred list', asDeferred.reviews.map((r) => r.id).join() === B);
     check('and out of the open one', !structured(await call('get_comments', { status: 'open' })).reviews.some((r) => r.id === B));
@@ -1168,9 +1225,12 @@ const rawPost = (hostHeader, body) =>
       const refusalShape = await validateOutput('comment', raw);
       check('the refusal still validates against the published schema', refusalShape.valid, refusalShape.errorMessage || '');
 
-      const onDisk = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
-      check('the winning ledger is what is on disk', onDisk.threads.some((t) => t.messages[0].body === 'written by the other window'));
-      check('and the review was not resolved there', onDisk.threads.find((t) => t.id === A)?.status !== 'resolved', onDisk.threads.find((t) => t.id === A)?.status);
+      // Folded back out of the file rather than read as fields off it: the
+      // ledger is an append-only event log, so "is it on disk" means "does the
+      // file still project to this".
+      const onDisk = createReviewStore({ file: reviewFile, projectPath: ROOT }).all();
+      check('the winning ledger is what is on disk', onDisk.some((t) => t.messages[0].body === 'written by the other window'));
+      check('and the review was not resolved there', onDisk.find((t) => t.id === A)?.status !== 'resolved', onDisk.find((t) => t.id === A)?.status);
       const after = await call('get_comments', { status: 'all', detail: 'full' });
       check('get_comments does not show the unsaved resolution', !structured(after).reviews.some((r) => r.id === A && r.status === 'resolved'), JSON.stringify(structured(after).reviews.map((r) => `${r.id === A ? 'A' : r.number}:${r.status}`)));
       check('and it does show the other window\u2019s review', structured(after).reviews.some((r) => r.id === foreign.id));
@@ -1180,7 +1240,7 @@ const rawPost = (hostHeader, body) =>
       // Recovered, not wedged: the same call made again now lands.
       const recovered = structured(await call('comment', { action: 'resolve', threadId: A, message: 'done and verified' }));
       check('doing it again against the reloaded ledger works', recovered.ok === true, JSON.stringify(recovered));
-      check('and that resolution really is on disk', JSON.parse(fs.readFileSync(reviewFile, 'utf8')).threads.find((t) => t.id === A).status === 'resolved');
+      check('and that resolution really is on disk', createReviewStore({ file: reviewFile, projectPath: ROOT }).get(A).status === 'resolved');
       // Put the ledger back the way the rest of this file expects to find it.
       await call('comment', { action: 'reopen', threadId: A, message: 'back to open' });
       ledger.remove(foreign.id);
@@ -1322,7 +1382,7 @@ const rawPost = (hostHeader, body) =>
   }
 
   await ledger.flush();
-  check('everything the agent did is on disk', JSON.parse(fs.readFileSync(reviewFile, 'utf8')).threads.length === 2);
+  check('everything the agent did is on disk', createReviewStore({ file: reviewFile, projectPath: ROOT }).size === 2);
   check('and it is not in the project', !reviewFile.startsWith(ROOT));
   try {
     fs.rmSync(reviewHome, { recursive: true, force: true });

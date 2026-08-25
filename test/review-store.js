@@ -91,6 +91,15 @@ const newId = () => `id${++seq}`;
 const freshStore = (file, opts = {}) =>
   createReviewStore({ file, projectPath: ROOT, now, newId, ...opts });
 
+// What is really on disk, read the way the app reads it.
+//
+// The ledger is an append-only event log now, so "is the resolve saved" is
+// answered by folding the file rather than by looking for a `status` field in
+// it. This is a stronger check than the one it replaces: it proves the bytes
+// are not merely present but re-readable into the same review.
+const readBack = (file) => createReviewStore({ file, projectPath: ROOT, now, newId }).all();
+const rawFile = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+
 const anchorOf = (over) => {
   const built = anchorFrom(payload(over));
   return built.ok ? built : null;
@@ -452,7 +461,9 @@ const anchorOf = (over) => {
 
     const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
     check('the file says which version it is', saved.version === VERSION);
-    check('the file is a list of threads', Array.isArray(saved.threads) && saved.threads.length === 1);
+    check('the file is an append-only event log', Array.isArray(saved.events) && saved.events.length >= 3, JSON.stringify(Object.keys(saved)));
+    check('which folds back into exactly the one review', readBack(file).length === 1, String(readBack(file).length));
+    check('and nothing on disk is a mutable thread blob', saved.threads === undefined);
     check('no temporary file is left behind', fs.readdirSync(path.dirname(file)).every((f) => !f.includes('tmp')), fs.readdirSync(path.dirname(file)).join());
 
     const reopened = freshStore(file);
@@ -614,7 +625,7 @@ const anchorOf = (over) => {
     check('the moved file still holds the original bytes', fs.readFileSync(store.problem.movedTo, 'utf8').includes('not json'));
     check('and the store is usable afterwards', store.apply({ action: 'create', message: 'fresh start', anchor: anchorFrom(payload()).anchor }).ok);
     await store.flush();
-    check('which writes a valid file over the empty slot', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
+    check('which writes a valid file over the empty slot', readBack(file).length === 1);
   }
 
   // Shapes that parse but are not a review file.
@@ -686,9 +697,9 @@ const anchorOf = (over) => {
     for (let i = 0; i < 20; i++) store.apply({ action: 'create', message: `burst ${i}`, anchor });
     // Before the writes land, the file on disk is still the whole previous
     // version — never a truncated one.
-    check('the file is never half written', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length >= 1);
+    check('the file is never half written', readBack(file).length >= 1);
     await store.flush();
-    check('a burst ends up on disk in full', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 21);
+    check('a burst ends up on disk in full', readBack(file).length === 21);
     check('and left no temporary files', fs.readdirSync(home).every((f) => !f.endsWith('.tmp')));
     check('the first write was real, not a coincidence', first.includes('first'));
 
@@ -696,7 +707,7 @@ const anchorOf = (over) => {
     const q = freshStore(path.join(home, 'quit.json'));
     q.apply({ action: 'create', message: 'written at quit', anchor });
     q.flushSync();
-    check('flushSync writes without awaiting anything', JSON.parse(fs.readFileSync(path.join(home, 'quit.json'), 'utf8')).threads.length === 1);
+    check('flushSync writes without awaiting anything', readBack(path.join(home, 'quit.json')).length === 1);
   }
 
   // Two writers, which is the ordinary case: the panel and an agent.
@@ -732,19 +743,20 @@ const anchorOf = (over) => {
     check('both stores start from the same empty ledger', A.size === 0 && B.size === 0);
 
     const bThread = B.apply({ action: 'create', message: 'from B', anchor }).thread;
-    check('B writes first and lands on disk', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
+    check('B writes first and lands on disk', readBack(file).length === 1);
 
     // A's memory predates B's write. Its write must not replace the file —
     // and, just as important, A must not be TOLD its write happened.
     const aResult = A.apply({ action: 'create', message: 'from A', anchor });
-    const disk = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const bodies = disk.threads.map((t) => t.messages[0].body);
+    const disk = rawFile(file);
+    const diskThreads = readBack(file);
+    const bodies = diskThreads.map((t) => t.messages[0].body);
     check('B\u2019s review is still there', bodies.includes('from B'), JSON.stringify(bodies));
     check('A did not replace the ledger with its stale copy', !bodies.includes('from A'), JSON.stringify(bodies));
     check('and A was told, in the answer to its own call', aResult.ok === false && aResult.code === 'foreign_write', JSON.stringify(aResult));
     check('with something a person could act on', /reloaded/.test(aResult.message || ''), aResult.message);
-    check('the file on disk is still valid JSON', typeof disk.version === 'number' && Array.isArray(disk.threads));
-    check('numbers were not handed out twice on disk', new Set(disk.threads.map((t) => t.number)).size === disk.threads.length);
+    check('the file on disk is still valid JSON', typeof disk.version === 'number' && Array.isArray(disk.events));
+    check('numbers were not handed out twice on disk', new Set(diskThreads.map((t) => t.number)).size === diskThreads.length);
     check('reopening sees the winning ledger', freshStore(file).get(bThread.id) !== null);
 
     // No ghost. The refused mutation is gone from memory too, and A is now
@@ -755,7 +767,7 @@ const anchorOf = (over) => {
     // ...so the obvious next move — do it again — works, and lands.
     const retry = A.apply({ action: 'create', message: 'from A', anchor });
     check('doing it again against the fresh ledger works', retry.ok === true, JSON.stringify(retry));
-    check('and that one really is on disk', JSON.parse(fs.readFileSync(file, 'utf8')).threads.map((t) => t.messages[0].body).includes('from A'));
+    check('and that one really is on disk', readBack(file).map((t) => t.messages[0].body).includes('from A'));
     check('the high-water mark did not reuse B\u2019s number', retry.thread.number === 2, String(retry.thread.number));
 
     // A stale RESOLVE is the dangerous one: an agent is told the feedback was
@@ -767,7 +779,7 @@ const anchorOf = (over) => {
     H.apply({ action: 'create', message: 'and the heading', anchor });
     const stale = G.apply({ action: 'resolve', threadId: made.id, message: 'fixed and verified' });
     check('a stale resolve is refused, not reported as done', stale.ok === false && stale.code === 'foreign_write', JSON.stringify(stale));
-    check('and the review is still open on disk', JSON.parse(fs.readFileSync(file4, 'utf8')).threads.find((t) => t.id === made.id).status === 'open');
+    check('and the review is still open on disk', readBack(file4).find((t) => t.id === made.id).status === 'open');
     check('and still open in memory — no resolution that nothing remembers', G.get(made.id).status === 'open', G.get(made.id).status);
     check('while the other window\u2019s review is now visible here', G.size === 2, String(G.size));
 
@@ -777,7 +789,7 @@ const anchorOf = (over) => {
     const D = freshStore(file2);
     C.apply({ action: 'create', message: 'from C', anchor });
     const dResult = D.apply({ action: 'create', message: 'from D', anchor });
-    const disk2 = JSON.parse(fs.readFileSync(file2, 'utf8')).threads.map((t) => t.messages[0].body);
+    const disk2 = readBack(file2).map((t) => t.messages[0].body);
     check('whoever wrote first keeps the ledger', disk2.join() === 'from C', JSON.stringify(disk2));
     check('and the loser is told so by its own call', dResult.ok === false && dResult.code === 'foreign_write', JSON.stringify(dResult));
 
@@ -790,11 +802,11 @@ const anchorOf = (over) => {
     const F = freshStore(file3);
     const eResult = E.apply({ action: 'create', message: 'from E', anchor });
     const fResult = F.apply({ action: 'create', message: 'from F', anchor });
-    const disk3 = JSON.parse(fs.readFileSync(file3, 'utf8')).threads.map((t) => t.messages[0].body);
+    const disk3 = readBack(file3).map((t) => t.messages[0].body);
     check('an interleaved pair does not lose a review', disk3.length === 1, JSON.stringify(disk3));
     check('and exactly one of them was told it worked', [eResult, fResult].filter((r) => r.ok).length === 1, JSON.stringify([eResult.ok, fResult.ok]));
     check('the other was told exactly why', [eResult, fResult].filter((r) => r.code === 'foreign_write').length === 1, JSON.stringify([eResult.code, fResult.code]));
-    check('nextNumber never went backwards', JSON.parse(fs.readFileSync(file3, 'utf8')).nextNumber >= 2);
+    check('nextNumber never went backwards', rawFile(file3).nextNumber >= 2);
     check('no lock was left behind', !fs.existsSync(`${file3}.lock`));
 
     // Every mutation, not just create: whatever is reported as done is on disk.
@@ -802,7 +814,7 @@ const anchorOf = (over) => {
       const file5 = path.join(home, 'durable.json');
       const S = freshStore(file5);
       const t1 = S.apply({ action: 'create', message: 'one', anchor }).thread;
-      const onDisk = () => JSON.parse(fs.readFileSync(file5, 'utf8'));
+      const onDisk = () => ({ threads: readBack(file5), nextNumber: rawFile(file5).nextNumber });
       check('a create is on disk the moment it answers', onDisk().threads.length === 1);
       check('a reply is on disk the moment it answers', S.apply({ action: 'reply', threadId: t1.id, message: 'two' }).ok && onDisk().threads[0].messages.length === 2);
       check('a defer is on disk the moment it answers', S.apply({ action: 'defer', threadId: t1.id, reason: 'later' }).ok && onDisk().threads[0].status === 'deferred');
@@ -828,7 +840,7 @@ const anchorOf = (over) => {
     store.apply({ action: 'reply', threadId: t.id, message: 'Reduced it to 12px.', authorType: 'agent' });
     store.apply({ action: 'reply', threadId: t.id, message: 'still looks off on a phone', authorType: 'human' });
     const msgs = () => store.get(t.id).messages;
-    const onDisk = () => JSON.parse(fs.readFileSync(file, 'utf8')).threads[0].messages;
+    const onDisk = () => readBack(file)[0].messages;
 
     check('a thread starts unedited', msgs().every((m) => m.editedAt === null), JSON.stringify(msgs().map((m) => m.editedAt)));
 
@@ -911,7 +923,7 @@ const anchorOf = (over) => {
       const made = store.apply({ action: 'create', message: 'after a crash', anchor });
       check('a lock whose owner is gone does not block a write', made.ok === true, JSON.stringify(made));
       check('and it is not waited out first', Date.now() - began < 500, `${Date.now() - began}ms`);
-      check('the write really landed', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
+      check('the write really landed', readBack(file).length === 1);
       check('and the lock was cleaned up', !fs.existsSync(lock));
     }
 

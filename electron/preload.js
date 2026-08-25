@@ -1773,6 +1773,20 @@ contextBridge.exposeInMainWorld('avb', {
   reviewsEditMessage: invoke('reviews:editMessage'),
   reviewsRemoveMessage: invoke('reviews:removeMessage'),
   reviewsSyncAnchors: invoke('reviews:syncAnchors'),
+  // Shared Reviews. Every one of these is something a PERSON does in this
+  // window — there is no MCP tool behind any of them, on purpose: an agent
+  // that could create a workspace, mint an invitation or point Stacki at
+  // another server would be an agent that could publish somebody's private
+  // comments. What crosses this bridge is a server address and an invitation,
+  // which are the two things a person types; credentials never come back.
+  reviewsShared: invoke('reviews:shared'),
+  reviewsSync: invoke('reviews:sync'),
+  reviewsSharedEnable: invoke('reviews:sharedEnable'),
+  reviewsSharedJoin: invoke('reviews:sharedJoin'),
+  reviewsSharedDisable: invoke('reviews:sharedDisable'),
+  reviewsSharedInvite: invoke('reviews:sharedInvite'),
+  reviewsIdentity: invoke('reviews:identity'),
+  reviewsSetIdentity: invoke('reviews:setIdentity'),
   onReviewsChanged: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('reviews:changed', listener);

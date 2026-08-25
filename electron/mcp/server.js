@@ -103,7 +103,24 @@ function createStackiMcpServer({
   // clients can hold this endpoint at once without sharing anything.
   const handler = createMcpHandler(() => {
     const server = new McpServer({ name, version }, { instructions });
-    registerTools(server, { getContext, capture, getComments, comment });
+    registerTools(server, {
+      getContext,
+      capture,
+      getComments,
+      comment,
+      // Who is connected, when the protocol has said. A client names itself at
+      // initialize, which in a stateless transport is a different request from
+      // the tool call — so this is often null, and the app falls back to a
+      // generic agent name rather than guessing at a person. It is used only
+      // to LABEL an agent's messages; nothing is authorized by it.
+      clientName: () => {
+        try {
+          return server.server?.getClientVersion?.()?.name || null;
+        } catch {
+          return null;
+        }
+      },
+    });
     return server;
   }, { onerror: report });
 

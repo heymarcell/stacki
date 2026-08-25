@@ -219,6 +219,50 @@ for (const name of required.keys()) {
 }
 check('the native check found the one native dependency there is', natives >= 1, `${natives} found`);
 
+// ── The reference Shared Reviews service is NOT the app ─────────────────────
+//
+// `service/` is a program somebody runs on a machine of their own. It has a
+// database, it listens on a port, and it has no business inside a desktop
+// application — shipping it would put a server in every install of Stacki,
+// and would mean an experimental node built-in (node:sqlite) became a runtime
+// dependency of the editor. So the boundary is checked in both directions:
+// nothing packages it, and nothing in the main process reaches into it.
+
+const serviceDir = path.join(root, 'service');
+if (fs.existsSync(serviceDir)) {
+  check(
+    'the reference reviews service is not packaged',
+    !files.some((f) => f.startsWith('service')),
+    JSON.stringify(files.filter((f) => f.includes('service')))
+  );
+  check('nor unpacked beside the archive', !unpacked.some((f) => f.startsWith('service')), JSON.stringify(unpacked));
+  for (const file of mainSide) {
+    const text = fs.readFileSync(file, 'utf8');
+    check(
+      `${path.relative(root, file)} does not require the reviews service`,
+      !/require\(\s*'[^']*\/service\//.test(text),
+      'the desktop app must work with no server anywhere'
+    );
+  }
+  // The other direction is allowed and deliberate: the service imports the
+  // event model from electron/review/events.js rather than keeping a second
+  // opinion about what an event is. That module must therefore stay free of
+  // anything Electron.
+  const eventModel = path.join(root, 'electron', 'review', 'events.js');
+  check('the event model exists where the service expects it', fs.existsSync(eventModel));
+  check(
+    'and needs nothing from Electron',
+    !/require\(\s*'electron'\s*\)/.test(fs.readFileSync(eventModel, 'utf8')),
+    'the service loads it in a plain node process'
+  );
+  // And it must not need anything from node_modules either, or a self-hosted
+  // service would need the app's dependency tree to run.
+  for (const m of fs.readFileSync(eventModel, 'utf8').matchAll(BARE)) {
+    const name = packageOf(m[1]);
+    check(`the event model's require of ${m[1]} is a node builtin`, builtin.has(name) || m[1].startsWith('node:'), 'the service must run without the app installed');
+  }
+}
+
 // ── The archive contains the app ────────────────────────────────────────────
 
 check('the main process is packaged', files.includes('electron/**/*'), JSON.stringify(files));

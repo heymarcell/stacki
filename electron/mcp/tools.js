@@ -142,7 +142,7 @@ const MAX_PADDING = 256;
  * the two review implementations are the app's own — passed in so this file
  * describes the surface and nothing else.
  */
-function registerTools(server, { getContext, capture, getComments, comment }) {
+function registerTools(server, { getContext, capture, getComments, comment, clientName = null }) {
   server.registerTool(
     'get_context',
     {
@@ -218,7 +218,7 @@ function registerTools(server, { getContext, capture, getComments, comment }) {
     }
   );
 
-  registerReviewTools(server, { getComments, comment });
+  registerReviewTools(server, { getComments, comment, clientName });
 }
 
 module.exports = { registerTools, INSTRUCTIONS, READ_ONLY, ContextOutput, CaptureOutput, MAX_PADDING };
