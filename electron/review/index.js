@@ -24,6 +24,8 @@ const {
   createReviewStore,
   selectThreads,
   project,
+  summarize,
+  detail,
   fileFor,
   MAX_RESPONSE_BYTES,
 } = require('./store');
