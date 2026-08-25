@@ -102,7 +102,13 @@ const OPERATIONS = {
     move_variables: { risk: 'write', via: 'main', channel: 'css:moveVariables', undoable: true, summary: 'Move variables between sections.', reuses: 'electron/cssVars.js' },
     add_section: { risk: 'write', via: 'main', channel: 'css:addSection', undoable: true, summary: 'Add a variable section.', reuses: 'electron/cssVars.js' },
     set_section_title: { risk: 'write', via: 'main', channel: 'css:setSectionTitle', undoable: true, summary: 'Retitle a variable section.', reuses: 'electron/cssVars.js' },
-    remove_section: { risk: 'high', via: 'main', channel: 'css:removeSection', undoable: true, summary: 'Remove a variable section and the variables in it.', reuses: 'electron/cssVars.js' },
+    // `write`, not `high`, and the registry itself said so: it is marked
+    // undoable, and "high" means put-it-back is not obviously available. Text
+    // removed from a stylesheet that Stacki records an undo command for is the
+    // same kind of thing as target.remove, which is a write. Classing it high
+    // also made the whole `style` tool destructive to a client — for an action
+    // nobody uses, over the read that everybody does.
+    remove_section: { risk: 'write', via: 'main', channel: 'css:removeSection', undoable: true, summary: 'Remove a variable section and the variables in it.', reuses: 'electron/cssVars.js' },
     move_heading: { risk: 'write', via: 'main', channel: 'css:moveHeading', undoable: true, summary: 'Reorder variable sections.', reuses: 'electron/cssVars.js' },
   },
 

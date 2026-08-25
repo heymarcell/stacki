@@ -53,7 +53,7 @@ says so.
 | `move_variables` | Edit project | main | ⌘Z | electron/cssVars.js | Move variables between sections. |
 | `add_section` | Edit project | main | ⌘Z | electron/cssVars.js | Add a variable section. |
 | `set_section_title` | Edit project | main | ⌘Z | electron/cssVars.js | Retitle a variable section. |
-| `remove_section` | Full control | main | ⌘Z | electron/cssVars.js | Remove a variable section and the variables in it. |
+| `remove_section` | Edit project | main | ⌘Z | electron/cssVars.js | Remove a variable section and the variables in it. |
 | `move_heading` | Edit project | main | ⌘Z | electron/cssVars.js | Reorder variable sections. |
 
 ## source
@@ -196,6 +196,6 @@ says so.
 ## Totals
 
 - 8 domains, 111 operations.
-- 48 readable in Inspect, 45 more in Edit project, 18 more in Full control.
+- 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
 - 31 land on Stacki's own undo stack.
 - 52 capabilities deliberately kept out.

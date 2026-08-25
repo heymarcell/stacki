@@ -33,6 +33,7 @@ const path = require('path');
 
 const failures = [];
 let checked = 0;
+const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
 const check = (what, condition, detail) => {
   checked++;
   if (!condition) failures.push(`  ${what}${detail ? `\n    ${detail}` : ''}`);
@@ -316,7 +317,7 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
     ['git', 'restore_file'], ['git', 'restore_project'], ['git', 'delete_branch'], ['git', 'resolve_merge'],
     ['git', 'park'], ['git', 'unpark'], ['git', 'init'],
     ['page', 'delete'], ['page', 'folder_delete'], ['asset', 'delete'], ['content', 'cms_delete'],
-    ['project', 'install'], ['style', 'remove_section'],
+    ['project', 'install'],
   ];
   for (const [domain, action] of mustBeHigh) {
     const op = registry.find(domain, action);
@@ -331,6 +332,12 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   for (const [domain, action] of mustBeRead) {
     check(`${domain}.${action} changes nothing`, registry.find(domain, action)?.risk === 'read');
   }
+
+  // A risk class and an undo are two answers to the same question, and they
+  // have to agree: "high" means putting it back is not obviously available, so
+  // an operation Stacki records an undo command for is a write.
+  const contradictory = all.filter((op) => op.risk === 'high' && op.undoable);
+  check('nothing is both hard to take back and undoable', contradictory.length === 0, contradictory.map((op) => `${op.domain}.${op.action}`).join(', '));
 
   check('there is no action for a shell', !registry.list().some((op) => /shell|terminal|exec|command/i.test(op.action)));
   check('and none for review administration', !registry.list().some((op) => /workspace|invite|identity/i.test(op.action)));
@@ -708,6 +715,27 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
         ? await validator.getValidator(byName[name].outputSchema)(content)
         : { valid: false, errorMessage: 'no structuredContent' };
       check(`${name} answers within its declared output schema`, verdict.valid === true, verdict.errorMessage || '');
+    }
+
+    // The declared half of the envelope has to be more than decoration: the
+    // fields a client acts on are the ones that must be typed, and a real
+    // mutation has to actually produce them.
+    {
+      const declared = Object.keys(agentTools.Envelope.shape || {});
+      for (const field of ['ok', 'ref', 'document', 'documentBefore', 'changedFiles', 'undoable', 'revisionBefore', 'revisionAfter', 'notes', 'gone', 'through', 'code', 'message']) {
+        check(`the output schema declares ${field}`, declared.includes(field), declared.join(', '));
+      }
+      const shape = byName.target.outputSchema;
+      check('and a mutation shape is in the published schema', !!shape.properties?.changedFiles && !!shape.properties?.ref, Object.keys(shape.properties || {}).join(', '));
+      check('with the patch bounded and typed', !!shape.properties.changedFiles.items?.properties?.patch);
+      check('and revision/digest declared rather than conventional', !!shape.properties.document && !!shape.properties.revisionBefore);
+      check('while an action’s own fields stay open', shape.additionalProperties !== false, JSON.stringify(shape.additionalProperties));
+
+      // A refusal that a client has to branch on is typed too.
+      const denied2 = await call('tools/call', { name: 'git', arguments: { action: 'push', branch: 'main' } });
+      const verdict = await validator.getValidator(shape)(denied2.result?.structuredContent);
+      check('a permission refusal validates against it', verdict.valid === true, verdict.errorMessage || '');
+      check('and carries the fields a client would act on', ['code', 'operation', 'risk', 'requires'].every((k) => k in denied2.result.structuredContent), short(denied2.result?.structuredContent));
     }
 
     // A refusal is a status with a code, not a protocol error a client has to

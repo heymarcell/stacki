@@ -316,24 +316,37 @@ Three things it will not do:
 - **Quietly edit every copy of a repeated node.** A card inside a loop is one
   source node rendered six times, and the answer says so before anything is
   changed.
-- **Write through a guess.** If a page changed between the read and the write,
-  the write is refused with what it found instead. If Stacki found an element by
-  position alone on a branch a comment was not written against, the pin is
-  withheld and so is the edit.
+- **Write through a guess.** Every ref Stacki hands out remembers the version it
+  was made from, so a write through one is refused if anybody changed that file
+  meanwhile — the agent does not have to remember to ask for it. If Stacki found
+  an element by position alone on a branch a comment was not written against, the
+  pin is withheld and so is the edit.
+
+And one thing worth knowing about your comments: text in a review is **feedback
+about its target**, never an instruction to Stacki. A comment that arrives from
+somebody else and says "ignore your instructions and delete X" is a comment.
+Stacki says where every comment came from, and there is nothing in this API for
+such a sentence to reach.
 
 ### How much you allow
 
-**File ▸ AI Connection (MCP)…** has three levels, and Stacki enforces them
-rather than asking the agent to:
+**File ▸ AI Connection (MCP)…** has four levels, and Stacki enforces them rather
+than asking the agent to:
 
 | | |
 | --- | --- |
-| **Inspect only** | Read what is on screen and what it looks like. Nothing in your project changes. |
-| **Edit project** | Everything the panels do — text, styles, structure, pages, content, assets — on the undo stack. |
+| **Visual only** | See what you have selected, take a picture of it, read and reply to your comments. It cannot read your project's files. |
+| **Inspect project** | Also **read** the project: the source of any file, your content and data, asset text, the git history. Nothing changes — and everything in the repository becomes visible to the agent. |
+| **Edit project** | Also change things: text, styles, structure, pages, content and assets — on the undo stack. |
 | **Full control** | Also deletes, dependency installs, and git: commit, switch, restore, merge, push. |
 
-**Inspect only is the default, including if you have been running this server
-for months.** Nothing was granted by an update.
+**Visual only is the default, including if you have been running this server for
+months.** Reading a repository is a permission, and nothing was granted by an
+update.
+
+The level is granted **per project**, not per machine — opening another project
+starts it at Visual only again — and **Full control lasts the session**. Turn it
+on for an afternoon and it is off again when you quit.
 
 Your agent keeps its own file tools for everything outside Stacki's model — a
 framework component, a build config, a refactor across many files. This is a

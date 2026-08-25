@@ -44,16 +44,79 @@ const FileRef = Ref.describe('The ref the read of this file gave you. It carries
 /**
  * What every answer carries.
  *
- * Loose on purpose, and declared rather than shrugged at: the envelope below
- * is on every result of every action, and each action adds its own fields on
- * top. Enumerating all of those in one schema would be a thousand lines that
- * went stale the first time an operation learned to say something new, and a
- * client would gain nothing it does not get from the tool description.
+ * Two halves, and the split is deliberate.
+ *
+ * DECLARED: the envelope, and every field a MUTATION answers with. Those are
+ * the fields a client is expected to act on — the ref to carry into the next
+ * call, the digests to compare, the patch to show somebody, whether ⌘Z will
+ * reach it — and leaving them undeclared would make them conventions rather
+ * than a contract. They are typed here, and test/agent-api.js checks that a
+ * real mutation actually produces them.
+ *
+ * LOOSE: everything an individual action adds on top. `target.read` answers
+ * with a different shape from `git.log`, and enumerating a hundred and thirty
+ * of those in one file would be a second copy of the implementation that went
+ * stale the first time an operation learned to say something new. The tool
+ * descriptions and get_capabilities are where an action's own shape is
+ * documented.
+ *
+ * So: strict about the parts that are the same everywhere, open about the parts
+ * that are not, and honest about which is which.
  */
+const ChangedFile = z.looseObject({
+  file: z.string().describe('Project-relative. Never an absolute path.'),
+  beforeDigest: z.string().nullable(),
+  afterDigest: z.string().nullable(),
+  patch: z
+    .looseObject({
+      hunks: z.array(z.looseObject({ at: z.number().int(), text: z.string() })),
+      linesRemoved: z.number().int(),
+      linesAdded: z.number().int(),
+    })
+    .nullable()
+    .describe('Bounded: a whole-file rewrite does not become a whole-file patch.'),
+});
+
+const DocumentState = z
+  .looseObject({
+    file: z.string().nullable().describe('The document this revision is about.'),
+    revision: z.number().int().nullable(),
+    digest: z.string().nullable(),
+  })
+  .nullable();
+
 const Envelope = z.looseObject({
   ok: z.boolean().describe('Whether the operation happened. False is a status with a code, never a crash.'),
-  code: z.string().nullable().optional().describe('Why not. permission_denied, stale_target, bound_value, not_editable, no_project, bad_request, …'),
+  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, bound_value, not_editable, no_project, bad_request, …'),
   message: z.string().nullable().optional(),
+
+  // --- what a mutation answers with ---------------------------------------
+  ref: z.string().nullable().optional().describe('The target as it now is. Null when the edit removed it. Carry this into the next call rather than re-reading.'),
+  action: z.string().optional(),
+  notes: z.array(z.string()).optional().describe('What the operation wants said out loud — a binding it dropped, a frontmatter const it took with a deletion.'),
+  gone: z.boolean().optional().describe('True when the edit removed the target, so there is nothing left to point at.'),
+  undoable: z.boolean().optional().describe('Whether Stacki’s own undo can take this back. False is honest, not an omission.'),
+  through: z.enum(['editor', 'disk']).optional().describe('Whether a source write went through the editor (undoable, on the canvas) or straight to disk.'),
+  documentBefore: DocumentState.optional(),
+  document: DocumentState.optional(),
+  revisionBefore: z.number().int().nullable().optional(),
+  revisionAfter: z.number().int().nullable().optional(),
+  changedFiles: z.array(ChangedFile).optional().describe('Only what actually changed, with a bounded patch each.'),
+  preview: z.looseObject({ note: z.string().optional() }).optional(),
+  note: z.string().nullable().optional(),
+  // On a refusal that is about currency rather than identity.
+  observed: z.looseObject({}).nullable().optional().describe('What the ref recorded when it was made.'),
+  current: z.looseObject({}).nullable().optional().describe('What is true now, so a re-read is one call rather than a guess.'),
+  currentDigest: z.string().nullable().optional(),
+  expectedDigest: z.string().nullable().optional(),
+  currentRevision: z.number().int().nullable().optional(),
+  expectedRevision: z.number().int().nullable().optional(),
+  // On a permission refusal.
+  operation: z.string().optional(),
+  risk: z.enum(['read', 'write', 'high']).optional(),
+  mode: z.string().optional(),
+  requires: z.string().optional(),
+  index: z.number().int().nullable().optional().describe('Which operation in a batch was refused. The batch as a whole was not applied.'),
 });
 
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
