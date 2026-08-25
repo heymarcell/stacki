@@ -4,6 +4,7 @@ import { setCanvasFrame, receiveCanvasReply, noteCanvasReady } from '../canvasQu
 import { forgetComputedColors } from '../style-panel/lib/computed-color';
 import { forgetComputedStyles } from '../style-panel/lib/computed-style';
 import { hoverIsSelection, onePerPlace, sameCopy } from '../outlineBoxes.js';
+import { registerCanvasProbe } from '../mcpCanvas.js';
 import { spacingBands } from '../spacingBands.js';
 import { setModifiers } from '../style-panel/lib/host.ts';
 import {
@@ -107,6 +108,7 @@ export default function PreviewPane({
   focusWhole,
   device,
   onDevice,
+  onCanvasReport,
 }) {
   // The breakpoint lives in App so a re-mount of this pane can't silently
   // kick the user out of a view (which would reload every preview iframe).
@@ -388,6 +390,113 @@ export default function PreviewPane({
     return deviceForWidth(shownWidth) || device;
   }, [device, shownWidth]);
 
+  // ── Telling an agent what is on the canvas ────────────────────────────────
+  //
+  // Two jobs, both about the same pixels. The report says what the canvas is
+  // showing and where the selected copy of the node sits, which App publishes
+  // as the MCP snapshot. The probe answers a screenshot request: it takes the
+  // outlines off, scrolls the copy in question into view, waits for the page
+  // to settle, and hands back the geometry the main process crops with.
+  //
+  // The outlines have to go. They are drawn over the page, in the app's own
+  // colours, with a label chip above the box — a picture of the site with a
+  // green rectangle across it is a picture of Stacki, and it is exactly the
+  // part an agent should not be reading colours off.
+  const [capturing, setCapturing] = React.useState(false);
+
+  const selRects = rects[selPath] || [];
+  // Which copy the boxes below actually describe. A click says which one it
+  // meant, but a node can report ONE box for several places — a slot, a run of
+  // markup the page collected into a single region — and then "the second copy"
+  // has no box of its own. Report the index that was really used, so the
+  // occurrence and the rect beside it can never disagree. Null stays null: that
+  // is the selection meaning the node rather than one copy of it.
+  const selOccUsed = selOcc == null ? null : selRects[selOcc] ? selOcc : selRects.length ? 0 : null;
+  const selRect = selRects[selOccUsed ?? 0] || selRects[0] || null;
+  const selSpacingList = spacing[selPath] || [];
+  const selSpacing = selSpacingList[selOccUsed ?? 0] || selSpacingList[0] || null;
+
+  // Read by the probe, which is registered once and must see the current
+  // measurements rather than the ones it closed over.
+  const liveRef = React.useRef(null);
+  liveRef.current = { rects, selPath, selOcc, selRect, url };
+
+  const onCanvasReportRef = React.useRef(onCanvasReport);
+  onCanvasReportRef.current = onCanvasReport;
+  const reportKeyRef = React.useRef(null);
+  React.useEffect(() => {
+    const el = iframeRef.current;
+    const report = {
+      device: activeDevice,
+      // What the page inside actually gets, which is not the same as the
+      // breakpoint that was clicked — see activeDevice above.
+      viewportWidth: el ? el.clientWidth : null,
+      viewportHeight: el ? el.clientHeight : null,
+      rect: selRect,
+      spacing: selSpacing,
+      occurrence: selOccUsed,
+      occurrenceCount: selRects.length || null,
+    };
+    const key = JSON.stringify(report);
+    if (key === reportKeyRef.current) return;
+    reportKeyRef.current = key;
+    onCanvasReportRef.current?.(report);
+  });
+
+  React.useEffect(() => {
+    // Two frames, so a React re-render has been through the compositor rather
+    // than merely been asked for. capturePage photographs what is on screen.
+    //
+    // Raced against a timer, because rAF is not a promise the browser always
+    // keeps: an occluded window stops painting, and this is asked for by an
+    // agent — which means it is usually asked for while Stacki is behind
+    // somebody's terminal. Waiting forever there would time the whole capture
+    // out and answer "no preview" about a window that is showing one.
+    const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+    const painted = () =>
+      Promise.race([
+        new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done()))),
+        settle(250),
+      ]);
+
+    return registerCanvasProbe({
+      async begin({ target }) {
+        setCapturing(true);
+        const frame = frameRef.current;
+        const el = iframeRef.current;
+        if (!frame) return null;
+        const win = el?.contentWindow;
+        if (target === 'selection' && win && liveRef.current.selPath) {
+          // The page scrolls smoothly, so the box moves for a few hundred
+          // milliseconds after the message lands. Wait for it before measuring
+          // — the frame keeps re-reporting rects as it goes.
+          win.postMessage(
+            { type: 'avb:scroll-to', path: liveRef.current.selPath, occ: liveRef.current.selOcc ?? 0 },
+            '*'
+          );
+          // The page has moved, so the box measured before it moved is stale.
+          // Wait, then read the rect the frame has since re-reported.
+          await settle(500);
+        }
+        await painted();
+        const box = (el || frame).getBoundingClientRect();
+        return {
+          frame: { x: box.left, y: box.top, width: box.width, height: box.height },
+          // 1 unless something is drawn at a scale — the arithmetic should not
+          // have to know which mode the canvas is in to be right.
+          scale: el && el.clientWidth ? box.width / el.clientWidth : 1,
+          selection: liveRef.current.selRect,
+          page: { width: window.innerWidth, height: window.innerHeight },
+        };
+      },
+      async end() {
+        setCapturing(false);
+        await painted();
+        return { ok: true };
+      },
+    });
+  }, []);
+
   // Any breakpoint change drops the drag-resize override — a click, a 1–4
   // keypress, or App resetting the pane to desktop when a project opens.
   // 'custom' is the drag itself, so it must not clear what the drag just set.
@@ -553,6 +662,7 @@ export default function PreviewPane({
                   nothing. */}
               {focusPath &&
                 !focusWhole &&
+                !capturing &&
                 onePerPlace(rects[focusPath]).map((r, i) => (
                   <div
                     key={`focus-${i}`}
@@ -564,6 +674,7 @@ export default function PreviewPane({
                   the page that side is holding open, in the colour of the box it
                   belongs to. Under the outlines, over the page. */}
               {spacingHover &&
+                !capturing &&
                 selPath &&
                 spacingBands(
                   (rects[selPath] || [])[selOcc ?? 0] || (rects[selPath] || [])[0],
@@ -584,15 +695,20 @@ export default function PreviewPane({
                     </span>
                   </div>
                 ))}
-              {[
-                // No second outline on the thing already outlined as selected —
-                // the same node AND the same copy of it (see hoverIsSelection).
-                hoverPath &&
-                !hoverIsSelection({ path: hoverPath, occ: hoverOccUsed }, { path: selPath, occ: selOcc })
-                  ? { path: hoverPath, type: 'hover', occ: hoverOccUsed }
-                  : null,
-                selPath ? { path: selPath, type: 'sel', occ: selOcc } : null,
-              ]
+              {/* Nothing at all while a screenshot is being taken: what an
+                  agent is asking for is the site, not the editor over it. */}
+              {(capturing
+                ? []
+                : [
+                    // No second outline on the thing already outlined as
+                    // selected — the same node AND the same copy of it (see
+                    // hoverIsSelection).
+                    hoverPath &&
+                    !hoverIsSelection({ path: hoverPath, occ: hoverOccUsed }, { path: selPath, occ: selOcc })
+                      ? { path: hoverPath, type: 'hover', occ: hoverOccUsed }
+                      : null,
+                    selPath ? { path: selPath, type: 'sel', occ: selOcc } : null,
+                  ])
                 .filter(Boolean)
                 .flatMap((o) => {
                   // A loop child renders once per item — one box per

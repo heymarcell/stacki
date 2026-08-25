@@ -7,13 +7,16 @@ import { isInlineRun, noteIndexAbove, noteText, noteValue, selectionAfterDelete 
 import { canvasClickAction } from './canvasClick.js';
 import { setSoundEnabled } from './ui/sound.js';
 import { createPreviewWatch } from './previewRecovery.js';
-import { tellCanvas } from './canvasQuery.js';
+import { queryCanvas, tellCanvas } from './canvasQuery.js';
+import { buildMcpPayload } from './mcpContext.js';
+import { beginCapture, endCapture } from './mcpCanvas.js';
 import PropsPanel from './panels/PropsPanel.jsx';
 import StylePanel from './panels/StylePanel.jsx';
 import PreviewPane from './panels/PreviewPane.jsx';
 import GitChip from './panels/GitChip.jsx';
 import HistoryPanel, { relativeTime } from './panels/HistoryPanel.jsx';
 import { ConfirmHost, confirmDialog } from './ui/ConfirmDialog.jsx';
+import McpDialog from './ui/McpDialog.jsx';
 import { mergeBranchAction, deleteBranchAction } from './gitActions.js';
 import LeftRail from './ui/LeftRail.jsx';
 import CodeWindow from './ui/CodeWindow.jsx';
@@ -695,6 +698,12 @@ export default function App() {
   const tabBeforePick = useRef(null);
   // Bumped by ⌘⇧A: the Components panel opens its naming dialog when it changes.
   const [createRequest, setCreateRequest] = useState(0);
+  // What the canvas last measured — the breakpoint it is really in, the frame's
+  // size, and the selected copy's box. Published to the MCP server, which is
+  // the only thing that reads it.
+  const [canvasReport, setCanvasReport] = useState(null);
+  // The AI-connection panel (File ▸ AI Connection), and the status it shows.
+  const [mcpStatus, setMcpStatus] = useState(null);
 
   // A layout is just a component that lives in src/layouts — it can be
   // placed on a page like any other. Every lookup that answers "what do we
@@ -2368,6 +2377,12 @@ export default function App() {
         if (res?.ok) showToast('Selection copied — paste it into your AI chat.');
         else showToast('Nothing selected to copy.', 'error');
       }),
+      // File ▸ AI Connection — where the MCP endpoint, the token and any
+      // startup failure are shown. Read fresh every time it opens: the server
+      // starts alongside the window and may not have been up on the last look.
+      window.avb.onMenu('mcp', async () => {
+        setMcpStatus((await window.avb.mcpStatus()) || { running: false, error: null });
+      }),
     ];
     return () => offs.forEach((off) => off());
   }, [undo, redo, copyNode, pasteNode, flushSave, showToast]);
@@ -3980,6 +3995,81 @@ export default function App() {
   };
 
   // ----------------------------------------------------------------
+  // MCP — what an agent can see
+  //
+  // Stacki's answer to "what is Marcell pointing at". The snapshot is built
+  // from what the app already knows and pushed whenever it changes; the two
+  // things only the live page can answer — an element's computed style, and
+  // the geometry a screenshot is cropped from — are asked for when a tool is
+  // actually called, because both cost a round trip to the canvas.
+  //
+  // Assembled during render into a ref rather than in an effect with a
+  // dependency list: it is a function of a dozen pieces of state, several of
+  // them derived a few lines above this, and a list that forgot one of them
+  // would go stale in exactly the way that is hardest to notice.
+  // ----------------------------------------------------------------
+  const mcpPayloadRef = useRef(null);
+  mcpPayloadRef.current = buildMcpPayload({
+    project,
+    currentPage,
+    // A dynamic route is a pattern; the canvas is showing one entry of it.
+    pageRoute: dynamicPaths[dynamicIndex]?.route || (editStack[0] || currentPage)?.route || null,
+    editStack,
+    selectedId,
+    selectedNode,
+    selectionKeys: selectionKeysRef.current,
+    crumbs,
+    selectedClasses,
+    hidden: stateIds.hidden.has(selectedId),
+    inert: stateIds.inert.has(selectedId),
+    devStatus,
+    canvas: canvasReport,
+  });
+  // Every render, deduped on what was last sent — the alternative is an IPC
+  // call per keystroke.
+  const mcpSentRef = useRef(null);
+  useEffect(() => {
+    const key = JSON.stringify(mcpPayloadRef.current);
+    if (key === mcpSentRef.current) return;
+    mcpSentRef.current = key;
+    void window.avb.mcpPublish(mcpPayloadRef.current);
+  });
+
+  // The path the canvas knows the selection by, for the computed-style query.
+  const mcpSelPathRef = useRef(null);
+  mcpSelPathRef.current = pathFor(selectedId);
+
+  useEffect(() => {
+    const answer = async ({ kind, params }) => {
+      if (kind === 'styles') {
+        const path = mcpSelPathRef.current;
+        if (!path) return { computed: null };
+        // The engine's own property list, which only a document can enumerate;
+        // the main process names the essential ones and this adds the rest.
+        const props =
+          params?.detail === 'full'
+            ? [...new Set([...(params.properties || []), ...Array.from(getComputedStyle(document.documentElement))])]
+            : params?.properties || [];
+        if (!props.length) return { computed: null };
+        const reply = await queryCanvas(path, [], [], props);
+        return { computed: reply?.computedProps || null };
+      }
+      if (kind === 'capture:begin') return beginCapture(params);
+      if (kind === 'capture:end') return endCapture();
+      return null;
+    };
+    return window.avb.onMcpAsk(async (ask) => {
+      let value = null;
+      try {
+        value = await answer(ask || {});
+      } catch {
+        value = null; // a question that cannot be answered is answered with nothing
+      }
+      void window.avb.mcpReply({ id: ask?.id, value });
+    });
+  }, []);
+
+  // ----------------------------------------------------------------
   // Render
   // ----------------------------------------------------------------
 
@@ -4461,6 +4551,7 @@ export default function App() {
             focusWhole={focusWhole}
             device={device}
             onDevice={setDevice}
+            onCanvasReport={setCanvasReport}
             onSelectPath={(p, info) => {
               // What the click MEANT — see canvasClick.js. The canvas answers
               // with a path or with null, and null has two causes that want
@@ -4743,6 +4834,7 @@ export default function App() {
       {busy && <BusyOverlay message={busy} />}
       {toast && <Toast toast={toast} />}
       <ConfirmHost />
+      {mcpStatus && <McpDialog status={mcpStatus} onClose={() => setMcpStatus(null)} />}
     </div>
   );
 }

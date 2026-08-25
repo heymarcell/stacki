@@ -15,6 +15,9 @@ MIT licensed — fork it, build on it, ship your own version.
 - **Live preview** — the app runs `astro dev` for the opened project and embeds it. Edits are auto-saved (300 ms debounce), so Astro's hot reload updates the preview as you type.
 - **Git & GitHub** — the branch chip in the title bar shows the current branch and dirty state. From its dropdown you can switch branches, create branches, commit, push, or publish a brand-new repo to GitHub (via the `gh` CLI).
 - **Tell an AI what's selected** — **⇧⌘C** copies whatever the canvas has selected as the trail of `file:line-range` pointers that leads to it: the page, each component drilled into on the way down, then the node itself. Paste that into Claude Code or any AI chat that can read the project and it knows exactly which markup you mean.
+- **Let an AI see what's selected (MCP)** — Stacki runs a small read-only [MCP](https://modelcontextprotocol.io)
+  server, so Claude Code, Cursor or any MCP client can ask what you have selected on the canvas, where it is
+  in source, and what it actually looks like. See [Connecting an AI agent](#connecting-an-ai-agent-mcp).
 - **Code fallback** — pages with markup too complex for the visual model open in a code editor instead, still with live preview.
 - **New project** — "New Project…" scaffolds a minimal Astro starter (layout + 5 components + home page) and runs `npm install` for you.
 
@@ -79,6 +82,73 @@ Issues and pull requests are welcome. A few notes:
   that exposes secrets to code from a fork.
 - Report security issues privately to the maintainer rather than opening a
   public issue.
+
+## Connecting an AI agent (MCP)
+
+Stacki exposes what it is showing over the [Model Context Protocol](https://modelcontextprotocol.io),
+so a coding agent can stop guessing which element you mean.
+
+The split is deliberate:
+
+> **Stacki is the eyes. Your agent is the brain and the hands.**
+
+There are exactly two tools, both read-only:
+
+| Tool | Answers |
+| --- | --- |
+| `get_context` | What is selected: the page and breakpoint on screen, the tag, the rendered classes, the box and spacing, the essential computed styles, and the `file:line` trail that leads to it through every component drilled into on the way down. |
+| `capture` | A picture of it: the selected element (the selected copy of a repeated node, scrolled into view, with Stacki's own outlines hidden) or the whole preview viewport. |
+
+Nothing here edits your project. Your agent keeps using its normal file tools;
+Stacki just tells it what you are pointing at and what the result looks like.
+
+Stacki does not have to be the window you are looking at — a capture taken while
+it sits behind your terminal is the current render, not the last one you saw.
+(One exception: while Stacki is *minimised*, the previewed page renders in a
+frame the OS has stopped drawing, so the picture may be older than the page.
+`capture` says so when that happens.)
+
+### The endpoint
+
+    http://127.0.0.1:43821/mcp
+
+It binds to loopback only, validates `Host` and `Origin` (so a web page cannot
+reach it by resolving its own domain to 127.0.0.1), sends no CORS headers, and
+requires a bearer token. The token is generated once and stored in Stacki's own
+application-support directory — never in your project, never in git.
+
+`STACKI_MCP_PORT` moves the port; `STACKI_MCP=off` turns the server off. If the
+port is taken, Stacki says so rather than quietly moving somewhere else.
+
+### Connecting
+
+**File ▸ AI Connection (MCP)…** shows whether the server is running, the
+endpoint, and a ready-made config for Claude Code or Cursor with the token
+filled in. Copy it from there rather than typing it — and don't commit it.
+
+Claude Code:
+
+```bash
+claude mcp add --transport http --scope user stacki \
+  http://127.0.0.1:43821/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Cursor — `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "stacki": {
+      "url": "http://127.0.0.1:43821/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Both are shown at user/global scope on purpose: Stacki switches between
+projects, and the endpoint does not.
 
 ## Requirements
 

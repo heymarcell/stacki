@@ -1726,6 +1726,19 @@ contextBridge.exposeInMainWorld('avb', {
   // ⇧⌘C — the canvas selection as file:line pointers, for an AI chat.
   copySelection: invoke('selection:copy'),
 
+  // MCP — the same selection, live, for an agent that is holding the project
+  // open beside this window. The renderer pushes a snapshot whenever what is
+  // on the canvas changes, and answers the two questions only the live page
+  // can answer (computed style, screenshot geometry) when they are asked.
+  mcpPublish: invoke('mcp:publish'),
+  mcpStatus: invoke('mcp:status'),
+  mcpReply: invoke('mcp:reply'),
+  onMcpAsk: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('mcp:ask', listener);
+    return () => ipcRenderer.removeListener('mcp:ask', listener);
+  },
+
   // CMS (JSON data under src/)
   listCms: invoke('cms:list'),
   readCms: invoke('cms:read'),
