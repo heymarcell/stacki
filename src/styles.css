@@ -6357,3 +6357,8 @@ textarea::selection {
 .review-checkout strong { color: var(--text); font-weight: 600; }
 .review-checkout.is-behind { background: rgba(255, 69, 58, 0.1); }
 .review-checkout.is-behind svg { color: var(--red); }
+/* Written elsewhere and found anyway. Context, not a warning — in the alert
+   colour it reads as a problem, and after a merge every review from the
+   merged branch would wear a permanent yellow alert about nothing. */
+.review-checkout.is-note { background: var(--bg-input); color: var(--text-faint); }
+.review-checkout.is-note svg { color: var(--text-faint); }

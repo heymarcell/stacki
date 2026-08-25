@@ -172,7 +172,9 @@ export default function CommentsPanel({
                 </p>
               </>
             ) : (
-              <p className="dim">No {status === 'all' ? '' : status} comments {scope === 'page' ? 'on this page' : 'in this project'}.</p>
+              <p className="dim">
+                No{status === 'all' ? '' : ` ${status}`} comments {scope === 'page' ? 'on this page' : 'in this project'}.
+              </p>
             )}
           </div>
         )}

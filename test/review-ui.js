@@ -903,6 +903,16 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     await render(bar({ ...synced, pending: 3 }));
     check('anything unsent is counted on screen', /3 to send/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
 
+    // The pair that has to hold together. "Synced just now" beside "can't
+    // reach the server" is a sentence contradicting itself, and it is read as
+    // "you are up to date" at the one moment that is untrue.
+    await render(bar({ ...synced, pending: 3, problem: { kind: 'offline', detail: null } }));
+    check('a failed sync does not claim to have synced', !/(^|[^t] )Synced /.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+    check('it says when the last one that worked was', /Last synced/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+    // And the count is shown ESPECIALLY then, rather than suppressed exactly
+    // when it is the thing somebody needs to see.
+    check('and unsent work is still counted while it is failing', /3 to send/.test($('.shared-bar').textContent), $('.shared-bar').textContent);
+
     await render(bar({ ...synced, problem: { kind: 'offline', detail: null } }));
     check('a problem gets a sentence, not a badge', !!$('.shared-problem'));
     check('and one somebody can act on', /saved here/.test($('.shared-problem').textContent), $('.shared-problem').textContent);
@@ -1062,8 +1072,35 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     await render(thread(elsewhere, { pinned: false }));
     check('a review from another branch says where it came from', /feature-a/.test($('.review-checkout').textContent));
     check('and why there is no pin', /prove it is the same element/.test($('.review-checkout').textContent));
+    check('and is drawn as a warning, because something is withheld', !$('.review-checkout').classList.contains('is-note'));
     await render(thread(elsewhere, { pinned: true }));
     check('and says the opposite when there is one', /found the same element/.test($('.review-checkout').textContent));
+    // Context, not an alarm. In the warning colour it reads as a problem, and
+    // after a merge every review from the merged branch would carry a
+    // permanent yellow warning about nothing being wrong.
+    check('a review that DID pin is not dressed as a problem', $('.review-checkout').classList.contains('is-note'));
+
+    // Deleting a shared thread takes other people's words with it, on their
+    // machines. Somebody agreeing to that has a right to know they are.
+    {
+      const mine = shared({ author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' } });
+      await render(thread(mine, { onDelete: () => {} }));
+      await click($('.review-trash'));
+      const asked = $('.modal-body')?.textContent || '';
+      check('deleting a thread somebody else replied to names them', /Alice/.test(asked), asked);
+      check('and says it goes for everyone', /everyone in this workspace/.test(asked), asked);
+      await click($$('.modal-footer button').find((b) => /Cancel/i.test(b.textContent)));
+
+      const alone = shared({
+        author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' },
+        messages: [{ id: 'm1', authorType: 'human', actorId: 'me', actorName: 'Bob', body: 'Only mine.', createdAt: Date.now(), editedAt: null }],
+      });
+      await render(thread(alone, { onDelete: () => {} }));
+      await click($('.review-trash'));
+      const solo = $('.modal-body')?.textContent || '';
+      check('while a thread only you wrote in asks the plain question', !/everyone in this workspace/.test(solo), solo);
+      await click($$('.modal-footer button').find((b) => /Cancel/i.test(b.textContent)));
+    }
 
     await render(thread(shared({ checkout: { branch: 'main', head: 'a', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: null } })));
     check('an ordinary same-tree review says nothing about checkouts', !$('.review-checkout'));

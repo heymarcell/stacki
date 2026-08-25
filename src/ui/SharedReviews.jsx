@@ -83,8 +83,16 @@ export function SharedReviewsBar({ shared, onSync, onSetUp, onManage, busy = fal
         {shared.workspace?.displayName || 'Shared'}
       </button>
       <span className="shared-when">
-        {shared.syncing || busy ? 'Syncing…' : `Synced ${shortAgo(shared.lastSyncAt)}`}
-        {shared.pending > 0 && !problem ? ` · ${shared.pending} to send` : ''}
+        {/* "Synced just now" beside "can't reach the server" is a sentence that
+            contradicts itself, and it is read as "you are up to date" at the
+            one moment that is untrue. So a failed attempt says LAST synced —
+            the timestamp is still the last one that worked — and the count of
+            unsent work is shown ESPECIALLY then, rather than suppressed
+            exactly when it is the thing somebody needs to see. */}
+        {shared.syncing || busy
+          ? 'Syncing…'
+          : `${problem ? 'Last synced' : 'Synced'} ${shortAgo(shared.lastSyncAt)}`}
+        {shared.pending > 0 ? ` · ${shared.pending} to send` : ''}
       </span>
       <button type="button" className="shared-link" onClick={onSync} disabled={busy || shared.syncing}>
         Sync

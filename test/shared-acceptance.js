@@ -224,6 +224,11 @@ const payloadFor = (root, branch) => ({
     check('Alice starts a workspace', enabled.ok === true, JSON.stringify(enabled));
     check('and the project is now sharing', enabled.shared.enabled === true && !!enabled.shared.workspace.id);
     check('under her own name', enabled.shared.identity.displayName === 'Alice');
+    // Nobody is asked to name a workspace, so it is named after the project it
+    // is for. The alternative is what the server calls one by default, which
+    // made every workspace on every project read identically in the one line
+    // at the top of the Comments panel — and in every agent's read of it.
+    check('and the workspace is named after the project', enabled.shared.workspace.displayName === path.basename(REPO_A), enabled.shared.workspace.displayName);
 
     const made = await alice.send('act', {
       action: 'create',
@@ -254,6 +259,7 @@ const payloadFor = (root, branch) => ({
     const joined = await bob.send('join', { invite: invitation.invite, publishExisting: false });
     check('Bob joins with the invitation', joined.ok === true, JSON.stringify(joined));
     check('and lands in Alice’s workspace', joined.shared.workspace.id === enabled.shared.workspace.id);
+    check('which he sees by the same name she does', joined.shared.workspace.displayName === enabled.shared.workspace.displayName, joined.shared.workspace.displayName);
 
     const bobList = await bob.send('list');
     const bobThread = bobList.reviews.find((r) => r.number === N);

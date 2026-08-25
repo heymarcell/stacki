@@ -26,6 +26,8 @@
 // human actions in the app's own window. MCP gets the same five review verbs
 // it always had.
 
+const path = require('node:path');
+
 const { ipcMain } = require('electron');
 
 const {
@@ -366,7 +368,12 @@ async function enableShared({ server, signupToken, displayName: shown, publishEx
   const made = await createRemoteWorkspace({
     baseUrl: server,
     signupToken,
-    displayName: shown || null,
+    // What everybody will see this called, on every machine and in every
+    // agent's read of it. Nobody is asked to name a workspace — the answer is
+    // always the project — and defaulting it to the server's own "Shared
+    // reviews" made every workspace on every project read identically, which
+    // is exactly what the one line at the top of the Comments panel is for.
+    displayName: shown || path.basename(projectPath) || null,
     repositoryHint: hint,
     actor,
   });

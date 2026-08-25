@@ -1,7 +1,7 @@
 import React from 'react';
 import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
-import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon } from './Icons.jsx';
+import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon } from './Icons.jsx';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
 
 // One review, opened.
@@ -102,9 +102,15 @@ export function CheckoutNote({ review, pinned = true }) {
       </div>
     );
   }
+  // Written somewhere else, and everything is fine: the element was found and
+  // the pin is on it. That is worth SAYING — it explains why a comment refers
+  // to something you do not remember writing — and it is not worth an alarm.
+  // Drawn in the warning colour it reads as a problem, and after a merge every
+  // review from the merged branch would carry a permanent yellow warning
+  // about nothing.
   return (
-    <div className="review-checkout">
-      <OrphanIcon size={13} />
+    <div className={`review-checkout${note.pinned ? ' is-note' : ''}`}>
+      {note.pinned ? <PinIcon size={13} /> : <OrphanIcon size={13} />}
       <div>
         <strong>Written on {note.branch || 'another branch'}</strong>
         {note.here ? `, and you are on ${note.here}` : ''}.{' '}
@@ -230,6 +236,16 @@ export default function ReviewThread({
   const orphaned = review.anchorState === 'orphaned';
   const messages = review.messages || [];
   const send = (action, extra) => onAct?.(action, extra);
+  // Whose words, other than yours, are in this thread — named, because
+  // deleting it takes them too.
+  const othersHere = [
+    ...new Set(
+      messages
+        .filter((m) => m.authorType === 'human' && m.actorId && m.actorId !== actorId)
+        .map((m) => m.actorName)
+        .filter(Boolean)
+    ),
+  ].join(' and ');
 
   return (
     <div className="review-thread">
@@ -268,7 +284,12 @@ export default function ReviewThread({
               if (
                 await confirmDialog({
                   title: 'Delete this comment?',
-                  body: 'Everything said in it goes with it, and it cannot be brought back. To keep the record instead, resolve it.',
+                  // On a shared thread "everything said in it" is other
+                  // people's words, on their machines, and somebody agreeing
+                  // to that has a right to know they are agreeing to it.
+                  body: othersHere
+                    ? `Everything said in it goes with it — including ${othersHere}’s — for everyone in this workspace, and it cannot be brought back. To keep the record instead, resolve it.`
+                    : 'Everything said in it goes with it, and it cannot be brought back. To keep the record instead, resolve it.',
                   confirmLabel: 'Delete',
                   danger: true,
                 })
