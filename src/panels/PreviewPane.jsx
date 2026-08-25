@@ -5,6 +5,10 @@ import { forgetComputedColors } from '../style-panel/lib/computed-color';
 import { forgetComputedStyles } from '../style-panel/lib/computed-style';
 import { hoverIsSelection, onePerPlace, sameCopy } from '../outlineBoxes.js';
 import { registerCanvasProbe } from '../mcpCanvas.js';
+import ReviewPins from './ReviewPins.jsx';
+import { ReviewSurface } from './ReviewPins.jsx';
+import { placePins } from '../reviewPins.js';
+import { pinRatios } from '../reviewMode.js';
 import { spacingBands } from '../spacingBands.js';
 import { setModifiers } from '../style-panel/lib/host.ts';
 import {
@@ -109,6 +113,32 @@ export default function PreviewPane({
   device,
   onDevice,
   onCanvasReport,
+  // ── Visual Review ────────────────────────────────────────────────────────
+  // The pins live in this pane because this is where the boxes are: a marker's
+  // position is its element's rendered rect plus the ratios the click stored,
+  // and nothing outside this component knows either.
+  commenting = false,
+  pinsVisible = true,
+  reviewItems,
+  reviewOpenId = null,
+  reviewDraft = null,
+  reviewBusyId = null,
+  reviewById,
+  onReviewOpen,
+  onReviewAct,
+  onReviewFocus,
+  onReviewDelete,
+  onReviewColor,
+  onReviewEditMessage,
+  onReviewDeleteMessage,
+  onReviewDraftChange,
+  onReviewDraftSubmit,
+  onReviewDraftCancel,
+  onReviewHidden,
+  onCommentTarget,
+  // Which copy of a repeated node to light up, asked for rather than clicked:
+  // focusing a review means the card it was left on, not the first one.
+  occRequest = null,
 }) {
   // The breakpoint lives in App so a re-mount of this pane can't silently
   // kick the user out of a view (which would reload every preview iframe).
@@ -142,6 +172,12 @@ export default function PreviewPane({
   // overlay in the frame, never inside the page itself.
   const iframeRef = React.useRef(null);
   const [rects, setRects] = React.useState({});
+  // The boxes, readable from the message handler below, which is bound once.
+  // A comment needs its element's box at the moment of the click: that is what
+  // turns "where the pointer was" into "where in this element", which is the
+  // whole reason a pin stays put when the page reflows.
+  const rectsRef = React.useRef({});
+  rectsRef.current = rects;
   // The selected element's own padding/margin in px, as the page measures it —
   // what the spacing box's hover is drawn from.
   const [spacing, setSpacing] = React.useState({});
@@ -177,6 +213,11 @@ export default function PreviewPane({
   onNodeStatesRef.current = onNodeStates;
   const onNodeClassesRef = React.useRef(onNodeClasses);
   onNodeClassesRef.current = onNodeClasses;
+  // The message handler is bound once; comment mode changes under it.
+  const commentingRef = React.useRef(commenting);
+  commentingRef.current = commenting;
+  const onCommentTargetRef = React.useRef(onCommentTarget);
+  onCommentTargetRef.current = onCommentTarget;
   // Last reported class string, so repeated rect sends stay quiet.
   //
   // `null` rather than '' for "nothing reported yet". An element with no
@@ -214,6 +255,25 @@ export default function PreviewPane({
     if (sameCopy(previous, selPath)) return;
     setSelOcc(null);
   }, [selPath]);
+
+  // Focusing a review means the copy it was left on — the second card, not the
+  // first. Every other route to a selection means the node (the effect above),
+  // so this is asked for explicitly, and carries a tick because asking for the
+  // same copy a second time is a real request too.
+  React.useEffect(() => {
+    if (!occRequest?.path || occRequest.path !== selPathRef.current) return;
+    const occ = Number.isInteger(occRequest.occ) ? occRequest.occ : 0;
+    // Claimed the way a click claims it, so the reset above leaves it alone
+    // when the next render arrives.
+    lastClickRef.current = { path: occRequest.path, occ };
+    setSelOcc(occ);
+    // And on screen: a capture crops what is in the frame, so a review focused
+    // below the fold would be photographed as the middle of the page.
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: 'avb:scroll-to', path: occRequest.path, occ },
+      '*'
+    );
+  }, [occRequest?.tick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   React.useEffect(() => {
     const onMsg = (e) => {
@@ -254,6 +314,30 @@ export default function PreviewPane({
       } else if (d?.type === 'avb:hover-node') {
         setCanvasHover(d.path || null);
         setHoverOcc(d.occurrence || 0);
+      } else if (d?.type === 'avb:click-node' && commentingRef.current) {
+        // Comment mode. The click picks what to comment on instead of
+        // selecting it: the selection, the panel and the open file all stay
+        // exactly where they were, so leaving a note never costs somebody the
+        // place they were working in.
+        const path = d.path || null;
+        const occ = d.occurrence || 0;
+        // The page measures the clicked node and sends its box along; what the
+        // app happens to be tracking is a fallback for an older frame that
+        // doesn't.
+        const tracked = path ? rectsRef.current[path] || [] : [];
+        const rect = d.rect || tracked[occ] || tracked[0] || null;
+        const point = { x: d.x, y: d.y };
+        onCommentTargetRef.current?.({
+          path,
+          occurrence: occ,
+          occurrenceCount: d.occurrenceCount || tracked.length || null,
+          outside: !!d.outside,
+          point,
+          rect,
+          // Where in the element it landed, as ratios: the pin then moves with
+          // the element instead of staying where the page happened to be.
+          pin: pinRatios(point, rect),
+        });
       } else if (d?.type === 'avb:click-node' && onSelectPath) {
         clickedPathRef.current = d.path || null;
         // Which instance was clicked: a node inside a loop renders once per
@@ -277,6 +361,10 @@ export default function PreviewPane({
         // canvasQuery.js. Routed here because this is the component that
         // knows which frame the message came from.
         receiveCanvasReply(d);
+      } else if (d?.type === 'avb:open-node' && commentingRef.current) {
+        // In comment mode a double-click is two clicks on the same thing, not
+        // a request to open it. Drilling here would change the open file under
+        // a composer that is already pointing at a node in the old one.
       } else if (d?.type === 'avb:open-node' && onOpenPath) {
         // A null path means the double-click landed on markup the open file
         // doesn't address — the layout's own chrome. App decides what that opens.
@@ -296,7 +384,15 @@ export default function PreviewPane({
   const hoverOccUsed = navHoverPath ? null : hoverOcc;
   // Newline-joined: a namespaced path (src/…/Card.astro|0.1) contains a pipe,
   // so that can no longer separate the tracked paths.
-  const trackKey = [...new Set([selPath, hoverPath, focusPath].filter(Boolean))].join(String.fromCharCode(10));
+  //
+  // The comment pins are tracked too, and for the same reason the selection is:
+  // a marker's position is its element's rendered box, and the page only
+  // reports boxes for paths it has been asked about. Everything downstream is
+  // keyed on this string rather than on the array, so a new list of the same
+  // paths costs nothing.
+  const trackKey = [
+    ...new Set([selPath, hoverPath, focusPath, ...(reviewItems || []).map((i) => i?.path)].filter(Boolean)),
+  ].join(String.fromCharCode(10));
   // The frame the style panel asks about the rendered DOM. Re-registered on
   // every load: a reloaded document is a different window to talk to.
   const registerFrame = React.useCallback(() => {
@@ -421,6 +517,25 @@ export default function PreviewPane({
   const liveRef = React.useRef(null);
   liveRef.current = { rects, selPath, selOcc, selRect, url };
 
+  // The pins, laid out once and handed to both layers — the markers inside the
+  // frame and the popover outside it — so the two can never disagree about
+  // where a comment is.
+  const { pins: reviewPins, hidden: reviewHidden } = React.useMemo(
+    () => placePins(reviewItems, rects),
+    [reviewItems, rects]
+  );
+  const hiddenKey = reviewHidden.join(',');
+  const onReviewHiddenRef = React.useRef(onReviewHidden);
+  onReviewHiddenRef.current = onReviewHidden;
+  React.useEffect(() => {
+    onReviewHiddenRef.current?.(hiddenKey ? hiddenKey.split(',').length : 0);
+  }, [hiddenKey]);
+
+  // Where the preview frame sits in the window. The popover is drawn in the
+  // window rather than in the frame — see ReviewPins — so it needs this to
+  // turn a pin's canvas position into a screen one.
+  const [frameBox, setFrameBox] = React.useState(null);
+
   const onCanvasReportRef = React.useRef(onCanvasReport);
   onCanvasReportRef.current = onCanvasReport;
   const reportKeyRef = React.useRef(null);
@@ -437,6 +552,16 @@ export default function PreviewPane({
       occurrence: selOccUsed,
       occurrenceCount: selRects.length || null,
     };
+    // Measured here because this effect already runs on every render that
+    // could have moved the frame: a device change, a resize, a new report.
+    if (el) {
+      const box = el.getBoundingClientRect();
+      setFrameBox((was) =>
+        was && Math.abs(was.left - box.left) < 0.5 && Math.abs(was.top - box.top) < 0.5
+          ? was
+          : { left: box.left, top: box.top, width: box.width, height: box.height }
+      );
+    }
     const key = JSON.stringify(report);
     if (key === reportKeyRef.current) return;
     reportKeyRef.current = key;
@@ -631,6 +756,29 @@ export default function PreviewPane({
         </div>
       </div>
 
+      {/* The composer and the opened thread. Deliberately outside the frame:
+          inside it they were clipped by the canvas, and at the phone
+          breakpoint a 288px panel could not fit in a 375px frame at all. */}
+      <ReviewSurface
+        pins={reviewPins}
+        frameBox={frameBox}
+        capturing={capturing}
+        openId={reviewOpenId}
+        onOpen={onReviewOpen}
+        onAct={onReviewAct}
+        onFocus={onReviewFocus}
+        onDelete={onReviewDelete}
+        onColor={onReviewColor}
+        onEditMessage={onReviewEditMessage}
+        onDeleteMessage={onReviewDeleteMessage}
+        reviewById={reviewById}
+        busyId={reviewBusyId}
+        draft={reviewDraft}
+        onDraftChange={onReviewDraftChange}
+        onDraftSubmit={onReviewDraftSubmit}
+        onDraftCancel={onReviewDraftCancel}
+      />
+
       <div className="preview-frame-wrap" ref={wrapRef}>
         {url && device === 'canvas' ? (
           <CanvasView url={url} refreshKey={refreshKey} />
@@ -644,7 +792,7 @@ export default function PreviewPane({
               ...(customH != null ? { height: customH, bottom: 'auto' } : {}),
             }}
           >
-            <div className="frame-clip">
+            <div className={`frame-clip${commenting ? ' commenting' : ''}`}>
               <iframe
                 key={`${url}-${refreshKey}`}
                 ref={iframeRef}
@@ -736,6 +884,18 @@ export default function PreviewPane({
                     </div>
                   ));
                 })}
+              {/* Comment pins and their popovers. Last, so a marker sits over
+                  the outlines rather than under them, and inside frame-clip so
+                  it scrolls and clips with the canvas — but still the editor's
+                  layer, never the page's. `capturing` takes them off for a
+                  screenshot for the same reason it takes the outlines off. */}
+              <ReviewPins
+                pins={reviewPins}
+                visible={pinsVisible}
+                capturing={capturing}
+                openId={reviewOpenId}
+                onOpen={onReviewOpen}
+              />
             </div>
             <div className="rz-handle rz-w" onPointerDown={startResize('w')} />
             <div className="rz-handle rz-e" onPointerDown={startResize('e')} />

@@ -22,6 +22,7 @@ const { createContextStore } = require('./contextStore');
 const { propertiesFor, pickEssential, allStyles } = require('./essentialStyles');
 const { createCapture } = require('./capture');
 const { createStackiMcpServer, DEFAULT_PORT } = require('./server');
+const reviews = require('../review');
 
 // How long the renderer gets to answer. Long enough for a busy canvas to
 // measure and paint a frame, short enough that a wedged page returns a status
@@ -134,11 +135,20 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
 
   const ask = createAsker(getWindow);
 
+  // The last payload as the renderer sent it, kept beside the normalized
+  // snapshot rather than instead of it. Visual Review anchors a comment to the
+  // selection KEYS, which normalizing deliberately resolves away into file:line
+  // — and a review that anchored to lines would come unstuck the first time
+  // somebody typed above it. Same object, two readers, no second source of
+  // truth about what is selected.
+  let lastPayload = null;
+
   if (!handlersRegistered) {
     handlersRegistered = true;
 
     ipcMain.handle('mcp:publish', (_e, payload) => {
       projectRoot = payload?.project?.root || null;
+      lastPayload = projectRoot ? payload : null;
       if (!projectRoot) return store.reset();
       return store.publish(payload);
     });
@@ -180,6 +190,34 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
     captureTimeoutMs: CAPTURE_TIMEOUT_MS,
   });
 
+  // --- and the two review tools ---------------------------------------------
+  //
+  // The ledger is the app's, not MCP's, so this hands it the two things only
+  // the MCP wiring has: the renderer round-trip (for `focus`, which moves the
+  // live app) and the published payload (for `create`, which anchors to what is
+  // on screen). Everything else it does on its own.
+  reviews.attach({ ask, readPayload: () => lastPayload, resolveTrail: (keys) => resolveTrail(keys) });
+
+  async function getComments({ status, scope, detail, limit }) {
+    // Which page and which element "page" and "selection" scope mean: the ones
+    // the snapshot is describing, so an agent's scope and its get_context can
+    // never be about different things.
+    const snapshot = store.read();
+    return reviews.list({
+      status,
+      scope,
+      detail,
+      limit,
+      page: snapshot.page,
+      keys: lastPayload?.selection?.keys || null,
+    });
+  }
+
+  async function comment(args) {
+    if (args?.action === 'focus') return reviews.focus(args.threadId);
+    return reviews.act({ ...args, authorType: 'agent' });
+  }
+
   // --- listen ---------------------------------------------------------------
 
   if (process.env.STACKI_MCP === 'off') {
@@ -195,6 +233,8 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
     version,
     getContext,
     capture,
+    getComments,
+    comment,
     onError: (err) => console.warn('[stacki] MCP:', err?.message || err),
   });
   try {

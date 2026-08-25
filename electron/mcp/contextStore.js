@@ -258,4 +258,22 @@ function createContextStore({ resolveTrail, now = Date.now } = {}) {
   };
 }
 
-module.exports = { createContextStore, normalize, emptySnapshot, STATUSES, relativeTo };
+// The clamps are exported too. Visual Review stores a snapshot of the same
+// selection this file describes, and a second set of "how long is too long"
+// rules would be a second answer to the same question.
+module.exports = {
+  createContextStore,
+  normalize,
+  emptySnapshot,
+  STATUSES,
+  relativeTo,
+  str,
+  num,
+  int,
+  listOf,
+  propsOf,
+  rectOf,
+  MAX_TEXT,
+  MAX_CHAIN,
+  MAX_CLASSES,
+};
