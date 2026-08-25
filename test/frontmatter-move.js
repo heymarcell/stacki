@@ -226,8 +226,12 @@ const check = (what, condition, detail) => {
 
   // --- the app asks for both ----------------------------------------------------------
   const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
-  check('deleting prunes what it made dead', /const dead = unusedDeclarations\(model\);/.test(app), 'nothing prunes declarations');
-  check('and says which lines went', /from the frontmatter/.test(app), 'the deletion is silent about it');
+  // Deleting a node is src/modelOps.js's removeNode — the same one the Agent
+  // API calls, so an agent's delete prunes what a person's delete prunes.
+  const ops = fs.readFileSync(path.join(__dirname, '..', 'src', 'modelOps.js'), 'utf8');
+  check('deleting prunes what it made dead', /const dead = unusedDeclarations\(model\);/.test(ops), 'nothing prunes declarations');
+  check('and says which lines went', /from the frontmatter/.test(ops), 'the deletion is silent about it');
+  check('and the app deletes through it', /ops\.removeNode\(model, \{ nodeId \}\)/.test(app), 'App deletes its own way again');
   check('copying takes the page’s code with it', /frontmatter: state\.model\.extraFrontmatter/.test(app), 'the clipboard holds markup only');
   check('pasting brings what the markup reads', /neededFrontmatter\(\{/.test(app), 'the paste carries nothing');
   check(

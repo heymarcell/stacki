@@ -83,14 +83,26 @@ const check = (what, condition, detail) => {
   );
 
   // --- the move asks -----------------------------------------------------------------
-  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
-  const move = app.slice(app.indexOf('const moveNode = useCallback'), app.indexOf('const removeNode = useCallback'));
+  //
+  // The move itself lives in src/modelOps.js, which is the one implementation
+  // the panels and the Agent API both call. That it is the one App reaches for
+  // is checked too: a second copy of this reasoning in the component is exactly
+  // the drift the shared layer exists to prevent.
+  const ops = fs.readFileSync(path.join(__dirname, '..', 'src', 'modelOps.js'), 'utf8');
+  const move = ops.slice(ops.indexOf('export function moveNode'), ops.indexOf('export function setTag'));
   check('a move asks about the slot it carries', /keepsSlot\(\{ slotName, host, definition \}\)/.test(move), 'the slot is not reconsidered on a move');
   check('and drops it when the answer is no', /delete node\.props\.slot/.test(move), 'nothing removes it');
   check(
     'the host is the component it landed in, not the node above it',
     /slotHostOf\(model, nodeId\)/.test(move),
     'a wrapper element would be read as the host'
+  );
+  const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
+  const appMove = app.slice(app.indexOf('const moveNode = useCallback'), app.indexOf('const removeNode = useCallback'));
+  check(
+    'and the app moves nodes through that one function',
+    /ops\.moveNode\(model, \{ nodeId, target \}/.test(appMove),
+    'App has its own move again, which can drift from the one an agent calls'
   );
 
   if (failures.length) {
