@@ -253,7 +253,17 @@ export default function ReviewThread({
       )}
       {(review.externalRefs || []).map((r) => (
         <div key={r} className="review-note review-ref">
-          <span title={r}>{r}</span>
+          {/* Openable only when it is actually a web address. An external
+              reference is a free string an agent wrote, so anything else is
+              shown as text rather than dressed up as a link that does nothing
+              — and the main process refuses non-http schemes regardless. */}
+          {/^https?:\/\//.test(r) ? (
+            <button type="button" title={r} onClick={() => window.avb.openExternal(r)}>
+              {r}
+            </button>
+          ) : (
+            <span title={r}>{r}</span>
+          )}
         </div>
       ))}
 

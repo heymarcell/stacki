@@ -123,8 +123,10 @@ export default function ReviewPins({ pins, visible, capturing, openId, onOpen })
             }}
           >
             {/* The number, so the pin on the page, the row in the panel and the
-                thing an agent was told to fix are all called the same thing. */}
-            {pin.numbers[0] ?? ''}
+                thing an agent was told to fix are all called the same thing.
+                In its own element because it gets nudged onto the pin's
+                optical centre, which is not the centre of its box. */}
+            <span className="review-pin-n">{pin.numbers[0] ?? ''}</span>
             {many && <span className="review-pin-more">+{pin.reviews.length - 1}</span>}
           </button>
         );

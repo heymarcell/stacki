@@ -20,7 +20,13 @@
 
 const { ipcMain } = require('electron');
 
-const { createReviewStore, selectThreads, summarize, detail, fileFor } = require('./store');
+const {
+  createReviewStore,
+  selectThreads,
+  project,
+  fileFor,
+  MAX_RESPONSE_BYTES,
+} = require('./store');
 const { anchorFrom } = require('./anchor');
 
 // Focusing a review can mean loading a page, drilling into two components and
@@ -101,22 +107,19 @@ function list({
   // by the client's own validation, which turns "no project is open" into an
   // unreadable protocol failure.
   if (!store) {
-    return { ...noProject(), status, scope, reviews: [], total: 0, truncated: false, revision: 0, problem: null };
+    return { ...noProject(), status, scope, reviews: [], total: 0, returned: 0, truncated: false, revision: 0, problem: null };
   }
   const picked = selectThreads(store.all(), { status, scope, page, keys, limit });
-  const resolver = withSource === false ? null : resolveTrail;
   return {
     ok: true,
     revision: store.revision,
     status,
     scope,
-    total: picked.total,
-    truncated: picked.truncated,
     // What went wrong reading the ledger, so a panel that is empty because a
     // file could not be read does not look like a project nobody has
     // commented on.
     problem: store.problem || null,
-    reviews: picked.threads.map((t) => (level === 'full' ? detail(t, resolver) : summarize(t))),
+    ...project(picked, { detail: level, resolver: withSource === false ? null : resolveTrail }),
   };
 }
 
@@ -289,4 +292,5 @@ module.exports = {
   focus,
   flushSync,
   FOCUS_TIMEOUT_MS,
+  MAX_RESPONSE_BYTES,
 };

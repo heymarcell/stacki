@@ -142,6 +142,150 @@ const check = (what, condition, detail) => {
     check('a repeated node resolves', resolveNode(model.nodes, '0.1.0.0', loopFp, { labelOf }).confidence === 'exact');
   }
 
+  // ── Same-kind siblings: the position is not identity ──────────────────────
+  //
+  // Four cards in a row. A review is on the third. Somebody adds a card at the
+  // top. The stored index now addresses a DIFFERENT card — and every card has
+  // the same kind, the same tag and the same ancestors, so nothing but the
+  // words and the shape of the sibling run can tell them apart.
+  //
+  // Getting this wrong is the worst failure this feature has: the pin moves to
+  // the wrong card, focus selects it, capture photographs it, and an agent
+  // edits code nobody complained about. Orphaning instead is merely annoying.
+  {
+    const plans = (names) =>
+      el('main', { class: 'page' }, [
+        el('section', { class: 'plans' }, names.map((n) => el('article', { class: 'plan' }, [el('h3', { class: 'name' }, [txt(n)])]))),
+      ]);
+    // The review was written on "Team" — third of four, index 2 among 4 peers.
+    const fp = (over = {}) => ({
+      nodeKind: 'element',
+      tag: 'h3',
+      text: 'Team',
+      breadcrumbs: ['index', 'page', 'plans', 'plan', 'name'],
+      // main / section / article(3rd of 4) / h3 — the run at every level.
+      peers: [{ index: 0, count: 1 }, { index: 0, count: 1 }, { index: 2, count: 4 }, { index: 0, count: 1 }],
+      ...over,
+    });
+    const AT = '0.0.2.0';
+    const nameAt = (tree, i) => tree.children[0].children[i]?.children[0]?.children[0]?.value;
+    const resolvedName = (tree, r) => {
+      if (!r.id) return null;
+      const found = tree.children[0].children.find((c) => c.children[0].id === r.id);
+      return found ? found.children[0].children[0].value : '(not a plan heading)';
+    };
+
+    // A — nothing changed.
+    {
+      const t = plans(['Basic', 'Pro', 'Team', 'Enterprise']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('A unchanged: stays attached', r.id !== null && resolvedName(t, r) === 'Team', `${r.confidence} -> ${resolvedName(t, r)}`);
+    }
+
+    // B — a same-kind sibling inserted before it. The target itself is
+    //     untouched, so its words still prove which one it is.
+    {
+      const t = plans(['New', 'Basic', 'Pro', 'Team', 'Enterprise']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('B sibling inserted before: follows the real target', resolvedName(t, r) === 'Team', `${r.confidence} -> ${resolvedName(t, r)} (slot now holds "${nameAt(t, 2)}")`);
+      check('B and never the node that inherited the slot', resolvedName(t, r) !== nameAt(t, 2) || nameAt(t, 2) === 'Team');
+    }
+
+    // C — the words were edited in place. Nothing moved.
+    {
+      const t = plans(['Basic', 'Pro', 'Team plan', 'Enterprise']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('C copy edited in place: stays attached', resolvedName(t, r) === 'Team plan', `${r.confidence} -> ${resolvedName(t, r)}`);
+    }
+
+    // D — the dangerous one. A sibling was inserted AND the target renamed in
+    //     the same edit. Nothing carries the old words and the slot moved.
+    //     There is no evidence left. It must orphan.
+    {
+      const t = plans(['New', 'Basic', 'Pro', 'Teams', 'Enterprise']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('D insert + rename: orphans rather than guessing', r.id === null, `${r.confidence}/${r.reason} -> ${resolvedName(t, r)}`);
+    }
+
+    // E — every sibling says the same thing, and the run changed size.
+    {
+      const same = ['Plan', 'Plan', 'Plan', 'Plan'];
+      const t = plans(['Plan', ...same]);
+      const r = resolveNode([t], AT, fp({ text: 'Plan' }), { labelOf });
+      check('E duplicate text + movement: orphans', r.id === null, `${r.confidence}/${r.reason}`);
+    }
+
+    // F — a sibling before it was deleted.
+    {
+      const t = plans(['Pro', 'Team', 'Enterprise']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('F sibling deleted before: follows the real target', resolvedName(t, r) === 'Team', `${r.confidence} -> ${resolvedName(t, r)}`);
+    }
+
+    // H — REORDERED. Nothing was added or removed, so every sibling run is
+    //     exactly the size and shape it was, and the structural proof alone
+    //     says "same slot" — about a slot that now holds a different card.
+    //     The recorded words are next door. They have to win.
+    {
+      const t = plans(['Basic', 'Pro', 'Enterprise', 'Team']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('H siblings reordered: follows the words, not the slot', resolvedName(t, r) === 'Team', `${r.confidence} -> ${resolvedName(t, r)} (slot now holds "${nameAt(t, 2)}")`);
+      check('H and does not attach to what took its place', resolvedName(t, r) !== 'Enterprise');
+    }
+
+    // I — reordered AND renamed in the same edit. Written down because it is
+    //     the limit of what the recorded evidence can decide, not because the
+    //     answer is satisfying.
+    //
+    //     Nothing was added or removed, so every run is the shape it was; and
+    //     no node carries the old words, so nothing says where the target
+    //     went. From the fingerprint alone this is byte for byte the same
+    //     situation as C — somebody edited the copy in place — and C must
+    //     stay attached, because orphaning a review at the moment its feedback
+    //     is acted on would break the one workflow this feature exists for.
+    //     So the slot is kept. Distinguishing the two would mean recording
+    //     what every SIBLING said as well, which is a much larger fingerprint
+    //     for a case that needs two edits in one save to arise.
+    {
+      const t = plans(['Basic', 'Pro', 'Enterprise', 'Teams']);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('I reorder + rename is indistinguishable from an in-place edit', r.confidence === 'exact', `${r.confidence}/${r.reason} -> ${resolvedName(t, r)}`);
+    }
+
+    // J — the same words turn up somewhere else in the file, under different
+    //     ancestors, and the target itself never moved. That is not a rival
+    //     candidate — ancestry is part of what a candidate is — so the review
+    //     stays exactly where it was rather than going ambiguous on a phrase
+    //     that happens to be repeated.
+    {
+      const t = el('main', { class: 'page' }, [
+        el('section', { class: 'plans' }, ['Basic', 'Pro', 'Team', 'Enterprise'].map((n) => el('article', { class: 'plan' }, [el('h3', { class: 'name' }, [txt(n)])]))),
+        el('aside', { class: 'sidebar' }, [el('h3', { class: 'name' }, [txt('Team')])]),
+      ]);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('J the same words elsewhere: the original keeps its review', r.id === t.children[0].children[2].children[0].id && r.confidence === 'exact', `${r.confidence}/${r.reason}`);
+    }
+
+    // G — moved under a different parent entirely.
+    {
+      const t = el('main', { class: 'page' }, [
+        el('section', { class: 'plans' }, ['Basic', 'Pro', 'Enterprise'].map((n) => el('article', { class: 'plan' }, [el('h3', { class: 'name' }, [txt(n)])]))),
+        el('aside', { class: 'sidebar' }, [el('h3', { class: 'name' }, [txt('Team')])]),
+      ]);
+      const r = resolveNode([t], AT, fp(), { labelOf });
+      check('G moved to another parent: does not attach to a plan heading', r.id === null || resolvedName(t, r) !== 'Basic', `${r.confidence}/${r.reason}`);
+    }
+
+    // And the no-text case: a bare wrapper among identical wrappers.
+    {
+      const rows = (n) => el('main', { class: 'page' }, [el('section', { class: 'grid' }, Array.from({ length: n }, () => el('div', { class: 'cell' }, [])))]);
+      const bare = { nodeKind: 'element', tag: 'div', text: null, breadcrumbs: ['index', 'page', 'grid', 'cell'],
+        peers: [{ index: 0, count: 1 }, { index: 0, count: 1 }, { index: 2, count: 4 }] };
+      check('an unchanged wrapper among identical wrappers stays attached', resolveNode([rows(4)], '0.0.2', bare, { labelOf }).id !== null);
+      check('but one whose run grew orphans rather than sliding', resolveNode([rows(5)], '0.0.2', bare, { labelOf }).id === null, JSON.stringify(resolveNode([rows(5)], '0.0.2', bare, { labelOf })));
+    }
+  }
+
   // ── Rung 1 refuses when the position holds something else ─────────────────
 
   {
@@ -271,6 +415,33 @@ const check = (what, condition, detail) => {
       'a review on another page is never judged from this one',
       checkAnchor(own, { file: 'src/pages/about.astro', nodes: page.nodes, labelOf }).state === 'unknown'
     );
+  }
+
+  // ── Is this tree really that file's tree? ─────────────────────────────────
+  //
+  // openFile names the new file before it reads it and sets the model after,
+  // so for one render the app says "HeroSection.astro" while still holding the
+  // page's tree. Anything that resolved an anchor in that window looked for a
+  // component's node in the wrong document and concluded it was gone — which
+  // orphaned good comments every time somebody navigated past them, silently,
+  // because "not found" and "not loaded yet" look identical to a resolver.
+  {
+    const { modelMatchesFile } = await load('reviewAnchor');
+    const tree = { nodes: [] };
+    check(
+      'a state stamped with the file it was read from is that file',
+      modelMatchesFile({ model: tree, file: '/p/src/pages/index.astro' }, '/p/src/pages/index.astro')
+    );
+    check(
+      'a state stamped with a DIFFERENT file is not — this is the stale pair',
+      !modelMatchesFile({ model: tree, file: '/p/src/pages/index.astro' }, '/p/src/components/Hero.astro')
+    );
+    check('no model at all is not a match', !modelMatchesFile({ file: '/p/a.astro' }, '/p/a.astro'));
+    check('and neither is nothing', !modelMatchesFile(null, '/p/a.astro') && !modelMatchesFile(undefined, undefined));
+    // In-place edits spread the previous state forward and carry the stamp, so
+    // the only unstamped state is one that predates stamping. Trusted, because
+    // refusing it would break every edit path for a case that cannot happen.
+    check('an unstamped state is trusted', modelMatchesFile({ model: tree }, '/p/anything.astro'));
   }
 
   // ── The path the canvas knows a review by ─────────────────────────────────
@@ -415,6 +586,44 @@ const check = (what, condition, detail) => {
       check('and a preview is assumed live when nobody said otherwise', focusPlan({ page: { file: 'a' }, keys: ['a#0'] }, {}).previewReady === true);
     }
 
+    // A repeated node's source identity survives the loop changing size; which
+    // rendered copy it is does not. Saying so is the difference between an
+    // agent photographing the right card and photographing the third of five
+    // believing it is the third of four.
+    {
+      const repeated = focusPlan(
+        { page: { file: 'a.astro' }, keys: ['a.astro#0.1'], occurrence: 2, occurrenceCount: 4 },
+        { pageFile: 'a.astro' }
+      );
+      check('the plan carries how many copies there were', repeated.occurrenceCount === 4);
+      const grown = focusNote({
+        restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true },
+        anchorState: 'attached',
+        plan: repeated,
+        liveOccurrenceCount: 5,
+      });
+      check('a loop that changed size is reported', /copy 3 of 4, and there are now 5/.test(grown || ''), grown);
+      check('and it says the element is still right', /element is right/.test(grown || ''));
+      check(
+        'a loop that did not change size says nothing',
+        focusNote({
+          restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true },
+          anchorState: 'attached',
+          plan: repeated,
+          liveOccurrenceCount: 4,
+        }) === null
+      );
+      check(
+        'and neither does one whose size is unknown',
+        focusNote({
+          restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true },
+          anchorState: 'attached',
+          plan: repeated,
+          liveOccurrenceCount: null,
+        }) === null
+      );
+    }
+
     check(
       'a focus that restored everything says nothing at all',
       focusNote({ restored: { page: true, breakpoint: true, component: true, node: true, occurrence: true }, anchorState: 'attached', plan: focusPlan({ page: { file: 'a' }, keys: ['a#0'] }, {}) }) === null
@@ -535,9 +744,20 @@ const check = (what, condition, detail) => {
     check('an orphan has nowhere to point', hidden.includes('e'));
     check('and so does a node that rendered nothing this time', hidden.includes('f'));
     check('neither is silently dropped', hidden.length === 2);
-    check('a resolved review does not clutter the canvas', pinnable('resolved') === false);
-    check('an open one does', pinnable('open') === true);
-    check('and a deferred one does — it still wants something', pinnable('deferred') === true);
+    // Unfinished work is always marked, whatever the panel is filtered to.
+    check('an open review is marked', pinnable('open', 'open') === true);
+    check('and a deferred one is — it still wants something', pinnable('deferred', 'open') === true);
+    check('an open one stays marked while reading resolved ones', pinnable('open', 'resolved') === true);
+    check('and while reading all of them', pinnable('deferred', 'all') === true);
+    // A finished review is marked when the panel is showing finished reviews,
+    // and not otherwise: the default view stays clean, and asking for Resolved
+    // actually points at where those reviews were.
+    check('a resolved review does not clutter the default view', pinnable('resolved', 'open') === false);
+    check('nor the deferred view', pinnable('resolved', 'deferred') === false);
+    check('but Resolved puts them back on the page', pinnable('resolved', 'resolved') === true);
+    check('and so does All', pinnable('resolved', 'all') === true);
+    // Called with no filter at all it must not start marking finished work.
+    check('with no filter given it is the quiet default', pinnable('resolved') === false);
   }
 
   if (failures.length) {

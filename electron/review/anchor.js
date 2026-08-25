@@ -79,7 +79,25 @@ function fingerprintOf(sel) {
     text: str(sel?.text, MAX_FINGERPRINT_TEXT),
     componentChain: listOf(sel?.componentChain, MAX_CHAIN),
     breadcrumbs: listOf(sel?.breadcrumbs, MAX_CHAIN),
+    // The sibling run at each level down to the node. This is the evidence
+    // that tells a slot that never moved apart from one a neighbour was
+    // inserted above — the difference between a review that follows its card
+    // and a review that silently jumps to the next one.
+    peers: peersOf(sel?.peers),
   };
+}
+
+/** A recorded sibling run, checked shape by shape. Null for anything else. */
+function peersOf(v) {
+  if (!Array.isArray(v) || !v.length || v.length > MAX_KEYS) return null;
+  const out = [];
+  for (const run of v) {
+    const index = int(run?.index);
+    const count = int(run?.count);
+    if (index == null || count == null || index < 0 || count < 1) return null;
+    out.push({ index, count });
+  }
+  return out;
 }
 
 /**

@@ -58,6 +58,15 @@ const EXCERPT = 200;
 // thread comes back as its tail plus a count of what was left out.
 const MAX_DETAIL_MESSAGES = 50;
 
+// How large one `get_comments` answer may get.
+//
+// Messages are capped per review, but nothing capped the response: 200 reviews
+// of maximum-length threads is tens of megabytes, and it arrives in somebody's
+// context window whether they wanted it or not. 512KB is far more review than
+// anyone reads in one go and small enough to be harmless — and the normal
+// workflow is a compact list, then focus one, then look at that one closely.
+const MAX_RESPONSE_BYTES = 512 * 1024;
+
 const STATUSES = ['open', 'resolved', 'deferred'];
 // The colours a comment can be. A fixed set rather than a free picker: these
 // have to stay legible as a 22px marker over an arbitrary website, and a
@@ -166,42 +175,49 @@ function reviveThread(raw) {
  *                written; an older app quietly rewriting a newer file in the
  *                old format is how review history gets destroyed for real.
  */
+/** The fingerprint of a ledger's bytes. Null for "there is no file". */
+const digest = (text) => (text == null ? null : crypto.createHash('sha1').update(text).digest('hex'));
+
 function loadFile(file) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
   } catch (err) {
-    if (err.code === 'ENOENT') return { threads: [], nextNumber: 1, writable: true, problem: null };
-    return { threads: [], nextNumber: 1, writable: false, problem: { kind: 'unreadable', detail: err.message } };
+    if (err.code === 'ENOENT') return { threads: [], nextNumber: 1, digest: null, writable: true, problem: null };
+    return { threads: [], nextNumber: 1, digest: null, writable: false, problem: { kind: 'unreadable', detail: err.message } };
   }
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    return { threads: [], nextNumber: 1, writable: true, problem: { kind: 'corrupt', detail: err.message, quarantine: true } };
+    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: err.message, quarantine: true } };
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { threads: [], nextNumber: 1, writable: true, problem: { kind: 'corrupt', detail: 'not an object', quarantine: true } };
+    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: 'not an object', quarantine: true } };
   }
   const version = Number(parsed.version);
   if (!Number.isInteger(version) || version < 1) {
-    return { threads: [], nextNumber: 1, writable: true, problem: { kind: 'corrupt', detail: `version ${parsed.version}`, quarantine: true } };
+    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: `version ${parsed.version}`, quarantine: true } };
   }
   if (version > VERSION) {
     return {
       threads: [],
       nextNumber: 1,
+      digest: null,
       writable: false,
       problem: { kind: 'newer', detail: `this file was written by a newer Stacki (version ${version})` },
     };
   }
   if (!Array.isArray(parsed.threads)) {
-    return { threads: [], nextNumber: 1, writable: true, problem: { kind: 'corrupt', detail: 'threads is not a list', quarantine: true } };
+    return { threads: [], nextNumber: 1, digest: null, writable: true, problem: { kind: 'corrupt', detail: 'threads is not a list', quarantine: true } };
   }
   const threads = parsed.threads.map(reviveThread).filter(Boolean);
   const dropped = parsed.threads.length - threads.length;
   return {
     threads,
+    // What the file said when we read it. Any later write compares against
+    // this to find out whether another Stacki has been here since.
+    digest: digest(text),
     // The high-water mark, as the last write left it. Deleting #3 must not free
     // #3 up for the next comment — an agent told "fix #3" before a restart and
     // acting after one would otherwise act on a different review. Derived from
@@ -224,6 +240,64 @@ function quarantine(file, stamp) {
     return null;
   }
 }
+
+// How long a lock may be held before it is presumed abandoned. A write is
+// microseconds; anything approaching this is a Stacki that died holding it, and
+// a ledger nobody can ever write to again is worse than a rare stolen lock.
+const LOCK_STALE_MS = 10_000;
+const LOCK_TRIES = 100;
+const LOCK_WAIT_MS = 10;
+
+/** Sleep without a promise — the write path is synchronous on purpose. */
+function pause(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* SharedArrayBuffer unavailable; spin briefly instead */
+    const until = Date.now() + ms;
+    while (Date.now() < until);
+  }
+}
+
+/**
+ * Take the ledger's lock, or answer null.
+ *
+ * `mkdir` is the atomic primitive here: it either creates the directory or
+ * fails with EEXIST, with no window between the two. That is what makes this a
+ * lock rather than a check — two processes cannot both believe they hold it,
+ * which is exactly the failure a stat-then-write has.
+ */
+function acquireLock(file) {
+  const lock = `${file}.lock`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (let attempt = 0; attempt < LOCK_TRIES; attempt++) {
+    try {
+      fs.mkdirSync(lock);
+      return lock;
+    } catch (err) {
+      if (err.code !== 'EEXIST') return null;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lock, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        /* it was released while we looked at it — try again immediately */
+        continue;
+      }
+      pause(LOCK_WAIT_MS);
+    }
+  }
+  return null;
+}
+
+const releaseLock = (lock) => {
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+  } catch {
+    /* already gone */
+  }
+};
 
 /**
  * Write, or leave the previous file exactly as it was.
@@ -306,28 +380,78 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   let revision = 0;
   let pending = Promise.resolve();
   let dirty = false;
+  // The bytes this store believes are on disk. Any write that finds something
+  // else there is a write on top of another Stacki's work.
+  let owned = loaded.digest;
 
   const snapshotText = () =>
     JSON.stringify({ version: VERSION, projectPath, nextNumber, threads }, null, 2);
+
+  /**
+   * Put the current state on disk, unless somebody else got there first.
+   *
+   * Two Stackis can have the same project open, and each holds its own copy of
+   * the ledger. Writing is replacing the whole file, so without this the second
+   * one to write silently erases the first one's reviews and hands their
+   * numbers out again.
+   *
+   * The compare and the write happen inside one lock, which is what makes this
+   * safe rather than merely unlikely: check-then-write with no lock lets both
+   * processes read the same file and then overwrite each other. Under the lock,
+   * the loser sees a ledger it does not recognise and refuses.
+   *
+   * Refusing is deliberate. Merging two review histories automatically is a way
+   * to get both of them wrong; keeping the newer file and saying so leaves the
+   * person with something true.
+   */
+  function commit() {
+    const lock = acquireLock(file);
+    if (!lock) {
+      problem = { kind: 'write_failed', detail: 'another Stacki is holding the review file' };
+      return false;
+    }
+    try {
+      let current = null;
+      try {
+        current = fs.readFileSync(file, 'utf8');
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+      if (digest(current) !== owned) {
+        // Somebody else has written since we loaded. Theirs is newer; ours is
+        // stale by definition, so it does not go over the top of it.
+        writable = false;
+        problem = {
+          kind: 'foreign_write',
+          detail:
+            'Another Stacki changed these comments. This window is not writing over them — ' +
+            'reopen the project to pick up the newer list.',
+        };
+        return false;
+      }
+      const text = snapshotText();
+      writeAtomic(file, text);
+      owned = digest(text);
+      return true;
+    } catch (err) {
+      // The change still holds in memory for this session. Saying nothing
+      // here would be the one failure mode that loses somebody's review
+      // without ever telling them.
+      problem = { kind: 'write_failed', detail: err.message };
+      console.warn('[stacki] could not save reviews:', err.message);
+      return false;
+    } finally {
+      releaseLock(lock);
+    }
+  }
 
   function schedule() {
     if (!writable) return pending;
     dirty = true;
     pending = pending.then(async () => {
-      if (!dirty) return;
-      // Taken at the moment the write runs, not when it was scheduled: a burst
-      // of mutations collapses into one write of the latest state.
-      const text = snapshotText();
+      if (!dirty || !writable) return;
       dirty = false;
-      try {
-        writeAtomic(file, text);
-      } catch (err) {
-        // The change still holds in memory for this session. Saying nothing
-        // here would be the one failure mode that loses somebody's review
-        // without ever telling them.
-        problem = { kind: 'write_failed', detail: err.message };
-        console.warn('[stacki] could not save reviews:', err.message);
-      }
+      commit();
     });
     return pending;
   }
@@ -576,11 +700,7 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     flushSync() {
       if (!writable || !dirty) return;
       dirty = false;
-      try {
-        writeAtomic(file, snapshotText());
-      } catch {
-        /* nothing left to do at quit time */
-      }
+      commit();
     },
   };
 }
@@ -638,6 +758,26 @@ function summarize(thread) {
  * anchor — the same resolver ⇧⌘C and get_context use. Injected because it
  * costs a parse per file and only a full read is worth spending it on.
  */
+/**
+ * The fingerprint as it goes on the wire: every field present, always.
+ *
+ * A review written before a fingerprint field existed simply has no such key,
+ * and passing the stored object straight out would publish a response missing
+ * a declared property — which a strict client rejects wholesale. The shape a
+ * caller sees is decided here, not by how old the review is.
+ */
+function wireFingerprint(fp) {
+  if (!fp || typeof fp !== 'object') return null;
+  return {
+    nodeKind: fp.nodeKind ?? null,
+    tag: fp.tag ?? null,
+    text: fp.text ?? null,
+    componentChain: Array.isArray(fp.componentChain) ? fp.componentChain : null,
+    breadcrumbs: Array.isArray(fp.breadcrumbs) ? fp.breadcrumbs : null,
+    peers: Array.isArray(fp.peers) ? fp.peers : null,
+  };
+}
+
 function detail(thread, resolveSource) {
   const trail = (typeof resolveSource === 'function' ? resolveSource(thread.anchor?.keys) : null) || null;
   const all = thread.messages || [];
@@ -656,7 +796,7 @@ function detail(thread, resolveSource) {
       keys: thread.anchor?.keys || [],
       breakpoint: thread.anchor?.breakpoint || { device: null, viewportWidth: null, viewportHeight: null },
       pin: thread.anchor?.pin || null,
-      fingerprint: thread.anchor?.fingerprint || null,
+      fingerprint: wireFingerprint(thread.anchor?.fingerprint),
       // Where the anchor points RIGHT NOW, lines and all. Null for an orphan,
       // which is the honest answer rather than the last place it was seen.
       sourceTrail: trail,
@@ -695,9 +835,44 @@ function selectThreads(threads, { status = 'open', scope = 'project', page = nul
   return { threads: sorted.slice(0, capped), total: sorted.length, truncated: sorted.length > capped };
 }
 
+/**
+ * What a selection of threads looks like on the wire, built against a byte
+ * budget.
+ *
+ * Lives here rather than in the service because it is pure — threads in, a
+ * response body out — and because it is the one projection every reader shares.
+ * A caller that built the list itself would be a second implementation of the
+ * answer, which is where the size cap would quietly stop applying.
+ */
+function project(picked, { detail: level = 'summary', resolver = null } = {}) {
+  const reviews = [];
+  let bytes = 0;
+  let overBudget = false;
+  for (const thread of picked.threads) {
+    const one = level === 'full' ? detail(thread, resolver) : summarize(thread);
+    bytes += JSON.stringify(one).length;
+    // The first review always goes in, however large — an answer with nothing
+    // in it would be worse than a big one.
+    if (bytes > MAX_RESPONSE_BYTES && reviews.length) {
+      overBudget = true;
+      break;
+    }
+    reviews.push(one);
+  }
+  return {
+    reviews,
+    total: picked.total,
+    // True when the list was cut — by the limit asked for, or by the size of
+    // what came back. Either way the caller knows it is not the whole story.
+    truncated: picked.truncated || overBudget,
+    returned: reviews.length,
+  };
+}
+
 module.exports = {
   createReviewStore,
   selectThreads,
+  project,
   summarize,
   detail,
   scopeKey,
@@ -719,5 +894,6 @@ module.exports = {
   MAX_MESSAGES,
   MAX_THREADS,
   MAX_DETAIL_MESSAGES,
+  MAX_RESPONSE_BYTES,
   EXCERPT,
 };

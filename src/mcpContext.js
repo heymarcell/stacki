@@ -61,6 +61,7 @@ export function tagOf(node) {
 export function buildMcpPayload({
   project,
   branch,
+  peers,
   currentPage,
   pageRoute,
   editStack,
@@ -114,6 +115,11 @@ export function buildMcpPayload({
     // review that came back to the first one would be looking at the wrong
     // instance of the right node.
     instanceOccurrence: (editStack || []).length > 1 ? editStack[1]?.focusOcc ?? 0 : null,
+    // The sibling run at every level on the way down to this node. It is what
+    // lets a review tell "nothing moved" apart from "something was inserted
+    // above me" — without it an index path is not identity among same-kind
+    // siblings. See src/reviewAnchor.js.
+    peers: Array.isArray(peers) ? peers : null,
     keys: selectionKeys || [],
     // The route an editor takes to reach this: the page, then each component
     // opened on the way down.

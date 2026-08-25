@@ -69,6 +69,10 @@ export function focusPlan(anchor, { pageFile = null, device = null, drilledIn = 
     // Which rendered copy. Null means the node rather than one copy of it,
     // which is what every route to a selection except a canvas click means.
     occurrence: Number.isInteger(anchor?.occurrence) ? anchor.occurrence : null,
+    // How many copies there were when the review was written. If the loop is a
+    // different size now, "copy 3" is not necessarily the same rendered item —
+    // source identity is intact, rendered-instance identity is not.
+    occurrenceCount: Number.isInteger(anchor?.occurrenceCount) ? anchor.occurrenceCount : null,
     // Whether the canvas is actually showing anything. A focus can identify the
     // right source node with no preview at all — and then there is nothing to
     // scroll to, nothing to measure and nothing to photograph, which is not the
@@ -118,7 +122,7 @@ const why = {
     'it was selected, and then Stacki navigated somewhere else — the project may still have been opening. Try again',
 };
 
-export function focusNote({ restored, anchorState, plan, reason } = {}) {
+export function focusNote({ restored, anchorState, plan, reason, liveOccurrenceCount = null } = {}) {
   const r = restored || nothingRestored();
   if (anchorState === 'attached') {
     const notes = [];
@@ -135,6 +139,14 @@ export function focusNote({ restored, anchorState, plan, reason } = {}) {
     if (plan && plan.previewReady === false) {
       notes.push(
         'The element was found in source, but the Stacki preview is not rendering yet — nothing was scrolled to and a capture will not show it. Wait for the preview and focus again.'
+      );
+    } else if (plan?.occurrence != null && plan.occurrenceCount != null && liveOccurrenceCount != null && liveOccurrenceCount !== plan.occurrenceCount) {
+      // The source node is right; which rendered copy is not provable. Said
+      // rather than assumed, because an agent about to photograph "copy 3"
+      // should know the list is a different length than when it was reviewed.
+      notes.push(
+        `This was left on copy ${plan.occurrence + 1} of ${plan.occurrenceCount}, and there are now ` +
+          `${liveOccurrenceCount}. The element is right; which rendered copy may not be — check before acting on it.`
       );
     } else if (plan?.occurrence != null && !r.occurrence) {
       notes.push(

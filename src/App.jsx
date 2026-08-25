@@ -10,7 +10,7 @@ import { createPreviewWatch } from './previewRecovery.js';
 import { queryCanvas, tellCanvas } from './canvasQuery.js';
 import { buildMcpPayload } from './mcpContext.js';
 import CommentsPanel from './panels/CommentsPanel.jsx';
-import { anchorSteps, checkAnchor, markerPathFor, resolveNode } from './reviewAnchor.js';
+import { anchorSteps, checkAnchor, markerPathFor, modelMatchesFile, peerPath, resolveNode } from './reviewAnchor.js';
 import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
 import { pinnable } from './reviewPins.js';
 import {
@@ -1028,7 +1028,18 @@ export default function App() {
       setCurrentPage(entry);
       setSelectedId(null);
       const result = await window.avb.readPage(entry.path);
-      setPageState({ ...result, dirty: false });
+      // Stamped with the file it was read from.
+      //
+      // `setCurrentPage` above happens BEFORE this await and `setPageState`
+      // after it, so for one render the app names a new file while still
+      // holding the previous one's tree. Anything that resolves a position
+      // against "the open file" during that window is looking the node up in
+      // the wrong document — which is how comments anchored inside components
+      // were being marked orphaned by nothing more than navigating past them.
+      // Carrying the path on the state is what lets a reader tell the pair
+      // apart from a matched one. Edits below spread the previous state, so
+      // the stamp survives them.
+      setPageState({ ...result, file: entry.path, dirty: false });
       // Whatever opens, opens on something rather than nothing: a component on
       // its <body> when it has one, else the first element it renders; a page
       // on its outermost node, which is the layout wrapper when it has one.
@@ -1117,7 +1128,7 @@ export default function App() {
       result.layouts.some((l) => l.path === open.path);
     if (stillThere) {
       const fresh = await window.avb.readPage(open.path);
-      setPageState({ ...fresh, dirty: false });
+      setPageState({ ...fresh, file: open.path, dirty: false });
       setSelectedId(null);
       dropPageHistory(); // page snapshots don't apply to another page; commands stay
     } else {
@@ -1524,7 +1535,7 @@ export default function App() {
           nextSelected = null;
         }
       }
-      setPageState({ ...result, dirty: false });
+      setPageState({ ...result, file: page.path, dirty: false });
       setSelectedId(nextSelected);
     });
     return off;
@@ -3975,6 +3986,15 @@ export default function App() {
   // not happen is a review inventing its own idea of where a node is. Same
   // keys, same builder, whether they end up on the clipboard, in an MCP
   // snapshot or in a review anchor.
+  // The sibling run at every level down to a node — the evidence that lets a
+  // review tell its own slot apart from the neighbour that inherits the index
+  // when something is inserted above it. Same trail keysFor walks, so the two
+  // can never describe different nodes.
+  const peersFor = (id) => {
+    if (!model || !id || id === 'frontmatter') return null;
+    const trail = pathOfNode(model.nodes, id);
+    return trail ? peerPath(model.nodes, trail) : null;
+  };
   const keysFor = (id) => {
     if (!openRel) return [];
     if (id === 'frontmatter') return [...hostKeys, `${openRel}#frontmatter`];
@@ -4046,6 +4066,7 @@ export default function App() {
     // than fetched where it is needed, so a review records the branch that was
     // checked out at the moment it describes.
     branch: gitInfo?.branch || null,
+    peers: peersFor(selectedId),
     currentPage,
     // A dynamic route is a pattern; the canvas is showing one entry of it.
     pageRoute: dynamicPaths[dynamicIndex]?.route || (editStack[0] || currentPage)?.route || null,
@@ -4215,6 +4236,12 @@ export default function App() {
   const anchorSyncRef = useRef('');
   useEffect(() => {
     if (!project || !model || !openRel || !allReviews.length) return;
+    // Only when the tree in hand is the tree of the file being named. During a
+    // navigation those disagree for a render, and judging an anchor then means
+    // looking for a component's node in the page's document and concluding it
+    // is gone — which orphaned perfectly good comments every time somebody
+    // moved around.
+    if (!modelOf(openRel)) return;
     const updates = [];
     for (const r of allReviews) {
       const health = checkAnchor(r.anchor, { file: openRel, nodes: model.nodes, labelOf: crumbLabel });
@@ -4253,7 +4280,7 @@ export default function App() {
   // best available answer: if the node has since moved the page reports no box
   // for it and it simply has no pin, which is where it was already.
   const reviewItems = allReviews
-    .filter((r) => pinnable(r.status) && onReviewPage(r))
+    .filter((r) => pinnable(r.status, reviewFilter) && onReviewPage(r))
     .map((r) => {
       // Where the file IS open the resolved position is used, because that one
       // follows the node if it moved. Everywhere else the anchor's own key is
@@ -4367,6 +4394,7 @@ export default function App() {
     const payload = buildMcpPayload({
       project,
       branch: gitInfo?.branch || null,
+      peers: peersFor(target.id),
       currentPage,
       pageRoute: reviewPageRoute,
       editStack,
@@ -4421,11 +4449,19 @@ export default function App() {
     return false;
   };
 
-  /** The tree of the file that is open right now, if it is the one expected. */
+  /**
+   * The tree of the file that is open right now, if it is the one expected.
+   *
+   * Both halves have to agree: the app naming a file is not the same as the
+   * app holding that file's tree (see the stamp in openFile). A reader that
+   * took the name for granted would resolve one document's positions against
+   * another's.
+   */
   const modelOf = (rel) => {
     const { currentPage: open, pageState: state } = pageStateRef.current;
     if (!open || relOf(open.path) !== rel) return null;
-    return state?.model || null;
+    if (!modelMatchesFile(state, open.path)) return null;
+    return state.model;
   };
 
   // What the canvas last reported about the selection — read after a focus to
@@ -4477,7 +4513,15 @@ export default function App() {
       transient: state !== 'attached' && TRANSIENT.has(reason),
       restored,
       keys: state === 'attached' ? resolvedKeys : null,
-      note: focusNote({ restored, anchorState: state, plan, reason }),
+      note: focusNote({
+        restored,
+        anchorState: state,
+        plan,
+        reason,
+        // What the canvas says the loop is now, so a copy that shifted under a
+        // resized collection is reported rather than assumed.
+        liveOccurrenceCount: canvasReportRef.current?.occurrenceCount ?? null,
+      }),
     });
 
     // 1 — the page, first, because a component drill is an index path into it.

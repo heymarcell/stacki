@@ -132,53 +132,152 @@ const chainMatches = (chain, wanted) => {
 };
 
 /**
+ * The run of siblings a node belongs to, among those of its own kind and tag.
+ *
+ * `{ index, count }` — which one it is, and how many there are. This is the
+ * only thing that can tell "nothing moved" apart from "something was inserted
+ * above me", and without it an index path is not identity at all: insert a
+ * card at the top of a list and every index below it addresses a different
+ * card that looks exactly the same.
+ */
+export function peersAt(nodes, trail) {
+  if (!Array.isArray(trail) || !trail.length) return null;
+  const parent = trail.slice(0, -1);
+  const list = parent.length ? nodeAt(nodes, parent)?.children : nodes;
+  if (!Array.isArray(list)) return null;
+  const self = list[trail[trail.length - 1]];
+  if (!self) return null;
+  const kind = self.kind;
+  const tag = tagOf(self);
+  let index = -1;
+  let count = 0;
+  for (const node of list) {
+    if (node.kind !== kind || tagOf(node) !== tag) continue;
+    if (node === self) index = count;
+    count += 1;
+  }
+  return index === -1 ? null : { index, count };
+}
+
+/**
+ * The sibling run at EVERY level on the way down to a node.
+ *
+ * The leaf alone is not enough, and the reason is the whole point: a heading
+ * is usually the only heading inside its own card, so its own run never
+ * changes — while the card it lives in slides down the page because somebody
+ * added another card above. What moved was an ancestor. So every level is
+ * recorded, and a change at any of them means the stored index path may now
+ * address a different, identical-looking thing.
+ */
+export function peerPath(nodes, trail) {
+  if (!Array.isArray(trail) || !trail.length) return null;
+  const out = [];
+  for (let depth = 1; depth <= trail.length; depth++) {
+    const run = peersAt(nodes, trail.slice(0, depth));
+    if (!run) return null;
+    out.push(run);
+  }
+  return out;
+}
+
+/** Whether two recorded sibling runs describe the same place in the tree. */
+export function samePeerPath(then, now) {
+  if (!Array.isArray(then) || !Array.isArray(now) || then.length !== now.length) return false;
+  return then.every((a, i) => a && now[i] && a.index === now[i].index && a.count === now[i].count);
+}
+
+/**
  * Where a review's node is in this model now.
  *
- * Answers `{ id, trail, confidence, reason }`. `confidence` is one of:
+ * The ladder runs from proof to evidence to nothing, and never guesses:
  *
- *   exact  — the index path still leads to the same sort of node
- *   moved  — it doesn't, but exactly one node in the file answers the
- *            fingerprint, so it is that one
- *   none   — nothing, or more than one thing. The caller orphans the review;
- *            it does not pick.
+ *   1. The stored slot is provably still the same slot — either the node has
+ *      no same-kind siblings to be confused with, or the sibling run is
+ *      exactly the size and shape it was when the review was written.
+ *
+ *   2. It isn't, so the recorded marks have to identify it: same kind, same
+ *      tag, same ancestor labels AND the same words. Exactly one such node is
+ *      an answer. Two or more is a coin toss, and a coin toss is an orphan.
+ *
+ *   3. Nothing carries the recorded words — they were edited. The slot is
+ *      usable only when there is exactly one candidate in the whole file, so
+ *      there was nothing for it to slide between.
+ *
+ * The case this shape exists for: a sibling inserted above the target AND the
+ * target's words changed in the same edit. The slot now holds a different card
+ * that looks identical, and no node carries the old words. There is no evidence
+ * left, so the only honest answer is `orphaned` — a review pointing at the
+ * wrong card is far worse than one pointing at nothing.
+ *
+ * Answers `{ id, trail, confidence, reason }` — `exact`, `moved`, or `none`.
  */
 export function resolveNode(nodes, indexPath, fingerprint, { labelOf } = {}) {
   const list = Array.isArray(nodes) ? nodes : [];
   const trail = trailOfPath(indexPath);
+  const fp = fingerprint || {};
+  const at = trail ? nodeAt(list, trail) : null;
+  const atMatches = !!at && sameSort(at, fp);
+  const fpText = norm(fp.text);
 
-  // Rung 1 — the position, which is what Stacki already means by "the same
-  // node" after a reload.
-  if (trail) {
-    const at = nodeAt(list, trail);
-    if (at && sameSort(at, fingerprint)) {
-      return { id: at.id, trail, confidence: 'exact', reason: null };
-    }
-  }
+  const wanted = ancestorsOf(fp);
+  // Everything this could be: same kind, same tag, same ancestry. Without
+  // recorded ancestors there is nothing worth searching on — kind and tag
+  // alone match every <span> in the file.
+  const peers = wanted
+    ? walk(list, labelOf).filter((e) => sameSort(e.node, fp) && chainMatches(e.chain, wanted))
+    : [];
 
-  // Rung 2 — the same sort of node, under the same ancestors, and only one of
-  // it. Without recorded ancestors there is nothing here worth trusting: kind
-  // and tag alone match every <span> in the file.
-  const wanted = ancestorsOf(fingerprint);
-  if (!wanted) {
-    return { id: null, trail: null, confidence: 'none', reason: trail ? 'changed' : 'no_path' };
+  // Where the recorded words are NOW. Needed before rung 1, not after: a
+  // structural proof about a slot is only a proof about the slot, and the
+  // words can say the target left it.
+  const marked = fpText ? peers.filter((e) => wordsOf(e.node) === fpText) : peers;
+  const atSays = !fpText || wordsOf(at) === fpText;
+  const claimedElsewhere = !!fpText && marked.some((e) => e.node !== at);
+
+  // 1 — is the slot provably the same slot?
+  const now = trail ? peerPath(list, trail) : null;
+  const then = Array.isArray(fp.peers) && fp.peers.length ? fp.peers : null;
+  const slotHeld =
+    atMatches &&
+    // Two cards swapped places. Every sibling run is the size and shape it
+    // always was — reordering does not change how many there are — so the
+    // structural proof below still says "same slot", and it is wrong: the
+    // words the review recorded are sitting on a DIFFERENT node now. Either
+    // this slot still says what the review said, or nothing else does; a slot
+    // whose words moved next door is not this review's slot any more.
+    (atSays || !claimedElsewhere) &&
+    // Nothing anywhere on the way down has a same-kind sibling, so there is
+    // nothing for the path to have slid between.
+    ((now && now.every((run) => run.count === 1)) ||
+      // The run is exactly the size and shape it was: same slot, provably.
+      samePeerPath(then, now) ||
+      // No run was recorded. That is a review written before runs existed, or
+      // a synthesised fingerprint (the component a drill step should open,
+      // which has neither ancestors nor words). Those keep the older rule —
+      // position plus kind and tag — which is what they have always used. It
+      // is weaker, and it is why `peers` exists for everything written from
+      // now on; orphaning every such review on sight would be worse.
+      (!then && (!wanted || atSays)));
+  if (slotHeld) return { id: at.id, trail, confidence: 'exact', reason: null };
+
+  // 2 — exactly one node still carries every recorded mark.
+  if (marked.length === 1) {
+    const found = marked[0];
+    return { id: found.node.id, trail: found.trail, confidence: 'moved', reason: null };
   }
-  const everything = walk(list, labelOf);
-  let candidates = everything.filter((e) => sameSort(e.node, fingerprint) && chainMatches(e.chain, wanted));
-  if (!candidates.length) {
-    return { id: null, trail: null, confidence: 'none', reason: 'gone' };
+  if (marked.length > 1) return { id: null, trail: null, confidence: 'none', reason: 'ambiguous' };
+
+  // 3 — nothing carries the recorded words, so they were edited. That is the
+  //     ordinary end of a piece of feedback being acted on, and it must not
+  //     orphan the review that asked for it. It is safe exactly when there is
+  //     ONE node in the whole file of this kind, tag and ancestry: whatever it
+  //     now says, there is nothing else it could be.
+  if (peers.length === 1) {
+    const only = peers[0];
+    return { id: only.node.id, trail: only.trail, confidence: 'moved', reason: null };
   }
-  if (candidates.length > 1) {
-    // Several nodes fit. The words are allowed to break the tie — and ONLY to
-    // break a tie between nodes that already agree on everything else.
-    const fpText = norm(fingerprint?.text);
-    const byText = fpText ? candidates.filter((e) => wordsOf(e.node) === fpText) : [];
-    if (byText.length !== 1) {
-      return { id: null, trail: null, confidence: 'none', reason: 'ambiguous' };
-    }
-    candidates = byText;
-  }
-  const found = candidates[0];
-  return { id: found.node.id, trail: found.trail, confidence: 'moved', reason: null };
+  if (!wanted) return { id: null, trail: null, confidence: 'none', reason: trail ? 'changed' : 'no_path' };
+  return { id: null, trail: null, confidence: 'none', reason: peers.length ? 'ambiguous' : 'gone' };
 }
 
 /**
@@ -204,6 +303,26 @@ export function anchorSteps(anchor) {
       opens: next ? componentNameOf(next.file) : null,
     };
   });
+}
+
+/**
+ * Whether a loaded page state really is the tree of `file`.
+ *
+ * `openFile` sets the current file BEFORE it reads it and the model AFTER, so
+ * for one render the app names a new file while still holding the previous
+ * one's tree. Judging an anchor in that window means looking for a component's
+ * node in the page's document and concluding it is gone — which orphaned
+ * perfectly good comments every time somebody navigated past them, and did it
+ * silently, because "not found" and "not loaded yet" look identical to a
+ * resolver.
+ *
+ * The stamp is what tells the pair apart. An unstamped state is trusted:
+ * in-place edits spread the previous state forward and keep the stamp, so the
+ * only way to be unstamped is to predate stamping entirely.
+ */
+export function modelMatchesFile(pageState, file) {
+  if (!pageState?.model) return false;
+  return !pageState.file || pageState.file === file;
 }
 
 /**

@@ -5738,7 +5738,6 @@ textarea::selection {
   min-width: 22px;
   height: 22px;
   padding: 0 6px;
-  font-variant-numeric: tabular-nums;
   border: 1.5px solid #fff;
   border-radius: 11px 11px 11px 3px;
   background: var(--pin, var(--accent));
@@ -5757,20 +5756,55 @@ textarea::selection {
   filter: brightness(1.15);
 }
 /* Deliberately not being done now: hollow, in the same colour. Shape carries
-   the state so the colour can stay the person's own. */
+   the state so the colour can stay the person's own.
+   White, not the editor's panel colour — this marker sits over somebody's
+   WEBSITE, which is usually light, and a dark fill there reads as a solid
+   blob rather than as an outline. */
 .review-pin.is-deferred {
-  background: var(--bg-panel-2);
+  background: #fff;
   color: var(--pin, var(--accent));
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px var(--pin, var(--accent));
 }
-.review-pin.is-deferred:hover:not(:disabled) { background: var(--bg-panel-2); }
+.review-pin.is-deferred:hover:not(:disabled) { background: #fff; filter: none; }
+/* Done. Shown only when the panel is showing resolved reviews, and shown
+   quietly when it is: grey rather than the person's colour, and faded, so a
+   page being checked over reads as "here is where that was" instead of as a
+   page full of outstanding work. Full strength on hover, because at that point
+   it is the one being looked at. */
+.review-pin.is-resolved {
+  background: #6b7280;
+  color: #fff;
+  opacity: 0.5;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+.review-pin.is-resolved:hover:not(:disabled) { background: #6b7280; opacity: 1; filter: none; }
+.review-pin.is-resolved.open { opacity: 1; }
 .review-pin.open { outline: 2px solid var(--pin, var(--accent)); outline-offset: 2px; }
+/* The number, sat on the pin's OPTICAL centre rather than the centre of its
+   box. The two are not the same here: three corners are full quarter-circles
+   and the fourth — the tail, bottom-left — is nearly square, so the shape
+   carries more colour on that side and its centre of area is down and left of
+   the middle. A digit placed dead centre reads as pushed up and to the right,
+   which is what it was doing. Half a pixel each way is one device pixel on a
+   retina screen, and it is the difference between a number sitting in the pin
+   and a number posted through it. */
+.review-pin-n {
+  display: block;
+  transform: translate(-0.5px, 0.5px);
+}
 /* How many more are underneath — a badge in the corner rather than more
    characters in the label, so a cluster is no wider than its number. */
 .review-pin-more {
   position: absolute;
-  top: -6px;
-  right: -7px;
+  /* BESIDE the pin, not on top of it. Sitting in the corner it covered the
+     number underneath, which is the one thing on a pin that has to stay
+     readable — the number is how a person and an agent name the same review.
+     So it hangs off the right edge entirely and only the pin's rounded corner
+     comes near it. */
+  top: -7px;
+  right: auto;
+  left: 100%;
+  margin-left: -3px;
   min-width: 14px;
   height: 14px;
   padding: 0 3px;
@@ -5970,6 +6004,17 @@ textarea::selection {
 .review-time { font-size: 10px; color: var(--text-faint); }
 .review-body { color: var(--text); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* The app sets `user-select: none` on the body and opts individual regions
+   back in. A comment is words somebody wrote to be read and quoted — the note
+   itself, what the element said, the reason it was deferred and the link it
+   was filed under are all things people copy — so they are opted in here.
+   The header stays unselectable: it is a drag handle. */
+.review-body,
+.review-target-text,
+.review-note span,
+.review-note button,
+.review-messages { user-select: text; -webkit-user-select: text; cursor: auto; }
+
 .review-note {
   display: flex;
   gap: 6px;
@@ -5982,7 +6027,21 @@ textarea::selection {
   line-height: 1.4;
 }
 .review-note svg { color: var(--amber); margin-top: 1px; flex-shrink: 0; }
-.review-ref span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
+.review-ref span,
+.review-ref button {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+  background: none;
+  padding: 0;
+  min-width: 0;
+  display: block;
+  text-align: left;
+  font-size: inherit;
+}
+.review-ref button { cursor: pointer; }
+.review-ref button:hover:not(:disabled) { background: none; text-decoration: underline; }
 
 /* Set apart from the conversation above it: a box you type into should not
    look like the next message in the thread. */

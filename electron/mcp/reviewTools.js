@@ -93,6 +93,11 @@ const Full = Summary.extend({
         text: nullableString,
         componentChain: z.array(z.string()).nullable(),
         breadcrumbs: z.array(z.string()).nullable(),
+        // The sibling run at each level down to the node, recorded when the
+        // review was written. It is what separates "this slot never moved"
+        // from "a neighbour was inserted above it", so it is part of the
+        // anchor an agent is allowed to see.
+        peers: z.array(z.object({ index: z.number().int(), count: z.number().int() })).nullable(),
       })
       .nullable(),
     sourceTrail: z.array(SourceRef).nullable(),
@@ -108,8 +113,19 @@ const CommentsOutput = z.object({
   status: z.string(),
   scope: z.string(),
   total: z.number().int(),
+  // How many came back, which is not always `limit`: a very large answer is
+  // cut to a byte budget as well as to the count asked for.
+  returned: z.number().int().optional(),
   truncated: z.boolean(),
   reviews: z.array(Review),
+  // What went wrong reading the ledger, if anything. Declared because the
+  // implementation always sends it — an undeclared field makes a strict client
+  // reject the entire response, which is how `get_comments` came to be
+  // unusable from a real MCP client while every local test passed.
+  problem: z
+    .object({ kind: z.string(), detail: z.string().nullable().optional(), movedTo: z.string().nullable().optional() })
+    .nullable()
+    .optional(),
   code: z.string().nullable().optional(),
   message: z.string().nullable().optional(),
 });
@@ -237,7 +253,10 @@ function registerReviewTools(server, { getComments, comment }) {
           .min(1)
           .max(MAX_LIMIT)
           .default(50)
-          .describe('How many to return, newest change first. The response says whether the list was cut.'),
+          .describe(
+            'How many to return, newest change first. A large answer is also capped by total size, so `returned` ' +
+              'may be fewer than asked for and `truncated` says the list was cut.'
+          ),
       }),
       outputSchema: CommentsOutput,
       annotations: READ_ONLY,

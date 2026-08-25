@@ -717,6 +717,68 @@ const anchorOf = (over) => {
     check('and so did the reply', back.get(b.id).messages.length === 2);
   }
 
+  // ── Two writers, two processes ────────────────────────────────────────────
+  //
+  // A dev Stacki and a packaged Stacki can both have the same project open.
+  // Each holds its own in-memory ledger and each write replaces the whole
+  // file, so the second one to write silently erases whatever the first one
+  // added — and hands out its numbers again. Losing somebody's review because
+  // they had two windows open is not a limitation, it is data loss.
+  {
+    const file = path.join(home, 'two-writers.json');
+    const anchor = anchorFrom(payload()).anchor;
+    const A = freshStore(file);
+    const B = freshStore(file);
+    check('both stores start from the same empty ledger', A.size === 0 && B.size === 0);
+
+    const bThread = B.apply({ action: 'create', message: 'from B', anchor }).thread;
+    await B.flush();
+    check('B writes first and lands on disk', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
+
+    // A's memory predates B's write. Its write must not replace the file.
+    const aResult = A.apply({ action: 'create', message: 'from A', anchor });
+    await A.flush();
+    const disk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const bodies = disk.threads.map((t) => t.messages[0].body);
+    check('B\u2019s review is still there', bodies.includes('from B'), JSON.stringify(bodies));
+    check('A did not replace the ledger with its stale copy', !bodies.includes('from A'), JSON.stringify(bodies));
+    check('A says so rather than failing silently', A.problem?.kind === 'foreign_write', JSON.stringify(A.problem));
+    check('and the mutation still succeeded in A\u2019s own memory', aResult.ok);
+    check('the file on disk is still valid JSON', typeof disk.version === 'number' && Array.isArray(disk.threads));
+    check('numbers were not handed out twice on disk', new Set(disk.threads.map((t) => t.number)).size === disk.threads.length);
+    check('reopening sees the winning ledger', freshStore(file).get(bThread.id) !== null);
+
+    // The other order.
+    const file2 = path.join(home, 'two-writers-2.json');
+    const C = freshStore(file2);
+    const D = freshStore(file2);
+    C.apply({ action: 'create', message: 'from C', anchor });
+    await C.flush();
+    D.apply({ action: 'create', message: 'from D', anchor });
+    await D.flush();
+    const disk2 = JSON.parse(fs.readFileSync(file2, 'utf8')).threads.map((t) => t.messages[0].body);
+    check('whoever wrote first keeps the ledger', disk2.join() === 'from C', JSON.stringify(disk2));
+    check('and the loser reports the conflict', D.problem?.kind === 'foreign_write', JSON.stringify(D.problem));
+
+    // The race the naive fix does not close: BOTH read, THEN both write.
+    // A stat-then-write with no lock lets each observe the same original file
+    // and then overwrite the other.
+    const file3 = path.join(home, 'two-writers-3.json');
+    const E = freshStore(file3);
+    const F = freshStore(file3);
+    E.apply({ action: 'create', message: 'from E', anchor });
+    F.apply({ action: 'create', message: 'from F', anchor });
+    // Interleaved with no await between them — the closest a single process
+    // gets to two of them arriving at once.
+    const both = Promise.all([E.flush(), F.flush()]);
+    await both;
+    const disk3 = JSON.parse(fs.readFileSync(file3, 'utf8')).threads.map((t) => t.messages[0].body);
+    check('an interleaved pair does not lose a review', disk3.length === 1, JSON.stringify(disk3));
+    check('and exactly one of them reports the conflict', [E, F].filter((s2) => s2.problem?.kind === 'foreign_write').length === 1, JSON.stringify([E.problem, F.problem]));
+    check('nextNumber never went backwards', JSON.parse(fs.readFileSync(file3, 'utf8')).nextNumber >= 2);
+    check('no lock was left behind', !fs.existsSync(`${file3}.lock`));
+  }
+
   // loadFile on its own, since the store swallows the shape it returns.
   {
     check('a missing file is not a problem', loadFile(path.join(home, 'nope.json')).problem === null);

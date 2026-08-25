@@ -354,6 +354,22 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     await render(thread(review({ status: 'deferred', deferredReason: 'Waiting on copy.', externalRefs: ['https://example.test/issues/9'] })));
     check('a deferred review shows why', /Waiting on copy/.test(container.textContent));
     check('and where it is tracked', /example.test\/issues\/9/.test(container.textContent));
+    // The reference is where the work actually lives, so it has to open.
+    // It looked like a link and did nothing.
+    {
+      const opened = [];
+      dom.window.avb.openExternal = async (u) => opened.push(u);
+      const link = $('.review-ref button');
+      check('a web reference is something you can click', !!link);
+      await click(link);
+      check('and it opens in the browser, not in the editor', opened.join() === 'https://example.test/issues/9', JSON.stringify(opened));
+    }
+    // An external reference is a free string an agent wrote. Anything that is
+    // not a web address is shown as text rather than dressed up as a link that
+    // cannot work.
+    await render(thread(review({ status: 'deferred', externalRefs: ['JIRA-4182', 'file:///etc/passwd'] })));
+    check('a non-web reference is not made clickable', $$('.review-ref button').length === 0, String($$('.review-ref button').length));
+    check('but it is still shown', /JIRA-4182/.test(container.textContent));
 
     // An orphan has to stay useful — it is the review, not a broken row.
     acted.length = 0;
@@ -701,9 +717,31 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     const paneSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'PreviewPane.jsx'), 'utf8');
     check('the pins are tracked, so the page reports boxes for them', /reviewItems \|\| \[\]\)\.map\(\(i\) => i\?\.path\)/.test(paneSource));
     check('and they are drawn inside the frame overlay', /frame-clip[\s\S]{0,4000}<ReviewPins/.test(paneSource));
+    // The app turns selection off on the body and opts regions back in. A
+    // comment is words somebody wrote to be read and quoted, so they have to
+    // be selectable — they were not.
+    const cssSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'styles.css'), 'utf8');
+    check('comment text can be selected and copied', /\.review-body,[\s\S]{0,200}user-select: text/.test(cssSource));
+    check('including the reference and the deferral reason', /\.review-note span,[\s\S]{0,200}user-select: text/.test(cssSource));
+    // A resolved pin appears only in the Resolved and All views, and when it
+    // does it has to read as finished rather than as one more thing to do.
+    check('a resolved pin is drawn quietly', /\.review-pin\.is-resolved \{[\s\S]{0,200}opacity: 0\.5;/.test(cssSource));
+    check('and comes up to full strength when it is the one being looked at', /\.review-pin\.is-resolved:hover:not\(:disabled\) \{[^}]*opacity: 1/.test(cssSource));
+    // The cluster badge sits BESIDE the pin. In the corner it covered the
+    // number, which is the one thing on a pin that has to stay readable — it
+    // is how a person and an agent name the same review.
+    check('the "+n" badge is clear of the number', /\.review-pin-more \{[\s\S]{0,500}left: 100%;/.test(cssSource));
+    check('rather than sitting over it', !/\.review-pin-more \{[\s\S]{0,500}right: -\d/.test(cssSource));
+    // And the number sits on the pin's optical centre, not its box centre —
+    // the tail is a square corner and the other three are quarter-circles, so
+    // dead centre reads as pushed away from the tail.
+    check('and it is nudged onto the optical centre', /\.review-pin-n \{[\s\S]{0,120}transform: translate\(-0\.5px, 0\.5px\)/.test(cssSource));
+    check('while the header stays a drag handle', /\.review-popover \.review-thread-head \{ cursor: grab; user-select: none; \}/.test(cssSource));
+
     const pinsSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'), 'utf8');
     check('the marker layer takes itself out of a capture', /if \(capturing \|\| !visible\) return null;/.test(pinsSource));
     check('and so does the panel layer', /if \(capturing \|\| !frameBox\) return null;/.test(pinsSource));
+    check('the pin number is its own element so it can be placed', /className="review-pin-n"/.test(pinsSource));
     const appSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
     check('the panel and MCP go through the same action door', /reviewsAct\(\{ action, threadId: id, authorType: 'human'/.test(appSource));
     check('a review is anchored with the app’s own key builder', /selectionKeys: keysFor\(target\.id\)/.test(appSource));
@@ -714,8 +752,14 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     // tree. A focus that waited only for the filename looked the node up in the
     // wrong model and reported a perfectly present element as gone.
     check('focus waits for the model, not just the filename', /state\.model !== left/.test(appSource));
+    // The same stale pair, in the other consumer. Every whole-model load is
+    // stamped with the file it came from, and both readers demand the stamp
+    // match before they judge an anchor against the tree in hand.
+    check('every model read from disk is stamped with its file', (appSource.match(/setPageState\(\{ \.\.\.\w+, file: /g) || []).length === 3, String((appSource.match(/setPageState\(\{ \.\.\.\w+, file: /g) || []).length));
+    check('the open-model lookup demands the stamp match', /modelMatchesFile\(state, open\.path\)/.test(appSource));
+    check('and the anchor health check refuses to judge a mismatched pair', /if \(!modelOf\(openRel\)\) return;/.test(appSource));
     // A pin is about the PAGE, not about the file that happens to be open.
-    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status\) && onReviewPage\(r\)/.test(appSource));
+    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status, reviewFilter\) && onReviewPage\(r\)/.test(appSource));
     check('and a component\u2019s nodes are named by their own file', /markerPathFor\(keys\[keys\.length - 1\], reviewPageFile\)/.test(appSource));
     check('the canvas is asked to measure them', /reviewItems \|\| \[\]\)\.map\(\(i\) => i\?\.path\)/.test(paneSource));
     // Reading must not damage what it reads. Clicking down a list of comments

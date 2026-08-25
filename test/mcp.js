@@ -49,6 +49,11 @@ const { propertiesFor, pickEssential, allStyles, ESSENTIAL } = require('../elect
 const { captureRect, fitWidth } = require('../electron/mcp/captureRect.js');
 const { createCapture } = require('../electron/mcp/capture.js');
 const { createStackiMcpServer, tokenMatches, bearerOf, DEFAULT_PORT, ENDPOINT_PATH } = require('../electron/mcp/server.js');
+// The validator the SDK hands a client, used here on the server's own answers:
+// a schema is only a contract if something checks the payload against it.
+const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
+
+const schemaValidator = new AjvJsonSchemaValidator();
 const { ContextOutput, CaptureOutput, INSTRUCTIONS } = require('../electron/mcp/tools.js');
 const {
   ACTIONS: REVIEW_ACTIONS,
@@ -56,7 +61,13 @@ const {
   MUTATES,
   READ_ONLY: REVIEW_READ_ONLY,
 } = require('../electron/mcp/reviewTools.js');
-const { createReviewStore, selectThreads, summarize, detail: reviewDetail } = require('../electron/review/store.js');
+const {
+  createReviewStore,
+  selectThreads,
+  project: projectReviews,
+  summarize,
+  detail: reviewDetail,
+} = require('../electron/review/store.js');
 const { anchorFrom } = require('../electron/review/anchor.js');
 const { selectionTrail, formatTrail } = require('../electron/selectionTrail.js');
 const { locateSelection } = require('../electron/astroParser.js');
@@ -78,6 +89,10 @@ const payload = (over = {}) => ({
     keys: ['src/pages/index.astro#0.1'],
     componentChain: ['index'],
     breadcrumbs: ['index', 'section'],
+    // The sibling run at each level down to the node, as the canvas publishes
+    // it — an anchor built from this payload records it, so the review tests
+    // exercise the same fingerprint a real selection produces.
+    peers: [{ index: 0, count: 1 }, { index: 1, count: 3 }],
     text: 'Hello world',
     props: { class: 'hero', 'data-x': 1 },
     classes: ['hero'],
@@ -672,14 +687,16 @@ const rawPost = (hostHeader, body) =>
       page: { route: SNAPSHOT.page.route, file: SNAPSHOT.page.file },
       keys: livePayload?.selection?.keys || null,
     });
+    // Projected by the same function the service uses. Building the list here
+    // instead would be a second implementation of the answer, and the size cap
+    // and the declared schema would only ever be tested against the copy.
     return {
       ok: true,
       revision: ledger.revision,
       status,
       scope,
-      total: picked.total,
-      truncated: picked.truncated,
-      reviews: picked.threads.map((t) => (level === 'full' ? reviewDetail(t, fakeTrail) : summarize(t))),
+      problem: ledger.problem || null,
+      ...projectReviews(picked, { detail: level, resolver: fakeTrail }),
     };
   };
   const comment = async (args) => {
@@ -1107,6 +1124,103 @@ const rawPost = (hostHeader, body) =>
     const limited = structured(await call('get_comments', { status: 'all', limit: 1 }));
     check('a limit is obeyed', limited.reviews.length === 1);
     check('and says the list was cut', limited.truncated === true && limited.total === 2);
+
+    // A single answer must not be tens of megabytes. Messages are capped per
+    // review, but nothing capped the response: 200 maximal reviews is ~44MB
+    // arriving in somebody's context window unasked.
+    {
+      const bigAnchor = {
+        type: 'node',
+        page: { route: '/', file: 'src/pages/index.astro' },
+        keys: Array.from({ length: 24 }, (_, i) => `src/components/C${i}.astro#${'0.'.repeat(20)}1`),
+        occurrence: 0,
+        occurrenceCount: 4,
+        breakpoint: { device: 'phone', viewportWidth: 375, viewportHeight: 800 },
+        pin: { xRatio: 0.5, yRatio: 0.5 },
+        fingerprint: { nodeKind: 'element', tag: 'span', text: 'x'.repeat(160), componentChain: Array(30).fill('Component'), breadcrumbs: Array(30).fill('label') },
+      };
+      const bigContext = {
+        page: bigAnchor.page,
+        keys: bigAnchor.keys,
+        componentChain: Array(30).fill('Component'),
+        breadcrumbs: Array(30).fill('label'),
+        nodeKind: 'element',
+        tag: 'span',
+        text: 't'.repeat(400),
+        props: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`p${i}`, 'v'.repeat(200)])),
+        classes: Array.from({ length: 60 }, () => 'c'.repeat(80)),
+        occurrence: 0,
+        occurrenceCount: 4,
+        breakpoint: bigAnchor.breakpoint,
+        rect: { x: 0, y: 0, width: 1, height: 1 },
+        branch: 'main',
+        sourceTrail: null,
+      };
+      const heavy = [];
+      for (let i = 0; i < 30; i++) {
+        const made = ledger.apply({ action: 'create', message: 'm'.repeat(4000), anchor: bigAnchor, creationContext: bigContext }).thread;
+        for (let j = 0; j < 60; j++) ledger.apply({ action: 'reply', threadId: made.id, message: 'r'.repeat(4000) });
+        heavy.push(made.id);
+      }
+      const fat = structured(await call('get_comments', { status: 'all', detail: 'full', limit: 200 }));
+      const size = JSON.stringify(fat).length;
+      check('a pathological full read stays within the budget', size < 700_000, `${Math.round(size / 1024)}KB`);
+      check('and says the list was cut', fat.truncated === true);
+      check('and how many actually came back', fat.returned < fat.total, `${fat.returned}/${fat.total}`);
+      check('while still returning something useful', fat.returned >= 1);
+      const slim = structured(await call('get_comments', { status: 'all', detail: 'summary', limit: 200 }));
+      check('a summary read of the same ledger stays small', JSON.stringify(slim).length < 200_000, `${Math.round(JSON.stringify(slim).length / 1024)}KB`);
+
+      // Every key the implementation sends must be DECLARED.
+      //
+      // Checked the way a real client checks it: the ACTUAL response body,
+      // against the ACTUAL schema this server publishes in tools/list, through
+      // the validator the SDK ships. Reading `structuredContent` and looking at
+      // its fields — which is what every other assertion in this file does — is
+      // exactly how `get_comments` came to be unusable from Claude Code
+      // ("data must NOT have additional properties") while the suite was green.
+      const published = Object.fromEntries(
+        ((await readBody(await post({ jsonrpc: '2.0', id: 9001, method: 'tools/list' })))?.result?.tools || []).map((t) => [
+          t.name,
+          t.outputSchema,
+        ])
+      );
+      const validateOutput = async (tool, response) => {
+        const schema = published[tool];
+        if (!schema) return { valid: false, errorMessage: `${tool} publishes no output schema` };
+        return await schemaValidator.getValidator(schema)(structured(response));
+      };
+      check('the published get_comments schema is a closed one', published.get_comments?.additionalProperties === false);
+      for (const shape of [
+        ['a full read', { status: 'all', detail: 'full', limit: 3 }],
+        ['a summary read', { status: 'open', detail: 'summary', limit: 50 }],
+        ['a page-scoped read', { status: 'all', scope: 'page' }],
+        ['an over-budget read', { status: 'all', detail: 'full', limit: 200 }],
+      ]) {
+        const verdict = await validateOutput('get_comments', await call('get_comments', shape[1]));
+        check(`${shape[0]} validates against the published get_comments schema`, verdict.valid, verdict.errorMessage || '');
+      }
+      for (const shape of [
+        ['a reply', { action: 'reply', threadId: A, message: 'schema probe' }],
+        ['a refusal', { action: 'reply', threadId: 'rt_nope', message: 'x' }],
+        ['a focus', { action: 'focus', threadId: A }],
+      ]) {
+        const verdict = await validateOutput('comment', await call('comment', shape[1]));
+        check(`${shape[0]} validates against the published comment schema`, verdict.valid, verdict.errorMessage || '');
+      }
+
+      for (const id of heavy) ledger.remove(id);
+
+      // And once more with the real anchors back — the pathological ones above
+      // were built by hand, so on their own they would not have exercised what
+      // anchorFrom actually records.
+      const real = await call('get_comments', { status: 'all', detail: 'full' });
+      check('the real reviews are what is being validated', structured(real).reviews.some((r) => r.id === A));
+      check('and they carry the sibling runs', structured(real).reviews.some((r) => r.anchor?.fingerprint?.peers?.length));
+      const back = await validateOutput('get_comments', real);
+      check('a full read of real anchors validates too', back.valid, back.errorMessage || '');
+    }
+
 
     // The review tools must not have changed what the other two answer.
     const after = structured(await call('get_context', {}));

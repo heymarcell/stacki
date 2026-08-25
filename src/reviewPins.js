@@ -122,12 +122,27 @@ export function placePins(items, rects) {
 /**
  * Whether a review's marker is drawn at all.
  *
- * Resolved reviews keep their pin off the canvas. They are done, the page is
- * covered in them after a week of work, and the panel is where a finished
- * review is read. Open and deferred both still want something from somebody,
- * so both are marked — a deferred one differently, since it is deliberately
- * not being acted on.
+ * Two rules, and the second one exists because the first was being applied to
+ * a question nobody asked:
+ *
+ *   Anything that still wants something from somebody is always marked. Open
+ *   and deferred both do — a deferred one differently, since it is
+ *   deliberately not being acted on — and they stay on the canvas whatever the
+ *   panel is filtered to, because "what is left to do here" is not a filter,
+ *   it is what a marker on a page is for.
+ *
+ *   A resolved review is marked when the panel is SHOWING resolved reviews.
+ *   Hiding it unconditionally was the wrong half of a good instinct: a page
+ *   covered in finished pins after a week of work is noise, but the fix for
+ *   that is the default filter, not a canvas that ignores the filter. Asking
+ *   for Resolved and getting a list whose items have no position on the page
+ *   is a control that does not do what it says — and the moment somebody most
+ *   wants to see where a resolved review WAS is the moment they are checking
+ *   whether it was really fixed.
  */
-export const pinnable = (status) => status === 'open' || status === 'deferred';
+export const pinnable = (status, filter = 'open') => {
+  if (status === 'open' || status === 'deferred') return true;
+  return filter === 'resolved' || filter === 'all';
+};
 
 export default placePins;
