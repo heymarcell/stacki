@@ -51,6 +51,38 @@ const clip = (value, max = MAX_VALUE) => {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 };
 
+// A style source's name, as something that may travel.
+//
+// The panel keys a source by its absolute path, which is right inside one
+// process and wrong the moment it leaves: an answer that carries somebody's
+// home directory has leaked where their project lives for no reason at all. So
+// what goes out is project-relative, and what comes back is turned into the
+// key the panel uses. Both directions here, so there is one rule.
+
+const projectRoot = () => String(getHost().projectPath || '');
+
+export function publicKey(key) {
+  const at = String(key || '').indexOf(':');
+  if (at === -1) return key;
+  const kind = key.slice(0, at);
+  const rest = key.slice(at + 1);
+  if (kind !== 'file' && kind !== 'astro') return key;
+  const root = projectRoot();
+  const rel = root && rest.startsWith(`${root}/`) ? rest.slice(root.length + 1) : rest;
+  return `${kind}:${rel}`;
+}
+
+export function internalKey(key) {
+  const at = String(key || '').indexOf(':');
+  if (at === -1) return key;
+  const kind = key.slice(0, at);
+  const rest = key.slice(at + 1);
+  if (kind !== 'file' && kind !== 'astro') return key;
+  if (rest.startsWith('/')) return key; // already absolute — an older answer
+  const root = projectRoot();
+  return root ? `${kind}:${root}/${rest}` : key;
+}
+
 /** The custom properties a value reads — `var(--gap, 1rem)` → ['--gap']. */
 export function variablesIn(value) {
   return [...new Set([...String(value ?? '').matchAll(/var\(\s*(--[\w-]+)/g)].map((m) => m[1]))];
@@ -65,7 +97,7 @@ export function variablesIn(value) {
  * is immediately.
  */
 export const declarationIdentity = (rule, prop) => ({
-  source: rule.embedKey,
+  source: publicKey(rule.embedKey),
   sourceLabel: rule.embedLabel,
   atContext: rule.atContext || [],
   selector: rule.selectorText,
@@ -129,14 +161,16 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
       atContext: rule.atContext || [],
       nested: rule.nestedDisplay || null,
       source: {
-        key: rule.embedKey,
+        key: publicKey(rule.embedKey),
         label: rule.embedLabel,
         fromComponent: !!rule.fromComponent,
         componentName: rule.componentName || null,
         // A stylesheet is a file an agent may also read as source; a <style>
         // block is a node in the document being edited.
         kind: rule.embedKey.startsWith('file:') ? 'stylesheet' : rule.embedKey.startsWith('astro:') ? 'component' : 'block',
-        file: rule.embedKey.startsWith('file:') || rule.embedKey.startsWith('astro:') ? rule.embedKey.slice(rule.embedKey.indexOf(':') + 1) : null,
+        file: rule.embedKey.startsWith('file:') || rule.embedKey.startsWith('astro:')
+          ? publicKey(rule.embedKey).slice(publicKey(rule.embedKey).indexOf(':') + 1)
+          : null,
       },
       declarations,
       declarationsOmitted: Math.max(0, rule.declarations.length - MAX_DECLS_PER_RULE),
@@ -158,7 +192,7 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
     // project stylesheet, which is where the panel puts one too.
     writableSources: docs
       .map((doc) => ({
-        key: doc.source.key,
+        key: publicKey(doc.source.key),
         label: doc.source.label,
         kind: doc.source.origin.kind,
       }))
@@ -173,10 +207,11 @@ const docFor = (docs, key) => docs.find((d) => d.source.key === key) || null;
 /** The parsed rule matching a semantic identity, or null. */
 function findRule(rules, identity) {
   const wantContext = (identity.atContext || []).join(' › ');
+  const want = internalKey(identity.source);
   return (
     rules.find(
       (rule) =>
-        rule.embedKey === identity.source &&
+        rule.embedKey === want &&
         rule.selectorText.trim() === String(identity.selector || '').trim() &&
         (rule.atContext || []).join(' › ') === wantContext
     ) || null
@@ -226,7 +261,7 @@ export async function setProperty(node, { identity, source, selector, property, 
     return {
       ok: true,
       wrote: { ...declarationIdentity(rule, prop), value: next, important },
-      source: { key: doc.source.key, label: doc.source.label, kind: doc.source.origin.kind },
+      source: { key: publicKey(doc.source.key), label: doc.source.label, kind: doc.source.origin.kind },
     };
   }
 
@@ -238,7 +273,7 @@ export async function setProperty(node, { identity, source, selector, property, 
         'Stacki will not guess which stylesheet a new rule belongs in.'
     );
   }
-  const doc = source ? docFor(docs, source) : null;
+  const doc = source ? docFor(docs, internalKey(source)) : null;
   if (!doc) {
     return problem(
       'no_source',
@@ -256,8 +291,8 @@ export async function setProperty(node, { identity, source, selector, property, 
   if (!written.ok) return problem('write_failed', written.error);
   return {
     ok: true,
-    wrote: { source: doc.source.key, sourceLabel: doc.source.label, atContext: [], selector: target, property: prop, value: next, important },
-    source: { key: doc.source.key, label: doc.source.label, kind: doc.source.origin.kind },
+    wrote: { source: publicKey(doc.source.key), sourceLabel: doc.source.label, atContext: [], selector: target, property: prop, value: next, important },
+    source: { key: publicKey(doc.source.key), label: doc.source.label, kind: doc.source.origin.kind },
     created: true,
   };
 }
@@ -284,7 +319,7 @@ export async function removeProperty(node, { identity, live = false }) {
     ok: true,
     removed: true,
     ruleRemoved: emptied,
-    source: { key: doc.source.key, label: doc.source.label, kind: doc.source.origin.kind },
+    source: { key: publicKey(doc.source.key), label: doc.source.label, kind: doc.source.origin.kind },
   };
 }
 
@@ -322,13 +357,13 @@ export async function listSources() {
   const scan = await scanPage();
   return {
     sources: scan.pageEmbeds.map((s) => ({
-      key: s.key,
+      key: publicKey(s.key),
       label: s.label,
       kind: s.origin.kind,
       fromComponent: !!s.fromComponent,
       componentName: s.componentName || null,
     })),
-    openFile: getHost().openFilePath || null,
+    openFile: publicKey(`file:${getHost().openFilePath || ''}`).slice('file:'.length) || null,
   };
 }
 

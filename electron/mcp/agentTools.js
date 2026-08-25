@@ -125,6 +125,11 @@ const TargetInput = z.discriminatedUnion('action', [
     ...withTarget({ occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of a repeated node to scroll to.') }),
   }),
   z.object({
+    action: z.literal('enter'),
+    ...withTarget({ occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of the instance to open — the third card, not the first.') }),
+  }),
+  z.object({ action: z.literal('exit') }),
+  z.object({
     action: z.literal('edit'),
     ...withTarget({ ...guard, operations: z.array(Operation).min(1).max(30), label: z.string().max(80).optional() }),
   }),

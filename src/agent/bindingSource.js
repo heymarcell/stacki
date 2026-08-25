@@ -30,6 +30,15 @@
 import { findDeclaration, findImportOf, collectionCallIn, referenceCallIn, parseDestructures } from '../dataSuggest.js';
 import { parseLoopHead } from '../modelOps.js';
 
+// A declaration can be a page of data. What identifies it is its name and where
+// it sits; the whole value belongs in a source read, not in every target that
+// happens to mention it.
+const MAX_STATEMENT = 600;
+const clip = (text) => {
+  const s = String(text ?? '');
+  return s.length > MAX_STATEMENT ? `${s.slice(0, MAX_STATEMENT)}…` : s;
+};
+
 /** The first name in a dotted path — `post.data.title` → `post`. */
 export function rootOf(expression) {
   const m = String(expression || '').trim().match(/^([A-Za-z_$][\w$]*)/);
@@ -119,7 +128,7 @@ export function resolveBinding(expression, { frontmatter = '', imports = [], anc
         collection: call.name,
         variable: root,
         path: text.slice(root.length).replace(/^[.?]+/, ''),
-        declaration: { name: root, start: declaration.start, end: declaration.end, statement: declaration.statement },
+        declaration: { name: root, start: declaration.start, end: declaration.end, statement: clip(declaration.statement) },
       };
     }
     if (call?.fn === 'getEntry' || referenceCallIn(declaration.value)) {
@@ -129,7 +138,7 @@ export function resolveBinding(expression, { frontmatter = '', imports = [], anc
         collection: call?.name || null,
         variable: root,
         path: text.slice(root.length).replace(/^[.?]+/, ''),
-        declaration: { name: root, start: declaration.start, end: declaration.end, statement: declaration.statement },
+        declaration: { name: root, start: declaration.start, end: declaration.end, statement: clip(declaration.statement) },
       };
     }
     return {
@@ -141,8 +150,8 @@ export function resolveBinding(expression, { frontmatter = '', imports = [], anc
         name: root,
         start: declaration.start,
         end: declaration.end,
-        statement: declaration.statement,
-        value: declaration.value,
+        statement: clip(declaration.statement),
+        value: clip(declaration.value),
       },
     };
   }

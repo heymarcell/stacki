@@ -589,7 +589,7 @@ export function cloneWithNewIds(node) {
 export function textNature(node) {
   if (!node) return { kind: 'none', expressions: [] };
   if (node.kind === 'expr') {
-    return { kind: 'bound', expressions: [String(node.value ?? '').trim()].filter(Boolean) };
+    return { kind: 'bound', expressions: [innerExpression(node.value)].filter(Boolean) };
   }
   if (node.kind === 'text' || node.kind === 'comment') {
     const holes = [...String(node.value ?? '').matchAll(/\{([^{}]*)\}/g)].map((m) => m[1].trim());
@@ -606,7 +606,7 @@ export function textNature(node) {
   const expressions = [];
   let literal = false;
   for (const child of kids) {
-    if (child.kind === 'expr') expressions.push(String(child.value ?? '').trim());
+    if (child.kind === 'expr') expressions.push(innerExpression(child.value));
     else if (child.kind === 'text') {
       const holes = [...String(child.value ?? '').matchAll(/\{([^{}]*)\}/g)].map((m) => m[1].trim());
       if (holes.length) expressions.push(...holes);
@@ -615,6 +615,21 @@ export function textNature(node) {
   }
   if (expressions.length) return { kind: literal ? 'mixed' : 'bound', expressions: expressions.filter(Boolean) };
   return { kind: 'direct', expressions: [] };
+}
+
+/**
+ * What an expression node actually says.
+ *
+ * The parser keeps an expression child as it was written — braces and all —
+ * because that is what serializing it back has to produce. Everything that
+ * REASONS about one wants what is inside them: `{post.title}` is a reference to
+ * `post.title`, and a resolver handed the braces concludes it is looking at
+ * code it cannot follow.
+ */
+export function innerExpression(value) {
+  const text = String(value ?? '').trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return text;
+  return text.slice(1, -1).trim();
 }
 
 /**

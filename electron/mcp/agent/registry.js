@@ -48,6 +48,18 @@ const OPERATIONS = {
       summary: 'Select a target in Stacki, so get_context and capture describe it.',
       reuses: 'App.jsx selection + occurrence request',
     },
+    enter: {
+      risk: 'read',
+      via: 'renderer',
+      summary: "Open a component instance and read inside its own file — what a double-click does.",
+      reuses: 'App.jsx openComponent',
+    },
+    exit: {
+      risk: 'read',
+      via: 'renderer',
+      summary: 'Come back out of a component to whatever contains it.',
+      reuses: 'App.jsx closeComponent',
+    },
     edit: {
       risk: 'write',
       via: 'renderer',

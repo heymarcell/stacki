@@ -162,6 +162,10 @@ function createAgentApi({
       const now = readFile(rel);
       const then = before.get(rel) ?? null;
       if (then === null && now === null) continue;
+      // Only what actually changed. A file that was watched and came out
+      // identical is not a changed file, and listing it invites an agent to
+      // wonder what happened to it.
+      if (then === now) continue;
       out.push({
         file: rel,
         beforeDigest: then === null ? null : digestOf(then),
@@ -223,19 +227,20 @@ function createAgentApi({
       writable = parsed.writable;
     }
 
-    if (action === 'read' || action === 'select') {
+    if (action === 'read' || action === 'select' || action === 'enter' || action === 'exit') {
       const answer = await command(
         { domain: 'target', action, anchor, occurrence: args.occurrence, navigate: args.navigate },
-        anchor ? NAVIGATING_TIMEOUT_MS : COMMAND_TIMEOUT_MS
+        anchor || action === 'enter' || action === 'exit' ? NAVIGATING_TIMEOUT_MS : COMMAND_TIMEOUT_MS
       );
       if (!answer.ok) return answer;
       if (action === 'select') {
-        return {
-          ...answer,
-          ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true }),
-        };
+        return { ...answer, ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true }) };
       }
-      return withSource(answer, ctx, writable);
+      // enter and exit both answer with a target, and it is a target inside a
+      // different file — so it is given the same source trail, snippet and ref
+      // a read gets, and the evidence is `exact` because the app just walked
+      // there itself.
+      return withSource(answer, ctx, action === 'read' ? writable : true);
     }
 
     if (!SINGLE[action] && action !== 'edit') return no('bad_action', `target has no action "${action}".`);
@@ -249,6 +254,20 @@ function createAgentApi({
 
     const operations = action === 'edit' ? args.operations || [] : [SINGLE[action](args)];
     if (!operations.length) return no('bad_request', 'edit needs at least one operation.');
+
+    // A move names where it is going with a ref. The renderer works in node
+    // ids, and a ref is not one — so it is read here, where refs are read, and
+    // the keys it carries go across instead.
+    for (const op of operations) {
+      if (op?.type !== 'move' || !op.to) continue;
+      if (op.to.parentRef) {
+        const parsed = readRef(op.to.parentRef, 'node');
+        if (!parsed.ok) return { ...parsed, message: `The move destination: ${parsed.message}` };
+        op.to = { parentKeys: parsed.data.keys || [], index: op.to.index };
+      } else {
+        op.to = { parentKeys: null, index: op.to.index };
+      }
+    }
 
     const watching = filesOf(anchor || currentAnchor(ctx));
     const before = snapshot(watching);
@@ -291,7 +310,11 @@ function createAgentApi({
     const payload = ctx.payload;
     return {
       keys: answer.keys || previous?.keys || payload?.selection?.keys || [],
-      fingerprint: answer.target ? fingerprintOf(answer.target) : previous?.fingerprint || null,
+      // The marks as they are NOW. An edit that changed the words would leave
+      // a ref describing the words that used to be there, and the next read
+      // would find the node on position alone and say so — correct, and a
+      // needless downgrade of something we can simply keep current.
+      fingerprint: answer.fingerprint || (answer.target ? fingerprintOf(answer.target) : previous?.fingerprint || null),
       page: answer.target?.page || previous?.page || { file: payload?.page?.file || null, route: payload?.page?.route || null },
       occurrence: answer.target?.occurrence?.index ?? previous?.occurrence ?? null,
       occurrenceCount: answer.target?.occurrence?.count ?? previous?.occurrenceCount ?? null,
@@ -327,10 +350,56 @@ function createAgentApi({
     if (!t) return answer;
     const trail = resolveTrail(t.keys) || [];
     const leaf = trail[trail.length - 1] || null;
+    // A ref for each child and for the parent, so walking the tree is reading
+    // this answer rather than a round trip per node. Their fingerprints carry
+    // what a summary knows — kind, tag, words — which with the position is the
+    // same evidence Stacki uses to re-find a node after a reload.
+    const near = (summary) =>
+      summary && Array.isArray(summary.keys) && summary.keys.length
+        ? nodeRef(
+            {
+              keys: summary.keys,
+              fingerprint: { nodeKind: summary.kind || null, tag: summary.tag || null, text: summary.text || null },
+              page: t.page,
+              branch: ctx.branch,
+            },
+            { writable: writable && t.editable !== false }
+          )
+        : null;
+    // A binding that resolves to a prop names the instance that sets it; a
+    // binding that resolves to a file names the file. Both become refs here,
+    // which is what turns "where do these words come from" into one more call
+    // rather than a search.
+    const followable = (binding) => {
+      const source = binding?.source;
+      if (!source) return binding;
+      if (source.kind === 'prop' && source.instanceKeys?.length) {
+        return {
+          ...binding,
+          source: {
+            ...source,
+            instanceRef: nodeRef(
+              { keys: source.instanceKeys, fingerprint: null, page: t.page, branch: ctx.branch },
+              { writable: true }
+            ),
+          },
+        };
+      }
+      if (source.kind === 'import' && source.spec) {
+        return { ...binding, source: { ...source, resolve: 'Use source.resolve_path or content.resolve_import with this spec.' } };
+      }
+      return binding;
+    };
     return {
       ...answer,
       target: {
         ...t,
+        bindings: Array.isArray(t.bindings) ? t.bindings.map(followable) : t.bindings,
+        occurrence: t.occurrence?.perOccurrence
+          ? { ...t.occurrence, perOccurrence: followable({ source: t.occurrence.perOccurrence }).source }
+          : t.occurrence,
+        parent: t.parent ? { ...t.parent, ref: near(t.parent) } : null,
+        children: Array.isArray(t.children) ? t.children.map((child) => ({ ...child, ref: near(child) })) : null,
         peers: answer.peers || null,
         source: leaf,
         sourceTrail: trail.length ? trail : null,
@@ -414,11 +483,15 @@ function createAgentApi({
     };
   }
 
+  // The style keys that travel are already project-relative (see
+  // src/agent/styleAgent.js), so this is a slice rather than a resolve — and an
+  // older absolute one is turned back into a relative path rather than watched
+  // as if it were inside the project.
   const styleFilesOf = (args) => {
     const key = args?.identity?.source || args?.source || '';
-    return typeof key === 'string' && (key.startsWith('file:') || key.startsWith('astro:'))
-      ? [relativeTo(getProjectRoot(), key.slice(key.indexOf(':') + 1))].filter(Boolean)
-      : [];
+    if (typeof key !== 'string' || !(key.startsWith('file:') || key.startsWith('astro:'))) return [];
+    const rest = key.slice(key.indexOf(':') + 1);
+    return [rest.startsWith('/') ? relativeTo(getProjectRoot(), rest) : rest].filter(Boolean);
   };
 
   /** Keep the before-image for files we watched, and null for ones we did not. */
@@ -435,7 +508,7 @@ function createAgentApi({
       ...answer,
       rules: answer.rules.map((rule) => ({
         ...rule,
-        sourceRef: rule.source?.file ? sourceRef(relativeTo(ctx.root, path.resolve(ctx.root, rule.source.file)) || rule.source.file) : null,
+        sourceRef: rule.source?.file ? sourceRef(rule.source.file) : null,
         declarations: (rule.declarations || []).map((decl) => ({
           ...decl,
           variableRefs: (decl.variables || []).map((name) =>

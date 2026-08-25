@@ -66,6 +66,18 @@ function propsOf(node) {
   return out;
 }
 
+/** The text this node itself holds — what set_text replaces, and nothing else. */
+function ownTextOf(node) {
+  if (!node) return null;
+  if (node.kind === 'text' || node.kind === 'comment') return String(node.value ?? '');
+  if (node.kind === 'expr') return String(node.value ?? '');
+  if (node.kind === 'map') return String(node.head ?? '');
+  if (node.kind === 'cond') return String(node.test ?? '');
+  if (node.kind === 'raw') return String(node.inner ?? '');
+  const own = (node.children || []).find((c) => c.kind === 'text');
+  return own ? String(own.value ?? '') : null;
+}
+
 /** A one-line description of a node, for a child or parent summary. */
 function labelOf(node, crumbLabel) {
   if (!node) return null;
@@ -76,7 +88,7 @@ function labelOf(node, crumbLabel) {
   return clip(node.name || node.kind, MAX_LABEL);
 }
 
-function summarize(node, crumbLabel) {
+function summarize(node, crumbLabel, keysFor) {
   if (!node) return null;
   return {
     kind: node.kind || null,
@@ -84,6 +96,10 @@ function summarize(node, crumbLabel) {
     label: labelOf(node, crumbLabel),
     text: clip(textOf(node).join(' '), 120),
     childCount: Array.isArray(node.children) ? node.children.length : null,
+    // Enough for the caller to mint a ref for this one, so walking the tree is
+    // reading the answer rather than making another round trip per node.
+    keys: typeof keysFor === 'function' ? keysFor(node.id) : null,
+    kindOfThing: node.kind === 'component' && !node.dynamicTag ? 'component_instance' : null,
   };
 }
 
@@ -128,7 +144,20 @@ function capabilitiesOf(node, { editable, parent }) {
  * Bounded: a node with thirty expressions on it is a node whose story is told
  * by the first dozen.
  */
-function bindingsOf(node, { model, ancestors }) {
+/**
+ * A prop's value is set by whoever renders this component — and Stacki knows
+ * exactly which instance that is, because the key chain that reached this node
+ * came down through it. So "there is no single value" comes with the place the
+ * value for THIS one is written.
+ */
+function withInstance(source, keys) {
+  if (source?.kind !== 'prop') return source;
+  const chain = Array.isArray(keys) ? keys : [];
+  if (chain.length < 2) return source;
+  return { ...source, instanceKeys: chain.slice(0, -1) };
+}
+
+function bindingsOf(node, { model, ancestors, keys }) {
   const seen = new Set();
   const out = [];
   const add = (expression, where) => {
@@ -138,11 +167,14 @@ function bindingsOf(node, { model, ancestors }) {
     out.push({
       expression: text,
       where,
-      source: resolveBinding(text, {
-        frontmatter: model?.extraFrontmatter || '',
-        imports: model?.imports || [],
-        ancestors,
-      }),
+      source: withInstance(
+        resolveBinding(text, {
+          frontmatter: model?.extraFrontmatter || '',
+          imports: model?.imports || [],
+          ancestors,
+        }),
+        keys
+      ),
     });
   };
 
@@ -167,6 +199,21 @@ function bindingsOf(node, { model, ancestors }) {
 function occurrenceOf(node, { canvas, bindings, ancestors }) {
   const count = Number.isInteger(canvas?.occurrenceCount) ? canvas.occurrenceCount : null;
   const index = Number.isInteger(canvas?.occurrence) ? canvas.occurrence : null;
+  // The loop itself is not one of its own copies. Saying "editing this changes
+  // every copy" about the `.map(` is true and useless — what an agent wants to
+  // know there is what the list is.
+  if (node.kind === 'map') {
+    const list = bindings.find((b) => b.where === 'loop')?.source || null;
+    return {
+      index: null,
+      count,
+      repeated: true,
+      scope: 'loop',
+      note: 'This is the loop, not one of the things it renders. Its children are the template every item uses.',
+      perOccurrence: null,
+      list,
+    };
+  }
   const inLoop = (ancestors || []).some((a) => a?.kind === 'map');
   const repeated = inLoop || (count != null && count > 1);
   // The list behind the repetition, when a binding names one. That ref is the
@@ -204,6 +251,7 @@ export function readTarget({
   keys,
   editable = true,
   crumbLabel = null,
+  keysFor = null,
   canvas = null,
   renderedClasses = null,
   componentChain = null,
@@ -215,9 +263,10 @@ export function readTarget({
 }) {
   if (!node) return null;
   const ancestors = ancestorChain(model?.nodes || [], node.id) || [];
+  const keysOf = typeof keysFor === 'function' ? keysFor : null;
   const parent = findParentNode(model?.nodes || [], node.id);
   const nature = textNature(node);
-  const bindings = bindingsOf(node, { model, ancestors });
+  const bindings = bindingsOf(node, { model, ancestors, keys });
   const authored = [
     ...new Set([
       ...namesIn(node.props?.class),
@@ -238,7 +287,14 @@ export function readTarget({
     breadcrumbs: breadcrumbs || null,
     text: {
       nature: nature.kind,
+      // What the node reads as, however deep the words are — the same reading
+      // get_context reports and a review fingerprints against.
       value: clip(textOf(node).join(' '), MAX_TEXT),
+      // And what set_text would actually replace, which is only ever this
+      // node's own text. The two differ for anything with children, and an
+      // agent that took the first for the second would type a section's whole
+      // contents into its first paragraph.
+      own: clip(ownTextOf(node), MAX_TEXT),
       expressions: nature.expressions.slice(0, MAX_BINDINGS),
     },
     props: propsOf(node),
@@ -249,12 +305,19 @@ export function readTarget({
       // applied classes are knowable.
       rendered: Array.isArray(renderedClasses) ? renderedClasses.slice(0, MAX_CLASSES) : null,
     },
+    // A component instance renders another file. Its children here are what
+    // the page puts INTO it; what it is made of is inside its own definition,
+    // which target "enter" opens the way a double-click does.
+    component:
+      node.kind === 'component' && !node.dynamicTag
+        ? { name: node.name || null, enterable: true }
+        : null,
     bound: isDataBound(node),
     bindings,
     occurrence: occurrenceOf(node, { canvas, bindings, ancestors }),
-    parent: summarize(parent, crumbLabel),
+    parent: summarize(parent, crumbLabel, keysOf),
     children: Array.isArray(node.children)
-      ? node.children.slice(0, MAX_CHILDREN).map((child, index) => ({ index, ...summarize(child, crumbLabel) }))
+      ? node.children.slice(0, MAX_CHILDREN).map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf) }))
       : null,
     childrenOmitted: Array.isArray(node.children) ? Math.max(0, node.children.length - MAX_CHILDREN) : 0,
     hidden: !!hidden,

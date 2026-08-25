@@ -20,6 +20,7 @@ import { readTarget } from './targetRead.js';
 import * as styleAgent from './styleAgent.js';
 import { applyOperations, findNodeById } from '../modelOps.js';
 import { resolveNode, anchorSteps } from '../reviewAnchor.js';
+import { textOf } from '../mcpContext.js';
 
 const fail = (code, message, extra = {}) => ({ ok: false, code, message, ...extra });
 
@@ -81,6 +82,31 @@ async function locate(app, anchor, { navigate = true } = {}) {
   };
 }
 
+/** One target, read. Shared by read, enter and exit, which all answer with one. */
+function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
+  const id = node.id;
+  return {
+    target: readTarget({
+      node,
+      model: a.model(),
+      page: a.page(),
+      keys: a.keysFor(id),
+      editable: a.editable(),
+      crumbLabel: a.crumbLabel,
+      keysFor: a.keysFor,
+      canvas: id === a.selectedId() ? a.canvas() : null,
+      renderedClasses: id === a.selectedId() ? a.renderedClasses() : null,
+      componentChain: a.componentChain(),
+      breadcrumbs: a.breadcrumbs(id),
+      hidden: a.isHidden(id),
+      inert: a.isInert(id),
+      confidence,
+      writable,
+    }),
+    peers: a.peersFor(id),
+  };
+}
+
 /** The document's identity right now — what a write names to prove it is current. */
 function documentOf(app) {
   return { file: app.openFile(), revision: app.revision(), digest: app.digest() };
@@ -91,7 +117,23 @@ function documentOf(app) {
  * anything the app happens to expose.
  */
 export function createAgentCommands(getApp) {
-  const app = () => getApp();
+  // Every property read goes back to the app's current bundle.
+  //
+  // Not a nicety. A command awaits — a navigation, a save, a canvas settling —
+  // and React re-renders underneath it with new state in a new bundle. A
+  // reference captured before the await would answer with the model that was
+  // open when the command started, which after `enter` is the wrong file
+  // entirely. This is one line and it removes the whole class.
+  const live = new Proxy(
+    {},
+    {
+      get: (_t, key) => {
+        const value = getApp()?.[key];
+        return typeof value === 'function' ? value.bind(getApp()) : value;
+      },
+    }
+  );
+  const app = () => live;
 
   async function target(action, args) {
     const a = app();
@@ -124,28 +166,48 @@ export function createAgentCommands(getApp) {
       return { ok: true, selected: true, navigated, note, document: documentOf(a), keys: a.keysFor(id) };
     }
 
+    // Going inside a component instance, and coming back out — the two
+    // navigations a person makes by double-clicking and pressing Escape. An
+    // agent needs them for the same reason: a component's own markup is in its
+    // own file, and nothing in the page's tree reaches it.
+    if (action === 'enter') {
+      const model = a.model();
+      const node = findNodeById(model?.nodes || [], id);
+      if (!node) return fail('no_node', 'That element is not in the open file any more.');
+      if (node.kind !== 'component' || node.dynamicTag) {
+        return fail('not_component', `<${node.name || node.kind}> is not a component instance, so there is nothing to open.`);
+      }
+      const entered = await a.enter(id, args.occurrence);
+      if (!entered.ok) return entered;
+      const inside = findNodeById(a.model()?.nodes || [], entered.id);
+      if (!inside) return fail('not_ready', `Stacki opened <${node.name}> but its tree is not loaded yet. Try again.`);
+      return { ok: true, entered: node.name, ...readAt(a, inside), document: documentOf(a), keys: a.keysFor(entered.id) };
+    }
+    if (action === 'exit') {
+      const left = await a.exit();
+      if (!left.ok) return left;
+      const inside = findNodeById(a.model()?.nodes || [], a.selectedId());
+      return {
+        ok: true,
+        exited: true,
+        ...(inside ? readAt(a, inside) : {}),
+        document: documentOf(a),
+        keys: a.keysFor(a.selectedId()),
+      };
+    }
+
     const model = a.model();
     const node = findNodeById(model?.nodes || [], id);
     if (!node) return fail('no_node', 'That element is not in the open file any more.');
 
     if (action === 'read') {
-      const payload = readTarget({
-        node,
-        model,
-        page: a.page(),
-        keys: a.keysFor(id),
-        editable: a.editable(),
-        crumbLabel: a.crumbLabel,
-        canvas: id === a.selectedId() ? a.canvas() : null,
-        renderedClasses: id === a.selectedId() ? a.renderedClasses() : null,
-        componentChain: a.componentChain(),
-        breadcrumbs: a.breadcrumbs(id),
-        hidden: a.isHidden(id),
-        inert: a.isInert(id),
-        confidence,
-        writable,
-      });
-      return { ok: true, target: payload, document: documentOf(a), navigated, note, peers: a.peersFor(id) };
+      return {
+        ok: true,
+        ...readAt(a, node, { confidence, writable }),
+        document: documentOf(a),
+        navigated,
+        note,
+      };
     }
 
     if (action === 'edit') {
@@ -176,19 +238,45 @@ export function createAgentCommands(getApp) {
         return fail('stale_target', `${doc.file} has changed since you read it. Nothing was changed.`, { document: doc });
       }
       // Every operation names the node it was given unless it says otherwise,
-      // so a caller does not repeat the ref once per operation.
-      const operations = (args.operations || []).map((op) => ({ nodeId: id, ...op }));
+      // so a caller does not repeat the ref once per operation. A move's
+      // destination arrives as the keys of a ref the main process read, and is
+      // resolved here in the tree those ids belong to.
+      const operations = [];
+      for (const op of args.operations || []) {
+        if (op?.type === 'move') {
+          const keys = op.to?.parentKeys || null;
+          let parentId = null;
+          if (keys && keys.length) {
+            const leaf = leafOf({ keys });
+            if (!leaf || leaf.file !== a.openFile()) {
+              return fail('bad_request', 'A node can only be moved somewhere in the file it already lives in.');
+            }
+            const found = resolveNode(model?.nodes || [], leaf.indexPath, null, { labelOf: a.crumbLabel });
+            if (!found.id) return fail('no_node', 'That move destination is not in the open file any more.');
+            parentId = found.id;
+          }
+          operations.push({ nodeId: id, type: 'move', target: { parentId, index: op.to?.index ?? 0 } });
+          continue;
+        }
+        operations.push({ nodeId: id, ...op });
+      }
       const dry = applyOperations(model, operations, { insertables: a.insertables() });
       if (!dry.ok) return { ...dry, ok: false, document: doc };
 
       const applied = await a.commit(operations, { label: args.label || 'agent edit' });
       if (!applied.ok) return { ...applied, document: doc };
+      // What the node looks like now, so the ref handed back describes what is
+      // there rather than what was.
+      const after = findNodeById(a.model()?.nodes || [], id);
       return {
         ok: true,
         notes: dry.notes,
         selected: applied.selectedId || null,
         document: documentOf(a),
         keys: a.keysFor(applied.selectedId || id),
+        fingerprint: after
+          ? { nodeKind: after.kind || null, tag: after.name || null, text: textOf(after).join(' ').trim() || null, peers: a.peersFor(id) }
+          : null,
         // The node the ref should now name. Identity survives most edits and
         // does not survive all of them — a delete leaves nothing to point at.
         gone: !findNodeById(a.model()?.nodes || [], id),

@@ -4241,6 +4241,41 @@ export default function App() {
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+    // Going into a component instance and coming back out: the app's own
+    // openComponent and closeComponent, waited on. Both read the refs rather
+    // than this render's state, because by the time they answer this render
+    // is several behind.
+    enter: async (id, occurrence) => {
+      const state = pageStateRef.current.pageState;
+      const node = state?.model ? findNodeById(state.model.nodes, id) : null;
+      if (!node || node.kind !== 'component' || node.dynamicTag) {
+        return { ok: false, code: 'not_component', message: 'That is not a component instance.' };
+      }
+      const before = state.model;
+      const hostPath = pathFor(id);
+      await openComponent(node.name, hostPath, Number.isInteger(occurrence) ? occurrence : 0, null);
+      for (let i = 0; i < 60; i++) {
+        const now = pageStateRef.current.pageState;
+        if (now?.model && now.model !== before && selectedIdRef.current) {
+          return { ok: true, id: selectedIdRef.current };
+        }
+        await new Promise((done) => setTimeout(done, 50));
+      }
+      return { ok: false, code: 'not_ready', message: `Stacki did not finish opening <${node.name}>.` };
+    },
+    exit: async () => {
+      if (editStackRef.current.length < 2) {
+        return { ok: false, code: 'at_top', message: 'Stacki is already at the page.' };
+      }
+      const before = pageStateRef.current.pageState?.model || null;
+      await closeComponent();
+      for (let i = 0; i < 60; i++) {
+        const now = pageStateRef.current.pageState;
+        if (now?.model && now.model !== before) return { ok: true };
+        await new Promise((done) => setTimeout(done, 50));
+      }
+      return { ok: false, code: 'not_ready', message: 'Stacki did not finish leaving the component.' };
+    },
     // Whether a ref resolved this way is good enough to write through. The
     // review pin rule, asked about the ref instead of a review.
     writableFor: (anchor, confidence) =>

@@ -234,7 +234,7 @@ const page = {
       }
       return { projectPath: ctx.root, name: input.name, layout };
     },
-    result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.path || ''), route: raw?.route ?? null }),
+    result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.pagePath || raw?.path || '') }),
   },
 
   delete: {
@@ -288,9 +288,13 @@ const page = {
     channel: 'component:usage',
     args: (input, ctx) => ({ projectPath: ctx.root, name: input.name, exclude: input.exclude || null }),
     result: (raw, _input, ctx) => ({
-      uses: take(raw?.uses || raw, MAX_LIST).map((u) =>
-        typeof u === 'string' ? relativeTo(ctx.root, u) || u : { ...u, path: u.path ? relativeTo(ctx.root, u.path) || u.path : null }
-      ),
+      total: raw?.total ?? null,
+      files: take(raw?.files, MAX_LIST).map((f) => ({
+        path: f.path ? relativeTo(ctx.root, f.path) || f.rel || null : f.rel || null,
+        name: f.name ?? null,
+        kind: f.kind ?? null,
+        count: f.count ?? null,
+      })),
     }),
   },
 
@@ -347,21 +351,61 @@ function outlineOf(nodes, depth) {
 }
 
 // --- content -----------------------------------------------------------------
+//
+// The CMS handlers name a file relative to `src/`, and one of them can carry a
+// `#export` on the end (a page's own `const plans = […]`, edited as data).
+// Everything in this API is project-relative, so the two are translated here
+// rather than by making a caller remember which convention it is in.
+
+const CMS_PREFIX = 'src/';
+
+/** A project-relative CMS path, as the handler wants it: src/-relative, fragment kept. */
+function cmsRel(ctx, value) {
+  const raw = String(value || '').trim();
+  const hash = raw.indexOf('#');
+  const filePart = hash === -1 ? raw : raw.slice(0, hash);
+  const fragment = hash === -1 ? '' : raw.slice(hash);
+  const at = rel(ctx, filePart, 'data file');
+  if (at.error) return at;
+  if (!at.rel.startsWith(CMS_PREFIX)) {
+    return problem('bad_path', `${at.rel} is not under src/, so it is not a data file Stacki manages.`);
+  }
+  return { ok: true, rel: at.rel.slice(CMS_PREFIX.length) + fragment, abs: at.abs, projectRel: at.rel + fragment };
+}
+
+/** And back: what a caller sees is always project-relative. */
+const cmsPublic = (r) => `${CMS_PREFIX}${r}`;
 
 const content = {
-  cms_list: { channel: 'cms:list', args: (_i, ctx) => ctx.root, result: (raw) => ({ files: take(raw?.files || raw, MAX_LIST) }) },
+  cms_list: {
+    channel: 'cms:list',
+    args: (_i, ctx) => ctx.root,
+    result: (raw) => ({
+      files: take(raw?.files || raw, MAX_LIST).map((f) => ({
+        path: cmsPublic(f.rel),
+        name: f.name,
+        dir: f.dir ?? null,
+        size: f.size ?? null,
+        // The data itself is what cms_read is for; a listing that carried every
+        // file's contents would be the whole CMS in one answer.
+        keys: f.data && typeof f.data === 'object' && !Array.isArray(f.data) ? Object.keys(f.data).slice(0, 60) : null,
+        entries: Array.isArray(f.data) ? f.data.length : null,
+      })),
+    }),
+  },
   cms_read: {
     channel: 'cms:read',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'data file');
+      const at = cmsRel(ctx, input.path);
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
+    result: (raw, input, ctx) => ({ path: input.path, digest: digestOfFile(cmsRel(ctx, input.path).abs), ...raw }),
   },
   cms_write: {
     channel: 'cms:write',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'data file');
+      const at = cmsRel(ctx, input.path);
       if (at.error) return at;
       const stale = checkDigest({ expected: input.expectedDigest, actual: digestOfFile(at.abs), what: at.rel });
       if (stale) return { error: stale };
@@ -370,15 +414,19 @@ const content = {
     },
     result: (raw, input, ctx) => ({
       path: input.path,
-      afterDigest: digestOfFile(path.resolve(ctx.root, input.path)),
+      afterDigest: digestOfFile(cmsRel(ctx, input.path).abs),
       ...(raw && typeof raw === 'object' ? raw : {}),
     }),
   },
-  cms_create: { channel: 'cms:create', args: (input, ctx) => ({ projectPath: ctx.root, name: input.name }) },
+  cms_create: {
+    channel: 'cms:create',
+    args: (input, ctx) => ({ projectPath: ctx.root, name: input.name }),
+    result: (raw) => ({ path: raw?.rel ? cmsPublic(raw.rel) : null, ...(raw && typeof raw === 'object' ? { ...raw, rel: undefined } : {}) }),
+  },
   cms_delete: {
     channel: 'cms:delete',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'data file');
+      const at = cmsRel(ctx, input.path);
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
@@ -386,7 +434,7 @@ const content = {
   cms_usage: {
     channel: 'cms:usage',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'data file');
+      const at = cmsRel(ctx, input.path);
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
@@ -395,7 +443,7 @@ const content = {
   cms_set_meta: {
     channel: 'cms:setMeta',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'data file');
+      const at = cmsRel(ctx, input.path);
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel, fields: input.fields };
     },
@@ -514,10 +562,40 @@ const asset = {
     },
     result: (_raw, input) => ({ path: input.path, afterDigest: digestOf(input.text) }),
   },
-  mkdir: { channel: 'assets:mkdir', args: (input, ctx) => ({ projectPath: ctx.root, parentRel: input.parent, name: input.name }) },
-  move: { channel: 'assets:move', args: (input, ctx) => ({ projectPath: ctx.root, fromRel: input.path, toDirRel: input.toFolder }) },
-  rename: { channel: 'assets:rename', args: (input, ctx) => ({ projectPath: ctx.root, rel: input.path, newName: input.name }) },
-  delete: { channel: 'assets:delete', args: (input, ctx) => ({ projectPath: ctx.root, rel: input.path }) },
+  mkdir: {
+    channel: 'assets:mkdir',
+    args: (input, ctx) => {
+      const at = rel(ctx, input.parent, 'asset folder');
+      if (at.error) return at;
+      return { projectPath: ctx.root, parentRel: at.rel, name: input.name };
+    },
+  },
+  move: {
+    channel: 'assets:move',
+    args: (input, ctx) => {
+      const from = rel(ctx, input.path, 'asset path');
+      if (from.error) return from;
+      const to = rel(ctx, input.toFolder, 'asset folder');
+      if (to.error) return to;
+      return { projectPath: ctx.root, fromRel: from.rel, toDirRel: to.rel };
+    },
+  },
+  rename: {
+    channel: 'assets:rename',
+    args: (input, ctx) => {
+      const at = rel(ctx, input.path, 'asset path');
+      if (at.error) return at;
+      return { projectPath: ctx.root, rel: at.rel, newName: input.name };
+    },
+  },
+  delete: {
+    channel: 'assets:delete',
+    args: (input, ctx) => {
+      const at = rel(ctx, input.path, 'asset path');
+      if (at.error) return at;
+      return { projectPath: ctx.root, rel: at.rel };
+    },
+  },
 };
 
 // --- style (the parts that are files rather than the live cascade) -----------
@@ -551,9 +629,24 @@ const style = {
     channel: 'css:variables',
     args: (_i, ctx) => ctx.root,
     result: (raw, input) => {
-      const sections = raw?.sections || raw || [];
+      const files = raw?.files || [];
       const limit = Math.min(input.limit || 200, MAX_LIST);
-      return { file: raw?.file ?? null, sections: take(sections, limit), truncated: sections.length > limit };
+      return {
+        // One entry per stylesheet that declares custom properties, with the
+        // sections the Variables panel shows. `values` is every name in the
+        // project resolved to its value, which is what a caller actually wants
+        // when it is chasing a var() it found in a declaration.
+        files: take(files, limit).map((f) => ({
+          path: f.rel,
+          name: f.name,
+          error: f.error || null,
+          count: f.count ?? null,
+          groups: take(f.groups, 60),
+        })),
+        values: raw?.values || {},
+        truncated: files.length > limit,
+        error: raw?.error || null,
+      };
     },
   },
   set_variable: { channel: 'css:setVariable', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
@@ -581,7 +674,20 @@ const project = {
   },
   dependencies: { channel: 'project:hasNodeModules', args: (_i, ctx) => ctx.root, result: (raw) => ({ installed: !!(raw?.has ?? raw) }) },
   install: { channel: 'project:install', args: (_i, ctx) => ctx.root },
-  diagnose: { channel: 'dev:diagnose', args: (_i, ctx) => ctx.root },
+  diagnose: {
+    channel: 'dev:diagnose',
+    args: (_i, ctx) => ctx.root,
+    // The panel shows the path to the node binary because a person may need to
+    // go and look at it. Nothing an agent can do with it is worth telling it
+    // where somebody's home directory is.
+    result: (raw) => ({
+      kind: raw?.kind ?? 'unknown',
+      nodeFound: !!raw?.nodePath,
+      nodeVersion: raw?.nodeVersion ?? null,
+      astroVersion: raw?.astroVersion ?? null,
+      requires: raw?.requires ?? null,
+    }),
+  },
   probe: { channel: 'dev:probe', args: (input, ctx) => input.url || ctx.devUrl || null },
   dev_start: { channel: 'dev:start', args: (_i, ctx) => ctx.root },
   dev_stop: { channel: 'dev:stop', args: () => undefined },
@@ -694,7 +800,14 @@ async function runMain(domain, action, input, ctx) {
   try {
     raw = await ctx.callMain(entry.channel, built);
   } catch (err) {
-    return { ok: false, code: 'failed', message: String(err?.message || err) };
+    const message = String(err?.message || err);
+    // A project that was never `git init`ed is a normal state, not a failure —
+    // and an agent told "fatal: not a git repository" will go looking for a
+    // bug rather than reading it as "there is no history here".
+    if (/not a git repository/i.test(message)) {
+      return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
+    }
+    return { ok: false, code: 'failed', message };
   }
   const shaped = entry.result ? entry.result(raw, input, ctx) : raw;
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
