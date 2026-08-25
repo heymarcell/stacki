@@ -493,6 +493,17 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
         revision: result.revision || 0,
         review: result.review || null,
         ...(result.restored ? { restored: result.restored, note: result.note || null } : {}),
+        // The handle for acting on what a focus just put on screen, which is
+        // the whole point of focusing. `focus` always sets these three (null
+        // and false when the walk did not land), so their presence on `result`
+        // is what says this was a focus — no second look at `args.action`.
+        ...('targetRef' in result
+          ? {
+              targetRef: result.targetRef,
+              targetEditable: !!result.targetEditable,
+              confidence: result.confidence || null,
+            }
+          : {}),
       };
       return {
         content: [{ type: 'text', text: JSON.stringify(body, null, 2) }],
