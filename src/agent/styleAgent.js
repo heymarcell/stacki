@@ -96,13 +96,32 @@ export function variablesIn(value) {
  * until the first edit above it — which, for a tool whose whole job is editing,
  * is immediately.
  */
-export const declarationIdentity = (rule, prop) => ({
+export const declarationIdentity = (rule, prop, sourceDigest = null) => ({
   source: publicKey(rule.embedKey),
   sourceLabel: rule.embedLabel,
   atContext: rule.atContext || [],
   selector: rule.selectorText,
   property: prop,
+  // What the source was when this was read. A rule can still be found in a
+  // stylesheet somebody has rewritten — same selector, same property, different
+  // file — and finding it is not the same as it being the version that was
+  // reasoned about. Carried on the identity so passing the identity back is
+  // the whole of the guard.
+  ...(sourceDigest ? { sourceDigest } : {}),
 });
+
+// A short version marker for a source's text. FNV-1a rather than a real hash:
+// this says which version, not who wrote it, and it is computed per rule on
+// every read.
+export function digestOfSource(text) {
+  const body = String(text ?? '');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < body.length; i++) {
+    hash ^= body.charCodeAt(i);
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return `${hash.toString(36)}-${body.length.toString(36)}`;
+}
 
 /** Everything the page's CSS is, parsed once. */
 async function readCascade(node) {
@@ -148,7 +167,7 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
         winning: status.winning !== false,
         overriddenBy: status.overriddenBy || null,
         variables: variablesIn(decl.value),
-        identity: declarationIdentity(rule, decl.prop),
+        identity: declarationIdentity(rule, decl.prop, digestOfDoc(docs, rule.embedKey)),
       };
     });
     for (const decl of declarations) wanted.add(decl.property);
@@ -204,6 +223,30 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
 /** The doc a rule was parsed out of. */
 const docFor = (docs, key) => docs.find((d) => d.source.key === key) || null;
 
+/** The version marker for the source a rule came out of. */
+const digestOfDoc = (docs, key) => {
+  const doc = docFor(docs, key);
+  return doc ? digestOfSource(doc.code) : null;
+};
+
+/**
+ * Whether the stylesheet a declaration was read from is still that stylesheet.
+ *
+ * Null when it is, or when the caller passed an identity from before this
+ * carried a digest. Otherwise the refusal — the rule may well still be there,
+ * and that is not the question being asked.
+ */
+function checkSource(docs, rule, identity) {
+  if (!identity?.sourceDigest) return null;
+  const now = digestOfDoc(docs, rule.embedKey);
+  if (now === identity.sourceDigest) return null;
+  return problem(
+    'stale_target',
+    `${identity.sourceLabel || identity.source} has changed since you read it — the rule is still there, but not ` +
+      'the version you reasoned about. Nothing was written. Read the styles again.'
+  );
+}
+
 /** The parsed rule matching a semantic identity, or null. */
 function findRule(rules, identity) {
   const wantContext = (identity.atContext || []).join(' › ');
@@ -251,6 +294,8 @@ export async function setProperty(node, { identity, source, selector, property, 
     }
     const doc = docFor(docs, rule.embedKey);
     if (!doc) return problem('no_source', 'That stylesheet is no longer loaded.');
+    const moved = checkSource(docs, rule, identity);
+    if (moved) return moved;
     const existing = rule.declarations.find((d) => d.prop.toLowerCase() === prop.toLowerCase());
     if (existing) setDeclarationValue(existing, next, important);
     else if (!addDeclaration(rule, prop, next, important)) {
@@ -307,6 +352,8 @@ export async function removeProperty(node, { identity, live = false }) {
   if (!rule) {
     return problem('stale_target', 'That rule is not in that stylesheet any more. Read the styles again.');
   }
+  const moved = checkSource(docs, rule, identity);
+  if (moved) return moved;
   const decl = rule.declarations.find((d) => d.prop.toLowerCase() === String(identity.property).toLowerCase());
   if (!decl) return { ok: true, removed: false, note: `${identity.property} was not on ${identity.selector}.` };
   const doc = docFor(docs, rule.embedKey);

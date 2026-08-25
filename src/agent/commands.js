@@ -270,18 +270,29 @@ export function createAgentCommands(getApp) {
       // claimed to know. An agent that did not pass expectedRevision still
       // wants both numbers back — that is what makes the next write able to
       // name one.
-      // What the node looks like now, so the ref handed back describes what is
-      // there rather than what was.
-      const after = findNodeById(a.model()?.nodes || [], id);
+      // The ref handed back describes ONE node, and it is the node the editor is
+      // now on: for an insert that is what was inserted, for a duplicate the
+      // copy, for a text or prop edit the node itself. Both halves have to be
+      // about that same node — an earlier version took the keys from the new
+      // node and the marks from the old one, and the two together described
+      // something that was not there, so the very next call could not find it.
+      const landed = applied.selectedId || id;
+      const after = findNodeById(a.model()?.nodes || [], landed);
       return {
         ok: true,
         notes: dry.notes,
         selected: applied.selectedId || null,
         documentBefore: doc,
         document: documentOf(a),
-        keys: a.keysFor(applied.selectedId || id),
+        keys: a.keysFor(landed),
         fingerprint: after
-          ? { nodeKind: after.kind || null, tag: after.name || null, text: textOf(after).join(' ').trim() || null, peers: a.peersFor(id) }
+          ? {
+              nodeKind: after.kind || null,
+              tag: after.name || null,
+              text: textOf(after).join(' ').trim() || null,
+              breadcrumbs: a.crumbsFor(landed),
+              peers: a.peersFor(landed),
+            }
           : null,
         // The node the ref should now name. Identity survives most edits and
         // does not survive all of them — a delete leaves nothing to point at.
@@ -356,6 +367,14 @@ export function createAgentCommands(getApp) {
     // Also not an action any tool can name. The main process sends it after a
     // write it carried out itself, so that write lands on the same undo stack
     // the panel's version of it lands on.
+    // Replacing the open document's source, through the editor rather than
+    // round it. Not an action any tool can name: the main process sends it when
+    // a raw write turns out to be about the file Stacki has open. See
+    // App.jsx's writeOpenSource.
+    if (action === 'write_open_source') {
+      const done = await a.writeOpenSource(args.text);
+      return { ...done, document: documentOf(a) };
+    }
     if (action === 'record_undo') {
       const done = await a.recordUndo(args);
       return { ok: true, undoable: !!done };

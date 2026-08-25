@@ -61,7 +61,7 @@ const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const mcp = require('./mcp');
 const reviews = require('./review');
-const agentPermissions = require('./mcp/agent/permissions');
+const { createAccessStore } = require('./mcp/agent/access');
 
 let mainWindow = null;
 let devServer = null; // {proc, url, projectPath}
@@ -433,9 +433,11 @@ app.whenReady().then(() => {
     // The project the app has open, which is what every ref and every path in
     // the Agent API is scoped to.
     getProjectRoot: () => openProjectRoot,
-    // Read every time rather than captured: a person who tightens the setting
-    // is obeyed by the next call, not by the next launch.
-    getAgentMode: () => settings.agentMode,
+    // Read every time rather than captured, and about the project that is open
+    // rather than about the machine: a person who tightens the setting is
+    // obeyed by the next call, and a grant made on one project does not follow
+    // Stacki into the next.
+    getAgentMode: () => agentAccess.modeFor(openProjectRoot),
     // One implementation of each operation, called by name. See mainOps.
     callMain: callMainOp,
   });
@@ -1086,14 +1088,26 @@ function isAstroProject(dir) {
 // Sound is off. An editor that makes a noise the first time somebody touches it
 // is an editor they turn off, so it is asked for rather than opted out of.
 //
-// `agentMode` is the Agent API's permission level, and its default is the
-// conservative one on purpose: an update that quietly handed a connected agent
-// the ability to edit somebody's project would be granting a permission nobody
-// was asked for. See electron/mcp/agent/permissions.js.
-const SETTINGS_DEFAULTS = { sound: false, agentMode: 'inspect' };
+// `agentAccess` is the Agent API's permission level, PER PROJECT — a map of
+// project fingerprint to level, empty until somebody grants something. It is
+// empty by default on purpose: an update that quietly handed a connected agent
+// the ability to read somebody's source would be granting a permission nobody
+// was asked for. See electron/mcp/agent/access.js.
+const SETTINGS_DEFAULTS = { sound: false, agentAccess: {} };
 let settings = { ...SETTINGS_DEFAULTS };
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
+
+// The Agent API's grants, per project. Reads and writes the settings through
+// the two functions below rather than holding a copy, so the window and the
+// gate can never be looking at different answers.
+const agentAccess = createAccessStore({
+  read: () => settings,
+  write: (next) => {
+    settings = next;
+    writeSettings();
+  },
+});
 
 function readSettings() {
   try {
@@ -1115,16 +1129,18 @@ function writeSettings() {
 // The renderer asks once on load; the menu pushes every change after that.
 handle('settings:get', () => settings);
 
-// How much of Stacki a connected agent may move. Set from the AI connection
-// window; enforced in the main process, where the tools actually run.
+// How much of Stacki a connected agent may move, for the project that is open.
+// Set from the AI connection window; enforced in the main process, where the
+// tools actually run. `full` is granted for this session only — see
+// electron/mcp/agent/access.js.
 handle('settings:setAgentMode', (_e, mode) => {
-  const next = agentPermissions.normalizeMode(mode);
-  if (next !== settings.agentMode) {
-    settings = { ...settings, agentMode: next };
-    writeSettings();
-  }
-  return { ok: true, agentMode: settings.agentMode };
+  const result = agentAccess.setModeFor(openProjectRoot, mode);
+  return { ...result, ...agentAccess.describe(openProjectRoot) };
 });
+
+// What the window draws the control from: the level in force for the open
+// project, whether it survives a restart, and what a restart would find.
+handle('settings:agentAccess', () => agentAccess.describe(openProjectRoot));
 
 // ---------------------------------------------------------------------------
 // Recent projects + preview thumbnails
@@ -1530,7 +1546,12 @@ handle('project:scan', async (_e, projectPath) => {
   // rescan, which runs on every file change and every panel refresh; rotating
   // there would expire an agent's refs several times a minute, between reading
   // a target and editing it.
-  if (openProjectRoot !== opened) mcp.projectChanged();
+  if (openProjectRoot !== opened) {
+    mcp.projectChanged();
+    // And the permission level is the next project's, whatever the last one's
+    // was. Keyed by project, so this is a statement rather than an operation.
+    agentAccess.projectChanged();
+  }
   openProjectRoot = opened;
   // And this project's reviews. Scoped to the folder the app has open, which
   // is why no renderer call ever names a review file: there is only ever one,
@@ -2786,6 +2807,21 @@ function writePageText(pagePath, text) {
     }, STYLE_NUDGE_MS)
   );
 }
+
+// The same read as `page:read`, of text nobody has written to disk yet.
+//
+// A raw source edit through the Agent API has to become a model before it can
+// go through the editor — that is what keeps it on the undo stack instead of
+// round the outside of it. Parsing is the main process's job and the parser is
+// already here; what changes is only where the text came from.
+handle('page:parseSource', async (_e, { pagePath, source }) => {
+  if (isMarkdownPage(pagePath)) {
+    return { ...parseMarkdownPage(source, { mdx: isMdx(pagePath) }), source };
+  }
+  const parsed = parsePage(source);
+  if (parsed.editable) resolveChunks(parsed.model, pagePath);
+  return { ...parsed, source };
+});
 
 handle('page:write', async (_e, { pagePath, model }) => {
   if (isMarkdownPage(pagePath)) {

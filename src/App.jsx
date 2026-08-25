@@ -1126,8 +1126,11 @@ export default function App() {
     docRevRef.current += 1;
     setPageState({ ...result, file: page.path, dirty: false });
     setSelectedId(nextSelected);
-    // Page snapshots describe a tree that is no longer there.
-    dropPageHistory();
+    // The history is deliberately left alone. Somebody editing the open file in
+    // another editor has always been able to press ⌘Z afterwards and get the
+    // model back — that is what undo means here, and it is not this function's
+    // place to decide otherwise. An earlier version of this dropped the page's
+    // snapshots and it was a behaviour change nobody asked for.
     return true;
   };
 
@@ -4305,6 +4308,66 @@ export default function App() {
         redo: () => put('after'),
       });
       return true;
+    },
+    /**
+     * Replace the open document's source, through the editor.
+     *
+     * The Agent API's raw source write used to go round the outside: write the
+     * file, then tell the renderer to take it from disk again. That worked and
+     * it threw the page's undo history away, because a reload describes a tree
+     * nobody has a snapshot of. So an edit an agent made could not be taken
+     * back, and neither could the three the person had made before it.
+     *
+     * This is the path the editor already has. `pushHistory` first, so ⌘Z has
+     * somewhere to go; then the state, then the normal save. Two shapes,
+     * because the app holds two:
+     *
+     *   a document Stacki models    the model is the truth and the file is
+     *                               written from it, so the new text is parsed
+     *                               and the model replaced. Undo restores the
+     *                               previous MODEL, and saving writes it back
+     *                               over the file — which is the original
+     *                               source, arrived at the way everything else
+     *                               here arrives at it.
+     *
+     *   a document it does not      `pageState.source` is the truth already.
+     *                               This is exactly what the code editor does.
+     */
+    writeOpenSource: async (text) => {
+      const { currentPage: page, pageState: state } = pageStateRef.current;
+      if (!page || !state) return { ok: false, code: 'not_open', message: 'Stacki has no document open.' };
+      const before = state.editable ? { kind: 'model', model: state.model } : { kind: 'source', source: state.source };
+      if (!state.editable) {
+        setRawSource(String(text));
+        await new Promise((done) => setTimeout(done, 0));
+        await flushSave();
+        return { ok: true, editable: false, undoable: true, restored: before.kind };
+      }
+      // Parse it the way opening the file would, so what lands in the model is
+      // what Stacki would have read.
+      let parsed;
+      try {
+        parsed = await window.avb.parseSource({ pagePath: page.path, source: String(text) });
+      } catch (err) {
+        return { ok: false, code: 'unparsable', message: String(err?.message || err) };
+      }
+      if (!parsed || parsed.editable === false) {
+        return {
+          ok: false,
+          code: 'unrepresentable',
+          message:
+            parsed?.reason ||
+            'Stacki could not read that as a document. Nothing was changed — the file it has open would have ' +
+              'become one it cannot edit.',
+        };
+      }
+      pushHistory(null); // its own step: a source rewrite is not a typing burst
+      docRevRef.current += 1;
+      setPageState((s) => (s ? { ...s, ...parsed, file: page.path, dirty: true } : s));
+      setSelectedId(null);
+      await new Promise((done) => setTimeout(done, 0));
+      await flushSave();
+      return { ok: true, editable: true, undoable: true, restored: before.kind };
     },
     // The open document changed on disk under the editor. Same reload the file
     // watcher does — see reloadOpenPageRef.

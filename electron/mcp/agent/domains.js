@@ -26,6 +26,40 @@ const { digestOf, digestOfFile, checkDigest } = require('./digest');
 
 const problem = (code, message, extra = {}) => ({ error: { ok: false, code, message, ...extra } });
 
+/**
+ * The guard on a write that replaces something.
+ *
+ * Three ways a caller can name the version it is replacing, in the order they
+ * are worth having:
+ *
+ *   a ref      handed over by the read that produced it, with the digest
+ *              baked into the signature. Nothing to remember and nothing to
+ *              copy wrongly.
+ *   a digest   named explicitly, for a caller that would rather.
+ *   nothing    refused, if the thing already exists. This used to be allowed
+ *              and it was the hole: concurrency protection that only worked
+ *              for clients that opted in.
+ *
+ * `ctx.refObservation(input.ref, expectedPath)` is the API's own reader — it
+ * verifies the signature and that the ref is about this path.
+ */
+function guardWrite(ctx, at, input, what) {
+  const actual = digestOfFile(at.abs);
+  let expected = input.expectedDigest;
+  if (input.ref) {
+    // Without a ref reader there is nothing behind the ref, and a write that
+    // quietly ignored one would be a write that lost its guard.
+    if (typeof ctx.refObservation !== 'function') {
+      return { error: { ok: false, code: 'bad_ref', message: 'Stacki cannot read refs right now.' } };
+    }
+    const fromRef = ctx.refObservation(input.ref, at.rel);
+    if (fromRef.error) return fromRef;
+    expected = fromRef.digest ?? expected;
+  }
+  const stale = checkDigest({ expected, actual, what: what || at.rel, requireForExisting: true });
+  return stale ? { error: stale } : { ok: true, actual };
+}
+
 // --- shared helpers ----------------------------------------------------------
 
 /** A project-relative path argument, validated. */
@@ -41,6 +75,17 @@ const clip = (text, max) => {
 };
 
 const take = (list, limit) => (Array.isArray(list) ? list.slice(0, limit) : []);
+
+// The two things the API layer supplies, with the behaviour to fall back on
+// when it has not — so `runMain` stays a function of its context and can be
+// driven straight in a test.
+const refFor = (ctx, rel) => (typeof ctx.sourceRef === 'function' ? ctx.sourceRef(rel) : null);
+const putText = (ctx, rel, text) =>
+  typeof ctx.writeText === 'function'
+    ? ctx.writeText(rel, text)
+    : Promise.resolve(ctx.callMain('src:writeText', { projectPath: ctx.root, rel, text })).then(() => ({
+        through: { through: 'disk', undoable: false },
+      }));
 
 // How much of an answer travels. Generous enough to be useful in one call,
 // small enough that no single call can fill a context window.
@@ -73,6 +118,10 @@ const source = {
     return {
       value: {
         path: at.rel,
+        // Hand back a ref as well as the digest. The ref carries the digest in
+        // its signature, so the write that follows this read is guarded by
+        // passing it back — with nothing for a caller to copy or forget.
+        ref: refFor(ctx, at.rel),
         // The digest is of the WHOLE file however much of it was read, because
         // that is what a write will be checked against.
         digest: digestOf(text),
@@ -91,18 +140,20 @@ const source = {
     if (at.error) return at;
     if (typeof input.text !== 'string') return problem('bad_request', 'text is required.');
     const before = digestOfFile(at.abs);
-    const stale = checkDigest({ expected: input.expectedDigest, actual: before, what: at.rel });
-    if (stale) return { error: stale };
+    const guard = guardWrite(ctx, at, input, at.rel);
+    if (guard.error) return guard;
     if (before == null && input.expectedDigest != null) {
       return problem('no_file', `There is no ${at.rel} to replace.`);
     }
-    await ctx.callMain('src:writeText', { projectPath: ctx.root, rel: at.rel, text: input.text });
+    const wrote = await putText(ctx, at.rel, input.text);
+    if (wrote.error) return wrote;
     return {
       value: {
         path: at.rel,
         beforeDigest: before,
         afterDigest: digestOf(input.text),
         bytes: Buffer.byteLength(input.text, 'utf8'),
+        ...wrote.through,
       },
     };
   },
@@ -118,8 +169,8 @@ const source = {
       return problem('no_file', `There is no ${at.rel}.`);
     }
     const before = digestOf(current);
-    const stale = checkDigest({ expected: input.expectedDigest, actual: before, what: at.rel });
-    if (stale) return { error: stale };
+    const guard = guardWrite(ctx, at, input, at.rel);
+    if (guard.error) return guard;
     const lines = current.split('\n');
     const from = Number(input.startLine);
     const to = Number(input.endLine ?? input.startLine);
@@ -127,7 +178,8 @@ const source = {
       return problem('bad_request', `${at.rel} has ${lines.length} lines; ${from}–${to} is not a range in it.`);
     }
     const next = [...lines.slice(0, from - 1), ...String(input.text).split('\n'), ...lines.slice(Math.min(to, lines.length))].join('\n');
-    await ctx.callMain('src:writeText', { projectPath: ctx.root, rel: at.rel, text: next });
+    const wrote = await putText(ctx, at.rel, next);
+    if (wrote.error) return wrote;
     return {
       value: {
         path: at.rel,
@@ -135,6 +187,7 @@ const source = {
         afterDigest: digestOf(next),
         replacedLines: `${from}-${to}`,
         lines: next.split('\n').length,
+        ...wrote.through,
       },
     };
   },
@@ -411,15 +464,20 @@ const content = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
-    result: (raw, input, ctx) => ({ path: input.path, digest: digestOfFile(cmsRel(ctx, input.path).abs), ...raw }),
+    result: (raw, input, ctx) => ({
+      path: input.path,
+      ref: refFor(ctx, cmsRel(ctx, input.path).projectRel),
+      digest: digestOfFile(cmsRel(ctx, input.path).abs),
+      ...raw,
+    }),
   },
   cms_write: {
     channel: 'cms:write',
     args: (input, ctx) => {
       const at = cmsRel(ctx, input.path);
       if (at.error) return at;
-      const stale = checkDigest({ expected: input.expectedDigest, actual: digestOfFile(at.abs), what: at.rel });
-      if (stale) return { error: stale };
+      const guard = guardWrite(ctx, { abs: at.abs, rel: at.projectRel }, input, at.projectRel);
+      if (guard.error) return guard;
       if (input.data === undefined) return problem('bad_request', 'data is required.');
       return { projectPath: ctx.root, rel: at.rel, data: input.data };
     },
@@ -558,7 +616,13 @@ const asset = {
     },
     result: (raw, input, ctx) => {
       const body = clip(raw?.text ?? '', MAX_TEXT_BYTES);
-      return { path: input.path, text: body.text, truncated: body.truncated, digest: digestOfFile(path.resolve(ctx.root, input.path)) };
+      return {
+        path: input.path,
+        ref: refFor(ctx, input.path),
+        text: body.text,
+        truncated: body.truncated,
+        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+      };
     },
   },
   write_text: {
@@ -566,8 +630,8 @@ const asset = {
     args: (input, ctx) => {
       const at = rel(ctx, input.path, 'asset path');
       if (at.error) return at;
-      const stale = checkDigest({ expected: input.expectedDigest, actual: digestOfFile(at.abs), what: at.rel });
-      if (stale) return { error: stale };
+      const guard = guardWrite(ctx, at, input, at.rel);
+      if (guard.error) return guard;
       if (typeof input.text !== 'string') return problem('bad_request', 'text is required.');
       return { projectPath: ctx.root, rel: at.rel, text: input.text };
     },
@@ -642,7 +706,13 @@ const style = {
     },
     result: (raw, input, ctx) => {
       const body = clip(raw?.css ?? raw?.text ?? '', MAX_TEXT_BYTES);
-      return { path: input.path, css: body.text, truncated: body.truncated, digest: digestOfFile(path.resolve(ctx.root, input.path)) };
+      return {
+        path: input.path,
+        ref: refFor(ctx, input.path),
+        css: body.text,
+        truncated: body.truncated,
+        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+      };
     },
   },
   write_source: {
@@ -650,8 +720,8 @@ const style = {
     args: (input, ctx) => {
       const at = rel(ctx, input.path, 'stylesheet path');
       if (at.error) return at;
-      const stale = checkDigest({ expected: input.expectedDigest, actual: digestOfFile(at.abs), what: at.rel });
-      if (stale) return { error: stale };
+      const guard = guardWrite(ctx, at, input, at.rel);
+      if (guard.error) return guard;
       if (typeof input.css !== 'string') return problem('bad_request', 'css is required.');
       return { filePath: at.abs, css: input.css };
     },

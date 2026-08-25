@@ -69,8 +69,96 @@ function createAgentApi({
       devUrl: payload?.preview?.url || null,
       branch: payload?.project?.branch || null,
       payload,
+      // The two things the domains need from the ref system: a ref to hand back
+      // with a read, and the observation to check a write against.
+      sourceRef: (rel) => sourceRef(rel),
+      refObservation: (ref, expectedPath) => refObservation(ref, expectedPath),
+      // And how text reaches a file, which is not always the same door.
+      writeText: (rel, text) => writeProjectText(rel, text),
     };
   };
+
+  /**
+   * Put text in a project file.
+   *
+   * Two doors, and which one it goes through is not the caller's business —
+   * it is a fact about what Stacki happens to have open:
+   *
+   *   the open document   through the EDITOR. `pushHistory`, the state, the
+   *                       normal save. The change is on the undo stack, the
+   *                       canvas has it, and ⌘Z takes it back. This is the
+   *                       whole reason the door exists: writing the file and
+   *                       then telling the renderer to re-read it also worked,
+   *                       and threw away every page snapshot in the history
+   *                       while it did.
+   *
+   *   any other file      straight to disk. There is no editor state to keep
+   *                       in step, and the answer says `undoable: false`
+   *                       rather than implying otherwise.
+   */
+  async function writeProjectText(rel, text) {
+    const ctx = context();
+    const open = openDocument(ctx);
+    if (open && open === rel) {
+      const answer = await command({ domain: 'project', action: 'write_open_source', text }, COMMAND_TIMEOUT_MS);
+      if (!answer?.ok) {
+        return {
+          error: answer || no('not_ready', 'The Stacki window did not answer in time.'),
+        };
+      }
+      return {
+        through: {
+          through: 'editor',
+          undoable: true,
+          document: answer.document || null,
+          note:
+            'Stacki has this file open, so the change went through its editor: it is on the canvas and ⌘Z takes ' +
+            'it back, along with everything else in the page’s history.',
+        },
+      };
+    }
+    await ctx.callMain('src:writeText', { projectPath: ctx.root, rel, text });
+    return {
+      through: {
+        through: 'disk',
+        // Honest rather than flattering: nothing in Stacki is holding this
+        // file, so nothing in Stacki can take the change back.
+        undoable: false,
+        note: 'Stacki does not have this file open, so the change went straight to disk and its undo cannot take it back.',
+      },
+    };
+  }
+
+  /** The document the editor is holding, project-relative. */
+  function openDocument(ctx) {
+    const keys = ctx.payload?.selection?.keys || [];
+    const leaf = keys.length ? keys[keys.length - 1] : null;
+    if (typeof leaf === 'string' && leaf.includes('#')) return leaf.slice(0, leaf.indexOf('#'));
+    return ctx.payload?.page?.file ? relativeTo(ctx.root, ctx.payload.page.file) : null;
+  }
+
+  /**
+   * What a file ref says it saw, checked against the file it is being used on.
+   *
+   * A ref names its own path, so a write that passes a ref for one file while
+   * naming another is a mistake worth catching rather than a guard worth
+   * ignoring — the digest would be about the wrong file, and would probably
+   * even match.
+   */
+  function refObservation(ref, expectedPath) {
+    const parsed = readRef(ref, 'source');
+    if (!parsed.ok) return { error: parsed };
+    const named = parsed.data?.path || null;
+    if (expectedPath && named && named !== expectedPath) {
+      return {
+        error: no(
+          'wrong_target',
+          `That ref is for ${named}, and this write names ${expectedPath}. Nothing was written.`
+        ),
+      };
+    }
+    return { digest: parsed.observed?.digest ?? null, path: named };
+  }
 
   // --- refs ------------------------------------------------------------------
 
@@ -82,7 +170,7 @@ function createAgentApi({
    * thing in the same way. `writable` is the caller's judgement about the
    * evidence, and the ref carries it rather than re-deriving it later.
    */
-  function nodeRef(anchor, { writable = true } = {}) {
+  function nodeRef(anchor, { writable = true, observed = null } = {}) {
     const ctx = context();
     if (!ctx.root || !anchor) return null;
     return refs.mint(
@@ -101,15 +189,64 @@ function createAgentApi({
         // and then resolves on position alone is the failure this stops.
         branch: anchor.branch ?? ctx.branch ?? null,
       },
-      { projectRoot: ctx.root, writable }
+      // What the read that produced this saw. A write through this ref is
+      // checked against it, which is what makes concurrency protection
+      // something a client cannot forget to ask for.
+      { projectRoot: ctx.root, writable, observed }
     );
   }
 
-  /** A ref for a file, as source. */
+  /**
+   * A ref for a file, as source.
+   *
+   * It carries the file's digest, so a write through it is guarded whether or
+   * not the caller thought to name one.
+   */
   function sourceRef(rel) {
     const ctx = context();
     if (!ctx.root || !rel) return null;
-    return refs.mint('source', { path: rel }, { projectRoot: ctx.root });
+    return refs.mint('source', { path: rel }, { projectRoot: ctx.root, observed: fileObservation(rel) });
+  }
+
+  /**
+   * The digest of a project file right now, or nothing when there is no file.
+   *
+   * A CMS path can name an export inside a page — `src/pages/index.astro#plans`
+   * — and the thing to read is the file, while the thing to identify is the
+   * export. So the fragment is kept on the ref and taken off to read.
+   */
+  function fileObservation(rel) {
+    const text = readFile(String(rel).split('#')[0]);
+    return text === null ? null : { digest: digestOf(text), file: rel };
+  }
+
+  /**
+   * Whether a ref's observation still holds.
+   *
+   * `null` when it does — or when the ref carried none, which is a ref about
+   * something that had no version to be stale against. Otherwise the refusal,
+   * with what is true now so a re-read is one call rather than a guess.
+   */
+  function checkObservation(parsed, current, what) {
+    const seen = parsed?.observed;
+    if (!seen) return null;
+    if (seen.revision != null && current.revision != null && seen.revision !== current.revision) {
+      return no(
+        'stale_target',
+        `${what} has changed since you read it (revision ${seen.revision} → ${current.revision}). Nothing was changed. ` +
+          'Read the target again and re-apply your change to what is there now.',
+        { observed: seen, current }
+      );
+    }
+    if (seen.digest != null && current.digest != null && seen.digest !== current.digest) {
+      return no(
+        'stale_target',
+        `${what} has changed since you read it — somebody or something else edited it. Nothing was changed. ` +
+          'Read it again and re-apply your change to what is there now.',
+        { observed: seen, current }
+      );
+    }
+    return null;
   }
 
   function readRef(ref, kind) {
@@ -245,11 +382,13 @@ function createAgentApi({
 
     let anchor = null;
     let writable = true;
+    let seen = null;
     if (args.ref) {
       const parsed = readRef(args.ref, 'node');
       if (!parsed.ok) return parsed;
       anchor = parsed.data;
       writable = parsed.writable;
+      seen = parsed;
     }
 
     if (action === 'read' || action === 'select' || action === 'enter' || action === 'exit') {
@@ -259,7 +398,10 @@ function createAgentApi({
       );
       if (!answer.ok) return answer;
       if (action === 'select') {
-        return { ...answer, ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true }) };
+        return {
+          ...answer,
+          ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true, observed: answer.document || null }),
+        };
       }
       // enter and exit both answer with a target, and it is a target inside a
       // different file — so it is given the same source trail, snippet and ref
@@ -310,8 +452,17 @@ function createAgentApi({
         action: 'edit',
         anchor,
         operations,
-        expectedRevision: args.expectedRevision,
-        expectedDigest: args.expectedDigest,
+        // The ref's own observation is the guard, and it is not optional: it
+        // was baked in by the read that handed the ref over. An explicit
+        // expectedRevision/expectedDigest still works and is checked as well —
+        // a caller that wants to name what it believes may.
+        //
+        // A call with NO ref acts on the live selection, which is by definition
+        // what is in front of the person right now. There is no earlier
+        // observation for it to be stale against, and that is the honest way to
+        // say "whatever is there now" rather than an accidental escape hatch.
+        expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
+        expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
         label: action,
       },
       NAVIGATING_TIMEOUT_MS
@@ -324,7 +475,7 @@ function createAgentApi({
       notes: answer.notes || [],
       // A delete leaves nothing to point at, and saying so is better than
       // handing back a ref that will fail on its next use.
-      ref: answer.gone ? null : nodeRef(nextAnchor, { writable: true }),
+      ref: answer.gone ? null : nodeRef(nextAnchor, { writable: true, observed: answer.document || null }),
       gone: !!answer.gone,
       // Both sides of the change, so the next write can name this one without
       // a second read.
@@ -415,7 +566,7 @@ function createAgentApi({
               page: t.page,
               branch: ctx.branch,
             },
-            { writable: writable && t.editable !== false }
+            { writable: writable && t.editable !== false, observed: answer.document || null }
           )
         : null;
     // A binding that resolves to a prop names the instance that sets it; a
@@ -432,6 +583,9 @@ function createAgentApi({
             ...source,
             instanceRef: nodeRef(
               { keys: source.instanceKeys, fingerprint: null, page: t.page, branch: ctx.branch },
+              // The instance lives in the page, which is a different document
+              // from the one this read was of — so it carries no observation of
+              // its own and a write through it reads that document first.
               { writable: true }
             ),
           },
@@ -466,7 +620,12 @@ function createAgentApi({
             breakpoint: null,
             branch: ctx.branch,
           },
-          { writable: writable && t.editable !== false }
+          // The document as this read found it. A write through this ref is
+          // refused if anybody has touched the document since — including when
+          // the node itself still resolves perfectly, which is the case that
+          // matters: "the right node" and "the version I reasoned about" are
+          // different facts.
+          { writable: writable && t.editable !== false, observed: answer.document || null }
         ),
         // The file itself, for the cases target cannot express. Named here so
         // an agent never has to work out which file to open.
@@ -623,7 +782,7 @@ function createAgentApi({
       editorReloaded: !!synced?.reloaded,
       document: synced?.document || null,
       note: synced?.reloaded
-        ? `${editing.filter((rel) => moved.includes(rel)).join(', ')} is open in Stacki, so the editor took it from disk again. Its undo history for that page is gone — a semantic edit through target would have kept it.`
+        ? `${editing.filter((rel) => moved.includes(rel)).join(', ')} is open in Stacki, so the editor took the file from disk again — the model, the canvas and the file agree.`
         : result.note ?? null,
       changedFiles: changed(moved, before),
     };
@@ -734,15 +893,27 @@ function createAgentApi({
       access: {
         mode: gate.mode,
         label: permissions.LABEL[gate.mode],
+        // What this level actually authorises, in the same words the window
+        // shows the person who granted it.
+        grants: permissions.BLURB[gate.mode],
         canRead: gate.allows('read'),
         canEdit: gate.allows('write'),
         canDoHighRisk: gate.allows('high'),
+        // Levels are granted per project, and the one that is not remembered
+        // says so — an agent that knows `full` is for this session will not
+        // assume it still has it tomorrow.
+        scope: 'project',
+        sessionOnly: gate.mode === permissions.SESSION_ONLY,
         note:
-          gate.mode === 'inspect'
-            ? 'Read-only. Every project mutation is refused until the person at the keyboard raises this in Stacki’s AI connection window.'
-            : gate.mode === 'edit'
-              ? 'Ordinary editing is allowed. Destructive and remote operations — git writes, deletes, dependency installs — are refused.'
-              : 'Everything Stacki exposes, including destructive and remote git operations.',
+          gate.mode === 'visual'
+            ? 'Visual only, which is what this endpoint did before it could touch the project: get_context, capture, ' +
+              'get_comments and comment work; every domain tool below is refused until the person at the keyboard ' +
+              'raises this in Stacki’s AI connection window, for this project.'
+            : gate.mode === 'inspect'
+              ? 'Read-only. Every project mutation is refused until the person at the keyboard raises this.'
+              : gate.mode === 'edit'
+                ? 'Ordinary editing is allowed. Destructive and remote operations — git writes, deletes, dependency installs — are refused.'
+                : 'Everything Stacki exposes, including destructive and remote git operations. Granted for this session and this project.',
       },
       // What there is, and whether this level may run it. Deliberately without
       // the per-action summaries: they are in the tool descriptions the client
@@ -757,6 +928,8 @@ function createAgentApi({
         }),
       })),
       limits: [
+        'Agent access is granted per project and starts at "Visual only". A grant made on one project does not follow ' +
+          'Stacki into the next, and "Full control" lasts only until Stacki quits.',
         'Refs are scoped to the open project and to this run of Stacki: reopening a project invalidates every one.',
         'Anything Stacki cannot model as a tree (a framework component, a config, plain JS) is readable and writable ' +
           'through the source domain only — the semantic operations report it rather than pretending.',

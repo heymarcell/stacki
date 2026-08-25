@@ -59,23 +59,44 @@ async function copyText(text) {
   }
 }
 
-// What each level means, in the terms somebody deciding would use. Kept in
-// step with permissions.js by the mcp test, which reads both.
+// What each level means, in the terms somebody deciding would use.
+//
+// The words come from electron/mcp/agent/permissions.js, which is where the
+// gate reads them from too — a window that described a level differently from
+// what it grants is worse than one that describes nothing. The test in
+// test/agent-api.js reads both files and checks they agree.
+//
+// The one thing this must not do is soften "Inspect project". It is the level
+// at which an agent can read every file in the repository, and the earlier
+// wording — "read what is on screen" — described the level below it.
 const ACCESS = [
   {
+    key: 'visual',
+    label: 'Visual only',
+    blurb:
+      'See what you have selected and take a picture of it, and read and reply to your comments. ' +
+      'It cannot read your project’s files.',
+  },
+  {
     key: 'inspect',
-    label: 'Inspect only',
-    blurb: 'Read what is on screen and what it looks like. Nothing in your project changes.',
+    label: 'Inspect project',
+    blurb:
+      'Also READ the project: the source of any file, your content and data, asset text, and the git ' +
+      'history. Nothing changes, and everything in the repository becomes visible to the agent.',
   },
   {
     key: 'edit',
     label: 'Edit project',
-    blurb: 'Text, styles, structure, pages, content and assets — everything the panels do, on Stacki’s undo stack.',
+    blurb:
+      'Also change things: text, styles, structure, pages, content and assets — through Stacki, on the ' +
+      'undo stack you can press ⌘Z on.',
   },
   {
     key: 'full',
     label: 'Full control',
-    blurb: 'Also deletes, dependency installs, and git — committing, switching, restoring, merging, pushing.',
+    blurb:
+      'Also the operations that are hard to take back or that reach the network: deletes, dependency ' +
+      'installs, and git — commit, switch, restore, merge, push. Lasts this session and this project.',
   },
 ];
 
@@ -86,15 +107,20 @@ export default function McpDialog({ status, onClose }) {
   const [access, setAccess] = React.useState(null);
   const closeRef = React.useRef(null);
 
-  // The level as the main process has it, which is the one that is enforced.
-  // Read when the dialog opens rather than held anywhere: this window is not
-  // where the answer lives.
+  // The level as the main process has it FOR THE PROJECT THAT IS OPEN, which is
+  // the one that is enforced. Read when the dialog opens rather than held
+  // anywhere: this window is not where the answer lives, and the answer is
+  // different in the next project.
   React.useEffect(() => {
     let alive = true;
-    void window.avb
-      .settings()
-      .then((s) => alive && setAccess(s?.agentMode || 'inspect'))
-      .catch(() => alive && setAccess('inspect'));
+    const read = window.avb.agentAccess;
+    if (!read) {
+      setAccess({ agentMode: 'visual', hasProject: false });
+      return undefined;
+    }
+    void read()
+      .then((state) => alive && setAccess(state || { agentMode: 'visual' }))
+      .catch(() => alive && setAccess({ agentMode: 'visual' }));
     return () => {
       alive = false;
     };
@@ -102,13 +128,16 @@ export default function McpDialog({ status, onClose }) {
 
   const chooseAccess = async (next) => {
     if (!window.avb.setAgentMode) return; // an older main process
-    setAccess(next);
+    setAccess((was) => ({ ...(was || {}), agentMode: next }));
     const result = await window.avb.setAgentMode(next).catch(() => null);
-    // What it actually settled on. A mode this build does not know is refused
-    // and comes back as the cautious one, and the control should show that
-    // rather than what was clicked.
-    if (result?.agentMode) setAccess(result.agentMode);
+    // What it actually settled on. A level this build does not know is refused
+    // and comes back as the cautious one, and Full control is granted for this
+    // session — the control should say what happened rather than what was
+    // clicked.
+    if (result?.agentMode) setAccess(result);
   };
+
+  const level = access?.agentMode || null;
 
   React.useEffect(() => {
     closeRef.current?.focus();
@@ -173,28 +202,42 @@ export default function McpDialog({ status, onClose }) {
               </p>
 
               <div className="mcp-access">
-                <div className="mcp-access-title">What a connected agent may do</div>
+                <div className="mcp-access-title">
+                  What a connected agent may do{access?.hasProject === false ? '' : ' in this project'}
+                </div>
                 <div className="mcp-access-options" role="radiogroup" aria-label="Agent access">
-                  {ACCESS.map((level) => (
+                  {ACCESS.map((option) => (
                     <button
-                      key={level.key}
+                      key={option.key}
                       type="button"
                       role="radio"
-                      aria-checked={access === level.key}
-                      className={`mcp-access-option ${access === level.key ? 'on' : ''}`}
-                      disabled={access === null}
-                      onClick={() => chooseAccess(level.key)}
+                      aria-checked={level === option.key}
+                      className={`mcp-access-option ${level === option.key ? 'on' : ''}`}
+                      disabled={level === null || access?.hasProject === false}
+                      onClick={() => chooseAccess(option.key)}
                     >
-                      <span className="mcp-access-name">{level.label}</span>
-                      <span className="mcp-access-blurb">{level.blurb}</span>
+                      <span className="mcp-access-name">{option.label}</span>
+                      <span className="mcp-access-blurb">{option.blurb}</span>
                     </button>
                   ))}
                 </div>
-                <p className="mcp-hint">
-                  This applies to every agent that connects, and it is enforced by Stacki rather than
-                  asked of the agent. You can change it at any time; the next thing it tries obeys the
-                  new setting.
-                </p>
+                {access?.hasProject === false ? (
+                  <p className="mcp-hint">
+                    Open a project to set this. Access is granted per project, so a project you have not
+                    opened yet starts at Visual only.
+                  </p>
+                ) : (
+                  <p className="mcp-hint">
+                    Granted for <strong>this project</strong>, not for Stacki — opening another one starts
+                    it at Visual only again. Enforced by Stacki rather than asked of the agent, and you can
+                    change it at any time; the next thing it tries obeys the new setting.
+                    {access?.sessionOnly
+                      ? ` Full control lasts until you quit Stacki; after that this project is back to ${
+                          ACCESS.find((o) => o.key === access.persisted)?.label || 'Visual only'
+                        }.`
+                      : ''}
+                  </p>
+                )}
               </div>
 
               <div className="mcp-tabs">

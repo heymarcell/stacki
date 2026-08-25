@@ -216,7 +216,7 @@ const EXCLUDED = [
   { channels: ['shell:openExternal'], why: 'human-only', reason: 'Opens a browser on this machine. An agent that wants a page read has its own way to fetch one.' },
   { channels: ['native:copy', 'native:paste', 'native:undo', 'native:redo'], why: 'human-only', reason: 'The operating system’s edit menu acting on whichever text field has focus. project.undo is the editor’s own stack, which is the one that means something here.' },
   { channels: ['settings:get'], why: 'redundant', reason: 'Application preferences — the sound setting, and this API’s own permission mode, which get_capabilities already reports.' },
-  { channels: ['settings:setAgentMode'], why: 'human-only', reason: 'How much of Stacki an agent may move. An agent that could raise its own permission level would not have one.' },
+  { channels: ['settings:setAgentMode', 'settings:agentAccess'], why: 'human-only', reason: 'How much of Stacki an agent may move, and what it currently is. An agent that could raise its own permission level would not have one; get_capabilities tells it what it has.' },
 
   // A second shell is a second trust surface and no new ability.
   { channels: ['terminal:start', 'terminal:resize', 'terminal:close'], why: 'unsafe', reason: 'An agent connected to Stacki already has its own shell. A second one behind this endpoint would widen what a stolen token is worth and buy nothing visual.' },
@@ -244,7 +244,7 @@ const EXCLUDED = [
 
   // Served through something else.
   { channels: ['selection:copy'], why: 'redundant', reason: 'Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data.' },
-  { channels: ['page:write', 'page:writeRaw'], why: 'exposed elsewhere', reason: 'The model and raw writers. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow.' },
+  { channels: ['page:write', 'page:writeRaw', 'page:parseSource'], why: 'exposed elsewhere', reason: 'The model and raw writers, and the parse that turns text into a model without touching disk. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow.' },
   { channels: ['style:listFiles', 'style:listAstroStyles'], why: 'exposed elsewhere', reason: 'The stylesheet scan the Style panel runs. style.read and style.list_sources answer from it, with the rules already matched against the element.' },
   { channels: ['mcp:publish', 'mcp:reply', 'mcp:status'], why: 'redundant', reason: 'The wiring between this server and its own window. Nothing about the project is in any of it.' },
 ];

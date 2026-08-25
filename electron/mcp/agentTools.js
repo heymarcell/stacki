@@ -28,7 +28,18 @@ const RelPath = z
   .min(1)
   .max(1024)
   .describe('A path inside the open project, relative to its root (src/pages/index.astro). Never absolute.');
-const Digest = z.string().min(4).max(64).describe('The digest Stacki reported when you read this. The write is refused if it no longer matches.');
+const Digest = z
+  .string()
+  .min(4)
+  .max(64)
+  .describe(
+    'The digest Stacki reported when you read this. Required to REPLACE something that already exists, unless you ' +
+      'pass the ref the read gave you instead — that carries the digest itself. Not needed to create something new.'
+  );
+
+// The ref a read handed back, which carries what that read saw. Passing it is
+// the easier half of the same guard: nothing to copy, nothing to forget.
+const FileRef = Ref.describe('The ref the read of this file gave you. It carries the version being replaced, so no digest is needed.');
 
 /**
  * What every answer carries.
@@ -170,8 +181,12 @@ const DeclarationIdentity = z
     atContext: z.array(z.string().max(300)).max(6).optional().describe('The at-rule chain the rule sits in, as reported.'),
     selector: z.string().max(1000),
     property: z.string().max(120).optional(),
+    // What the stylesheet was when the read reported this. Pass it back
+    // unchanged — a rule can be found again in a file somebody has rewritten,
+    // and "the same rule" is not "the version I reasoned about".
+    sourceDigest: z.string().max(64).optional().describe('Pass back exactly what style.read gave you; the write is refused if the stylesheet changed meanwhile.'),
   })
-  .describe('A declaration, named the way style.read reported it — by source, at-rule context, selector and property.');
+  .describe('A declaration, named the way style.read reported it. Pass the whole object back unchanged.');
 
 const StyleInput = z.discriminatedUnion('action', [
   z.object({
@@ -203,7 +218,7 @@ const StyleInput = z.discriminatedUnion('action', [
       .max(40),
   }),
   z.object({ action: z.literal('read_source'), path: RelPath }),
-  z.object({ action: z.literal('write_source'), path: RelPath, css: z.string().max(2_000_000), expectedDigest: Digest.optional() }),
+  z.object({ action: z.literal('write_source'), path: RelPath, css: z.string().max(2_000_000), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
   z.object({ action: z.literal('variables'), limit: z.number().int().min(1).max(400).optional() }),
   z.object({
     action: z.literal('set_variable'),
@@ -216,7 +231,10 @@ const StyleInput = z.discriminatedUnion('action', [
       valueStart: z.number().int().min(0),
       valueEnd: z.number().int().min(0),
       value: z.string().max(2000),
-      expect: z.string().max(2000).optional().describe('The value that is there now, as `variables` reported it. Passing it makes a moved file a refusal.'),
+      // Required, not optional. This writes at a byte offset in a stylesheet;
+      // if the file moved under the offset, an unguarded write does not do
+      // nothing — it writes in the wrong place.
+      expect: z.string().max(2000).describe('The value that is there now, exactly as `variables` reported it. The write is refused if the file has moved under the offset.'),
     }),
   }),
   z.object({
@@ -252,15 +270,15 @@ const StyleInput = z.discriminatedUnion('action', [
   }),
   z.object({
     action: z.literal('set_section_title'),
-    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), title: z.string().max(200), expect: z.string().max(4000).optional() }),
+    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), title: z.string().max(200), expect: z.string().max(4000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
   z.object({
     action: z.literal('remove_section'),
-    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), expect: z.string().max(20000).optional() }),
+    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), expect: z.string().max(20000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
   z.object({
     action: z.literal('move_heading'),
-    edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).optional() }),
+    edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
 ]);
 
@@ -273,13 +291,20 @@ const SourceInput = z.discriminatedUnion('action', [
     startLine: z.number().int().min(1).optional(),
     endLine: z.number().int().min(1).optional(),
   }),
-  z.object({ action: z.literal('write'), path: RelPath, text: z.string().max(2_000_000), expectedDigest: Digest.optional() }),
+  z.object({
+    action: z.literal('write'),
+    path: RelPath,
+    text: z.string().max(2_000_000),
+    ref: FileRef.optional(),
+    expectedDigest: Digest.optional(),
+  }),
   z.object({
     action: z.literal('replace_range'),
     path: RelPath,
     startLine: z.number().int().min(1),
     endLine: z.number().int().min(1).optional(),
     text: z.string().max(2_000_000),
+    ref: FileRef.optional(),
     expectedDigest: Digest.optional(),
   }),
   z.object({ action: z.literal('read_symbol'), fromFile: RelPath, spec: z.string().max(1024), name: z.string().max(200) }),
@@ -317,7 +342,7 @@ const PageInput = z.discriminatedUnion('action', [
 const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('cms_list') }),
   z.object({ action: z.literal('cms_read'), path: RelPath }),
-  z.object({ action: z.literal('cms_write'), path: RelPath, data: z.unknown(), expectedDigest: Digest.optional() }),
+  z.object({ action: z.literal('cms_write'), path: RelPath, data: z.unknown(), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
   z.object({ action: z.literal('cms_create'), name: z.string().max(300) }),
   z.object({ action: z.literal('cms_delete'), path: RelPath }),
   z.object({ action: z.literal('cms_usage'), path: RelPath }),
@@ -350,7 +375,7 @@ const AssetInput = z.discriminatedUnion('action', [
   }),
   z.object({ action: z.literal('dimensions'), path: RelPath }),
   z.object({ action: z.literal('read_text'), path: RelPath }),
-  z.object({ action: z.literal('write_text'), path: RelPath, text: z.string().max(2_000_000), expectedDigest: Digest.optional() }),
+  z.object({ action: z.literal('write_text'), path: RelPath, text: z.string().max(2_000_000), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
   z.object({ action: z.literal('mkdir'), parent: z.string().max(1024), name: z.string().max(200) }),
   z.object({ action: z.literal('move'), path: RelPath, toFolder: z.string().max(1024) }),
   z.object({ action: z.literal('rename'), path: RelPath, name: z.string().max(200) }),
@@ -412,9 +437,9 @@ const DESCRIPTIONS = {
     'many copies of it the page is rendering — so you do not have to search the repository for any of that. ' +
     'The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo stack, and ' +
     'save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
-    'to act on what the user has selected. Pass expectedRevision/expectedDigest from your read and the edit is ' +
-    'refused rather than applied if somebody changed the document meanwhile. Text that comes from a {binding} ' +
-    'is NOT replaced with a literal: the answer says where the real value lives.',
+    'to act on what the user has selected right now. A ref carries the document as your read found it, so an ' +
+    'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
+    'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
   style:
     'Why an element looks the way it does, and how to change it. read lists every declaration reaching it, in ' +
     'cascade order, with the selector, the file it was authored in, whether it wins, what overrides it, and any ' +
@@ -423,8 +448,8 @@ const DESCRIPTIONS = {
   source:
     'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
     'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
-    '.astro markup: it keeps undo, the preview and the editor in step. Paths are project-relative; writes take ' +
-    'the digest from your read.',
+    '.astro markup: it keeps undo, the preview and the editor in step. Paths are project-relative. Replacing a ' +
+    'file that already exists needs the ref your read gave you (or its digest); creating one does not.',
   page: 'Pages, page folders and components as project objects: list, read, create, move, delete, and where a component is used.',
   content: 'The CMS data files and the content collections: list, read, write, create, delete, validate, rename, and the entries themselves.',
   asset: 'Files already inside the project, under public/ and src/: list, measure, read and write text ones, make folders, move, rename, delete.',

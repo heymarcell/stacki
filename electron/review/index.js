@@ -210,6 +210,11 @@ function list({
       // question from what the review says, and the one that stops a shared
       // "resolved" from being read as "fixed on your screen".
       checkout: level === 'full' && checkout ? (thread) => checkout.forThread(thread) : null,
+      // Who "you" are, so each review can say whether it came from this
+      // keyboard or arrived from somebody else's. An agent that can now edit
+      // the project needs that difference on the object rather than inferred
+      // from a name it has no way to check.
+      localId: me()?.id || null,
     }),
   };
 }

@@ -35,13 +35,27 @@ function digestOfFile(abs) {
 /**
  * Whether a write may proceed.
  *
- * `expected` absent means the caller did not claim to know — allowed, because
- * plenty of writes are genuinely blind (create a file, set a variable by name)
- * and demanding a digest for those would be ceremony. Where a caller DOES
- * claim, the claim is what is checked, and a mismatch is a refusal with enough
- * in it to go and read again.
+ * `expected` absent used to mean "the caller did not claim to know", and was
+ * allowed. That was the hole: a client which simply never sent the field got a
+ * write that took whatever it found, and the protection existed only for
+ * clients that remembered to ask for it. `requireForExisting` closes it — a
+ * write that REPLACES something has to name what it is replacing, whether by
+ * carrying a ref (which has the digest baked into it) or by saying so.
+ *
+ * A write that creates something is different and stays open: there is no
+ * prior object for it to be stale against.
  */
-function checkDigest({ expected, actual, what = 'that file' }) {
+function checkDigest({ expected, actual, what = 'that file', requireForExisting = false }) {
+  if (expected == null && requireForExisting && actual != null) {
+    return {
+      ok: false,
+      code: 'guard_required',
+      currentDigest: actual,
+      message:
+        `${what} already exists, so replacing it needs to say which version it is replacing. ` +
+        'Read it first and pass the ref it gave you, or pass its expectedDigest. Nothing was written.',
+    };
+  }
   if (expected == null) return null;
   if (typeof expected !== 'string' || !expected) {
     return { ok: false, code: 'bad_request', message: 'expectedDigest must be a digest Stacki gave you.' };

@@ -173,7 +173,7 @@ says so.
 | `shell:openExternal` | human-only | Opens a browser on this machine. An agent that wants a page read has its own way to fetch one. |
 | `native:copy`<br>`native:paste`<br>`native:undo`<br>`native:redo` | human-only | The operating system’s edit menu acting on whichever text field has focus. project.undo is the editor’s own stack, which is the one that means something here. |
 | `settings:get` | redundant | Application preferences — the sound setting, and this API’s own permission mode, which get_capabilities already reports. |
-| `settings:setAgentMode` | human-only | How much of Stacki an agent may move. An agent that could raise its own permission level would not have one. |
+| `settings:setAgentMode`<br>`settings:agentAccess` | human-only | How much of Stacki an agent may move, and what it currently is. An agent that could raise its own permission level would not have one; get_capabilities tells it what it has. |
 | `terminal:start`<br>`terminal:resize`<br>`terminal:close` | unsafe | An agent connected to Stacki already has its own shell. A second one behind this endpoint would widen what a stolen token is worth and buy nothing visual. |
 | `project:scaffold`<br>`project:createAstro`<br>`project:createStarter` | human-only | Creating a project decides where it lives on disk and runs the Astro installer. This API acts on the project that is already open. |
 | `project:close` | human-only | Closes the project and reloads the window — it would pull the ground out from under the agent’s own refs mid-call. |
@@ -189,7 +189,7 @@ says so.
 | `reviews:sync`<br>`reviews:syncAnchors`<br>`reviews:shared` | redundant | Housekeeping the window does for itself; get_comments already reports the result of all of it. |
 | `reviews:list`<br>`reviews:act` | exposed elsewhere | These ARE get_comments and comment, which existed before this feature and are unchanged by it. |
 | `selection:copy` | redundant | Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data. |
-| `page:write`<br>`page:writeRaw` | exposed elsewhere | The model and raw writers. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow. |
+| `page:write`<br>`page:writeRaw`<br>`page:parseSource` | exposed elsewhere | The model and raw writers, and the parse that turns text into a model without touching disk. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow. |
 | `style:listFiles`<br>`style:listAstroStyles` | exposed elsewhere | The stylesheet scan the Style panel runs. style.read and style.list_sources answer from it, with the rules already matched against the element. |
 | `mcp:publish`<br>`mcp:reply`<br>`mcp:status` | redundant | The wiring between this server and its own window. Nothing about the project is in any of it. |
 
@@ -198,4 +198,4 @@ says so.
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 45 more in Edit project, 18 more in Full control.
 - 31 land on Stacki's own undo stack.
-- 50 capabilities deliberately kept out.
+- 52 capabilities deliberately kept out.

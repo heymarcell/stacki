@@ -116,11 +116,20 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
 // ── Permissions ──────────────────────────────────────────────────────────────
 
 {
-  check('the default is the conservative one', permissions.DEFAULT_MODE === 'inspect');
-  check('an unrecognised mode is the conservative one too', permissions.normalizeMode('root') === 'inspect');
-  check('and so is a missing one', permissions.normalizeMode(undefined) === 'inspect');
+  // The bottom rung is what the endpoint could do BEFORE the Agent API: see
+  // what is on screen, take a picture, read and reply to reviews. It is the
+  // default because anything else means an update handing an existing bearer
+  // token the ability to read a repository nobody offered it.
+  check('the default grants nothing over the project', permissions.DEFAULT_MODE === 'visual');
+  check('an unrecognised mode is the conservative one too', permissions.normalizeMode('root') === 'visual');
+  check('and so is a missing one', permissions.normalizeMode(undefined) === 'visual');
+  check('reading the project is its own level', permissions.MODES[1] === 'inspect');
+  check('and the levels are in order of what they grant', JSON.stringify(permissions.MODES) === JSON.stringify(['visual', 'inspect', 'edit', 'full']));
 
   const table = [
+    ['visual', 'read', false],
+    ['visual', 'write', false],
+    ['visual', 'high', false],
     ['inspect', 'read', true],
     ['inspect', 'write', false],
     ['inspect', 'high', false],
@@ -135,6 +144,17 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
     check(`${mode} ${allowed ? 'may' : 'may not'} run a ${risk} operation`, permissions.allows(mode, risk) === allowed);
   }
 
+  // The one that would have been the regression: an existing installation, on
+  // the level it gets by default, must not be able to read the project.
+  const legacy = permissions.createGate(() => permissions.DEFAULT_MODE);
+  check('the default cannot read project source', legacy.check('source.read', 'read')?.code === 'permission_denied');
+  check('nor the content', legacy.check('content.cms_read', 'read')?.code === 'permission_denied');
+  check('nor the git history', legacy.check('git.log', 'read')?.code === 'permission_denied');
+  check('and the refusal says which level would', legacy.check('source.read', 'read').requires === 'inspect');
+  check('and every level has words describing what it grants', permissions.MODES.every((m) => (permissions.BLURB[m] || '').length > 40));
+  check('and "inspect" says out loud that it reads the project', /READ the project/.test(permissions.BLURB.inspect));
+  check('and "full" says it does not outlive the session', /this session/.test(permissions.BLURB.full));
+
   let mode = 'inspect';
   const gate = permissions.createGate(() => mode);
   const denied = gate.check('target.set_text', 'write');
@@ -145,6 +165,48 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   mode = 'edit';
   check('the gate is read every time, not captured', gate.check('target.set_text', 'write') === null);
   check('and still refuses what edit may not do', gate.check('git.push', 'high')?.code === 'permission_denied');
+}
+
+// ── Whose project, and for how long ──────────────────────────────────────────
+//
+// The endpoint is the machine's; the authorisation is not. "This agent may
+// commit and push" is a sentence about a repository, and a grant that followed
+// Stacki into the next one would be somebody's client project inheriting a
+// permission they gave a scratch folder.
+
+{
+  const { createAccessStore } = require('../electron/mcp/agent/access.js');
+  let settings = { sound: false, agentAccess: {} };
+  const store = () => createAccessStore({ read: () => settings, write: (next) => { settings = next; } });
+  const A = '/tmp/stacki-project-a';
+  const B = '/tmp/stacki-project-b';
+
+  const first = store();
+  check('a project nobody has been asked about grants nothing', first.modeFor(A) === 'visual');
+  check('and so does no project at all', first.modeFor(null) === 'visual');
+
+  const granted = first.setModeFor(A, 'full');
+  check('full control can be granted', granted.agentMode === 'full' && first.modeFor(A) === 'full');
+  check('and says it is for this session only', granted.sessionOnly === true);
+  check('another project does NOT inherit it', first.modeFor(B) === 'visual', first.modeFor(B));
+
+  first.setModeFor(B, 'inspect');
+  check('two projects hold two different levels', first.modeFor(A) === 'full' && first.modeFor(B) === 'inspect');
+
+  // A restart: the settings survive, the session does not.
+  const next = store();
+  check('full control does not survive a restart', next.modeFor(A) === 'edit', next.modeFor(A));
+  check('but what was written down does', next.modeFor(B) === 'inspect');
+  check('and nothing was written down as full', !Object.values(settings.agentAccess).includes('full'), JSON.stringify(settings.agentAccess));
+
+  next.setModeFor(A, 'visual');
+  check('turning a level down takes effect at once', next.modeFor(A) === 'visual');
+  check('and stops being stored, since it is the default', !(Object.keys(settings.agentAccess).length && settings.agentAccess[Object.keys(settings.agentAccess).find((k) => next.modeFor(A) === 'visual' && false)]));
+  check('an unrecognised level is refused into the default', next.setModeFor(B, 'superuser').agentMode === 'visual');
+  check('and with no project open there is nothing to grant', next.setModeFor(null, 'full').ok === false);
+
+  // What is stored is a fingerprint, not a list of where somebody works.
+  check('the settings do not record project paths', !JSON.stringify(settings).includes('/tmp/stacki-project'), JSON.stringify(settings));
 }
 
 // ── The control the person actually uses ─────────────────────────────────────
@@ -169,13 +231,30 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   const offered = [...accessTable.matchAll(/key: '([a-z]+)'/g)].map((m) => m[1]);
   check('and offers no level the main process does not know', offered.length > 0 && offered.every((k) => permissions.MODES.includes(k)), offered.join(', '));
   check('and says what each one means', permissions.MODES.every((m) => new RegExp(`key: '${m}'[\\s\\S]{0,200}blurb:`).test(dialog)));
-  check('and reads the level from the main process rather than remembering one', /window\.avb\s*\n?\s*\.settings\(\)/.test(dialog));
+  check('and reads the level from the main process rather than remembering one', /window\.avb\.agentAccess/.test(dialog));
+  check('and asks about the project that is open', /agentAccess: invoke\('settings:agentAccess'\)/.test(preload));
   check('and shows what it actually settled on', /result\?\.agentMode/.test(dialog));
+  check('and says the grant is per project', /this project/.test(dialog));
+  check('and says when full control expires', /lasts until you quit/.test(dialog));
 
   check('the bridge carries the choice', /setAgentMode: invoke\('settings:setAgentMode'\)/.test(preload));
   check('and the main process is where it is stored', /handle\('settings:setAgentMode'/.test(main));
-  check('and an unrecognised one is normalized rather than trusted', /agentPermissions\.normalizeMode\(mode\)/.test(main));
-  check('and an existing installation keeps the cautious default', /agentMode: 'inspect'/.test(main));
+  check('and it is keyed by the open project', /agentAccess\.setModeFor\(openProjectRoot, mode\)/.test(main));
+  check('and the gate reads that project’s level', /getAgentMode: \(\) => agentAccess\.modeFor\(openProjectRoot\)/.test(main));
+  check('and nothing is granted until somebody grants it', /agentAccess: \{\}/.test(main));
+
+  // The words in the window and the words the gate reports have to be the same
+  // words. A level described as harmless and enforced as sweeping is worse
+  // than one described as nothing at all.
+  // The blurbs are written across lines in the JSX, so the joins come out
+  // before comparing — what is checked is the sentence, not how it was typed.
+  const table = dialog
+    .slice(dialog.indexOf('const ACCESS = ['), dialog.indexOf('export default function McpDialog'))
+    .replace(/'\s*\+\s*'/g, '');
+  for (const mode of permissions.MODES) {
+    check(`the window describes "${mode}" the way permissions.js does`, table.includes(permissions.BLURB[mode]), permissions.BLURB[mode].slice(0, 60));
+    check('and labels it the same', table.includes(`label: '${permissions.LABEL[mode]}'`), permissions.LABEL[mode]);
+  }
 
   check(
     'and no MCP tool can set it',
@@ -478,6 +557,19 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
     check('a source write against a wrong digest is refused', staleWrite.code === 'stale_target');
     check('and nothing was written', fs.readFileSync(path.join(ROOT, file), 'utf8') === '<p>hi</p>');
 
+    // The one the first version got wrong: no guard at all used to mean "take
+    // whatever is there", which is protection a client could opt out of by
+    // doing nothing.
+    const unguarded = await runMain('source', 'write', { path: file, text: 'x' }, ctx);
+    check('a write with NO guard at all is refused for an existing file', unguarded.code === 'guard_required', unguarded.code);
+    check('and says how to name the version', /pass the ref it gave you/.test(unguarded.message));
+    check('and still nothing was written', fs.readFileSync(path.join(ROOT, file), 'utf8') === '<p>hi</p>');
+
+    // Creating is different: there is no prior version to be stale against.
+    const created = await runMain('source', 'write', { path: 'src/pages/fresh.astro', text: '<p>new</p>' }, ctx);
+    check('creating something new needs no guard', created.ok === true, created.message);
+    check('and the file is there', fs.existsSync(path.join(ROOT, 'src/pages/fresh.astro')));
+
     const okWrite = await runMain('source', 'write', { path: file, text: '<p>bye</p>', expectedDigest: read.digest }, ctx);
     check('a source write against the right digest goes through', okWrite.ok === true, okWrite.message);
     check('and the file says so', fs.readFileSync(path.join(ROOT, file), 'utf8') === '<p>bye</p>');
@@ -487,7 +579,7 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
     const before = digestOf('a\nb\nc\nd\n');
     const range = await runMain('source', 'replace_range', { path: file, startLine: 2, endLine: 3, text: 'B', expectedDigest: before }, ctx);
     check('a range replace replaces the range', range.ok && fs.readFileSync(path.join(ROOT, file), 'utf8') === 'a\nB\nd\n', range.message);
-    const badRange = await runMain('source', 'replace_range', { path: file, startLine: 99, text: 'x' }, ctx);
+    const badRange = await runMain('source', 'replace_range', { path: file, startLine: 99, text: 'x', expectedDigest: digestOf('a\nB\nd\n') }, ctx);
     check('a range that is not in the file is a bad request', badRange.code === 'bad_request', badRange.code);
     check('and says how long the file actually is', /\b4 lines\b/.test(badRange.message), badRange.message);
 

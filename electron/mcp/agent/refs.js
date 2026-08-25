@@ -26,6 +26,17 @@
 //               is how the Visual Review evidence rules reach the write path:
 //               a node recovered on position alone across a branch gets a
 //               readable ref and no permission to change anything.
+//   an           `o` carries WHAT WAS OBSERVED when the ref was minted — the
+//   observation  document revision and digest for a node, the file digest for
+//               a declaration or a file. A write through the ref is checked
+//               against it before anything happens.
+//
+// That last one is the difference between concurrency protection that exists
+// and concurrency protection a client has to remember to ask for. The first
+// version made `expectedRevision` and `expectedDigest` optional arguments, and
+// a caller that simply left them out got a write that took whatever it found —
+// which is exactly the accident the fields were added to prevent. A ref is
+// handed out BY a read; it is the natural place to carry what that read saw.
 //
 // Nothing is stored. The signature IS the record, so there is no table to
 // grow, nothing to evict, and no way for two windows to disagree about which
@@ -100,7 +111,7 @@ function sign(body) {
  * filesystem path would leak one the moment a client logged what it was
  * holding.
  */
-function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true, now = Date.now } = {}) {
+function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true, observed = null, now = Date.now } = {}) {
   if (!KINDS.includes(kind)) throw new Error(`unknown ref kind: ${kind}`);
   const payload = {
     v: VERSION,
@@ -112,6 +123,10 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
     d: data && typeof data === 'object' ? data : {},
   };
   if (!writable) payload.w = false;
+  // What the read that produced this ref saw. Absent for a ref minted about
+  // something that did not exist yet, or that has no version to be stale
+  // against; present for everything a write can collide with.
+  if (observed && typeof observed === 'object' && Object.keys(observed).length) payload.o = observed;
   const body = b64(JSON.stringify(payload));
   return `${PREFIX}:${body}.${sign(body)}`;
 }
@@ -180,6 +195,9 @@ function parse(ref, { projectRoot, kind = null, now = Date.now } = {}) {
     expiresAt: payload.x,
     // Absent means writable — only a deliberately withheld ref carries the flag.
     writable: payload.w !== false,
+    // What was true when this ref was made. The caller checks it against what
+    // is true now, before it writes.
+    observed: payload.o || null,
   };
 }
 
