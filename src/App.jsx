@@ -4314,7 +4314,20 @@ export default function App() {
 
   // --- doing something to one ----------------------------------------------
 
+  /**
+   * A method that is not on the bridge means this window is running against an
+   * older main process. The renderer hot-reloads on save; the main process and
+   * the preload do not, so during development a control can be wired to a
+   * channel that does not exist yet — and a button that silently does nothing
+   * is the worst possible way to find that out.
+   */
+  const needsRestart = () => {
+    showToast('Stacki needs restarting before this will work.', 'error');
+    return false;
+  };
+
   const actOnReview = async (id, action, extra = {}) => {
+    if (!window.avb.reviewsAct) return needsRestart();
     setReviewBusyId(id);
     try {
       // The same door an agent goes through, with `human` on the message. One
@@ -4323,6 +4336,9 @@ export default function App() {
       const result = await window.avb.reviewsAct({ action, threadId: id, authorType: 'human', ...extra });
       if (!result?.ok) showToast(result?.message || 'That comment could not be changed.', 'error');
       setReviewTick((n) => n + 1);
+    } catch (err) {
+      // An IPC call that throws must not be a control that does nothing.
+      showToast('That comment could not be changed.', 'error');
     } finally {
       setReviewBusyId(null);
     }
@@ -4339,22 +4355,28 @@ export default function App() {
   // purpose: an agent that could rewrite the conversation is an agent whose
   // record of it means nothing.
   const editReviewMessage = async (id, messageId, message) => {
+    if (!window.avb.reviewsEditMessage) return needsRestart();
     setReviewBusyId(id);
     try {
       const result = await window.avb.reviewsEditMessage({ threadId: id, messageId, message });
       if (!result?.ok) showToast(result?.message || 'That comment could not be edited.', 'error');
       setReviewTick((n) => n + 1);
+    } catch (err) {
+      showToast('That comment could not be edited.', 'error');
     } finally {
       setReviewBusyId(null);
     }
   };
 
   const deleteReviewMessage = async (id, messageId) => {
+    if (!window.avb.reviewsRemoveMessage) return needsRestart();
     setReviewBusyId(id);
     try {
       const result = await window.avb.reviewsRemoveMessage({ threadId: id, messageId });
       if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
       setReviewTick((n) => n + 1);
+    } catch (err) {
+      showToast('That comment could not be deleted.', 'error');
     } finally {
       setReviewBusyId(null);
     }
