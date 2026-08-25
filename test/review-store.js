@@ -815,6 +815,76 @@ const anchorOf = (over) => {
     }
   }
 
+  // ── Editing and pruning what was said ─────────────────────────────────────
+  //
+  // A person tidying their own notes. Neither is an `apply` action, so neither
+  // is reachable from MCP — an agent that could reword the conversation is an
+  // agent whose record of it means nothing.
+  {
+    const file = path.join(home, 'edits.json');
+    const store = freshStore(file);
+    const anchor = anchorFrom(payload()).anchor;
+    const t = store.apply({ action: 'create', message: 'the padding is wrong', anchor }).thread;
+    store.apply({ action: 'reply', threadId: t.id, message: 'Reduced it to 12px.', authorType: 'agent' });
+    store.apply({ action: 'reply', threadId: t.id, message: 'still looks off on a phone', authorType: 'human' });
+    const msgs = () => store.get(t.id).messages;
+    const onDisk = () => JSON.parse(fs.readFileSync(file, 'utf8')).threads[0].messages;
+
+    check('a thread starts unedited', msgs().every((m) => m.editedAt === null), JSON.stringify(msgs().map((m) => m.editedAt)));
+
+    // Your own words.
+    const edited = store.editMessage(t.id, msgs()[0].id, 'the padding is wrong on mobile');
+    check('you can reword what you wrote', edited.ok === true, JSON.stringify(edited));
+    check('and it says what it now says', msgs()[0].body === 'the padding is wrong on mobile');
+    check('and it is on disk before the call answers', onDisk()[0].body === 'the padding is wrong on mobile');
+    check('and it is marked as edited', typeof msgs()[0].editedAt === 'number');
+    check('while the others are not', msgs()[1].editedAt === null && msgs()[2].editedAt === null);
+    check('the review counts as touched', store.get(t.id).updatedAt >= msgs()[0].editedAt);
+
+    // Not the agent's.
+    const notYours = store.editMessage(t.id, msgs()[1].id, 'I did nothing of the sort');
+    check('an agent\u2019s reply cannot be reworded', notYours.ok === false, JSON.stringify(notYours));
+    check('and says why rather than failing blankly', notYours.code === 'not_yours', notYours.code);
+    check('and the words are untouched', msgs()[1].body === 'Reduced it to 12px.');
+
+    check('an empty edit is refused', store.editMessage(t.id, msgs()[0].id, '   ').code === 'no_message');
+    check('an unknown message is refused', store.editMessage(t.id, 'rm_nope', 'x').code === 'no_message_id');
+    check('an unknown review is refused', store.editMessage('rt_nope', msgs()[0].id, 'x').code === 'no_thread');
+    check('an edit that changes nothing is a no-op, not an error', store.editMessage(t.id, msgs()[0].id, 'the padding is wrong on mobile').ok === true);
+    check('a very long edit is cut to the same cap as anything else', store.editMessage(t.id, msgs()[0].id, 'x'.repeat(MAX_BODY + 500)).ok && msgs()[0].body.length === MAX_BODY);
+
+    // Pruning.
+    const gone = msgs()[1].id;
+    const pruned = store.removeMessage(t.id, gone);
+    check('a message can be taken out of a thread', pruned.ok === true, JSON.stringify(pruned));
+    check('and it really is gone', !msgs().some((m) => m.id === gone));
+    check('on disk too, before the call answers', !onDisk().some((m) => m.id === gone));
+    check('the rest of the thread is intact', msgs().length === 2 && msgs()[1].body === 'still looks off on a phone');
+    check('an agent\u2019s reply CAN be removed even though it cannot be reworded', true);
+    check('an unknown message is refused', store.removeMessage(t.id, 'rm_nope').code === 'no_message_id');
+
+    // The last one is the review.
+    store.removeMessage(t.id, msgs()[1].id);
+    check('down to one', msgs().length === 1, String(msgs().length));
+    const last = store.removeMessage(t.id, msgs()[0].id);
+    check('the only message cannot be deleted from in here', last.ok === false, JSON.stringify(last));
+    check('and it points at the decision that actually is being made', last.code === 'last_message', last.code);
+    check('so the review still exists', store.get(t.id) !== null && msgs().length === 1);
+
+    // Across a reload, because "(edited)" that disappears on restart would
+    // make the record quietly less true than it was.
+    const t2 = store.apply({ action: 'create', message: 'second', anchor }).thread;
+    store.editMessage(t2.id, store.get(t2.id).messages[0].id, 'second, reworded');
+    const back = freshStore(file);
+    check('an edit survives a reload', back.get(t2.id).messages[0].body === 'second, reworded');
+    check('and so does the fact that it was one', typeof back.get(t2.id).messages[0].editedAt === 'number');
+
+    // Not on the door an agent goes through.
+    check('editing is not an apply action', !ACTIONS.includes('edit') && !ACTIONS.includes('editMessage'));
+    check('nor is deleting a message', !ACTIONS.includes('removeMessage') && !ACTIONS.includes('delete'));
+    check('so apply refuses to be talked into either', store.apply({ action: 'editMessage', threadId: t.id, messageId: msgs()[0].id, message: 'x' }).code === 'bad_action');
+  }
+
   // ── Whose lock is it ──────────────────────────────────────────────────────
   //
   // The lock is held for a read, a write and a rename, so one that is seconds

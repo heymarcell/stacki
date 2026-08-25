@@ -1768,6 +1768,10 @@ contextBridge.exposeInMainWorld('avb', {
   reviewsAct: invoke('reviews:act'),
   reviewsRemove: invoke('reviews:remove'),
   reviewsRecolor: invoke('reviews:recolor'),
+  // Editing and pruning are a person tidying their own notes. Neither has an
+  // MCP tool behind it — the store keeps them off `apply` on purpose.
+  reviewsEditMessage: invoke('reviews:editMessage'),
+  reviewsRemoveMessage: invoke('reviews:removeMessage'),
   reviewsSyncAnchors: invoke('reviews:syncAnchors'),
   onReviewsChanged: (cb) => {
     const listener = (_e, data) => cb(data);

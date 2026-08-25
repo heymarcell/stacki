@@ -45,6 +45,8 @@ export default function CommentsPanel({
   onFocus,
   onDelete,
   onColor,
+  onEditMessage,
+  onDeleteMessage,
   busyId = null,
   problem = null,
   hiddenPins = 0,
@@ -138,6 +140,8 @@ export default function CommentsPanel({
                 onFocus={() => onFocus(r)}
                 onDelete={() => onDelete(r.id)}
                 onColor={(c) => onColor?.(r.id, c)}
+                onEditMessage={onEditMessage ? (messageId, message) => onEditMessage(r.id, messageId, message) : null}
+                onDeleteMessage={onDeleteMessage ? (messageId) => onDeleteMessage(r.id, messageId) : null}
                 onClose={() => onOpen(null)}
               />
             </div>

@@ -129,6 +129,8 @@ export default function PreviewPane({
   onReviewFocus,
   onReviewDelete,
   onReviewColor,
+  onReviewEditMessage,
+  onReviewDeleteMessage,
   onReviewDraftChange,
   onReviewDraftSubmit,
   onReviewDraftCancel,
@@ -767,6 +769,8 @@ export default function PreviewPane({
         onFocus={onReviewFocus}
         onDelete={onReviewDelete}
         onColor={onReviewColor}
+        onEditMessage={onReviewEditMessage}
+        onDeleteMessage={onReviewDeleteMessage}
         reviewById={reviewById}
         busyId={reviewBusyId}
         draft={reviewDraft}

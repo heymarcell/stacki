@@ -311,6 +311,87 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     check('every message is shown', $$('.review-msg').length === 2);
     check('a human message says who', /You/.test($$('.review-msg')[0].textContent));
     check('an agent message says so', /Agent/.test($$('.review-msg')[1].textContent));
+
+    // ── Editing and pruning what was said ───────────────────────────────────
+    //
+    // A person tidying their own notes. Not the agent's words: an agent's
+    // reply can be taken out of the thread, but it cannot be made to say
+    // something else while still signed "Agent".
+    {
+      const three = () => [
+        { id: 'rm_1', authorType: 'human', body: 'The pill is too tight on mobile.', createdAt: Date.now(), editedAt: null },
+        { id: 'rm_2', authorType: 'agent', body: 'Reduced the padding to 12px.', createdAt: Date.now(), editedAt: null },
+        { id: 'rm_3', authorType: 'human', body: 'Still tight at 375.', createdAt: Date.now(), editedAt: null },
+      ];
+      const edits = [];
+      const drops = [];
+      await render(
+        thread(review({ messages: three() }), {
+          onEditMessage: (id, text) => edits.push([id, text]),
+          onDeleteMessage: (id) => drops.push(id),
+        })
+      );
+      const tools = (i) => $$('.review-msg')[i].querySelectorAll('.review-msg-tools button');
+      check('your own message offers both an edit and a delete', tools(0).length === 2, String(tools(0).length));
+      check('an agent\u2019s offers only a delete', tools(1).length === 1, String(tools(1).length));
+      check('and that one is the delete', /Delete/.test(tools(1)[0].getAttribute('title') || ''), tools(1)[0].getAttribute('title'));
+
+      // Editing happens where the words are, not in a separate dialog.
+      await click(tools(0)[0]);
+      check('editing opens in place', !!$('.review-msg.editing .review-edit textarea'));
+      check('prefilled with what it says', $('.review-edit textarea').value === 'The pill is too tight on mobile.', $('.review-edit textarea').value);
+      check('and the other messages are untouched', $$('.review-msg.editing').length === 1);
+      await type($('.review-edit textarea'), 'The pill is too tight below 400px.');
+      await act(async () => { $('.review-edit').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })); });
+      check('saving reports the new words against the right message', edits.length === 1 && edits[0][0] === 'rm_1' && edits[0][1] === 'The pill is too tight below 400px.', JSON.stringify(edits));
+      check('and puts the thread back to reading', !$('.review-edit'));
+
+      // Cancelling changes nothing.
+      edits.length = 0;
+      await click(tools(0)[0]);
+      await type($('.review-edit textarea'), 'never mind');
+      await click($$('.review-edit .review-actions button').find((b) => /Cancel/i.test(b.textContent)));
+      check('cancelling an edit sends nothing', edits.length === 0);
+      check('and closes the box', !$('.review-edit'));
+
+      // An empty edit is not a way to blank somebody's comment.
+      await click(tools(0)[0]);
+      await type($('.review-edit textarea'), '   ');
+      check('an empty edit cannot be saved', $$('.review-edit .review-actions button').find((b) => /Save/i.test(b.textContent)).disabled === true);
+      await click($$('.review-edit .review-actions button').find((b) => /Cancel/i.test(b.textContent)));
+
+      // Deleting one asks first — the words do not come back.
+      await click(tools(1)[0]);
+      check('deleting a message asks first', !!$('.confirm-dialog') || !!$('[role="alertdialog"]') || !!$('.confirm-host button'), 'no dialog');
+      const confirm = $$('button').find((b) => /^Delete$/i.test(b.textContent.trim()));
+      if (confirm) await click(confirm);
+      check('and then reports which one', drops.length === 1 && drops[0] === 'rm_2', JSON.stringify(drops));
+
+      // "(edited)" is a fact about the message, and it is shown.
+      await render(thread(review({ messages: [{ id: 'rm_1', authorType: 'human', body: 'reworded', createdAt: Date.now(), editedAt: Date.now() }] })));
+      check('an edited message says so', !!$('.review-edited'), $('.review-msg')?.textContent);
+      check('and an untouched one does not', (await render(thread(review({ messages: three() }))), !$('.review-edited')));
+
+      // The last thing in a review is the review. Deleting it from in here
+      // would be deleting the review sideways.
+      const only = [];
+      await render(
+        thread(review({ messages: [{ id: 'rm_1', authorType: 'human', body: 'the only thing said', createdAt: Date.now(), editedAt: null }] }), {
+          onEditMessage: () => {},
+          onDeleteMessage: (id) => only.push(id),
+        })
+      );
+      const solo = $$('.review-msg-tools button');
+      check('the only message still offers an edit', solo[0].disabled === false);
+      check('but its delete is not available', solo[1].disabled === true);
+      check('and says what to do instead', /delete the review/i.test(solo[1].getAttribute('title') || ''), solo[1].getAttribute('title'));
+
+      // A thread rendered without the handlers has no tools at all, so nothing
+      // half-wired can offer a control that goes nowhere.
+      await render(thread(review({ messages: three() })));
+      check('no handlers, no tools', $$('.review-msg-tools').length === 0);
+    }
+
     check('what it was left on is shown', /<span>/.test($('.review-target')?.textContent || ''), $('.review-target')?.textContent);
     check('including the words it had', /Learn more/.test($('.review-target')?.textContent || ''));
 

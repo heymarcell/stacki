@@ -152,6 +152,8 @@ export function ReviewSurface({
   onFocus,
   onDelete,
   onColor,
+  onEditMessage,
+  onDeleteMessage,
   reviewById,
   busyId,
   draft,
@@ -245,6 +247,8 @@ export function ReviewSurface({
         onFocus={() => onFocus(openReview)}
         onDelete={() => onDelete(openReview.id)}
         onColor={(c) => onColor?.(openReview.id, c)}
+        onEditMessage={onEditMessage ? (messageId, message) => onEditMessage(openReview.id, messageId, message) : null}
+        onDeleteMessage={onDeleteMessage ? (messageId) => onDeleteMessage(openReview.id, messageId) : null}
         onClose={() => onOpen(null)}
       />
     </div>

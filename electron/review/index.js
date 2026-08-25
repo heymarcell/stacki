@@ -176,6 +176,25 @@ function recolor(threadId, color) {
   return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
 }
 
+/**
+ * A person rewording what they wrote. Never reachable from MCP — see the store.
+ *
+ * Only their own messages, and only from the panel: an agent that could
+ * rewrite the conversation is an agent whose record of it means nothing.
+ */
+function editMessage({ threadId, messageId, message } = {}) {
+  if (!store) return noProject();
+  const result = store.editMessage(threadId, messageId, message);
+  return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
+}
+
+/** A person pruning their own thread. Never reachable from MCP — see the store. */
+function removeMessage({ threadId, messageId } = {}) {
+  if (!store) return noProject();
+  const result = store.removeMessage(threadId, messageId);
+  return result.ok ? { ok: true, review: detail(result.thread, null), revision: store.revision } : result;
+}
+
 /** A human deleting their own note. Never reachable from MCP — see the store. */
 function remove(threadId) {
   if (!store) return noProject();
@@ -264,6 +283,8 @@ function start({ userDataPath, send }) {
   ipcMain.handle('reviews:act', (_e, args) => act(args || {}));
   ipcMain.handle('reviews:remove', (_e, threadId) => remove(threadId));
   ipcMain.handle('reviews:recolor', (_e, args) => recolor(args?.threadId, args?.color));
+  ipcMain.handle('reviews:editMessage', (_e, args) => editMessage(args || {}));
+  ipcMain.handle('reviews:removeMessage', (_e, args) => removeMessage(args || {}));
   ipcMain.handle('reviews:syncAnchors', (_e, args) => syncAnchors(args));
 }
 
@@ -288,6 +309,8 @@ module.exports = {
   act,
   remove,
   recolor,
+  editMessage,
+  removeMessage,
   syncAnchors,
   focus,
   flushSync,

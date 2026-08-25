@@ -74,6 +74,10 @@ const Full = Summary.extend({
       authorType: z.enum(['human', 'agent']),
       body: z.string(),
       createdAt: z.number().int(),
+      // When a person rewrote their own words, if they did. Null otherwise.
+      // Only a human's message can be reworded, and only from the panel — an
+      // agent cannot edit what was said, here or anywhere.
+      editedAt: z.number().int().nullable(),
     })
   ),
   // How many older messages were left out of `messages` above, so a long

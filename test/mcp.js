@@ -1187,6 +1187,22 @@ const rawPost = (hostHeader, body) =>
       check('the ledger is back to the two these tests share', ledger.size === 2, String(ledger.size));
     }
 
+    // Editing and pruning are not things an agent gets to do. The store keeps
+    // them off `apply`; this is the check that the door itself has no handle.
+    {
+      check('comment has no edit action', !REVIEW_ACTIONS.includes('edit') && !REVIEW_ACTIONS.includes('editMessage'), REVIEW_ACTIONS.join());
+      check('nor one for deleting a message', !REVIEW_ACTIONS.includes('removeMessage') && !REVIEW_ACTIONS.includes('delete'), REVIEW_ACTIONS.join());
+      const tried = structured(await call('comment', { action: 'editMessage', threadId: A, message: 'not on my watch' }));
+      check('and asking for one is refused at the schema', tried?.ok !== true, JSON.stringify(tried));
+      const source = fs.readFileSync(path.join(__dirname, '..', 'electron', 'mcp', 'reviewTools.js'), 'utf8');
+      check('no MCP tool reaches editMessage', !/editMessage/.test(source));
+      check('nor removeMessage', !/removeMessage/.test(source));
+      // It IS visible, though: an agent reading a thread should know that a
+      // message was changed after the fact.
+      const full = structured(await call('get_comments', { status: 'all', detail: 'full' }));
+      check('but an edited message is visible to a reader', full.reviews.every((r) => (r.messages || []).every((m) => 'editedAt' in m)), JSON.stringify(full.reviews[0]?.messages?.[0]));
+    }
+
     // A single answer must not be tens of megabytes. Messages are capped per
     // review, but nothing capped the response: 200 maximal reviews is ~44MB
     // arriving in somebody's context window unasked.

@@ -133,6 +133,10 @@ function reviveThread(raw) {
         authorType: authorOf(m.authorType),
         body: text,
         createdAt: int(m.createdAt) || 0,
+        // When somebody rewrote it, if they did. Kept across a reload, because
+        // "(edited)" disappearing on restart would make the record quietly
+        // less true than it was.
+        editedAt: int(m.editedAt) || null,
       };
     })
     .filter(Boolean)
@@ -592,6 +596,7 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     authorType: authorOf(authorType),
     body: text,
     createdAt: at,
+    editedAt: null,
   });
 
   /**
@@ -720,6 +725,78 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   }
 
   /**
+   * Change the words of something already said.
+   *
+   * Deliberately not an `apply` action, for the same reason delete is not —
+   * and for one more. A thread is a record of a conversation between a person
+   * and an agent, and an agent rewriting what it said, or what somebody said
+   * to it, is the one edit that makes the record untrustworthy rather than
+   * merely wrong. So this is not reachable from MCP at all.
+   *
+   * Only what a PERSON wrote can be rewritten. An agent's replies can be
+   * removed — see `removeMessage`, a thread nobody wants to read is a thread
+   * somebody should be able to prune — but they cannot be reworded while
+   * still saying "Agent". Taking words out is visible; putting different ones
+   * in somebody's mouth is not.
+   */
+  function editMessage(threadId, messageId, text) {
+    if (!writable) return fail('read_only', 'The review file cannot be written.');
+    const thread = find(str(threadId, 100));
+    if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
+    const wanted = str(messageId, 100);
+    const message_ = thread.messages.find((m) => m.id === wanted);
+    if (!message_) return fail('no_message_id', 'That comment is not in this review.');
+    if (message_.authorType !== 'human') {
+      return fail('not_yours', 'Only what you wrote can be edited. An agent\u2019s reply can be deleted, not reworded.');
+    }
+    const body_ = body(text, MAX_BODY);
+    if (!body_) return fail('no_message', 'A comment needs something written in it.');
+    if (body_ === message_.body) return { ok: true, thread: find(thread.id) };
+    const at = now();
+    const next = {
+      ...thread,
+      // Said out loud, because a message that changed after somebody replied
+      // to it is a different thing from one that did not.
+      messages: thread.messages.map((m) => (m.id === wanted ? { ...m, body: body_, editedAt: at } : m)),
+      updatedAt: at,
+    };
+    threads = threads.map((t) => (t.id === thread.id ? next : t));
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, thread: find(thread.id) };
+  }
+
+  /**
+   * Take one message out of a thread.
+   *
+   * Not an `apply` action either: pruning somebody's conversation is a person
+   * tidying their own notes, not a thing an agent gets an opinion about.
+   *
+   * The last one cannot go. A review with nothing said in it is not a review —
+   * `reviveThread` drops it on the next read — so deleting the only message
+   * would be deleting the review by accident, on the way to something else.
+   * Deleting the review is its own decision, with its own confirmation.
+   */
+  function removeMessage(threadId, messageId) {
+    if (!writable) return fail('read_only', 'The review file cannot be written.');
+    const thread = find(str(threadId, 100));
+    if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
+    const wanted = str(messageId, 100);
+    if (!thread.messages.some((m) => m.id === wanted)) {
+      return fail('no_message_id', 'That comment is not in this review.');
+    }
+    if (thread.messages.length <= 1) {
+      return fail('last_message', 'This is the only thing said in this review. Delete the review itself instead.');
+    }
+    const at = now();
+    const next = { ...thread, messages: thread.messages.filter((m) => m.id !== wanted), updatedAt: at };
+    threads = threads.map((t) => (t.id === thread.id ? next : t));
+    const saved = changed();
+    if (!saved.ok) return saved;
+    return { ok: true, thread: find(thread.id) };
+  }
+
+  /**
    * Delete a review outright.
    *
    * Deliberately not an `apply` action, so the MCP surface cannot reach it by
@@ -801,6 +878,8 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     apply,
     remove,
     setColor,
+    editMessage,
+    removeMessage,
     syncAnchors,
     /**
      * Nothing is ever waiting: every mutation is on disk before it answers.
@@ -925,7 +1004,16 @@ function detail(thread, resolveSource) {
   return {
     ...summarize(thread),
     createdAt: thread.createdAt,
-    messages: omitted ? all.slice(-MAX_DETAIL_MESSAGES) : all,
+    // Normalised on the way out for the same reason the anchor is: a message
+    // written before a field existed has no such key, and a declared property
+    // that is missing costs the whole response to a strict client.
+    messages: (omitted ? all.slice(-MAX_DETAIL_MESSAGES) : all).map((m) => ({
+      id: m.id,
+      authorType: m.authorType,
+      body: m.body,
+      createdAt: m.createdAt,
+      editedAt: m.editedAt ?? null,
+    })),
     // Said rather than silently swallowed: a thread that looks 50 long when it
     // is 200 long is a thread whose history an agent will assume it has read.
     messagesOmitted: omitted,

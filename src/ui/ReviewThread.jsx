@@ -1,7 +1,7 @@
 import React from 'react';
 import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
-import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon } from './Icons.jsx';
+import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon } from './Icons.jsx';
 
 // One review, opened.
 //
@@ -108,6 +108,8 @@ export default function ReviewThread({
   onDelete,
   onClose,
   onColor,
+  onEditMessage,
+  onDeleteMessage,
   busy = false,
   autoFocusReply = false,
 }) {
@@ -116,6 +118,9 @@ export default function ReviewThread({
   const [deferring, setDeferring] = React.useState(false);
   const [reason, setReason] = React.useState('');
   const [ref, setRef] = React.useState('');
+  // Which message is being reworded, and what it says while that is going on.
+  const [editing, setEditing] = React.useState(null);
+  const [draft, setDraft] = React.useState('');
 
   React.useEffect(() => {
     setReply('');
@@ -123,6 +128,8 @@ export default function ReviewThread({
     setDeferring(false);
     setReason('');
     setRef('');
+    setEditing(null);
+    setDraft('');
   }, [review?.id]);
 
   if (!review) return null;
@@ -234,15 +241,115 @@ export default function ReviewThread({
         )}
 
       <div className="review-messages">
-        {messages.map((m) => (
-          <div key={m.id} className={`review-msg is-${m.authorType}`}>
-            <div className="review-msg-head">
-              <span className="review-author">{m.authorType === 'agent' ? 'Agent' : 'You'}</span>
-              <span className="review-time">{ago(m.createdAt)}</span>
+        {messages.map((m) => {
+          // Only your own words can be reworded. An agent's reply can be taken
+          // out of the thread, but it cannot be made to say something else
+          // while still signed "Agent" — see electron/review/store.js.
+          const mine = m.authorType === 'human';
+          const last = messages.length <= 1;
+          const isEditing = editing === m.id;
+          return (
+            <div key={m.id} className={`review-msg is-${m.authorType}${isEditing ? ' editing' : ''}`}>
+              <div className="review-msg-head">
+                <span className="review-author">{m.authorType === 'agent' ? 'Agent' : 'You'}</span>
+                <span className="review-time">{ago(m.createdAt)}</span>
+                {/* Said out loud. A message somebody replied to and then
+                    changed is a different thing from one nobody touched. */}
+                {m.editedAt ? (
+                  <span className="review-edited" title={`Edited ${ago(m.editedAt)}`}>
+                    edited
+                  </span>
+                ) : null}
+                {!isEditing && (onEditMessage || onDeleteMessage) && (
+                  <span className="review-msg-tools">
+                    {mine && onEditMessage && (
+                      <button
+                        type="button"
+                        title="Edit this"
+                        disabled={busy}
+                        onClick={() => {
+                          setEditing(m.id);
+                          setDraft(m.body);
+                        }}
+                      >
+                        <PencilIcon size={11} />
+                      </button>
+                    )}
+                    {onDeleteMessage && (
+                      <button
+                        type="button"
+                        // The only thing in a thread is the thread. Deleting it
+                        // from in here would be deleting the review sideways,
+                        // so it says so rather than being quietly missing.
+                        title={last ? 'This is the only thing in this review — delete the review instead' : 'Delete this'}
+                        disabled={busy || last}
+                        onClick={async () => {
+                          if (
+                            await confirmDialog({
+                              title: 'Delete this message?',
+                              body: 'It goes out of the thread and cannot be brought back. The rest of the review stays.',
+                              confirmLabel: 'Delete',
+                              danger: true,
+                            })
+                          ) {
+                            onDeleteMessage(m.id);
+                          }
+                        }}
+                      >
+                        <TrashIcon size={11} />
+                      </button>
+                    )}
+                  </span>
+                )}
+              </div>
+              {isEditing ? (
+                <form
+                  className="review-edit"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const text = draft.trim();
+                    if (!text || text === m.body) {
+                      setEditing(null);
+                      return;
+                    }
+                    onEditMessage(m.id, text);
+                    setEditing(null);
+                  }}
+                >
+                  <AutoTextarea
+                    value={draft}
+                    minRows={2}
+                    autoFocus
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      // The same two keys as the reply box: ⌘↩ saves, Escape
+                      // puts it back the way it was.
+                      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                        e.preventDefault();
+                        e.currentTarget.form?.requestSubmit();
+                      }
+                      if (e.key === 'Escape') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setEditing(null);
+                      }
+                    }}
+                  />
+                  <div className="review-actions">
+                    <button type="button" className="ghost" onClick={() => setEditing(null)}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="primary" disabled={busy || !draft.trim()}>
+                      Save
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="review-body">{m.body}</div>
+              )}
             </div>
-            <div className="review-body">{m.body}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {review.deferredReason && (

@@ -6002,7 +6002,40 @@ textarea::selection {
 }
 .review-msg.is-agent .review-author { color: var(--component-green); }
 .review-time { font-size: 10px; color: var(--text-faint); }
+/* Said out loud, and quietly. A message that changed after somebody replied to
+   it is a different thing from one nobody touched — but it is a footnote about
+   the message, not a second author line. */
+.review-edited { font-size: 10px; color: var(--text-faint); font-style: italic; }
+/* The two things you can do to something already said. On hover, because a
+   thread is for reading: a pencil and a bin beside every line would make five
+   messages look like ten controls. They stay put once one is focused, so the
+   keyboard can reach them. */
+.review-msg-tools {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.review-msg:hover .review-msg-tools,
+.review-msg-tools:focus-within { opacity: 1; }
+.review-msg-tools button {
+  padding: 2px;
+  min-width: 0;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  border-radius: 3px;
+}
+.review-msg-tools button:hover:not(:disabled) { background: var(--bg-active); color: var(--text); }
+/* Disabled means "there is nothing else in this review", which is a state
+   worth seeing rather than a control worth hiding. */
+.review-msg-tools button:disabled { opacity: 0.25; }
 .review-body { color: var(--text); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Editing in place, so the words stay where they were while they change. */
+.review-msg.editing { border-left-color: var(--amber); }
+.review-edit { display: flex; flex-direction: column; gap: 6px; }
+.review-edit .review-actions { margin-top: 0; }
 
 /* The app sets `user-select: none` on the body and opts individual regions
    back in. A comment is words somebody wrote to be read and quoted — the note
@@ -6010,6 +6043,7 @@ textarea::selection {
    was filed under are all things people copy — so they are opted in here.
    The header stays unselectable: it is a drag handle. */
 .review-body,
+.review-edit textarea,
 .review-target-text,
 .review-note span,
 .review-note button,

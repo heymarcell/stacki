@@ -4334,6 +4334,32 @@ export default function App() {
     setReviewTick((n) => n + 1);
   };
 
+  // Rewording and pruning are a person tidying their own notes. Neither goes
+  // through `reviewsAct` — there is no MCP action behind either of them, on
+  // purpose: an agent that could rewrite the conversation is an agent whose
+  // record of it means nothing.
+  const editReviewMessage = async (id, messageId, message) => {
+    setReviewBusyId(id);
+    try {
+      const result = await window.avb.reviewsEditMessage({ threadId: id, messageId, message });
+      if (!result?.ok) showToast(result?.message || 'That comment could not be edited.', 'error');
+      setReviewTick((n) => n + 1);
+    } finally {
+      setReviewBusyId(null);
+    }
+  };
+
+  const deleteReviewMessage = async (id, messageId) => {
+    setReviewBusyId(id);
+    try {
+      const result = await window.avb.reviewsRemoveMessage({ threadId: id, messageId });
+      if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
+      setReviewTick((n) => n + 1);
+    } finally {
+      setReviewBusyId(null);
+    }
+  };
+
   const deleteReview = async (id) => {
     const result = await window.avb.reviewsRemove(id);
     if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
@@ -5037,6 +5063,8 @@ export default function App() {
                 onFocus={focusReviewFromUi}
                 onDelete={deleteReview}
                 onColor={recolorReview}
+                onEditMessage={editReviewMessage}
+                onDeleteMessage={deleteReviewMessage}
                 busyId={reviewBusyId}
                 problem={reviewProblem}
                 hiddenPins={pinsHidden}
@@ -5235,6 +5263,8 @@ export default function App() {
             onReviewFocus={focusReviewFromUi}
             onReviewDelete={deleteReview}
             onReviewColor={recolorReview}
+            onReviewEditMessage={editReviewMessage}
+            onReviewDeleteMessage={deleteReviewMessage}
             onReviewDraftChange={setDraftBody}
             onReviewDraftSubmit={submitComment}
             onReviewDraftCancel={() => commentDispatch({ type: 'escape' })}
