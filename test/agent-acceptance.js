@@ -367,6 +367,66 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     await run('target', 'remove_class', { ref: heroRef, className: 'edited-by-a-person' });
   }
 
+  // ── A ref that outlives the tree moving under it ───────────────────────────
+  //
+  // An index path is about a SLOT. Insert a sibling above and the slot holds
+  // something else — so a ref has to carry enough about the node itself to be
+  // found again, and to fail rather than land on the neighbour when it cannot.
+
+  {
+    const page = await topLevel();
+    const footer = page.target.children.find((c) => c.tag === 'footer');
+    await run('target', 'insert_before', { ref: footer.ref, node: { kind: 'element', tag: 'hr' } });
+    await H.settle(150);
+
+    const again = await run('target', 'read', { ref: footer.ref });
+    check('a ref still finds its node after a sibling is inserted above it', again.ok && again.target.tag === 'footer', short(again));
+    check('and says it found it by its marks rather than its position', again.target.confidence === 'moved', short(again.target?.confidence));
+
+    // And the case where it must not guess: the node itself is gone.
+    const gone = await run('target', 'remove', { ref: footer.ref });
+    await H.settle(150);
+    const dead = await run('target', 'read', { ref: footer.ref });
+    check('and a ref to a node that is gone resolves to nothing', gone.ok && dead.ok === false, short(dead));
+    check('rather than to whatever is in its place', dead.code === 'no_node', short(dead.code));
+    await run('project', 'undo');
+    await H.settle(200);
+    const hr = (await topLevel()).target.children.find((c) => c.tag === 'hr');
+    await run('target', 'remove', { ref: hr.ref });
+    await H.settle(150);
+  }
+
+  // ── A raw write to the file the editor has open ────────────────────────────
+  //
+  // The model in memory then describes a file that is gone. Left alone, the
+  // next model save puts the old markup back over the new file and the only
+  // evidence is the work disappearing.
+
+  {
+    const before = await topLevel();
+    const doc = await run('source', 'read', { path: 'src/pages/index.astro' });
+    const rewritten = doc.text.replace('Made carefully.', 'Rewritten behind the editor');
+    const wrote = await run('source', 'write', { path: 'src/pages/index.astro', text: rewritten, expectedDigest: doc.digest });
+    check('a raw write to the open document goes through', wrote.ok === true, short(wrote));
+    check('and says the editor took the file again', wrote.editorReloaded === true, short(wrote));
+    check('and says the page’s undo history went with it', /undo history/.test(wrote.note || ''), short(wrote.note));
+    check('and the file has the new text', /Rewritten behind the editor/.test(app.read('src/pages/index.astro')));
+
+    const model = await topLevel();
+    check('and the editor’s own model has it too', JSON.stringify(model.target.children).includes('Rewritten behind the editor'), short(model.target.children));
+
+    const late = await run('target', 'set_prop', {
+      ref: before.target.ref,
+      name: 'data-x',
+      value: '1',
+      expectedRevision: before.document.revision,
+      expectedDigest: before.document.digest,
+    });
+    check('and a model write against the revision from before it is refused', late.ok === false && late.code === 'stale_target', short(late));
+    check('so the raw write cannot be silently undone by a stale model', !/data-x/.test(app.read('src/pages/index.astro')));
+    check('and the raw text is still there', /Rewritten behind the editor/.test(app.read('src/pages/index.astro')));
+  }
+
   // ── H. Source Stacki cannot model ──────────────────────────────────────────
 
   {

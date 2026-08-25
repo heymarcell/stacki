@@ -357,12 +357,18 @@ function createAgentApi({
     };
   }
 
-  /** The marks a ref re-identifies its node by, from a target read. */
+  /**
+   * The marks a ref re-identifies its node by, from a target read.
+   *
+   * The same five things a review anchor records, under the same names —
+   * src/reviewAnchor.js reads `breadcrumbs` and `peers` off a fingerprint, and
+   * a field spelled anything else is a field it never looks at.
+   */
   const fingerprintOf = (t) => ({
     nodeKind: t.kind || null,
     tag: t.tag || null,
     text: t.text?.value || null,
-    ancestors: t.breadcrumbs || null,
+    breadcrumbs: t.breadcrumbs || null,
     peers: t.peers || null,
   });
 
@@ -392,7 +398,16 @@ function createAgentApi({
         ? nodeRef(
             {
               keys: summary.keys,
-              fingerprint: { nodeKind: summary.kind || null, tag: summary.tag || null, text: summary.text || null },
+              fingerprint: {
+                nodeKind: summary.kind || null,
+                tag: summary.tag || null,
+                text: summary.text || null,
+                // Without this the ref is only about the slot, and a sibling
+                // inserted above it turns "this node" into "whatever is here
+                // now" — which the resolver correctly refuses, leaving an
+                // agent with a dead ref for a node that plainly still exists.
+                breadcrumbs: summary.breadcrumbs || null,
+              },
               page: t.page,
               branch: ctx.branch,
             },
@@ -552,6 +567,46 @@ function createAgentApi({
     };
   }
 
+  /**
+   * A main-process operation, and then the editor caught up with it.
+   *
+   * `source.write` to the page Stacki has open is the case that made this
+   * necessary. The model in memory then describes a file that is gone, and
+   * nothing tells it: the writer marks its own writes so the watcher does not
+   * echo them, which is right for the app's own save and wrong for this. Left
+   * alone, the next model save would put the old markup back over the new file
+   * and the only evidence would be the work disappearing.
+   *
+   * So after any write, if the open document's bytes moved, the renderer is
+   * asked to take it from disk again — the same reload the watcher does for an
+   * outside editor, because that is what this is.
+   */
+  async function mainWithSync(domain, action, args, ctx, op) {
+    if (op.risk === 'read') return runMain(domain, action, args, ctx);
+    const openFile = ctx.payload?.page?.file ? relativeTo(ctx.root, ctx.payload.page.file) : null;
+    // The open PAGE is what the canvas is showing; the open DOCUMENT may be a
+    // component drilled into. Watch both — either changing under the model is
+    // the same problem.
+    const watching = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
+    const before = snapshot(watching);
+    const result = await runMain(domain, action, args, ctx);
+    const moved = watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel));
+    if (!moved.length) return result;
+    const synced = await command({ domain: 'project', action: 'reload_open_document' }, COMMAND_TIMEOUT_MS);
+    return {
+      ...result,
+      // Said out loud rather than done quietly: reloading the document drops
+      // the page's undo snapshots, because they describe a tree that is no
+      // longer there.
+      editorReloaded: !!synced?.reloaded,
+      document: synced?.document || null,
+      note: synced?.reloaded
+        ? `${moved.join(', ')} is open in Stacki, so the editor took it from disk again. Its undo history for that page is gone — a semantic edit through target would have kept it.`
+        : result.note ?? null,
+      changedFiles: changed(moved, before),
+    };
+  }
+
   // --- capabilities ----------------------------------------------------------
 
   function capabilities() {
@@ -643,7 +698,7 @@ function createAgentApi({
         const answer = await command({ domain, action, ...args });
         return answer;
       }
-      return await runMain(domain, action, args, ctx);
+      return await mainWithSync(domain, action, args, ctx, op);
     } catch (err) {
       return no('failed', String(err?.message || err));
     }

@@ -81,8 +81,14 @@ for (const m of main.matchAll(/require\(\s*'\.\/([\w.-]+?)(?:\.js)?'\s*\)/g)) {
     }
   }
 }
+// Both spellings. main.js registers through its own `handle()` — a recorder
+// that keeps each handler by name as well as passing it to ipcMain, so the
+// Agent API can call the same function the panels call (see
+// electron/mcp/agent/domains.js). It is still an ipcMain.handle registration;
+// a test that only knew the long spelling would report every channel in the
+// app as unhandled.
 for (const text of mainSide) {
-  for (const m of text.matchAll(/ipcMain\.handle\(\s*['"]([^'"]+)['"]/g)) handled.add(m[1]);
+  for (const m of text.matchAll(/(?:ipcMain\.)?\bhandle\(\s*['"]([^'"]+)['"]/g)) handled.add(m[1]);
 }
 
 // The channel each exposed method invokes, so a method that is exposed but has

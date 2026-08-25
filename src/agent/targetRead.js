@@ -88,7 +88,7 @@ function labelOf(node, crumbLabel) {
   return clip(node.name || node.kind, MAX_LABEL);
 }
 
-function summarize(node, crumbLabel, keysFor) {
+function summarize(node, crumbLabel, keysFor, crumbsFor = null) {
   if (!node) return null;
   return {
     kind: node.kind || null,
@@ -99,6 +99,13 @@ function summarize(node, crumbLabel, keysFor) {
     // Enough for the caller to mint a ref for this one, so walking the tree is
     // reading the answer rather than making another round trip per node.
     keys: typeof keysFor === 'function' ? keysFor(node.id) : null,
+    // And enough for that ref to survive the tree moving underneath it. An
+    // index path plus a tag is Stacki's "same node after a reload" rule, and
+    // it is only about the slot: insert a sibling above and the slot holds
+    // something else. The trail of labels is what lets the resolver find the
+    // node itself, one rung further down — the same evidence a review anchor
+    // carries, spelled the same way, so it reads them the same.
+    breadcrumbs: typeof crumbsFor === 'function' ? crumbsFor(node.id) : null,
     kindOfThing: node.kind === 'component' && !node.dynamicTag ? 'component_instance' : null,
   };
 }
@@ -252,6 +259,7 @@ export function readTarget({
   editable = true,
   crumbLabel = null,
   keysFor = null,
+  crumbsFor = null,
   canvas = null,
   renderedClasses = null,
   componentChain = null,
@@ -315,9 +323,11 @@ export function readTarget({
     bound: isDataBound(node),
     bindings,
     occurrence: occurrenceOf(node, { canvas, bindings, ancestors }),
-    parent: summarize(parent, crumbLabel, keysOf),
+    parent: summarize(parent, crumbLabel, keysOf, crumbsFor),
     children: Array.isArray(node.children)
-      ? node.children.slice(0, MAX_CHILDREN).map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf) }))
+      ? node.children
+          .slice(0, MAX_CHILDREN)
+          .map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf, crumbsFor) }))
       : null,
     childrenOmitted: Array.isArray(node.children) ? Math.max(0, node.children.length - MAX_CHILDREN) : 0,
     hidden: !!hidden,

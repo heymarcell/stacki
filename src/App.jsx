@@ -1079,33 +1079,56 @@ export default function App() {
         return;
       }
 
-      // Hot-reload the current page's model unless the user has unsaved
-      // edits in flight (their pending save would win anyway).
-      if (state?.dirty) return;
-
-      let result;
-      try {
-        result = await window.avb.readPage(page.path);
-      } catch {
-        return;
-      }
-
-      // Re-select the node at the same tree position (ids regenerate).
-      const selId = selectedIdRef.current;
-      let nextSelected = selId;
-      if (selId && selId !== 'layout' && selId !== 'frontmatter') {
-        if (state?.editable && result.editable) {
-          const trail = pathOfNode(state.model.nodes, selId);
-          nextSelected = trail ? (nodeAtPath(result.model.nodes, trail)?.id ?? null) : null;
-        } else {
-          nextSelected = null;
-        }
-      }
-      setPageState({ ...result, file: page.path, dirty: false });
-      setSelectedId(nextSelected);
+      await reloadOpenPageRef.current?.();
     });
     return off;
   }, [rescan]);
+
+  /**
+   * Take the open page's model from disk again.
+   *
+   * The file watcher's answer to somebody editing the open file in another
+   * editor — and the Agent API's answer to its own raw source write, which is
+   * the same situation wearing a different hat: the bytes changed and the model
+   * in memory is now describing a file that is gone. Left to itself the next
+   * save would put the old model back over it.
+   *
+   * Through a ref so both callers reach the one implementation; the watcher
+   * effect binds long before this is in scope.
+   */
+  const reloadOpenPageRef = useRef(null);
+  reloadOpenPageRef.current = async () => {
+    const { currentPage: page, pageState: state } = pageStateRef.current;
+    if (!page) return false;
+    // Unsaved edits in flight win: their pending save is about to be written,
+    // and reloading over them would throw away work nobody has seen yet.
+    if (state?.dirty) return false;
+    let result;
+    try {
+      result = await window.avb.readPage(page.path);
+    } catch {
+      return false;
+    }
+    // Re-select the node at the same tree position (ids regenerate).
+    const selId = selectedIdRef.current;
+    let nextSelected = selId;
+    if (selId && selId !== 'layout' && selId !== 'frontmatter') {
+      if (state?.editable && result.editable) {
+        const trail = pathOfNode(state.model.nodes, selId);
+        nextSelected = trail ? (nodeAtPath(result.model.nodes, trail)?.id ?? null) : null;
+      } else {
+        nextSelected = null;
+      }
+    }
+    // A document that came from somewhere other than this model is a new
+    // document as far as anything holding a revision is concerned.
+    docRevRef.current += 1;
+    setPageState({ ...result, file: page.path, dirty: false });
+    setSelectedId(nextSelected);
+    // Page snapshots describe a tree that is no longer there.
+    dropPageHistory();
+    return true;
+  };
 
   // ----------------------------------------------------------------
   // Model operations
@@ -4217,6 +4240,11 @@ export default function App() {
     // (an undo walking back to where it started) are still told apart.
     digest: () => digestOfModel(pageState?.editable ? model : pageState?.source),
     crumbLabel,
+    // The navigator's own trail for any node, not just the selection. A ref
+    // minted for a child records this, and src/reviewAnchor.js reads it back —
+    // two spellings of the same trail would be two nodes as far as it is
+    // concerned.
+    crumbsFor: (id) => crumbsFor(id).map((c) => c.label).filter(Boolean),
     pathFor,
     keysFor,
     peersFor,
@@ -4241,6 +4269,13 @@ export default function App() {
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+    // The open document changed on disk under the editor. Same reload the file
+    // watcher does — see reloadOpenPageRef.
+    reloadOpenPage: async () => {
+      const done = await reloadOpenPageRef.current?.();
+      await new Promise((settled) => setTimeout(settled, 0));
+      return { ok: true, reloaded: !!done, file: openRel };
+    },
     // Going into a component instance and coming back out: the app's own
     // openComponent and closeComponent, waited on. Both read the refs rather
     // than this render's state, because by the time they answer this render

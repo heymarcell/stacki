@@ -94,10 +94,11 @@ function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
       editable: a.editable(),
       crumbLabel: a.crumbLabel,
       keysFor: a.keysFor,
+      crumbsFor: a.crumbsFor,
       canvas: id === a.selectedId() ? a.canvas() : null,
       renderedClasses: id === a.selectedId() ? a.renderedClasses() : null,
       componentChain: a.componentChain(),
-      breadcrumbs: a.breadcrumbs(id),
+      breadcrumbs: a.crumbsFor(id),
       hidden: a.isHidden(id),
       inert: a.isInert(id),
       confidence,
@@ -342,6 +343,14 @@ export function createAgentCommands(getApp) {
     }
     if (action === 'dev_status') {
       return { ok: true, ...a.preview() };
+    }
+    // Not an action any tool can name — there is nothing for it in the registry
+    // or the schemas. The main process sends it after a write that changed the
+    // file the editor has open, so the model, the disk and the canvas agree
+    // again before anybody reads the next revision.
+    if (action === 'reload_open_document') {
+      const done = await a.reloadOpenPage();
+      return { ...done, document: documentOf(a) };
     }
     return fail('bad_action', `project has no renderer action "${action}".`);
   }
