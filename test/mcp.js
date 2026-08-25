@@ -753,9 +753,16 @@ const rawPost = (hostHeader, body) =>
       if (!thread) return { ok: false, code: 'no_thread', message: 'No review with that id.', revision: ledger.revision, review: null };
       focusedWith = thread.anchor;
       if (!focusAnswer.transient) ledger.syncAnchors([{ id: args.threadId, anchorState: focusAnswer.anchorState }]);
+      const landed = focusAnswer.anchorState === 'attached';
       return {
-        ok: focusAnswer.anchorState === 'attached',
-        code: focusAnswer.anchorState === 'attached' ? null : focusAnswer.transient ? 'not_ready' : 'orphaned',
+        ok: landed,
+        code: landed ? null : focusAnswer.transient ? 'not_ready' : 'orphaned',
+        // The real focus() mints a ref when the walk lands and nulls it when it
+        // does not. The double has to do the same, or a handler that drops the
+        // ref on the way to the wire looks exactly like one that keeps it.
+        targetRef: landed ? 'stacki:double.ref' : null,
+        targetEditable: landed && focusAnswer.writable !== false,
+        confidence: landed ? focusAnswer.confidence || 'exact' : null,
         restored: focusAnswer.restored,
         note: focusAnswer.note || null,
         revision: ledger.revision,
@@ -1051,6 +1058,12 @@ const rawPost = (hostHeader, body) =>
     check('and sends Stacki to the review\\u2019s own anchor', focusedWith?.keys?.join() === 'src/pages/index.astro#0.1');
     check('and says what it managed to restore', focused.restored?.page === true && focused.restored?.node === true);
     check('and changes nothing about the review', focused.review.status === 'open' && focused.review.messages.length === 1);
+    // The ref has to survive the handler, not just the review module: the
+    // tool advertises that focusing hands one back, and an agent that gets
+    // the anchor without it has to go and find the element by hand.
+    check('and hands the target back as something the editor tools can take', typeof focused.targetRef === 'string' && focused.targetRef.startsWith('stacki:'), JSON.stringify(focused.targetRef));
+    check('saying it may be written through', focused.targetEditable === true);
+    check('and how the element was identified', focused.confidence === 'exact', JSON.stringify(focused.confidence));
 
     // An orphan focus degrades honestly rather than selecting something near.
     focusAnswer = {
@@ -1061,6 +1074,7 @@ const rawPost = (hostHeader, body) =>
     const lost = structured(await call('comment', { action: 'focus', threadId: A }));
     check('focusing an orphan does not report success', lost?.ok === false, JSON.stringify(lost).slice(0, 200));
     check('it says which rung it got to', lost.restored.page === true && lost.restored.node === false);
+    check('an orphan hands back no ref to act through', lost.targetRef === null && lost.targetEditable === false);
     check('it says so in words as well', /no longer there/.test(lost.note || ''), lost.note);
     check('and the review is marked orphaned rather than hidden', lost.review.anchorState === 'orphaned' && lost.review.status === 'open');
     check('an orphan still carries what it was about', lost.review.creationContext.text === 'Hello world', JSON.stringify(lost.review.creationContext).slice(0, 200));
