@@ -244,7 +244,14 @@ function quarantine(file, stamp) {
 // How long a lock may be held before it is presumed abandoned. A write is
 // microseconds; anything approaching this is a Stacki that died holding it, and
 // a ledger nobody can ever write to again is worse than a rare stolen lock.
+// How long a lock with nobody's name on it may sit before it is assumed to be
+// the leftovers of a process that died.
 const LOCK_STALE_MS = 10_000;
+// And how long one whose owner still answers may sit. This is a backstop for a
+// pid that got recycled, not a timeout for honest work: the lock is held for a
+// read, a write and a rename, so a Stacki that has held it for a minute is not
+// coming back.
+const LOCK_ABANDONED_MS = 60_000;
 const LOCK_TRIES = 100;
 const LOCK_WAIT_MS = 10;
 
@@ -267,22 +274,80 @@ function pause(ms) {
  * lock rather than a check — two processes cannot both believe they hold it,
  * which is exactly the failure a stat-then-write has.
  */
+/** Whether a process is still there to be waited for. */
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    // Signal 0 checks for existence without delivering anything.
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // It exists but belongs to somebody else. Still a reason to wait.
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Whether a lock somebody else is holding can be taken away from them.
+ *
+ * Age alone is not the question, and this is the part that used to be wrong.
+ * A lock is held for a read, a write and a rename — microseconds — so one that
+ * is ten seconds old is almost certainly abandoned. Almost. A process that was
+ * suspended, stopped at a breakpoint, or on a laptop that went to sleep mid
+ * write is still going to finish that write when it wakes up, and reaping its
+ * lock puts two writers inside the one section this whole file exists to keep
+ * to one. That is the silent-overwrite bug, reintroduced through the back door.
+ *
+ * So the owner is asked about first. A pid that no longer exists is a crash,
+ * and its lock goes immediately rather than after ten seconds of waiting. A pid
+ * that still answers is given room. Age remains, as a backstop for the two
+ * cases a pid cannot cover: a crash between taking the lock and writing the
+ * name into it, and a pid that has since been handed to somebody else.
+ *
+ * The pid is meaningful because the ledger lives in this machine's own
+ * application-support directory. It is not a lock for a shared drive and does
+ * not pretend to be one.
+ */
+function reapable(lock) {
+  let age;
+  try {
+    age = Date.now() - fs.statSync(lock).mtimeMs;
+  } catch {
+    // Released while we were looking at it; there is nothing to reap and the
+    // next mkdir is the one that matters.
+    return true;
+  }
+  let pid = null;
+  try {
+    pid = Number(fs.readFileSync(path.join(lock, 'owner'), 'utf8').trim()) || null;
+  } catch {
+    /* no name on it — fall back to age, which is the rule this always had */
+  }
+  if (pid === null) return age > LOCK_STALE_MS;
+  if (!alive(pid)) return true;
+  return age > LOCK_ABANDONED_MS;
+}
+
 function acquireLock(file) {
   const lock = `${file}.lock`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   for (let attempt = 0; attempt < LOCK_TRIES; attempt++) {
     try {
       fs.mkdirSync(lock);
+      // Whose it is, so somebody finding it later can ask whether waiting is
+      // pointless. Best effort: a lock with no name still works, it is just
+      // reaped on age alone.
+      try {
+        fs.writeFileSync(path.join(lock, 'owner'), String(process.pid));
+      } catch {
+        /* the lock is held either way */
+      }
       return lock;
     } catch (err) {
       if (err.code !== 'EEXIST') return null;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
-          fs.rmSync(lock, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        /* it was released while we looked at it — try again immediately */
+      if (reapable(lock)) {
+        fs.rmSync(lock, { recursive: true, force: true });
         continue;
       }
       pause(LOCK_WAIT_MS);
@@ -337,16 +402,9 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   if (!file) throw new Error('a review store needs a file to live in');
   const id = newId || (() => crypto.randomUUID());
 
-  const loaded = loadFile(file);
-  let threads = loaded.threads;
-  let writable = loaded.writable;
-  let problem = loaded.problem || null;
-
-  if (problem?.quarantine) {
-    const moved = quarantine(file, now());
-    problem = { ...problem, movedTo: moved, quarantine: undefined };
-  }
-
+  let threads = [];
+  let writable = true;
+  let problem = null;
   // The next short number.
   //
   // A uuid is the right identity and the wrong name: nobody says "resolve
@@ -354,35 +412,53 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
   // project and never reused — the number on the pin, the number in the list,
   // and the thing a person can type at an agent. Taken from the high-water
   // mark rather than the count, so deleting #2 does not make the next one #2.
-  //
-  // Whichever is higher: what the last write recorded, or one past the highest
-  // number still present. The recorded value is what makes a deleted number
-  // stay dead across a restart; the scan is the floor for a file written by an
-  // older Stacki, or one somebody edited by hand.
-  let nextNumber = Math.max(loaded.nextNumber || 1, threads.reduce((max, t) => Math.max(max, t.number || 0), 0) + 1);
-  // A review written before numbering gets one now, oldest first, so the order
-  // people see matches the order they wrote them. A number that somehow appears
-  // twice is treated the same way: "#3" has to name exactly one review, so the
-  // later of the two is renumbered rather than left ambiguous.
-  const seen = new Set();
-  const needsOne = [];
-  for (const t of [...threads].sort((a, b) => a.createdAt - b.createdAt)) {
-    if (!t.number || seen.has(t.number)) needsOne.push(t);
-    else seen.add(t.number);
-  }
-  if (needsOne.length) {
-    for (const t of needsOne) t.number = nextNumber++;
-    threads = [...threads];
-  }
-
+  let nextNumber = 1;
+  // The bytes this store believes are on disk. Any write that finds something
+  // else there is a write on top of another Stacki's work.
+  let owned = null;
   // Counts CHANGES, like the context store's does — so a UI can ask "is there
   // anything new" without diffing, and a read can never make one happen.
   let revision = 0;
-  let pending = Promise.resolve();
-  let dirty = false;
-  // The bytes this store believes are on disk. Any write that finds something
-  // else there is a write on top of another Stacki's work.
-  let owned = loaded.digest;
+
+  /**
+   * Become whatever the file says, discarding whatever was held before.
+   *
+   * Used to open the ledger, and used again when a write is refused — see
+   * `persist`. Both are the same operation: the file is the truth and this is
+   * a view of it.
+   */
+  function readFresh() {
+    const loaded = loadFile(file);
+    threads = loaded.threads;
+    writable = loaded.writable;
+    problem = loaded.problem || null;
+    owned = loaded.digest;
+    if (problem?.quarantine) {
+      const moved = quarantine(file, now());
+      problem = { ...problem, movedTo: moved, quarantine: undefined };
+    }
+    // Whichever is higher: what the last write recorded, or one past the
+    // highest number still present. The recorded value is what makes a deleted
+    // number stay dead across a restart; the scan is the floor for a file
+    // written by an older Stacki, or one somebody edited by hand.
+    nextNumber = Math.max(loaded.nextNumber || 1, threads.reduce((max, t) => Math.max(max, t.number || 0), 0) + 1);
+    // A review written before numbering gets one now, oldest first, so the
+    // order people see matches the order they wrote them. A number that somehow
+    // appears twice is treated the same way: "#3" has to name exactly one
+    // review, so the later of the two is renumbered rather than left ambiguous.
+    const seen = new Set();
+    const needsOne = [];
+    for (const t of [...threads].sort((a, b) => a.createdAt - b.createdAt)) {
+      if (!t.number || seen.has(t.number)) needsOne.push(t);
+      else seen.add(t.number);
+    }
+    if (needsOne.length) {
+      for (const t of needsOne) t.number = nextNumber++;
+      threads = [...threads];
+    }
+  }
+
+  readFresh();
 
   const snapshotText = () =>
     JSON.stringify({ version: VERSION, projectPath, nextNumber, threads }, null, 2);
@@ -406,10 +482,7 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
    */
   function commit() {
     const lock = acquireLock(file);
-    if (!lock) {
-      problem = { kind: 'write_failed', detail: 'another Stacki is holding the review file' };
-      return false;
-    }
+    if (!lock) return { kind: 'write_failed', detail: 'another Stacki is holding the review file' };
     try {
       let current = null;
       try {
@@ -420,50 +493,80 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
       if (digest(current) !== owned) {
         // Somebody else has written since we loaded. Theirs is newer; ours is
         // stale by definition, so it does not go over the top of it.
-        writable = false;
-        problem = {
+        return {
           kind: 'foreign_write',
-          detail:
-            'Another Stacki changed these comments. This window is not writing over them — ' +
-            'reopen the project to pick up the newer list.',
+          detail: 'another Stacki changed these comments first',
         };
-        return false;
       }
       const text = snapshotText();
       writeAtomic(file, text);
       owned = digest(text);
-      return true;
+      return null;
     } catch (err) {
-      // The change still holds in memory for this session. Saying nothing
-      // here would be the one failure mode that loses somebody's review
-      // without ever telling them.
-      problem = { kind: 'write_failed', detail: err.message };
       console.warn('[stacki] could not save reviews:', err.message);
-      return false;
+      return { kind: 'write_failed', detail: err.message };
     } finally {
       releaseLock(lock);
     }
   }
 
-  function schedule() {
-    if (!writable) return pending;
-    dirty = true;
-    pending = pending.then(async () => {
-      if (!dirty || !writable) return;
-      dirty = false;
-      commit();
-    });
-    return pending;
+  /**
+   * Save the mutation that just happened, or undo it.
+   *
+   * This runs INSIDE the mutation, before it answers, and that is the whole
+   * point. The write used to be scheduled: a mutation changed memory, returned
+   * `ok: true`, and a later commit discovered somebody else had written the
+   * file and quietly refused. An agent had been told a review was resolved
+   * when nothing would remember it, and `get_comments` from this window
+   * reported the resolution as though it were a fact. "It worked" has to mean
+   * "it is on disk", and the only way for one call to promise that is to do it.
+   *
+   * When the write is refused the change does not stay in memory as a ghost.
+   * The file is re-read, which either picks up the other Stacki's newer list
+   * (a foreign write — theirs won, and this window now shows theirs) or puts
+   * back exactly what was there before (a failed write — rename(2) is atomic,
+   * so the old file is intact). Either way this store ends up describing what
+   * is actually on disk, and the caller is told, in the answer to the call it
+   * made, that its change did not happen.
+   *
+   * The reviews are not merged. Two histories combined automatically is a way
+   * to get both of them wrong; the newer file wins whole and the person is told
+   * to look at it.
+   */
+  function persist() {
+    const trouble = commit();
+    if (!trouble) return { ok: true };
+    const stale = threads;
+    readFresh();
+    if (trouble.kind === 'foreign_write') {
+      return fail(
+        'foreign_write',
+        'Another Stacki changed these comments first, so this change was not saved. ' +
+          'Stacki has reloaded their list — read it and, if it still applies, do this again.'
+      );
+    }
+    // Nothing landed and nothing was taken away either; the file is as it was.
+    // If it could not even be re-read the store is now read-only and says so,
+    // which is the honest end of a disk that has stopped answering.
+    if (!writable && threads.length === 0 && stale.length) {
+      problem = problem || { kind: 'write_failed', detail: trouble.detail };
+    }
+    return fail('write_failed', `These comments could not be saved: ${trouble.detail}`);
   }
 
+  /**
+   * A mutation happened. Save it, tell anybody listening, and answer whether
+   * it is real.
+   */
   function changed() {
     revision += 1;
-    schedule();
+    const saved = persist();
     try {
       onChange?.(revision);
     } catch {
       /* a listener that throws must not take the mutation with it */
     }
+    return saved;
   }
 
   /**
@@ -538,7 +641,10 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
         updatedAt: at,
       };
       threads = [...threads, thread];
-      changed();
+      // Only true once it is on disk. A refused write puts the ledger back to
+      // what the file says, so this thread no longer exists to return.
+      const saved = changed();
+      if (!saved.ok) return saved;
       return { ok: true, thread };
     }
 
@@ -587,7 +693,8 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
 
     thread.updatedAt = at;
     threads = threads.map((t) => (t.id === thread.id ? { ...thread } : t));
-    changed();
+    const saved = changed();
+    if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
 
@@ -607,7 +714,8 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     if (!thread) return fail('no_thread', `No review called ${ref || '(none)'}.`);
     if (thread.color === color) return { ok: true, thread: { ...thread } };
     threads = threads.map((t) => (t.id === thread.id ? { ...t, color } : t));
-    changed();
+    const saved = changed();
+    if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
 
@@ -624,7 +732,8 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     const thread = find(str(threadId, 100));
     if (!thread) return fail('no_thread', `No review called ${threadId || '(none)'}.`);
     threads = threads.filter((t) => t.id !== thread.id);
-    changed();
+    const saved = changed();
+    if (!saved.ok) return saved;
     return { ok: true, thread };
   }
 
@@ -660,7 +769,8 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     });
     if (!touched) return { ok: true, changed: 0 };
     threads = next;
-    changed();
+    const saved = changed();
+    if (!saved.ok) return saved;
     return { ok: true, changed: touched };
   }
 
@@ -692,16 +802,19 @@ function createReviewStore({ file, projectPath = null, now = Date.now, newId, on
     remove,
     setColor,
     syncAnchors,
-    /** Wait for everything scheduled to be on disk. */
+    /**
+     * Nothing is ever waiting: every mutation is on disk before it answers.
+     *
+     * Both of these are kept because callers depend on them — the quit hook,
+     * closing a project, the tests — and because "make sure it is saved" is
+     * still the right thing for those callers to say. There is simply nothing
+     * left for them to do.
+     */
     flush() {
-      return pending;
+      return Promise.resolve();
     },
     /** The same, for a quit that cannot await. */
-    flushSync() {
-      if (!writable || !dirty) return;
-      dirty = false;
-      commit();
-    },
+    flushSync() {},
   };
 }
 
@@ -759,13 +872,40 @@ function summarize(thread) {
  * costs a parse per file and only a full read is worth spending it on.
  */
 /**
- * The fingerprint as it goes on the wire: every field present, always.
+ * The anchor as it goes on the wire: every field present, always.
  *
- * A review written before a fingerprint field existed simply has no such key,
- * and passing the stored object straight out would publish a response missing
- * a declared property — which a strict client rejects wholesale. The shape a
- * caller sees is decided here, not by how old the review is.
+ * A review written before a field existed simply has no such key, and a
+ * ledger can also be hand-edited or written by an older Stacki. Passing the
+ * stored object straight out would publish a response missing a declared
+ * property, which a strict client rejects wholesale — not the field, the whole
+ * answer. The shape a caller sees is decided here, not by how old the review
+ * is or who wrote it.
  */
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+function wireAnchor(anchor, trail) {
+  const a = anchor && typeof anchor === 'object' ? anchor : {};
+  const page = a.page && typeof a.page === 'object' ? a.page : {};
+  const bp = a.breakpoint && typeof a.breakpoint === 'object' ? a.breakpoint : {};
+  const pin = a.pin && typeof a.pin === 'object' ? a.pin : null;
+  return {
+    page: { route: page.route ?? null, file: page.file ?? null },
+    keys: Array.isArray(a.keys) ? a.keys : [],
+    breakpoint: {
+      device: bp.device ?? null,
+      viewportWidth: num(bp.viewportWidth),
+      viewportHeight: num(bp.viewportHeight),
+    },
+    // Both halves or neither: a pin with one coordinate cannot be placed, and
+    // publishing it as though it could is worse than saying there isn't one.
+    pin: pin && num(pin.xRatio) !== null && num(pin.yRatio) !== null ? { xRatio: pin.xRatio, yRatio: pin.yRatio } : null,
+    fingerprint: wireFingerprint(a.fingerprint),
+    // Where the anchor points RIGHT NOW, lines and all. Null for an orphan,
+    // which is the honest answer rather than the last place it was seen.
+    sourceTrail: trail,
+  };
+}
+
 function wireFingerprint(fp) {
   if (!fp || typeof fp !== 'object') return null;
   return {
@@ -791,16 +931,7 @@ function detail(thread, resolveSource) {
     messagesOmitted: omitted,
     deferredReason: thread.deferredReason || null,
     externalRefs: thread.externalRefs || [],
-    anchor: {
-      page: thread.anchor?.page || { route: null, file: null },
-      keys: thread.anchor?.keys || [],
-      breakpoint: thread.anchor?.breakpoint || { device: null, viewportWidth: null, viewportHeight: null },
-      pin: thread.anchor?.pin || null,
-      fingerprint: wireFingerprint(thread.anchor?.fingerprint),
-      // Where the anchor points RIGHT NOW, lines and all. Null for an orphan,
-      // which is the honest answer rather than the last place it was seen.
-      sourceTrail: trail,
-    },
+    anchor: wireAnchor(thread.anchor, trail),
     creationContext: thread.creationContext || {},
   };
 }

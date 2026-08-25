@@ -45,7 +45,7 @@ const check = (what, condition, detail) => {
     return import(`file://${out}?v=${Date.now()}`);
   };
 
-  const { resolveNode, checkAnchor, anchorSteps, keyParts, trailOfPath, componentNameOf, sameSort } =
+  const { resolveNode, checkAnchor, anchorSteps, keyParts, trailOfPath, componentNameOf, sameSort, peerPath } =
     await load('reviewAnchor');
   const { focusPlan, hostPathFor, focusNote, nothingRestored } = await load('reviewFocus');
   const mode = await load('reviewMode');
@@ -233,23 +233,27 @@ const check = (what, condition, detail) => {
       check('H and does not attach to what took its place', resolvedName(t, r) !== 'Enterprise');
     }
 
-    // I — reordered AND renamed in the same edit. Written down because it is
-    //     the limit of what the recorded evidence can decide, not because the
-    //     answer is satisfying.
+    // I — reordered AND renamed in the same edit. The limit of what the
+    //     recorded evidence can decide. Proved below, against the real parser;
+    //     here is what the resolver does about it.
     //
     //     Nothing was added or removed, so every run is the shape it was; and
     //     no node carries the old words, so nothing says where the target
-    //     went. From the fingerprint alone this is byte for byte the same
-    //     situation as C — somebody edited the copy in place — and C must
-    //     stay attached, because orphaning a review at the moment its feedback
-    //     is acted on would break the one workflow this feature exists for.
-    //     So the slot is kept. Distinguishing the two would mean recording
-    //     what every SIBLING said as well, which is a much larger fingerprint
-    //     for a case that needs two edits in one save to arise.
+    //     went. The slot is kept — an in-place copy edit is what happens every
+    //     time feedback is acted on, and orphaning that would break the one
+    //     workflow this feature exists for — but it is kept as a POSITION,
+    //     not as proof, and the answer says which it is.
     {
       const t = plans(['Basic', 'Pro', 'Enterprise', 'Teams']);
       const r = resolveNode([t], AT, fp(), { labelOf });
-      check('I reorder + rename is indistinguishable from an in-place edit', r.confidence === 'exact', `${r.confidence}/${r.reason} -> ${resolvedName(t, r)}`);
+      check('I reorder + rename keeps the slot', r.id !== null, `${r.confidence}/${r.reason}`);
+      check('I and does not call a position a proof', r.confidence === 'positional', r.confidence);
+      // The ordinary case is still the strong one, so the two are told apart.
+      check('I while an in-place edit that keeps its words is exact', resolveNode([plans(['Basic', 'Pro', 'Team', 'Enterprise'])], AT, fp(), { labelOf }).confidence === 'exact');
+      check('I and a slot with no recorded words to lose is exact too', resolveNode([plans(['Basic', 'Pro', 'Team', 'Enterprise'])], AT, fp({ text: null }), { labelOf }).confidence === 'exact');
+      // Either way it is attached: `positional` is a description, not a
+      // downgrade to orphaned.
+      check('I a positional hold is still an attached review', checkAnchor({ keys: [`index.astro#${AT}`], fingerprint: fp() }, { file: 'index.astro', nodes: [t], labelOf }).state === 'attached');
     }
 
     // J — the same words turn up somewhere else in the file, under different
@@ -264,6 +268,76 @@ const check = (what, condition, detail) => {
       ]);
       const r = resolveNode([t], AT, fp(), { labelOf });
       check('J the same words elsewhere: the original keeps its review', r.id === t.children[0].children[2].children[0].id && r.confidence === 'exact', `${r.confidence}/${r.reason}`);
+    }
+
+    // ── The proof that I is not a gap in the rules ────────────────────────
+    //
+    // Built out of real Astro source and read with the real parser, because
+    // the claim being made is about what the resolver can possibly know, and
+    // a hand-built tree could always be accused of leaving something out.
+    //
+    // Two DIFFERENT edits:
+    //   X  the reviewed card is moved to the end and renamed
+    //   Y  two cards have their copy edited where they stand
+    //
+    // They produce the same file. Not similar — identical, byte for byte. So
+    // the resolver is handed the same tree and the same fingerprint in both
+    // cases and must return the same answer, while the correct answers differ.
+    // That is not something more rules can fix: it is the absence of a stable
+    // node identity in the source. Recorded here so that nobody later reads
+    // case I as a bug and "fixes" it by orphaning ordinary copy edits.
+    {
+      const { parsePage } = require('../electron/astroParser.js');
+      const card = (n) => `  <article class="plan">\n    <h3 class="name">${n}</h3>\n  </article>`;
+      const page = (names) => `---\n---\n<section class="plans">\n${names.map(card).join('\n')}\n</section>\n`;
+      const headings = (m) => m.nodes[0].children.map((a) => a.children[0]);
+      const words = (h) => h.children[0].value;
+
+      const before = parsePage(page(['Basic', 'Pro', 'Team', 'Enterprise']), {}).model;
+      const at = '0.2.0';
+      check('the review is on the third card', words(headings(before)[2]) === 'Team');
+      // Recorded with the same labeller the resolver is given, which is the
+      // whole reason it is an argument: the parser keeps a prop as
+      // `{type, value}` rather than a bare string, so crumbLabel falls back to
+      // the tag here. Hard-coding class names instead would have made every
+      // candidate invisible and quietly turned this proof into a tautology.
+      const crumb = (n) => labelOf(n);
+      const print = {
+        nodeKind: 'element',
+        tag: 'h3',
+        text: 'Team',
+        breadcrumbs: ['index', crumb(before.nodes[0]), crumb(before.nodes[0].children[2]), crumb(headings(before)[2])],
+        peers: peerPath(before.nodes, [0, 2, 0]),
+      };
+      check('the fixture records the ancestors the resolver will compute', print.breadcrumbs.join('/') === 'index/section/article/h3', print.breadcrumbs.join('/'));
+
+      // X: the card the review is on moves to the end and is renamed.
+      const afterX = page(['Basic', 'Pro', 'Enterprise', 'Teams']);
+      // Y: nothing moves; the third card's copy becomes "Enterprise" and the
+      //    fourth's becomes "Teams".
+      const afterY = page(['Basic', 'Pro', 'Enterprise', 'Teams']);
+      check('two different edits produce the same source, byte for byte', afterX === afterY);
+
+      const mX = parsePage(afterX, {}).model;
+      const mY = parsePage(afterY, {}).model;
+      const rX = resolveNode(mX.nodes, at, print, { labelOf });
+      const rY = resolveNode(mY.nodes, at, print, { labelOf });
+      const landedOn = (m, r) => {
+        const found = headings(m).find((h) => h.id === r.id);
+        return found ? words(found) : null;
+      };
+      check('so the resolver cannot answer them differently', rX.confidence === rY.confidence && landedOn(mX, rX) === landedOn(mY, rY), `${rX.confidence}:${landedOn(mX, rX)} vs ${rY.confidence}:${landedOn(mY, rY)}`);
+      check('and the correct answers are genuinely different', 'Teams' !== 'Enterprise');
+      // What it actually does, and what it calls it.
+      check('it keeps the slot — right for Y, wrong for X', landedOn(mX, rX) === 'Enterprise', String(landedOn(mX, rX)));
+      check('and reports that as a position rather than a proof', rX.confidence === 'positional', rX.confidence);
+
+      // The same edit WITHOUT the rename is not ambiguous at all: the words
+      // are still there to follow, so the review goes with its card.
+      const kept = parsePage(page(['Basic', 'Pro', 'Enterprise', 'Team']), {}).model;
+      const rKept = resolveNode(kept.nodes, at, print, { labelOf });
+      check('a reorder on its own is not ambiguous — the words follow', landedOn(kept, rKept) === 'Team', String(landedOn(kept, rKept)));
+      check('and that is reported as a move, not as the old slot', rKept.confidence === 'moved', rKept.confidence);
     }
 
     // G — moved under a different parent entirely.

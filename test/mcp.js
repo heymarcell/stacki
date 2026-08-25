@@ -1125,6 +1125,68 @@ const rawPost = (hostHeader, body) =>
     check('a limit is obeyed', limited.reviews.length === 1);
     check('and says the list was cut', limited.truncated === true && limited.total === 2);
 
+    // Checked the way a real client checks it: the ACTUAL response body,
+    // against the ACTUAL schema this server publishes in tools/list, through
+    // the validator the SDK ships. Reading `structuredContent` and looking at
+    // its fields — which is what every other assertion in this file does — is
+    // exactly how `get_comments` came to be unusable from Claude Code
+    // ("data must NOT have additional properties") while the suite was green.
+    const published = Object.fromEntries(
+      ((await readBody(await post({ jsonrpc: '2.0', id: 9001, method: 'tools/list' })))?.result?.tools || []).map((t) => [
+        t.name,
+        t.outputSchema,
+      ])
+    );
+    const validateOutput = async (tool, response) => {
+      const schema = published[tool];
+      if (!schema) return { valid: false, errorMessage: `${tool} publishes no output schema` };
+      return await schemaValidator.getValidator(schema)(structured(response));
+    };
+
+    // ── A mutation that will not be saved must not be reported as done ──
+    //
+    // Two Stackis, one project. The other one writes; this one's next
+    // mutation is refused by the store. What must NOT happen is `comment`
+    // answering ok:true — an agent told a review was resolved moves on, and
+    // nothing will remember the resolution.
+    {
+      const other = createReviewStore({ file: reviewFile, projectPath: ROOT });
+      const foreign = other.apply({
+        action: 'create',
+        message: 'written by the other window',
+        // A deliberately thin anchor, the way a hand-edited or older ledger
+        // can be: the answer still has to match the published schema.
+        anchor: { page: {}, keys: ['src/pages/index.astro#0.9'], breakpoint: {}, pin: null, fingerprint: null },
+        creationContext: {},
+      }).thread;
+
+      const raw = await call('comment', { action: 'resolve', threadId: A, message: 'done and verified' });
+      const refused = structured(raw);
+      check('a mutation the store will not save is not reported as done', refused.ok === false, JSON.stringify(refused));
+      check('and says exactly which conflict it was', refused.code === 'foreign_write', refused.code);
+      check('in words that tell the agent what to do next', /reloaded/.test(refused.message || ''), refused.message);
+      const refusalShape = await validateOutput('comment', raw);
+      check('the refusal still validates against the published schema', refusalShape.valid, refusalShape.errorMessage || '');
+
+      const onDisk = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+      check('the winning ledger is what is on disk', onDisk.threads.some((t) => t.messages[0].body === 'written by the other window'));
+      check('and the review was not resolved there', onDisk.threads.find((t) => t.id === A)?.status !== 'resolved', onDisk.threads.find((t) => t.id === A)?.status);
+      const after = await call('get_comments', { status: 'all', detail: 'full' });
+      check('get_comments does not show the unsaved resolution', !structured(after).reviews.some((r) => r.id === A && r.status === 'resolved'), JSON.stringify(structured(after).reviews.map((r) => `${r.id === A ? 'A' : r.number}:${r.status}`)));
+      check('and it does show the other window\u2019s review', structured(after).reviews.some((r) => r.id === foreign.id));
+      const thinShape = await validateOutput('get_comments', after);
+      check('a thin anchor from another window still validates', thinShape.valid, thinShape.errorMessage || '');
+
+      // Recovered, not wedged: the same call made again now lands.
+      const recovered = structured(await call('comment', { action: 'resolve', threadId: A, message: 'done and verified' }));
+      check('doing it again against the reloaded ledger works', recovered.ok === true, JSON.stringify(recovered));
+      check('and that resolution really is on disk', JSON.parse(fs.readFileSync(reviewFile, 'utf8')).threads.find((t) => t.id === A).status === 'resolved');
+      // Put the ledger back the way the rest of this file expects to find it.
+      await call('comment', { action: 'reopen', threadId: A, message: 'back to open' });
+      ledger.remove(foreign.id);
+      check('the ledger is back to the two these tests share', ledger.size === 2, String(ledger.size));
+    }
+
     // A single answer must not be tens of megabytes. Messages are capped per
     // review, but nothing capped the response: 200 maximal reviews is ~44MB
     // arriving in somebody's context window unasked.
@@ -1156,10 +1218,15 @@ const rawPost = (hostHeader, body) =>
         branch: 'main',
         sourceTrail: null,
       };
+      // Four maximal threads is already more than the budget: a full read of
+      // one is fifty 4000-character messages plus a maxed creation context,
+      // about 215KB. Four rather than forty because every mutation is a write
+      // now — the fixture is about the size of the ANSWER, and building it out
+      // of a thousand saved ledgers would only be measuring the disk.
       const heavy = [];
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 4; i++) {
         const made = ledger.apply({ action: 'create', message: 'm'.repeat(4000), anchor: bigAnchor, creationContext: bigContext }).thread;
-        for (let j = 0; j < 60; j++) ledger.apply({ action: 'reply', threadId: made.id, message: 'r'.repeat(4000) });
+        for (let j = 0; j < 50; j++) ledger.apply({ action: 'reply', threadId: made.id, message: 'r'.repeat(4000) });
         heavy.push(made.id);
       }
       const fat = structured(await call('get_comments', { status: 'all', detail: 'full', limit: 200 }));
@@ -1172,24 +1239,6 @@ const rawPost = (hostHeader, body) =>
       check('a summary read of the same ledger stays small', JSON.stringify(slim).length < 200_000, `${Math.round(JSON.stringify(slim).length / 1024)}KB`);
 
       // Every key the implementation sends must be DECLARED.
-      //
-      // Checked the way a real client checks it: the ACTUAL response body,
-      // against the ACTUAL schema this server publishes in tools/list, through
-      // the validator the SDK ships. Reading `structuredContent` and looking at
-      // its fields — which is what every other assertion in this file does — is
-      // exactly how `get_comments` came to be unusable from Claude Code
-      // ("data must NOT have additional properties") while the suite was green.
-      const published = Object.fromEntries(
-        ((await readBody(await post({ jsonrpc: '2.0', id: 9001, method: 'tools/list' })))?.result?.tools || []).map((t) => [
-          t.name,
-          t.outputSchema,
-        ])
-      );
-      const validateOutput = async (tool, response) => {
-        const schema = published[tool];
-        if (!schema) return { valid: false, errorMessage: `${tool} publishes no output schema` };
-        return await schemaValidator.getValidator(schema)(structured(response));
-      };
       check('the published get_comments schema is a closed one', published.get_comments?.additionalProperties === false);
       for (const shape of [
         ['a full read', { status: 'all', detail: 'full', limit: 3 }],

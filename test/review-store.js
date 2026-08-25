@@ -732,51 +732,154 @@ const anchorOf = (over) => {
     check('both stores start from the same empty ledger', A.size === 0 && B.size === 0);
 
     const bThread = B.apply({ action: 'create', message: 'from B', anchor }).thread;
-    await B.flush();
     check('B writes first and lands on disk', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
 
-    // A's memory predates B's write. Its write must not replace the file.
+    // A's memory predates B's write. Its write must not replace the file —
+    // and, just as important, A must not be TOLD its write happened.
     const aResult = A.apply({ action: 'create', message: 'from A', anchor });
-    await A.flush();
     const disk = JSON.parse(fs.readFileSync(file, 'utf8'));
     const bodies = disk.threads.map((t) => t.messages[0].body);
     check('B\u2019s review is still there', bodies.includes('from B'), JSON.stringify(bodies));
     check('A did not replace the ledger with its stale copy', !bodies.includes('from A'), JSON.stringify(bodies));
-    check('A says so rather than failing silently', A.problem?.kind === 'foreign_write', JSON.stringify(A.problem));
-    check('and the mutation still succeeded in A\u2019s own memory', aResult.ok);
+    check('and A was told, in the answer to its own call', aResult.ok === false && aResult.code === 'foreign_write', JSON.stringify(aResult));
+    check('with something a person could act on', /reloaded/.test(aResult.message || ''), aResult.message);
     check('the file on disk is still valid JSON', typeof disk.version === 'number' && Array.isArray(disk.threads));
     check('numbers were not handed out twice on disk', new Set(disk.threads.map((t) => t.number)).size === disk.threads.length);
     check('reopening sees the winning ledger', freshStore(file).get(bThread.id) !== null);
+
+    // No ghost. The refused mutation is gone from memory too, and A is now
+    // looking at the ledger that won rather than at its own stale copy.
+    check('the refused create is not in A\u2019s memory either', !A.all().some((t) => t.messages[0].body === 'from A'), JSON.stringify(A.all().map((t) => t.messages[0].body)));
+    check('and A has picked up the winner', A.get(bThread.id) !== null && A.size === 1);
+    check('A is usable again rather than stuck', A.writable === true && A.problem === null, JSON.stringify(A.problem));
+    // ...so the obvious next move — do it again — works, and lands.
+    const retry = A.apply({ action: 'create', message: 'from A', anchor });
+    check('doing it again against the fresh ledger works', retry.ok === true, JSON.stringify(retry));
+    check('and that one really is on disk', JSON.parse(fs.readFileSync(file, 'utf8')).threads.map((t) => t.messages[0].body).includes('from A'));
+    check('the high-water mark did not reuse B\u2019s number', retry.thread.number === 2, String(retry.thread.number));
+
+    // A stale RESOLVE is the dangerous one: an agent is told the feedback was
+    // dealt with and moves on.
+    const file4 = path.join(home, 'two-writers-resolve.json');
+    const G = freshStore(file4);
+    const made = G.apply({ action: 'create', message: 'the padding is wrong', anchor }).thread;
+    const H = freshStore(file4);
+    H.apply({ action: 'create', message: 'and the heading', anchor });
+    const stale = G.apply({ action: 'resolve', threadId: made.id, message: 'fixed and verified' });
+    check('a stale resolve is refused, not reported as done', stale.ok === false && stale.code === 'foreign_write', JSON.stringify(stale));
+    check('and the review is still open on disk', JSON.parse(fs.readFileSync(file4, 'utf8')).threads.find((t) => t.id === made.id).status === 'open');
+    check('and still open in memory — no resolution that nothing remembers', G.get(made.id).status === 'open', G.get(made.id).status);
+    check('while the other window\u2019s review is now visible here', G.size === 2, String(G.size));
 
     // The other order.
     const file2 = path.join(home, 'two-writers-2.json');
     const C = freshStore(file2);
     const D = freshStore(file2);
     C.apply({ action: 'create', message: 'from C', anchor });
-    await C.flush();
-    D.apply({ action: 'create', message: 'from D', anchor });
-    await D.flush();
+    const dResult = D.apply({ action: 'create', message: 'from D', anchor });
     const disk2 = JSON.parse(fs.readFileSync(file2, 'utf8')).threads.map((t) => t.messages[0].body);
     check('whoever wrote first keeps the ledger', disk2.join() === 'from C', JSON.stringify(disk2));
-    check('and the loser reports the conflict', D.problem?.kind === 'foreign_write', JSON.stringify(D.problem));
+    check('and the loser is told so by its own call', dResult.ok === false && dResult.code === 'foreign_write', JSON.stringify(dResult));
 
     // The race the naive fix does not close: BOTH read, THEN both write.
     // A stat-then-write with no lock lets each observe the same original file
-    // and then overwrite the other.
+    // and then overwrite the other. Now that the write happens inside the
+    // mutation, the second one finds out while it is still being asked.
     const file3 = path.join(home, 'two-writers-3.json');
     const E = freshStore(file3);
     const F = freshStore(file3);
-    E.apply({ action: 'create', message: 'from E', anchor });
-    F.apply({ action: 'create', message: 'from F', anchor });
-    // Interleaved with no await between them — the closest a single process
-    // gets to two of them arriving at once.
-    const both = Promise.all([E.flush(), F.flush()]);
-    await both;
+    const eResult = E.apply({ action: 'create', message: 'from E', anchor });
+    const fResult = F.apply({ action: 'create', message: 'from F', anchor });
     const disk3 = JSON.parse(fs.readFileSync(file3, 'utf8')).threads.map((t) => t.messages[0].body);
     check('an interleaved pair does not lose a review', disk3.length === 1, JSON.stringify(disk3));
-    check('and exactly one of them reports the conflict', [E, F].filter((s2) => s2.problem?.kind === 'foreign_write').length === 1, JSON.stringify([E.problem, F.problem]));
+    check('and exactly one of them was told it worked', [eResult, fResult].filter((r) => r.ok).length === 1, JSON.stringify([eResult.ok, fResult.ok]));
+    check('the other was told exactly why', [eResult, fResult].filter((r) => r.code === 'foreign_write').length === 1, JSON.stringify([eResult.code, fResult.code]));
     check('nextNumber never went backwards', JSON.parse(fs.readFileSync(file3, 'utf8')).nextNumber >= 2);
     check('no lock was left behind', !fs.existsSync(`${file3}.lock`));
+
+    // Every mutation, not just create: whatever is reported as done is on disk.
+    {
+      const file5 = path.join(home, 'durable.json');
+      const S = freshStore(file5);
+      const t1 = S.apply({ action: 'create', message: 'one', anchor }).thread;
+      const onDisk = () => JSON.parse(fs.readFileSync(file5, 'utf8'));
+      check('a create is on disk the moment it answers', onDisk().threads.length === 1);
+      check('a reply is on disk the moment it answers', S.apply({ action: 'reply', threadId: t1.id, message: 'two' }).ok && onDisk().threads[0].messages.length === 2);
+      check('a defer is on disk the moment it answers', S.apply({ action: 'defer', threadId: t1.id, reason: 'later' }).ok && onDisk().threads[0].status === 'deferred');
+      check('a reopen is on disk the moment it answers', S.apply({ action: 'reopen', threadId: t1.id }).ok && onDisk().threads[0].status === 'open');
+      check('a resolve is on disk the moment it answers', S.apply({ action: 'resolve', threadId: t1.id }).ok && onDisk().threads[0].status === 'resolved');
+      check('a recolour is on disk the moment it answers', S.setColor(t1.id, 'teal').ok && onDisk().threads[0].color === 'teal');
+      check('an anchor sync is on disk the moment it answers', S.syncAnchors([{ id: t1.id, anchorState: 'orphaned' }]).ok && onDisk().threads[0].anchorState === 'orphaned');
+      check('a delete is on disk the moment it answers', S.remove(t1.id).ok && onDisk().threads.length === 0);
+      check('and the number it used stays used', onDisk().nextNumber === 2, String(onDisk().nextNumber));
+    }
+  }
+
+  // ── Whose lock is it ──────────────────────────────────────────────────────
+  //
+  // The lock is held for a read, a write and a rename, so one that is seconds
+  // old has almost certainly been left behind by a process that died. Almost:
+  // a Stacki that was suspended, or on a laptop that slept mid-write, is still
+  // going to finish. Taking its lock away puts two writers inside the section
+  // this file exists to keep to one.
+  {
+    const anchor = anchorFrom(payload()).anchor;
+    const backdate = (lock, ms) => {
+      const when = new Date(Date.now() - ms);
+      fs.utimesSync(lock, when, when);
+    };
+
+    // A crashed Stacki. Its pid is gone, so there is nothing to wait for and
+    // the lock goes at once rather than after ten seconds of nothing.
+    {
+      const file = path.join(home, 'lock-dead.json');
+      const store = freshStore(file);
+      const lock = `${file}.lock`;
+      fs.mkdirSync(lock, { recursive: true });
+      fs.writeFileSync(path.join(lock, 'owner'), '4000000');
+      const began = Date.now();
+      const made = store.apply({ action: 'create', message: 'after a crash', anchor });
+      check('a lock whose owner is gone does not block a write', made.ok === true, JSON.stringify(made));
+      check('and it is not waited out first', Date.now() - began < 500, `${Date.now() - began}ms`);
+      check('the write really landed', JSON.parse(fs.readFileSync(file, 'utf8')).threads.length === 1);
+      check('and the lock was cleaned up', !fs.existsSync(lock));
+    }
+
+    // A Stacki that is still there. Its lock is older than the age rule, and
+    // that is not a reason to take it: it may have been stopped mid-write.
+    {
+      const file = path.join(home, 'lock-live.json');
+      const store = freshStore(file);
+      const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+      const lock = `${file}.lock`;
+      fs.mkdirSync(lock, { recursive: true });
+      fs.writeFileSync(path.join(lock, 'owner'), String(process.pid));
+      backdate(lock, 30_000);
+      const made = store.apply({ action: 'create', message: 'while somebody holds it', anchor });
+      check('a lock whose owner still answers is respected', made.ok === false, JSON.stringify(made));
+      check('and the caller is told rather than left guessing', made.code === 'write_failed', made.code);
+      check('the file was not written over', (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null) === before);
+      check('and the refused create is not in memory either', store.size === 0, String(store.size));
+      fs.rmSync(lock, { recursive: true, force: true });
+      check('once it is released the same call works', store.apply({ action: 'create', message: 'now then', anchor }).ok === true);
+    }
+
+    // A lock with no name on it — a crash between taking it and writing the
+    // owner in. The rule this always had still applies.
+    {
+      const file = path.join(home, 'lock-anon.json');
+      const store = freshStore(file);
+      const lock = `${file}.lock`;
+      fs.mkdirSync(lock, { recursive: true });
+      backdate(lock, 30_000);
+      check('an old lock with no owner is still reaped on age', store.apply({ action: 'create', message: 'nameless', anchor }).ok === true);
+      check('but a fresh one with no owner is not', (() => {
+        fs.mkdirSync(lock, { recursive: true });
+        const r = store.apply({ action: 'reply', threadId: store.all()[0].id, message: 'blocked' });
+        fs.rmSync(lock, { recursive: true, force: true });
+        return r.ok === false && r.code === 'write_failed';
+      })());
+    }
   }
 
   // loadFile on its own, since the store swallows the shape it returns.

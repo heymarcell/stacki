@@ -189,15 +189,20 @@ export function samePeerPath(then, now) {
 /**
  * Where a review's node is in this model now.
  *
- * The ladder runs from proof to evidence to nothing, and never guesses:
+ * The ladder runs from proof to evidence to nothing:
  *
- *   1. The stored slot is provably still the same slot — either the node has
+ *   1. The stored slot is provably still the same SLOT — either the node has
  *      no same-kind siblings to be confused with, or the sibling run is
- *      exactly the size and shape it was when the review was written.
+ *      exactly the size and shape it was when the review was written. Note
+ *      what that proves and what it does not: nothing slid past this position.
+ *      Whether the thing standing in it is the same NODE is a separate
+ *      question, and when the recorded words are gone it is not one this can
+ *      answer — see "What this cannot do" below.
  *
- *   2. It isn't, so the recorded marks have to identify it: same kind, same
- *      tag, same ancestor labels AND the same words. Exactly one such node is
- *      an answer. Two or more is a coin toss, and a coin toss is an orphan.
+ *   2. The slot moved, so the recorded marks have to identify it: same kind,
+ *      same tag, same ancestor labels AND the same words. Exactly one such
+ *      node is an answer. Two or more is a coin toss, and a coin toss is an
+ *      orphan.
  *
  *   3. Nothing carries the recorded words — they were edited. The slot is
  *      usable only when there is exactly one candidate in the whole file, so
@@ -209,7 +214,36 @@ export function samePeerPath(then, now) {
  * left, so the only honest answer is `orphaned` — a review pointing at the
  * wrong card is far worse than one pointing at nothing.
  *
- * Answers `{ id, trail, confidence, reason }` — `exact`, `moved`, or `none`.
+ * WHAT THIS CANNOT DO, and why it does not pretend otherwise.
+ *
+ * Two same-kind siblings swap places while the reviewed one's words are also
+ * edited, all in one save. Nothing was added or removed, so every sibling run
+ * is the shape it always was; and the old words are gone, so nothing points at
+ * where the node went. That input is not merely hard to read — it is the SAME
+ * input as an ordinary in-place copy edit on two neighbouring nodes. The two
+ * edits produce byte-identical source (test/review-anchor.js proves it by
+ * building both), so no function of the tree and the fingerprint can answer
+ * both correctly. It is not a gap in the rules; it is the absence of a stable
+ * node identity in the source, and the only cures are writing ids into
+ * somebody's project or keeping an edit log — a second source-mapping system.
+ * Neither is worth it for this.
+ *
+ * So a prior is chosen, deliberately: KEEP THE SLOT. An in-place copy edit is
+ * what happens every time a piece of feedback is acted on — it is the dominant
+ * outcome of this whole feature — and orphaning it would turn every success
+ * into a lost anchor. A reorder-and-rename in one save is rare by comparison,
+ * and when the prior is wrong it lands the review on an adjacent node of the
+ * same kind under the same ancestors, with the pin visibly moving and the
+ * frozen creationContext still describing what was meant. Wrong, but bounded
+ * and visible; the alternative is quietly broken all the time.
+ *
+ * Answers `{ id, trail, confidence, reason }`:
+ *
+ *   exact       the slot held and the words still agree, or there were none
+ *   positional  the slot held on structure alone and the words are gone — the
+ *               node is very probably right and is not proven to be
+ *   moved       found somewhere else by its recorded marks
+ *   none        orphaned; `reason` says which way
  */
 export function resolveNode(nodes, indexPath, fingerprint, { labelOf } = {}) {
   const list = Array.isArray(nodes) ? nodes : [];
@@ -258,7 +292,10 @@ export function resolveNode(nodes, indexPath, fingerprint, { labelOf } = {}) {
       // is weaker, and it is why `peers` exists for everything written from
       // now on; orphaning every such review on sight would be worse.
       (!then && (!wanted || atSays)));
-  if (slotHeld) return { id: at.id, trail, confidence: 'exact', reason: null };
+  // Held, but say how. `exact` is the slot plus corroborating words; when the
+  // recorded words are gone this is a position that nothing slid past, which is
+  // a weaker thing and is named as one rather than dressed up as proof.
+  if (slotHeld) return { id: at.id, trail, confidence: atSays ? 'exact' : 'positional', reason: null };
 
   // 2 — exactly one node still carries every recorded mark.
   if (marked.length === 1) {
