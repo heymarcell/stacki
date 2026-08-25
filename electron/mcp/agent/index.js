@@ -503,7 +503,10 @@ function createAgentApi({
     const op = registry.find('style', action);
     if (!op) return no('bad_action', `style has no action "${action}".`);
 
-    if (op.via === 'main') return runMain('style', action, args, ctx);
+    // Through the same door as every other main-process write, so a variable
+    // edit lands on the undo stack and a stylesheet the editor has open is
+    // taken from disk again.
+    if (op.via === 'main') return mainWithSync('style', action, args, ctx, op);
 
     let anchor = null;
     if (args.ref) {
@@ -584,27 +587,134 @@ function createAgentApi({
   async function mainWithSync(domain, action, args, ctx, op) {
     if (op.risk === 'read') return runMain(domain, action, args, ctx);
     const openFile = ctx.payload?.page?.file ? relativeTo(ctx.root, ctx.payload.page.file) : null;
-    // The open PAGE is what the canvas is showing; the open DOCUMENT may be a
-    // component drilled into. Watch both — either changing under the model is
-    // the same problem.
-    const watching = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
+    // Two different lists, for two different questions.
+    //
+    //   `editing` is what the editor is holding — the page on the canvas and
+    //   the document drilled into. If one of those moves under the model, the
+    //   model has to be taken from disk again.
+    //
+    //   `named` is what this operation says it is about. That is what an undo
+    //   command puts back, and it is deliberately not the same list: a
+    //   stylesheet edit that changed no open document still wants an undo, and
+    //   reloading the editor for it would be pointless churn.
+    const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
+    const named = [...new Set(touchedBy(domain, action, args, ctx).filter(Boolean))];
+    const watching = [...new Set([...editing, ...named])];
     const before = snapshot(watching);
     const result = await runMain(domain, action, args, ctx);
+    const undone = result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching);
     const moved = watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel));
-    if (!moved.length) return result;
+    const reloadNeeded = editing.some((rel) => moved.includes(rel));
+    if (!moved.length) return { ...result, ...(op.undoable ? { undoable: undone } : {}) };
+    if (!reloadNeeded) {
+      return { ...result, ...(op.undoable ? { undoable: undone } : {}), changedFiles: changed(moved, before) };
+    }
     const synced = await command({ domain: 'project', action: 'reload_open_document' }, COMMAND_TIMEOUT_MS);
     return {
       ...result,
+      ...(op.undoable ? { undoable: undone } : {}),
       // Said out loud rather than done quietly: reloading the document drops
       // the page's undo snapshots, because they describe a tree that is no
       // longer there.
       editorReloaded: !!synced?.reloaded,
       document: synced?.document || null,
       note: synced?.reloaded
-        ? `${moved.join(', ')} is open in Stacki, so the editor took it from disk again. Its undo history for that page is gone — a semantic edit through target would have kept it.`
+        ? `${editing.filter((rel) => moved.includes(rel)).join(', ')} is open in Stacki, so the editor took it from disk again. Its undo history for that page is gone — a semantic edit through target would have kept it.`
         : result.note ?? null,
       changedFiles: changed(moved, before),
     };
+  }
+
+  /**
+   * Which files an operation is about, so a change to one can be put back.
+   *
+   * Named rather than discovered: a CSS variable edit can touch several
+   * stylesheets, and reading the whole project before and after every write to
+   * find out which would cost more than the write.
+   */
+  function touchedBy(domain, action, args, ctx) {
+    if (domain === 'style') {
+      if (action === 'write_source') return [args.path];
+      // A variable edit reaches whichever stylesheets declare the names it
+      // touches; the variables read says which files those are.
+      return VARIABLE_ACTIONS.has(action) ? styleVariableFiles(ctx) : [];
+    }
+    if (domain === 'content' && action === 'cms_write') {
+      const raw = String(args.path || '');
+      return [raw.includes('#') ? raw.slice(0, raw.indexOf('#')) : raw];
+    }
+    return [];
+  }
+
+  const VARIABLE_ACTIONS = new Set([
+    'set_variable', 'add_variables', 'rename_variables', 'move_variables',
+    'add_section', 'set_section_title', 'remove_section', 'move_heading',
+  ]);
+
+  /** The stylesheets that declare custom properties. Read once per write. */
+  function styleVariableFiles(ctx) {
+    try {
+      const cssVars = require('../../cssVars');
+      return (cssVars.readVariables(ctx.root)?.files || []).map((f) => f.rel);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Put a main-process write on the app's own undo stack.
+   *
+   * Only for the operations the panels make undoable, and only with the inverse
+   * the panels use. A content change is the bytes put back; a rename or a move
+   * is itself read backwards. Anything that does not fit one of those is not
+   * recorded, because a half-inverse on an undo stack is worse than a gap in it.
+   */
+  async function recordUndo(domain, action, args, ctx, op, before, watching) {
+    if (!op.undoable) return false;
+    let restore = null;
+    if (domain === 'asset' && action === 'rename') {
+      const dir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
+      const landed = dir ? `${dir}/${args.name}` : args.name;
+      restore = {
+        kind: 'asset_rename',
+        back: { rel: landed, name: String(args.path).slice(String(args.path).lastIndexOf('/') + 1) },
+        forward: { rel: args.path, name: args.name },
+      };
+    } else if (domain === 'asset' && action === 'move') {
+      const name = String(args.path).slice(String(args.path).lastIndexOf('/') + 1);
+      const fromDir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
+      const landed = args.toFolder ? `${args.toFolder}/${name}` : name;
+      restore = {
+        kind: 'asset_move',
+        back: { fromRel: landed, toDirRel: fromDir },
+        forward: { fromRel: args.path, toDirRel: args.toFolder },
+      };
+    } else {
+      // A content change: the bytes, for every file that actually moved and
+      // existed on both sides. A file that appeared or vanished is not a
+      // content change and has no bytes-inverse.
+      const files = {};
+      for (const rel of watching) {
+        const then = before.get(rel) ?? null;
+        const now = readFile(rel);
+        if (then === null || now === null || then === now) continue;
+        files[rel] = { before: then, after: now };
+      }
+      if (!Object.keys(files).length) return false;
+      restore = { kind: 'files', files };
+    }
+    const answer = await command(
+      {
+        domain: 'project',
+        action: 'record_undo',
+        label: `${domain}.${action}`,
+        // One step per burst, the way a slider drag is one step.
+        coalesceKey: `agent:${domain}.${action}`,
+        restore,
+      },
+      COMMAND_TIMEOUT_MS
+    );
+    return !!answer?.undoable;
   }
 
   // --- capabilities ----------------------------------------------------------

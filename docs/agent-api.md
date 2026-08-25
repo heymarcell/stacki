@@ -171,8 +171,31 @@ fields call: a stylesheet edit records an undo command on the app's stack, and a
 `<style>` block goes through the page model like any other edit. Nothing is
 special-cased for agents.
 
-Operations that are *not* undoable in the UI are not undoable here either. This
-does not invent history the app does not have.
+Writes that never touch the page model — a CSS variable, a content edit, an
+asset rename — get an undo entry of their own, because that is what the panels
+do for them: without one, ⌘Z would skip straight past to the last layout change.
+The inverse is the panels' inverse. A content change is the bytes put back; a
+rename or a move is itself read backwards. There is no third kind, and an
+operation that fits neither is not recorded rather than recorded wrongly.
+
+Operations that are *not* undoable in the UI are not undoable here either — a
+page delete, a git commit, a dependency install. This does not invent history
+the app does not have, and the result says `undoable` so an agent is not left
+guessing.
+
+### A raw write to the file the editor has open
+
+`source.write` to the open page leaves the model in memory describing a file
+that is gone, and the writer marks its own writes so the watcher does not echo
+them — which is right for the app's own save and wrong for this. Left alone, the
+next model save would put the old markup back over the new file.
+
+So after any write, if the open document's bytes moved, the renderer is asked to
+take it from disk again: the same reload the watcher does for an outside editor,
+because that is what this is. The answer says `editorReloaded`, and says that the
+page's undo snapshots went with it — they describe a tree that is no longer
+there. A semantic edit through `target` would have kept them, and the note says
+so.
 
 ## Bound text
 

@@ -180,6 +180,56 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     await H.settle(300);
   }
 
+  // ── ⌘Z reaches the writes that never touch the page model ──────────────────
+  //
+  // A CSS variable, a content edit, an asset rename: none of them go through
+  // the document, so the panels record their own undo entries for them. An
+  // agent's version has to land in the same place, or the stack tells a story
+  // that leaves things out.
+
+  {
+    const vars = await run('style', 'variables');
+    const gap = vars.files[0].groups[0].blocks[0].rows.find((r) => r.name === '--gap').cells[0];
+    check('a variable read says where its value sits', Number.isInteger(gap.valueStart) && gap.file === 'src/styles/site.css', short(gap));
+
+    const before = app.read('src/styles/site.css');
+    const set = await run('style', 'set_variable', {
+      edit: { file: gap.file, valueStart: gap.valueStart, valueEnd: gap.valueEnd, value: '2rem', expect: '1rem' },
+    });
+    check('and the value can be changed', set.ok && /--gap: 2rem/.test(app.read('src/styles/site.css')), short(set));
+    check('and it says it is undoable', set.undoable === true, short(set.undoable));
+    await H.settle(150);
+    await run('project', 'undo');
+    await H.settle(350);
+    check('and ⌘Z puts the variable back', app.read('src/styles/site.css') === before, app.read('src/styles/site.css'));
+    await run('project', 'redo');
+    await H.settle(350);
+    check('and redo takes it forward again', /--gap: 2rem/.test(app.read('src/styles/site.css')));
+    await run('project', 'undo');
+    await H.settle(350);
+
+    // A write that names an offset in a file that has moved must refuse.
+    const stale = await run('style', 'set_variable', {
+      edit: { file: gap.file, valueStart: gap.valueStart, valueEnd: gap.valueEnd, value: '3rem', expect: 'something else' },
+    });
+    check('a variable write against a value that is not there is refused', stale.ok === false || stale.stale === true, short(stale));
+    check('and the stylesheet is untouched', app.read('src/styles/site.css') === before);
+
+    const wrote = await run('content', 'cms_write', { path: 'src/data/site.json', data: { title: 'X', tagline: 'Y' } });
+    check('a content write is undoable too', wrote.undoable === true, short(wrote));
+    await H.settle(150);
+    await run('project', 'undo');
+    await H.settle(350);
+    check('and ⌘Z puts the data back', /A place to test things/.test(app.read('src/data/site.json')));
+
+    const renamed = await run('asset', 'rename', { path: 'public/robots.txt', name: 'r2.txt' });
+    check('and so is an asset rename', renamed.undoable === true, short(renamed));
+    await H.settle(150);
+    await run('project', 'undo');
+    await H.settle(350);
+    check('which ⌘Z reads backwards rather than by bytes', app.exists('public/robots.txt') && !app.exists('public/r2.txt'));
+  }
+
   // ── E. Bound content ───────────────────────────────────────────────────────
   //
   // The rule that matters most: what is rendered from an expression is never

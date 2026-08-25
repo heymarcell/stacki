@@ -205,14 +205,63 @@ const StyleInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('read_source'), path: RelPath }),
   z.object({ action: z.literal('write_source'), path: RelPath, css: z.string().max(2_000_000), expectedDigest: Digest.optional() }),
   z.object({ action: z.literal('variables'), limit: z.number().int().min(1).max(400).optional() }),
-  z.object({ action: z.literal('set_variable'), edit: z.record(z.string(), z.unknown()).describe('The edit, as the Variables panel makes it: the section, the name, and the new value or name.') }),
-  z.object({ action: z.literal('add_variables'), adds: z.array(z.record(z.string(), z.unknown())).min(1).max(100) }),
-  z.object({ action: z.literal('rename_variables'), renames: z.array(z.record(z.string(), z.unknown())).min(1).max(100) }),
-  z.object({ action: z.literal('move_variables'), moves: z.array(z.record(z.string(), z.unknown())).min(1).max(100) }),
-  z.object({ action: z.literal('add_section'), edit: z.record(z.string(), z.unknown()) }),
-  z.object({ action: z.literal('set_section_title'), edit: z.record(z.string(), z.unknown()) }),
-  z.object({ action: z.literal('remove_section'), edit: z.record(z.string(), z.unknown()) }),
-  z.object({ action: z.literal('move_heading'), edit: z.record(z.string(), z.unknown()) }),
+  z.object({
+    action: z.literal('set_variable'),
+    // The offsets are the ones `variables` reported for that cell. They are
+    // required, and they are why `expect` is worth passing: the write is at a
+    // position in a file, and a file that moved under it should refuse rather
+    // than write somewhere else.
+    edit: z.object({
+      file: RelPath,
+      valueStart: z.number().int().min(0),
+      valueEnd: z.number().int().min(0),
+      value: z.string().max(2000),
+      expect: z.string().max(2000).optional().describe('The value that is there now, as `variables` reported it. Passing it makes a moved file a refusal.'),
+    }),
+  }),
+  z.object({
+    action: z.literal('add_variables'),
+    adds: z
+      .array(z.object({ file: RelPath, selector: z.string().max(300), name: z.string().max(200), value: z.string().max(2000).optional(), after: z.string().max(200).optional() }))
+      .min(1)
+      .max(100),
+  }),
+  z.object({
+    action: z.literal('rename_variables'),
+    renames: z.array(z.object({ from: z.string().max(200), to: z.string().max(200) })).min(1).max(100),
+  }),
+  z.object({
+    action: z.literal('move_variables'),
+    moves: z
+      .array(
+        z.object({
+          file: RelPath,
+          selector: z.string().max(300),
+          name: z.string().max(200).optional().describe('One variable. Give `names` instead to move a whole section.'),
+          names: z.array(z.string().max(200)).max(200).optional(),
+          target: z.string().max(300).optional(),
+          at: z.number().int().min(0).optional(),
+        })
+      )
+      .min(1)
+      .max(100),
+  }),
+  z.object({
+    action: z.literal('add_section'),
+    edit: z.object({ file: RelPath, selector: z.string().max(300), title: z.string().max(200), before: z.string().max(200).optional(), at: z.number().int().min(0).optional() }),
+  }),
+  z.object({
+    action: z.literal('set_section_title'),
+    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), title: z.string().max(200), expect: z.string().max(4000).optional() }),
+  }),
+  z.object({
+    action: z.literal('remove_section'),
+    edit: z.object({ file: RelPath, start: z.number().int().min(0), end: z.number().int().min(0), expect: z.string().max(20000).optional() }),
+  }),
+  z.object({
+    action: z.literal('move_heading'),
+    edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).optional() }),
+  }),
 ]);
 
 // --- source ------------------------------------------------------------------

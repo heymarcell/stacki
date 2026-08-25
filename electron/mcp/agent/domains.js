@@ -611,6 +611,27 @@ const asset = {
 
 // --- style (the parts that are files rather than the live cascade) -----------
 
+/** One stylesheet edit, with its file checked. */
+function cssEdit(ctx, edit) {
+  if (!edit || typeof edit !== 'object') return problem('bad_request', 'edit is required.');
+  const at = rel(ctx, edit.file, 'stylesheet path');
+  if (at.error) return at;
+  return { projectPath: ctx.root, ...edit, file: at.rel };
+}
+
+/** A list of them, refused as a set: half a batch of variable edits is worse. */
+function cssEdits(ctx, list, what) {
+  if (!Array.isArray(list) || !list.length) return problem('bad_request', `${what} must name at least one edit.`);
+  const out = [];
+  for (const edit of list) {
+    const built = cssEdit(ctx, edit);
+    if (built.error) return built;
+    const { projectPath, ...rest } = built;
+    out.push(rest);
+  }
+  return { projectPath: ctx.root, [what]: out };
+}
+
 const style = {
   read_source: {
     channel: 'style:readFile',
@@ -660,14 +681,20 @@ const style = {
       };
     },
   },
-  set_variable: { channel: 'css:setVariable', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
-  add_variables: { channel: 'css:addVariables', args: (input, ctx) => ({ projectPath: ctx.root, adds: input.adds }) },
+  // Every one of these writes at an OFFSET in a stylesheet — that is how the
+  // Variables panel edits one value without reformatting the file around it.
+  // Which makes the file argument the sharpest edge in this domain: an offset
+  // is meaningless anywhere else, and a missing one is not a no-op but a write
+  // over the whole file. So the path is validated here and the numbers are
+  // required by the schema.
+  set_variable: { channel: 'css:setVariable', args: (input, ctx) => cssEdit(ctx, input.edit) },
+  add_variables: { channel: 'css:addVariables', args: (input, ctx) => cssEdits(ctx, input.adds, 'adds') },
   rename_variables: { channel: 'css:renameVariables', args: (input, ctx) => ({ projectPath: ctx.root, renames: input.renames }) },
-  move_variables: { channel: 'css:moveVariables', args: (input, ctx) => ({ projectPath: ctx.root, moves: input.moves }) },
-  add_section: { channel: 'css:addSection', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
-  set_section_title: { channel: 'css:setSectionTitle', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
-  remove_section: { channel: 'css:removeSection', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
-  move_heading: { channel: 'css:moveHeading', args: (input, ctx) => ({ projectPath: ctx.root, ...input.edit }) },
+  move_variables: { channel: 'css:moveVariables', args: (input, ctx) => cssEdits(ctx, input.moves, 'moves') },
+  add_section: { channel: 'css:addSection', args: (input, ctx) => cssEdit(ctx, input.edit) },
+  set_section_title: { channel: 'css:setSectionTitle', args: (input, ctx) => cssEdit(ctx, input.edit) },
+  remove_section: { channel: 'css:removeSection', args: (input, ctx) => cssEdit(ctx, input.edit) },
+  move_heading: { channel: 'css:moveHeading', args: (input, ctx) => cssEdit(ctx, input.edit) },
 };
 
 // --- project -----------------------------------------------------------------

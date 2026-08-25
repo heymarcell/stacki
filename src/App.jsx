@@ -4269,6 +4269,50 @@ export default function App() {
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+    /**
+     * Put a write the main process carried out on the undo stack.
+     *
+     * The panels do this for exactly these operations — a CSS variable, a
+     * content edit, an asset rename — because none of them touch the page
+     * model, so without an entry ⌘Z would skip straight past them to the last
+     * layout change. An agent's version of the same operation has to land in
+     * the same place or the stack tells a story that leaves things out.
+     *
+     * The inverse is the panels' inverse. A content change is the bytes put
+     * back; a rename or a move is the rename or the move read backwards. There
+     * is no third kind, and something that does not fit one of them is not
+     * recorded rather than recorded wrongly.
+     */
+    recordUndo: async ({ label, coalesceKey, restore }) => {
+      if (!restore || !project?.path) return false;
+      const put = async (which) => {
+        if (restore.kind === 'files') {
+          for (const [rel, pair] of Object.entries(restore.files || {})) {
+            if (typeof pair?.[which] !== 'string') continue;
+            await window.avb.writeSourceText({ projectPath: project.path, rel, text: pair[which] });
+          }
+        } else if (restore.kind === 'asset_rename') {
+          const step = which === 'before' ? restore.back : restore.forward;
+          await window.avb.renameAsset({ projectPath: project.path, rel: step.rel, newName: step.name });
+        } else if (restore.kind === 'asset_move') {
+          const step = which === 'before' ? restore.back : restore.forward;
+          await window.avb.moveAsset({ projectPath: project.path, fromRel: step.fromRel, toDirRel: step.toDirRel });
+        } else {
+          return;
+        }
+        // The panels reload after their own undo for the same reason: the file
+        // it rewrote may be the one on screen.
+        setRefreshKey((k) => k + 1);
+        await reloadOpenPageRef.current?.();
+      };
+      pushCommand({
+        label: label || 'that change',
+        coalesceKey: coalesceKey ?? null,
+        undo: () => put('before'),
+        redo: () => put('after'),
+      });
+      return true;
+    },
     // The open document changed on disk under the editor. Same reload the file
     // watcher does — see reloadOpenPageRef.
     reloadOpenPage: async () => {

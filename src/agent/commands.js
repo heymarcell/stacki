@@ -329,7 +329,7 @@ export function createAgentCommands(getApp) {
     return fail('bad_action', `style has no action "${action}".`);
   }
 
-  async function project(action) {
+  async function project(action, args = {}) {
     const a = app();
     if (action === 'undo') {
       const before = a.historyDepth();
@@ -348,6 +348,13 @@ export function createAgentCommands(getApp) {
     // or the schemas. The main process sends it after a write that changed the
     // file the editor has open, so the model, the disk and the canvas agree
     // again before anybody reads the next revision.
+    // Also not an action any tool can name. The main process sends it after a
+    // write it carried out itself, so that write lands on the same undo stack
+    // the panel's version of it lands on.
+    if (action === 'record_undo') {
+      const done = await a.recordUndo(args);
+      return { ok: true, undoable: !!done };
+    }
     if (action === 'reload_open_document') {
       const done = await a.reloadOpenPage();
       return { ...done, document: documentOf(a) };

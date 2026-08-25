@@ -94,7 +94,7 @@ const OPERATIONS = {
     remove_property: { risk: 'write', via: 'renderer', undoable: true, summary: 'Remove one authored declaration.', reuses: 'src/style-panel/lib/css.ts removeDeclaration' },
     set_declarations: { risk: 'write', via: 'renderer', undoable: true, summary: 'Set several properties on one rule in a single step.', reuses: 'src/style-panel/lib/css.ts' },
     read_source: { risk: 'read', via: 'main', channel: 'style:readFile', summary: 'A stylesheet as text.', reuses: 'electron/main.js style:readFile' },
-    write_source: { risk: 'write', via: 'main', channel: 'style:writeFile', summary: 'Replace a stylesheet.', reuses: 'electron/main.js style:writeFile' },
+    write_source: { risk: 'write', via: 'main', channel: 'style:writeFile', undoable: true, summary: 'Replace a stylesheet.', reuses: 'electron/main.js style:writeFile' },
     variables: { risk: 'read', via: 'main', channel: 'css:variables', summary: 'The project CSS custom properties, in their sections.', reuses: 'electron/cssVars.js' },
     set_variable: { risk: 'write', via: 'main', channel: 'css:setVariable', undoable: true, summary: "Change a variable's value or name.", reuses: 'electron/cssVars.js' },
     add_variables: { risk: 'write', via: 'main', channel: 'css:addVariables', undoable: true, summary: 'Add variables to a section.', reuses: 'electron/cssVars.js' },
@@ -134,7 +134,7 @@ const OPERATIONS = {
   content: {
     cms_list: { risk: 'read', via: 'main', channel: 'cms:list', summary: 'The JSON data files under src/.', reuses: 'electron/main.js cms:list' },
     cms_read: { risk: 'read', via: 'main', channel: 'cms:read', summary: 'One data file, with its inferred schema.', reuses: 'electron/main.js cms:read' },
-    cms_write: { risk: 'write', via: 'main', channel: 'cms:write', summary: 'Replace a data file.', reuses: 'electron/main.js cms:write' },
+    cms_write: { risk: 'write', via: 'main', channel: 'cms:write', undoable: true, summary: 'Replace a data file.', reuses: 'electron/main.js cms:write' },
     cms_create: { risk: 'write', via: 'main', channel: 'cms:create', summary: 'Create a data file.', reuses: 'electron/main.js cms:create' },
     cms_delete: { risk: 'high', via: 'main', channel: 'cms:delete', summary: 'Delete a data file.', reuses: 'electron/main.js cms:delete' },
     cms_usage: { risk: 'read', via: 'main', channel: 'cms:usage', summary: 'Which pages read a data file.', reuses: 'electron/cmsRefs.js' },
@@ -158,8 +158,8 @@ const OPERATIONS = {
     read_text: { risk: 'read', via: 'main', channel: 'assets:readText', summary: 'A text asset.', reuses: 'electron/main.js assets:readText' },
     write_text: { risk: 'write', via: 'main', channel: 'assets:writeText', summary: 'Replace a text asset.', reuses: 'electron/main.js assets:writeText' },
     mkdir: { risk: 'write', via: 'main', channel: 'assets:mkdir', summary: 'Create an asset folder.', reuses: 'electron/main.js assets:mkdir' },
-    move: { risk: 'write', via: 'main', channel: 'assets:move', summary: 'Move an asset into another folder.', reuses: 'electron/main.js assets:move' },
-    rename: { risk: 'write', via: 'main', channel: 'assets:rename', summary: 'Rename an asset.', reuses: 'electron/main.js assets:rename' },
+    move: { risk: 'write', via: 'main', channel: 'assets:move', undoable: true, summary: 'Move an asset into another folder.', reuses: 'electron/main.js assets:move' },
+    rename: { risk: 'write', via: 'main', channel: 'assets:rename', undoable: true, summary: 'Rename an asset.', reuses: 'electron/main.js assets:rename' },
     delete: { risk: 'high', via: 'main', channel: 'assets:delete', summary: 'Delete an asset.', reuses: 'electron/main.js assets:delete' },
   },
 

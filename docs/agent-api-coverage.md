@@ -45,7 +45,7 @@ says so.
 | `remove_property` | Edit project | renderer | ⌘Z | src/style-panel/lib/css.ts removeDeclaration | Remove one authored declaration. |
 | `set_declarations` | Edit project | renderer | ⌘Z | src/style-panel/lib/css.ts | Set several properties on one rule in a single step. |
 | `read_source` | Inspect | main | — | electron/main.js style:readFile | A stylesheet as text. |
-| `write_source` | Edit project | main | — | electron/main.js style:writeFile | Replace a stylesheet. |
+| `write_source` | Edit project | main | ⌘Z | electron/main.js style:writeFile | Replace a stylesheet. |
 | `variables` | Inspect | main | — | electron/cssVars.js | The project CSS custom properties, in their sections. |
 | `set_variable` | Edit project | main | ⌘Z | electron/cssVars.js | Change a variable's value or name. |
 | `add_variables` | Edit project | main | ⌘Z | electron/cssVars.js | Add variables to a section. |
@@ -91,7 +91,7 @@ says so.
 | --- | --- | --- | --- | --- | --- |
 | `cms_list` | Inspect | main | — | electron/main.js cms:list | The JSON data files under src/. |
 | `cms_read` | Inspect | main | — | electron/main.js cms:read | One data file, with its inferred schema. |
-| `cms_write` | Edit project | main | — | electron/main.js cms:write | Replace a data file. |
+| `cms_write` | Edit project | main | ⌘Z | electron/main.js cms:write | Replace a data file. |
 | `cms_create` | Edit project | main | — | electron/main.js cms:create | Create a data file. |
 | `cms_delete` | Full control | main | — | electron/main.js cms:delete | Delete a data file. |
 | `cms_usage` | Inspect | main | — | electron/cmsRefs.js | Which pages read a data file. |
@@ -117,8 +117,8 @@ says so.
 | `read_text` | Inspect | main | — | electron/main.js assets:readText | A text asset. |
 | `write_text` | Edit project | main | — | electron/main.js assets:writeText | Replace a text asset. |
 | `mkdir` | Edit project | main | — | electron/main.js assets:mkdir | Create an asset folder. |
-| `move` | Edit project | main | — | electron/main.js assets:move | Move an asset into another folder. |
-| `rename` | Edit project | main | — | electron/main.js assets:rename | Rename an asset. |
+| `move` | Edit project | main | ⌘Z | electron/main.js assets:move | Move an asset into another folder. |
+| `rename` | Edit project | main | ⌘Z | electron/main.js assets:rename | Rename an asset. |
 | `delete` | Full control | main | — | electron/main.js assets:delete | Delete an asset. |
 
 ## project
@@ -197,5 +197,5 @@ says so.
 
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 45 more in Edit project, 18 more in Full control.
-- 27 land on Stacki's own undo stack.
+- 31 land on Stacki's own undo stack.
 - 50 capabilities deliberately kept out.
