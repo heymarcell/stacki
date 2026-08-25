@@ -18,9 +18,10 @@ MIT licensed — fork it, build on it, ship your own version.
 - **Comments** — press **C** and click anything on the page to leave a comment on it. The comment stays attached
   to that element — at the breakpoint you left it at, and on the copy of it you were looking at — and your coding
   agent can read them, go and look at each one, do the work, and close the loop. See [Comments](#comments).
-- **Let an AI see what's selected (MCP)** — Stacki runs a small [MCP](https://modelcontextprotocol.io)
+- **Let an AI see and change what's selected (MCP)** — Stacki runs a small [MCP](https://modelcontextprotocol.io)
   server, so Claude Code, Cursor or any MCP client can ask what you have selected on the canvas, where it is
-  in source, and what it actually looks like. See [Connecting an AI agent](#connecting-an-ai-agent-mcp).
+  in source, what it actually looks like — and, if you allow it, change that exact thing through Stacki, on
+  the undo stack you can press ⌘Z on. See [Connecting an AI agent](#connecting-an-ai-agent-mcp).
 - **Code fallback** — pages with markup too complex for the visual model open in a code editor instead, still with live preview.
 - **New project** — "New Project…" scaffolds a minimal Astro starter (layout + 5 components + home page) and runs `npm install` for you.
 
@@ -271,11 +272,12 @@ because a box was already ticked.
 Stacki exposes what it is showing over the [Model Context Protocol](https://modelcontextprotocol.io),
 so a coding agent can stop guessing which element you mean.
 
-The split is deliberate:
+The idea is short:
 
-> **Stacki is the eyes. Your agent is the brain and the hands.**
+> **Stacki already knows which file, which node, which selector and which
+> value. Your agent should not have to work any of that out again.**
 
-There are exactly four tools:
+### Seeing
 
 | Tool | Answers |
 | --- | --- |
@@ -284,14 +286,60 @@ There are exactly four tools:
 | `get_comments` | Your [comments](#comments), filtered by state (`open` by default) and scope, as compact rows or in full. |
 | `comment` | One action at a time: `focus` (send Stacki to a comment's target), `create`, `reply`, `resolve`, `defer`, `reopen`. A comment is named by its id or by its short number — `"#3"` and `"3"` both work. |
 
-The first three are read-only. `comment` writes exactly two things: Stacki's own
-comment ledger, and where Stacki is looking. There is no `delete` — an agent
-that disagrees with a comment resolves it and says why, which leaves you able to
-disagree back.
+`get_context` and `comment` with `action: "focus"` both hand back a **ref** — an
+opaque handle to the exact source-backed object you pointed at. Everything below
+takes one.
 
-Nothing here edits your project. Your agent keeps using its normal file tools;
-Stacki just tells it what you are pointing at, what the result looks like, and
-what you asked for.
+### Changing
+
+| Tool | Does |
+| --- | --- |
+| `get_capabilities` | What Stacki can do right now, and what this permission level may run. Worth one call at the start. |
+| `target` | The element itself: read it, select it, open the component it is an instance of, set its text, props and classes, insert, duplicate, move, delete — several of those at once as one undo step. |
+| `style` | Why it looks like that: every declaration reaching it, in cascade order, with the file it was authored in, whether it wins, what overrides it, and the CSS variables it reads. And changing any of them. |
+| `source` | Project files as text, for code Stacki does not model as a tree. |
+| `page` | Pages, page folders and components: list, read, create, move, delete, and where a component is used. |
+| `content` | The CMS data files and the content collections. |
+| `asset` | Files already inside the project, under `public/` and `src/`. |
+| `project` | What is in the project, whether the preview is up, why it is not — and Stacki's own undo and redo. |
+| `git` | The repository, through Stacki's own git operations. |
+
+Those edits go through the same editor a click goes through. They appear on the
+canvas, they land on your undo stack, and they save through the normal writer —
+so ⌘Z after an AI edit gets your page back.
+
+Three things it will not do:
+
+- **Silently turn a binding into a literal.** If the words come from
+  `{product.title}`, changing them means changing the value — and the answer
+  says where that value lives, with a ref to follow.
+- **Quietly edit every copy of a repeated node.** A card inside a loop is one
+  source node rendered six times, and the answer says so before anything is
+  changed.
+- **Write through a guess.** If a page changed between the read and the write,
+  the write is refused with what it found instead. If Stacki found an element by
+  position alone on a branch a comment was not written against, the pin is
+  withheld and so is the edit.
+
+### How much you allow
+
+**File ▸ AI Connection (MCP)…** has three levels, and Stacki enforces them
+rather than asking the agent to:
+
+| | |
+| --- | --- |
+| **Inspect only** | Read what is on screen and what it looks like. Nothing in your project changes. |
+| **Edit project** | Everything the panels do — text, styles, structure, pages, content, assets — on the undo stack. |
+| **Full control** | Also deletes, dependency installs, and git: commit, switch, restore, merge, push. |
+
+**Inspect only is the default, including if you have been running this server
+for months.** Nothing was granted by an update.
+
+Your agent keeps its own file tools for everything outside Stacki's model — a
+framework component, a build config, a refactor across many files. This is a
+fast path, not a fence.
+
+### Comments, when they are shared
 
 On a [shared](#sharing-comments-with-other-people) project your agent is a
 participant like anybody else: its replies carry its own name, they reach the
@@ -319,6 +367,11 @@ application-support directory — never in your project, never in git.
 
 `STACKI_MCP_PORT` moves the port; `STACKI_MCP=off` turns the server off. If the
 port is taken, Stacki says so rather than quietly moving somewhere else.
+
+[`docs/agent-api.md`](docs/agent-api.md) has the detail — refs, staleness, the
+undo path, the permission gate and the security boundary — and
+[`docs/agent-api-coverage.md`](docs/agent-api-coverage.md) lists every
+operation and everything deliberately left off.
 
 ### Connecting
 

@@ -1,16 +1,21 @@
 import React from 'react';
 
-// How an agent connects to this window.
+// How an agent connects to this window, and how much of it it may move.
 //
-// Stacki runs a small read-only MCP server so a coding agent can ask what is
-// selected on the canvas and what it looks like. A background service on a
-// port with a bearer token is exactly the sort of thing that should not be
-// invisible, so this is where it is: whether it is up, where it is, how to
-// connect, and — the one that matters when it isn't working — why it isn't.
+// Stacki runs a small MCP server so a coding agent can ask what is selected on
+// the canvas, what it looks like, and — since the Agent API — change it. A
+// background service on a port with a bearer token is exactly the sort of thing
+// that should not be invisible, so this is where it is: whether it is up, where
+// it is, how to connect, and — the one that matters when it isn't working —
+// why it isn't.
 //
-// Deliberately not a settings screen. There is nothing to configure here; the
-// port is fixed (STACKI_MCP_PORT overrides it) and the token is generated
-// once. This is a status panel with three things to copy.
+// It has one setting, and it is the one that had to be a setting. The token
+// answers "is this our agent"; it has nothing to say about "should our agent be
+// able to delete a branch", and that question is the user's. Three levels,
+// because there are three genuinely different fears — see
+// electron/mcp/agent/permissions.js — and the default is the most cautious one
+// even for somebody who has been running this server for months, because an
+// update must never quietly hand out a permission nobody was asked for.
 
 const CLIENTS = [
   {
@@ -54,11 +59,56 @@ async function copyText(text) {
   }
 }
 
+// What each level means, in the terms somebody deciding would use. Kept in
+// step with permissions.js by the mcp test, which reads both.
+const ACCESS = [
+  {
+    key: 'inspect',
+    label: 'Inspect only',
+    blurb: 'Read what is on screen and what it looks like. Nothing in your project changes.',
+  },
+  {
+    key: 'edit',
+    label: 'Edit project',
+    blurb: 'Text, styles, structure, pages, content and assets — everything the panels do, on Stacki’s undo stack.',
+  },
+  {
+    key: 'full',
+    label: 'Full control',
+    blurb: 'Also deletes, dependency installs, and git — committing, switching, restoring, merging, pushing.',
+  },
+];
+
 export default function McpDialog({ status, onClose }) {
   const [client, setClient] = React.useState('claude');
   const [copied, setCopied] = React.useState(null);
   const [revealed, setRevealed] = React.useState(false);
+  const [access, setAccess] = React.useState(null);
   const closeRef = React.useRef(null);
+
+  // The level as the main process has it, which is the one that is enforced.
+  // Read when the dialog opens rather than held anywhere: this window is not
+  // where the answer lives.
+  React.useEffect(() => {
+    let alive = true;
+    void window.avb
+      .settings()
+      .then((s) => alive && setAccess(s?.agentMode || 'inspect'))
+      .catch(() => alive && setAccess('inspect'));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const chooseAccess = async (next) => {
+    if (!window.avb.setAgentMode) return; // an older main process
+    setAccess(next);
+    const result = await window.avb.setAgentMode(next).catch(() => null);
+    // What it actually settled on. A mode this build does not know is refused
+    // and comes back as the cautious one, and the control should show that
+    // rather than what was clicked.
+    if (result?.agentMode) setAccess(result.agentMode);
+  };
 
   React.useEffect(() => {
     closeRef.current?.focus();
@@ -117,9 +167,35 @@ export default function McpDialog({ status, onClose }) {
           {running && (
             <>
               <p className="mcp-lead">
-                A connected agent can ask Stacki what you have selected and take a picture of it.
-                It cannot edit anything through this — your agent keeps using its own file tools.
+                A connected agent can ask Stacki what you have selected, take a picture of it, and —
+                depending on what you allow below — change the exact thing you pointed at, through
+                Stacki, on the undo stack you can press ⌘Z on.
               </p>
+
+              <div className="mcp-access">
+                <div className="mcp-access-title">What a connected agent may do</div>
+                <div className="mcp-access-options" role="radiogroup" aria-label="Agent access">
+                  {ACCESS.map((level) => (
+                    <button
+                      key={level.key}
+                      type="button"
+                      role="radio"
+                      aria-checked={access === level.key}
+                      className={`mcp-access-option ${access === level.key ? 'on' : ''}`}
+                      disabled={access === null}
+                      onClick={() => chooseAccess(level.key)}
+                    >
+                      <span className="mcp-access-name">{level.label}</span>
+                      <span className="mcp-access-blurb">{level.blurb}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="mcp-hint">
+                  This applies to every agent that connects, and it is enforced by Stacki rather than
+                  asked of the agent. You can change it at any time; the next thing it tries obeys the
+                  new setting.
+                </p>
+              </div>
 
               <div className="mcp-tabs">
                 {CLIENTS.map((c) => (

@@ -3130,6 +3130,33 @@ body > .embed-editor_provenance {
 .mcp-error { color: var(--red); margin: 10px 0 0; user-select: text; }
 .mcp-lead { margin: 10px 0 0; }
 .mcp-hint { margin: 8px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+/* What a connected agent may do. Three cards rather than a dropdown: the
+   difference between them is the whole decision, and a dropdown shows one at a
+   time. The chosen one is lit rather than ticked — this is a setting somebody
+   glances at to check, not one they read. */
+.mcp-access { margin: 16px 0 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.mcp-access-title { color: var(--text); font-size: 12px; font-weight: 500; margin-bottom: 8px; }
+.mcp-access-options { display: flex; flex-direction: column; gap: 6px; }
+.mcp-access-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.mcp-access-option:hover:not(:disabled) { border-color: var(--text-faint); }
+.mcp-access-option:disabled { opacity: 0.5; cursor: default; }
+.mcp-access-option.on { border-color: var(--accent, #4b8cff); background: rgba(75, 140, 255, 0.08); }
+.mcp-access-name { color: var(--text); font-size: 12px; font-weight: 500; }
+.mcp-access-option.on .mcp-access-name { color: var(--accent, #4b8cff); }
+.mcp-access-blurb { color: var(--text-faint); font-size: 11px; line-height: 1.45; }
+
 .mcp-tabs { display: flex; gap: 6px; margin: 14px 0 8px; }
 .mcp-tabs button { font-size: 11.5px; padding: 3px 10px; }
 .mcp-tabs button.on { background: var(--surface-2, rgba(255, 255, 255, 0.06)); color: var(--text); }

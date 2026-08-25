@@ -1759,6 +1759,11 @@ contextBridge.exposeInMainWorld('avb', {
   mcpPublish: invoke('mcp:publish'),
   mcpStatus: invoke('mcp:status'),
   mcpReply: invoke('mcp:reply'),
+  // How much of Stacki a connected agent may move. Set from the AI connection
+  // window and enforced in the main process — this bridge carries the choice,
+  // not the authority. There is deliberately no MCP tool behind it: an agent
+  // that could raise its own permission level would not have one.
+  setAgentMode: invoke('settings:setAgentMode'),
   onMcpAsk: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('mcp:ask', listener);

@@ -127,6 +127,7 @@
     "test:sharedacceptance": "node --disable-warning=ExperimentalWarning test/shared-acceptance.js",
     "reviews:serve": "node --disable-warning=ExperimentalWarning service/bin.js",
     "test:mcp": "node test/mcp.js",
+    "agent:coverage": "node scripts/agent-api-coverage.js",
     "test:agentapi": "node test/agent-api.js",
     "test:agentacceptance": "node test/agent-acceptance.js",
     "test:packaging": "node test/packaging.js",

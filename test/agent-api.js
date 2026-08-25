@@ -147,6 +147,42 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   check('and still refuses what edit may not do', gate.check('git.push', 'high')?.code === 'permission_denied');
 }
 
+// ── The control the person actually uses ─────────────────────────────────────
+//
+// A gate nobody can find is a gate that is always on its default. So: the three
+// levels are in the window, they are the three the main process enforces, the
+// renderer carries the choice rather than the authority, and no tool can reach
+// the setting.
+
+{
+  const dialog = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'McpDialog.jsx'), 'utf8');
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+  const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
+
+  for (const mode of permissions.MODES) {
+    check(`the window offers "${mode}"`, new RegExp(`key: '${mode}'`).test(dialog), 'a level nobody can choose is a level nobody has');
+  }
+  // The ACCESS table specifically — the CLIENTS list above it in that file has
+  // the same shape and is about which agent you are configuring, not what it
+  // may do.
+  const accessTable = dialog.slice(dialog.indexOf('const ACCESS = ['), dialog.indexOf('export default function McpDialog'));
+  const offered = [...accessTable.matchAll(/key: '([a-z]+)'/g)].map((m) => m[1]);
+  check('and offers no level the main process does not know', offered.length > 0 && offered.every((k) => permissions.MODES.includes(k)), offered.join(', '));
+  check('and says what each one means', permissions.MODES.every((m) => new RegExp(`key: '${m}'[\\s\\S]{0,200}blurb:`).test(dialog)));
+  check('and reads the level from the main process rather than remembering one', /window\.avb\s*\n?\s*\.settings\(\)/.test(dialog));
+  check('and shows what it actually settled on', /result\?\.agentMode/.test(dialog));
+
+  check('the bridge carries the choice', /setAgentMode: invoke\('settings:setAgentMode'\)/.test(preload));
+  check('and the main process is where it is stored', /handle\('settings:setAgentMode'/.test(main));
+  check('and an unrecognised one is normalized rather than trusted', /agentPermissions\.normalizeMode\(mode\)/.test(main));
+  check('and an existing installation keeps the cautious default', /agentMode: 'inspect'/.test(main));
+
+  check(
+    'and no MCP tool can set it',
+    !/settings:setAgentMode/.test(fs.readFileSync(path.join(__dirname, '..', 'electron', 'mcp', 'agent', 'domains.js'), 'utf8'))
+  );
+}
+
 // ── Coverage ─────────────────────────────────────────────────────────────────
 //
 // The inventory this feature started from: every project-semantic thing Stacki
@@ -219,6 +255,36 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
 
   check('there is no action for a shell', !registry.list().some((op) => /shell|terminal|exec|command/i.test(op.action)));
   check('and none for review administration', !registry.list().some((op) => /workspace|invite|identity/i.test(op.action)));
+}
+
+// ── The generated table ──────────────────────────────────────────────────────
+//
+// The coverage document is the answer to "was this considered". A hand-written
+// one answers it wrongly the first time somebody adds an operation, so it comes
+// out of the registry — and this is what stops it drifting.
+
+{
+  const { execFileSync } = require('node:child_process');
+  let up = true;
+  let why = '';
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'agent-api-coverage.js'), '--check'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    up = false;
+    why = String(err.stderr || err.message).trim();
+  }
+  check('the coverage table matches the registry', up, why);
+  const doc = fs.readFileSync(path.join(__dirname, '..', 'docs', 'agent-api-coverage.md'), 'utf8');
+  check('and lists every domain', registry.DOMAINS.every((d) => doc.includes(`## ${d}`)));
+  check('and every exclusion', registry.EXCLUDED.every((e) => doc.includes(`\`${e.channels[0]}\``)));
+  const design = fs.readFileSync(path.join(__dirname, '..', 'docs', 'agent-api.md'), 'utf8');
+  check('and the design notes say what a ref is', /StackiRef/.test(design));
+  check('and how a stale write is refused', /stale_target/.test(design));
+  check('and what the permission modes are', permissions.MODES.every((m) => new RegExp(m, 'i').test(design)));
+  check('and what is kept human-only', /Human-only, and why/.test(design));
+  check('and what the known limits are', /Known limits/.test(design));
 }
 
 // ── Paths ────────────────────────────────────────────────────────────────────
