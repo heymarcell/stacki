@@ -125,10 +125,11 @@ something that looks similar. It still shows what you said, which page, which
 component, and what the element was — so it stays readable, and you can still
 reply to it, resolve it, defer it or delete it.
 
-Comments are **local and yours**. They live in Stacki's own application-support
+Comments are **local by default**. They live in Stacki's own application-support
 directory — one file per project, keyed by the project folder's real path — and
-nothing is ever written into the website's repository. There is no account, no
-server and nobody else's cursor.
+nothing is ever written into the website's repository. There is no account and
+no server unless you [share them](#sharing-comments-with-other-people), which is
+something you turn on per project.
 
 The branch you were on is **recorded on the comment, not used to file it**:
 checking out another branch does not give you a second list, and does not hide
@@ -164,12 +165,106 @@ comment(action: "defer", threadId: "…", reason: "Tracked separately.",
 
 Stacki stores the text. It never fetches it.
 
-**Limits.** One reviewer, one machine — no sharing, sync or export yet, and one
-Stacki window per project at a time (two would each hold the same file open). A
-comment on a component's internals can only be checked against the source while
-that file is open or when it is focused; until then it keeps the health it last
-had. Screenshots taken with `capture` never include pins, the composer or any
-other editor chrome — they are pictures of the site.
+**Limits.** One Stacki window per project at a time (two would each hold the
+same file open). A comment on a component's internals can only be checked
+against the source while that file is open or when it is focused; until then it
+keeps the health it last had. Screenshots taken with `capture` never include
+pins, the composer or any other editor chrome — they are pictures of the site.
+
+## Sharing comments with other people
+
+**Off unless you turn it on, per project.** A project that has not been shared
+makes no network request of any kind — not a check, not a ping. Review comments
+are candid by nature, and that guarantee is the whole privacy model.
+
+Sharing is **asynchronous, not live**. Stacki catches up when you open a shared
+project, when you press **Sync**, and — quietly, at most once a minute — when
+you come back to the window. There are no live cursors, no presence, no typing
+indicators and no socket. A comment is written in minutes and read in hours;
+streaming it would buy nothing and cost a permanent connection.
+
+### A workspace
+
+A **workspace** is the thing comments are shared through. It has a random id, a
+name, and the people who have been invited into it — and it is a thing you
+create, never something Stacki discovers. A matching git remote will say *"this
+repository may already have a workspace"*; it will never join one. A public
+clone must not be a key to somebody's private comments.
+
+Stacki has **no cloud**. Run the reference service yourself:
+
+```
+npm run reviews:serve
+```
+
+It prints its address and a signup token. Paste both into **Comments → Share…**
+to start a workspace; everybody else joins with a one-use invitation you send
+them. The service stores review events and the minimum needed to know who may
+read them — never your source, never a screenshot, never a path on your disk.
+Credentials live in Stacki's own application-support directory and are never
+written into your project, your git config or your repository.
+
+Turning sharing off keeps every comment. It only stops this computer talking to
+the workspace.
+
+### Who wrote what
+
+Everybody gets a stable id and a display name. The name is suggested from
+`git config user.name` and can be changed; the id is a UUID and never moves, so
+renaming yourself does not orphan anything you have already written. Your git
+**email is never used**. Agents are participants too: what Claude resolves says
+*Claude*, on your machine and on everybody else's.
+
+You may edit and delete **your own** messages, delete an agent's replies, and
+delete your own reviews. You may not edit or delete somebody else's — and that
+is enforced when the thread is rebuilt, not merely by hiding a button, so a
+peer that ignored the rule is ignored back.
+
+### Your comments, your checkout
+
+This is the part that makes shared reviews different from shared screenshots.
+**A review and the source it is about travel separately.** Alice may be on
+another branch, ahead by four commits, or have unsaved work.
+
+So Stacki keeps two states apart and never runs them together:
+
+| | |
+| --- | --- |
+| **the review** | open, deferred or resolved — shared, and the same for everybody |
+| **your checkout** | what *your* working copy can say about it — local, and never shared |
+
+A review that arrives from somebody else is **never handed their anchor**. Your
+Stacki resolves it against your own tree, and until it has, the review has no
+pin. When the review came from another branch, a pin needs *evidence about the
+element* — the words, the ancestry, the sibling runs it recorded — and never a
+position that merely happens to still be free. The thread stays readable and
+says where it came from; the marker is what is withheld.
+
+And when somebody resolves a review after changing the source, the revision is
+recorded with it. If your checkout does not contain that revision, Stacki says
+so instead of showing a tick:
+
+> **Resolved by Claude on `def4567`.** Your checkout doesn't include that change
+> yet, so what you are looking at may still be the old version.
+
+If a rebase or a squash makes the commit unreachable, it says *that* rather than
+guessing. A comment that claims to be fixed when the bug is still on your screen
+is the one failure this feature will not produce.
+
+### How it works underneath
+
+Comments are shared as an **append-only set of events**, folded into a thread by
+a rule both machines agree on, so two people who were offline at the same time
+end up with the same conversation rather than two versions of one. Git is used
+as **evidence about source**, never as the way comments travel.
+[`docs/shared-reviews.md`](docs/shared-reviews.md) has the detail.
+
+### Comments you already have
+
+Turning sharing on asks what to do with the comments already in the project, and
+the answer defaults to **keep them**. Off means every existing comment stays on
+this computer for good and sharing starts with the next one. Nothing is uploaded
+because a box was already ticked.
 
 ## Connecting an AI agent (MCP)
 
@@ -190,13 +285,22 @@ There are exactly four tools:
 | `comment` | One action at a time: `focus` (send Stacki to a comment's target), `create`, `reply`, `resolve`, `defer`, `reopen`. A comment is named by its id or by its short number — `"#3"` and `"3"` both work. |
 
 The first three are read-only. `comment` writes exactly two things: Stacki's own
-local comment file, and where Stacki is looking. There is no `delete` — an agent
+comment ledger, and where Stacki is looking. There is no `delete` — an agent
 that disagrees with a comment resolves it and says why, which leaves you able to
 disagree back.
 
 Nothing here edits your project. Your agent keeps using its normal file tools;
 Stacki just tells it what you are pointing at, what the result looks like, and
 what you asked for.
+
+On a [shared](#sharing-comments-with-other-people) project your agent is a
+participant like anybody else: its replies carry its own name, they reach the
+other people in the workspace on the next sync, and resolving records the
+revision the source was on so that somebody whose checkout predates it is told
+rather than shown a tick. `get_comments` reports both — what the review says and
+what *this* checkout can say about it. There are no extra tools for any of it,
+and none for workspaces, invitations or credentials: those are things a person
+does in the Stacki window.
 
 Stacki does not have to be the window you are looking at — a capture taken while
 it sits behind your terminal is the current render, not the last one you saw.
@@ -251,6 +355,7 @@ projects, and the endpoint does not.
 - Node.js 18+ and npm (the app shells out to `npm install` / `astro dev` for opened projects)
 - `git` for version control features
 - [GitHub CLI](https://cli.github.com) (`gh`), authenticated via `gh auth login`, for "Publish to GitHub"
+- Node.js 22.5+ to run the reference Shared Reviews service (`npm run reviews:serve`); it uses node's built-in SQLite and is not part of the desktop app
 
 ## How editing works
 

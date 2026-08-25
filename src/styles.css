@@ -6198,3 +6198,162 @@ textarea::selection {
   font-size: 10.5px;
   line-height: 1.45;
 }
+
+/* ---------------------------------------------------------------------------
+   Shared Reviews
+   ---------------------------------------------------------------------------
+   One row, and it stays one row. A panel whose job is to show three sentences
+   of feedback must not grow a console for a background service — so what is
+   permanently on screen is who these comments are shared with, when they last
+   caught up, and a way to catch up now. Everything that needs a form lives in
+   a dialog that is only open while somebody is filling it in.
+
+   Nothing here is a live indicator. This synchronises when there is a reason
+   to and not otherwise, and a light that means "we spoke a minute ago" would
+   be read as "we are speaking now". */
+
+.shared-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 0 8px 8px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.shared-off { color: var(--text-faint); }
+.shared-name {
+  background: none;
+  padding: 0;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.shared-name:hover { color: var(--text); }
+.shared-when { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shared-link {
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.shared-link:disabled { color: var(--text-faint); cursor: default; }
+/* A problem gets its own line rather than a badge: it is a sentence somebody
+   has to act on, and a sentence needs room to be read. */
+.shared-problem {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(255, 214, 10, 0.1);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.shared-problem svg { color: var(--yellow, #ffd60a); flex-shrink: 0; margin-top: 1px; }
+
+.shared-dialog { width: 460px; max-width: 92vw; }
+.shared-dialog .modal-header { display: flex; align-items: center; justify-content: space-between; }
+.shared-body .seg {
+  display: flex;
+  background: var(--bg-input);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+.shared-body .seg button {
+  flex: 1;
+  padding: 5px 6px;
+  font-size: 11px;
+  background: none;
+  color: var(--text-dim);
+  border-radius: 4px;
+}
+.shared-body .seg button.on { background: var(--bg-active); color: var(--text); }
+.shared-body .dim { color: var(--text-dim); font-size: 11.5px; line-height: 1.5; }
+.shared-body .dim.small { font-size: 10.5px; color: var(--text-faint); }
+.shared-body code { font-size: 10.5px; user-select: text; }
+
+.shared-field { display: flex; flex-direction: column; gap: 4px; }
+.shared-field > span { font-size: 10.5px; color: var(--text-faint); }
+.shared-field input { width: 100%; }
+
+/* The privacy decision. It sits with the question rather than after it, and it
+   starts unticked — a project's back catalogue of candid notes is not
+   something to upload because a default said so. */
+.shared-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+  cursor: pointer;
+}
+.shared-check input { margin: 2px 0 0; flex-shrink: 0; }
+.shared-check em { display: block; margin-top: 2px; color: var(--text-faint); font-style: normal; font-size: 10.5px; }
+
+.shared-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.shared-error { color: var(--red); font-size: 11.5px; line-height: 1.45; user-select: text; }
+.shared-invite {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+.shared-invite code {
+  display: block;
+  word-break: break-all;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+.shared-invite button { align-self: flex-start; }
+
+/* Who left a comment, in the list. Only shown when the project is shared —
+   a column of "You" on a project nobody else can see is noise. */
+.comments-row-author {
+  font-size: 9.5px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comments-row-author.is-agent { color: var(--accent); }
+.review-author.is-agent { color: var(--accent); }
+
+/* How a review stands against the source that is actually here.
+   `is-behind` is the one that matters: the thread says resolved and this
+   checkout does not contain the revision it was resolved on, so what is on
+   screen may still be the bug. It is drawn as a warning and never as a tick. */
+.review-checkout {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0 0 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(255, 214, 10, 0.1);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.review-checkout svg { color: var(--yellow, #ffd60a); margin-top: 1px; flex-shrink: 0; }
+.review-checkout strong { color: var(--text); font-weight: 600; }
+.review-checkout.is-behind { background: rgba(255, 69, 58, 0.1); }
+.review-checkout.is-behind svg { color: var(--red); }
