@@ -458,7 +458,19 @@ const fakeTrail = (keys) =>
   check('the server says to focus before acting', /focus/.test(INSTRUCTIONS));
   check('the server says to verify before resolving', /verif/i.test(INSTRUCTIONS) && /[Rr]esolve/.test(INSTRUCTIONS));
   check('the server says what deferring is for', /defer/i.test(INSTRUCTIONS));
-  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1200, `${INSTRUCTIONS.length} chars`);
+  // The cap moved once, when the server stopped being four read-only tools and
+  // became an editor: the preference order — start from Stacki, follow the ref
+  // it gave you, do not go looking for what it already found — is the whole
+  // point of the feature and cannot be said in a sentence. It is still a cap,
+  // and it is still small: an agent reads this before every session.
+  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1500, `${INSTRUCTIONS.length} chars`);
+  // The new half has to reach an agent through these, or it will keep doing
+  // what it did before: photograph the element, then grep for it.
+  check('the server says not to re-find what Stacki found', /rediscover|do not search the repository/i.test(INSTRUCTIONS));
+  check('the server says the edits are undoable', /undo/i.test(INSTRUCTIONS));
+  check('the server says a stale write is refused', /expectedDigest|expectedRevision/.test(INSTRUCTIONS));
+  check('the server says bound text is not overwritten', /[Bb]ound text/.test(INSTRUCTIONS));
+  check('the server still says the repository tools remain available', /fast path, not a fence/i.test(INSTRUCTIONS));
 }
 
 // ── The door ────────────────────────────────────────────────────────────────

@@ -248,6 +248,13 @@ const ActionOutput = z.object({
     .nullable()
     .optional(),
   note: nullableString.optional(),
+  // The focused element, as something the editor tools can act on. Present
+  // only when the walk landed; null — and `targetEditable` false — when Stacki
+  // identified the node by position alone on a tree this review was not
+  // written against, which is the same evidence that withholds its pin.
+  targetRef: nullableString.optional(),
+  targetEditable: z.boolean().optional(),
+  confidence: nullableString.optional(),
   review: Full.nullable(),
 });
 
@@ -391,15 +398,18 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
       description:
         "Act on the user's visual review threads. " +
         'focus — send Stacki to a review\'s target: its page, its breakpoint, the components it is inside, the ' +
-        'element itself and the rendered copy of it. Do this BEFORE acting on a review, so get_context and capture ' +
-        'then describe and photograph the right thing. ' +
+        'element itself and the rendered copy of it. Do this BEFORE acting on a review: it hands back targetRef, ' +
+        'which the target and style tools act on directly, so there is nothing left to search for. ' +
+        'targetEditable false means Stacki found the element by position alone on a tree this review was not ' +
+        'written against — read it, do not write through it. ' +
         'create — leave a new review on whatever is selected in Stacki right now. ' +
         'reply — add a note to a thread. ' +
         'resolve — a decision was reached (implemented and visually verified, or keeping it as it is). ' +
         'defer — valid, but not being done now: give a reason, and an externalRef if you tracked it elsewhere. ' +
         'reopen — put a resolved or deferred review back to open. ' +
-        'This writes only to Stacki\'s own review ledger and moves Stacki\'s view. It does not edit project ' +
-        'source, run commands, or manage sharing — make code changes with your normal repository tools. ' +
+        'This writes only to Stacki\'s own review ledger and moves Stacki\'s view — the edits themselves are the ' +
+        'target, style, content, page, asset and source tools, or your own repository tools for anything outside ' +
+        'Stacki\'s model. It does not manage sharing. ' +
         'When the project shares its comments, what you write here is synchronised to the other people in the ' +
         'workspace, signed with your agent name; resolving records the revision the source was on, so somebody ' +
         'whose checkout predates it is told rather than shown a tick. ' +

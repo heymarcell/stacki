@@ -122,6 +122,9 @@ import {
 // agent can also perform goes through these — see src/modelOps.js for why
 // there is exactly one implementation of each of them.
 import * as ops from './modelOps.js';
+import { applyOperations } from './modelOps.js';
+import { createAgentCommands } from './agent/commands.js';
+import { digestOfModel } from './agent/digest.js';
 
 // How long a pending save waits, by urgency. See scheduleSave.
 const SAVE_DELAY = { true: 0, live: 120, false: 300 };
@@ -854,6 +857,19 @@ export default function App() {
 
   const historyRef = useRef({ past: [], future: [], lastPush: 0, lastKey: null });
 
+  // How many times the open document has changed.
+  //
+  // The MCP context revision counts what is on SCREEN — a selection moving
+  // bumps it and an edit to an unselected node may not. A write has to name
+  // the document, so it gets a counter of its own: bumped by every accepted
+  // model or source change, including the ones undo and redo make. Monotonic
+  // across files, and reported beside the file it is about, so two documents
+  // can never be mistaken for one because their numbers agree.
+  const docRevRef = useRef(0);
+  const bumpDoc = useCallback(() => {
+    docRevRef.current += 1;
+  }, []);
+
   const snapshotOf = (state) =>
     state.editable
       ? { kind: 'model', model: structuredClone(state.model) }
@@ -919,6 +935,7 @@ export default function App() {
   }, []);
 
   const applySnapshot = useCallback((entry) => {
+    docRevRef.current += 1; // an undo is a change to the document like any other
     setPageState((s) => {
       if (!s) return s;
       if (entry.kind === 'model') {
@@ -1013,6 +1030,7 @@ export default function App() {
   const mutateModel = useCallback(
     (fn, immediate = false, coalesceKey = null) => {
       pushHistory(coalesceKey);
+      bumpDoc();
       setPageState((s) => {
         if (!s || !s.editable) return s;
         const model = fn(structuredClone(s.model));
@@ -1020,16 +1038,17 @@ export default function App() {
       });
       scheduleSave(immediate);
     },
-    [scheduleSave, pushHistory]
+    [scheduleSave, pushHistory, bumpDoc]
   );
 
   const setRawSource = useCallback(
     (source) => {
       pushHistory('raw-source');
+      bumpDoc();
       setPageState((s) => (s ? { ...s, source, dirty: true } : s));
       scheduleSave();
     },
-    [scheduleSave, pushHistory]
+    [scheduleSave, pushHistory, bumpDoc]
   );
 
   // ----------------------------------------------------------------
@@ -3467,6 +3486,9 @@ export default function App() {
   // Answered by the Visual Review section below; declared here because the
   // handler that reads it is registered above it.
   const focusReviewRef = useRef(null);
+  // Same for the Agent API's commands, which are built at the end of the
+  // component out of everything above them.
+  const agentRunRef = useRef(null);
 
   // The path the canvas knows the selection by, for the computed-style query.
   const mcpSelPathRef = useRef(null);
@@ -3493,6 +3515,10 @@ export default function App() {
       // Through a ref because this handler is bound once, long before the
       // navigation it calls is in scope.
       if (kind === 'review:focus') return focusReviewRef.current?.(params) ?? null;
+      // And the Agent API's editor commands. One door, a fixed set of named
+      // commands behind it, every one of them carried out through what the
+      // panels already call — see src/agent/commands.js.
+      if (kind === 'agent') return agentRunRef.current?.(params) ?? null;
       return null;
     };
     return window.avb.onMcpAsk(async (ask) => {
@@ -4022,11 +4048,33 @@ export default function App() {
     // merely LOOKING at a list of comments mark them all as lost. Reading must
     // not damage what it reads.
     const TRANSIENT = new Set(['not_open', 'moved_away']);
+    // Filled in when the leaf resolves; 'none' until then, which is what an
+    // unresolved anchor is.
+    let leafConfidence = 'none';
+    // What the pin rule is asked about. A review focus asks about the review;
+    // an agent following a ref of its own asks about the ref, whose evidence
+    // is the branch it was minted on against the branch checked out now —
+    // exactly the comparison `divergent` makes, so it is made by the same
+    // function rather than a second copy of the reasoning.
+    const forPin = reviewById(threadId) || {
+      anchorState: 'attached',
+      checkout: {
+        source: 'changed',
+        sameBranch: !anchor?.branch || anchor.branch === (gitInfo?.branch ?? null),
+        branch: gitInfo?.branch ?? null,
+      },
+    };
     const done = (state, reason) => ({
       anchorState: state,
       transient: state !== 'attached' && TRANSIENT.has(reason),
       restored,
       keys: state === 'attached' ? resolvedKeys : null,
+      // HOW the node was identified, not merely whether it was. `positional`
+      // means the slot held and nothing corroborated it — enough to look at,
+      // and not enough to write through on a tree the anchor was not written
+      // against. See src/reviewCheckout.js.
+      confidence: leafConfidence,
+      writable: state === 'attached' && mayPin(forPin, leafConfidence),
       note: focusNote({
         restored,
         anchorState: state,
@@ -4094,6 +4142,7 @@ export default function App() {
       labelOf: crumbLabel,
     });
     if (!leaf.id) return done('orphaned', leaf.reason);
+    leafConfidence = leaf.confidence;
     // The positions this walk actually used. Any of them may have moved since
     // the review was written, and the ledger takes the new ones.
     resolvedKeys = [
@@ -4101,9 +4150,10 @@ export default function App() {
       `${plan.leaf.file}#${leaf.trail.join('.')}`,
     ];
     setSelectedId(leaf.id);
-    // The panel follows, so a person watching an agent work can see which
-    // comment it is on.
-    setLeftTab('comments');
+    // The panel follows a review, so a person watching an agent work can see
+    // which comment it is on. An agent following a ref of its own is not on a
+    // comment, and yanking the panel there would be noise.
+    if (threadId) setLeftTab('comments');
     restored.node = true;
 
     // 5 — and which copy of it, scrolled into view. The marker path is built
@@ -4140,6 +4190,102 @@ export default function App() {
     return done('attached', null);
   };
   focusReviewRef.current = focusReview;
+
+  // ----------------------------------------------------------------
+  // The Agent API's window
+  //
+  // Everything an agent's editor commands need, as functions of the state
+  // this render is holding. Not one line of it is a new way to change the
+  // document: `commit` is mutateModel, `select` is setSelectedId, `undo` is
+  // undo. What it adds is the ability to say all of it in one round trip, and
+  // to answer for what happened afterwards.
+  //
+  // Assembled during render into a ref, for the same reason the MCP payload
+  // is: it reads two dozen pieces of state, and a dependency list that forgot
+  // one of them would go stale exactly where it is hardest to notice.
+  // ----------------------------------------------------------------
+  const agentAppRef = useRef(null);
+  agentAppRef.current = {
+    project: () => project,
+    page: () => ({ file: reviewPageFile, route: reviewPageRoute }),
+    openFile: () => openRel,
+    model: () => model,
+    editable: () => !!pageState?.editable && !inPreview && !previewRef,
+    selectedId: () => selectedId,
+    revision: () => docRevRef.current,
+    // A hash of the tree, so two edits that arrive at the same revision number
+    // (an undo walking back to where it started) are still told apart.
+    digest: () => digestOfModel(pageState?.editable ? model : pageState?.source),
+    crumbLabel,
+    pathFor,
+    keysFor,
+    peersFor,
+    canvas: () => canvasReport,
+    renderedClasses: () => selectedClasses,
+    componentChain: () => editStack.map((e) => e?.name).filter(Boolean),
+    breadcrumbs: (id) => (id === selectedId ? crumbs.map((c) => c?.label).filter(Boolean) : null),
+    isHidden: (id) => stateIds.hidden.has(id),
+    isInert: (id) => stateIds.inert.has(id),
+    insertables: () => insertables,
+    preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
+    historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
+    undo,
+    redo,
+    select: (id, occurrence) => {
+      setSelectedId(id);
+      if (Number.isInteger(occurrence)) {
+        setOccRequest({ path: pathFor(id), occ: occurrence, tick: Date.now() });
+      }
+    },
+    // A moment for the canvas to catch up, so a style read after a select is
+    // asking about the element that is now selected.
+    settle: () => new Promise((done) => setTimeout(done, 120)),
+    focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+    // Whether a ref resolved this way is good enough to write through. The
+    // review pin rule, asked about the ref instead of a review.
+    writableFor: (anchor, confidence) =>
+      mayPin(
+        {
+          anchorState: 'attached',
+          checkout: {
+            source: 'changed',
+            sameBranch: !anchor?.branch || anchor.branch === (gitInfo?.branch ?? null),
+            branch: gitInfo?.branch ?? null,
+          },
+        },
+        confidence
+      ),
+    /**
+     * Apply a batch of operations as ONE change.
+     *
+     * One mutateModel, so one undo snapshot, so one ⌘Z. The operations were
+     * already run against a copy by the caller and refused as a set if any of
+     * them could not be done — this is the commit, and it saves before it
+     * answers so whoever asked can read the file that resulted.
+     */
+    commit: async (operations, { label } = {}) => {
+      let outcome = null;
+      mutateModel((m) => {
+        const run = applyOperations(m, operations, { insertables });
+        outcome = run;
+        return run.ok ? run.model : m;
+      }, true);
+      if (!outcome?.ok) return { ok: false, code: outcome?.code || 'failed', message: outcome?.message || 'That edit could not be applied.' };
+      if (outcome.selectId) setSelectedId(outcome.selectId);
+      // The model state has not committed yet — flushSave reads it through the
+      // ref, which React updates before effects run, so give it that turn.
+      await new Promise((done) => setTimeout(done, 0));
+      await flushSave();
+      return { ok: true, selectedId: outcome.selectId || null, label: label || null };
+    },
+  };
+
+  useEffect(() => {
+    agentRunRef.current = createAgentCommands(() => agentAppRef.current);
+    return () => {
+      agentRunRef.current = null;
+    };
+  }, []);
 
   // From the panel or a pin: the same operation, plus saying so when it could
   // not be done — an agent gets that in its tool result, a person gets a toast.
