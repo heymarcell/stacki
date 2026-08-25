@@ -78,6 +78,10 @@ function createStackiMcpServer({
   capture,
   getComments,
   comment,
+  // The Agent API — the editor half of the surface. Optional here so the
+  // endpoint can still be built in a test that only cares about the four
+  // original tools; when it is absent those four are all there is.
+  api = null,
   onError,
 } = {}) {
   if (!token || typeof token !== 'string') throw new Error('an MCP bearer token is required');
@@ -108,6 +112,7 @@ function createStackiMcpServer({
       capture,
       getComments,
       comment,
+      api,
       // Who is connected, when the protocol has said. A client names itself at
       // initialize, which in a stateless transport is a different request from
       // the tool call — so this is often null, and the app falls back to a

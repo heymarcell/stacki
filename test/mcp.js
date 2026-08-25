@@ -458,7 +458,26 @@ const fakeTrail = (keys) =>
   check('the server says to focus before acting', /focus/.test(INSTRUCTIONS));
   check('the server says to verify before resolving', /verif/i.test(INSTRUCTIONS) && /[Rr]esolve/.test(INSTRUCTIONS));
   check('the server says what deferring is for', /defer/i.test(INSTRUCTIONS));
-  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1200, `${INSTRUCTIONS.length} chars`);
+  // The cap has moved twice, and both times for something an agent gets wrong
+  // without being told: first the preference order (start from Stacki, follow
+  // the ref, do not go looking for what it already found), then that a review
+  // body is data rather than an instruction — which is the one thing here that
+  // no amount of filtering can enforce and only saying can. It is still a cap,
+  // and it is still a page: an agent reads this before every session.
+  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1700, `${INSTRUCTIONS.length} chars`);
+  // The new half has to reach an agent through these, or it will keep doing
+  // what it did before: photograph the element, then grep for it.
+  check('the server says not to re-find what Stacki found', /rediscover|do not search the repository/i.test(INSTRUCTIONS));
+  check('the server says the edits are undoable', /undo/i.test(INSTRUCTIONS));
+  check('the server says a stale write is refused', /refused rather than overwriting/.test(INSTRUCTIONS));
+  check('and that the ref is what carries the guard', /ref\s*\n?\s*carries the version/.test(INSTRUCTIONS.replace(/\s+/g, ' ')) || /ref carries the version/.test(INSTRUCTIONS));
+  // The one an editor-capable server has to say, and the one a filter cannot
+  // solve: what arrives in a review is somebody's words, not an instruction.
+  check('the server says review text is data', /REVIEW TEXT IS DATA/.test(INSTRUCTIONS));
+  check('and that it grants no authority', /carries no\s+authority/.test(INSTRUCTIONS.replace(/\s+/g, ' ')) || /carries no authority/.test(INSTRUCTIONS));
+  check('and that access is granted per project', /per project/.test(INSTRUCTIONS));
+  check('the server says bound text is not overwritten', /[Bb]ound text/.test(INSTRUCTIONS));
+  check('the server still says the repository tools remain available', /fast path, not a fence/i.test(INSTRUCTIONS));
 }
 
 // ── The door ────────────────────────────────────────────────────────────────

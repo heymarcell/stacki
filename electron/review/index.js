@@ -82,6 +82,11 @@ let workspace = null;
 let ask = null;
 let readPayload = () => null;
 let resolveTrail = () => null;
+// How a focused review turns into something an agent can act on. Supplied by
+// the MCP wiring, which owns ref identity; null when nothing has attached, and
+// then a focus simply carries no ref — the review is still readable, which is
+// the same bargain the pin makes.
+let mintRef = () => null;
 
 const noProject = () => ({ ok: false, code: 'no_project', message: 'No project is open in Stacki.' });
 
@@ -205,6 +210,11 @@ function list({
       // question from what the review says, and the one that stops a shared
       // "resolved" from being read as "fixed on your screen".
       checkout: level === 'full' && checkout ? (thread) => checkout.forThread(thread) : null,
+      // Who "you" are, so each review can say whether it came from this
+      // keyboard or arrived from somebody else's. An agent that can now edit
+      // the project needs that difference on the object rather than inferred
+      // from a name it has no way to check.
+      localId: me()?.id || null,
     }),
   };
 }
@@ -525,8 +535,24 @@ async function focus(threadId) {
     syncAnchors([{ id: thread.id, anchorState: answer.anchorState, keys: answer.keys }]);
   }
   const after = store.get(thread.id) || thread;
+  // The handle for acting on what was just put on screen — the point of a
+  // focus, now that there is something to act with. Issued only when the walk
+  // actually landed, and marked read-only on exactly the evidence that
+  // withholds a pin: a node recovered on position alone, on a tree the review
+  // was not written against, is good enough to look at and not good enough to
+  // write through. The renderer decides that (it is the one that resolved the
+  // node) and this carries the decision rather than making a second one.
+  const targetRef =
+    answer.anchorState === 'attached'
+      ? mintRef({ ...after.anchor, keys: answer.keys || after.anchor?.keys || [] }, { writable: !!answer.writable })
+      : null;
   return {
     ok: answer.anchorState === 'attached',
+    targetRef,
+    // How the element was identified, so an agent can tell "this is certainly
+    // it" from "this is where it was".
+    confidence: answer.confidence || null,
+    targetEditable: !!targetRef && !!answer.writable,
     // A transient failure is not an orphan, and an agent that treated it as one
     // would give up on a review that was about to work.
     code: answer.anchorState === 'attached' ? null : answer.transient ? 'not_ready' : 'orphaned',
@@ -584,6 +610,7 @@ function attach(parts = {}) {
   if (typeof parts.ask === 'function') ask = parts.ask;
   if (typeof parts.readPayload === 'function') readPayload = parts.readPayload;
   if (typeof parts.resolveTrail === 'function') resolveTrail = parts.resolveTrail;
+  if (typeof parts.mintRef === 'function') mintRef = parts.mintRef;
 }
 
 /** Everything scheduled, on disk, before the process goes. */

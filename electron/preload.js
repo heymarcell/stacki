@@ -1796,6 +1796,15 @@ contextBridge.exposeInMainWorld('avb', {
   mcpPublish: invoke('mcp:publish'),
   mcpStatus: invoke('mcp:status'),
   mcpReply: invoke('mcp:reply'),
+  // How much of Stacki a connected agent may move. Set from the AI connection
+  // window and enforced in the main process — this bridge carries the choice,
+  // not the authority. There is deliberately no MCP tool behind it: an agent
+  // that could raise its own permission level would not have one.
+  setAgentMode: invoke('settings:setAgentMode'),
+  // And what it is now, for the project that is open. Read rather than
+  // remembered: the level lives in the main process, keyed by project, and a
+  // window that kept its own copy would show the last project's answer.
+  agentAccess: invoke('settings:agentAccess'),
   onMcpAsk: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('mcp:ask', listener);
@@ -1890,6 +1899,9 @@ contextBridge.exposeInMainWorld('avb', {
 
   // Pages
   readPage: invoke('page:read'),
+  // The same parse, of text that is not on disk — how a raw source edit becomes
+  // a model so it can go through the editor rather than around it.
+  parseSource: invoke('page:parseSource'),
   writePage: invoke('page:write'),
   writePageRaw: invoke('page:writeRaw'),
   createPage: invoke('page:create'),

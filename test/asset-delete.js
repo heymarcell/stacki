@@ -184,7 +184,10 @@ const check = (what, condition, detail) => {
 
   // --- the file goes somewhere it can be got back from --------------------------------
   const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
-  const handler = main.slice(main.indexOf("ipcMain.handle('assets:delete'"), main.indexOf("// Text assets (css/js"));
+  // `handle(` — main.js registers through its own recorder now, which still
+  // calls ipcMain.handle with the same function (see
+  // electron/mcp/agent/domains.js for why it keeps the name too).
+  const handler = main.slice(main.indexOf("handle('assets:delete'"), main.indexOf("// Text assets (css/js"));
   check('deleting sends the file to the bin', /shell\.trashItem\(abs\)/.test(handler), handler.slice(0, 300));
   check('never unlinks it outright', !/unlinkSync|rmSync/.test(handler), handler.slice(0, 300));
   check('and only inside the asset roots', /assetAbs\(projectPath, rel\)/.test(handler), handler.slice(0, 200));

@@ -92,298 +92,40 @@ import {
   TerminalIcon,
 } from './ui/Icons.jsx';
 
-let idCounter = 1000;
-const newId = () => `c${idCounter++}`;
-
-// HTML elements that can never have children.
-const VOID_ELEMENTS = new Set([
-  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
-  'link', 'meta', 'param', 'source', 'track', 'wbr',
-]);
-
-// Placeholder copy for newly inserted text elements, so they're visible on the
-// canvas straight away instead of collapsing to a zero-height box.
-const LOREM =
-  'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse varius ' +
-  'enim in eros elementum tristique. Duis cursus, mi quis viverra ornare, eros ' +
-  'dolor interdum nulla, ut commodo diam libero vitae erat. Aenean faucibus nibh ' +
-  'et justo cursus id rutrum lorem imperdiet. Nunc ut sem vitae risus tristique ' +
-  'posuere.';
-const DEFAULT_TEXT = {
-  h1: 'Heading',
-  h2: 'Heading',
-  h3: 'Heading',
-  h4: 'Heading',
-  h5: 'Heading',
-  h6: 'Heading',
-  p: LOREM,
-};
-
-// ---------------------------------------------------------------------------
-// Tree helpers (model.nodes is a tree of {id, kind, name?, props?, children?})
-// ---------------------------------------------------------------------------
-
-function findNodeById(nodes, id) {
-  for (const node of nodes) {
-    if (node.id === id) return node;
-    if (Array.isArray(node.children)) {
-      const found = findNodeById(node.children, id);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-// Returns {list, index} of the array containing the node.
-// Whether a subtree reads anything from the file it currently sits in — an
-// expression, a conditional, a loop, or a prop written as code. Moved into a
-// component, those names aren't in scope any more: `{title}` in a page reads
-// the page's `title`, and in Card.astro it reads nothing at all. Not something
-// to refuse over (the fix is a prop, and only the author knows its name) but
-// very much something to say out loud.
-function usesPageScope(node) {
-  if (!node || typeof node !== 'object') return false;
-  if (['expr', 'cond', 'map', 'branch'].includes(node.kind)) return true;
-  for (const value of Object.values(node.props || {})) {
-    if (value && value.type === 'expr') return true;
-  }
-  return (node.children || []).some(usesPageScope);
-}
-
-function findParentList(model, id) {
-  const search = (list) => {
-    const index = list.findIndex((n) => n.id === id);
-    if (index !== -1) return { list, index };
-    for (const node of list) {
-      if (Array.isArray(node.children)) {
-        const found = search(node.children);
-        if (found) return found;
-      }
-    }
-    return null;
-  };
-  return search(model.nodes);
-}
-
-function isDescendantOf(candidateParent, id) {
-  if (!Array.isArray(candidateParent.children)) return false;
-  return !!findNodeById(candidateParent.children, id) || candidateParent.id === id;
-}
-
-// Position (index trail) of a node in the tree, for re-selecting the
-// equivalent node after an external reload regenerates ids.
-function pathOfNode(nodes, id, trail = []) {
-  for (let i = 0; i < nodes.length; i++) {
-    const n = nodes[i];
-    if (n.id === id) return [...trail, i];
-    if (Array.isArray(n.children)) {
-      const p = pathOfNode(n.children, id, [...trail, i]);
-      if (p) return p;
-    }
-  }
-  return null;
-}
-
-// Ancestor chain (root → … → node) for breadcrumbs.
-function ancestorChain(nodes, id, trail = []) {
-  for (const node of nodes) {
-    if (node.id === id) return [...trail, node];
-    if (Array.isArray(node.children)) {
-      const r = ancestorChain(node.children, id, [...trail, node]);
-      if (r) return r;
-    }
-  }
-  return null;
-}
-
-function nodeAtPath(nodes, trail) {
-  let list = nodes;
-  let node = null;
-  for (const i of trail) {
-    node = list?.[i];
-    if (!node) return null;
-    list = Array.isArray(node.children) ? node.children : [];
-  }
-  return node;
-}
-
-// The node whose children list holds `id` — null when it sits at the page root.
-function findParentNode(nodes, id) {
-  for (const n of nodes) {
-    if (!Array.isArray(n.children)) continue;
-    if (n.children.some((c) => c.id === id)) return n;
-    const found = findParentNode(n.children, id);
-    if (found) return found;
-  }
-  return null;
-}
-
-// Loops and conditionals render their children straight through, so a `slot`
-// under one is still read by whatever component sits above it.
-const SLOT_TRANSPARENT = new Set(['map', 'cond', 'branch', 'chunk-group']);
-
-// The component (or layout) whose slots a node's `slot` attribute names,
-// looking past those pass-through wrappers. Null when the node lands in a
-// plain element or at the page root — nothing there reads a slot name.
-function slotHostOf(model, id) {
-  let node = findParentNode(model.nodes, id);
-  while (node && SLOT_TRANSPARENT.has(node.kind)) {
-    node = findParentNode(model.nodes, node.id);
-  }
-  return node && node.kind === 'component' ? node : null;
-}
-
-// What we know about a placed component, which may be imported under a local
-// name of its own (`import Layout from '../layouts/BaseLayout.astro'`) — so
-// fall back to the file the import points at. Null means "no definition
-// scanned", which is never the same answer as "has no slots".
-function definitionOf(model, node, insertables) {
-  const byName = insertables.find((c) => c.name === node.name);
-  if (byName) return byName;
-  const imp = (model.imports || []).find((i) => i.name === node.name);
-  const base = imp?.path.split('/').pop()?.replace(/\.astro$/i, '');
-  return (base && insertables.find((c) => c.name === base)) || null;
-}
-
-// ---------------------------------------------------------------------------
-// Renaming a loop variable
-//
-// `services.map((service) => …)` — renaming `service` has to follow every
-// reference below it, or the loop's own children stop compiling. Text-level
-// rewriting, since the children hold code as strings.
-// ---------------------------------------------------------------------------
-
-const MAP_HEAD_RE = /^([\s\S]+?)\.map\(\s*\(\s*([\w$]+)\s*(?:,\s*([\w$]+)\s*)?\)\s*=>\s*\($/;
-
-function splitMapHead(head) {
-  const m = String(head).trim().match(MAP_HEAD_RE);
-  return m ? { data: m[1].trim(), item: m[2], index: m[3] || '' } : null;
-}
-
-// Whole identifier only: `service` but never the `service` in `x.service`
-// (a property of something else) or in `services`.
-const renameIdent = (code, from, to) =>
-  String(code ?? '').replace(new RegExp(`(?<![.\\w$])${from}(?![\\w$])`, 'g'), to);
-
-// Text nodes are prose with {expressions} in it — rewrite only the braces,
-// so a loop variable named `title` doesn't rewrite the word in a sentence.
-const renameInBraces = (text, from, to) =>
-  String(text ?? '').replace(/\{([^{}]*)\}/g, (_, inner) => `{${renameIdent(inner, from, to)}}`);
-
-function renameLoopVar(nodes, from, to) {
-  for (const n of nodes) {
-    if (n.kind === 'map') {
-      const p = splitMapHead(n.head);
-      if (p) {
-        // Only the data expression is a reference; the parameters are this
-        // loop's own declarations.
-        const data = renameIdent(p.data, from, to);
-        if (data !== p.data) {
-          n.head = `${data}.map((${p.item}${p.index ? `, ${p.index}` : ''}) => (`;
-        }
-        // Declarations in a statement-body loop read the outer item as
-        // freely as the markup does.
-        if (Array.isArray(n.body)) n.body = n.body.map((line) => renameIdent(line, from, to));
-        // A nested loop that re-declares the name shadows the outer one, so
-        // everything below it means something else by it.
-        if (p.item === from || p.index === from) continue;
-      } else {
-        n.head = renameIdent(n.head, from, to); // custom head — best effort
-      }
-    } else if (n.kind === 'expr') {
-      n.value = renameIdent(n.value, from, to);
-    } else if (n.kind === 'cond') {
-      n.test = renameIdent(n.test, from, to);
-    } else if (n.kind === 'text') {
-      n.value = renameInBraces(n.value, from, to);
-    }
-    for (const [key, v] of Object.entries(n.props || {})) {
-      if (v?.type === 'expr') n.props[key] = { ...v, value: renameIdent(v.value, from, to) };
-    }
-    if (Array.isArray(n.children)) renameLoopVar(n.children, from, to);
-  }
-}
-
-// First element with this tag, depth-first. Used to land the selection on a
-// layout's <body> when it is opened: the html/head wrapper above it is not
-// what anyone came to edit, and <body> is the page's real root.
-function findElementByTag(nodes, tag) {
-  for (const n of nodes || []) {
-    if (n.kind === 'element' && String(n.name).toLowerCase() === tag) return n;
-    if (Array.isArray(n.children)) {
-      const found = findElementByTag(n.children, tag);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-// What a freshly opened component starts on: its <body> when it owns the
-// document (a layout), otherwise the first thing its markup renders. Leading
-// comments and text aren't what the file is about, so they're skipped; if
-// there's nothing else, the first node of any kind is better than nothing.
-function openingSelection(nodes) {
-  const list = Array.isArray(nodes) ? nodes : [];
-  return findElementByTag(list, 'body') || outermostNode(list);
-}
-
-// The outermost thing a page renders: its layout wrapper when it has one,
-// otherwise the first real node. A doctype line, a leading comment or stray
-// whitespace isn't what the page is about, so those are skipped — but any
-// node beats selecting nothing.
-function outermostNode(nodes) {
-  const list = Array.isArray(nodes) ? nodes : [];
-  return list.find((n) => n.kind === 'element' || n.kind === 'component') || list[0] || null;
-}
-
-function collectUsedNames(model) {
-  const used = new Set();
-  const walk = (list) => {
-    for (const node of list) {
-      if (node.name) used.add(node.name);
-      if (Array.isArray(node.children)) walk(node.children);
-    }
-  };
-  walk(model.nodes);
-  return used;
-}
-
-// Comments in the frontmatter are prose about the page, and prose names the
-// things the page is built from — `// Hero copy` is talk about <Hero>, not a
-// use of it. Only whole-line `//` comments go: a trailing one can't be told
-// from the `//` inside a URL without really parsing, and cutting a string in
-// half there would hide a reference that is real.
-function stripComments(code) {
-  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
-}
-
-// Everything in the file that is code rather than markup: the frontmatter, a
-// loop's head, a condition's test, an expression node, and any prop whose
-// value is an expression. An imported name can be used in any of them without
-// ever appearing as a tag.
-//
-// <style> and <script> bodies are pointedly not code for this purpose. Both
-// are their own scope in Astro — CSS never sees a frontmatter binding, and a
-// <script> is a separate module — so a name inside one is a coincidence, not
-// a use. Reading them meant a `.Hero` class or a `/* Hero */` note pinned
-// <Hero>'s import in place for good. What those blocks genuinely share comes
-// in through `define:vars`, which is a prop expression and is still read.
-function codeText(model) {
-  const parts = [stripComments(model.extraFrontmatter || '')];
-  const walk = (list) => {
-    for (const node of list) {
-      if (node.kind === 'expr' || node.kind === 'raw-line') parts.push(node.value || '');
-      if (node.kind === 'map') parts.push(node.head || '');
-      if (node.kind === 'cond') parts.push(node.test || '');
-      for (const v of Object.values(node.props || {})) {
-        if (v && (v.type === 'expr' || v.type === 'spread')) parts.push(String(v.value ?? ''));
-      }
-      if (Array.isArray(node.children)) walk(node.children);
-    }
-  };
-  walk(model.nodes);
-  return parts.join('\n');
-}
+import {
+  ancestorChain,
+  chooseImportPath,
+  codeText,
+  DEFAULT_TEXT,
+  definitionOf,
+  disconnectDependentLoops,
+  findElementByTag,
+  findNodeById,
+  findParentList,
+  findParentNode,
+  insertIntoModel,
+  isDescendantOf,
+  loopVarsAt,
+  newId,
+  nodeAtPath,
+  openingSelection,
+  outermostNode,
+  parseLoopHead,
+  pathOfNode,
+  pruneImports,
+  renameLoopVar,
+  slotHostOf,
+  stripLostBindings,
+  usesPageScope,
+  VOID_ELEMENTS,
+} from "./modelOps.js";
+// The node operations themselves, under one name. Every mutation below that an
+// agent can also perform goes through these — see src/modelOps.js for why
+// there is exactly one implementation of each of them.
+import * as ops from './modelOps.js';
+import { applyOperations } from './modelOps.js';
+import { createAgentCommands } from './agent/commands.js';
+import { digestOfModel } from './agent/digest.js';
 
 // How long a pending save waits, by urgency. See scheduleSave.
 const SAVE_DELAY = { true: 0, live: 120, false: 300 };
@@ -402,199 +144,6 @@ function routeToPath(route, trailingSlash) {
   return route; // 'ignore' — the default, and it serves either
 }
 
-// Imports the app is willing to remove once nothing refers to them: a
-// component file of any flavour Astro renders, an image, and Astro's own
-// <Image>/<Picture>. All three are reachable only as a tag or from an
-// expression, both of which the check below reads in full. A stylesheet, a
-// data module or a utility is left alone — those get imported for effects
-// this file can't see, and dropping one that is still doing its job breaks
-// the page.
-const COMPONENT_IMPORT_RE = /\.(astro|jsx|tsx|vue|svelte)$/i;
-const ASSET_IMPORT_RE = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
-
-function prunableImport(i) {
-  return (
-    COMPONENT_IMPORT_RE.test(i.path) ||
-    ASSET_IMPORT_RE.test(i.path) ||
-    i.path === ASTRO_ASSETS_MODULE
-  );
-}
-
-function pruneImports(model) {
-  const used = collectUsedNames(model);
-  // A name can be referenced as code rather than as a tag — inside a
-  // `<Fragment set:html>` chunk, a frontmatter const, a prop expression. The
-  // test is deliberately loose (a bare word anywhere in the code counts),
-  // because the cost of a false positive is a stray import and the cost of a
-  // false negative is deleting something the page still needs.
-  const code = codeText(model);
-  const mentioned = (name) =>
-    new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(code);
-  model.imports = model.imports.filter(
-    (i) => !prunableImport(i) || used.has(i.name) || mentioned(i.name)
-  );
-}
-
-// Chooses an import path matching the page's existing style: if it already
-// imports via a src alias (e.g. "@/components/X.astro"), reuse that alias
-// root for the new import; otherwise fall back to a relative path.
-function chooseImportPath(model, { relative, srcRelative }) {
-  if (srcRelative) {
-    for (const imp of model.imports) {
-      if (imp.path.startsWith('.')) continue;
-      for (const marker of ['/components/', '/layouts/']) {
-        const idx = imp.path.indexOf(marker);
-        if (idx > 0) return imp.path.slice(0, idx + 1) + srcRelative;
-      }
-    }
-  }
-  return relative;
-}
-
-// `data.map((item[, index]) => (` → its pieces, or null when the head is
-// hand-written code the loop editor can't model.
-function parseLoopHead(head) {
-  const m = String(head || '').match(
-    /^([\s\S]*?)\.map\(\s*\(\s*([A-Za-z_$][\w$]*)\s*(?:,\s*([A-Za-z_$][\w$]*)\s*)?\)\s*=>\s*\($/
-  );
-  return m ? { data: m[1].trim(), item: m[2], index: m[3] || '' } : null;
-}
-
-// Whether `expr` reads from the variable `v` (`service`, `service.tags`) —
-// not merely contains its letters (`services`, `x.service`).
-const readsVar = (expr, v) =>
-  new RegExp(`(^|[^\\w$.])${v}\\b`).test(String(expr || ''));
-
-// Switching a loop's data source orphans any loop beneath it that reads from
-// the item — `service.tags.map(...)` under `services.map((service) => …)`
-// would call .map on undefined once the parent points somewhere else. Those
-// loops are repointed at an empty array: still valid code, renders nothing,
-// and the child markup is preserved for re-pointing by hand.
-function disconnectDependentLoops(list, vars) {
-  for (const n of list || []) {
-    if (!Array.isArray(n.children)) continue;
-    if (n.kind === 'map') {
-      const h = parseLoopHead(n.head);
-      if (h && vars.some((v) => readsVar(h.data, v))) {
-        n.head = `[].map((${h.item}${h.index ? `, ${h.index}` : ''}) => (`;
-      }
-      // The declarations are left alone: an empty list never calls the
-      // callback, so nothing in there can run, and the code is still what the
-      // user wrote for when they point it at data again.
-      // A nested loop that reuses the name shadows it, so anything deeper
-      // refers to the inner one and is still valid.
-      const shadowed = new Set([h?.item, h?.index].filter(Boolean));
-      const rest = vars.filter((v) => !shadowed.has(v));
-      if (rest.length) disconnectDependentLoops(n.children, rest);
-    } else if (n.kind === 'cond') {
-      // Same for a condition reading the item: false renders the else branch
-      // instead of throwing.
-      if (vars.some((v) => readsVar(n.test, v))) n.test = 'false';
-      disconnectDependentLoops(n.children, vars);
-    } else {
-      disconnectDependentLoops(n.children, vars);
-    }
-  }
-}
-
-// The loop variables in scope at a node: every enclosing map's item/index.
-function loopVarsAt(nodes, id) {
-  const vars = [];
-  const walk = (list, scope) => {
-    for (const n of list) {
-      if (n.id === id) {
-        vars.push(...scope);
-        return true;
-      }
-      if (Array.isArray(n.children)) {
-        const next =
-          n.kind === 'map'
-            ? [...scope, ...[parseLoopHead(n.head)?.item, parseLoopHead(n.head)?.index].filter(Boolean)]
-            : scope;
-        if (walk(n.children, next)) return true;
-      }
-    }
-    return false;
-  };
-  walk(nodes, []);
-  return [...new Set(vars)];
-}
-
-// What a dropped binding is replaced with, so the element keeps rendering
-// something you can select and retype.
-const UNBOUND_TEXT = 'content';
-
-// Moving or pasting a node out of its loop leaves its bindings pointing at a
-// variable that no longer exists — `{service.text}` becomes a hard
-// ReferenceError that blanks the whole page. Replace exactly those bindings:
-// `{…}` children and interpolations become placeholder text, expression props
-// are dropped (a stale `href="content"` would just be a broken link), and
-// nested loops that read from the departed item are pointed at an empty
-// array.
-function stripLostBindings(node, vars) {
-  if (!vars.length) return 0;
-  let removed = 0;
-  const walk = (n) => {
-    for (const [k, v] of Object.entries(n.props || {})) {
-      if (v?.type === 'expr' && vars.some((x) => readsVar(v.value, x))) {
-        delete n.props[k];
-        removed++;
-      }
-    }
-    // A dropped binding leaves placeholder text rather than a hole, so the
-    // element stays visible and editable on the canvas.
-    if (n.kind === 'expr' && vars.some((x) => readsVar(n.value, x))) {
-      removed++;
-      n.kind = 'text';
-      n.value = UNBOUND_TEXT;
-      delete n.head;
-      delete n.children;
-      return;
-    }
-    if (n.kind === 'text' && n.value.includes('{')) {
-      const next = n.value.replace(/\{([^{}]*)\}/g, (whole, inner) =>
-        vars.some((x) => readsVar(inner, x)) ? UNBOUND_TEXT : whole
-      );
-      if (next !== n.value) {
-        removed++;
-        n.value = next;
-      }
-    }
-    if (n.kind === 'map') {
-      const h = parseLoopHead(n.head);
-      if (h && vars.some((x) => readsVar(h.data, x))) {
-        n.head = `[].map((${h.item}${h.index ? `, ${h.index}` : ''}) => (`;
-        removed++;
-      }
-      if (Array.isArray(n.body)) {
-        // This loop can still run (its own data may be fine), so a
-        // declaration reading a lost variable would throw. Dropping the line
-        // would orphan whatever reads the name it declares — so keep the
-        // binding and swap what it's assigned, the same placeholder a lost
-        // text binding gets.
-        n.body = n.body.map((line) => {
-          if (!vars.some((x) => readsVar(line, x))) return line;
-          const decl = line.match(/^((?:const|let)\s+[^=]+=\s*)/);
-          if (!decl) return line;
-          removed++;
-          return `${decl[1]}'${UNBOUND_TEXT}';`;
-        });
-      }
-    }
-    // A condition on a variable that's gone would throw; false keeps the
-    // markup and renders the else branch.
-    if (n.kind === 'cond' && vars.some((x) => readsVar(n.test, x))) {
-      n.test = 'false';
-      removed++;
-    }
-    if (Array.isArray(n.children)) {
-      n.children.forEach(walk);
-      n.children = n.children.filter((c) => !c.__drop);
-    }
-  };
-  walk(node);
-  return removed;
-}
 
 // Whether the props panel would offer this node a Content field — the rich
 // inline editor over its words. The same test PropsPanel makes: children that
@@ -1309,6 +858,19 @@ export default function App() {
 
   const historyRef = useRef({ past: [], future: [], lastPush: 0, lastKey: null });
 
+  // How many times the open document has changed.
+  //
+  // The MCP context revision counts what is on SCREEN — a selection moving
+  // bumps it and an edit to an unselected node may not. A write has to name
+  // the document, so it gets a counter of its own: bumped by every accepted
+  // model or source change, including the ones undo and redo make. Monotonic
+  // across files, and reported beside the file it is about, so two documents
+  // can never be mistaken for one because their numbers agree.
+  const docRevRef = useRef(0);
+  const bumpDoc = useCallback(() => {
+    docRevRef.current += 1;
+  }, []);
+
   const snapshotOf = (state) =>
     state.editable
       ? { kind: 'model', model: structuredClone(state.model) }
@@ -1374,6 +936,7 @@ export default function App() {
   }, []);
 
   const applySnapshot = useCallback((entry) => {
+    docRevRef.current += 1; // an undo is a change to the document like any other
     setPageState((s) => {
       if (!s) return s;
       if (entry.kind === 'model') {
@@ -1468,6 +1031,7 @@ export default function App() {
   const mutateModel = useCallback(
     (fn, immediate = false, coalesceKey = null) => {
       pushHistory(coalesceKey);
+      bumpDoc();
       setPageState((s) => {
         if (!s || !s.editable) return s;
         const model = fn(structuredClone(s.model));
@@ -1475,16 +1039,17 @@ export default function App() {
       });
       scheduleSave(immediate);
     },
-    [scheduleSave, pushHistory]
+    [scheduleSave, pushHistory, bumpDoc]
   );
 
   const setRawSource = useCallback(
     (source) => {
       pushHistory('raw-source');
+      bumpDoc();
       setPageState((s) => (s ? { ...s, source, dirty: true } : s));
       scheduleSave();
     },
-    [scheduleSave, pushHistory]
+    [scheduleSave, pushHistory, bumpDoc]
   );
 
   // ----------------------------------------------------------------
@@ -1515,33 +1080,59 @@ export default function App() {
         return;
       }
 
-      // Hot-reload the current page's model unless the user has unsaved
-      // edits in flight (their pending save would win anyway).
-      if (state?.dirty) return;
-
-      let result;
-      try {
-        result = await window.avb.readPage(page.path);
-      } catch {
-        return;
-      }
-
-      // Re-select the node at the same tree position (ids regenerate).
-      const selId = selectedIdRef.current;
-      let nextSelected = selId;
-      if (selId && selId !== 'layout' && selId !== 'frontmatter') {
-        if (state?.editable && result.editable) {
-          const trail = pathOfNode(state.model.nodes, selId);
-          nextSelected = trail ? (nodeAtPath(result.model.nodes, trail)?.id ?? null) : null;
-        } else {
-          nextSelected = null;
-        }
-      }
-      setPageState({ ...result, file: page.path, dirty: false });
-      setSelectedId(nextSelected);
+      await reloadOpenPageRef.current?.();
     });
     return off;
   }, [rescan]);
+
+  /**
+   * Take the open page's model from disk again.
+   *
+   * The file watcher's answer to somebody editing the open file in another
+   * editor — and the Agent API's answer to its own raw source write, which is
+   * the same situation wearing a different hat: the bytes changed and the model
+   * in memory is now describing a file that is gone. Left to itself the next
+   * save would put the old model back over it.
+   *
+   * Through a ref so both callers reach the one implementation; the watcher
+   * effect binds long before this is in scope.
+   */
+  const reloadOpenPageRef = useRef(null);
+  reloadOpenPageRef.current = async () => {
+    const { currentPage: page, pageState: state } = pageStateRef.current;
+    if (!page) return false;
+    // Unsaved edits in flight win: their pending save is about to be written,
+    // and reloading over them would throw away work nobody has seen yet.
+    if (state?.dirty) return false;
+    let result;
+    try {
+      result = await window.avb.readPage(page.path);
+    } catch {
+      return false;
+    }
+    // Re-select the node at the same tree position (ids regenerate).
+    const selId = selectedIdRef.current;
+    let nextSelected = selId;
+    if (selId && selId !== 'layout' && selId !== 'frontmatter') {
+      if (state?.editable && result.editable) {
+        const trail = pathOfNode(state.model.nodes, selId);
+        nextSelected = trail ? (nodeAtPath(result.model.nodes, trail)?.id ?? null) : null;
+      } else {
+        nextSelected = null;
+      }
+    }
+    // A document that came from somewhere other than this model is a new
+    // document as far as anything holding a revision is concerned.
+    docRevRef.current += 1;
+    setPageState({ ...result, file: page.path, dirty: false });
+    setSelectedId(nextSelected);
+    // The history is deliberately left alone. Somebody editing the open file in
+    // another editor has always been able to press ⌘Z afterwards and get the
+    // model back — that is what undo means here, and it is not this function's
+    // place to decide otherwise. An earlier version of this dropped the page's
+    // snapshots and it was a behaviour change nobody asked for.
+    return true;
+  };
 
   // ----------------------------------------------------------------
   // Model operations
@@ -1713,69 +1304,13 @@ export default function App() {
 
   const moveNode = useCallback(
     (nodeId, target) => {
+      const said = [];
       mutateModel((model) => {
-        const found = findParentList(model, nodeId);
-        if (!found) return model;
-        const node = found.list[found.index];
-
-        // Prevent dropping a node into its own subtree.
-        if (target?.parentId) {
-          if (target.parentId === nodeId) return model;
-          if (isDescendantOf(node, target.parentId)) return model;
-        }
-
-        // Capture target list before removal to fix up indices.
-        const sameList =
-          (target?.parentId == null && found.list === model.nodes) ||
-          (target?.parentId != null &&
-            findNodeById(model.nodes, target.parentId)?.children === found.list);
-
-        const before = loopVarsAt(model.nodes, nodeId);
-
-        // Take the node's note with it. Both come out in one splice, so the
-        // drop index has to be shifted by however many were actually removed.
-        const noteAt = noteIndexAbove(found.list, found.index);
-        const note = noteAt === -1 ? null : found.list[noteAt];
-        const removeAt = note ? noteAt : found.index;
-        const removedCount = note ? 2 : 1;
-
-        found.list.splice(removeAt, removedCount);
-        let index = target?.index ?? Number.MAX_SAFE_INTEGER;
-        if (sameList && index > removeAt) {
-          // A drop that landed *between* the note and its element collapses
-          // onto where the pair used to start.
-          index = Math.max(removeAt, index - removedCount);
-        }
-        insertIntoModel(model, node, target ? { ...target, index } : null);
-        // Put the note back directly above wherever the node landed — let
-        // insertIntoModel decide placement, then follow it.
-        if (note) {
-          const landed = findParentList(model, nodeId);
-          if (landed) landed.list.splice(landed.index, 0, note);
-        }
-
-        // `slot` is a word addressed to the component the node sat inside, and
-        // means nothing anywhere else (src/slotAttr.js).
-        const slot = node.props?.slot;
-        const slotName = slot?.type === 'string' ? slot.value : null;
-        if (slotName) {
-          const host = slotHostOf(model, nodeId);
-          const definition = host ? definitionOf(model, host, insertables) : null;
-          if (!keepsSlot({ slotName, host, definition })) delete node.props.slot;
-        }
-
-        // Left a loop? Anything still reading its item would throw.
-        const after = loopVarsAt(model.nodes, nodeId);
-        const lost = before.filter((v) => !after.includes(v));
-        const removed = stripLostBindings(node, lost);
-        if (removed) {
-          showToast(
-            `Removed ${removed} binding${removed === 1 ? '' : 's'} that referenced ${lost.join(', ')}.`,
-            'info'
-          );
-        }
+        const result = ops.moveNode(model, { nodeId, target }, { insertables });
+        said.push(...(result.notes || []));
         return model;
       }, true);
+      for (const note of said) showToast(note, 'info');
     },
     [insertables, mutateModel, showToast]
   );
@@ -1787,50 +1322,27 @@ export default function App() {
 
   const removeNode = useCallback(
     (nodeId) => {
-      const state = pageStateRef.current.pageState;
-      const target = state?.editable ? findNodeById(state.model.nodes, nodeId) : null;
-      if (target?.kind === 'chunk-group') {
-        showToast('This section comes from the page frontmatter — remove it from the code instead.', 'error');
-        return;
-      }
-      // Worked out against the tree as it stands, before the node is gone.
-      const nextId = state?.editable ? selectionAfterDelete(state.model, nodeId) : null;
+      const said = [];
+      let landed;
+      let refused = null;
       mutateModel((model) => {
-        const found = findParentList(model, nodeId);
-        if (found) {
-          // Delete the node's note with it, or it would re-attach to whatever
-          // now follows and read as that element's description.
-          const noteAt = noteIndexAbove(found.list, found.index);
-          if (noteAt === -1) found.list.splice(found.index, 1);
-          else found.list.splice(noteAt, 2);
+        const result = ops.removeNode(model, { nodeId });
+        if (!result.ok) {
+          refused = result.message;
+          return model;
         }
-        pruneImports(model);
-        // The code the deleted markup was the only reader of goes with it: a
-        // `const jobs = […]` nothing lists any more is left behind otherwise,
-        // and a page collects them one deletion at a time. Only what nothing
-        // else mentions — another declaration included — and never an export,
-        // which is the page's own interface to Astro.
-        const dead = unusedDeclarations(model);
-        if (dead.length) {
-          model.extraFrontmatter = withoutDeclarations(
-            model.extraFrontmatter,
-            dead.map((d) => d.name)
-          );
-          droppedRef.current = dead.map((d) => d.name);
-        }
+        said.push(...(result.notes || []));
+        landed = result.selectId;
         return model;
       }, true);
-      if (droppedRef.current?.length) {
-        const names = droppedRef.current;
-        droppedRef.current = null;
-        showToast(
-          `Also removed ${names.map((n) => `\`${n}\``).join(', ')} from the frontmatter — nothing was reading ${names.length === 1 ? 'it' : 'them'} any more.`,
-          'info'
-        );
+      if (refused) {
+        showToast(refused, 'error');
+        return;
       }
+      for (const note of said) showToast(note, 'info');
       // Only the selection that just vanished moves — deleting some other row
       // (navigator menu, canvas) leaves what you were working on alone.
-      setSelectedId((id) => (id === nodeId ? nextId : id));
+      setSelectedId((id) => (id === nodeId ? landed ?? null : id));
     },
     [mutateModel, showToast]
   );
@@ -1877,24 +1389,18 @@ export default function App() {
 
   const duplicateNode = useCallback(
     (nodeId) => {
-      const state = pageStateRef.current.pageState;
-      if (!state?.editable) return;
-      const src = findNodeById(state.model.nodes, nodeId);
-      if (!src) return;
-      if (src.kind === 'chunk-group' || src.chunkFile) {
-        showToast('Chunk sections are defined in the page frontmatter and cannot be duplicated here.', 'error');
-        return;
-      }
-      const clone = cloneWithNewIds(src);
+      let landed = null;
+      let refused = null;
       mutateModel((model) => {
-        const found = findParentList(model, nodeId);
-        if (!found) return model;
-        found.list.splice(found.index + 1, 0, clone);
+        const result = ops.duplicateNode(model, { nodeId });
+        if (!result.ok) refused = result.message;
+        else landed = result.selectId;
         return model;
       }, true);
-      setSelectedId(clone.id);
+      if (refused) showToast(refused, 'error');
+      else if (landed) setSelectedId(landed);
     },
-    [mutateModel]
+    [mutateModel, showToast]
   );
 
   // Pastes into the current selection when it can host children (a non-void
@@ -2714,25 +2220,13 @@ export default function App() {
   // understand to extend, so that one is said out loud rather than dropped.
   const addClassToNode = useCallback(
     (nodeId, className) => {
-      const clean = String(className || '').trim();
-      if (!nodeId || !clean) return;
-      let refused = false;
+      let refused = null;
       mutateModel((model) => {
-        const node = findNodeById(model.nodes, nodeId);
-        if (!node) return model;
-        if (hasClass(node.props, clean)) return model;
-        const edit = withClass(node.props, clean);
-        if (!edit) {
-          refused = true;
-          return model;
-        }
-        if (!node.props) node.props = {};
-        node.props[edit.key] = edit.value;
+        const result = ops.addClass(model, { nodeId, className });
+        if (!result.ok) refused = result.message;
         return model;
       }, true);
-      if (refused) {
-        showToast(`Add ${clean} to this element yourself — its class comes from code Stacki can't edit safely.`);
-      }
+      if (refused) showToast(refused);
     },
     [mutateModel, showToast]
   );
@@ -2741,11 +2235,7 @@ export default function App() {
     (nodeId, propName, value, immediate = false) => {
       mutateModel(
         (model) => {
-          const node = findNodeById(model.nodes, nodeId);
-          if (!node) return model;
-          if (!node.props) node.props = {};
-          if (value === undefined) delete node.props[propName];
-          else node.props[propName] = value;
+          ops.setProp(model, { nodeId, name: propName, value });
           return model;
         },
         immediate,
@@ -2761,13 +2251,7 @@ export default function App() {
     (nodeId, patch, immediate = true) => {
       mutateModel(
         (model) => {
-          const node = findNodeById(model.nodes, nodeId);
-          if (!node) return model;
-          if (!node.props) node.props = {};
-          for (const [name, value] of Object.entries(patch)) {
-            if (value === undefined) delete node.props[name];
-            else node.props[name] = value;
-          }
+          ops.setProps(model, { nodeId, patch });
           return model;
         },
         immediate,
@@ -2835,15 +2319,7 @@ export default function App() {
   const renameProp = useCallback(
     (nodeId, oldName, newName) => {
       mutateModel((model) => {
-        const node = findNodeById(model.nodes, nodeId);
-        if (!node?.props || !(oldName in node.props)) return model;
-        if (!newName || newName === oldName) return model;
-        const next = {};
-        for (const [k, v] of Object.entries(node.props)) {
-          if (k === oldName) next[newName] = v;
-          else if (k !== newName) next[k] = v;
-        }
-        node.props = next;
+        ops.renameProp(model, { nodeId, from: oldName, to: newName });
         return model;
       }, true);
     },
@@ -2905,39 +2381,8 @@ export default function App() {
 
   const changeElementTag = useCallback(
     (nodeId, newTag) => {
-      const tag = String(newTag || '').trim().toLowerCase();
-      if (!/^[a-z][a-z0-9-]*$/.test(tag)) return;
       mutateModel((model) => {
-        const node = findNodeById(model.nodes, nodeId);
-        if (!node || node.name === tag) return model;
-        // A component becoming a plain tag keeps only what a tag understands:
-        // its props were the component's API, and they'd serialize as junk
-        // attributes on a <div>.
-        const wasComponent = node.kind !== 'element';
-        const oldNames = wasComponent
-          ? new Set(Object.keys(node.props || {}))
-          : new Set(getElementSchema(node.name).map((f) => f.name));
-        if (wasComponent) {
-          node.kind = 'element';
-          delete node.astroAsset;
-          delete node.dynamicTag;
-        }
-        const newNames = new Set(getElementSchema(tag).map((f) => f.name));
-        for (const attr of Object.keys(node.props || {})) {
-          if (
-            oldNames.has(attr) &&
-            !newNames.has(attr) &&
-            !GLOBAL_ATTRS.has(attr) &&
-            !/^(data-|aria-)/.test(attr)
-          ) {
-            delete node.props[attr];
-          }
-        }
-        node.name = tag;
-        // Void elements can't have children; paired tags serialize as a pair.
-        if (VOID_ELEMENTS.has(tag)) node.children = null;
-        else if (node.children === null) node.children = [];
-        pruneImports(model);
+        ops.setTag(model, { nodeId, tag: newTag });
         return model;
       }, true);
     },
@@ -2956,27 +2401,11 @@ export default function App() {
       const renaming = (renames || []).some((r) => r.from && r.to && r.from !== r.to);
       mutateModel(
         (model) => {
-          const node = findNodeById(model.nodes, nodeId);
-          if (!node) return model;
-          if (node.kind === 'map') {
-            const prev = parseLoopHead(node.head);
-            node.head = value;
-            for (const { from, to } of renames || []) {
-              if (from && to && from !== to) renameLoopVar(node.children || [], from, to);
-            }
-            // Renames above already re-pointed the children, so compare the
-            // data sources and orphan-proof what reads from this item.
-            const next = parseLoopHead(value);
-            if (prev && next && prev.data !== next.data) {
-              const vars = [next.item, next.index].filter(Boolean);
-              if (vars.length) disconnectDependentLoops(node.children || [], vars);
-            }
-          } else if (node.kind === 'cond') {
-            node.test = value;
-          } else if (node.kind === 'raw') node.inner = value;
-          else if (node.kind === 'text' || node.kind === 'expr' || node.kind === 'comment') {
-            node.value = value;
-          }
+          // `replaceBinding` because this IS the field showing the expression:
+          // a person editing `{post.title}` in the props panel can see what
+          // they are typing over. The Agent API passes it only when an agent
+          // has said in as many words that it means to replace a binding.
+          ops.setText(model, { nodeId, value, renames, replaceBinding: true });
           return model;
         },
         renaming || immediate,
@@ -3068,27 +2497,15 @@ export default function App() {
     (nodeId, value) => {
       mutateModel(
         (model) => {
-          const node = findNodeById(model.nodes, nodeId);
-          if (!node || node.kind === 'text') return model;
-          if (!Array.isArray(node.children)) node.children = [];
-          const at = node.children.findIndex((c) => c.kind === 'text');
-          // Emptying the field takes the text node out rather than leaving an
-          // empty one behind for the serializer to puzzle over — but where it
-          // sat is remembered, so clearing the field and typing again puts the
-          // words back among the children instead of after all of them.
-          if (at !== -1 && !value) {
-            textSlotRef.current[nodeId] = at;
-            node.children.splice(at, 1);
-          } else if (at !== -1) {
-            node.children[at].value = value;
-          } else if (value) {
-            const back = textSlotRef.current[nodeId];
-            const idx =
-              Number.isInteger(back) && back <= node.children.length
-                ? back
-                : node.children.length;
-            node.children.splice(idx, 0, { id: newId(), kind: 'text', value });
-          }
+          const result = ops.setText(model, {
+            nodeId,
+            value,
+            replaceBinding: true,
+            // Where this node's loose text last sat, so emptying the Content
+            // field and typing again restores its place rather than appending.
+            slotHint: textSlotRef.current[nodeId],
+          });
+          if (Number.isInteger(result.textSlot)) textSlotRef.current[nodeId] = result.textSlot;
           return model;
         },
         false,
@@ -4088,6 +3505,9 @@ export default function App() {
   // Answered by the Visual Review section below; declared here because the
   // handler that reads it is registered above it.
   const focusReviewRef = useRef(null);
+  // Same for the Agent API's commands, which are built at the end of the
+  // component out of everything above them.
+  const agentRunRef = useRef(null);
 
   // The path the canvas knows the selection by, for the computed-style query.
   const mcpSelPathRef = useRef(null);
@@ -4114,6 +3534,10 @@ export default function App() {
       // Through a ref because this handler is bound once, long before the
       // navigation it calls is in scope.
       if (kind === 'review:focus') return focusReviewRef.current?.(params) ?? null;
+      // And the Agent API's editor commands. One door, a fixed set of named
+      // commands behind it, every one of them carried out through what the
+      // panels already call — see src/agent/commands.js.
+      if (kind === 'agent') return agentRunRef.current?.(params) ?? null;
       return null;
     };
     return window.avb.onMcpAsk(async (ask) => {
@@ -4643,11 +4067,33 @@ export default function App() {
     // merely LOOKING at a list of comments mark them all as lost. Reading must
     // not damage what it reads.
     const TRANSIENT = new Set(['not_open', 'moved_away']);
+    // Filled in when the leaf resolves; 'none' until then, which is what an
+    // unresolved anchor is.
+    let leafConfidence = 'none';
+    // What the pin rule is asked about. A review focus asks about the review;
+    // an agent following a ref of its own asks about the ref, whose evidence
+    // is the branch it was minted on against the branch checked out now —
+    // exactly the comparison `divergent` makes, so it is made by the same
+    // function rather than a second copy of the reasoning.
+    const forPin = reviewById(threadId) || {
+      anchorState: 'attached',
+      checkout: {
+        source: 'changed',
+        sameBranch: !anchor?.branch || anchor.branch === (gitInfo?.branch ?? null),
+        branch: gitInfo?.branch ?? null,
+      },
+    };
     const done = (state, reason) => ({
       anchorState: state,
       transient: state !== 'attached' && TRANSIENT.has(reason),
       restored,
       keys: state === 'attached' ? resolvedKeys : null,
+      // HOW the node was identified, not merely whether it was. `positional`
+      // means the slot held and nothing corroborated it — enough to look at,
+      // and not enough to write through on a tree the anchor was not written
+      // against. See src/reviewCheckout.js.
+      confidence: leafConfidence,
+      writable: state === 'attached' && mayPin(forPin, leafConfidence),
       note: focusNote({
         restored,
         anchorState: state,
@@ -4715,6 +4161,7 @@ export default function App() {
       labelOf: crumbLabel,
     });
     if (!leaf.id) return done('orphaned', leaf.reason);
+    leafConfidence = leaf.confidence;
     // The positions this walk actually used. Any of them may have moved since
     // the review was written, and the ledger takes the new ones.
     resolvedKeys = [
@@ -4722,9 +4169,10 @@ export default function App() {
       `${plan.leaf.file}#${leaf.trail.join('.')}`,
     ];
     setSelectedId(leaf.id);
-    // The panel follows, so a person watching an agent work can see which
-    // comment it is on.
-    setLeftTab('comments');
+    // The panel follows a review, so a person watching an agent work can see
+    // which comment it is on. An agent following a ref of its own is not on a
+    // comment, and yanking the panel there would be noise.
+    if (threadId) setLeftTab('comments');
     restored.node = true;
 
     // 5 — and which copy of it, scrolled into view. The marker path is built
@@ -4761,6 +4209,269 @@ export default function App() {
     return done('attached', null);
   };
   focusReviewRef.current = focusReview;
+
+  // ----------------------------------------------------------------
+  // The Agent API's window
+  //
+  // Everything an agent's editor commands need, as functions of the state
+  // this render is holding. Not one line of it is a new way to change the
+  // document: `commit` is mutateModel, `select` is setSelectedId, `undo` is
+  // undo. What it adds is the ability to say all of it in one round trip, and
+  // to answer for what happened afterwards.
+  //
+  // Assembled during render into a ref, for the same reason the MCP payload
+  // is: it reads two dozen pieces of state, and a dependency list that forgot
+  // one of them would go stale exactly where it is hardest to notice.
+  // ----------------------------------------------------------------
+  const agentAppRef = useRef(null);
+  agentAppRef.current = {
+    project: () => project,
+    page: () => ({ file: reviewPageFile, route: reviewPageRoute }),
+    openFile: () => openRel,
+    model: () => model,
+    editable: () => !!pageState?.editable && !inPreview && !previewRef,
+    selectedId: () => selectedId,
+    revision: () => docRevRef.current,
+    // A hash of the tree, so two edits that arrive at the same revision number
+    // (an undo walking back to where it started) are still told apart.
+    digest: () => digestOfModel(pageState?.editable ? model : pageState?.source),
+    crumbLabel,
+    // The navigator's own trail for any node, not just the selection. A ref
+    // minted for a child records this, and src/reviewAnchor.js reads it back —
+    // two spellings of the same trail would be two nodes as far as it is
+    // concerned.
+    crumbsFor: (id) => crumbsFor(id).map((c) => c.label).filter(Boolean),
+    pathFor,
+    keysFor,
+    peersFor,
+    canvas: () => canvasReport,
+    renderedClasses: () => selectedClasses,
+    componentChain: () => editStack.map((e) => e?.name).filter(Boolean),
+    breadcrumbs: (id) => (id === selectedId ? crumbs.map((c) => c?.label).filter(Boolean) : null),
+    isHidden: (id) => stateIds.hidden.has(id),
+    isInert: (id) => stateIds.inert.has(id),
+    insertables: () => insertables,
+    preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
+    historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
+    undo,
+    redo,
+    select: (id, occurrence) => {
+      setSelectedId(id);
+      if (Number.isInteger(occurrence)) {
+        setOccRequest({ path: pathFor(id), occ: occurrence, tick: Date.now() });
+      }
+    },
+    // A moment for the canvas to catch up, so a style read after a select is
+    // asking about the element that is now selected.
+    settle: () => new Promise((done) => setTimeout(done, 120)),
+    focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+    /**
+     * Put a write the main process carried out on the undo stack.
+     *
+     * The panels do this for exactly these operations — a CSS variable, a
+     * content edit, an asset rename — because none of them touch the page
+     * model, so without an entry ⌘Z would skip straight past them to the last
+     * layout change. An agent's version of the same operation has to land in
+     * the same place or the stack tells a story that leaves things out.
+     *
+     * The inverse is the panels' inverse. A content change is the bytes put
+     * back; a rename or a move is the rename or the move read backwards. There
+     * is no third kind, and something that does not fit one of them is not
+     * recorded rather than recorded wrongly.
+     */
+    recordUndo: async ({ label, coalesceKey, restore }) => {
+      if (!restore || !project?.path) return false;
+      const put = async (which) => {
+        if (restore.kind === 'files') {
+          for (const [rel, pair] of Object.entries(restore.files || {})) {
+            if (typeof pair?.[which] !== 'string') continue;
+            await window.avb.writeSourceText({ projectPath: project.path, rel, text: pair[which] });
+          }
+        } else if (restore.kind === 'asset_rename') {
+          const step = which === 'before' ? restore.back : restore.forward;
+          await window.avb.renameAsset({ projectPath: project.path, rel: step.rel, newName: step.name });
+        } else if (restore.kind === 'asset_move') {
+          const step = which === 'before' ? restore.back : restore.forward;
+          await window.avb.moveAsset({ projectPath: project.path, fromRel: step.fromRel, toDirRel: step.toDirRel });
+        } else {
+          return;
+        }
+        // The panels reload after their own undo for the same reason: the file
+        // it rewrote may be the one on screen.
+        setRefreshKey((k) => k + 1);
+        await reloadOpenPageRef.current?.();
+      };
+      pushCommand({
+        label: label || 'that change',
+        coalesceKey: coalesceKey ?? null,
+        undo: () => put('before'),
+        redo: () => put('after'),
+      });
+      return true;
+    },
+    /**
+     * Replace the open document's source, through the editor.
+     *
+     * The Agent API's raw source write used to go round the outside: write the
+     * file, then tell the renderer to take it from disk again. That worked and
+     * it threw the page's undo history away, because a reload describes a tree
+     * nobody has a snapshot of. So an edit an agent made could not be taken
+     * back, and neither could the three the person had made before it.
+     *
+     * This is the path the editor already has. `pushHistory` first, so ⌘Z has
+     * somewhere to go; then the state, then the normal save. Two shapes,
+     * because the app holds two:
+     *
+     *   a document Stacki models    the model is the truth and the file is
+     *                               written from it, so the new text is parsed
+     *                               and the model replaced. Undo restores the
+     *                               previous MODEL, and saving writes it back
+     *                               over the file — which is the original
+     *                               source, arrived at the way everything else
+     *                               here arrives at it.
+     *
+     *   a document it does not      `pageState.source` is the truth already.
+     *                               This is exactly what the code editor does.
+     */
+    writeOpenSource: async (text) => {
+      const { currentPage: page, pageState: state } = pageStateRef.current;
+      if (!page || !state) return { ok: false, code: 'not_open', message: 'Stacki has no document open.' };
+      const before = state.editable ? { kind: 'model', model: state.model } : { kind: 'source', source: state.source };
+      if (!state.editable) {
+        setRawSource(String(text));
+        await new Promise((done) => setTimeout(done, 0));
+        await flushSave();
+        return { ok: true, editable: false, undoable: true, restored: before.kind };
+      }
+      // Parse it the way opening the file would, so what lands in the model is
+      // what Stacki would have read.
+      let parsed;
+      try {
+        parsed = await window.avb.parseSource({ pagePath: page.path, source: String(text) });
+      } catch (err) {
+        return { ok: false, code: 'unparsable', message: String(err?.message || err) };
+      }
+      if (!parsed || parsed.editable === false) {
+        return {
+          ok: false,
+          code: 'unrepresentable',
+          message:
+            parsed?.reason ||
+            'Stacki could not read that as a document. Nothing was changed — the file it has open would have ' +
+              'become one it cannot edit.',
+        };
+      }
+      pushHistory(null); // its own step: a source rewrite is not a typing burst
+      docRevRef.current += 1;
+      // Re-select the node at the same position, the way the file watcher does
+      // after somebody edits the open file elsewhere. A reparse invents fresh
+      // ids, so the old selection means nothing — but the POSITION still does,
+      // and dropping the selection leaves the person looking at a canvas with
+      // nothing chosen for a change they may not even have made.
+      const trail = state.editable && selectedIdRef.current ? pathOfNode(state.model.nodes, selectedIdRef.current) : null;
+      const landed = trail ? nodeAtPath(parsed.model?.nodes || [], trail)?.id ?? null : null;
+      setPageState((s) => (s ? { ...s, ...parsed, file: page.path, dirty: true } : s));
+      setSelectedId(landed);
+      await new Promise((done) => setTimeout(done, 0));
+      await flushSave();
+      return { ok: true, editable: true, undoable: true, restored: before.kind };
+    },
+    // The open document changed on disk under the editor. Same reload the file
+    // watcher does — see reloadOpenPageRef.
+    reloadOpenPage: async () => {
+      const done = await reloadOpenPageRef.current?.();
+      await new Promise((settled) => setTimeout(settled, 0));
+      return { ok: true, reloaded: !!done, file: openRel };
+    },
+    // Going into a component instance and coming back out: the app's own
+    // openComponent and closeComponent, waited on. Both read the refs rather
+    // than this render's state, because by the time they answer this render
+    // is several behind.
+    enter: async (id, occurrence) => {
+      const state = pageStateRef.current.pageState;
+      const node = state?.model ? findNodeById(state.model.nodes, id) : null;
+      if (!node || node.kind !== 'component' || node.dynamicTag) {
+        return { ok: false, code: 'not_component', message: 'That is not a component instance.' };
+      }
+      const before = state.model;
+      const hostPath = pathFor(id);
+      await openComponent(node.name, hostPath, Number.isInteger(occurrence) ? occurrence : 0, null);
+      for (let i = 0; i < 60; i++) {
+        const now = pageStateRef.current.pageState;
+        if (now?.model && now.model !== before && selectedIdRef.current) {
+          return { ok: true, id: selectedIdRef.current };
+        }
+        await new Promise((done) => setTimeout(done, 50));
+      }
+      return { ok: false, code: 'not_ready', message: `Stacki did not finish opening <${node.name}>.` };
+    },
+    exit: async () => {
+      if (editStackRef.current.length < 2) {
+        return { ok: false, code: 'at_top', message: 'Stacki is already at the page.' };
+      }
+      const before = pageStateRef.current.pageState?.model || null;
+      await closeComponent();
+      for (let i = 0; i < 60; i++) {
+        const now = pageStateRef.current.pageState;
+        if (now?.model && now.model !== before) return { ok: true };
+        await new Promise((done) => setTimeout(done, 50));
+      }
+      return { ok: false, code: 'not_ready', message: 'Stacki did not finish leaving the component.' };
+    },
+    // Whether a ref resolved this way is good enough to write through. The
+    // review pin rule, asked about the ref instead of a review.
+    writableFor: (anchor, confidence) =>
+      mayPin(
+        {
+          anchorState: 'attached',
+          checkout: {
+            source: 'changed',
+            sameBranch: !anchor?.branch || anchor.branch === (gitInfo?.branch ?? null),
+            branch: gitInfo?.branch ?? null,
+          },
+        },
+        confidence
+      ),
+    /**
+     * Apply a batch of operations as ONE change.
+     *
+     * One mutateModel, so one undo snapshot, so one ⌘Z. The operations were
+     * already run against a copy by the caller and refused as a set if any of
+     * them could not be done — this is the commit, and it saves before it
+     * answers so whoever asked can read the file that resulted.
+     */
+    commit: async (operations, { label } = {}) => {
+      let outcome = null;
+      mutateModel((m) => {
+        const run = applyOperations(m, operations, { insertables });
+        outcome = run;
+        return run.ok ? run.model : m;
+      }, true);
+      // A turn of the loop before anything is read back.
+      //
+      // `setPageState`'s updater is where the operations actually run, and
+      // React decides when that is — sometimes inside the call above and
+      // sometimes after it. Reading `outcome` straight away was right about
+      // half the time, and the half it was wrong about reported a perfectly
+      // good edit as a failure while quietly leaving it applied. Waiting is
+      // also what lets flushSave see the new model, which it reads through the
+      // ref React updates before effects run.
+      await new Promise((done) => setTimeout(done, 0));
+      if (!outcome?.ok) {
+        return { ok: false, code: outcome?.code || 'failed', message: outcome?.message || 'That edit could not be applied.' };
+      }
+      if (outcome.selectId) setSelectedId(outcome.selectId);
+      await flushSave();
+      return { ok: true, selectedId: outcome.selectId || null, label: label || null };
+    },
+  };
+
+  useEffect(() => {
+    agentRunRef.current = createAgentCommands(() => agentAppRef.current);
+    return () => {
+      agentRunRef.current = null;
+    };
+  }, []);
 
   // From the panel or a pin: the same operation, plus saying so when it could
   // not be done — an agent gets that in its tool result, a person gets a toast.
@@ -5683,21 +5394,6 @@ export default function App() {
   );
 }
 
-function insertIntoModel(model, node, target) {
-  if (!target || target.parentId == null) {
-    const index = target ? Math.min(target.index, model.nodes.length) : model.nodes.length;
-    model.nodes.splice(index, 0, node);
-    return;
-  }
-  const parent = findNodeById(model.nodes, target.parentId);
-  if (!parent) {
-    model.nodes.push(node);
-    return;
-  }
-  if (!Array.isArray(parent.children)) parent.children = [];
-  const index = Math.min(target.index, parent.children.length);
-  parent.children.splice(index, 0, node);
-}
 
 function BusyOverlay({ message }) {
   return (

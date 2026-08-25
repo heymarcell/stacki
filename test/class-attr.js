@@ -163,7 +163,13 @@ const { class: className } = Astro.props;
     /<StylePanel[\s\S]{0,2000}?onAddClass=/.test(app),
     'onAddClass is on some other panel, so typing a class reaches nothing'
   );
-  check('the app adds classes through this rule', /withClass\(node\.props, clean\)/.test(app));
+  const ops = fs.readFileSync(path.join(__dirname, '..', 'src', 'modelOps.js'), 'utf8');
+  check('the app adds classes through this rule', /withClass\(node\.props, clean\)/.test(ops));
+  check(
+    'and reaches it through the shared operation, not a copy',
+    /ops\.addClass\(model, \{ nodeId, className \}\)/.test(app),
+    'App builds the class attribute itself again, which can drift from what an agent gets'
+  );
   check(
     'and says so when it cannot',
     /refused[\s\S]{0,200}showToast/.test(app),

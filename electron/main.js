@@ -61,6 +61,7 @@ const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const mcp = require('./mcp');
 const reviews = require('./review');
+const { createAccessStore } = require('./mcp/agent/access');
 
 let mainWindow = null;
 let devServer = null; // {proc, url, projectPath}
@@ -346,7 +347,31 @@ let pendingProject = null;
 //   - the whole process restarted ("Reload All Code"), and memory is gone —
 //     relaunchApp left the path in a file. Consumed on read, so a later cold
 //     start doesn't silently skip the welcome screen.
-ipcMain.handle('project:pending', () => {
+// Every IPC handler, kept by name as well as registered.
+//
+// The Agent API carries out a page creation, a content write or a git commit by
+// calling the SAME function the Pages panel, the CMS view and the Git chip call
+// — the one below the `ipcMain.handle` line. Recording it here is what makes
+// that possible without a second implementation of anything.
+//
+// It is not a way for an agent to name a channel. Nothing in the MCP surface
+// takes one: a tool takes a domain and an action, and electron/mcp/agent's
+// registry is the only thing that maps those to a name in this table. A
+// channel missing from that registry is unreachable however it is spelled.
+const mainOps = new Map();
+const handle = (channel, fn) => {
+  mainOps.set(channel, fn);
+  ipcMain.handle(channel, fn);
+};
+
+/** Call one by name, with no Electron event behind it. */
+function callMainOp(channel, payload) {
+  const fn = mainOps.get(channel);
+  if (!fn) throw new Error(`Stacki has no ${channel} handler.`);
+  return fn(null, payload);
+}
+
+handle('project:pending', () => {
   const asked = pendingProject;
   pendingProject = null;
   if (asked && fs.existsSync(asked)) return asked;
@@ -368,22 +393,22 @@ ipcMain.handle('project:pending', () => {
 
 // Native clipboard actions on the focused element, requested by the renderer
 // when a menu Copy/Paste lands while a text field has focus.
-ipcMain.handle('native:copy', () => {
+handle('native:copy', () => {
   mainWindow?.webContents.copy();
   return { ok: true };
 });
-ipcMain.handle('native:paste', () => {
+handle('native:paste', () => {
   mainWindow?.webContents.paste();
   return { ok: true };
 });
 // Undo INSIDE a field. ⌘Z is a menu accelerator, so the key never reaches the
 // page and a text field's own undo never runs — this is the app handing it
 // back when that is what the shortcut meant.
-ipcMain.handle('native:undo', () => {
+handle('native:undo', () => {
   mainWindow?.webContents.undo();
   return { ok: true };
 });
-ipcMain.handle('native:redo', () => {
+handle('native:redo', () => {
   mainWindow?.webContents.redo();
   return { ok: true };
 });
@@ -405,6 +430,16 @@ app.whenReady().then(() => {
     getWindow: () => mainWindow,
     version: app.getVersion(),
     settings,
+    // The project the app has open, which is what every ref and every path in
+    // the Agent API is scoped to.
+    getProjectRoot: () => openProjectRoot,
+    // Read every time rather than captured, and about the project that is open
+    // rather than about the machine: a person who tightens the setting is
+    // obeyed by the next call, and a grant made on one project does not follow
+    // Stacki into the next.
+    getAgentMode: () => agentAccess.modeFor(openProjectRoot),
+    // One implementation of each operation, called by name. See mainOps.
+    callMain: callMainOp,
   });
   // Visual Review's ledger. Also for the app rather than for a project — the
   // door is registered once, and which project's reviews are behind it moves
@@ -420,7 +455,7 @@ app.whenReady().then(() => {
 // held — a page half-loaded, an undo stack, a watcher, a shell — and none of
 // this survives the reload on its own: a pty outlives the window that opened
 // it, and the dev server outlives everything.
-ipcMain.handle('project:close', async (_e, next) => {
+handle('project:close', async (_e, next) => {
   pendingProject = typeof next === 'string' && next ? next : null;
   stopDevServer();
   stopAllServices();
@@ -435,6 +470,7 @@ ipcMain.handle('project:close', async (_e, next) => {
   openProjectRoot = null;
   // And nothing is selected, so nothing should still be described as selected.
   mcp.resetContext();
+  mcp.projectChanged();
   // The reviews are written and let go of — they belong to the project being
   // closed, not to the window that is about to reload onto another one.
   reviews.closeProject();
@@ -1051,10 +1087,27 @@ function isAstroProject(dir) {
 
 // Sound is off. An editor that makes a noise the first time somebody touches it
 // is an editor they turn off, so it is asked for rather than opted out of.
-const SETTINGS_DEFAULTS = { sound: false };
+//
+// `agentAccess` is the Agent API's permission level, PER PROJECT — a map of
+// project fingerprint to level, empty until somebody grants something. It is
+// empty by default on purpose: an update that quietly handed a connected agent
+// the ability to read somebody's source would be granting a permission nobody
+// was asked for. See electron/mcp/agent/access.js.
+const SETTINGS_DEFAULTS = { sound: false, agentAccess: {} };
 let settings = { ...SETTINGS_DEFAULTS };
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
+
+// The Agent API's grants, per project. Reads and writes the settings through
+// the two functions below rather than holding a copy, so the window and the
+// gate can never be looking at different answers.
+const agentAccess = createAccessStore({
+  read: () => settings,
+  write: (next) => {
+    settings = next;
+    writeSettings();
+  },
+});
 
 function readSettings() {
   try {
@@ -1074,7 +1127,20 @@ function writeSettings() {
 }
 
 // The renderer asks once on load; the menu pushes every change after that.
-ipcMain.handle('settings:get', () => settings);
+handle('settings:get', () => settings);
+
+// How much of Stacki a connected agent may move, for the project that is open.
+// Set from the AI connection window; enforced in the main process, where the
+// tools actually run. `full` is granted for this session only — see
+// electron/mcp/agent/access.js.
+handle('settings:setAgentMode', (_e, mode) => {
+  const result = agentAccess.setModeFor(openProjectRoot, mode);
+  return { ...result, ...agentAccess.describe(openProjectRoot) };
+});
+
+// What the window draws the control from: the level in force for the open
+// project, whether it survives a restart, and what a restart would find.
+handle('settings:agentAccess', () => agentAccess.describe(openProjectRoot));
 
 // ---------------------------------------------------------------------------
 // Recent projects + preview thumbnails
@@ -1099,7 +1165,7 @@ function writeRecents(list) {
   }
 }
 
-ipcMain.handle('recents:list', async () => {
+handle('recents:list', async () => {
   // Drop entries whose folder is gone or no longer looks like an Astro project.
   const list = readRecents().filter((r) => {
     try {
@@ -1133,7 +1199,7 @@ function hasDependencies(projectPath) {
   return fs.existsSync(path.join(projectPath, 'node_modules', '.bin', binName));
 }
 
-ipcMain.handle('recents:add', async (_e, projectPath) => {
+handle('recents:add', async (_e, projectPath) => {
   const list = readRecents().filter((r) => r.path !== projectPath);
   list.unshift({
     path: projectPath,
@@ -1144,7 +1210,7 @@ ipcMain.handle('recents:add', async (_e, projectPath) => {
   return { ok: true };
 });
 
-ipcMain.handle('recents:remove', async (_e, projectPath) => {
+handle('recents:remove', async (_e, projectPath) => {
   writeRecents(readRecents().filter((r) => r.path !== projectPath));
   // The picture and the note about when it was taken both go.
   thumbs.forget(app.getPath('userData'), projectPath);
@@ -1267,7 +1333,7 @@ const cleanDevLog = (text) =>
     .slice(0, 300);
 
 // Asked for by the start screen, for a card whose picture is out of date.
-ipcMain.handle('recents:refreshThumb', async (_e, projectPath) => {
+handle('recents:refreshThumb', async (_e, projectPath) => {
   const result = await captureThumb(projectPath);
   const userData = app.getPath('userData');
   return { ...result, thumb: thumbs.readThumb(userData, projectPath), stale: thumbs.isStale(userData, projectPath) };
@@ -1293,7 +1359,7 @@ function scheduleThumb(projectPath, delay) {
 // Project IPC
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('project:openDialog', async () => {
+handle('project:openDialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Open an Astro project',
     properties: ['openDirectory'],
@@ -1306,7 +1372,7 @@ ipcMain.handle('project:openDialog', async () => {
   return { canceled: false, projectPath: dir };
 });
 
-ipcMain.handle('project:newDialog', async () => {
+handle('project:newDialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Choose an empty folder for the new project',
     properties: ['openDirectory', 'createDirectory'],
@@ -1354,7 +1420,7 @@ async function installDependencies(dir) {
 // Output is streamed to the renderer so the user sees the same progress the
 // terminal would show. The chosen folder is the cwd and "." the target, so
 // create-astro never has to guess a name from a parent directory.
-ipcMain.handle('project:createAstro', async (_e, opts) => {
+handle('project:createAstro', async (_e, opts) => {
   const { dir, template = 'basics', install = true, git = true, ai = false } = opts || {};
   if (!dir || !fs.existsSync(dir)) throw new Error('Choose a folder for the new project first.');
   ensureToolPath(); // npm is a Node shim — same PATH problem as astro
@@ -1427,7 +1493,7 @@ ipcMain.handle('project:createAstro', async (_e, opts) => {
 
 // A folder to put a new project IN, rather than the project's own folder: the
 // starter arrives as a directory of its own, named by the user.
-ipcMain.handle('project:parentDialog', async () => {
+handle('project:parentDialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Choose where the site should go',
     properties: ['openDirectory', 'createDirectory'],
@@ -1439,7 +1505,7 @@ ipcMain.handle('project:parentDialog', async () => {
 // Starting from a starter. The scaffolder, the first commit and the package's
 // name are in ./starter.js; what is here is the install that follows and the
 // log the wizard reads.
-ipcMain.handle('project:createStarter', async (_e, { starter = 'lumos', parentPath, name }) => {
+handle('project:createStarter', async (_e, { starter = 'lumos', parentPath, name }) => {
   ensureToolPath(); // npm and git are both on the PATH the Dock does not have
   const result = await createStarter({
     starter,
@@ -1453,25 +1519,40 @@ ipcMain.handle('project:createStarter', async (_e, { starter = 'lumos', parentPa
   return result;
 });
 
-ipcMain.handle('project:scaffold', async (_e, { dir, name }) => {
+handle('project:scaffold', async (_e, { dir, name }) => {
   scaffoldProject(dir, name);
   await installDependencies(dir);
   return { ok: true };
 });
 
-ipcMain.handle('project:hasNodeModules', async (_e, projectPath) => {
+handle('project:hasNodeModules', async (_e, projectPath) => {
   return fs.existsSync(path.join(projectPath, 'node_modules'));
 });
 
-ipcMain.handle('project:install', async (_e, projectPath) => {
+handle('project:install', async (_e, projectPath) => {
   await installDependencies(projectPath);
   return { ok: true };
 });
 
-ipcMain.handle('project:scan', async (_e, projectPath) => {
+handle('project:scan', async (_e, projectPath) => {
   // Also set here, not just in watch:start — the Assets panel can render
   // thumbnails before the watcher starts, and they'd be refused.
-  openProjectRoot = path.resolve(projectPath);
+  const opened = path.resolve(projectPath);
+  // Refs an agent is holding were minted about the LAST project, and a project
+  // that has changed has to invalidate them — a ref that survived would quietly
+  // start meaning the same position in a different tree.
+  //
+  // Only when it actually changed. This handler is also the app's ordinary
+  // rescan, which runs on every file change and every panel refresh; rotating
+  // there would expire an agent's refs several times a minute, between reading
+  // a target and editing it.
+  if (openProjectRoot !== opened) {
+    mcp.projectChanged();
+    // And the permission level is the next project's, whatever the last one's
+    // was. Keyed by project, so this is a statement rather than an operation.
+    agentAccess.projectChanged();
+  }
+  openProjectRoot = opened;
   // And this project's reviews. Scoped to the folder the app has open, which
   // is why no renderer call ever names a review file: there is only ever one,
   // and the main process is the only thing that knows which.
@@ -1554,7 +1635,7 @@ ipcMain.handle('project:scan', async (_e, projectPath) => {
 // Every CSS class name used anywhere under src/ — class attributes in markup
 // plus selectors in stylesheets and <style> blocks — for the class-prop
 // autocomplete in the props panel.
-ipcMain.handle('project:classes', async (_e, projectPath) => {
+handle('project:classes', async (_e, projectPath) => {
   const out = new Set();
   const exts = /\.(astro|css|scss|less|html|jsx|tsx|js|ts|vue|svelte)$/i;
   const files = [];
@@ -1823,7 +1904,7 @@ function markSelfWrite(p) {
   notePageMayHaveChanged();
 }
 
-ipcMain.handle('watch:start', async (_e, projectPath) => {
+handle('watch:start', async (_e, projectPath) => {
   openProjectRoot = path.resolve(projectPath); // scopes the asset protocol
   if (watcher) {
     watcher.close();
@@ -1972,7 +2053,7 @@ function uniqueDest(dir, name) {
   return path.join(dir, candidate);
 }
 
-ipcMain.handle('assets:list', async (_e, projectPath) => {
+handle('assets:list', async (_e, projectPath) => {
   const entries = [];
   // Folders are only worth showing when something is in them, which for src/
   // means "holds media somewhere below" — otherwise every component folder in
@@ -2036,7 +2117,7 @@ ipcMain.handle('assets:list', async (_e, projectPath) => {
 });
 
 // Opens a picker and copies the chosen files into public/<destRel>.
-ipcMain.handle('assets:pickUpload', async (_e, { projectPath, destRel }) => {
+handle('assets:pickUpload', async (_e, { projectPath, destRel }) => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Upload assets',
     properties: ['openFile', 'multiSelections'],
@@ -2046,7 +2127,7 @@ ipcMain.handle('assets:pickUpload', async (_e, { projectPath, destRel }) => {
 });
 
 // Copies OS-dragged files into public/<destRel>.
-ipcMain.handle('assets:upload', async (_e, { projectPath, destRel, filePaths }) => {
+handle('assets:upload', async (_e, { projectPath, destRel, filePaths }) => {
   return copyAssetsIn(projectPath, destRel, filePaths || []);
 });
 
@@ -2068,7 +2149,7 @@ function copyAssetsIn(projectPath, destRel, filePaths) {
   return { added };
 }
 
-ipcMain.handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
+handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   const from = assetAbs(projectPath, fromRel);
   const toDir = assetAbs(projectPath, toDirRel);
   // Between roots the file's IDENTITY changes, not just its path: a public/
@@ -2096,7 +2177,7 @@ ipcMain.handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => 
   return { ok: true };
 });
 
-ipcMain.handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
+handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   const clean = String(newName).trim().replace(/[/\\]/g, '');
   if (!clean) throw new Error('Invalid name');
   const from = assetAbs(projectPath, rel);
@@ -2114,7 +2195,7 @@ ipcMain.handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
 // often as it is a placeholder, references to it live in files this does not
 // read, and the app has no copy of it — so "gone" has to mean somewhere they
 // can get it back from without us.
-ipcMain.handle('assets:delete', async (_e, { projectPath, rel }) => {
+handle('assets:delete', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
   if (!fs.existsSync(abs)) return { ok: false };
   markSelfWrite(abs);
@@ -2126,7 +2207,7 @@ ipcMain.handle('assets:delete', async (_e, { projectPath, rel }) => {
 // Text assets (css/js/json/svg/…) are editable in the floating code window.
 const MAX_EDITABLE_BYTES = 5 * 1024 * 1024;
 
-ipcMain.handle('assets:readText', async (_e, { projectPath, rel }) => {
+handle('assets:readText', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
   const stat = fs.statSync(abs);
   if (stat.size > MAX_EDITABLE_BYTES) {
@@ -2135,14 +2216,14 @@ ipcMain.handle('assets:readText', async (_e, { projectPath, rel }) => {
   return { text: fs.readFileSync(abs, 'utf8') };
 });
 
-ipcMain.handle('assets:writeText', async (_e, { projectPath, rel, text }) => {
+handle('assets:writeText', async (_e, { projectPath, rel, text }) => {
   const abs = assetAbs(projectPath, rel);
   markSelfWrite(abs);
   fs.writeFileSync(abs, text, 'utf8');
   return { ok: true };
 });
 
-ipcMain.handle('assets:mkdir', async (_e, { projectPath, parentRel, name }) => {
+handle('assets:mkdir', async (_e, { projectPath, parentRel, name }) => {
   const clean = String(name).trim().replace(/[/\\]/g, '');
   if (!clean) throw new Error('Invalid folder name');
   const dir = path.join(assetAbs(projectPath, parentRel), clean);
@@ -2203,7 +2284,7 @@ function cmsAbs(projectPath, rel) {
 // Every .json under src/, with its parsed contents. Files are small enough
 // that parsing them all up front is cheaper than a round trip per collection,
 // and it lets the panel show item counts without opening anything.
-ipcMain.handle('cms:list', async (_e, projectPath) => {
+handle('cms:list', async (_e, projectPath) => {
   const root = path.join(projectPath, 'src');
   const files = [];
   if (!fs.existsSync(root)) return { files };
@@ -2319,7 +2400,7 @@ ipcMain.handle('cms:list', async (_e, projectPath) => {
   return { files };
 });
 
-ipcMain.handle('cms:read', async (_e, { projectPath, rel }) => {
+handle('cms:read', async (_e, { projectPath, rel }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   const abs = cmsAbs(projectPath, fileRel);
   if (!exportName) return { data: JSON.parse(fs.readFileSync(abs, 'utf8')) };
@@ -2349,7 +2430,7 @@ ipcMain.handle('cms:read', async (_e, { projectPath, rel }) => {
 
 // Writes the collection back, matching the file's existing indentation so
 // the diff stays limited to what the user actually changed.
-ipcMain.handle('cms:write', async (_e, { projectPath, rel, data }) => {
+handle('cms:write', async (_e, { projectPath, rel, data }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   if (exportName) {
     const abs = cmsAbs(projectPath, fileRel);
@@ -2395,7 +2476,7 @@ ipcMain.handle('cms:write', async (_e, { projectPath, rel, data }) => {
 
 // New collections land in src/data/, the conventional home for Astro content
 // that isn't a content collection.
-ipcMain.handle('cms:create', async (_e, { projectPath, name }) => {
+handle('cms:create', async (_e, { projectPath, name }) => {
   const slug = String(name).trim().toLowerCase().replace(/\.json$/i, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   if (!slug) throw new Error('Give the collection a name.');
   const rel = `data/${slug}.json`;
@@ -2421,14 +2502,14 @@ function readCmsMeta(projectPath) {
   }
 }
 
-ipcMain.handle('cms:meta', async (_e, projectPath) => ({ meta: readCmsMeta(projectPath) }));
+handle('cms:meta', async (_e, projectPath) => ({ meta: readCmsMeta(projectPath) }));
 
 // What the project's content config declares: every collection, where its
 // entries live, whether they can be written at all, and the JSON Schema its
 // zod schema amounts to. Read from the config itself rather than inferred from
 // the data, so the editor enforces the same rules the build does — see
 // contentConfig.js for how, and why it happens in a child process.
-ipcMain.handle('content:config', async (_e, { projectPath, force } = {}) =>
+handle('content:config', async (_e, { projectPath, force } = {}) =>
   readContentConfig(projectPath, { force: !!force })
 );
 
@@ -2444,7 +2525,7 @@ const collectionOf = async (projectPath, name) => {
 // The collections themselves, with counts, for the panel that lists them.
 // Every CSS custom property in the project, grouped the way the stylesheets
 // themselves group them — see cssVars.js for what "the way" means.
-ipcMain.handle('css:variables', async (_e, projectPath) => {
+handle('css:variables', async (_e, projectPath) => {
   try {
     return cssVars.readVariables(projectPath);
   } catch (err) {
@@ -2455,7 +2536,7 @@ ipcMain.handle('css:variables', async (_e, projectPath) => {
 // A variable added at the bottom of a group. One call carries several: a row in
 // a table of modes is one name in every mode, and a row in a family is one
 // property of every member.
-ipcMain.handle('css:addVariables', async (_e, { projectPath, adds }) => {
+handle('css:addVariables', async (_e, { projectPath, adds }) => {
   let last = { ok: true };
   for (const add of adds || []) {
     markSelfWrite(path.resolve(projectPath, add.file));
@@ -2468,7 +2549,7 @@ ipcMain.handle('css:addVariables', async (_e, { projectPath, adds }) => {
 
 // A row dragged to a new place: the declaration moves inside its rule, which is
 // where the order actually lives.
-ipcMain.handle('css:moveVariables', async (_e, { projectPath, moves }) => {
+handle('css:moveVariables', async (_e, { projectPath, moves }) => {
   let last = { ok: true };
   for (const move of moves || []) {
     markSelfWrite(path.resolve(projectPath, move.file));
@@ -2482,7 +2563,7 @@ ipcMain.handle('css:moveVariables', async (_e, { projectPath, moves }) => {
 
 // A heading that is a comment rather than a shared name: renaming it rewrites
 // the comment, in place, the same way a value is written.
-ipcMain.handle('css:setSectionTitle', async (_e, { projectPath, ...edit }) => {
+handle('css:setSectionTitle', async (_e, { projectPath, ...edit }) => {
   markSelfWrite(path.resolve(projectPath, edit.file));
   const result = cssVars.setSectionTitle(projectPath, edit);
   if (result.ok) send('css:changed', {});
@@ -2491,21 +2572,21 @@ ipcMain.handle('css:setSectionTitle', async (_e, { projectPath, ...edit }) => {
 
 // A heading is a line between declarations: removing it joins the runs either
 // side, and adding one splits them.
-ipcMain.handle('css:removeSection', async (_e, { projectPath, ...edit }) => {
+handle('css:removeSection', async (_e, { projectPath, ...edit }) => {
   markSelfWrite(path.resolve(projectPath, edit.file));
   const result = cssVars.removeSection(projectPath, edit);
   if (result.ok) send('css:changed', {});
   return result;
 });
 
-ipcMain.handle('css:moveHeading', async (_e, { projectPath, ...edit }) => {
+handle('css:moveHeading', async (_e, { projectPath, ...edit }) => {
   markSelfWrite(path.resolve(projectPath, edit.file));
   const result = cssVars.moveHeading(projectPath, edit);
   if (result.ok) send('css:changed', {});
   return result;
 });
 
-ipcMain.handle('css:addSection', async (_e, { projectPath, ...edit }) => {
+handle('css:addSection', async (_e, { projectPath, ...edit }) => {
   markSelfWrite(path.resolve(projectPath, edit.file));
   const result = cssVars.addSection(projectPath, edit);
   if (result.ok) send('css:changed', {});
@@ -2515,7 +2596,7 @@ ipcMain.handle('css:addSection', async (_e, { projectPath, ...edit }) => {
 // Renaming reaches every file that mentions the name, so it is one call rather
 // than one per file: the panel says which names become which, and either all of
 // them move or none does.
-ipcMain.handle('css:renameVariables', async (_e, { projectPath, renames }) => {
+handle('css:renameVariables', async (_e, { projectPath, renames }) => {
   const result = cssVars.renameVariables(projectPath, { renames, markWrite: markSelfWrite });
   if (result.ok) send('css:changed', {});
   return result;
@@ -2524,7 +2605,7 @@ ipcMain.handle('css:renameVariables', async (_e, { projectPath, renames }) => {
 // One value, replaced where it sits. The old value is sent back with the new
 // one: if the file no longer says what the panel was showing, somebody else has
 // edited it and the offsets are meaningless.
-ipcMain.handle('css:setVariable', async (_e, { projectPath, ...edit }) => {
+handle('css:setVariable', async (_e, { projectPath, ...edit }) => {
   const abs = path.resolve(projectPath, edit.file);
   markSelfWrite(abs);
   const result = cssVars.setVariable(projectPath, edit);
@@ -2532,7 +2613,7 @@ ipcMain.handle('css:setVariable', async (_e, { projectPath, ...edit }) => {
   return result;
 });
 
-ipcMain.handle('content:collections', async (_e, projectPath) => {
+handle('content:collections', async (_e, projectPath) => {
   const config = await readContentConfig(projectPath);
   if (config.missing || config.error) return { ...config, collections: [] };
   const collections = (config.collections || []).map((collection) => ({
@@ -2547,21 +2628,21 @@ ipcMain.handle('content:collections', async (_e, projectPath) => {
   return { collections, covered: coveredPaths(config.collections || []), configPath: config.configPath };
 });
 
-ipcMain.handle('content:entries', async (_e, { projectPath, name }) => {
+handle('content:entries', async (_e, { projectPath, name }) => {
   const { collection } = await collectionOf(projectPath, name);
   return { collection, ...listEntries(projectPath, collection) };
 });
 
 // A save is a list of edits against one entry, not a new copy of the file: see
 // contentEntries.js and ./formats for what that protects.
-ipcMain.handle('content:writeEntry', async (_e, { projectPath, entry, edits, body }) => {
+handle('content:writeEntry', async (_e, { projectPath, entry, edits, body }) => {
   const result = writeEntry(projectPath, entry, edits || [], { body });
   markSelfWrite(path.resolve(projectPath, entry.file));
   send('cms:changed', {});
   return result;
 });
 
-ipcMain.handle('content:validate', async (_e, { projectPath, collection, data }) =>
+handle('content:validate', async (_e, { projectPath, collection, data }) =>
   validateEntry(projectPath, { collection, data })
 );
 
@@ -2569,7 +2650,7 @@ ipcMain.handle('content:validate', async (_e, { projectPath, collection, data })
 // because an id is what every reference to the entry holds: the plan is shown
 // before anything is written, so a rename that would touch six other entries
 // says so first.
-ipcMain.handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
+handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
   // The entry data itself is big and the renderer only needs the shape of the
@@ -2577,7 +2658,7 @@ ipcMain.handle('content:renamePlan', async (_e, { projectPath, name, from, to })
   return { ...plan, entry: { id: plan.entry.id, file: plan.entry.file } };
 });
 
-ipcMain.handle('content:rename', async (_e, { projectPath, name, from, to }) => {
+handle('content:rename', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
   const result = applyRename(projectPath, plan);
@@ -2588,7 +2669,7 @@ ipcMain.handle('content:rename', async (_e, { projectPath, name, from, to }) => 
 
 // Every entry of a collection something can point at, as id and label — what a
 // reference field offers instead of asking the user to remember ids.
-ipcMain.handle('content:targets', async (_e, { projectPath, name }) => {
+handle('content:targets', async (_e, { projectPath, name }) => {
   const { collection } = await collectionOf(projectPath, name);
   const { entries } = listEntries(projectPath, collection);
   return { targets: entries.map((e) => ({ id: e.id, title: e.title })) };
@@ -2598,11 +2679,11 @@ ipcMain.handle('content:targets', async (_e, { projectPath, name }) => {
 // binding — `import Layout from '@/layouts/BaseLayout.astro'` renders as
 // <Layout> — so drilling into a component has to follow the import, not the
 // name.
-ipcMain.handle('project:resolveImport', async (_e, { projectPath, fromFile, spec }) => ({
+handle('project:resolveImport', async (_e, { projectPath, fromFile, spec }) => ({
   path: resolveImport(projectPath, fromFile, spec),
 }));
 
-ipcMain.handle('cms:setMeta', async (_e, { projectPath, rel, fields }) => {
+handle('cms:setMeta', async (_e, { projectPath, rel, fields }) => {
   const meta = readCmsMeta(projectPath);
   if (fields && Object.keys(fields).length) meta[rel] = fields;
   else delete meta[rel];
@@ -2616,12 +2697,12 @@ ipcMain.handle('cms:setMeta', async (_e, { projectPath, rel, fields }) => {
 // the import becomes `const clients = []`, which leaves every
 // `clients.map(...)` on the page working and rendering nothing.
 
-ipcMain.handle('cms:usage', async (_e, { projectPath, rel }) => {
+handle('cms:usage', async (_e, { projectPath, rel }) => {
   const abs = cmsAbs(projectPath, splitCmsRel(rel).fileRel);
   return { files: importersOf(projectPath, abs).map((h) => h.rel) };
 });
 
-ipcMain.handle('cms:delete', async (_e, { projectPath, rel }) => {
+handle('cms:delete', async (_e, { projectPath, rel }) => {
   // An export shares its file with other code, so there's no file to trash and
   // removing the statement is a code edit, not a content one.
   if (splitCmsRel(rel).exportName) {
@@ -2682,7 +2763,7 @@ function writeChunks(model) {
 // Page IPC
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('page:read', async (_e, pagePath) => {
+handle('page:read', async (_e, pagePath) => {
   const source = fs.readFileSync(pagePath, 'utf8');
   // Markdown builds the same tree from a different syntax, so everything
   // downstream — navigator, props, text editing, undo — is unchanged. Only
@@ -2727,7 +2808,22 @@ function writePageText(pagePath, text) {
   );
 }
 
-ipcMain.handle('page:write', async (_e, { pagePath, model }) => {
+// The same read as `page:read`, of text nobody has written to disk yet.
+//
+// A raw source edit through the Agent API has to become a model before it can
+// go through the editor — that is what keeps it on the undo stack instead of
+// round the outside of it. Parsing is the main process's job and the parser is
+// already here; what changes is only where the text came from.
+handle('page:parseSource', async (_e, { pagePath, source }) => {
+  if (isMarkdownPage(pagePath)) {
+    return { ...parseMarkdownPage(source, { mdx: isMdx(pagePath) }), source };
+  }
+  const parsed = parsePage(source);
+  if (parsed.editable) resolveChunks(parsed.model, pagePath);
+  return { ...parsed, source };
+});
+
+handle('page:write', async (_e, { pagePath, model }) => {
   if (isMarkdownPage(pagePath)) {
     writePageText(pagePath, serializeMarkdownPage(model));
     return { ok: true };
@@ -2737,12 +2833,12 @@ ipcMain.handle('page:write', async (_e, { pagePath, model }) => {
   return { ok: true };
 });
 
-ipcMain.handle('page:writeRaw', async (_e, { pagePath, source }) => {
+handle('page:writeRaw', async (_e, { pagePath, source }) => {
   writePageText(pagePath, source);
   return { ok: true };
 });
 
-ipcMain.handle('page:create', async (_e, { projectPath, name, layout }) => {
+handle('page:create', async (_e, { projectPath, name, layout }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   let fileName = name.trim().replace(/\.astro$/i, '');
   fileName = fileName.replace(/[^a-zA-Z0-9/_-]+/g, '-');
@@ -2762,7 +2858,7 @@ ipcMain.handle('page:create', async (_e, { projectPath, name, layout }) => {
   return { pagePath };
 });
 
-ipcMain.handle('page:delete', async (_e, pagePath) => {
+handle('page:delete', async (_e, pagePath) => {
   markSelfWrite(pagePath);
   fs.rmSync(pagePath);
   return { ok: true };
@@ -2771,7 +2867,7 @@ ipcMain.handle('page:delete', async (_e, pagePath) => {
 // Moves/renames a page within src/pages. `to` is the new path relative to
 // the pages dir (with extension). When the folder changes, relative imports
 // in the file's frontmatter are rewritten so they keep resolving.
-ipcMain.handle('page:move', async (_e, { projectPath, from, to }) => {
+handle('page:move', async (_e, { projectPath, from, to }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const dest = path.resolve(pagesDir, to);
   if (!dest.startsWith(pagesDir + path.sep)) throw new Error('Invalid destination.');
@@ -2811,12 +2907,12 @@ const resolvePagesDir = (projectPath, rel) => {
   return full;
 };
 
-ipcMain.handle('pagefolder:create', async (_e, { projectPath, dir }) => {
+handle('pagefolder:create', async (_e, { projectPath, dir }) => {
   fs.mkdirSync(resolvePagesDir(projectPath, dir), { recursive: true });
   return { ok: true };
 });
 
-ipcMain.handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
+handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   const a = resolvePagesDir(projectPath, from);
   const b = resolvePagesDir(projectPath, to);
   if (fs.existsSync(b)) throw new Error('A folder with that name already exists.');
@@ -2824,7 +2920,7 @@ ipcMain.handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   return { ok: true };
 });
 
-ipcMain.handle('pagefolder:delete', async (_e, { projectPath, dir }) => {
+handle('pagefolder:delete', async (_e, { projectPath, dir }) => {
   const full = resolvePagesDir(projectPath, dir);
   const pagesDir = path.join(projectPath, 'src', 'pages');
   if (full === pagesDir) throw new Error('Invalid folder.');
@@ -2853,14 +2949,14 @@ function fillRoute(pattern, params) {
 // own at all, in which case these are the only pages there are. Preview only:
 // their source lives inside a dependency, so nothing here is editable, and
 // they are deliberately kept out of the page list the editor writes through.
-ipcMain.handle('project:injectedRoutes', async (_e, { projectPath }) => ({
+handle('project:injectedRoutes', async (_e, { projectPath }) => ({
   routes: readInjectedRoutes(projectPath),
 }));
 
 // The concrete URLs a dynamic page stands for, by asking the dev server to run
 // its getStaticPaths. Returns [] for a static page, and for any failure — a
 // page that can't answer is previewed at its own pattern, exactly as before.
-ipcMain.handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
+handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
   const pattern = routeForPage(projectPath, pagePath);
   if (!pattern.includes('[') || !devUrl) return { entries: [] };
   const rel = toPosix(path.relative(projectPath, pagePath));
@@ -2889,7 +2985,7 @@ ipcMain.handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }
 // One entry of a collection, sampled — what a picker shows beside the fields
 // of a page that lists them. Answered by the dev server because only it can
 // run the project's loaders; without one there is simply no sample.
-ipcMain.handle('content:sampleEntry', async (_e, { devUrl, name, id }) => {
+handle('content:sampleEntry', async (_e, { devUrl, name, id }) => {
   if (!devUrl || !name) return { entry: null };
   try {
     const q = `c=${encodeURIComponent(name)}${id ? `&id=${encodeURIComponent(id)}` : ''}`;
@@ -2903,7 +2999,7 @@ ipcMain.handle('content:sampleEntry', async (_e, { devUrl, name, id }) => {
 
 // Turn a piece of a page into a component of its own. The file is worked out
 // in componentFile.js; writing it belongs here, with every other write.
-ipcMain.handle('component:create', async (_e, opts) => {
+handle('component:create', async (_e, opts) => {
   const { path: target, rel, text } = componentFile(opts);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   markSelfWrite(target);
@@ -2913,11 +3009,11 @@ ipcMain.handle('component:create', async (_e, opts) => {
 
 // Which files hold instances of a component — the list behind the palette's
 // "23 instances".
-ipcMain.handle('component:usage', async (_e, { projectPath, name, exclude }) =>
+handle('component:usage', async (_e, { projectPath, name, exclude }) =>
   componentUsage({ projectPath, name, exclude })
 );
 
-ipcMain.handle('page:importPathFor', async (_e, { pagePath, targetPath, projectPath }) => {
+handle('page:importPathFor', async (_e, { pagePath, targetPath, projectPath }) => {
   const rel = toPosix(path.relative(path.dirname(pagePath), targetPath));
   const relative = rel.startsWith('.') ? rel : './' + rel;
   let srcRelative = null;
@@ -2937,7 +3033,7 @@ ipcMain.handle('page:importPathFor', async (_e, { pagePath, targetPath, projectP
 // src/pages/blog/post.astro points at nothing. Anything else — an alias, a bare
 // package, `astro:content` — means the same thing wherever it is written, and
 // is handed back untouched.
-ipcMain.handle('page:rebaseImport', async (_e, { fromPagePath, toPagePath, spec }) => {
+handle('page:rebaseImport', async (_e, { fromPagePath, toPagePath, spec }) => {
   const text = String(spec || '');
   if (!text.startsWith('.')) return { path: text };
   if (!fromPagePath || !toPagePath) return { path: text };
@@ -2962,7 +3058,7 @@ ipcMain.handle('page:rebaseImport', async (_e, { fromPagePath, toPagePath, spec 
 // Resolved by electron/selectionTrail.js, which the MCP server reads too — the
 // clipboard text and the structured trail an agent asks for are the same
 // answer in two spellings.
-ipcMain.handle('selection:copy', async (_e, state) => {
+handle('selection:copy', async (_e, state) => {
   const trail = selectionTrail(state, locateSelection);
   if (!trail) return { ok: false };
   clipboard.writeText(formatTrail(trail));
@@ -3798,7 +3894,7 @@ function readAstroLock(projectPath) {
 // the loser dies with "exited before becoming ready".
 let devStartInFlight = null;
 
-ipcMain.handle('dev:start', (_e, projectPath) => {
+handle('dev:start', (_e, projectPath) => {
   // Whatever thumbnails were queued for the start screen, this takes priority.
   captureEra++;
   if (devStartInFlight) return devStartInFlight;
@@ -3957,7 +4053,7 @@ function listCssFiles(root) {
   });
 }
 
-ipcMain.handle('style:listFiles', async (_e, projectPath) => {
+handle('style:listFiles', async (_e, projectPath) => {
   if (!projectPath) return { files: [] };
   return { files: listCssFiles(projectPath) };
 });
@@ -4006,17 +4102,17 @@ function listAstroStyleFiles(root) {
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-ipcMain.handle('style:listAstroStyles', async (_e, projectPath) => {
+handle('style:listAstroStyles', async (_e, projectPath) => {
   if (!projectPath) return { files: [] };
   return { files: listAstroStyleFiles(projectPath) };
 });
 
-ipcMain.handle('style:readFile', async (_e, filePath) => {
+handle('style:readFile', async (_e, filePath) => {
   const abs = assertInProject(filePath);
   return { css: fs.readFileSync(abs, 'utf8') };
 });
 
-ipcMain.handle('style:writeFile', async (_e, { filePath, css }) => {
+handle('style:writeFile', async (_e, { filePath, css }) => {
   const abs = assertInProject(filePath);
   markSelfWrite(abs); // the watcher must not treat our own write as external
   fs.writeFileSync(abs, css, 'utf8');
@@ -4107,7 +4203,7 @@ function declarationLine(text, name) {
 
 // Opens the file an imported symbol comes from. `fromFile` is the file doing
 // the importing, so relative specifiers resolve the way the bundler sees them.
-ipcMain.handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name }) => {
+handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name }) => {
   if (!projectPath || !fromFile) return { ok: false };
   const abs = resolveImportPath(projectPath, path.resolve(fromFile), spec);
   if (!abs) return { ok: false, reason: 'not-found' };
@@ -4126,7 +4222,7 @@ ipcMain.handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name 
 // Where an import points, as a project-relative path. Same resolution as
 // src:readSymbol, but it never reads the file — the callers here are asking
 // about images, and their bytes are none of this channel's business.
-ipcMain.handle('src:resolvePath', async (_e, { projectPath, fromFile, spec }) => {
+handle('src:resolvePath', async (_e, { projectPath, fromFile, spec }) => {
   if (!projectPath || !fromFile) return { ok: false };
   const abs = resolveImportPath(projectPath, path.resolve(fromFile), spec);
   if (!abs) return { ok: false };
@@ -4206,24 +4302,24 @@ function imageSizeOf(abs) {
   return null;
 }
 
-ipcMain.handle('assets:dimensions', async (_e, { projectPath, rel }) => {
+handle('assets:dimensions', async (_e, { projectPath, rel }) => {
   const abs = assertInProject(path.resolve(projectPath, rel));
   return { dims: imageSizeOf(abs) };
 });
 
-ipcMain.handle('src:readText', async (_e, { projectPath, rel }) => {
+handle('src:readText', async (_e, { projectPath, rel }) => {
   const abs = assertInProject(path.resolve(projectPath, rel));
   return { text: fs.readFileSync(abs, 'utf8') };
 });
 
-ipcMain.handle('src:writeText', async (_e, { projectPath, rel, text }) => {
+handle('src:writeText', async (_e, { projectPath, rel, text }) => {
   const abs = assertInProject(path.resolve(projectPath, rel));
   markSelfWrite(abs);
   fs.writeFileSync(abs, text, 'utf8');
   return { ok: true };
 });
 
-ipcMain.handle('dev:stop', async () => {
+handle('dev:stop', async () => {
   stopDevServer();
   return { ok: true };
 });
@@ -4274,9 +4370,9 @@ function nodeVersionOf(bin) {
   }
 }
 
-ipcMain.handle('dev:probe', (_e, url) => probeUrl(url));
+handle('dev:probe', (_e, url) => probeUrl(url));
 
-ipcMain.handle('dev:diagnose', async (_e, projectPath) => {
+handle('dev:diagnose', async (_e, projectPath) => {
   const nodePath = resolveNodeBin();
   const nodeVersion = nodePath ? nodeVersionOf(nodePath) : null;
 
@@ -4307,7 +4403,7 @@ ipcMain.handle('dev:diagnose', async (_e, projectPath) => {
 // Git / GitHub IPC
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('git:info', async (_e, projectPath) => {
+handle('git:info', async (_e, projectPath) => {
   try {
     await git(projectPath, ['rev-parse', '--is-inside-work-tree']);
   } catch {
@@ -4425,7 +4521,7 @@ ipcMain.handle('git:info', async (_e, projectPath) => {
 // Is the GitHub CLI usable? Checked when the publish dialog opens so a
 // missing or logged-out `gh` is stated up front, instead of surfacing as a
 // failure after the user has filled the form in.
-ipcMain.handle('git:ghStatus', async (_e, projectPath) => {
+handle('git:ghStatus', async (_e, projectPath) => {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
@@ -4442,7 +4538,7 @@ ipcMain.handle('git:ghStatus', async (_e, projectPath) => {
   }
 });
 
-ipcMain.handle('git:init', async (_e, projectPath) => {
+handle('git:init', async (_e, projectPath) => {
   await git(projectPath, ['init', '-b', 'main']);
   return { ok: true };
 });
@@ -4513,7 +4609,7 @@ async function unpark(projectPath, branch) {
 
 // Switching branches. The behaviour, and why it tries before it asks, is in
 // gitBranches.js; park/unpark are handed in because they live here.
-ipcMain.handle('git:checkout', async (_e, { projectPath, branch, create, parkFirst }) => {
+handle('git:checkout', async (_e, { projectPath, branch, create, parkFirst }) => {
   const r = await switchBranch(git, {
     projectPath,
     branch,
@@ -4570,7 +4666,7 @@ function stopAllPreviews() {
   for (const [projectPath] of previewServers) stopPreview(projectPath);
 }
 
-ipcMain.handle('preview:atCommit', async (_e, { projectPath, ref }) => {
+handle('preview:atCommit', async (_e, { projectPath, ref }) => {
   const dir = await previewWorktree.ensureWorktree(git, { projectPath, ref });
 
   // A server already up for this project just needs the checkout moved under
@@ -4632,7 +4728,7 @@ ipcMain.handle('preview:atCommit', async (_e, { projectPath, ref }) => {
   );
 });
 
-ipcMain.handle('preview:stop', async (_e, { projectPath }) => {
+handle('preview:stop', async (_e, { projectPath }) => {
   await stopPreview(projectPath);
   return { ok: true };
 });
@@ -4644,71 +4740,71 @@ ipcMain.handle('preview:stop', async (_e, { projectPath }) => {
 // this is the side that knows the project's shape, and because it keeps the
 // panel about drawing rather than about interpreting paths.
 
-ipcMain.handle('git:log', async (_e, { projectPath, ref, limit, skip }) =>
+handle('git:log', async (_e, { projectPath, ref, limit, skip }) =>
   gitHistory.log(git, { projectPath, ref, limit, skip })
 );
 
-ipcMain.handle('git:commitFiles', async (_e, { projectPath, ref }) =>
+handle('git:commitFiles', async (_e, { projectPath, ref }) =>
   gitHistory.describeFiles(await gitHistory.commitFiles(git, { projectPath, ref }))
 );
 
 // Every file in the project, with what has happened to each — the file
 // browser's list, and the same status the commit picker reads.
-ipcMain.handle('git:allFiles', async (_e, { projectPath }) =>
+handle('git:allFiles', async (_e, { projectPath }) =>
   gitHistory.describeFiles(await gitHistory.allFiles(git, { projectPath }))
 );
 
-ipcMain.handle('git:status', async (_e, { projectPath }) =>
+handle('git:status', async (_e, { projectPath }) =>
   gitHistory.describeFiles(await gitHistory.status(git, { projectPath }))
 );
 
-ipcMain.handle('git:fileAt', async (_e, { projectPath, ref, path: filePath }) =>
+handle('git:fileAt', async (_e, { projectPath, ref, path: filePath }) =>
   gitHistory.fileAt(git, { projectPath, ref, path: filePath })
 );
 
-ipcMain.handle('git:worktrees', async (_e, { projectPath }) =>
+handle('git:worktrees', async (_e, { projectPath }) =>
   gitHistory.worktrees(git, { projectPath })
 );
 
 // Setting work aside and picking it back up, on their own. The switch has done
 // this internally for a while; a merge that finds unsaved work in its way needs
 // the same two steps, and the user is the one deciding to take them.
-ipcMain.handle('git:park', async (_e, { projectPath }) => {
+handle('git:park', async (_e, { projectPath }) => {
   const branch = await currentBranch(projectPath);
   const parked = await park(projectPath, branch);
   return { ok: true, parked, branch };
 });
 
-ipcMain.handle('git:unpark', async (_e, { projectPath }) => {
+handle('git:unpark', async (_e, { projectPath }) => {
   const branch = await currentBranch(projectPath);
   return unpark(projectPath, branch);
 });
 
-ipcMain.handle('git:merge', async (_e, { projectPath, branch }) =>
+handle('git:merge', async (_e, { projectPath, branch }) =>
   mergeBranch(git, { projectPath, branch })
 );
 
 // Finishing a merge the user has chosen their way through. The conflicting
 // files come back from git:merge with both versions; this applies the answers.
-ipcMain.handle('git:resolveMerge', async (_e, { projectPath, branch, choices }) =>
+handle('git:resolveMerge', async (_e, { projectPath, branch, choices }) =>
   resolveMerge(git, { projectPath, branch, choices })
 );
 
-ipcMain.handle('git:deleteBranch', async (_e, { projectPath, branch, force }) =>
+handle('git:deleteBranch', async (_e, { projectPath, branch, force }) =>
   deleteBranch(git, { projectPath, branch, force })
 );
 
-ipcMain.handle('git:commit', async (_e, { projectPath, message, paths }) =>
+handle('git:commit', async (_e, { projectPath, message, paths }) =>
   gitSnapshot.commit(git, { projectPath, message, paths })
 );
 
-ipcMain.handle('git:restoreFile', async (_e, { projectPath, ref, path: filePath }) =>
+handle('git:restoreFile', async (_e, { projectPath, ref, path: filePath }) =>
   gitSnapshot.restoreFile(git, { projectPath, ref, path: filePath })
 );
 
 // `park` is handed in rather than imported: it lives here, over the stash, and
 // is the reason going back to an old version cannot lose what is on disk now.
-ipcMain.handle('git:restoreProject', async (_e, { projectPath, ref }) => {
+handle('git:restoreProject', async (_e, { projectPath, ref }) => {
   const branch = await currentBranch(projectPath);
   return gitSnapshot.restoreProject(git, {
     projectPath,
@@ -4717,12 +4813,12 @@ ipcMain.handle('git:restoreProject', async (_e, { projectPath, ref }) => {
   });
 });
 
-ipcMain.handle('git:push', async (_e, { projectPath, branch }) => {
+handle('git:push', async (_e, { projectPath, branch }) => {
   await git(projectPath, ['push', '-u', 'origin', branch], { timeout: 120000 });
   return { ok: true };
 });
 
-ipcMain.handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
+handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
@@ -4754,7 +4850,7 @@ ipcMain.handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) =
   return { ok: true, url, output };
 });
 
-ipcMain.handle('shell:openExternal', async (_e, url) => {
+handle('shell:openExternal', async (_e, url) => {
   if (/^https?:\/\//.test(url)) shell.openExternal(url);
   return { ok: true };
 });

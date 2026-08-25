@@ -185,7 +185,9 @@ const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
   const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
   check('the File menu offers a way in', /label: 'Open Project…'/.test(main), 'no Open Project item');
   check('and a way out', /label: 'Close Project'/.test(main), 'no Close Project item');
-  const close = main.slice(main.indexOf("ipcMain.handle('project:close'"), main.indexOf("app.on('window-all-closed'"));
+  // `handle(` — main.js registers through its own recorder now, which still
+  // calls ipcMain.handle with the same function.
+  const close = main.slice(main.indexOf("handle('project:close'"), main.indexOf("app.on('window-all-closed'"));
   check('letting go stops the dev server', /stopDevServer\(\)/.test(close), close.slice(0, 200));
   check('and the shells, which outlive a window', /cleanupTerminals\(\)/.test(close), close.slice(0, 200));
   check('and the watcher', /watcher\.close\(\)/.test(close), close.slice(0, 200));

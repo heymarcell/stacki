@@ -22,6 +22,9 @@ const { createContextStore } = require('./contextStore');
 const { propertiesFor, pickEssential, allStyles } = require('./essentialStyles');
 const { createCapture } = require('./capture');
 const { createStackiMcpServer, DEFAULT_PORT } = require('./server');
+const { createAgentApi } = require('./agent');
+const agentRefs = require('./agent/refs');
+const { anchorFrom } = require('../review/anchor');
 const reviews = require('../review');
 
 // How long the renderer gets to answer. Long enough for a busy canvas to
@@ -102,6 +105,31 @@ let running = null; // the started server
 let state = { running: false, url: null, port: null, error: null };
 let store = null;
 let handlersRegistered = false;
+let api = null; // the Agent API, once an app is behind it
+
+/**
+ * A ref for what is selected right now.
+ *
+ * Built from the same anchor a review records, so the identity an agent holds
+ * and the identity a comment holds are the same object. Null whenever there is
+ * nothing selectable to name — no project, no page, nothing picked — which is
+ * a status the snapshot already reports rather than an error.
+ */
+function selectionRef() {
+  if (!api || !latestPayload) return null;
+  const built = anchorFrom(latestPayload);
+  if (!built.ok) return null;
+  return api.nodeRef({ ...built.anchor, branch: latestPayload.project?.branch || null }, { writable: true });
+}
+
+// The last payload, at module scope so `selectionRef` can reach it. `startMcp`
+// keeps its own binding in step; there is one window and one selection.
+let latestPayload = null;
+
+/** The project changed. Every ref an agent is holding was about the last one. */
+function projectChanged() {
+  agentRefs.rotate();
+}
 
 /** What the settings/status surface shows. Includes the token, which the app's own window may display. */
 function status() {
@@ -122,7 +150,14 @@ function resolvePort(settings) {
  * `getWindow()` answers with the app window — the one whose canvas is being
  * described and photographed.
  */
-async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
+async function startMcp({
+  getWindow,
+  version = '0.0.0',
+  settings = {},
+  getProjectRoot = () => null,
+  getAgentMode = () => 'inspect',
+  callMain = null,
+} = {}) {
   store = store || createContextStore({ resolveTrail: (keys) => resolveTrail(keys) });
   let projectRoot = null;
 
@@ -149,6 +184,7 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
     ipcMain.handle('mcp:publish', (_e, payload) => {
       projectRoot = payload?.project?.root || null;
       lastPayload = projectRoot ? payload : null;
+      latestPayload = lastPayload;
       if (!projectRoot) return store.reset();
       return store.publish(payload);
     });
@@ -166,6 +202,11 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
 
   async function getContext({ styleDetail }) {
     const snapshot = store.read();
+    // The handle for the rest of the surface. Minted from the same anchor a
+    // review would record, so "the thing get_context is describing" and "the
+    // thing target.read acts on" are provably one object rather than two
+    // descriptions that usually agree.
+    snapshot.selection.ref = selectionRef();
     if (styleDetail === 'none' || snapshot.selection.status !== 'ready') return snapshot;
     // The essential list is named here; for `full` the renderer adds whatever
     // else the engine knows about, since only a document can enumerate that.
@@ -183,6 +224,19 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
     return snapshot;
   }
 
+  // The editor half of the surface. It takes the same three things the review
+  // tools take — the renderer round trip, the published payload, the trail
+  // resolver — because it is answering about the same selection they are.
+  api = createAgentApi({
+    getProjectRoot,
+    getAgentMode,
+    callMain,
+    ask,
+    readPayload: () => lastPayload,
+    resolveTrail: (keys) => resolveTrail(keys),
+    version,
+  });
+
   const capture = createCapture({
     getWindow,
     ask,
@@ -196,7 +250,16 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
   // the MCP wiring has: the renderer round-trip (for `focus`, which moves the
   // live app) and the published payload (for `create`, which anchors to what is
   // on screen). Everything else it does on its own.
-  reviews.attach({ ask, readPayload: () => lastPayload, resolveTrail: (keys) => resolveTrail(keys) });
+  reviews.attach({
+    ask,
+    readPayload: () => lastPayload,
+    resolveTrail: (keys) => resolveTrail(keys),
+    // A focus that lands is a target an agent may then work on, so it comes
+    // back with a ref. Withheld — or issued read-only — exactly where the pin
+    // is withheld: the renderer answers with how it identified the node, and
+    // the same rule decides both. See src/reviewCheckout.js.
+    mintRef: (anchor, { writable }) => api?.nodeRef(anchor, { writable }) || null,
+  });
 
   async function getComments({ status, scope, detail, limit }) {
     // Which page and which element "page" and "selection" scope mean: the ones
@@ -240,6 +303,7 @@ async function startMcp({ getWindow, version = '0.0.0', settings = {} } = {}) {
     capture,
     getComments,
     comment,
+    api,
     onError: (err) => console.warn('[stacki] MCP:', err?.message || err),
   });
   try {
@@ -269,4 +333,12 @@ function resetContext() {
   store?.reset();
 }
 
-module.exports = { startMcp, stopMcp, status, resetContext, readOrCreateToken, tokenPath };
+module.exports = {
+  startMcp,
+  stopMcp,
+  status,
+  resetContext,
+  projectChanged,
+  readOrCreateToken,
+  tokenPath,
+};
