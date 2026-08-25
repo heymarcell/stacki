@@ -713,6 +713,80 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     }
   }
 
+  // ── The whole thing, as it actually happens ────────────────────────────────
+  //
+  // Everything above tests a piece. This is the sentence the feature was
+  // written to make true:
+  //
+  //   a person points at something in Stacki, and an agent inspects, changes
+  //   and verifies THAT source-backed object, through Stacki, without first
+  //   rediscovering where it lives.
+  //
+  // So the review ledger is wired up the way electron/mcp/index.js wires it,
+  // a comment is left on text three levels down, and an agent starting from
+  // nothing but the comment list fixes it.
+
+  {
+    const fsx = require('fs');
+    const osx = require('os');
+    const pathx = require('path');
+    const reviews = require('../electron/review');
+    reviews.start({ userDataPath: fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'stacki-agent-reviews-')), send: () => {} });
+    reviews.openProject(root);
+    reviews.attach({
+      ask: app.ask,
+      readPayload: app.payload,
+      resolveTrail: app.resolveTrail,
+      mintRef: (anchor, opts) => api.nodeRef(anchor, opts),
+    });
+
+    // The person: drill into the component and click its heading.
+    const page = await topLevel();
+    const hero = page.target.children.find((c) => c.tag === 'Hero');
+    const inside = await run('target', 'enter', { ref: hero.ref });
+    const h1 = inside.target.children.find((c) => c.tag === 'h1');
+    await run('target', 'select', { ref: h1.ref });
+    await H.settle(200);
+    const made = reviews.act({ action: 'create', message: 'This heading should say what the product does.', authorType: 'human' });
+    check('a comment can be left on the selection', made.ok === true, short(made));
+
+    // The agent, from cold: back at the page, holding nothing but the ledger.
+    await run('target', 'exit');
+    await run('target', 'select', { ref: page.target.ref });
+    await H.settle(200);
+
+    const listed = reviews.list({ status: 'open', scope: 'project', detail: 'summary', limit: 10 });
+    check('and an agent finds it in the list', listed.reviews.length === 1, short(listed.reviews?.length));
+    check('with the file it is about', listed.reviews[0].source === 'src/components/Hero.astro', short(listed.reviews[0].source));
+
+    const focused = await reviews.focus(listed.reviews[0].id);
+    check('focusing it lands', focused.ok === true, short(focused));
+    check('and hands back a target ref', typeof focused.targetRef === 'string');
+    check('and says the element was identified by its marks', focused.confidence === 'exact', short(focused.confidence));
+    check('and that the ref may be written through', focused.targetEditable === true);
+
+    const read = await run('target', 'read', { ref: focused.targetRef });
+    check('which reads as the heading the comment was about', read.target.tag === 'h1', short(read.target?.tag));
+    check('naming the file and the line', read.target.source.file === 'src/components/Hero.astro' && read.target.source.startLine === 5, short(read.target.source));
+
+    const fixed = await run('target', 'set_text', {
+      ref: focused.targetRef,
+      text: 'Build Astro sites by pointing at them',
+      expectedRevision: read.document.revision,
+      expectedDigest: read.document.digest,
+    });
+    check('and the change goes in', fixed.ok === true, short(fixed));
+    check('to the file the comment was about', /Build Astro sites by pointing at them/.test(app.read('src/components/Hero.astro')));
+
+    const resolved = reviews.act({ action: 'resolve', threadId: listed.reviews[0].id, authorType: 'agent' });
+    check('and the comment can then be resolved', resolved.ok && resolved.review.status === 'resolved', short(resolved.review?.status));
+    // And the claim underneath all of it, checked rather than asserted: this
+    // whole section reached the heading through the comment, the focus and the
+    // ref it handed back. The only file paths in it are the ones being read
+    // back to confirm what happened.
+    await run('target', 'exit');
+  }
+
   // ── The performance claim ──────────────────────────────────────────────────
   //
   // The one that is not about correctness: every target above was reached from

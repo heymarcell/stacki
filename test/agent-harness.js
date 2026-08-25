@@ -482,7 +482,11 @@ async function start(root, { agentMode = 'full' } = {}) {
     api,
     callMain,
     handlers,
+    // The three doors the MCP wiring gives the review ledger, so a test can
+    // wire the ledger up the way electron/mcp/index.js does.
+    ask,
     payload: () => payload,
+    resolveTrail: (keys) => selectionTrail({ projectPath: root, keys }, locateSelection),
     setMode: (next) => {
       mode = next;
     },

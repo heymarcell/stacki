@@ -518,7 +518,11 @@ function fakeAudio() {
   const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
   check('the setting is a menu item', /label: 'Interface Sounds'/.test(main));
   check('a checkbox, so it reads as a toggle', /type: 'checkbox'/.test(main));
-  check('off unless it has been turned on', /SETTINGS_DEFAULTS = \{ sound: false \}/.test(main));
+  // The sound default specifically, rather than the whole literal: other
+  // settings live in that object now (the Agent API's permission level), and a
+  // check pinned to its exact spelling was a check about the object rather than
+  // about the sound.
+  check('off unless it has been turned on', /SETTINGS_DEFAULTS = \{[^}]*\bsound: false\b/.test(main));
   check('and remembered across launches', /writeSettings\(\)/.test(main) && /settings:get/.test(main));
 
   const select = fs.readFileSync(

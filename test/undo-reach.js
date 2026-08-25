@@ -79,14 +79,17 @@ check(
 // a handler; this says which methods have to exist at all.
 check('the bridge offers a native undo', /nativeUndo: invoke\('native:undo'\)/.test(preload));
 check('and a native redo', /nativeRedo: invoke\('native:redo'\)/.test(preload));
+// `handle(` rather than `ipcMain.handle(` — main.js registers through its own
+// recorder now (see electron/mcp/agent/domains.js for why), which still calls
+// ipcMain.handle with the same function.
 check(
   'answered by the window that has the caret in it',
-  /ipcMain\.handle\('native:undo'[\s\S]{0,120}webContents\.undo\(\)/.test(main),
+  /(?:ipcMain\.)?\bhandle\('native:undo'[\s\S]{0,120}webContents\.undo\(\)/.test(main),
   'native:undo does not reach webContents'
 );
 check(
   'and the same for redo',
-  /ipcMain\.handle\('native:redo'[\s\S]{0,120}webContents\.redo\(\)/.test(main)
+  /(?:ipcMain\.)?\bhandle\('native:redo'[\s\S]{0,120}webContents\.redo\(\)/.test(main)
 );
 
 // --- what the panels record ------------------------------------------------------
