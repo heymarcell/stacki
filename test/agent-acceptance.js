@@ -101,6 +101,8 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     check('and shows the change as a patch', /\+\s+<h1>Welcome to the fixture<\/h1>/.test(edit.changedFiles[0].patch.hunks[0].text), short(edit.changedFiles[0].patch));
     check('and the file on disk says the same', /Welcome to the fixture/.test(app.read('src/components/Hero.astro')));
     check('and it says the edit is undoable', edit.undoable === true);
+    check('and reports both sides of the revision', edit.revisionBefore < edit.revisionAfter, short({ before: edit.revisionBefore, after: edit.revisionAfter }));
+    check('so the next write can name this one without reading again', edit.document.digest !== edit.documentBefore.digest, short(edit.document));
     check('and hands back a fresh ref', typeof edit.ref === 'string' && edit.ref !== h1.ref);
     check('and does not claim the review is done', !/resolve/i.test(JSON.stringify(edit.preview || {})));
 

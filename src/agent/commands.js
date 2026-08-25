@@ -266,6 +266,10 @@ export function createAgentCommands(getApp) {
 
       const applied = await a.commit(operations, { label: args.label || 'agent edit' });
       if (!applied.ok) return { ...applied, document: doc };
+      // What the document was before this edit, whether or not the caller
+      // claimed to know. An agent that did not pass expectedRevision still
+      // wants both numbers back — that is what makes the next write able to
+      // name one.
       // What the node looks like now, so the ref handed back describes what is
       // there rather than what was.
       const after = findNodeById(a.model()?.nodes || [], id);
@@ -273,6 +277,7 @@ export function createAgentCommands(getApp) {
         ok: true,
         notes: dry.notes,
         selected: applied.selectedId || null,
+        documentBefore: doc,
         document: documentOf(a),
         keys: a.keysFor(applied.selectedId || id),
         fingerprint: after

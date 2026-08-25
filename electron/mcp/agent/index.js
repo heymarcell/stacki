@@ -326,7 +326,11 @@ function createAgentApi({
       // handing back a ref that will fail on its next use.
       ref: answer.gone ? null : nodeRef(nextAnchor, { writable: true }),
       gone: !!answer.gone,
-      revisionBefore: args.expectedRevision ?? null,
+      // Both sides of the change, so the next write can name this one without
+      // a second read.
+      revisionBefore: answer.documentBefore?.revision ?? args.expectedRevision ?? null,
+      revisionAfter: answer.document?.revision ?? null,
+      documentBefore: answer.documentBefore || null,
       document: answer.document || null,
       changedFiles: changed(watching, before),
       undoable: true,
