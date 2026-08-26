@@ -3767,6 +3767,11 @@ export default function App() {
       };
     });
 
+  // The reviews that have a marker on the canvas for this render. A thread
+  // whose pin is right there does not also need to be spelled out inside the
+  // list — the popover over the pin is already showing it.
+  const pinnedReviewIds = new Set(reviewItems.map((r) => r.id));
+
   const reviewRows = allReviews
     .filter((r) => (reviewFilter === 'all' ? true : r.status === reviewFilter))
     .filter((r) => (reviewScope === 'page' ? onReviewPage(r) : true))
@@ -4933,6 +4938,10 @@ export default function App() {
                 totalCount={allReviews.length}
                 actorId={reviewShared?.identity?.actorId || null}
                 withheldIds={withheldPins}
+                // Which reviews have a marker on the canvas right now. The
+                // panel needs it to know whether the thread is already being
+                // shown somewhere: if it is, the row is just a row.
+                pinnedIds={pinnedReviewIds}
                 syncing={reviewSyncing}
                 onSync={syncReviews}
                 onShareEnable={shareEnable}

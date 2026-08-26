@@ -6435,6 +6435,15 @@ textarea::selection {
   cursor: pointer;
 }
 .comments-row:hover:not(:disabled) { background: var(--bg-hover); }
+/* The one being read. Unmistakable without being loud: the row it is, and a
+   rule down its leading edge in the accent so the eye finds it in a list of
+   twenty without having to read any of them. */
+.comments-row.on {
+  background: var(--bg-active);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.comments-row.on:hover:not(:disabled) { background: var(--bg-active); }
+.comments-row.on .comments-excerpt { color: var(--text); }
 .comments-row .review-dot { margin-top: 5px; }
 .comments-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 /* Where it is and what it is called go ABOVE the words. Underneath, they read

@@ -53,6 +53,8 @@ export default function CommentsPanel({
   // conversation is docked here rather than opened in a card over the design.
   expanded = false,
   onExpand = null,
+  // Which reviews currently have a pin on the canvas.
+  pinnedIds = null,
   onAct,
   onFocus,
   onDelete,
@@ -215,7 +217,14 @@ export default function CommentsPanel({
         )}
 
         {reviews.map((r) =>
-          r.id === openId ? (
+          // The thread is spelled out inside the list only when there is
+          // nowhere else for it to be. With a pin on the canvas the popover
+          // over that pin is already showing this conversation, and drawing it
+          // twice at once — once here, once there — is the same words in two
+          // places and a row that jumps the list around as it opens.
+          //
+          // Otherwise the row is a row, marked as the selected one.
+          r.id === openId && !pinnedIds?.has(r.id) ? (
             <div key={r.id} className="comments-open">
               <ReviewThread
                 review={r}
@@ -233,7 +242,11 @@ export default function CommentsPanel({
               />
             </div>
           ) : (
-            <button key={r.id} className="comments-row" onClick={() => onOpen(r.id)}>
+            <button
+              key={r.id}
+              className={`comments-row${r.id === openId ? ' on' : ''}`}
+              onClick={() => onOpen(r.id)}
+            >
               <ReviewStatusDot status={r.status} anchorState={r.anchorState} color={r.color} />
               <span className="comments-row-main">
                 <span className="comments-row-top">

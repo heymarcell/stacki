@@ -23,6 +23,12 @@ const os = require('os');
 const path = require('path');
 const { app, BrowserWindow, dialog } = require('electron');
 
+// Nobody is watching this run. A modal dialog would stop it dead — the app
+// waits for a click that is never coming — and leave the box on the screen of
+// whoever started it. Set before main.js is required, because that is when the
+// updater and its handlers are wired up.
+process.env.STACKI_NO_DIALOGS = '1';
+
 const { makeCanvasProject, removeCanvasProject, astroCached } = require('./agent-canvas-fixture.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
@@ -65,8 +71,49 @@ fs.writeFileSync(
 );
 dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [root] });
 
+const mcp = require('../electron/mcp');
 const reviews = require('../electron/review');
 require('../electron/main.js');
+
+/**
+ * Stop, then leave.
+ *
+ * `app.exit()` skips before-quit, so the Astro dev server this run started
+ * outlives it — one orphaned server per run, holding its port and its memory,
+ * until somebody notices there are forty of them. It is stopped through the
+ * app's own door first.
+ */
+async function teardown(code) {
+  try {
+    const status = mcp.status();
+    if (status?.running && status.url && status.token) {
+      await fetch(status.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${status.token}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 9999,
+          method: 'tools/call',
+          params: { name: 'project', arguments: { action: 'dev_stop' } },
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+    }
+  } catch (err) {
+    shout(`review-ux-visual: could not stop the preview: ${String(err?.message || err).slice(0, 120)}`);
+  }
+  removeCanvasProject(root);
+  try {
+    fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+  } catch {
+    /* a temp folder that will not go is not a failure */
+  }
+  app.exit(code);
+}
 
 // --- the conversations that broke the old reader -----------------------------
 
@@ -226,17 +273,37 @@ const SHOTS = [];
   }
 
   // --- a very long agent reply --------------------------------------------
-  await js(`document.querySelector('.review-x')?.click()`);
-  await wait(400);
+  await js(`document.querySelector('.review-popover .review-x:last-of-type')?.click()`);
+  await wait(500);
+  // Back to the list, whatever is currently open.
+  //
+  // A thread showing in the panel REPLACES the list, so a row cannot be
+  // clicked until whatever is open has been closed — and the close button in
+  // the panel header matches the same selector as the one in the popover, so
+  // "click .review-x" was closing the wrong thing.
+  const backToList = async () => {
+    await js(`(() => {
+      document.querySelector('.comments-reader .comments-back')?.click();
+      document.querySelector('.comments-open .review-x:last-of-type')?.click();
+      return true;
+    })()`);
+    await wait(500);
+    return js(`document.querySelectorAll('.comments-row').length`);
+  };
+  const pickRow = async (pattern) => {
+    await backToList();
+    return js(`(() => {
+      const rows = [...document.querySelectorAll('.comments-row')];
+      const row = rows.find((r) => ${pattern}.test(r.textContent || ''));
+      if (!row) return 'not found';
+      row.click();
+      return 'clicked';
+    })()`);
+  };
+
   const rowTexts = await js(`[...document.querySelectorAll('.comments-row')].map((r) => (r.textContent || '').slice(0, 60))`);
   say(`  rows: ${JSON.stringify(rowTexts)}`);
-  const clicked = await js(`(() => {
-    const rows = [...document.querySelectorAll('.comments-row')];
-    const row = rows.find((r) => /spacing on this/i.test(r.textContent || ''));
-    if (!row) return 'not found';
-    row.click();
-    return 'clicked';
-  })()`);
+  const clicked = await pickRow('/spacing on this/i');
   check('the long thread has a row to click', clicked === 'clicked', String(clicked));
   await wait(1400);
   const openedWhat = await js(`(() => {
@@ -313,20 +380,12 @@ const SHOTS = [];
   check('the reply box is reachable at the bottom too', bottom === true);
 
   // --- a ten-message discussion -------------------------------------------
-  await js(`document.querySelector('.comments-back')?.click()`);
-  await wait(400);
-  await js(`(() => {
-    const rows = [...document.querySelectorAll('.comments-row')];
-    const row = rows.find((r) => /feels crowded/i.test(r.textContent || ''));
-    if (row) row.click();
-    return !!row;
-  })()`);
+  check('the ten-message thread has a row', (await pickRow('/feels crowded/i')) === 'clicked');
   await wait(1000);
   await shot('06-ten-messages');
 
   // --- resolved: absent from the canvas until selected --------------------
-  await js(`document.querySelector('.comments-back')?.click()`);
-  await wait(300);
+  await backToList();
   await js(`(() => {
     const tabs = [...document.querySelectorAll('.comments-filters button')];
     const all = tabs.find((t) => t.textContent.trim() === 'All');
@@ -337,13 +396,8 @@ const SHOTS = [];
   const pinsWhenAll = await js(`document.querySelectorAll('.review-pin').length`);
   await shot('07-resolved-deselected');
 
-  await js(`(() => {
-    const rows = [...document.querySelectorAll('.comments-row')];
-    const row = rows.find((r) => /Colour was wrong/i.test(r.textContent || ''));
-    if (row) row.click();
-    return !!row;
-  })()`);
-  await wait(1200);
+  check('the resolved thread has a row under All', (await pickRow('/Colour was wrong/i')) === 'clicked');
+  await wait(1400);
   const pinsWhenSelected = await js(`document.querySelectorAll('.review-pin').length`);
   await shot('08-resolved-selected');
   check(
@@ -375,14 +429,11 @@ const SHOTS = [];
   if (failures.length) {
     shout(`\nreview-ux-visual: ${failures.length} failed, ${checked - failures.length} passed\n`);
     for (const f of failures) shout(f);
-    removeCanvasProject(root);
-    return app.exit(1);
+    return teardown(1);
   }
   say(`review-ux-visual: ${checked} passed  [a real window, photographed]`);
-  removeCanvasProject(root);
-  return app.exit(0);
+  return teardown(0);
 })().catch((err) => {
   shout(`review-ux-visual: ${err?.stack || err}`);
-  removeCanvasProject(root);
-  app.exit(1);
+  void teardown(1);
 });
