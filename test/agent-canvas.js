@@ -28,6 +28,10 @@ const { app, BrowserWindow } = require('electron');
 
 const { dialog } = require('electron');
 
+// Nobody is watching an automated run, and a modal dialog would stop it dead
+// waiting for a click that is never coming. Set before main.js is required.
+process.env.STACKI_NO_DIALOGS = '1';
+
 const { makeCanvasProject, removeCanvasProject, astroCached } = require('./agent-canvas-fixture.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
@@ -50,6 +54,11 @@ const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 // pattern test/thumbs.js already uses, for the same two reasons.
 const say = (text) => fs.writeSync(1, `${text}\n`);
 const shout = (text) => fs.writeSync(2, `${text}\n`);
+// `app.exit()` skips before-quit, so the Astro dev server this run started
+// outlives it — one orphaned server, holding its port and its memory, per run.
+// main.js takes it down by hand for the same reason; so does this, in the
+// report section below, while the MCP server it calls through is still up.
+let stopPreview = async () => {};
 const done = (code) => {
   app.exit(code);
 };
@@ -177,6 +186,8 @@ require('../electron/main.js');
     const image = (body.result?.content || []).find((c) => c.type === 'image') || null;
     return { meta: body.result?.structuredContent || {}, image };
   };
+
+  stopPreview = () => call('project', { action: 'dev_stop' });
 
   const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 
@@ -515,6 +526,42 @@ require('../electron/main.js');
   }
 
   // --- the report ----------------------------------------------------------
+
+  // The preview goes first, and it has to: the two lines under this one take
+  // the windows and the MCP server away, and dev_stop is a call THROUGH that
+  // server. Stopping it afterwards fails with "fetch failed" and leaves an
+  // Astro process running for as long as the machine is up — one per run.
+  const where = await call('project', { action: 'dev_status' }).catch(() => null);
+  const previewUrl = where?.url || where?.preview?.url || null;
+  const stopped = await stopPreview().catch((err) => ({ error: String(err?.message || err) }));
+  if (!stopped || stopped.error || stopped.ok === false) {
+    shout(`agent-canvas: could not stop the preview: ${JSON.stringify(stopped ?? null).slice(0, 140)}`);
+  }
+  // `ok` means "asked", not "stopped".
+  //
+  // Astro 7 daemonizes its dev server, so stopDevServer hands the job to
+  // `astro dev stop` through execFile and returns immediately. Exiting here
+  // would delete the project directory out from under that command and leave
+  // the server running for as long as the machine is up — which is how an
+  // afternoon of test runs ends up holding several gigabytes.
+  //
+  // So wait for the port to actually stop answering. The real state, not a
+  // sleep long enough to usually work.
+  if (previewUrl) {
+    const gone = await until(
+      'the preview to stop answering',
+      async () => {
+        try {
+          await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
+          return null;
+        } catch {
+          return true;
+        }
+      },
+      { timeout: 20000, every: 400 }
+    ).catch(() => false);
+    if (!gone) shout(`agent-canvas: the preview at ${previewUrl} would not stop`);
+  }
 
   for (const w of BrowserWindow.getAllWindows()) w.destroy();
   await mcp.stopMcp().catch(() => {});

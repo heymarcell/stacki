@@ -87,21 +87,49 @@ async function teardown(code) {
   try {
     const status = mcp.status();
     if (status?.running && status.url && status.token) {
-      await fetch(status.url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-          authorization: `Bearer ${status.token}`,
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 9999,
-          method: 'tools/call',
-          params: { name: 'project', arguments: { action: 'dev_stop' } },
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
+      const call = async (args) => {
+        const res = await fetch(status.url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            authorization: `Bearer ${status.token}`,
+          },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 9999, method: 'tools/call', params: { name: 'project', arguments: args } }),
+          signal: AbortSignal.timeout(8000),
+        });
+        const text = await res.text();
+        const line = text.split('\n').find((l) => l.startsWith('data:')) || text;
+        try {
+          return JSON.parse(line.replace(/^data:\s*/, ''))?.result?.structuredContent || null;
+        } catch {
+          return null;
+        }
+      };
+      const where = await call({ action: 'dev_status' });
+      const previewUrl = where?.url || where?.preview?.url || null;
+      await call({ action: 'dev_stop' });
+
+      // `ok` from dev_stop means "asked", not "stopped": Astro 7 daemonizes its
+      // dev server, so Stacki hands the job to `astro dev stop` and returns.
+      // Exiting here would delete the project directory out from under that
+      // command and leave the server running for as long as the machine is up.
+      // So wait for the port to actually go quiet — the real state, not a sleep.
+      if (previewUrl) {
+        const stop = Date.now() + 20000;
+        for (;;) {
+          try {
+            await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
+          } catch {
+            break;
+          }
+          if (Date.now() > stop) {
+            shout(`review-ux-visual: the preview at ${previewUrl} would not stop`);
+            break;
+          }
+          await wait(400);
+        }
+      }
     }
   } catch (err) {
     shout(`review-ux-visual: could not stop the preview: ${String(err?.message || err).slice(0, 120)}`);

@@ -43,6 +43,7 @@ const check = (what, condition, detail) => {
     entry,
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
 export { default as ReviewPins, ReviewSurface, clampPoint } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
+export { applyMarkdownKey } from "/Users/heymarcell/DEV/stacki/src/ui/markdownKeys.js";
 export { placePins, pinnable, longEnoughToDock } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
 export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
 export { SharedReviewsBar, SharedReviewsDialog, syncProblemText } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'SharedReviews.jsx'))};
@@ -1300,6 +1301,44 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     check('the header says it can be dragged', !!$('.review-grip'));
     check('and the grip is not a control', $('.review-grip').tagName !== 'BUTTON');
     check('so a screen reader is not told it is one', $('.review-grip').getAttribute('aria-hidden') === 'true');
+  }
+
+  // ------------------------------------------------------------------
+  // Formatting shortcuts on a plain textarea
+  // ------------------------------------------------------------------
+  {
+    const at = (value, a, b = a) => ({ value, selectionStart: a, selectionEnd: b });
+    const key = (k, mods = { metaKey: true }) => ({ key: k, ...mods });
+
+    const bold = ui.applyMarkdownKey(at('make this loud', 5, 9), key('b'));
+    check('bold wraps the selection', bold.value === 'make **this** loud', bold.value);
+    check('and leaves the words selected', bold.value.slice(bold.selectionStart, bold.selectionEnd) === 'this');
+
+    const italic = ui.applyMarkdownKey(at('make this soft', 5, 9), key('i'));
+    check('italic wraps with one star', italic.value === 'make *this* soft', italic.value);
+    const code = ui.applyMarkdownKey(at('the file is here', 4, 8), key('e'));
+    check('code wraps with a backtick', code.value === 'the `file` is here', code.value);
+
+    const link = ui.applyMarkdownKey(at('see the docs', 8, 12), key('k'));
+    check('a link keeps the words and offers a url', link.value === 'see the [docs](url)', link.value);
+    check('with the url part selected, because that is what is missing', link.value.slice(link.selectionStart, link.selectionEnd) === 'url', link.value.slice(link.selectionStart, link.selectionEnd));
+
+    // Nothing selected: type the marker with a word to replace.
+    const empty = ui.applyMarkdownKey(at('', 0), key('b'));
+    check('with nothing selected it writes a placeholder', empty.value === '**bold**', empty.value);
+    check('and selects it so the next keystroke replaces it', empty.value.slice(empty.selectionStart, empty.selectionEnd) === 'bold');
+
+    // Pressing it twice must not stack markers.
+    const twice = ui.applyMarkdownKey(at(bold.value, bold.selectionStart, bold.selectionEnd), key('b'));
+    check('pressing bold again takes it off', twice.value === 'make this loud', twice.value);
+
+    // Everything else falls straight through, or copy and select-all break in
+    // the one box people write in.
+    check('plain letters are not intercepted', ui.applyMarkdownKey(at('x', 0, 1), { key: 'b' }) === null);
+    check('nor select-all', ui.applyMarkdownKey(at('x', 0, 1), key('a')) === null);
+    check('nor copy', ui.applyMarkdownKey(at('x', 0, 1), key('c')) === null);
+    check('nor ⌥-modified keys', ui.applyMarkdownKey(at('x', 0, 1), key('b', { metaKey: true, altKey: true })) === null);
+    check('ctrl works for people not on a Mac', ui.applyMarkdownKey(at('hi', 0, 2), key('b', { ctrlKey: true }))?.value === '**hi**');
   }
 
   // ------------------------------------------------------------------

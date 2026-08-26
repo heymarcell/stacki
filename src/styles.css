@@ -5777,11 +5777,26 @@ textarea::selection {
   cursor: pointer;
   transition: transform 0.08s ease;
 }
+/* The marker is small so it covers as little of the page as possible, and a
+   small target is a hard one to hit. This gives it a few pixels of reach on
+   every side without drawing anything. */
+.review-pin::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 14px;
+}
 .review-pin:hover:not(:disabled) {
   background: var(--pin, var(--accent));
   transform: translate(-4px, -100%) scale(1.12);
   filter: brightness(1.15);
+  z-index: 8;
 }
+/* The one being read sits above its neighbours. In a cluster of four the
+   selected marker being drawn underneath one of the others is how somebody
+   ends up sure they clicked the wrong comment. */
+.review-pin.open { z-index: 9; }
+.review-pin:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 /* Deliberately not being done now: hollow, in the same colour. Shape carries
    the state so the colour can stay the person's own.
    White, not the editor's panel colour — this marker sits over somebody's
@@ -5929,6 +5944,8 @@ textarea::selection {
 }
 .review-composer-target .dim { color: var(--text-faint); }
 .review-hint { font-size: 10px; color: var(--text-faint); margin-right: auto; }
+/* Discoverability without a toolbar. */
+.review-md-hint { font-size: 10px; color: var(--text-faint); margin-right: auto; }
 
 /* --- a thread, wherever it is read --------------------------------- */
 

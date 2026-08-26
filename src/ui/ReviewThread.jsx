@@ -3,6 +3,7 @@ import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
 import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, GripIcon, ExpandIcon, CollapseIcon } from './Icons.jsx';
 import ReviewMarkdown from './ReviewMarkdown.jsx';
+import { applyMarkdownKey } from './markdownKeys.js';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
 
 // One review, opened.
@@ -246,6 +247,35 @@ export default function ReviewThread({
   onExpand = null,
 }) {
   const [reply, setReply] = React.useState('');
+
+  /**
+   * ⌘B / ⌘I / ⌘E / ⌘K on a plain textarea.
+   *
+   * Applied by hand rather than by execCommand so undo still behaves and the
+   * value stays exactly what the store will hold. Anything that is not one of
+   * the four falls straight through — a handler that swallowed ⌘A or ⌘C to be
+   * safe would break selecting and copying in a box people write in.
+   */
+  const markdownKeys = (setter) => (e) => {
+    const field = e.currentTarget;
+    const next = applyMarkdownKey(
+      { value: field.value, selectionStart: field.selectionStart, selectionEnd: field.selectionEnd },
+      e
+    );
+    if (!next) return false;
+    e.preventDefault();
+    setter(next.value);
+    // After React has written the new value, not before it.
+    requestAnimationFrame(() => {
+      try {
+        field.setSelectionRange(next.selectionStart, next.selectionEnd);
+        field.focus();
+      } catch {
+        /* the field went away while the frame was pending */
+      }
+    });
+    return true;
+  };
   const [picking, setPicking] = React.useState(false);
   const [deferring, setDeferring] = React.useState(false);
   const [reason, setReason] = React.useState('');
@@ -512,7 +542,9 @@ export default function ReviewThread({
                       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                         e.preventDefault();
                         e.currentTarget.form?.requestSubmit();
+                        return;
                       }
+                      if (markdownKeys(setDraft)(e)) return;
                       if (e.key === 'Escape') {
                         e.preventDefault();
                         e.stopPropagation();
@@ -615,13 +647,21 @@ export default function ReviewThread({
                 if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                   e.preventDefault();
                   e.currentTarget.form?.requestSubmit();
+                  return;
                 }
+                markdownKeys(setReply)(e);
               }}
             />
             {reply.trim() && (
-              <button type="submit" className="primary" disabled={busy}>
-                Reply
-              </button>
+              <>
+                {/* Said once, quietly, where somebody is already looking. A
+                    toolbar would be a row of buttons above every reply box for
+                    a syntax most people writing here already know. */}
+                <span className="review-md-hint">Markdown supported</span>
+                <button type="submit" className="primary" disabled={busy}>
+                  Reply
+                </button>
+              </>
             )}
           </form>
 
