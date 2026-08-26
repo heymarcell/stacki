@@ -60,6 +60,7 @@ const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const { updatePolicy, UPDATE_ENABLED_FIELD } = require('./updatePolicy');
+const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('./dialogPolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
 const { createAccessStore } = require('./mcp/agent/access');
@@ -604,6 +605,23 @@ function currentUpdatePolicy() {
   return updatePolicy({ isPackaged: app.isPackaged, updateEnabledMetadata: declared });
 }
 
+/**
+ * Show a message box, unless this run has said nobody is watching.
+ *
+ * Every blocking dialog in this process is an updater dialog, and a modal one
+ * stops an automated run dead — the app waits for a click that is not coming.
+ * With STACKI_NO_DIALOGS=1 the dialog becomes a log line and answers itself
+ * with the harmless button, so a script driving Stacki keeps moving and a
+ * failed update never restarts the app out from under it.
+ */
+async function showMessage(parent, options) {
+  if (dialogsSuppressed()) {
+    logAutoUpdate(suppressedLine(options));
+    return { response: suppressedResponse(options), checkboxChecked: false };
+  }
+  return dialog.showMessageBox(parent, options);
+}
+
 function logAutoUpdate(message, details) {
   const detailText =
     details === undefined
@@ -626,7 +644,7 @@ function logAutoUpdate(message, details) {
 
 async function promptToInstallDownloadedUpdate(version) {
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-  const { response } = await dialog.showMessageBox(parent, {
+  const { response } = await showMessage(parent, {
     type: 'info',
     title: 'Update Ready',
     buttons: ['Restart Now', 'Later'],
@@ -670,7 +688,7 @@ function registerAutoUpdaterEvents() {
     autoUpdateErrorDialogShown = true;
 
     const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-    void dialog.showMessageBox(parent, {
+    void showMessage(parent, {
       type: 'warning',
       title: 'Update Check Failed',
       message: 'Stacki could not check for updates.',
@@ -717,7 +735,7 @@ async function checkForUpdatesFromMenu() {
   // hunt for it.
   const policy = currentUpdatePolicy();
   if (!policy.enabled) {
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
       message:
@@ -733,7 +751,7 @@ async function checkForUpdatesFromMenu() {
   }
 
   if (autoUpdateCheckInFlight) {
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
       message: 'Already checking for updates.',
@@ -750,7 +768,7 @@ async function checkForUpdatesFromMenu() {
     // what electron-updater does only when it is actually newer.
     if (result?.downloadPromise) {
       logAutoUpdate('Manual check found an update', { version: result.updateInfo?.version });
-      await dialog.showMessageBox(parent, {
+      await showMessage(parent, {
         type: 'info',
         title: 'Update Available',
         message: `Stacki ${result.updateInfo?.version} is downloading.`,
@@ -759,14 +777,14 @@ async function checkForUpdatesFromMenu() {
       return;
     }
     logAutoUpdate('Manual check found no update', { version: app.getVersion() });
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
       message: `Stacki ${app.getVersion()} is the latest version.`,
     });
   } catch (error) {
     logAutoUpdate('Manual check failed', formatAutoUpdateError(error));
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'warning',
       title: 'Check for Updates',
       // The raw error carries response headers and a stack; the log has all of

@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { updatePolicy, saysTrue, UPDATE_ENABLED_FIELD } = require('../electron/updatePolicy.js');
+const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('../electron/dialogPolicy.js');
 
 const failures = [];
 let checked = 0;
@@ -169,6 +170,52 @@ const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
   }
   const pkg = JSON.parse(read('package.json'));
   check('the appId is unchanged', pkg.build.appId === 'com.stacki.editor', pkg.build.appId);
+}
+
+// --- dialogs, when nobody is watching ----------------------------------------
+
+{
+  // Off unless a run says so. Never inferred: guessing "this looks automated"
+  // eventually guesses wrong about somebody's real session, and they lose the
+  // one message telling them an update failed.
+  check('dialogs are shown by default', dialogsSuppressed({}) === false);
+  check('and with an unrelated environment', dialogsSuppressed({ CI: 'true', NODE_ENV: 'test' }) === false);
+  check('STACKI_NO_DIALOGS=1 suppresses them', dialogsSuppressed({ STACKI_NO_DIALOGS: '1' }) === true);
+  check('so does the string true', dialogsSuppressed({ STACKI_NO_DIALOGS: 'true' }) === true);
+  for (const value of ['0', 'false', '', 'yes', undefined]) {
+    check(`STACKI_NO_DIALOGS=${JSON.stringify(value)} does not suppress`, dialogsSuppressed({ STACKI_NO_DIALOGS: value }) === false);
+  }
+  check('a missing environment does not throw', dialogsSuppressed(undefined) === false || dialogsSuppressed(undefined) === true);
+}
+
+{
+  // A suppressed dialog must never answer with the button that does something.
+  // The only consequential one asks whether to restart and install; answering
+  // yes on an unattended machine quits the app out from under whatever was
+  // driving it.
+  const restart = { buttons: ['Restart Now', 'Later'], defaultId: 0, cancelId: 1 };
+  check('the restart prompt answers Later', suppressedResponse(restart) === 1, String(suppressedResponse(restart)));
+  check('and never Restart Now', suppressedResponse(restart) !== restart.defaultId);
+  check('a plain info dialog answers safely', suppressedResponse({}) === 0);
+  check('buttons without a cancelId answer with the last one', suppressedResponse({ buttons: ['A', 'B', 'C'] }) === 2);
+  check('the log line names the dialog', /Update Ready/.test(suppressedLine({ title: 'Update Ready', message: 'x' })));
+  check('and only the first line of the detail', !/second/.test(suppressedLine({ title: 't', message: 'm', detail: 'first\nsecond' })));
+}
+
+{
+  // Every blocking dialog in the main process is an updater dialog, and each
+  // must go through the helper — one that did not would hang an automated run
+  // no matter what the flag said.
+  const main = read('electron/main.js');
+  const direct = (main.match(/dialog\.showMessageBox/g) || []).length;
+  check('only the helper calls showMessageBox directly', direct === 1, `${direct} direct call(s)`);
+  const helperAt = main.indexOf('async function showMessage(');
+  check('the helper exists', helperAt > 0);
+  const helper = main.slice(helperAt, helperAt + 500);
+  check('and consults the dialog policy', /dialogsSuppressed\(\)/.test(helper), helper.slice(0, 200));
+  check('and logs what it did not show', /suppressedLine/.test(helper), helper.slice(0, 200));
+  check('and answers with the harmless button', /suppressedResponse/.test(helper), helper.slice(0, 200));
+  check('no showMessageBoxSync anywhere', !/showMessageBoxSync/.test(main));
 }
 
 if (failures.length) {

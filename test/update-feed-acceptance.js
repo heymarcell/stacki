@@ -41,8 +41,9 @@ const REPO = path.join(__dirname, '..');
 const DEFAULT_APP = path.join(REPO, 'release', 'mac-universal', 'Stacki.app');
 
 /** A server that records every request anybody makes to it. */
-function countingFeed() {
+function countingFeed({ offer = '0.0.1' } = {}) {
   const hits = [];
+  const state = { offer };
   const server = http.createServer((req, res) => {
     hits.push({ method: req.method, url: req.url, at: Date.now() });
     // Answer like a generic electron-updater feed would, but name a version
@@ -54,10 +55,11 @@ function countingFeed() {
     // could not check for updates" dialog on the screen of whoever is running
     // the test. Nothing is learned from that download, so it does not happen.
     res.writeHead(200, { 'content-type': 'application/x-yaml' });
-    res.end(`version: 0.0.1\npath: Stacki-0.0.1-universal-mac.zip\nsha512: ${'0'.repeat(88)}\nreleaseDate: '2020-01-01T00:00:00.000Z'\n`);
+    res.end(`version: ${state.offer}\npath: Stacki-${state.offer}-universal-mac.zip\nsha512: ${'0'.repeat(88)}\nreleaseDate: '2020-01-01T00:00:00.000Z'\n`);
   });
   return {
     hits,
+    state,
     listen: () =>
       new Promise((done) => {
         server.listen(0, '127.0.0.1', () => done(server.address().port));
@@ -105,8 +107,10 @@ async function runFor(copy, seconds, port) {
   const log = [];
   const child = spawn(bin, [], {
     // A free MCP port, so a copy started here never fights the app the person
-    // at the keyboard has open.
-    env: { ...process.env, STACKI_MCP_PORT: String(port) },
+    // at the keyboard has open — and no modal dialogs, because this run has
+    // nobody watching it and a message box would leave the app waiting for a
+    // click on somebody's screen until the test's timeout.
+    env: { ...process.env, STACKI_MCP_PORT: String(port), STACKI_NO_DIALOGS: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (d) => log.push(String(d)));
@@ -162,6 +166,25 @@ async function runFor(copy, seconds, port) {
     // nothing. A download here would mean the control is doing more than
     // measuring.
     check('and downloads nothing, because the offered version is older', !/Update downloaded|checksum mismatch/i.test(releaseLog), releaseLog.slice(0, 300));
+    // --- the dialog that used to stop everything ---------------------------
+    //
+    // The exact arrangement that put a real "Stacki could not check for
+    // updates" box on somebody's screen mid-test: a build allowed to update,
+    // a feed offering something newer, and a checksum that will not match. A
+    // modal dialog here waits for a click that is never coming, so an
+    // unattended run hangs until its timeout with the app frozen behind it.
+    //
+    // Headless, the same failure must be a log line and nothing else.
+    feed.hits.length = 0;
+    feed.state.offer = '99.0.0';
+    const noisy = stageApp(appPath, port, { enabled: true });
+    staged.push(noisy.dir);
+    const noisyLog = await runFor(noisy.copy, 40, 44103);
+
+    check('a failing update is still attempted when enabled', feed.hits.length > 0, `${feed.hits.length} request(s)`);
+    check('and the failure is reported to the log', /Auto update error|checksum mismatch/i.test(noisyLog), noisyLog.slice(-400));
+    check('but no dialog is put on screen', /Dialog suppressed/.test(noisyLog), noisyLog.slice(-400));
+    check('and the app is still running when the run ends', !/quitAndInstall/.test(noisyLog));
   } finally {
     await feed.close();
     for (const dir of staged) {
