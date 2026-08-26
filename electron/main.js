@@ -59,6 +59,7 @@ const gitSnapshot = require('./gitSnapshot');
 const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
+const { updatePolicy, UPDATE_ENABLED_FIELD } = require('./updatePolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
 const { createAccessStore } = require('./mcp/agent/access');
@@ -576,6 +577,33 @@ function formatAutoUpdateError(error) {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
+/**
+ * Whether this build may update itself, and why.
+ *
+ * The field is read from the packaged package.json — the copy electron-builder
+ * writes into the app — through Electron's own resolver rather than by joining
+ * paths, so it is the same file the runtime is actually running from. In
+ * development there is no packaged metadata and none is looked for: the policy
+ * has already said no by then.
+ *
+ * Recomputed on each call rather than cached at startup. It cannot change
+ * under a running app, but a value that is derived where it is used cannot go
+ * stale in the one direction that matters here.
+ */
+function currentUpdatePolicy() {
+  let declared;
+  try {
+    // require of the app's own manifest: in a packaged app this resolves
+    // inside the asar, which is exactly the metadata the release build wrote.
+    declared = app.isPackaged ? require('../package.json')?.[UPDATE_ENABLED_FIELD] : undefined;
+  } catch {
+    // A manifest that cannot be read is a build that never said it could
+    // update itself, which is already the safe answer.
+    declared = undefined;
+  }
+  return updatePolicy({ isPackaged: app.isPackaged, updateEnabledMetadata: declared });
+}
+
 function logAutoUpdate(message, details) {
   const detailText =
     details === undefined
@@ -654,7 +682,10 @@ function registerAutoUpdaterEvents() {
 }
 
 async function runAutoUpdateCheck() {
-  if (!app.isPackaged || autoUpdateCheckInFlight) return;
+  // The gate is here as well as in startAutoUpdateChecks, because this is what
+  // the interval calls. Belt and braces on the one function that actually
+  // reaches the network.
+  if (!currentUpdatePolicy().enabled || autoUpdateCheckInFlight) return;
 
   autoUpdateCheckInFlight = true;
   try {
@@ -676,14 +707,27 @@ async function checkForUpdatesFromMenu() {
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
 
   // Nothing to check against: electron-updater reads the feed the installer
-  // was built with, and a dev run has no installer. Saying so beats a check
-  // that silently does nothing.
-  if (!app.isPackaged) {
+  // was built with, and a build that is not an update-enabled release has no
+  // business asking that feed anything. Saying so beats a check that silently
+  // does nothing — and beats one that contacts the official feed on behalf of
+  // somebody's local build.
+  //
+  // Info, not warning: this is how the build is meant to work, not a failure.
+  // The menu item stays where it is, because removing it only makes somebody
+  // hunt for it.
+  const policy = currentUpdatePolicy();
+  if (!policy.enabled) {
     await dialog.showMessageBox(parent, {
       type: 'info',
       title: 'Check for Updates',
-      message: 'Updates are only checked in the installed app.',
-      detail: `This is a development build (${app.getVersion()}), which updates when you rebuild it.`,
+      message:
+        policy.reason === 'development'
+          ? 'Updates are only checked in the installed app.'
+          : 'This build does not receive automatic updates.',
+      detail:
+        policy.reason === 'development'
+          ? `This is a development build (${app.getVersion()}), which updates when you rebuild it.`
+          : policy.detail,
     });
     return;
   }
@@ -737,8 +781,13 @@ async function checkForUpdatesFromMenu() {
 }
 
 function startAutoUpdateChecks() {
-  if (!app.isPackaged) {
-    logAutoUpdate('Skipping auto update checks in development');
+  const policy = currentUpdatePolicy();
+  if (!policy.enabled) {
+    // Nothing is registered, nothing is scheduled, nothing is fetched. An
+    // update-disabled build must not hold an interval or an event handler for
+    // a mechanism it is never going to use — and must not touch the feed to
+    // discover that.
+    logAutoUpdate(`Automatic updates disabled for this build (${policy.reason})`);
     return;
   }
 
