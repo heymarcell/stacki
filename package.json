@@ -133,6 +133,7 @@
     "test:agentapi": "node test/agent-api.js",
     "test:agentacceptance": "node test/agent-acceptance.js",
     "test:agentcanvas": "electron test/agent-canvas.js",
+    "test:stress": "electron test/mcp-real-stress.js",
     "test:packaging": "node test/packaging.js",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder",
