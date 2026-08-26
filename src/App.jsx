@@ -3495,11 +3495,28 @@ export default function App() {
   // Every render, deduped on what was last sent — the alternative is an IPC
   // call per keystroke.
   const mcpSentRef = useRef(null);
+  // Which node the main process has actually taken a snapshot of.
+  //
+  // Publishing is push-based, so "the selection moved" and "get_context can
+  // see that it moved" are two different moments with a render, an effect and
+  // an IPC round trip between them. Anything that waits a fixed number of
+  // milliseconds for that is racing it — and lost, at 120ms, often enough that
+  // a get_context straight after a select reported the previous node.
+  const mcpPublishedIdRef = useRef(null);
   useEffect(() => {
     const key = JSON.stringify(mcpPayloadRef.current);
     if (key === mcpSentRef.current) return;
     mcpSentRef.current = key;
-    void window.avb.mcpPublish(mcpPayloadRef.current);
+    const sending = mcpPayloadRef.current;
+    const sendingId = selectedId;
+    void window.avb.mcpPublish(sending).then(
+      () => {
+        mcpPublishedIdRef.current = sendingId;
+      },
+      () => {
+        /* a publish that failed leaves the last good snapshot in place */
+      }
+    );
   });
 
   // Answered by the Visual Review section below; declared here because the
@@ -4264,6 +4281,23 @@ export default function App() {
     // A moment for the canvas to catch up, so a style read after a select is
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
+    /**
+     * Resolve once the snapshot the main process holds is the one describing
+     * this node — the real event, rather than a duration chosen to be longer
+     * than it usually takes.
+     *
+     * Answers false on timeout instead of throwing: a caller that could not
+     * confirm the publish should say what it did and let the next read decide,
+     * not fail an edit that landed.
+     */
+    selectionPublished: async (id, { timeout = 3000 } = {}) => {
+      const stop = Date.now() + timeout;
+      for (;;) {
+        if (mcpPublishedIdRef.current === id) return true;
+        if (Date.now() > stop) return false;
+        await new Promise((done) => setTimeout(done, 15));
+      }
+    },
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
     /**
      * Put a write the main process carried out on the undo stack.

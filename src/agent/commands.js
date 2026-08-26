@@ -164,6 +164,19 @@ export function createAgentCommands(getApp) {
 
     if (action === 'select') {
       a.select(id, args.occurrence);
+      // `ok: true` has to mean the selection has actually moved.
+      //
+      // `a.selectedId()` reads through the bundle React rebuilds each render,
+      // so until that render lands the next call still sees the previous node.
+      // Returning without waiting made every selection-consuming call one node
+      // behind: a review created straight after selecting an element anchored
+      // to whatever had been selected before it, silently and reproducibly.
+      // The style path already waits here, for exactly this reason.
+      await a.settle();
+      // And the snapshot get_context serves is published, not pulled, so
+      // waiting for the canvas is not the same as waiting for the answer to
+      // change. This waits for the publish itself.
+      await a.selectionPublished(id);
       return { ok: true, selected: true, navigated, note, document: documentOf(a), keys: a.keysFor(id) };
     }
 

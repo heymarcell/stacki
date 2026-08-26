@@ -46,7 +46,42 @@ const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 // not wait for a piped stdout — both learned the hard way in agent-canvas.js.
 const say = (text) => fs.writeSync(1, `${text}\n`);
 const shout = (text) => fs.writeSync(2, `${text}\n`);
-const done = (code) => app.exit(code);
+
+/**
+ * Stop, then leave.
+ *
+ * `app.exit()` skips before-quit — main.js says so itself, and takes the Astro
+ * dev server down by hand for that reason. A test that exits without doing the
+ * same orphans a dev server per run: 42 of them, holding 4.2GB, is what that
+ * looked like after an afternoon. So the dev server is stopped through the
+ * app's own door before anything else, and the temp projects go with it.
+ */
+async function teardown(code) {
+  try {
+    if (client) {
+      const stopped = await client.call('project', { action: 'dev_stop' }, { deadline: 8000 });
+      say(`stress: teardown dev_stop -> ${JSON.stringify(stopped.structured ?? stopped.rpcError ?? null).slice(0, 200)}`);
+    }
+  } catch (err) {
+    say(`stress: teardown dev_stop threw -> ${String(err?.message || err).slice(0, 160)}`);
+  }
+  // The projects and the app-data directory this run made. Reported rather
+  // than swallowed: a removal that quietly fails leaves a gigabyte of
+  // node_modules behind every run, which is how a machine ends up with 5GB of
+  // temp and no idea where it came from.
+  for (const dir of [FIXTURE, OTHER, userData]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    } catch (err) {
+      shout(`stress: could not remove ${dir}: ${String(err?.message || err).slice(0, 120)}`);
+    }
+  }
+  say(`stress: teardown cleaned up, exiting ${code}`);
+  app.exit(code);
+}
+const done = (code) => {
+  void teardown(code);
+};
 
 async function until(what, fn, { timeout = 60000, every = 250 } = {}) {
   const stop = Date.now() + timeout;
@@ -495,6 +530,214 @@ phase(2, 'permissions', async () => {
   check('and coming back finds the original grant intact', back.access.mode === 'edit', short(back.access));
 });
 
+// ---------------------------------------------------------------------------
+// 3 — review to target, end to end
+// ---------------------------------------------------------------------------
+
+/**
+ * The identity of a node, as two different answers can be compared.
+ *
+ * Not the ref string: two refs minted a moment apart legitimately differ in
+ * what they observed, so comparing them by value would fail on a difference
+ * nobody cares about. What must match is the thing they name — the file, the
+ * lines, the marks, the tag, and which rendered copy.
+ */
+const identityOf = (read) => {
+  const t = read?.target;
+  if (!t) return null;
+  return {
+    file: t.source?.file ?? null,
+    startLine: t.source?.startLine ?? null,
+    endLine: t.source?.endLine ?? null,
+    tag: t.tag ?? null,
+    kind: t.kind ?? null,
+    keys: t.keys || null,
+    occurrence: t.occurrence ?? null,
+    chain: t.componentChain || null,
+  };
+};
+
+phase(3, 'review to target', async () => {
+  await setMode('edit');
+  await canvasReady();
+
+  // Reviews are made where the app is looking, so each one needs its node
+  // selected first. These are chosen to be the awkward cases: a plain node on
+  // the page, one four components deep behind a slot, one inside a
+  // conditional, one inside a ternary, one inside a Fragment, and one that is
+  // a single template rendered many times.
+  const wanted = [
+    { what: 'a plain page node', find: (kids) => kids.find((c) => c.tag === 'h1') },
+    { what: 'a node inside a conditional', find: (kids) => kids.find((c) => c.kind === 'cond') },
+    { what: 'a node inside a Fragment', find: (kids) => kids.find((c) => c.tag === 'Fragment' || c.label === 'Fragment') },
+    { what: 'a repeated node', find: (kids) => kids.find((c) => c.label === 'repeat-list' || c.kind === 'map') },
+    { what: 'a component instance', find: (kids) => kids.find((c) => c.tag === 'Shell') },
+  ];
+
+  const page = await client.s('target', { action: 'read' });
+  check('the fixture page reads', page?.ok === true, short(page));
+  const kids = page?.target?.children || [];
+  check('and has children to work with', kids.length > 3, short(kids.map((k) => ({ t: k.tag, k: k.kind }))));
+
+  const made = [];
+  for (const { what, find } of wanted) {
+    const node = find(kids);
+    if (!node) {
+      check(`the fixture offers ${what}`, false, short(kids.map((k) => ({ tag: k.tag, kind: k.kind, label: k.label }))));
+      continue;
+    }
+    const selected = await client.s('target', { action: 'select', ref: node.ref });
+    if (!check(`${what} can be selected`, selected?.ok === true, short(selected))) continue;
+    const review = await client.s('comment', { action: 'create', message: `stress: ${what}` });
+    if (!check(`a review can be left on ${what}`, review?.ok === true, short(review))) continue;
+    made.push({ what, number: review.review.number, id: review.review.id });
+  }
+  check('every awkward shape took a review', made.length === wanted.length, short(made));
+
+  // --- the invariant -------------------------------------------------------
+  //
+  // Focus a review and the ref it hands back must name the node the canvas
+  // actually selected. Not something similar, not the parent, not another copy
+  // of the same template: the same node. This is checked by reading through
+  // the returned ref and reading through no ref at all — which means "whatever
+  // is selected" — and requiring the two to describe the same thing.
+  for (const entry of made) {
+    const focused = await client.s('comment', { action: 'focus', threadId: String(entry.number) });
+    if (!check(`focusing ${entry.what} lands`, focused?.ok === true, short(focused))) continue;
+
+    check(`focusing ${entry.what} hands back a ref over the wire`, typeof focused.targetRef === 'string' && focused.targetRef.startsWith('stacki:'), short(focused.targetRef));
+    check(`and says how it identified it`, typeof focused.confidence === 'string', short(focused.confidence));
+    if (typeof focused.targetRef !== 'string') continue;
+
+    const viaRef = await client.s('target', { action: 'read', ref: focused.targetRef });
+    check(`the returned ref reads for ${entry.what}`, viaRef?.ok === true, short(viaRef));
+    const viaSelection = await client.s('target', { action: 'read' });
+    check(`and the live selection reads for ${entry.what}`, viaSelection?.ok === true, short(viaSelection));
+
+    const a = identityOf(viaRef);
+    const b = identityOf(viaSelection);
+    check(
+      `the ref focus returned for ${entry.what} names the node the canvas selected`,
+      a && b && JSON.stringify(a) === JSON.stringify(b),
+      `ref=${short(a, 200)} selection=${short(b, 200)}`
+    );
+
+    // Nothing about this flow may have needed the filesystem: the source is in
+    // the answer, which is the whole claim of the feature.
+    check(`the answer names the file for ${entry.what}`, typeof viaRef?.target?.source?.file === 'string', short(viaRef?.target?.source));
+    check(`and the lines`, Number.isInteger(viaRef?.target?.source?.startLine), short(viaRef?.target?.source));
+
+    // A writable ref requires evidence. Where the pin is withheld, the write
+    // must be withheld too.
+    if (focused.targetEditable === false) {
+      const write = await client.s('target', { action: 'add_class', className: 'should-not-land', ref: focused.targetRef });
+      check(`a non-editable ref for ${entry.what} refuses a write`, write?.ok !== true, short(write));
+    }
+  }
+
+  // --- an orphan -----------------------------------------------------------
+  //
+  // A review whose node is gone must degrade rather than point at whatever is
+  // nearby, and must hand back no ref to write through.
+  const victim = made.find((m) => m.what === 'a plain page node');
+  if (victim) {
+    const wasAt = await client.s('comment', { action: 'focus', threadId: String(victim.number) });
+    const wasRead = wasAt?.targetRef ? await client.s('target', { action: 'read', ref: wasAt.targetRef }) : null;
+    log(`orphan probe — before deletion: confidence=${wasAt?.confidence} keys=${short(wasRead?.target?.keys)} tag=${wasRead?.target?.tag} source=${short(wasRead?.target?.source)}`);
+    const before = diskRead(FIXTURE, 'src/pages/index.astro');
+    fs.writeFileSync(
+      path.join(FIXTURE, 'src/pages/index.astro'),
+      before.replace('<h1 class="page-title">{heading}</h1>', ''),
+      'utf8'
+    );
+    await settled('the page to settle after the node was cut out', async () => {
+      const list = await client.s('get_comments', { status: 'open', detail: 'summary' });
+      return list?.reviews?.find((r) => r.number === victim.number)?.anchorState || null;
+    }, { timeout: 60000 });
+    const orphaned = await client.s('comment', { action: 'focus', threadId: String(victim.number) });
+    const orphanRead = orphaned?.targetRef ? await client.s('target', { action: 'read', ref: orphaned.targetRef }) : null;
+    log(`orphan probe — after deletion: ok=${orphaned?.ok} anchorState=${orphaned?.review?.anchorState} confidence=${orphaned?.confidence} editable=${orphaned?.targetEditable}`);
+    log(`orphan probe — ref now names: keys=${short(orphanRead?.target?.keys)} tag=${orphanRead?.target?.tag} kind=${orphanRead?.target?.kind} source=${short(orphanRead?.target?.source)}`);
+    log(`orphan probe — page still contains page-title? ${diskRead(FIXTURE, 'src/pages/index.astro').includes('page-title')}`);
+    check('focusing a review whose node was deleted does not report success', orphaned?.ok === false, short(orphaned));
+    check('and hands back no ref to act through', orphaned?.targetRef === null, short(orphaned?.targetRef));
+    check('and says it is not editable', orphaned?.targetEditable === false, short(orphaned?.targetEditable));
+    fs.writeFileSync(path.join(FIXTURE, 'src/pages/index.astro'), before, 'utf8');
+    await canvasReady();
+  }
+});
+
+// A single-node walk-through, printed, for pinning down where an identity
+// stops matching. Not part of the matrix — run it with PHASES=probe.
+phase('probe', 'one node, every step printed', async () => {
+  await setMode('edit');
+  await canvasReady();
+
+  const page = await client.s('target', { action: 'read' });
+  log(`root read: tag=${page?.target?.tag} kind=${page?.target?.kind} keys=${short(page?.target?.keys)}`);
+  const h1 = (page?.target?.children || []).find((c) => c.tag === 'h1');
+  log(`h1 child: ${short(h1)}`);
+
+  const selected = await client.s('target', { action: 'select', ref: h1.ref });
+  log(`select ok=${selected?.ok} -> ${short(selected?.target && identityOf(selected))}`);
+
+  const ctx = await client.s('get_context', { styleDetail: 'none' });
+  log(`get_context selection: status=${ctx?.selection?.status} tag=${ctx?.selection?.tag} source=${short(ctx?.selection?.source)} chain=${short(ctx?.selection?.componentChain)}`);
+
+  const readNoRef = await client.s('target', { action: 'read' });
+  log(`read(no ref):  ${short(identityOf(readNoRef), 300)}`);
+  const readWithRef = await client.s('target', { action: 'read', ref: h1.ref });
+  log(`read(h1 ref):  ${short(identityOf(readWithRef), 300)}`);
+
+  const review = await client.s('comment', { action: 'create', message: 'probe: the h1' });
+  log(`review created ok=${review?.ok} number=${review?.review?.number}`);
+  log(`review anchor keys:      ${short(review?.review?.anchor?.keys)}`);
+  log(`review anchor fingerprint:${short(review?.review?.anchor?.fingerprint, 260)}`);
+  log(`review creationContext:  keys=${short(review?.review?.creationContext?.keys)} tag=${review?.review?.creationContext?.tag}`);
+
+  const focused = await client.s('comment', { action: 'focus', threadId: String(review.review.number) });
+  log(`focus ok=${focused?.ok} confidence=${focused?.confidence} editable=${focused?.targetEditable} restored=${short(focused?.restored)}`);
+  const viaRef = await client.s('target', { action: 'read', ref: focused.targetRef });
+  log(`focus ref names: ${short(identityOf(viaRef), 300)}`);
+  const viaSel = await client.s('target', { action: 'read' });
+  log(`selection now:   ${short(identityOf(viaSel), 300)}`);
+});
+
+// Does a selection made through the API become the selection the next call
+// sees? Run with PHASES=probe2.
+phase('probe2', 'select then immediately act', async () => {
+  await setMode('edit');
+  await canvasReady();
+
+  const page = await client.s('target', { action: 'read' });
+  const kids = page?.target?.children || [];
+  const picks = [
+    kids.find((c) => c.tag === 'h1'),
+    kids.find((c) => c.label === 'tagline'),
+    kids.find((c) => c.label === 'inline-styled'),
+  ].filter(Boolean);
+
+  for (const pick of picks) {
+    const sel = await client.s('target', { action: 'select', ref: pick.ref });
+    // Nothing between the select and the thing that consumes the selection.
+    const ctx = await client.s('get_context', { styleDetail: 'none' });
+    // How long until get_context agrees, if ever?
+    const t0 = Date.now();
+    let agreedAt = null;
+    for (let i = 0; i < 40; i++) {
+      const c = await client.s('get_context', { styleDetail: 'none' });
+      if (JSON.stringify(c?.selection?.keys) === JSON.stringify(pick.keys)) { agreedAt = Date.now() - t0; break; }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    log(`  ${pick.label}: get_context first=${ctx?.selection?.tag}/${short(ctx?.selection?.keys)} agreedAfter=${agreedAt === null ? 'NEVER' : agreedAt + 'ms'}`);
+    const review = await client.s('comment', { action: 'create', message: `probe2: ${pick.label}` });
+    const agreed = JSON.stringify(review?.review?.anchor?.keys) === JSON.stringify(pick.keys);
+    log(`${pick.label}: select.ok=${sel?.ok} ctxTag=${ctx?.selection?.tag} wantKeys=${short(pick.keys)} reviewKeys=${short(review?.review?.anchor?.keys)} ${agreed ? 'AGREE' : 'DISAGREE'}`);
+    check(`a review created straight after selecting ${pick.label} anchors to it`, agreed, `wanted ${short(pick.keys)} got ${short(review?.review?.anchor?.keys)}`);
+    check(`and get_context reports ${pick.label} as selected`, ctx?.selection?.tag === pick.tag, `wanted ${pick.tag} got ${ctx?.selection?.tag}`);
+  }
+});
+
 // --- run ---------------------------------------------------------------------
 
 (async () => {
@@ -545,17 +788,11 @@ phase(2, 'permissions', async () => {
   if (failures.length) {
     shout(`\nmcp-real-stress: ${failures.length} failed, ${checked - failures.length} passed\n`);
     for (const f of failures) shout(f);
-    removeStressProject(FIXTURE);
-    removeStressProject(OTHER);
     return done(1);
   }
   say(`mcp-real-stress: ${checked} passed  [a real server, a real project, used badly]`);
-  removeStressProject(FIXTURE);
-  removeStressProject(OTHER);
   return done(0);
 })().catch((err) => {
   shout(`mcp-real-stress: ${err?.stack || err}`);
-  removeStressProject(FIXTURE);
-  removeStressProject(OTHER);
   done(1);
 });

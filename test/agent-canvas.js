@@ -50,8 +50,19 @@ const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 // pattern test/thumbs.js already uses, for the same two reasons.
 const say = (text) => fs.writeSync(1, `${text}\n`);
 const shout = (text) => fs.writeSync(2, `${text}\n`);
+// `app.exit()` skips before-quit, so the Astro dev server this run started
+// outlives it — one orphaned server, holding its port and its memory, per run.
+// main.js takes it down by hand for the same reason; so does this.
+let stopPreview = async () => {};
 const done = (code) => {
-  app.exit(code);
+  void (async () => {
+    try {
+      await stopPreview();
+    } catch {
+      /* a preview that will not stop must not keep the process alive */
+    }
+    app.exit(code);
+  })();
 };
 
 /**
@@ -177,6 +188,8 @@ require('../electron/main.js');
     const image = (body.result?.content || []).find((c) => c.type === 'image') || null;
     return { meta: body.result?.structuredContent || {}, image };
   };
+
+  stopPreview = () => call('project', { action: 'dev_stop' });
 
   const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 
