@@ -1,7 +1,7 @@
 import React from 'react';
 import ReviewThread, { ReviewWhere, ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
 import { SharedReviewsBar, SharedReviewsDialog } from '../ui/SharedReviews.jsx';
-import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
+import { ReviewIcon, PinIcon, OrphanIcon, BackIcon } from '../ui/Icons.jsx';
 
 // The comments panel.
 //
@@ -49,6 +49,10 @@ export default function CommentsPanel({
   onScope,
   openId,
   onOpen,
+  // Whether the open thread has taken over the panel body. See App.jsx: a long
+  // conversation is docked here rather than opened in a card over the design.
+  expanded = false,
+  onExpand = null,
   onAct,
   onFocus,
   onDelete,
@@ -80,6 +84,8 @@ export default function CommentsPanel({
 }) {
   const open = reviews.find((r) => r.id === openId) || null;
   const [setUp, setSetUp] = React.useState(false);
+  // The thread the panel is showing, when it is showing one on its own.
+  const openReview = openId ? reviews.find((r) => r.id === openId) || null : null;
 
   return (
     <div className="panel-section grow comments-panel">
@@ -159,6 +165,35 @@ export default function CommentsPanel({
         </div>
       </div>
 
+      {/* The docked reader.
+
+          It replaces the list rather than sitting inside it, so the thread's
+          own header and reply box are pinned to the panel instead of scrolling
+          with a list of other comments. The pin on the canvas stays selected
+          the whole time — this is a second way of reading the same thread, not
+          a different place for it to live — and there is one obvious way back. */}
+      {expanded && openReview ? (
+        <div className="panel-body comments-reader">
+          <button className="comments-back" onClick={() => onExpand?.(false)}>
+            <BackIcon size={12} /> All comments
+          </button>
+          <ReviewThread
+            review={openReview}
+            actorId={actorId}
+            density="expanded"
+            pinned={!withheldIds?.has(openReview.id)}
+            busy={busyId === openReview.id}
+            onAct={(action, extra) => onAct(openReview.id, action, extra)}
+            onFocus={() => onFocus(openReview)}
+            onDelete={() => onDelete(openReview.id)}
+            onColor={(c) => onColor?.(openReview.id, c)}
+            onEditMessage={onEditMessage ? (messageId, message) => onEditMessage(openReview.id, messageId, message) : null}
+            onDeleteMessage={onDeleteMessage ? (messageId) => onDeleteMessage(openReview.id, messageId) : null}
+            onExpand={onExpand ? () => onExpand(false) : null}
+            onClose={() => onOpen(null)}
+          />
+        </div>
+      ) : (
       <div className="panel-body comments-body">
         {!reviews.length && (
           <div className="comments-empty">
@@ -193,6 +228,7 @@ export default function CommentsPanel({
                 onColor={(c) => onColor?.(r.id, c)}
                 onEditMessage={onEditMessage ? (messageId, message) => onEditMessage(r.id, messageId, message) : null}
                 onDeleteMessage={onDeleteMessage ? (messageId) => onDeleteMessage(r.id, messageId) : null}
+                onExpand={onExpand ? () => onExpand(true) : null}
                 onClose={() => onOpen(null)}
               />
             </div>
@@ -232,6 +268,7 @@ export default function CommentsPanel({
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

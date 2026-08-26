@@ -121,6 +121,10 @@ export default function PreviewPane({
   pinsVisible = true,
   reviewItems,
   reviewOpenId = null,
+  // True while the Comments panel is showing this thread. The pin stays — it is
+  // what says WHERE — but the card does not, because the conversation is
+  // already on screen somewhere with room for it.
+  reviewExpanded = false,
   reviewDraft = null,
   reviewBusyId = null,
   reviewById,
@@ -763,7 +767,7 @@ export default function PreviewPane({
         pins={reviewPins}
         frameBox={frameBox}
         capturing={capturing}
-        openId={reviewOpenId}
+        openId={reviewExpanded ? null : reviewOpenId}
         onOpen={onReviewOpen}
         onAct={onReviewAct}
         onFocus={onReviewFocus}

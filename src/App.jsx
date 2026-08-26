@@ -13,7 +13,7 @@ import { buildMcpPayload } from './mcpContext.js';
 import CommentsPanel from './panels/CommentsPanel.jsx';
 import { anchorSteps, checkAnchor, markerPathFor, modelMatchesFile, peerPath, resolveNode } from './reviewAnchor.js';
 import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
-import { pinnable } from './reviewPins.js';
+import { pinnable, longEnoughToDock } from './reviewPins.js';
 import { mayPin } from './reviewCheckout.js';
 import {
   initialReviewMode,
@@ -3581,6 +3581,14 @@ export default function App() {
   const [allReviews, setAllReviews] = useState([]);
   const [reviewProblem, setReviewProblem] = useState(null);
   const [reviewOpenId, setReviewOpenId] = useState(null);
+  // Which of the two reading densities the open thread is in.
+  //
+  // A pin's card is the right shape for "the padding is wrong here". It is the
+  // wrong shape for two thousand words about four files, and making the card
+  // taller only trades one problem for another: a panel that covers the design
+  // it is about. So a long thread moves into the Comments panel, where there
+  // is room to read it and the canvas is still visible beside it.
+  const [reviewExpanded, setReviewExpanded] = useState(false);
   const [reviewBusyId, setReviewBusyId] = useState(null);
   const [reviewTick, setReviewTick] = useState(0);
   // Whether these comments are shared, with whom, and how the last catch-up
@@ -4494,6 +4502,8 @@ export default function App() {
   commentModeRef.current = commentMode;
   const reviewOpenIdRef = useRef(reviewOpenId);
   reviewOpenIdRef.current = reviewOpenId;
+  const reviewExpandedRef = useRef(reviewExpanded);
+  reviewExpandedRef.current = reviewExpanded;
   const canCommentRef = useRef(false);
   canCommentRef.current = !!project && !!devUrl && !inPreview;
 
@@ -4519,9 +4529,16 @@ export default function App() {
         return;
       }
       if (e.key === 'Escape') {
-        // One rung at a time: not that element, then not commenting. A thread
-        // opened from its pin closes first, since that is what is in the way.
-        if (reviewOpenIdRef.current && commentModeRef.current.phase === 'off') {
+        // One rung at a time: out of the reader, then not that element, then
+        // not commenting. A thread opened from its pin closes first, since
+        // that is what is in the way.
+        if (reviewExpandedRef.current && commentModeRef.current.phase === 'off') {
+          // Docked, so nothing is covering the page — the first Escape puts
+          // the conversation back on its pin rather than throwing away the
+          // place somebody had got to in it.
+          e.preventDefault();
+          setReviewExpanded(false);
+        } else if (reviewOpenIdRef.current && commentModeRef.current.phase === 'off') {
           e.preventDefault();
           setReviewOpenId(null);
         } else if (commentModeRef.current.phase !== 'off') {
@@ -4874,8 +4891,11 @@ export default function App() {
                 scope={reviewScope}
                 onScope={setReviewScope}
                 openId={reviewOpenId}
+                expanded={reviewExpanded}
+                onExpand={setReviewExpanded}
                 onOpen={(id) => {
                   setReviewOpenId(id);
+                  setReviewExpanded(id ? longEnoughToDock(reviewRows.find((r) => r.id === id)) : false);
                   // Choosing a comment from the list means "show me this" —
                   // reading it and finding it are the same act. An orphan has
                   // nowhere to go, so it just opens.
@@ -5089,6 +5109,7 @@ export default function App() {
             pinsVisible={pinsVisible}
             reviewItems={reviewItems}
             reviewOpenId={reviewOpenId}
+            reviewExpanded={reviewExpanded}
             reviewDraft={reviewDraft}
             reviewBusyId={reviewBusyId}
             reviewById={reviewById}

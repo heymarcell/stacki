@@ -37,6 +37,9 @@ const GAP = 14;
 const PANEL_W = 348;
 // How much of the panel has to stay on screen for it to be grabbable again.
 const KEEP = 60;
+// The same idea while a drag is in flight, with a little more margin so the
+// header — and therefore the close button — is never the part that goes.
+const DRAG_KEEP = 72;
 
 /** Which way a box hanging off a point has to open to stay on screen. */
 export function placement(x, y, bounds) {
@@ -169,10 +172,17 @@ function useDragOffset(key) {
     }
     setDragging(true);
 
-    let frame = 0;
+    // `queued` rather than the rAF handle, because the handle is assigned
+    // AFTER the callback in any environment where rAF runs synchronously — so
+    // paint would clear a variable that is then immediately set again, and the
+    // second frame would never be scheduled. A flag set before scheduling
+    // cannot get out of order with itself.
+    let queued = false;
+    let handle = 0;
     let pending = null;
     const paint = () => {
-      frame = 0;
+      queued = false;
+      handle = 0;
       if (!pending) return;
       node.style.setProperty('--drag-x', `${pending.dx}px`);
       node.style.setProperty('--drag-y', `${pending.dy}px`);
@@ -192,7 +202,10 @@ function useDragOffset(key) {
       // The old clamp used two constants that had nothing to do with the box
       // actually on screen.
       pending = clampToWindow(wanted, origin, size);
-      if (!frame) frame = requestAnimationFrame(paint);
+      if (!queued) {
+        queued = true;
+        handle = requestAnimationFrame(paint);
+      }
     };
 
     const finish = (ev) => {
@@ -200,8 +213,8 @@ function useDragOffset(key) {
       node.removeEventListener('pointermove', move);
       node.removeEventListener('pointerup', finish);
       node.removeEventListener('pointercancel', finish);
-      if (frame) {
-        cancelAnimationFrame(frame);
+      if (queued) {
+        if (handle) cancelAnimationFrame(handle);
         paint();
       }
       try {
@@ -232,16 +245,20 @@ function useDragOffset(key) {
  */
 export function clampToWindow(wanted, origin, size) {
   if (typeof window === 'undefined') return wanted;
+  // Nothing to clamp against. A box that has not been laid out measures zero,
+  // and a zero width turns the "keep this much on screen" bound into a
+  // POSITIVE minimum offset — which pinned the panel 72px from where the
+  // pointer was and then held it there for the whole drag.
+  if (!size || !size.w || !size.h) return wanted;
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const KEEP = 72; // how much of the panel must remain visible
   const left = origin.left + wanted.dx;
   const top = origin.top + wanted.dy;
-  const minLeft = -(size.w - KEEP);
-  const maxLeft = vw - KEEP;
+  const minLeft = -(size.w - DRAG_KEEP);
+  const maxLeft = vw - DRAG_KEEP;
   // The header must stay reachable, so the top edge never goes above 0.
   const minTop = 0;
-  const maxTop = vh - Math.min(size.h, KEEP);
+  const maxTop = vh - Math.min(size.h, DRAG_KEEP);
   return {
     dx: wanted.dx + (Math.min(Math.max(left, minLeft), maxLeft) - left),
     dy: wanted.dy + (Math.min(Math.max(top, minTop), maxTop) - top),

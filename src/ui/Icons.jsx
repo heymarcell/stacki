@@ -121,6 +121,15 @@ export const CloseIcon = (p) => (
 /* Six dots: the thing you take hold of to move a panel. Quiet enough to sit in
    a header without competing with the number beside it, and unmistakable —
    this shape has meant "drag me" for long enough that it needs no label. */
+/* Back to the list. A left chevron with a shoulder, so it reads as "return"
+   rather than "previous page". */
+export const BackIcon = (p) => (
+  <I {...p}>
+    <path d="M13 8H3.5" />
+    <path d="M7 3.5 2.5 8 7 12.5" />
+  </I>
+);
+
 export const GripIcon = (p) => (
   <I {...p} filled>
     <circle cx="6" cy="4" r="1.15" />

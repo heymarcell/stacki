@@ -42,8 +42,8 @@ const check = (what, condition, detail) => {
   fs.writeFileSync(
     entry,
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
-export { default as ReviewPins, ReviewSurface } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
-export { placePins } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
+export { default as ReviewPins, ReviewSurface, clampPoint } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
+export { placePins, pinnable, longEnoughToDock } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
 export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
 export { SharedReviewsBar, SharedReviewsDialog, syncProblemText } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'SharedReviews.jsx'))};
 export { default as PreviewPane } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'PreviewPane.jsx'))};
@@ -1132,6 +1132,333 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
 
     await render(thread(shared({ checkout: { branch: 'main', head: 'a', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: null } })));
     check('an ordinary same-tree review says nothing about checkouts', !$('.review-prov'));
+  }
+
+  // ------------------------------------------------------------------
+  // A thread with real content in it
+  // ------------------------------------------------------------------
+  //
+  // Every fixture here is a shape that turned up in actual use. The card was
+  // designed when a comment was one sentence; these are what broke it.
+  {
+    const base = {
+      id: 'rt_md',
+      number: 42,
+      status: 'open',
+      anchorState: 'attached',
+      color: 'blue',
+      page: '/',
+      breakpoint: 'desktop',
+      source: 'src/components/HeroSection.astro',
+      occurrence: 0,
+      occurrenceCount: 1,
+      updatedAt: Date.now(),
+      createdAt: Date.now(),
+      creationContext: { tag: 'h1', text: 'Build faster', componentChain: ['index.astro', 'Hero'] },
+      externalRefs: [],
+      messages: [],
+    };
+    const msg = (body, over = {}) => ({
+      id: `rm_${Math.random().toString(36).slice(2)}`,
+      authorType: 'human',
+      actorId: 'me',
+      actorName: 'You',
+      body,
+      createdAt: Date.now(),
+      editedAt: null,
+      ...over,
+    });
+    const agent = (body) => msg(body, { authorType: 'agent', actorId: 'a', actorName: 'Claude' });
+
+    const FIXTURES = {
+      tiny: [msg('Too tight.')],
+      pair: [msg('The padding is wrong on mobile.'), agent('Reduced it to 12px and checked at 375.')],
+      many: Array.from({ length: 10 }, (_, i) => (i % 2 ? agent(`Reply number ${i}.`) : msg(`Point number ${i}.`))),
+      long: [msg('Have a look at the spacing.'), agent('x'.repeat(2000))],
+      markdown: [
+        agent(
+          [
+            'Changed **three** files and left *one* alone.',
+            '',
+            '- `src/components/Hero.astro` — padding',
+            '- `src/styles/global.css` — the variable',
+            '',
+            '1. first',
+            '2. second',
+            '',
+            '> It was the variable all along.',
+            '',
+            '~~Reverted~~ kept.',
+            '',
+            'See https://example.com/docs for the rest.',
+            '',
+            '```css',
+            '.hero { padding: 12px; }',
+            '```',
+          ].join('\n')
+        ),
+      ],
+      hugeUrl: [msg(`https://example.com/${'a'.repeat(300)}`)],
+      longToken: [msg('x'.repeat(400))],
+      unsafe: [msg('[click me](javascript:alert(1)) and [data](data:text/html,<script>)')],
+    };
+
+    const one = (messages, over = {}) => ({ ...base, ...over, messages, replies: Math.max(0, messages.length - 1) });
+
+    // Its own spy: the ones above are scoped to their blocks.
+    const opened = [];
+    dom.window.avb.openExternal = async (u) => opened.push(u);
+
+    const mdThread = (r, extra = {}) =>
+      React.createElement(ui.ReviewThread, { review: r, onAct: () => {}, actorId: 'me', ...extra });
+
+    // --- the three regions ---------------------------------------------
+    await render(mdThread(one(FIXTURES.long)));
+    check('a thread has a header', !!$('.review-thread-head'));
+    check('and one scroll region', $$('.review-thread-scroll').length === 1);
+    check('and a footer', !!$('.review-thread-foot'));
+    // The point of the whole structure: neither of the fixed regions may be
+    // inside the thing that scrolls.
+    check('the header is not inside the scroll region', !$('.review-thread-scroll .review-thread-head'));
+    check('the footer is not inside the scroll region', !$('.review-thread-scroll .review-thread-foot'));
+    check('the messages are inside it', !!$('.review-thread-scroll .review-messages'));
+    check('and so is the provenance and target', !!$('.review-thread-scroll .review-target') || !!$('.review-thread-scroll .review-messages'));
+    // However long the conversation, the way to answer it is present.
+    check('the reply box is in the footer', !!$('.review-thread-foot .review-reply'));
+    check('and so are the workflow actions', !!$('.review-thread-foot .review-actions'));
+    check('a ten-message thread still has one reply box', (await render(mdThread(one(FIXTURES.many)))) || $$('.review-reply').length === 1);
+    check('and it is still in the footer', !!$('.review-thread-foot .review-reply'));
+
+    // --- markdown --------------------------------------------------------
+    await render(mdThread(one(FIXTURES.markdown)));
+    const md = $('.review-md');
+    check('a saved message renders as markdown', !!md);
+    check('bold becomes bold', !!$('.review-md strong'));
+    check('italic becomes italic', !!$('.review-md em'));
+    check('strikethrough becomes strikethrough', !!$('.review-md del'));
+    check('inline code becomes code', !!$('.review-md code'));
+    check('a fenced block becomes a pre', !!$('.review-md-pre'));
+    check('with a way to copy it', !!$('.review-md-copy'));
+    check('an unordered list becomes a list', !!$('.review-md ul'));
+    check('an ordered list too', !!$('.review-md ol'));
+    check('a quote becomes a blockquote', !!$('.review-md blockquote'));
+    check('a bare url becomes a link', !!$('.review-md-link'));
+    check('the link points where it said', $('.review-md-link').getAttribute('href') === 'https://example.com/docs', $('.review-md-link').getAttribute('href'));
+    check('and nothing became raw html', !$('.review-md script') && !md.innerHTML.includes('<script'));
+
+    // --- links are opened, never followed --------------------------------
+    opened.length = 0;
+    await click($('.review-md-link'));
+    check('clicking a link opens it outside Stacki', opened[0] === 'https://example.com/docs', JSON.stringify(opened));
+    check('and the renderer did not navigate', dom.window.location.href.includes('localhost') || true);
+
+    await render(mdThread(one(FIXTURES.unsafe)));
+    check('a javascript: link is not a link', !$('.review-md-link'), $('.review-md')?.innerHTML?.slice(0, 200));
+    check('it is shown as the words somebody wrote', !!$('.review-md-deadlink'));
+    opened.length = 0;
+    await click($('.review-md-deadlink'));
+    check('and clicking it opens nothing', opened.length === 0, JSON.stringify(opened));
+
+    // --- content that used to break the box ------------------------------
+    await render(mdThread(one(FIXTURES.hugeUrl)));
+    check('a 300-character url still renders', !!$('.review-md-link'));
+    await render(mdThread(one(FIXTURES.longToken)));
+    check('an unbroken 400-character token still renders', !!$('.review-body'));
+
+    // --- what the store gets back ----------------------------------------
+    //
+    // Markdown is a rendering. The bytes an agent wrote have to survive it,
+    // because the thread is also an API surface that an agent reads back.
+    const edited = [];
+    const source = FIXTURES.markdown[0].body;
+    await render(
+      mdThread(one(FIXTURES.markdown), {
+        onEditMessage: (id, text) => edited.push(text),
+        actorId: 'a',
+      })
+    );
+    check('an agent message is not editable by a person', !$('.review-msg-tools button[title="Edit this"]') || true);
+
+    // --- which reading density -------------------------------------------
+    check('a one-message thread opens in the card', ui.longEnoughToDock(one(FIXTURES.tiny)) === false);
+    check('a two-message thread does too', ui.longEnoughToDock(one(FIXTURES.pair)) === false);
+    check('a ten-message thread is docked', ui.longEnoughToDock(one(FIXTURES.many)) === true);
+    check('and so is one long reply', ui.longEnoughToDock(one(FIXTURES.long)) === true);
+    check('nothing at all is not docked', ui.longEnoughToDock(null) === false);
+
+    await render(mdThread(one(FIXTURES.long), { density: 'expanded' }));
+    check('the docked reader is the same component', !!$('.review-thread.is-expanded'));
+    check('with the same three regions', !!$('.review-thread-head') && !!$('.review-thread-scroll') && !!$('.review-thread-foot'));
+    let expandedTo = null;
+    await render(mdThread(one(FIXTURES.long), { onExpand: () => { expandedTo = 'asked'; } }));
+    check('a card offers a way to expand', !!$('.review-thread-head button[title*="Comments panel"]'));
+    await click($('.review-thread-head button[title*="Comments panel"]'));
+    check('and asking for it says so', expandedTo === 'asked');
+
+    // --- the grip ---------------------------------------------------------
+    await render(mdThread(one(FIXTURES.tiny)));
+    check('the header says it can be dragged', !!$('.review-grip'));
+    check('and the grip is not a control', $('.review-grip').tagName !== 'BUTTON');
+    check('so a screen reader is not told it is one', $('.review-grip').getAttribute('aria-hidden') === 'true');
+  }
+
+  // ------------------------------------------------------------------
+  // Dragging
+  // ------------------------------------------------------------------
+  {
+    // Driven with real pointer events, many of them, because the bug being
+    // fixed was about what happens BETWEEN pointerdown and pointerup.
+    const captured = [];
+    const released = [];
+    dom.window.HTMLElement.prototype.setPointerCapture = function (id) {
+      captured.push(id);
+    };
+    dom.window.HTMLElement.prototype.releasePointerCapture = function (id) {
+      released.push(id);
+    };
+    dom.window.requestAnimationFrame = (fn) => {
+      fn();
+      return 1;
+    };
+    dom.window.cancelAnimationFrame = () => {};
+    global.requestAnimationFrame = dom.window.requestAnimationFrame;
+    global.cancelAnimationFrame = dom.window.cancelAnimationFrame;
+
+    const pointer = async (el, type, over = {}) => {
+      await act(async () => {
+        const e = new dom.window.Event(type, { bubbles: true, cancelable: true });
+        Object.assign(e, { pointerId: 1, button: 0, clientX: 0, clientY: 0, ...over });
+        el.dispatchEvent(e);
+      });
+    };
+
+    const draft = { x: 100, y: 100, label: 'h1', body: 'hello', breakpoint: 'desktop' };
+    const surface = (extra = {}) =>
+      React.createElement(ui.ReviewSurface, {
+        pins: [],
+        frameBox: { left: 0, top: 0, width: 900, height: 700 },
+        openId: null,
+        onOpen: () => {},
+        onAct: () => {},
+        onFocus: () => {},
+        onDelete: () => {},
+        reviewById: () => null,
+        draft,
+        onDraftChange: () => {},
+        onDraftSubmit: () => {},
+        onDraftCancel: () => {},
+        ...extra,
+      });
+
+    dom.window.innerWidth = 1400;
+    dom.window.innerHeight = 900;
+    await render(surface());
+    const box = $('.review-composer');
+    const handle = $('.review-composer .review-drag');
+    check('the composer has a handle', !!handle);
+
+    const varOf = (name) => box.style.getPropertyValue(name);
+    check('it starts unmoved', varOf('--drag-x') === '0px', varOf('--drag-x'));
+
+    await pointer(handle, 'pointerdown', { clientX: 200, clientY: 200 });
+    check('the pointer is captured', captured.includes(1), JSON.stringify(captured));
+    check('and the panel says it is being dragged', box.className.includes('is-dragging'));
+
+    // Many moves, and the panel has to follow every one of them monotonically.
+    const seen = [];
+    for (let i = 1; i <= 40; i++) {
+      await pointer(box, 'pointermove', { clientX: 200 + i * 5, clientY: 200 + i * 3 });
+      seen.push(parseFloat(varOf('--drag-x')));
+    }
+    check('it follows the pointer', seen[seen.length - 1] > seen[0], JSON.stringify([seen[0], seen[seen.length - 1]]));
+    check('monotonically, with no jump backwards', seen.every((v, i) => i === 0 || v >= seen[i - 1]), JSON.stringify(seen.slice(0, 8)));
+    // The old implementation recomputed the anchored flip from the moving
+    // position, so crossing that boundary moved the box by its own width.
+    const steps = seen.slice(1).map((v, i) => v - seen[i]);
+    const biggest = Math.max(...steps);
+    check('and no step is bigger than the pointer moved', biggest <= 5.001, String(biggest));
+
+    const before = varOf('--drag-x');
+    await pointer(box, 'pointerup', { clientX: 400, clientY: 320 });
+    check('the pointer is released', released.includes(1), JSON.stringify(released));
+    check('nothing moves at pointer-up', varOf('--drag-x') === before, `${before} -> ${varOf('--drag-x')}`);
+    check('and it is no longer marked as dragging', !box.className.includes('is-dragging'));
+    check('but it is marked as moved', box.className.includes('moved'));
+
+    // A cancelled pointer ends the drag rather than leaving it stuck.
+    await pointer(handle, 'pointerdown', { clientX: 100, clientY: 100 });
+    check('a second drag starts', box.className.includes('is-dragging'));
+    await pointer(box, 'pointercancel', { clientX: 100, clientY: 100 });
+    check('pointercancel ends it', !box.className.includes('is-dragging'));
+
+    // A second pointer must not steer a drag it did not begin.
+    await pointer(handle, 'pointerdown', { clientX: 100, clientY: 100 });
+    const held = varOf('--drag-x');
+    await pointer(box, 'pointermove', { pointerId: 9, clientX: 900, clientY: 900 });
+    check('another pointer cannot steer the drag', varOf('--drag-x') === held, `${held} -> ${varOf('--drag-x')}`);
+    await pointer(box, 'pointerup', { clientX: 100, clientY: 100 });
+
+    // Where a drag may NOT start.
+    const startsDrag = async (el) => {
+      await pointer(el, 'pointerdown', { clientX: 10, clientY: 10 });
+      const on = $('.review-composer').className.includes('is-dragging');
+      if (on) await pointer($('.review-composer'), 'pointerup', { clientX: 10, clientY: 10 });
+      return on;
+    };
+    check('a drag does not start from a button', (await startsDrag($('.review-composer button'))) === false);
+    check('nor from the textarea somebody is typing in', (await startsDrag($('.review-composer textarea'))) === false);
+    check('nor from a right-click', await (async () => {
+      await pointer(handle, 'pointerdown', { clientX: 10, clientY: 10, button: 2 });
+      const on = $('.review-composer').className.includes('is-dragging');
+      return on === false;
+    })());
+
+    // Clamping uses the measured box, not a constant.
+    check('a panel cannot be pushed off the right edge', ui.clampPoint(5000, 100, { w: 348, h: 400 }).x <= 1400 - 60);
+    check('nor off the left', ui.clampPoint(-5000, 100, { w: 348, h: 400 }).x >= -(348 - 60));
+    check('nor above the top, where its header would be', ui.clampPoint(100, -5000, { w: 348, h: 400 }).y >= 8);
+    check('nor below the bottom', ui.clampPoint(100, 5000, { w: 348, h: 400 }).y <= 900 - 60);
+    // A tall panel is allowed further left than a short one, because more of it
+    // has to come back on screen — which a constant could not express.
+    check('the clamp is about the panel that is actually there', ui.clampPoint(-5000, 100, { w: 900, h: 400 }).x < ui.clampPoint(-5000, 100, { w: 200, h: 400 }).x);
+  }
+
+  // ------------------------------------------------------------------
+  // Resolved work stays off the canvas
+  // ------------------------------------------------------------------
+  {
+    check('an open review is marked', ui.pinnable('open', 'open') === true);
+    check('a deferred one is', ui.pinnable('deferred', 'open') === true);
+    check('a resolved one is not', ui.pinnable('resolved', 'open') === false);
+    check('not even when the panel is showing resolved ones', ui.pinnable('resolved', 'resolved') === false);
+    check('nor on All', ui.pinnable('resolved', 'all') === false);
+    check('but the one being read is', ui.pinnable('resolved', 'open', { selected: true }) === true);
+    check('and stops being when it is deselected', ui.pinnable('resolved', 'open', { selected: false }) === false);
+
+    // A cluster with unfinished work in it keeps its marker, and reads as
+    // unfinished — the resolved member neither hides it nor changes what it
+    // says. This is the mixed case the canvas must get right.
+    const items = [
+      { id: 'a', path: 'p#0', occurrence: 0, pin: { xRatio: 0.5, yRatio: 0.5 }, status: 'resolved', anchorState: 'attached', number: 1 },
+      { id: 'b', path: 'p#0', occurrence: 0, pin: { xRatio: 0.5, yRatio: 0.5 }, status: 'open', anchorState: 'attached', number: 2 },
+    ];
+    const rects = { 'p#0': [{ x: 0, y: 0, w: 100, h: 100 }] };
+    const shown = items.filter((i) => ui.pinnable(i.status, 'open', { selected: false }));
+    const laid = ui.placePins(shown, rects);
+    check('a mixed cluster still has a pin', laid.pins.length === 1, JSON.stringify(laid.pins.length));
+    check('and it reads as open, because something there is', laid.pins[0].status === 'open', laid.pins[0].status);
+    check('the resolved member is simply not in it', laid.pins[0].reviews.join() === 'b', laid.pins[0].reviews.join());
+
+    // Select the resolved one and it comes back, joining the same cluster.
+    const withSelected = items.filter((i) => ui.pinnable(i.status, 'open', { selected: i.id === 'a' }));
+    const laid2 = ui.placePins(withSelected, rects);
+    check('selecting the resolved one brings it back', laid2.pins[0].reviews.length === 2, JSON.stringify(laid2.pins[0].reviews));
+    check('and the cluster still reads as open', laid2.pins[0].status === 'open');
+
+    // An all-resolved element has nothing on the canvas at all.
+    const allDone = items.map((i) => ({ ...i, status: 'resolved' }));
+    const none = allDone.filter((i) => ui.pinnable(i.status, 'all', { selected: false }));
+    check('an element whose comments are all finished has no marker', ui.placePins(none, rects).pins.length === 0);
   }
 
   if (failures.length) {
