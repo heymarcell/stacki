@@ -30,6 +30,14 @@ const BOX_W = 300;
 const BOX_H = 320;
 const GAP = 14;
 
+// The panel's actual width, from .review-popover in styles.css. Used only as
+// the fallback for a clamp before the box has been measured — the measurement
+// is what normally decides, and this is a real number rather than the generous
+// estimate the flip test uses.
+const PANEL_W = 348;
+// How much of the panel has to stay on screen for it to be grabbable again.
+const KEEP = 60;
+
 /** Which way a box hanging off a point has to open to stay on screen. */
 export function placement(x, y, bounds) {
   const w = Number(bounds?.width) || 0;
@@ -52,6 +60,50 @@ const toWindow = (x, y, frameBox) => ({
 });
 
 /**
+ * The panel's real size, watched.
+ *
+ * A thread's height depends on what is in it, so a constant cannot clamp it.
+ * ResizeObserver is not available in every environment this renders in — jsdom
+ * has none — so the measurement is optional and the fallback is the stylesheet
+ * width with no vertical clamp, which is the behaviour that cannot push a
+ * panel somewhere unreachable.
+ */
+function useMeasuredSize(nodeRef, deps) {
+  const [size, setSize] = React.useState(null);
+  React.useEffect(() => {
+    const node = nodeRef.current;
+    if (!node) return undefined;
+    const read = () => {
+      const r = node.getBoundingClientRect();
+      if (r.width && r.height) setSize({ w: r.width, h: r.height });
+    };
+    read();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(read);
+    ro.observe(node);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+  return size;
+}
+
+/**
+ * Keep a panel reachable, wherever it is being put.
+ *
+ * Applies to the anchored position as much as to a dragged one: a pin near the
+ * right edge of a narrow window would otherwise open a panel whose header —
+ * and therefore its close button — is off the screen.
+ */
+export function clampPoint(x, y, size) {
+  if (typeof window === 'undefined') return { x, y };
+  const w = size?.w || PANEL_W;
+  return {
+    x: Math.min(Math.max(x, -(w - KEEP)), window.innerWidth - KEEP),
+    y: Math.min(Math.max(y, 8), Math.max(8, window.innerHeight - KEEP)),
+  };
+}
+
+/**
  * Let the panel be pushed out of the way.
  *
  * A comment about an element opens on top of that element, which is exactly
@@ -60,32 +112,139 @@ const toWindow = (x, y, frameBox) => ({
  * a marker that wandered would stop meaning anything. And the offset is
  * forgotten when the thread closes, because where somebody shoved a panel for
  * ten seconds is not a preference worth remembering.
+ *
+ * The previous version put the offset in React state and set it on every
+ * pointermove, so a whole ReviewThread — every message, every Markdown body —
+ * re-rendered per pixel of movement. Worse, the anchored flip placement kept
+ * being recomputed from the moving position, so crossing the boundary where
+ * the box would have opened on the other side made it jump the width of
+ * itself.
+ *
+ * So: the pointer is captured, one pointer owns the drag, the geometry is
+ * frozen at pointerdown, the flip decision is frozen with it, movement writes
+ * a CSS variable inside a rAF, and React hears about it exactly once at the
+ * end.
  */
 function useDragOffset(key) {
+  // The committed position. React only ever sees this — never the intermediate
+  // frames — which is what stops a thread re-rendering per pixel.
   const [offset, setOffset] = React.useState({ dx: 0, dy: 0 });
-  React.useEffect(() => setOffset({ dx: 0, dy: 0 }), [key]);
+  const [dragging, setDragging] = React.useState(false);
+  const nodeRef = React.useRef(null);
+  const live = React.useRef({ dx: 0, dy: 0 });
+
+  React.useEffect(() => {
+    setOffset({ dx: 0, dy: 0 });
+    live.current = { dx: 0, dy: 0 };
+    const node = nodeRef.current;
+    if (node) {
+      node.style.setProperty('--drag-x', '0px');
+      node.style.setProperty('--drag-y', '0px');
+    }
+  }, [key]);
+
   const start = (e) => {
-    // Not from the buttons in the header — closing and deleting are clicks.
-    if (e.target.closest('button')) return;
+    // Not from a control, and not from anything selectable. Pulling on a
+    // header is a drag; pulling across a sentence is a selection, and the two
+    // must never be the same gesture.
+    if (e.button !== 0) return;
+    if (e.target.closest('button, a, input, textarea, [data-no-drag]')) return;
+    const node = nodeRef.current;
+    if (!node) return;
+
+    // Frozen once, here. Everything below is arithmetic on numbers that cannot
+    // change while the pointer is down — no measuring a moving box, and no
+    // asking again which side of the pin to open on.
+    const rect = node.getBoundingClientRect();
+    const from = { x: e.clientX, y: e.clientY, dx: live.current.dx, dy: live.current.dy };
+    const size = { w: rect.width, h: rect.height };
+    const origin = { left: rect.left - live.current.dx, top: rect.top - live.current.dy };
+    const pointerId = e.pointerId;
+
     e.preventDefault();
-    const from = { x: e.clientX, y: e.clientY, ...offset };
-    const move = (ev) => setOffset({ dx: from.dx + ev.clientX - from.x, dy: from.dy + ev.clientY - from.y });
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+    try {
+      node.setPointerCapture(pointerId);
+    } catch {
+      /* a pointer that cannot be captured still drags; it just is not exclusive */
+    }
+    setDragging(true);
+
+    let frame = 0;
+    let pending = null;
+    const paint = () => {
+      frame = 0;
+      if (!pending) return;
+      node.style.setProperty('--drag-x', `${pending.dx}px`);
+      node.style.setProperty('--drag-y', `${pending.dy}px`);
+      live.current = pending;
     };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+
+    const move = (ev) => {
+      // One pointer owns this. A second finger or a stray device must not
+      // steer a drag it did not begin.
+      if (ev.pointerId !== pointerId) return;
+      const wanted = {
+        dx: from.dx + ev.clientX - from.x,
+        dy: from.dy + ev.clientY - from.y,
+      };
+      // Clamped against the panel's MEASURED size, so a tall thread cannot be
+      // pushed below the window and a wide one cannot be lost off the side.
+      // The old clamp used two constants that had nothing to do with the box
+      // actually on screen.
+      pending = clampToWindow(wanted, origin, size);
+      if (!frame) frame = requestAnimationFrame(paint);
+    };
+
+    const finish = (ev) => {
+      if (ev && ev.pointerId !== pointerId) return;
+      node.removeEventListener('pointermove', move);
+      node.removeEventListener('pointerup', finish);
+      node.removeEventListener('pointercancel', finish);
+      if (frame) {
+        cancelAnimationFrame(frame);
+        paint();
+      }
+      try {
+        node.releasePointerCapture(pointerId);
+      } catch {
+        /* already released, or never captured */
+      }
+      setDragging(false);
+      // The one commit. Where the variable already put it, so nothing moves
+      // at pointer-up.
+      setOffset({ ...live.current });
+    };
+
+    node.addEventListener('pointermove', move);
+    node.addEventListener('pointerup', finish);
+    node.addEventListener('pointercancel', finish);
   };
-  return [offset, start];
+
+  return { offset, start, dragging, nodeRef };
 }
 
-/** Keep a dragged panel on screen — a note shoved off the edge is a note lost. */
-function onScreen(x, y) {
-  if (typeof window === 'undefined') return { x, y };
+/**
+ * Keep a dragged panel reachable.
+ *
+ * Measured, not guessed: enough of the panel stays on screen that it can
+ * always be grabbed again, and its header can never be pushed above the top of
+ * the window where there is nothing to take hold of.
+ */
+export function clampToWindow(wanted, origin, size) {
+  if (typeof window === 'undefined') return wanted;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const KEEP = 72; // how much of the panel must remain visible
+  const left = origin.left + wanted.dx;
+  const top = origin.top + wanted.dy;
+  const minLeft = -(size.w - KEEP);
+  const maxLeft = vw - KEEP;
+  // The header must stay reachable, so the top edge never goes above 0.
+  const minTop = 0;
+  const maxTop = vh - Math.min(size.h, KEEP);
   return {
-    x: Math.min(Math.max(x, -BOX_W + 80), window.innerWidth - 60),
-    y: Math.min(Math.max(y, 8), window.innerHeight - 60),
+    dx: wanted.dx + (Math.min(Math.max(left, minLeft), maxLeft) - left),
+    dy: wanted.dy + (Math.min(Math.max(top, minTop), maxTop) - top),
   };
 }
 
@@ -165,7 +324,10 @@ export function ReviewSurface({
   const openReview = openId ? reviewById?.(openId) : null;
   // One hook, whichever panel is up, so the rules of hooks are kept while the
   // two branches below can still return early.
-  const [offset, startDrag] = useDragOffset(draft ? 'draft' : openId);
+  const { offset, start: startDrag, dragging, nodeRef } = useDragOffset(draft ? 'draft' : openId);
+  // Measured whenever the thread being shown changes, because a one-line
+  // review and a forty-message one are different shapes.
+  const measured = useMeasuredSize(nodeRef, [draft ? 'draft' : openId, openId]);
 
   if (capturing || !frameBox) return null;
 
@@ -173,16 +335,30 @@ export function ReviewSurface({
     typeof window === 'undefined'
       ? null
       : { width: window.innerWidth, height: window.innerHeight };
+  // The anchor point only. The drag offset rides in CSS variables, so moving
+  // the panel does not change any React-owned position — which is what lets a
+  // drag avoid re-rendering the thread.
   const place = (x, y) => {
-    const at = onScreen(x + offset.dx, y + offset.dy);
-    return { left: at.x, top: at.y };
+    const at = clampPoint(x, y, measured);
+    return {
+      left: at.x,
+      top: at.y,
+      // The drag offset rides in CSS variables, so moving the panel changes no
+      // React-owned position — which is what lets a drag avoid re-rendering
+      // the whole thread.
+      '--drag-x': `${offset.dx}px`,
+      '--drag-y': `${offset.dy}px`,
+    };
   };
+  const moved = offset.dx || offset.dy ? ' moved' : '';
+  const dragCls = dragging ? ' is-dragging' : '';
 
   if (draft) {
     const at = toWindow(draft.x, draft.y, frameBox);
     return (
       <div
-        className={`review-composer${sideClass(at.x, at.y, screen)}${offset.dx || offset.dy ? ' moved' : ''}`}
+        ref={nodeRef}
+        className={`review-composer${sideClass(at.x, at.y, screen)}${moved}${dragCls}`}
         style={place(at.x, at.y)}
         onClick={(e) => e.stopPropagation()}
       >
@@ -232,11 +408,12 @@ export function ReviewSurface({
   const at = toWindow(openPin.x, openPin.y, frameBox);
   return (
     <div
-      className={`review-popover${sideClass(at.x, at.y, screen)}${offset.dx || offset.dy ? ' moved' : ''}`}
+      ref={nodeRef}
+      className={`review-popover${sideClass(at.x, at.y, screen)}${moved}${dragCls}`}
       style={place(at.x, at.y)}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => {
-        // The header is the handle; everything below it is a control.
+        // The header is the handle; everything below it is words to read.
         if (e.target.closest('.review-thread-head')) startDrag(e);
       }}
     >

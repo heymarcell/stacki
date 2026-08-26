@@ -823,13 +823,22 @@ const check = (what, condition, detail) => {
     check('and a deferred one is — it still wants something', pinnable('deferred', 'open') === true);
     check('an open one stays marked while reading resolved ones', pinnable('open', 'resolved') === true);
     check('and while reading all of them', pinnable('deferred', 'all') === true);
-    // A finished review is marked when the panel is showing finished reviews,
-    // and not otherwise: the default view stays clean, and asking for Resolved
-    // actually points at where those reviews were.
+    // A finished review is never marked by the filter. After a week of work a
+    // page wears dozens of finished pins and every one of them is in the way
+    // of the ones that are not finished — so the panel is where resolved work
+    // is found, and the canvas stays about what is left to do.
     check('a resolved review does not clutter the default view', pinnable('resolved', 'open') === false);
     check('nor the deferred view', pinnable('resolved', 'deferred') === false);
-    check('but Resolved puts them back on the page', pinnable('resolved', 'resolved') === true);
-    check('and so does All', pinnable('resolved', 'all') === true);
+    check('and asking for Resolved does not put them all back on the page', pinnable('resolved', 'resolved') === false);
+    check('nor does All', pinnable('resolved', 'all') === false);
+    // With one exception, which is the moment somebody actually wants it: the
+    // review they are reading. Its marker comes back for exactly as long as it
+    // is selected, so "was this really fixed?" has somewhere to point.
+    check('the resolved review being read is marked', pinnable('resolved', 'open', { selected: true }) === true);
+    check('whatever the panel is filtered to', pinnable('resolved', 'all', { selected: true }) === true);
+    check('and stops being marked the moment it is deselected', pinnable('resolved', 'all', { selected: false }) === false);
+    // Selection changes nothing for the states that were always marked.
+    check('an open review is marked either way', pinnable('open', 'open', { selected: false }) === true);
     // Called with no filter at all it must not start marking finished work.
     check('with no filter given it is the quiet default', pinnable('resolved') === false);
   }

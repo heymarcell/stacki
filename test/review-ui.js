@@ -845,7 +845,7 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     check('the open-model lookup demands the stamp match', /modelMatchesFile\(state, open\.path\)/.test(appSource));
     check('and the anchor health check refuses to judge a mismatched pair', /if \(!modelOf\(openRel\)\) return;/.test(appSource));
     // A pin is about the PAGE, not about the file that happens to be open.
-    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status, reviewFilter\) && onReviewPage\(r\)/.test(appSource));
+    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status, reviewFilter, \{ selected: r\.id === reviewOpenId \}\) && onReviewPage\(r\)/.test(appSource));
     check('and a component\u2019s nodes are named by their own file', /markerPathFor\(keys\[keys\.length - 1\], reviewPageFile\)/.test(appSource));
     check('the canvas is asked to measure them', /reviewItems \|\| \[\]\)\.map\(\(i\) => i\?\.path\)/.test(paneSource));
     // Reading must not damage what it reads. Clicking down a list of comments
@@ -1048,11 +1048,30 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
       resolvedBy: { actorId: 'c', actorKind: 'agent', actorName: 'Claude' },
       checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: 'behind' },
     });
+    // These fixtures deliberately reuse one review id, so the strip's expanded
+    // state carries from block to block. Say what is wanted rather than
+    // depending on how many times it has been clicked already.
+    const provOpen = async () => {
+      if (!$('.review-prov-detail')) await click($('.review-prov-strip'));
+    };
+    const provShut = async () => {
+      if ($('.review-prov-detail')) await click($('.review-prov-strip'));
+    };
+
     await render(thread(behind));
-    check('a resolution this checkout lacks is called out', !!$('.review-checkout.is-behind'));
-    check('naming who resolved it', /Claude/.test($('.review-checkout').textContent));
-    check('and the revision', /def4567/.test($('.review-checkout').textContent));
-    check('and saying what that means for what is on screen', /still be the old version/.test($('.review-checkout').textContent));
+    await provShut();
+    // The strip is one line by default now. What it says at a glance has to be
+    // enough to know something is wrong, and the sentence explaining it is one
+    // click away rather than four lines of every card.
+    check('a resolution this checkout lacks is called out', !!$('.review-prov.is-behind'));
+    check('naming who resolved it, in the line', /Claude/.test($('.review-prov-line').textContent));
+    check('and the revision', /def4567/.test($('.review-prov-line').textContent));
+    check('and saying it is not in this checkout', /not in your checkout/.test($('.review-prov-line').textContent));
+    check('the meaning is not shown until asked for', !$('.review-prov-detail'));
+    await click($('.review-prov-strip'));
+    check('and saying what that means for what is on screen', /still be the old version/.test($('.review-prov-detail').textContent));
+    await click($('.review-prov-strip'));
+    check('and it folds away again', !$('.review-prov-detail'));
 
     const unproven = shared({
       status: 'resolved',
@@ -1061,24 +1080,33 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
       checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: 'unknown' },
     });
     await render(thread(unproven));
-    check('an unprovable resolution is shown as uncertainty', !!$('.review-checkout') && !$('.review-checkout.is-behind'));
-    check('saying so in as many words', /can\u2019t tell/.test($('.review-checkout').textContent), $('.review-checkout').textContent);
-    check('and adding the fact it can prove', /hasn\u2019t changed here/.test($('.review-checkout').textContent));
+    // Uncertainty is still uncertainty. It must not be quiet the way an
+    // ordinary cross-branch note is quiet, or a resolution nobody can prove
+    // would read as a settled one.
+    check('an unprovable resolution is shown as uncertainty', !!$('.review-prov.is-unproven'));
+    check('and is not dressed as an ordinary note', !$('.review-prov.is-note'));
+    check('the line says the checkout is unknown', /checkout unknown/.test($('.review-prov-line').textContent), $('.review-prov-line').textContent);
+    await provOpen();
+    check('saying so in as many words', /can\u2019t tell/.test($('.review-prov-detail').textContent), $('.review-prov-detail').textContent);
+    check('and adding the fact it can prove', /hasn\u2019t changed here/.test($('.review-prov-detail').textContent));
 
     const elsewhere = shared({
       provenance: { head: 'aaa', branch: 'feature-a', dirty: false, files: {} },
       checkout: { branch: 'main', head: 'abc1234', dirty: false, origin: { branch: 'feature-a', head: 'aaa', dirty: false }, sameBranch: false, originIn: 'behind', source: 'changed', resolution: null },
     });
     await render(thread(elsewhere, { pinned: false }));
-    check('a review from another branch says where it came from', /feature-a/.test($('.review-checkout').textContent));
-    check('and why there is no pin', /prove it is the same element/.test($('.review-checkout').textContent));
-    check('and is drawn as a warning, because something is withheld', !$('.review-checkout').classList.contains('is-note'));
+    check('a review from another branch says where it came from', /feature-a/.test($('.review-prov-line').textContent));
+    check('and says the pin was withheld', /not placed here/.test($('.review-prov-line').textContent));
+    check('and is drawn as a warning, because something is withheld', !$('.review-prov').classList.contains('is-note'));
+    await provOpen();
+    check('and why there is no pin', /prove it is the same element/.test($('.review-prov-detail').textContent));
     await render(thread(elsewhere, { pinned: true }));
-    check('and says the opposite when there is one', /found the same element/.test($('.review-checkout').textContent));
+    await provOpen();
+    check('and says the opposite when there is one', /found the same element/.test($('.review-prov-detail').textContent));
     // Context, not an alarm. In the warning colour it reads as a problem, and
     // after a merge every review from the merged branch would carry a
     // permanent yellow warning about nothing being wrong.
-    check('a review that DID pin is not dressed as a problem', $('.review-checkout').classList.contains('is-note'));
+    check('a review that DID pin is not dressed as a problem', $('.review-prov').classList.contains('is-note'));
 
     // Deleting a shared thread takes other people's words with it, on their
     // machines. Somebody agreeing to that has a right to know they are.
@@ -1103,7 +1131,7 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     }
 
     await render(thread(shared({ checkout: { branch: 'main', head: 'a', dirty: false, origin: null, sameBranch: true, originIn: null, source: 'same', resolution: null } })));
-    check('an ordinary same-tree review says nothing about checkouts', !$('.review-checkout'));
+    check('an ordinary same-tree review says nothing about checkouts', !$('.review-prov'));
   }
 
   if (failures.length) {

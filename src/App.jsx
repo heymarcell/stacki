@@ -3714,7 +3714,10 @@ export default function App() {
   // the wrong card is the one failure nobody ever notices.
   const withheldPins = new Set(allReviews.map((r) => r.id));
   const reviewItems = allReviews
-    .filter((r) => pinnable(r.status, reviewFilter) && onReviewPage(r))
+    // `selected` is what brings a resolved review's marker back — for as long
+    // as it is the one being read, and no longer. Everything else about which
+    // pins are drawn is unchanged.
+    .filter((r) => pinnable(r.status, reviewFilter, { selected: r.id === reviewOpenId }) && onReviewPage(r))
     .map((r) => {
       // Where the file IS open the resolved position is used, because that one
       // follows the node if it moved. Everywhere else the anchor's own key is

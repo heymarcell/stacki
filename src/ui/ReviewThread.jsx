@@ -1,7 +1,8 @@
 import React from 'react';
 import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
-import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon } from './Icons.jsx';
+import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, GripIcon, ExpandIcon, CollapseIcon } from './Icons.jsx';
+import ReviewMarkdown from './ReviewMarkdown.jsx';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
 
 // One review, opened.
@@ -60,64 +61,88 @@ export function authorLabel(who, actorId) {
  * here, and that "cannot tell" is said as uncertainty rather than as absence.
  */
 export function CheckoutNote({ review, pinned = true }) {
+  const [open, setOpen] = React.useState(false);
+  // Folded again whenever this is about a different review. Without it, opening
+  // the details on one thread and then clicking through to the next leaves the
+  // next one expanded — the state belongs to the note being read, not to the
+  // slot it is being read in.
+  React.useEffect(() => setOpen(false), [review?.id]);
   const note = checkoutNote(review, { pinned });
   if (!note) return null;
   const who = note.who || 'Somebody';
+
+  // One line that says what happened, and a sentence behind it that says what
+  // it means for what is on screen right now.
+  //
+  // It used to be the sentence, always, in a yellow box — three or four lines
+  // of a card that is only about fifteen lines tall, above every message, on
+  // every thread that had ever crossed a branch. The information is worth
+  // keeping and was worth far less room, so the line is the default and the
+  // explanation is a click away.
+  //
+  // Tone is the one thing here that must not drift. A resolution this checkout
+  // cannot see, and a resolution Stacki cannot prove, are both marked as
+  // unsettled — quietly, but marked — because the whole point of this note is
+  // to stop a tick being drawn over a bug somebody can still see. Only the
+  // ordinary case, where the review came from another branch and its element
+  // was found here, is allowed to be silent-coloured.
+  let tone = 'note';
+  let icon = <PinIcon size={12} />;
+  let bits = [];
+  let detail = null;
+
   if (note.kind === 'resolved-elsewhere') {
-    return (
-      <div className="review-checkout is-behind">
-        <OrphanIcon size={13} />
-        <div>
-          <strong>
-            Resolved by {who}
-            {note.commit ? ` on ${note.commit}` : ''}.
-          </strong>{' '}
-          Your checkout doesn’t include that change yet, so what you are looking at may still be the old version.
-        </div>
-      </div>
-    );
+    tone = 'behind';
+    icon = <OrphanIcon size={12} />;
+    bits = [`Resolved by ${who}`, note.commit, 'not in your checkout'];
+    detail = 'Your checkout doesn’t include that change yet, so what you are looking at may still be the old version.';
+  } else if (note.kind === 'resolved-unproven') {
+    tone = 'unproven';
+    icon = <OrphanIcon size={12} />;
+    bits = [`Resolved by ${who}`, note.commit, note.uncommitted ? 'uncommitted' : 'checkout unknown'];
+    detail = note.uncommitted
+      ? 'That was on uncommitted work, so Stacki can’t tell whether you have it.'
+      : 'Stacki can’t tell whether your checkout includes it — that commit isn’t in this repository.';
+    if (note.unchanged) detail += ' The file this was about hasn’t changed here.';
+  } else if (note.kind === 'missing-source') {
+    tone = 'behind';
+    icon = <OrphanIcon size={12} />;
+    bits = ['Not in your checkout', note.branch ? `written on ${note.branch}` : null];
+    detail = 'The file this was written about isn’t here, so there is nothing to point at.';
+  } else if (note.pinned) {
+    // Written elsewhere, found here. Worth saying — it explains a comment you
+    // do not remember writing — and not worth an alarm: drawn in the warning
+    // colour, every review from a merged branch would carry a permanent
+    // yellow warning about nothing.
+    tone = 'note';
+    icon = <PinIcon size={12} />;
+    bits = [`Written on ${note.branch || 'another branch'}`, note.here ? `you are on ${note.here}` : null];
+    detail = 'Stacki found the same element here.';
+  } else {
+    tone = 'unproven';
+    icon = <OrphanIcon size={12} />;
+    bits = [`Written on ${note.branch || 'another branch'}`, 'not placed here'];
+    detail = 'Stacki won’t place a pin from another branch unless it can prove it is the same element.';
   }
-  if (note.kind === 'resolved-unproven') {
-    return (
-      <div className="review-checkout">
-        <OrphanIcon size={13} />
-        <div>
-          <strong>Resolved by {who}{note.commit ? ` on ${note.commit}` : ''}.</strong>{' '}
-          {note.uncommitted
-            ? 'That was on uncommitted work, so Stacki can’t tell whether you have it.'
-            : 'Stacki can’t tell whether your checkout includes it — that commit isn’t in this repository.'}
-          {note.unchanged ? ' The file this was about hasn’t changed here.' : ''}
-        </div>
-      </div>
-    );
-  }
-  if (note.kind === 'missing-source') {
-    return (
-      <div className="review-checkout">
-        <OrphanIcon size={13} />
-        <div>
-          <strong>Not in your checkout.</strong> The file this was written about
-          {note.branch ? ` on ${note.branch}` : ''} isn’t here, so there is nothing to point at.
-        </div>
-      </div>
-    );
-  }
-  // Written somewhere else, and everything is fine: the element was found and
-  // the pin is on it. That is worth SAYING — it explains why a comment refers
-  // to something you do not remember writing — and it is not worth an alarm.
-  // Drawn in the warning colour it reads as a problem, and after a merge every
-  // review from the merged branch would carry a permanent yellow warning
-  // about nothing.
+
+  const line = bits.filter(Boolean).join(' · ');
   return (
-    <div className={`review-checkout${note.pinned ? ' is-note' : ''}`}>
-      {note.pinned ? <PinIcon size={13} /> : <OrphanIcon size={13} />}
-      <div>
-        <strong>Written on {note.branch || 'another branch'}</strong>
-        {note.here ? `, and you are on ${note.here}` : ''}.{' '}
-        {note.pinned
-          ? 'Stacki found the same element here.'
-          : 'Stacki won’t place a pin from another branch unless it can prove it is the same element.'}
-      </div>
+    <div className={`review-prov is-${tone}${open ? ' is-open' : ''}`}>
+      <button
+        type="button"
+        className="review-prov-strip"
+        aria-expanded={open}
+        title={detail || line}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+      >
+        <span className="review-prov-icon">{icon}</span>
+        <span className="review-prov-line">{line}</span>
+        {detail ? <span className="review-prov-more">{open ? 'Less' : 'Details'}</span> : null}
+      </button>
+      {open && detail ? <div className="review-prov-detail">{detail}</div> : null}
     </div>
   );
 }
@@ -212,6 +237,13 @@ export default function ReviewThread({
   pinned = true,
   busy = false,
   autoFocusReply = false,
+  // Which of the two reading densities this is. A pin's card is `compact`;
+  // the docked reader is `expanded` and gets more measure and no ceiling of
+  // its own — the panel it sits in is the ceiling.
+  density = 'compact',
+  // Shown only where there is somewhere to expand INTO. The popover has the
+  // Comments panel; the panel is already the expanded surface.
+  onExpand = null,
 }) {
   const [reply, setReply] = React.useState('');
   const [picking, setPicking] = React.useState(false);
@@ -248,12 +280,20 @@ export default function ReviewThread({
   ].join(' and ');
 
   return (
-    <div className="review-thread">
+    <div className={`review-thread is-${density}`}>
       {/* The two things that are ABOUT the thread rather than actions on it —
           throwing it away and closing it — live up here. Down in the action row
           they made three workflow buttons look like five, and put a delete
           next to a Resolve. */}
       <div className="review-thread-head">
+        {/* Something to take hold of. The header has been draggable all along,
+            which nobody could know by looking at it — a surface that moves
+            when you pull it has to say so. Not a button: it does nothing on
+            click, and announcing it to a screen reader as an action would be
+            a lie about what it is. */}
+        <span className="review-grip" aria-hidden="true" title="Drag to move">
+          <GripIcon size={12} />
+        </span>
         {/* The dot is also the way to recolour: it is the thing whose colour is
             being changed, so it is where somebody reaches for it. */}
         {onColor ? (
@@ -275,6 +315,18 @@ export default function ReviewThread({
             whatever an agent was asked to fix. */}
         {review.number != null && <span className="review-number">#{review.number}</span>}
         <ReviewWhere review={review} />
+        {onExpand && (
+          <button
+            className="review-x"
+            title={density === 'expanded' ? 'Show on the canvas' : 'Open in the Comments panel'}
+            onClick={(e) => {
+              e.stopPropagation();
+              onExpand();
+            }}
+          >
+            {density === 'expanded' ? <CollapseIcon size={12} /> : <ExpandIcon size={12} />}
+          </button>
+        )}
         {onDelete && canDeleteThread(review, actorId) && (
           <button
             className="review-x review-trash"
@@ -318,6 +370,15 @@ export default function ReviewThread({
         />
       )}
 
+      {/* The ONLY thing that scrolls.
+
+          The shell is `overflow: hidden` and this is the one region inside it
+          with `overflow-y: auto`, which is what keeps the header and the reply
+          box on screen through a two-thousand-word conversation. Before this,
+          the whole popover scrolled: past the first screenful the number, the
+          location, the close button and the reply box had all gone, and the
+          only way back to any of them was to scroll a wall of text. */}
+      <div className="review-thread-scroll">
       {orphaned && (
         <div className="review-orphan">
           <OrphanIcon size={13} />
@@ -469,7 +530,7 @@ export default function ReviewThread({
                   </div>
                 </form>
               ) : (
-                <div className="review-body">{m.body}</div>
+                <ReviewMarkdown text={m.body} />
               )}
             </div>
           );
@@ -498,6 +559,11 @@ export default function ReviewThread({
         </div>
       ))}
 
+      </div>
+
+      {/* Fixed. Whatever is being said above, the way to answer it and the
+          two things that can happen next are always right here. */}
+      <div className="review-thread-foot">
       {deferring ? (
         <form
           className="review-defer"
@@ -580,6 +646,7 @@ export default function ReviewThread({
           </div>
         </>
       )}
+      </div>
     </div>
   );
 }
