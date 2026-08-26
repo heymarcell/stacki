@@ -285,249 +285,259 @@ const SHOTS = [];
   await wait(900);
   await shot('01-comments-panel');
 
-  const rowCount = await js(`document.querySelectorAll('.comments-row').length`);
-  check('the panel lists the seeded comments', rowCount >= 3, String(rowCount));
-
-  // --- a short thread on the canvas ---------------------------------------
-  const openPin = async (n) =>
-    js(`(() => {
-      const pins = [...document.querySelectorAll('.review-pin')];
-      const pin = pins.find((p) => (p.textContent || '').trim().startsWith('${n}')) || pins[0];
-      if (!pin) return 'no pins';
-      pin.click();
-      return 'clicked';
-    })()`);
-
-  await openPin(tiny.review.number);
-  await wait(800);
-  await shot('02-compact-short');
-
-  const compact = await js(`(() => {
-    const el = document.querySelector('.review-popover');
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    const scroll = el.querySelectorAll('.review-thread-scroll').length;
-    return {
-      w: Math.round(r.width),
-      h: Math.round(r.height),
-      shellOverflow: getComputedStyle(el).overflowY,
-      scrollRegions: scroll,
-      headInScroll: !!el.querySelector('.review-thread-scroll .review-thread-head'),
-      footInScroll: !!el.querySelector('.review-thread-scroll .review-thread-foot'),
-      grip: !!el.querySelector('.review-grip'),
-    };
-  })()`);
-  check('the compact card opened', !!compact, JSON.stringify(compact));
-  if (compact) {
-    check('it is the width it claims', compact.w >= 330 && compact.w <= 370, String(compact.w));
-    check('a short thread stays short', compact.h < 400, String(compact.h));
-    check('the shell itself does not scroll', compact.shellOverflow === 'hidden', compact.shellOverflow);
-    check('there is exactly one scroll region', compact.scrollRegions === 1, String(compact.scrollRegions));
-    check('the header is not inside it', compact.headInScroll === false);
-    check('the footer is not inside it', compact.footInScroll === false);
-    check('and the header shows a grip', compact.grip === true);
-  }
-
-  // --- a very long agent reply --------------------------------------------
-  await js(`document.querySelector('.review-popover .review-x:last-of-type')?.click()`);
-  await wait(500);
-  // Back to the list, whatever is currently open.
-  //
-  // A thread showing in the panel REPLACES the list, so a row cannot be
-  // clicked until whatever is open has been closed — and the close button in
-  // the panel header matches the same selector as the one in the popover, so
-  // "click .review-x" was closing the wrong thing.
+  // Back to the list, whatever is open, then pick a row by what it says. The
+  // Inspector REPLACES the list, so a row cannot be clicked until whatever is
+  // open has been closed.
   const backToList = async () => {
-    await js(`(() => {
-      document.querySelector('.comments-reader .comments-back')?.click();
-      document.querySelector('.comments-open .review-x:last-of-type')?.click();
-      return true;
-    })()`);
+    await js(`document.querySelector('.review-back')?.click()`);
     await wait(500);
     return js(`document.querySelectorAll('.comments-row').length`);
   };
   const pickRow = async (pattern) => {
     await backToList();
-    return js(`(() => {
+    const clicked = await js(`(() => {
       const rows = [...document.querySelectorAll('.comments-row')];
       const row = rows.find((r) => ${pattern}.test(r.textContent || ''));
       if (!row) return 'not found';
       row.click();
       return 'clicked';
     })()`);
+    await wait(900);
+    return clicked;
   };
 
-  const rowTexts = await js(`[...document.querySelectorAll('.comments-row')].map((r) => (r.textContent || '').slice(0, 60))`);
-  say(`  rows: ${JSON.stringify(rowTexts)}`);
-  const clicked = await pickRow('/spacing on this/i');
-  check('the long thread has a row to click', clicked === 'clicked', String(clicked));
-  await wait(1400);
-  const openedWhat = await js(`(() => {
-    const el = document.querySelector('.comments-reader') || document.querySelector('.comments-open');
-    if (!el) return 'nothing open';
-    return {
-      where: el.className,
-      number: el.querySelector('.review-number')?.textContent,
-      messages: el.querySelectorAll('.review-msg').length,
-      hasMd: !!el.querySelector('.review-md'),
-      pre: el.querySelectorAll('.review-md-pre').length,
-      links: el.querySelectorAll('.review-md-link').length,
-    };
-  })()`);
-  say(`  opened: ${JSON.stringify(openedWhat)}`);
-  await shot('03-long-thread-docked');
+  const rowCount = await js(`document.querySelectorAll('.comments-row').length`);
+  check('the index lists the seeded comments', rowCount >= 3, String(rowCount));
+  check('and the index never renders a thread inside itself', (await js(`!document.querySelector('.comments-body .review-thread')`)) === true);
+  // Opening Comments must not decide for somebody which review they came for.
+  check('opening Comments selects nobody', (await js(`!document.querySelector('.comments-row.on')`)) === true);
+  check('and shows no Inspector', (await js(`!document.querySelector('.review-inspector')`)) === true);
 
-  // How wide the reading surface actually is, which is the whole point of
-  // docking. A 260px column is what the list needs; a conversation about four
-  // files needs a measure it can be read at.
-  const geometry = await js(`(() => {
-    const panel = document.querySelector('.panel.left');
-    const body = document.querySelector('.comments-reader .review-body');
-    const canvas = document.querySelector('iframe');
-    return {
-      panel: panel ? Math.round(panel.getBoundingClientRect().width) : null,
-      reading: panel ? panel.classList.contains('is-reading') : null,
-      text: body ? Math.round(body.getBoundingClientRect().width) : null,
-      canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : null,
-      vw: innerWidth,
-      docWidth: document.documentElement.scrollWidth,
-    };
+  // --- filters mean what they say ------------------------------------------
+  const filterCounts = await js(`(() => {
+    const tabs = [...document.querySelectorAll('.comments-filters .seg button')];
+    return tabs.map((t) => t.textContent.trim());
   })()`);
-  say(`  docked geometry at ${geometry?.vw}px: ${JSON.stringify(geometry)}`);
-  check('the panel is in its reading state', geometry?.reading === true, JSON.stringify(geometry));
-  check(
-    `the docked reader is materially wider than the 260px list (${geometry?.panel}px)`,
-    geometry?.panel >= 380 && geometry?.panel <= 430,
-    JSON.stringify(geometry)
-  );
-  check('the message text gets a real measure', geometry?.text >= 330, String(geometry?.text));
-  check('and the website is still meaningfully visible', geometry?.canvas >= 300, String(geometry?.canvas));
-  check('with no horizontal overflow', geometry?.docWidth <= geometry?.vw + 1, `${geometry?.docWidth} vs ${geometry?.vw}`);
+  check('the four status filters are there', filterCounts.join(',').includes('Open'), JSON.stringify(filterCounts));
 
-  const docked = await js(`(() => {
-    const el = document.querySelector('.comments-reader');
+  // --- peek -----------------------------------------------------------------
+  const hoverPin = async (n) =>
+    js(`(() => {
+      const pins = [...document.querySelectorAll('.review-pin')];
+      const pin = pins.find((p) => (p.textContent || '').trim() === String(${n})) || pins[0];
+      if (!pin) return 'no pins';
+      // React delegates enter/leave through pointerover/pointerout, so a bare
+      // pointerenter reaches nothing.
+      pin.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+      pin.dispatchEvent(new PointerEvent('pointerenter', { bubbles: true }));
+      return 'hovered';
+    })()`);
+  await hoverPin(tiny.review.number);
+  await wait(700);
+  await shot('02-peek');
+  const peek = await js(`(() => {
+    const el = document.querySelector('.review-peek');
     if (!el) return null;
-    const scroll = el.querySelector('.review-thread-scroll');
+    const r = el.getBoundingClientRect();
     return {
-      docked: true,
-      back: !!el.querySelector('.comments-back'),
-      scrollable: scroll ? scroll.scrollHeight > scroll.clientHeight : false,
-      canvasVisible: !!document.querySelector('iframe'),
+      w: Math.round(r.width),
+      pointer: getComputedStyle(el).pointerEvents,
+      buttons: el.querySelectorAll('button').length,
+      fields: el.querySelectorAll('textarea, input').length,
+      links: el.querySelectorAll('a').length,
+      role: el.getAttribute('role'),
+      lines: Math.round(el.querySelector('.review-peek-body')?.getBoundingClientRect().height || 0),
+    };
+  })()`);
+  check('hovering a pin shows a peek', !!peek, JSON.stringify(peek));
+  if (peek) {
+    check('about the right size', peek.w >= 200 && peek.w <= 280, String(peek.w));
+    check('the pointer goes through it', peek.pointer === 'none', peek.pointer);
+    check('there is nothing to press', peek.buttons === 0, String(peek.buttons));
+    check('nothing to type into', peek.fields === 0, String(peek.fields));
+    check('no links to follow', peek.links === 0, String(peek.links));
+    check('and it is a tooltip', peek.role === 'tooltip', peek.role);
+    check('bounded to about two lines', peek.lines > 0 && peek.lines <= 44, String(peek.lines));
+  }
+  await js(`document.querySelector('.review-pin')?.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }))`);
+  await wait(300);
+
+  // --- pin click goes to the Inspector -------------------------------------
+  await js(`(() => {
+    const pins = [...document.querySelectorAll('.review-pin')];
+    const pin = pins.find((p) => (p.textContent || '').trim() === String(${tiny.review.number})) || pins[0];
+    pin?.click();
+    return true;
+  })()`);
+  await wait(1200);
+  await shot('03-inspector-short');
+  const inspector = await js(`(() => {
+    const el = document.querySelector('.review-inspector');
+    if (!el) return null;
+    const scroll = el.querySelectorAll('.review-thread-scroll');
+    return {
+      w: Math.round(el.getBoundingClientRect().width),
+      role: el.tagName,
+      label: el.getAttribute('aria-label'),
+      head: !!el.querySelector('.review-thread-head'),
+      back: !!el.querySelector('.review-back'),
+      locate: !!el.querySelector('.review-locate'),
+      overflow: !!el.querySelector('.review-overflow'),
+      scrollers: scroll.length,
+      headInScroll: !!el.querySelector('.review-thread-scroll .review-thread-head'),
+      footInScroll: !!el.querySelector('.review-thread-scroll .review-thread-foot'),
+      foot: !!el.querySelector('.review-thread-foot .review-reply'),
+      resizer: !!el.querySelector('.review-resizer'),
       popover: !!document.querySelector('.review-popover'),
+      canvas: Math.round(document.querySelector('iframe')?.getBoundingClientRect().width || 0),
+      overflowX: document.documentElement.scrollWidth <= innerWidth + 1,
+    };
+  })()`);
+  check('clicking a pin opens the Inspector', !!inspector, JSON.stringify(inspector));
+  if (inspector) {
+    check('and never a floating conversation', inspector.popover === false);
+    check('it is a labelled region', inspector.role === 'SECTION' && !!inspector.label, JSON.stringify(inspector.label));
+    check('with a Back', inspector.back === true);
+    check('a Locate', inspector.locate === true);
+    check('an overflow menu', inspector.overflow === true);
+    check('exactly one conversation scroller', inspector.scrollers === 1, String(inspector.scrollers));
+    check('the header outside it', inspector.headInScroll === false);
+    check('the footer outside it', inspector.footInScroll === false);
+    check('a reply box in the footer', inspector.foot === true);
+    check('a resize divider', inspector.resizer === true);
+    check('the website still visible beside it', inspector.canvas >= 300, String(inspector.canvas));
+    check('and no horizontal overflow', inspector.overflowX === true);
+  }
+
+  // A short review and a long one land in the same place.
+  await js(`document.querySelector('.review-back')?.click()`);
+  await wait(500);
+  check('the long thread has a row', (await pickRow('/spacing on this/i')) === 'clicked');
+  await wait(1200);
+  await shot('04-inspector-long');
+  const longShape = await js(`(() => {
+    const el = document.querySelector('.review-inspector');
+    if (!el) return null;
+    const s = el.querySelector('.review-thread-scroll');
+    return {
+      same: true,
+      scrollable: s ? s.scrollHeight > s.clientHeight : false,
+      scrollers: el.querySelectorAll('.review-thread-scroll').length,
       md: !!el.querySelector('.review-md'),
       code: !!el.querySelector('.review-md-pre'),
       link: !!el.querySelector('.review-md-link'),
-      list: !!el.querySelector('.review-md ul'),
-      quote: !!el.querySelector('.review-md blockquote'),
+      w: Math.round(el.getBoundingClientRect().width),
     };
   })()`);
-  check('a long thread opens docked in the panel', !!docked && docked.docked, JSON.stringify(docked));
-  if (docked) {
-    check('with a way back to the list', docked.back === true);
-    check('its body scrolls', docked.scrollable === true);
-    check('the website is still visible beside it', docked.canvasVisible === true);
-    check('and no card is covering the design', docked.popover === false);
-    check('markdown rendered', docked.md === true);
-    check('the fenced block became a code block', docked.code === true);
-    check('the url became a link', docked.link === true);
-    check('the list became a list', docked.list === true);
-    check('and the quote a blockquote', docked.quote === true);
-  }
+  check('a long thread opens in the same Inspector', !!longShape && longShape.same);
+  check('at the same width — length routes nothing', longShape.w === inspector.w, `${inspector.w} vs ${longShape.w}`);
+  // Whether it scrolls depends on the window height, which the matrix varies
+  // deliberately; what must hold is that the region exists and is the only one.
+  check('its conversation is the one scroll region', longShape.scrollers === 1, String(longShape.scrollers));
+  check('Markdown rendered', longShape.md === true);
+  check('code blocks', longShape.code === true);
+  check('and links', longShape.link === true);
 
-  // Scrolled halfway, and at the bottom: the header and reply box must still
-  // be there in both.
+  // Header and footer survive scrolling.
+  await js(`(() => { const s = document.querySelector('.review-thread-scroll'); if (s) s.scrollTop = s.scrollHeight; return true; })()`);
+  await shot('05-inspector-bottom');
+  check('the reply box is still there at the bottom', (await js(`!!document.querySelector('.review-thread-foot .review-reply')`)) === true);
+  check('and so is the header', (await js(`!!document.querySelector('.review-thread-head')`)) === true);
+
+  // --- drafts survive switching --------------------------------------------
   await js(`(() => {
-    const s = document.querySelector('.comments-reader .review-thread-scroll');
-    if (s) s.scrollTop = Math.round((s.scrollHeight - s.clientHeight) / 2);
+    const t = document.querySelector('.review-reply textarea');
+    if (!t) return false;
+    const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    set.call(t, 'half written reply');
+    t.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
   })()`);
-  await shot('04-long-thread-half-scrolled');
-  const half = await js(`(() => {
-    const el = document.querySelector('.comments-reader');
-    if (!el) return null;
-    const head = el.querySelector('.review-thread-head').getBoundingClientRect();
-    const foot = el.querySelector('.review-thread-foot').getBoundingClientRect();
-    const box = el.getBoundingClientRect();
-    return { headVisible: head.top >= box.top - 1 && head.bottom <= box.bottom + 1, footVisible: foot.bottom <= box.bottom + 1 && foot.top >= box.top };
-  })()`);
-  check('the header is still on screen halfway down', half?.headVisible === true, JSON.stringify(half));
-  check('and so is the reply box', half?.footVisible === true, JSON.stringify(half));
+  await wait(400);
+  await js(`document.querySelector('.review-back')?.click()`);
+  await wait(400);
+  await pickRow('/too tight/i');
+  await wait(700);
+  await js(`document.querySelector('.review-back')?.click()`);
+  await wait(400);
+  await pickRow('/spacing on this/i');
+  await wait(800);
+  const kept = await js(`document.querySelector('.review-reply textarea')?.value || ''`);
+  check('an unsent reply survives going to another review and back', kept === 'half written reply', JSON.stringify(kept));
+  await shot('06-draft-preserved');
 
-  await js(`(() => {
-    const s = document.querySelector('.comments-reader .review-thread-scroll');
-    if (s) s.scrollTop = s.scrollHeight;
-    return true;
-  })()`);
-  await shot('05-long-thread-bottom');
-  const bottom = await js(`!!document.querySelector('.comments-reader .review-thread-foot .review-reply')`);
-  check('the reply box is reachable at the bottom too', bottom === true);
-
-  // --- a ten-message discussion -------------------------------------------
-  check('the ten-message thread has a row', (await pickRow('/feels crowded/i')) === 'clicked');
-  await wait(1000);
-  await shot('06-ten-messages');
-
-  // --- resolved: absent from the canvas until selected --------------------
-  await backToList();
-  await js(`(() => {
-    const tabs = [...document.querySelectorAll('.comments-filters button')];
-    const all = tabs.find((t) => t.textContent.trim() === 'All');
-    if (all) all.click();
-    return !!all;
-  })()`);
-  await wait(900);
-  const pinsWhenAll = await js(`document.querySelectorAll('.review-pin').length`);
-  await shot('07-resolved-deselected');
-
-  check('the resolved thread has a row under All', (await pickRow('/Colour was wrong/i')) === 'clicked');
-  await wait(1400);
-  const pinsWhenSelected = await js(`document.querySelectorAll('.review-pin').length`);
-  await shot('08-resolved-selected');
-  check(
-    'selecting a resolved comment brings its marker back',
-    pinsWhenSelected > pinsWhenAll,
-    `${pinsWhenAll} deselected -> ${pinsWhenSelected} selected`
-  );
-
-  // --- a narrow window -----------------------------------------------------
-  // A genuinely small window, with a long thread docked in it — the case the
-  // width has to degrade for. The minimum has to be lowered first: macOS
-  // refuses to make the window narrower than the app's own minimum, and the
-  // measurement silently became a 1024px one when it was not.
+  // --- the display matrix ---------------------------------------------------
+  //
+  // The sizes the design was validated at. Each one is measured AND
+  // photographed, because a number can be right while the thing looks wrong.
+  const MATRIX = [
+    ['mbp14-largest', 1024, 665],
+    ['mbp14-larger', 1147, 745],
+    ['mbp14-balanced', 1352, 878],
+    ['mbp14-default', 1512, 982],
+    ['mbp14-more', 1800, 1169],
+    ['mbp16-largest', 1168, 755],
+    ['mbp16-larger', 1312, 848],
+    ['mbp16-balanced', 1496, 967],
+    ['mbp16-default', 1728, 1117],
+    ['mbp16-more', 2056, 1329],
+    ['external-1080', 1920, 1080],
+  ];
   win.setMinimumSize(600, 400);
-  win.setSize(900, 700);
-  await wait(900);
-  check('the long thread has a row at this size', (await pickRow('/spacing on this/i')) === 'clicked');
-  await wait(1200);
-  await shot('09-narrow-window');
-  const narrow = await js(`(() => {
-    const el = document.querySelector('.review-popover') || document.querySelector('.comments-reader');
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top), w: Math.round(r.width), vw: innerWidth, vh: innerHeight };
-  })()`);
-  check('the reader is still fully on screen in a small window', !!narrow && narrow.left >= -1 && narrow.right <= narrow.vw + 1 && narrow.top >= -1, JSON.stringify(narrow));
-  const tight = await js(`(() => {
-    const panel = document.querySelector('.panel.left');
-    const canvas = document.querySelector('iframe');
-    return {
-      panel: panel ? Math.round(panel.getBoundingClientRect().width) : null,
-      reading: panel ? panel.classList.contains('is-reading') : null,
-      canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : null,
-      vw: innerWidth,
-      docWidth: document.documentElement.scrollWidth,
-    };
-  })()`);
-  say(`  narrow geometry at ${tight?.vw}px: ${JSON.stringify(tight)}`);
-  // On a small window the reader gives way rather than swallowing the canvas:
-  // the site this conversation is ABOUT has to stay on screen.
-  check('a narrow window constrains the reader rather than the canvas', tight?.panel <= 330, String(tight?.panel));
-  check('and the website is still there', tight?.canvas >= 150, String(tight?.canvas));
-  check('and nothing overflows sideways', tight?.docWidth <= tight?.vw + 1, `${tight?.docWidth} vs ${tight?.vw}`);
+  /**
+   * Read the geometry once it has stopped moving.
+   *
+   * A window resize is three separate things — the OS resizing the window, the
+   * renderer noticing, React re-rendering — and a fixed wait between them is a
+   * race. Waiting for two identical readings waits for the thing itself.
+   */
+  const settledGeometry = async (read) => {
+    let last = null;
+    for (let i = 0; i < 40; i++) {
+      const now = await read();
+      const key = JSON.stringify(now);
+      if (key === last) return now;
+      last = key;
+      await wait(150);
+    }
+    return JSON.parse(last);
+  };
 
-  win.setSize(1600, 1000);
-  await wait(900);
-  await shot('10-wide-window');
+  for (const [slug, w, h] of MATRIX) {
+    win.setSize(w, h);
+    await wait(250);
+    const g = await settledGeometry(() => js(`(() => {
+      const panel = document.querySelector('.panel.left');
+      const props = document.querySelector('.panel.right');
+      // The area between the panels, not the iframe: the iframe is the
+      // previewed device (a 1280px desktop, a 375px phone) and says nothing
+      // about how much room the canvas has been left.
+      const canvas = document.querySelector('.preview-frame-wrap');
+      const body = document.querySelector('.review-body');
+      return {
+        vw: innerWidth,
+        mode: panel ? (panel.classList.contains('is-overlay') ? 'overlay' : panel.classList.contains('is-inspector') ? 'docked' : 'index') : null,
+        inspector: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+        canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : 0,
+        props: props ? Math.round(props.getBoundingClientRect().width) : 0,
+        prose: body ? Math.round(body.getBoundingClientRect().width) : 0,
+        overflowX: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`));
+    say(`  ${slug.padEnd(15)} ${JSON.stringify(g)}`);
+    check(`${slug}: no horizontal overflow`, g.overflowX === false, JSON.stringify(g));
+    check(`${slug}: the Inspector is readable`, g.inspector >= 320, String(g.inspector));
+    if (g.mode === 'docked') {
+      check(`${slug}: the canvas is usable`, g.canvas >= 600, String(g.canvas));
+    }
+    if (g.mode === 'overlay') {
+      check(`${slug}: the canvas keeps its width behind the overlay`, g.canvas >= 600, String(g.canvas));
+    }
+    check(`${slug}: prose has a real measure`, g.prose === 0 || g.prose >= 280, String(g.prose));
+    await shot(`matrix-${slug}`);
+  }
+  win.setSize(1512, 982);
+  await wait(700);
 
   say('');
   say(`review-ux-visual: ${SHOTS.length} screenshots in ${OUT}`);

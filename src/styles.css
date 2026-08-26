@@ -1453,6 +1453,23 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   box-shadow: 0 0 0 1px var(--border-strong), 18px 0 44px rgba(0, 0, 0, 0.5);
 }
 
+/* Style/Settings, while the reader has its room. Closing the reader brings the
+   panel back, which is what this says and does. */
+.props-reveal {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 30;
+  padding: 4px 10px;
+  font-size: 11px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.props-reveal:hover { color: var(--text); }
+
 .review-inspector {
   position: relative;
   display: flex;
@@ -1527,11 +1544,27 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
 }
 .review-locate:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
 .review-thread-context {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   flex-shrink: 0;
-  padding: 5px 10px 7px;
-  border-bottom: 1px solid var(--border);
+  padding: 2px 10px 8px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  min-width: 0;
 }
-.review-thread-context .review-where { font-size: 10.5px; }
+.review-source-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-context-dot { opacity: 0.6; }
+/* Provenance is header furniture, not conversation: it belongs above the
+   messages and outside the region that scrolls away. */
+.review-thread > .review-prov {
+  flex-shrink: 0;
+  margin: 0 10px 8px;
+}
 /* Rare and destructive things live behind this rather than in the header. */
 .review-overflow { position: relative; flex-shrink: 0; }
 .review-menu {
@@ -6347,14 +6380,31 @@ textarea::selection {
    long one — especially when both are "You". Each gets a rule down its side in
    its author's colour, so where one ends and the next begins is a shape rather
    than a line of small grey text. */
-.review-messages { display: flex; flex-direction: column; gap: 12px; }
-.review-msg {
-  padding-left: 9px;
-  border-left: 2px solid var(--accent);
-  border-radius: 1px;
+/* A conversation, not a stack of cards.
+   The coloured rule down each message marked all of them as important and told
+   you nothing; who said it is the thing that actually differs, so that is what
+   is marked. Messages are separated by a hairline instead. */
+.review-messages { display: flex; flex-direction: column; }
+.review-msg { position: relative; padding: 7px 0 11px; }
+.review-msg + .review-msg {
+  margin-top: 10px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
-.review-msg.is-agent { border-left-color: var(--component-green); }
-.review-msg-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 3px; }
+.review-msg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.review-avatar {
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  font-size: 8px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, #5f93ff, #9b62d9);
+}
+.review-avatar.is-agent { background: linear-gradient(135deg, #30a463, #67d28c); }
 .review-author {
   font-size: 10px;
   font-weight: 700;
@@ -6362,7 +6412,8 @@ textarea::selection {
   text-transform: uppercase;
   color: var(--accent);
 }
-.review-msg.is-agent .review-author { color: var(--component-green); }
+.review-author.is-agent { color: #75d994; }
+.review-author.is-human { color: #63c5ff; }
 .review-time { font-size: 10px; color: var(--text-faint); }
 /* Said out loud, and quietly. A message that changed after somebody replied to
    it is a different thing from one nobody touched — but it is a footnote about
@@ -6528,7 +6579,7 @@ textarea::selection {
 /* The ordinary case stays quiet. */
 .review-prov.is-note .review-prov-strip { background: var(--bg-active); }
 /* Editing in place, so the words stay where they were while they change. */
-.review-msg.editing { border-left-color: var(--amber); }
+.review-msg.editing { background: rgba(255, 193, 7, 0.05); border-radius: 6px; }
 .review-edit { display: flex; flex-direction: column; gap: 6px; }
 .review-edit .review-actions { margin-top: 0; }
 
@@ -6587,9 +6638,27 @@ textarea::selection {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
 }
+/* Three marks, what it understands, and how to send — one line. */
+.review-reply-bar { display: flex; align-items: center; gap: 4px; }
+.review-reply-bar .review-md-hint { margin-right: 0; }
+.review-reply-spacer { flex: 1; }
+.review-tool {
+  min-width: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  line-height: 1.4;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.review-tool:hover { color: var(--text); background: var(--bg-hover); }
+.review-tool b, .review-tool i { font-family: var(--font); }
+/* A normal button, not a full-width bar. Sending a reply is an ordinary act. */
+.review-send { min-width: 0; padding: 4px 12px; }
 .review-defer { display: flex; flex-direction: column; gap: 6px; }
 /* One line, always. Three narrow buttons that wrap read as a broken panel,
    and the panel is only 260px wide. */

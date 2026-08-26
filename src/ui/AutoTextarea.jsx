@@ -1,10 +1,13 @@
-import React, { useLayoutEffect, useRef } from 'react';
+import React, { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 
 // Textarea that grows and shrinks to fit its content. Height tracks the
 // value on every change (and on width changes via ResizeObserver, since
 // wrapping depends on width).
-export default function AutoTextarea({ value, minRows = 2, maxRows = 0, style, ...props }) {
+function AutoTextarea({ value, minRows = 2, maxRows = 0, style, ...props }, outerRef) {
   const ref = useRef(null);
+  // The composer's formatting buttons act on the field directly, so whoever
+  // renders it needs a handle on the element rather than on this component.
+  useImperativeHandle(outerRef, () => ref.current, []);
 
   const fit = () => {
     const el = ref.current;
@@ -45,3 +48,5 @@ export default function AutoTextarea({ value, minRows = 2, maxRows = 0, style, .
     />
   );
 }
+
+export default forwardRef(AutoTextarea);

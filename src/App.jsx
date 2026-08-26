@@ -4043,7 +4043,8 @@ export default function App() {
     commentDispatch({ type: 'submitted' });
     setDraftBody('');
     setReviewTick((n) => n + 1);
-    setReviewOpenId(result.review?.id || null);
+    // What was just written is what you want to look at.
+    openReviewRef.current?.(result.review?.id || null);
   };
 
   // --- going back to one ----------------------------------------------------
@@ -4268,7 +4269,7 @@ export default function App() {
       return done('orphaned', 'moved_away');
     }
 
-    if (threadId) setReviewOpenId(threadId);
+    if (threadId) setReviewSelectedId(threadId);
     return done('attached', null);
   };
   focusReviewRef.current = focusReview;
@@ -4579,6 +4580,12 @@ export default function App() {
   /** Out of the reader, back to the list — still on the same review. */
   const backToIndex = useCallback(() => setReviewPresentation('index'), []);
 
+  // Reached from submitComment, which is declared above this. A ref rather
+  // than a reorder: moving the declaration would mean moving everything it
+  // closes over with it.
+  const openReviewRef = useRef(null);
+  openReviewRef.current = openReview;
+
   const reviewSelected = reviewSelectedId ? allReviews.find((r) => r.id === reviewSelectedId) || null : null;
 
   const reviewSelectedIdRef = useRef(reviewSelectedId);
@@ -4655,7 +4662,10 @@ export default function App() {
   // that only gets noticed by the person it happens to.
   useEffect(() => {
     commentDispatch({ type: 'context-lost' });
-    setReviewOpenId(null);
+    setReviewSelectedId(null);
+    setReviewPresentation('index');
+    setReviewPeek(null);
+    setReviewCluster(null);
   }, [reviewPageFile, project?.path]);
 
   // Drilling into a component is not leaving the page — the canvas still shows
@@ -5314,11 +5324,12 @@ export default function App() {
                 focusPath,
                 scope: editedRel ? `${editedRel}|` : '',
               });
-              // Picking something else means you are done with the comment
-              // that was open. Without this its panel stays over the canvas,
-              // swallowing the clicks that land on it — which reads as the
-              // editor having stopped selecting.
-              setReviewOpenId(null);
+              // Anything transient over the canvas goes. The Inspector is a
+              // panel and does not swallow clicks, so it stays where it is —
+              // selecting an element while reading a review about it is a
+              // perfectly reasonable thing to be doing.
+              setReviewPeek(null);
+              setReviewCluster(null);
               if (kind === 'nothing') return;
               if (kind === 'close') { closeComponent(); return; }
               if (kind === 'layout') { reveal(model && findNodeById(model.nodes, 'layout')); return; }
@@ -5428,7 +5439,22 @@ export default function App() {
           </div>
         )}
 
-        {pageState?.editable && !previewRef && (
+        {/* Style/Settings gives way before the canvas does.
+
+            It is what somebody uses to FIX the feedback they just read, so it
+            is the third thing protected, not the first — but a 300px canvas is
+            not somewhere you can work, and this can be brought back with one
+            click while a crushed canvas cannot. See src/reviewLayout.js. */}
+        {pageState?.editable && !previewRef && !reviewShape.propsVisible && (
+          <button
+            className="props-reveal"
+            title="Show Style and Settings"
+            onClick={() => setReviewPresentation('index')}
+          >
+            Style
+          </button>
+        )}
+        {pageState?.editable && !previewRef && reviewShape.propsVisible && (
           <div className="panel right">
             <div className="right-tabs">
               {rightTabInd && <span className="right-tabs-indicator" style={rightTabInd} />}

@@ -335,6 +335,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         React.createElement(ui.ReviewThread, {
           review: r,
           onAct: (action, args) => acted.push([action, args]),
+          onFocus: () => acted.push(['focus', null]),
           onFocus: () => acted.push(['focus']),
           onDelete: () => acted.push(['delete']),
           ...extra,
@@ -430,8 +431,14 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       check('no handlers, no tools', $$('.review-msg-tools').length === 0);
     }
 
-    check('what it was left on is shown', /<span>/.test($('.review-target')?.textContent || ''), $('.review-target')?.textContent);
+    // The chip survives only where it is the only description of the target
+    // there is: an orphan. Everywhere else the header names the component and
+    // Locate goes to it, so a chip repeating that is one more thing to read.
+    check('an ordinary review does not repeat its target as a chip', !$('.review-target'));
+    await render(thread(review({ anchorState: 'orphaned' })));
+    check('what an orphan was left on is still shown', /<span>/.test($('.review-target')?.textContent || ''), $('.review-target')?.textContent);
     check('including the words it had', /Learn more/.test($('.review-target')?.textContent || ''));
+    await render(thread(review()));
 
     const buttons = () => $$('.review-actions button');
     const named = (text) => buttons().find((b) => new RegExp(text, 'i').test(b.textContent));
@@ -446,10 +453,11 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     await click(named('Resolve'));
     check('resolve goes through the one action door', acted.some(([a]) => a === 'resolve'), JSON.stringify(acted));
     // Going to the element is not a decision about the review, so it is not a
-    // third verb in the row — it is the line that says where the review is.
-    check('the line that says where it is, is the way back to it', !!$('.review-target.can-go'));
+    // third verb in the row — it is Locate, in the header, beside the name of
+    // the thing it goes to.
+    check('the way back to the element is in the header', !!$('.review-thread-head .review-locate'));
     check('and it is not a button in the action row', !named('Show me'));
-    await click($('.review-target.can-go'));
+    await click($('.review-locate'));
     check('clicking it goes there', acted.some(([a]) => a === 'focus'), JSON.stringify(acted));
 
     await click(named('Defer'));
@@ -555,7 +563,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // Resolve — a header with six controls is a header nobody reads, and a bin
     // next to a Resolve is a fourth workflow verb.
     check('deleting is not in among the workflow buttons', !$$('.review-actions button').some((b) => b.classList.contains('review-trash')));
-    check('the action row holds at most two verbs', $$('.review-actions button').length <= 2, String($$('.review-actions button').length));
+    check('the action row holds at most two verbs', $$('.review-actions button:not(.review-foot-more)').length <= 2, String($$('.review-actions button:not(.review-foot-more)').length));
     const overflow = $('.review-overflow button');
     check('the header has an overflow menu', !!overflow);
     await click(overflow);
@@ -918,9 +926,12 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
 
     // Choosing a comment from the list means "show me this".
     check('opening a comment from the panel goes to it', /if \(picked && picked\.anchorState !== 'orphaned'\) void focusReviewFromUi\(picked\)/.test(appSource));
-    // And picking something else on the canvas puts the panel away, instead of
-    // leaving it over the page swallowing clicks.
-    check('selecting on the canvas closes an open thread', /setReviewOpenId\(null\);\n\s+if \(kind === 'nothing'\) return;/.test(appSource));
+    // Picking something else on the canvas dismisses whatever was floating
+    // over it. The Inspector is a panel now and does not swallow clicks, so it
+    // stays — selecting an element while reading a review about it is a
+    // perfectly reasonable thing to be doing.
+    check('selecting on the canvas dismisses the transient surfaces', /setReviewPeek\(null\);\n\s+setReviewCluster\(null\);/.test(appSource));
+    check('and leaves the Inspector where it is', !/setReviewPresentation\('index'\);\n\s+if \(kind === 'nothing'\)/.test(appSource));
     check('and every navigation goes through that wait', !/settleOnFile/.test(appSource) && /goTo\(plan\.page\.file/.test(appSource) && /goTo\(drill\.componentFile/.test(appSource));
     check('and nothing in the renderer names a review file', !/reviews\.json|userData/.test(appSource));
   }

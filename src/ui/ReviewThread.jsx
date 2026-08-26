@@ -271,6 +271,28 @@ export default function ReviewThread({
    * the four falls straight through — a handler that swallowed ⌘A or ⌘C to be
    * safe would break selecting and copying in a box people write in.
    */
+  const replyRef = React.useRef(null);
+
+  /** What the three marks in the composer bar do, without a keyboard. */
+  const applyTool = (key) => {
+    const field = replyRef.current;
+    if (!field) return;
+    const next = applyMarkdownKey(
+      { value: field.value, selectionStart: field.selectionStart, selectionEnd: field.selectionEnd },
+      { key, metaKey: true }
+    );
+    if (!next) return;
+    setReply(next.value);
+    requestAnimationFrame(() => {
+      try {
+        field.setSelectionRange(next.selectionStart, next.selectionEnd);
+        field.focus();
+      } catch {
+        /* the field went away while the frame was pending */
+      }
+    });
+  };
+
   const markdownKeys = (setter) => (e) => {
     const field = e.currentTarget;
     const next = applyMarkdownKey(
@@ -441,9 +463,24 @@ export default function ReviewThread({
       {/* Where it lives, under the title rather than beside it — the file and
           the breakpoint are context for everything below, not part of the
           name. */}
+      {/* Where it lives. The source path is what somebody acts on — the
+          page route is already implied by the canvas they are looking at. */}
       <div className="review-thread-context">
-        <ReviewWhere review={review} />
+        <span className="review-source-path">{review.source || review.page || ''}</span>
+        {review.breakpoint && <span className="review-context-dot">·</span>}
+        {review.breakpoint && <span>{review.breakpoint}</span>}
+        {review.occurrenceCount > 1 && Number.isInteger(review.occurrence) && (
+          <>
+            <span className="review-context-dot">·</span>
+            <span>
+              copy {review.occurrence + 1}/{review.occurrenceCount}
+            </span>
+          </>
+        )}
       </div>
+      {/* Provenance sits here, above the conversation and below the name,
+          because it changes how everything under it should be read. */}
+      <CheckoutNote review={review} pinned={pinned} />
 
       {picking && onColor && (
         <ReviewPalette
@@ -474,11 +511,6 @@ export default function ReviewThread({
         </div>
       )}
 
-      {/* How this stands against the source that is actually here. Above the
-          conversation, because it changes how everything below it should be
-          read — a thread that says "resolved" over code that still has the
-          bug is the one failure this feature must never produce. */}
-      <CheckoutNote review={review} pinned={pinned} />
 
       {/* What the human was looking at, kept from the moment they wrote it.
           On an orphan this is the only description of the target there is,
@@ -488,7 +520,7 @@ export default function ReviewThread({
           of workflow verbs, which is both crowded and wrong: going to the
           element is not a decision about the review, it is a fact about where
           the review is — so it belongs on the line that says where. */}
-      {(review.creationContext?.text || review.creationContext?.tag) &&
+      {orphaned && (review.creationContext?.text || review.creationContext?.tag) &&
         React.createElement(
           onFocus && !orphaned ? 'button' : 'div',
           {
@@ -521,6 +553,12 @@ export default function ReviewThread({
           return (
             <div key={m.id} className={`review-msg is-${m.authorType}${isEditing ? ' editing' : ''}`}>
               <div className="review-msg-head">
+                {/* A small initial rather than a coloured rule down the side.
+                    The rail marked every message as important; an avatar marks
+                    who said it, which is the thing that actually differs. */}
+                <span className={`review-avatar is-${m.authorType}`} aria-hidden="true">
+                  {(authorLabel(m, actorId) || '?').trim().charAt(0).toUpperCase()}
+                </span>
                 <span className={`review-author is-${m.authorType}`}>{authorLabel(m, actorId)}</span>
                 <span className="review-time">{ago(m.createdAt)}</span>
                 {/* Said out loud. A message somebody replied to and then
@@ -690,8 +728,10 @@ export default function ReviewThread({
             }}
           >
             <AutoTextarea
+              ref={replyRef}
               value={reply}
-              minRows={1}
+              minRows={2}
+              maxRows={10}
               autoFocus={autoFocusReply}
               placeholder="Reply…"
               onChange={(e) => setReply(e.target.value)}
@@ -707,22 +747,56 @@ export default function ReviewThread({
                 markdownKeys(setReply)(e);
               }}
             />
-            {reply.trim() && (
-              <>
-                {/* Said once, quietly, where somebody is already looking. A
-                    toolbar would be a row of buttons above every reply box for
-                    a syntax most people writing here already know. */}
-                <span className="review-md-hint">Markdown supported</span>
-                <button type="submit" className="primary" disabled={busy}>
+            {/* One line under the field: what it understands, and how to send.
+                Said quietly, where somebody is already looking — a formatting
+                toolbar above every reply box would be a row of buttons for a
+                syntax most people writing here already know.
+
+                The footer is deliberately small until it needs to be bigger. On
+                a 14-inch laptop a composer that starts three rows tall is a
+                third of the conversation gone before anybody types. */}
+            {/* Three marks and a reminder. Not a formatting toolbar — these
+                type the characters somebody would otherwise type, and the
+                shortcut beside them is the thing most people will use. */}
+            <div className="review-reply-bar">
+              <button type="button" className="review-tool" title="Bold (⌘B)" onMouseDown={(e) => e.preventDefault()} onClick={() => applyTool('b')}>
+                <b>B</b>
+              </button>
+              <button type="button" className="review-tool" title="Italic (⌘I)" onMouseDown={(e) => e.preventDefault()} onClick={() => applyTool('i')}>
+                <i>I</i>
+              </button>
+              <button type="button" className="review-tool" title="Code (⌘E)" onMouseDown={(e) => e.preventDefault()} onClick={() => applyTool('e')}>
+                {'</>'}
+              </button>
+              <span className="review-md-hint">Markdown</span>
+              <span className="review-reply-spacer" />
+              {reply.trim() ? (
+                <button type="submit" className="primary review-send" disabled={busy}>
                   Reply
                 </button>
-              </>
-            )}
+              ) : (
+                <span className="review-md-hint">⌘↩ to reply</span>
+              )}
+            </div>
           </form>
 
           {/* One row, and it does not wrap. Three verbs at most: where it is,
               and the two things that can happen to it next. */}
           <div className="review-actions">
+            {onDelete && canDeleteThread(review, actorId) && (
+              <button
+                type="button"
+                className="review-x review-foot-more"
+                title="More"
+                aria-haspopup="menu"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMenuOpen((v) => !v);
+                }}
+              >
+                <MoreIcon size={13} />
+              </button>
+            )}
             <span className="spacer" />
             {review.status === 'open' ? (
               <>
