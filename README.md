@@ -233,6 +233,29 @@ against the source while that file is open or when it is focused; until then it
 keeps the health it last had. Screenshots taken with `capture` never include
 pins, the composer or any other editor chrome — they are pictures of the site.
 
+### Reading them yourself
+
+**C**, then click anything on the page. A pin marks where the comment is.
+
+Pins are the spatial part and only the spatial part:
+
+- **Hover or focus a pin** for a two-line preview — enough to recognise a
+  review without opening it.
+- **Click it** to open the **Review Inspector** in the Comments panel: the
+  whole conversation, in Markdown, with the reply box and the workflow buttons
+  always in view however long the thread is.
+- **Several comments on one spot** ask which one you meant rather than opening
+  the first.
+
+Every review opens the same way, whatever it contains. The Inspector is
+resizable, and on a small window it floats over the canvas rather than
+squeezing it — the Style panel gives way first, because a crushed canvas is not
+somewhere you can work.
+
+Resolved comments keep no marker on the page. They stay in the Comments panel
+under **Resolved** or **All**, and selecting one brings its marker back for as
+long as you are looking at it.
+
 ## Sharing comments with other people
 
 **Off unless you turn it on, per project.** A project that has not been shared
