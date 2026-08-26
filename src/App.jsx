@@ -3579,6 +3579,11 @@ export default function App() {
   const [reviewFilter, setReviewFilter] = useState('open');
   const [reviewScope, setReviewScope] = useState('project');
   const [allReviews, setAllReviews] = useState([]);
+  // Read through a ref by openReview, which must not be rebuilt every time a
+  // review changes — it is handed to the preview pane, and a new identity on
+  // every keystroke in a thread would re-render the canvas with it.
+  const allReviewsRef = useRef(allReviews);
+  allReviewsRef.current = allReviews;
   const [reviewProblem, setReviewProblem] = useState(null);
   const [reviewOpenId, setReviewOpenId] = useState(null);
   // Which of the two reading densities the open thread is in.
@@ -4500,6 +4505,21 @@ export default function App() {
 
   const commentModeRef = useRef(commentMode);
   commentModeRef.current = commentMode;
+  // Opening a review, from wherever.
+  //
+  // Both doors — a pin on the canvas and a row in the panel — have to decide
+  // the reading density, and decide it the same way. Setting the id alone left
+  // whatever density the LAST thread used in place, so a short comment opened
+  // from its pin could appear docked in the panel because something long had
+  // been read before it.
+  const openReview = useCallback(
+    (id) => {
+      setReviewOpenId(id);
+      setReviewExpanded(id ? longEnoughToDock(allReviewsRef.current.find((r) => r.id === id)) : false);
+    },
+    []
+  );
+
   const reviewOpenIdRef = useRef(reviewOpenId);
   reviewOpenIdRef.current = reviewOpenId;
   const reviewExpandedRef = useRef(reviewExpanded);
@@ -4894,8 +4914,7 @@ export default function App() {
                 expanded={reviewExpanded}
                 onExpand={setReviewExpanded}
                 onOpen={(id) => {
-                  setReviewOpenId(id);
-                  setReviewExpanded(id ? longEnoughToDock(reviewRows.find((r) => r.id === id)) : false);
+                  openReview(id);
                   // Choosing a comment from the list means "show me this" —
                   // reading it and finding it are the same act. An orphan has
                   // nowhere to go, so it just opens.
@@ -5113,7 +5132,7 @@ export default function App() {
             reviewDraft={reviewDraft}
             reviewBusyId={reviewBusyId}
             reviewById={reviewById}
-            onReviewOpen={setReviewOpenId}
+            onReviewOpen={openReview}
             onReviewAct={actOnReview}
             onReviewFocus={focusReviewFromUi}
             onReviewDelete={deleteReview}
