@@ -1,0 +1,106 @@
+import React from 'react';
+import { ReviewStatusDot } from '../ui/ReviewThread.jsx';
+
+// Which review, when several are in the same place.
+//
+// The old behaviour opened the first one. That is a coin toss presented as a
+// decision: two people leaving notes on the same heading get one of them read
+// and the other silently skipped, and nothing on screen says the second exists.
+//
+// So a cluster asks. It is selection only — status, number, one line each —
+// and choosing takes you to the Inspector, which is where reviews are read.
+// There is no conversation in here, no reply box and no workflow actions,
+// because a chooser that could also resolve things is a second Inspector that
+// happens to be tiny.
+
+/** Enough to tell two reviews apart on one line. */
+const EXCERPT = 60;
+
+/**
+ * The chooser, anchored to its cluster.
+ *
+ * Placement flips near the window edges and the pointer flips with it, so the
+ * arrow keeps pointing at the marker this list belongs to — a chooser that
+ * detaches from its pin is a list of comments about nothing in particular.
+ */
+export default function ReviewCluster({ reviews, at, onPick, onClose }) {
+  const ref = React.useRef(null);
+  const [flip, setFlip] = React.useState({ x: false, y: false });
+  const [active, setActive] = React.useState(0);
+
+  React.useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node || typeof window === 'undefined') return;
+    const box = node.getBoundingClientRect();
+    setFlip({
+      x: at.x + 16 + box.width > window.innerWidth - 8,
+      y: at.y + 12 + box.height > window.innerHeight - 8,
+    });
+  }, [at.x, at.y, reviews?.length]);
+
+  React.useEffect(() => {
+    ref.current?.focus();
+  }, []);
+
+  const list = reviews || [];
+  const move = (delta) => setActive((i) => (i + delta + list.length) % list.length);
+
+  return (
+    <div
+      ref={ref}
+      className={`review-cluster${flip.x ? ' flip-x' : ''}${flip.y ? ' flip-y' : ''}`}
+      style={{ left: at.x, top: at.y }}
+      role="listbox"
+      aria-label={`${list.length} comments here`}
+      tabIndex={-1}
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          onClose?.();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          move(1);
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          move(-1);
+        }
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          const picked = list[active];
+          if (picked) onPick?.(picked.id);
+        }
+      }}
+    >
+      <div className="review-cluster-title">{list.length} comments here</div>
+      {/* Native scrolling, and only when a cluster is unusually large. Most
+          are two or three. */}
+      <div className="review-cluster-list">
+        {list.map((r, i) => (
+          <button
+            key={r.id}
+            role="option"
+            aria-selected={i === active}
+            className={`review-cluster-row${i === active ? ' on' : ''}`}
+            onMouseEnter={() => setActive(i)}
+            onClick={(e) => {
+              e.stopPropagation();
+              onPick?.(r.id);
+            }}
+          >
+            <ReviewStatusDot status={r.status} anchorState={r.anchorState} color={r.color} />
+            {r.number != null && <span className="review-cluster-n">#{r.number}</span>}
+            <span className="review-cluster-text">
+              {String(r.message || '').replace(/\s+/g, ' ').trim().slice(0, EXCERPT)}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}

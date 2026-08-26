@@ -42,10 +42,14 @@ const check = (what, condition, detail) => {
   fs.writeFileSync(
     entry,
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
-export { default as ReviewPins, ReviewSurface, clampPoint } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
+export { default as ReviewInspector } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewInspector.jsx";
+export { default as ReviewPeek, peekLabel } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewPeek.jsx";
+export { default as ReviewCluster } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewCluster.jsx";
+export { reviewLayout, clampInspector, INSPECTOR_MIN, INSPECTOR_MAX, INSPECTOR_DEFAULT } from "/Users/heymarcell/DEV/stacki/src/reviewLayout.js";
+export { default as ReviewPins, ReviewSurface, placement } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
 export { safeHref } from "/Users/heymarcell/DEV/stacki/src/ui/ReviewMarkdown.jsx";
 export { applyMarkdownKey } from "/Users/heymarcell/DEV/stacki/src/ui/markdownKeys.js";
-export { placePins, pinnable, longEnoughToDock } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
+export { placePins, pinnable } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
 export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
 export { SharedReviewsBar, SharedReviewsDialog, syncProblemText } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'SharedReviews.jsx'))};
 export { default as PreviewPane } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'PreviewPane.jsx'))};
@@ -498,20 +502,26 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('but there is nowhere to go — so nothing offers to take you there', !$('.review-target.can-go'));
     check('though it still says what the element was', /Learn more/.test($('.review-target')?.textContent || ''));
 
-    // A reply.
+    // A reply. The draft is owned by whoever shows the thread now — that is
+    // what lets it survive switching reviews — so the test owns it too.
     acted.length = 0;
-    await render(thread(review()));
+    let replyDraft = '';
+    const withReply = () =>
+      render(thread(review(), { reply: replyDraft, onReplyChange: (v) => { replyDraft = v; } }));
+    await withReply();
     await type($('.review-reply textarea'), 'Also on tablet.');
+    await withReply();
     await act(async () => {
       $('.review-reply').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
     });
     check('a reply is sent with its words', acted.some(([a, args]) => a === 'reply' && args.message === 'Also on tablet.'), JSON.stringify(acted));
-    check('and the box is emptied afterwards', $('.review-reply textarea').value === '');
+    check('and the draft is cleared afterwards', replyDraft === '', JSON.stringify(replyDraft));
     acted.length = 0;
+    await withReply();
     await act(async () => {
       $('.review-reply').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
     });
-    check('an empty reply sends nothing', acted.length === 0);
+    check('an empty reply sends nothing', acted.length === 0, JSON.stringify(acted));
 
     // Colour is the person's own filing; STATE is the shape. A marker has to
     // answer "is this done" without a legend, so the two must not share an
@@ -541,12 +551,16 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // Deleting is a person's decision and is asked about first.
     acted.length = 0;
     await render(thread(review()));
-    // Deleting sits with closing, in the header — not beside Resolve, where it
-    // read as a fourth workflow verb.
-    const bin = $('.review-thread-head .review-trash');
-    check('a person can delete their own comment', !!bin);
-    check('and it is not in among the workflow buttons', !$$('.review-actions button').some((b) => b.classList.contains('review-trash')));
+    // Deleting is behind the overflow, not in the header and not beside
+    // Resolve — a header with six controls is a header nobody reads, and a bin
+    // next to a Resolve is a fourth workflow verb.
+    check('deleting is not in among the workflow buttons', !$$('.review-actions button').some((b) => b.classList.contains('review-trash')));
     check('the action row holds at most two verbs', $$('.review-actions button').length <= 2, String($$('.review-actions button').length));
+    const overflow = $('.review-overflow button');
+    check('the header has an overflow menu', !!overflow);
+    await click(overflow);
+    const bin = [...document.querySelectorAll('.review-menu button')].find((b) => /Delete comment/.test(b.textContent));
+    check('a person can delete their own comment', !!bin);
     await click(bin);
     check('deleting asks first', /Delete this comment\?/.test(document.body.textContent), document.body.textContent.slice(0, 120));
     check('and says what is lost', /cannot be brought back/.test(document.body.textContent));
@@ -623,7 +637,10 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('a pin follows its element when the page reflows', $$('.review-pin').some((p) => p.style.top === '650px'), $$('.review-pin').map((p) => p.style.top).join());
 
     await click($('.review-pin'));
-    check('clicking a pin opens its thread', opened.length === 1 && typeof opened[0] === 'string');
+    // A pin hands back the marker, not an id: a marker can stand for several
+    // reviews, and the caller is what decides between opening one and asking
+    // which. It never picks for you.
+    check('clicking a pin hands back the marker it stands for', opened.length === 1 && Array.isArray(opened[0]?.reviews), JSON.stringify(opened[0])?.slice(0, 120));
 
     // Several reviews on one spot are one marker with a number on it.
     const stacked = [
@@ -632,12 +649,16 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     ];
     await render(pins({ items: stacked }));
     check('two comments on one spot are one pin', $$('.review-pin').length === 1);
-    check('it wears the first one\u2019s number', /^7/.test($('.review-pin').textContent), $('.review-pin').textContent);
-    check('and says how many more are under it', /\+1/.test($('.review-pin').textContent), $('.review-pin').textContent);
+    // A cluster wears its COUNT rather than one member's number: a marker
+    // reading "7" for a spot holding two reviews is a marker telling you about
+    // one of them and hiding the other.
+    check('a cluster wears how many are under it', $('.review-pin').textContent.trim() === '2', JSON.stringify($('.review-pin').textContent));
+    check('and says so to a screen reader too', /2 comments here/.test($('.review-pin').getAttribute('aria-label') || ''), $('.review-pin').getAttribute('aria-label'));
     // The count sits in a corner badge rather than in the label, so a cluster
     // is never wider than its number — #128 is a real name and has to fit.
-    check('the count is a badge, not more characters in the label', !!$('.review-pin .review-pin-more'));
-    check('so the label is only the number', $('.review-pin').firstChild.textContent === '7', JSON.stringify($('.review-pin').firstChild.textContent));
+    check('and is marked as a cluster', $('.review-pin').className.includes('many'));
+    await render(pins({ items: [items[0]] }));
+    check('a single pin wears its number', $('.review-pin').textContent.trim() === '1', JSON.stringify($('.review-pin').textContent));
 
     // Three digits is a real number once a project has been reviewed for a
     // while, and it has to read as a name rather than as a smudge.
@@ -719,6 +740,9 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     dom.window.innerWidth = 800;
     await render(pins({ frameBox: { left: 700, top: 100, width: 375, height: 800 }, draft: { x: 180, y: 300, label: 'pill', body: '' }, onDraftChange: () => {}, onDraftSubmit: () => {}, onDraftCancel: () => {} }));
     check('and never off the edge of it', parseFloat($('.review-composer').style.left) <= 740, $('.review-composer').style.left);
+    // The anchor is not moved with it: it marks the element, and an anchor
+    // dragged back on screen would be pointing at the wrong thing.
+    check('while the draft anchor stays on the point it marks', parseFloat($('.review-draft-anchor').style.left) === 880, $('.review-draft-anchor').style.left);
     await render(pins({ frameBox: null, draft: { x: 10, y: 10, label: 'pill', body: '' }, onDraftChange: () => {}, onDraftSubmit: () => {}, onDraftCancel: () => {} }));
     check('and with no frame measured yet, nothing is drawn on a guess', !$('.review-composer'));
   }
@@ -851,7 +875,12 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // the tail is a square corner and the other three are quarter-circles, so
     // dead centre reads as pushed away from the tail.
     check('and it is nudged onto the optical centre', /\.review-pin-n \{[\s\S]{0,120}transform: translate\(-0\.5px, 0\.5px\)/.test(cssSource));
-    check('while the header stays a drag handle', /\.review-popover \.review-thread-head \{ cursor: grab; user-select: none; \}/.test(cssSource));
+    // Nothing in a review is draggable any more: the pin is the spatial truth
+    // and the conversation is a panel. The only drag left is the Inspector's
+    // resize divider.
+    const reviewCss = cssSource.split('\n').filter((l) => /\.review-|\.comments-/.test(l)).join('\n');
+    check('no review surface is a drag handle any more', !/cursor: grab/.test(reviewCss), reviewCss.split('\n').filter((l) => /cursor: grab/.test(l)).join(' | '));
+    check('and the only drag left is the resize divider', /\.review-resizer \{[^}]*cursor: col-resize/s.test(cssSource));
 
     const pinsSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'), 'utf8');
     check('the marker layer takes itself out of a capture', /if \(capturing \|\| !visible\) return null;/.test(pinsSource));
@@ -874,7 +903,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('the open-model lookup demands the stamp match', /modelMatchesFile\(state, open\.path\)/.test(appSource));
     check('and the anchor health check refuses to judge a mismatched pair', /if \(!modelOf\(openRel\)\) return;/.test(appSource));
     // A pin is about the PAGE, not about the file that happens to be open.
-    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status, reviewFilter, \{ selected: r\.id === reviewOpenId \}\) && onReviewPage\(r\)/.test(appSource));
+    check('every review on the page gets a pin, not only the open file\u2019s', /pinnable\(r\.status, reviewFilter, \{ selected: r\.id === reviewSelectedId \}\) && onReviewPage\(r\)/.test(appSource));
     check('and a component\u2019s nodes are named by their own file', /markerPathFor\(keys\[keys\.length - 1\], reviewPageFile\)/.test(appSource));
     check('the canvas is asked to measure them', /reviewItems \|\| \[\]\)\.map\(\(i\) => i\?\.path\)/.test(paneSource));
     // Reading must not damage what it reads. Clicking down a list of comments
@@ -1060,6 +1089,14 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         React.createElement(ui.ConfirmHost)
       );
 
+    // These fixtures reuse one review id, so the overflow menu's open state
+    // carries from block to block. Say what is wanted rather than depending on
+    // how many times it has been clicked already.
+    const menuItem = async (label) => {
+      if (!$('.review-menu')) await click($('.review-overflow button'));
+      return [...document.querySelectorAll('.review-menu button')].find((b) => label.test(b.textContent));
+    };
+
     await render(thread(shared()));
     check('a shared thread names both people', /Alice/.test($$('.review-msg')[0].textContent) && /You/.test($$('.review-msg')[1].textContent));
     const tools = (i) => $$('.review-msg')[i].querySelectorAll('.review-msg-tools button');
@@ -1067,7 +1104,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('while your own offers both', tools(1).length === 2, String(tools(1).length));
     check('and somebody else\u2019s review cannot be deleted from here', !$('.review-trash'));
     await render(thread(shared({ author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' } })));
-    check('your own review can be', !!$('.review-trash'));
+    check('your own review can be', !!(await menuItem(/Delete comment/)));
 
     // The one that matters. A thread that says resolved over a checkout that
     // does not contain the fix must never look like a tick.
@@ -1142,7 +1179,8 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     {
       const mine = shared({ author: { actorId: 'me', actorKind: 'human', actorName: 'Bob' } });
       await render(thread(mine, { onDelete: () => {} }));
-      await click($('.review-trash'));
+      check('a deletable thread offers an overflow menu', !!$('.review-overflow button'));
+      await click(await menuItem(/Delete comment/));
       const asked = $('.modal-body')?.textContent || '';
       check('deleting a thread somebody else replied to names them', /Alice/.test(asked), asked);
       check('and says it goes for everyone', /everyone in this workspace/.test(asked), asked);
@@ -1153,7 +1191,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         messages: [{ id: 'm1', authorType: 'human', actorId: 'me', actorName: 'Bob', body: 'Only mine.', createdAt: Date.now(), editedAt: null }],
       });
       await render(thread(alone, { onDelete: () => {} }));
-      await click($('.review-trash'));
+      await click(await menuItem(/Delete comment/));
       const solo = $('.modal-body')?.textContent || '';
       check('while a thread only you wrote in asks the plain question', !/everyone in this workspace/.test(solo), solo);
       await click($$('.modal-footer button').find((b) => /Cancel/i.test(b.textContent)));
@@ -1308,27 +1346,35 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     );
     check('an agent message is not editable by a person', !$('.review-msg-tools button[title="Edit this"]') || true);
 
-    // --- which reading density -------------------------------------------
-    check('a one-message thread opens in the card', ui.longEnoughToDock(one(FIXTURES.tiny)) === false);
-    check('a two-message thread does too', ui.longEnoughToDock(one(FIXTURES.pair)) === false);
-    check('a ten-message thread is docked', ui.longEnoughToDock(one(FIXTURES.many)) === true);
-    check('and so is one long reply', ui.longEnoughToDock(one(FIXTURES.long)) === true);
-    check('nothing at all is not docked', ui.longEnoughToDock(null) === false);
+    // --- one presentation, whatever the content ---------------------------
+    //
+    // The old model chose between a card and a panel by counting messages and
+    // characters, so the same click did different things for reasons nobody
+    // could see. There is one reader now, and nothing about a thread routes it
+    // anywhere else.
+    check('nothing exports a length-based routing rule any more', ui.longEnoughToDock === undefined);
+    for (const [name, messages] of Object.entries(FIXTURES)) {
+      await render(mdThread(one(messages)));
+      check(`${name} renders in the one reader`, !!$('.review-thread'), name);
+      check(`  with a fixed header`, !!$('.review-thread-head'), name);
+      check(`  one scroll region`, $$('.review-thread-scroll').length === 1, name);
+      check(`  and a fixed footer`, !!$('.review-thread-foot'), name);
+      check(`  and no density class`, !$('.review-thread.is-compact') && !$('.review-thread.is-expanded'), name);
+    }
 
-    await render(mdThread(one(FIXTURES.long), { density: 'expanded' }));
-    check('the docked reader is the same component', !!$('.review-thread.is-expanded'));
-    check('with the same three regions', !!$('.review-thread-head') && !!$('.review-thread-scroll') && !!$('.review-thread-foot'));
-    let expandedTo = null;
-    await render(mdThread(one(FIXTURES.long), { onExpand: () => { expandedTo = 'asked'; } }));
-    check('a card offers a way to expand', !!$('.review-thread-head button[title*="Comments panel"]'));
-    await click($('.review-thread-head button[title*="Comments panel"]'));
-    check('and asking for it says so', expandedTo === 'asked');
-
-    // --- the grip ---------------------------------------------------------
+    // --- nothing here is draggable ----------------------------------------
     await render(mdThread(one(FIXTURES.tiny)));
-    check('the header says it can be dragged', !!$('.review-grip'));
-    check('and the grip is not a control', $('.review-grip').tagName !== 'BUTTON');
-    check('so a screen reader is not told it is one', $('.review-grip').getAttribute('aria-hidden') === 'true');
+    check('the header carries no drag grip', !$('.review-grip'));
+
+    // --- the Inspector header ---------------------------------------------
+    let backed = false;
+    await render(mdThread(one(FIXTURES.pair), { onBack: () => { backed = true; }, onFocus: () => {} }));
+    check('there is a way back to the index', !!$('.review-back'));
+    await click($('.review-back'));
+    check('and it says so', backed === true);
+    check('the header names the review', !!$('.review-head-title'));
+    check('and offers Locate', !!$('.review-locate'));
+    check('the file and breakpoint are context beneath it', !!$('.review-thread-context'));
   }
 
   // ------------------------------------------------------------------
@@ -1381,16 +1427,26 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // Now type into the reply box and count what gets re-rendered. The count
     // is taken from React's own work: if the memo is doing its job, the saved
     // bodies are not re-rendered at all.
+    // The draft belongs to whoever owns the Inspector now, so the test has to
+    // own it too — which is the point: it survives the thread being swapped.
+    let draft = '';
+    const withDraft = () =>
+      render(React.createElement(counted.ReviewThread, {
+        review: long, onAct: () => {}, actorId: 'me',
+        reply: draft, onReplyChange: (v) => { draft = v; },
+      }));
+    await withDraft();
     const box = $('.review-reply textarea');
     check('there is a reply box to type into', !!box);
 
     counted.counter.renders = 0;
     for (let i = 0; i < 100; i++) {
-      await type(box, 'x'.repeat(i + 1));
+      await type($('.review-reply textarea'), 'x'.repeat(i + 1));
+      await withDraft();
     }
     const whileTyping = counted.counter.renders;
 
-    check('the reply box took all hundred characters', box.value.length === 100, String(box.value.length));
+    check('the reply box took all hundred characters', draft.length === 100, String(draft.length));
     check('every saved message is still on screen', $$('.counted-md').length === 10, String($$('.counted-md').length));
     // The number is the whole test. Unmemoized this is ten messages × a
     // hundred keystrokes; memoized it is nothing at all, because not one of
@@ -1478,23 +1534,65 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
   }
 
   // ------------------------------------------------------------------
-  // Dragging
+  // Where the Inspector goes, and how wide
+  // ------------------------------------------------------------------
+  //
+  // Presentation comes from the room available, never from the conversation.
+  // These are the geometries the design prototype was validated at across ten
+  // MacBook Pro logical resolutions plus a 1920 external display.
+  {
+    const L = (vw, pref) => ui.reviewLayout({ viewportWidth: vw, preferredWidth: pref ?? 440, open: true });
+
+    const MATRIX = [
+      // 14-inch
+      [1024, 'overlay', 440, false],
+      [1147, 'docked', 440, false],
+      [1352, 'docked', 440, false],
+      [1512, 'docked', 440, true],
+      [1800, 'docked', 440, true],
+      // 16-inch
+      [1168, 'docked', 440, false],
+      [1312, 'docked', 440, false],
+      [1496, 'docked', 440, true],
+      [1728, 'docked', 440, true],
+      [2056, 'docked', 440, true],
+      // external
+      [1920, 'docked', 440, true],
+    ];
+    for (const [vw, mode, width, props] of MATRIX) {
+      const got = L(vw);
+      check(`${vw}px puts the Inspector ${mode}`, got.mode === mode, `${got.mode} ${got.width}`);
+      check(`  at ${width}px`, got.width === width, String(got.width));
+      check(`  with Style/Settings ${props ? 'visible' : 'collapsed'}`, got.propsVisible === props, String(got.propsVisible));
+      // The thing the whole priority order exists to protect.
+      check(`  and no negative canvas`, got.canvas >= 0, String(got.canvas));
+    }
+
+    // The order of what gives way. Style/Settings goes before the canvas does.
+    check('a roomy window keeps everything', L(1728).propsVisible === true);
+    check('a tighter one drops Style/Settings first', L(1312).propsVisible === false);
+    check('and still leaves a usable canvas', L(1312).canvas >= 650, String(L(1312).canvas));
+    check('a small one stops taking canvas space at all', L(1024).mode === 'overlay');
+    check('and the canvas keeps its whole width behind it', L(1024).canvas === 1024 - 44, String(L(1024).canvas));
+
+    // A wider preference is honoured where it fits and trimmed where it does not.
+    check('a 560px preference is given at 1920', L(1920, 560).width === 560, String(L(1920, 560).width));
+    check('and trimmed rather than refused when it does not fit', L(1200, 560).width < 560, String(L(1200, 560).width));
+    check('never below the readable minimum while docked', L(1200, 560).width >= 360, String(L(1200, 560).width));
+
+    check('closed means closed', ui.reviewLayout({ viewportWidth: 1512, open: false }).mode === 'closed');
+    check('a width outside the range is brought inside it', ui.clampInspector(9000) === ui.INSPECTOR_MAX && ui.clampInspector(1) === ui.INSPECTOR_MIN);
+  }
+
+  // ------------------------------------------------------------------
+  // Resizing the Inspector
   // ------------------------------------------------------------------
   {
-    // Driven with real pointer events, many of them, because the bug being
-    // fixed was about what happens BETWEEN pointerdown and pointerup.
     const captured = [];
     const released = [];
-    dom.window.HTMLElement.prototype.setPointerCapture = function (id) {
-      captured.push(id);
-    };
-    dom.window.HTMLElement.prototype.releasePointerCapture = function (id) {
-      released.push(id);
-    };
-    dom.window.requestAnimationFrame = (fn) => {
-      fn();
-      return 1;
-    };
+    dom.window.HTMLElement.prototype.setPointerCapture = function (id) { captured.push(id); };
+    dom.window.HTMLElement.prototype.releasePointerCapture = function (id) { released.push(id); };
+    dom.window.requestAnimationFrame = (fn) => { fn(); return 1; };
     dom.window.cancelAnimationFrame = () => {};
     global.requestAnimationFrame = dom.window.requestAnimationFrame;
     global.cancelAnimationFrame = dom.window.cancelAnimationFrame;
@@ -1507,95 +1605,184 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       });
     };
 
-    const draft = { x: 100, y: 100, label: 'h1', body: 'hello', breakpoint: 'desktop' };
-    const surface = (extra = {}) =>
-      React.createElement(ui.ReviewSurface, {
-        pins: [],
-        frameBox: { left: 0, top: 0, width: 900, height: 700 },
-        openId: null,
-        onOpen: () => {},
-        onAct: () => {},
-        onFocus: () => {},
-        onDelete: () => {},
-        reviewById: () => null,
-        draft,
-        onDraftChange: () => {},
-        onDraftSubmit: () => {},
-        onDraftCancel: () => {},
-        ...extra,
-      });
+    const msg = (body) => ({ id: 'm1', authorType: 'human', actorId: 'me', actorName: 'You', body, createdAt: Date.now(), editedAt: null });
+    const one = {
+      id: 'rt_resize', number: 5, status: 'open', anchorState: 'attached', color: 'blue',
+      page: '/', breakpoint: 'desktop', source: 'src/components/Hero.astro',
+      occurrence: 0, occurrenceCount: 1, updatedAt: Date.now(), createdAt: Date.now(),
+      creationContext: { tag: 'h1', text: 'Hi', componentChain: ['index.astro', 'Hero'] },
+      externalRefs: [], messages: [msg('Short.')], replies: 0,
+    };
 
-    dom.window.innerWidth = 1400;
-    dom.window.innerHeight = 900;
-    await render(surface());
-    const box = $('.review-composer');
-    const handle = $('.review-composer .review-drag');
-    check('the composer has a handle', !!handle);
+    let width = 440;
+    const renderInspector = async (extra = {}) =>
+      render(React.createElement(ui.ReviewInspector, {
+        review: one, width, onWidthChange: (w) => { width = w; }, onAct: () => {}, actorId: 'me', ...extra,
+      }));
 
-    const varOf = (name) => box.style.getPropertyValue(name);
-    check('it starts unmoved', varOf('--drag-x') === '0px', varOf('--drag-x'));
+    // jsdom lays nothing out, so a measured drag would start from zero and
+    // clamp to the minimum on the first move. The shell reports the width it
+    // was given, which is what a real layout would have done.
+    const measured = () => {
+      const el = $('.review-inspector');
+      if (el) el.getBoundingClientRect = () => ({ width, height: 600, top: 0, left: 0, right: width, bottom: 600 });
+    };
+    await renderInspector();
+    measured();
+    const shell = $('.review-inspector');
+    check('the Inspector is a region with a name', shell.tagName === 'SECTION' && !!shell.getAttribute('aria-label'));
+    const grip = $('.review-resizer');
+    check('it has a divider', !!grip);
+    check('announced as a separator', grip.getAttribute('role') === 'separator');
+    check('with its range', grip.getAttribute('aria-valuemin') === '360' && grip.getAttribute('aria-valuemax') === '560');
+    check('and where it currently is', grip.getAttribute('aria-valuenow') === '440');
+    check('reachable by keyboard', grip.getAttribute('tabindex') === '0');
 
-    await pointer(handle, 'pointerdown', { clientX: 200, clientY: 200 });
-    check('the pointer is captured', captured.includes(1), JSON.stringify(captured));
-    check('and the panel says it is being dragged', box.className.includes('is-dragging'));
-
-    // Many moves, and the panel has to follow every one of them monotonically.
+    // Dragging writes a CSS variable, not React state: the conversation inside
+    // can be two thousand words and must not re-render once per pointer pixel.
+    await pointer(grip, 'pointerdown', { clientX: 500 });
+    check('the pointer is captured', captured.includes(1));
     const seen = [];
-    for (let i = 1; i <= 40; i++) {
-      await pointer(box, 'pointermove', { clientX: 200 + i * 5, clientY: 200 + i * 3 });
-      seen.push(parseFloat(varOf('--drag-x')));
+    for (let i = 1; i <= 30; i++) {
+      await pointer(grip, 'pointermove', { clientX: 500 + i * 2 });
+      seen.push(parseFloat(shell.style.getPropertyValue('--inspector-w')));
     }
     check('it follows the pointer', seen[seen.length - 1] > seen[0], JSON.stringify([seen[0], seen[seen.length - 1]]));
-    check('monotonically, with no jump backwards', seen.every((v, i) => i === 0 || v >= seen[i - 1]), JSON.stringify(seen.slice(0, 8)));
-    // The old implementation recomputed the anchored flip from the moving
-    // position, so crossing that boundary moved the box by its own width.
-    const steps = seen.slice(1).map((v, i) => v - seen[i]);
-    const biggest = Math.max(...steps);
-    check('and no step is bigger than the pointer moved', biggest <= 5.001, String(biggest));
+    check('monotonically', seen.every((v, i) => i === 0 || v >= seen[i - 1]), JSON.stringify(seen.slice(0, 6)));
+    check('and React was not told during the drag', width === 440, String(width));
+    await pointer(grip, 'pointerup', { clientX: 560 });
+    check('the pointer is released', released.includes(1));
+    check('and the width is committed once, at the end', width === 500, String(width));
 
-    const before = varOf('--drag-x');
-    await pointer(box, 'pointerup', { clientX: 400, clientY: 320 });
-    check('the pointer is released', released.includes(1), JSON.stringify(released));
-    check('nothing moves at pointer-up', varOf('--drag-x') === before, `${before} -> ${varOf('--drag-x')}`);
-    check('and it is no longer marked as dragging', !box.className.includes('is-dragging'));
-    check('but it is marked as moved', box.className.includes('moved'));
+    // Clamped at both ends, whatever the pointer does.
+    width = 440;
+    await renderInspector();
+    measured();
+    await pointer($('.review-resizer'), 'pointerdown', { clientX: 500 });
+    await pointer($('.review-resizer'), 'pointermove', { clientX: 5000 });
+    await pointer($('.review-resizer'), 'pointerup', { clientX: 5000 });
+    check('dragged far right it stops at the maximum', width === 560, String(width));
+    await renderInspector();
+    measured();
+    await pointer($('.review-resizer'), 'pointerdown', { clientX: 500 });
+    await pointer($('.review-resizer'), 'pointermove', { clientX: -5000 });
+    await pointer($('.review-resizer'), 'pointerup', { clientX: -5000 });
+    check('and far left at the minimum', width === 360, String(width));
 
-    // A cancelled pointer ends the drag rather than leaving it stuck.
-    await pointer(handle, 'pointerdown', { clientX: 100, clientY: 100 });
-    check('a second drag starts', box.className.includes('is-dragging'));
-    await pointer(box, 'pointercancel', { clientX: 100, clientY: 100 });
-    check('pointercancel ends it', !box.className.includes('is-dragging'));
+    // Double-click is the way back to the default.
+    await act(async () => {
+      $('.review-resizer').dispatchEvent(new dom.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    });
+    check('double-clicking the divider resets it', width === 440, String(width));
 
-    // A second pointer must not steer a drag it did not begin.
-    await pointer(handle, 'pointerdown', { clientX: 100, clientY: 100 });
-    const held = varOf('--drag-x');
-    await pointer(box, 'pointermove', { pointerId: 9, clientX: 900, clientY: 900 });
-    check('another pointer cannot steer the drag', varOf('--drag-x') === held, `${held} -> ${varOf('--drag-x')}`);
-    await pointer(box, 'pointerup', { clientX: 100, clientY: 100 });
-
-    // Where a drag may NOT start.
-    const startsDrag = async (el) => {
-      await pointer(el, 'pointerdown', { clientX: 10, clientY: 10 });
-      const on = $('.review-composer').className.includes('is-dragging');
-      if (on) await pointer($('.review-composer'), 'pointerup', { clientX: 10, clientY: 10 });
-      return on;
+    // Keyboard separator semantics.
+    const key = async (k, over = {}) => {
+      await act(async () => {
+        const e = new dom.window.KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...over });
+        $('.review-resizer').dispatchEvent(e);
+      });
+      await renderInspector();
     };
-    check('a drag does not start from a button', (await startsDrag($('.review-composer button'))) === false);
-    check('nor from the textarea somebody is typing in', (await startsDrag($('.review-composer textarea'))) === false);
-    check('nor from a right-click', await (async () => {
-      await pointer(handle, 'pointerdown', { clientX: 10, clientY: 10, button: 2 });
-      const on = $('.review-composer').className.includes('is-dragging');
-      return on === false;
-    })());
+    width = 440; await renderInspector();
+    await key('ArrowRight');
+    check('an arrow key moves it', width === 450, String(width));
+    await key('ArrowLeft');
+    check('and back', width === 440, String(width));
+    await key('Home');
+    check('Home takes it to the minimum', width === 360, String(width));
+    await key('End');
+    check('End to the maximum', width === 560, String(width));
+    await key('Enter');
+    check('Enter puts it back to the default', width === 440, String(width));
 
-    // Clamping uses the measured box, not a constant.
-    check('a panel cannot be pushed off the right edge', ui.clampPoint(5000, 100, { w: 348, h: 400 }).x <= 1400 - 60);
-    check('nor off the left', ui.clampPoint(-5000, 100, { w: 348, h: 400 }).x >= -(348 - 60));
-    check('nor above the top, where its header would be', ui.clampPoint(100, -5000, { w: 348, h: 400 }).y >= 8);
-    check('nor below the bottom', ui.clampPoint(100, 5000, { w: 348, h: 400 }).y <= 900 - 60);
-    // A tall panel is allowed further left than a short one, because more of it
-    // has to come back on screen — which a constant could not express.
-    check('the clamp is about the panel that is actually there', ui.clampPoint(-5000, 100, { w: 900, h: 400 }).x < ui.clampPoint(-5000, 100, { w: 200, h: 400 }).x);
+    // In overlay mode there is nothing to take space from.
+    await render(React.createElement(ui.ReviewInspector, { review: one, width: 440, resizable: false, onWidthChange: () => {}, onAct: () => {}, actorId: 'me' }));
+    check('an overlay Inspector offers no divider', !$('.review-resizer'));
+  }
+
+  // ------------------------------------------------------------------
+  // Peek — what a pin is, without opening it
+  // ------------------------------------------------------------------
+  {
+    const review = {
+      id: 'rt_peek', number: 17, status: 'open', anchorState: 'attached', color: 'blue',
+      updatedAt: Date.now() - 72e5,
+      author: { actorId: 'c', actorKind: 'agent', actorName: 'Claude' },
+      message: 'The accent colour looks off here on dark background.',
+      messages: [
+        { id: 'a', authorType: 'agent', actorId: 'c', actorName: 'Claude', body: 'The accent colour looks off here on dark background. It should use the green from the brand tokens, which is what everything else on this page uses.', createdAt: Date.now(), editedAt: null },
+        { id: 'b', authorType: 'human', actorId: 'me', actorName: 'You', body: 'Agreed.', createdAt: Date.now(), editedAt: null },
+      ],
+    };
+    await render(React.createElement(ui.ReviewPeek, { review, at: { x: 100, y: 100 }, cluster: 0 }));
+    const peek = $('.review-peek');
+    check('a peek appears', !!peek);
+    check('it is a tooltip, not a panel', peek.getAttribute('role') === 'tooltip');
+    // The whole point: the pointer goes through it to the pin underneath. The
+    // stylesheet is not loaded in jsdom, so the rule is checked where it lives.
+    const css = fs.readFileSync(path.join(__dirname, '..', 'src', 'styles.css'), 'utf8');
+    const peekRule = css.slice(css.indexOf('.review-peek {'), css.indexOf('@keyframes review-peek-in'));
+    check('the pointer passes straight through it', /pointer-events:\s*none/.test(peekRule), peekRule.slice(0, 200));
+    check('and it is clamped to two lines', /-webkit-line-clamp:\s*2/.test(css));
+    check('there is nothing to press', $$('.review-peek button').length === 0);
+    check('nothing to type into', $$('.review-peek textarea, .review-peek input').length === 0);
+    check('and no links to follow', $$('.review-peek a').length === 0);
+    check('it does not scroll', !$('.review-peek [style*="overflow"]'));
+    check('it names the review', /#17/.test(peek.textContent));
+    check('and who said it', /Claude/i.test(peek.textContent));
+    check('and how many replies', /1 reply/.test(peek.textContent), peek.textContent);
+    check('it is hidden from screen readers, which read the pin instead', peek.getAttribute('aria-hidden') === 'true');
+
+    // The pin's accessible name carries the same words, where focus actually is.
+    const label = ui.peekLabel(review, 0);
+    check('the pin gets an accessible description', /#17/.test(label) && /Claude/.test(label), label);
+    check('a cluster says how many instead', ui.peekLabel(null, 3) === '3 comments here');
+
+    await render(React.createElement(ui.ReviewPeek, { review: null, at: { x: 10, y: 10 }, cluster: 4 }));
+    check('a cluster peek counts rather than picking one', /4 comments here/.test($('.review-peek').textContent));
+  }
+
+  // ------------------------------------------------------------------
+  // The cluster chooser — never picking for you
+  // ------------------------------------------------------------------
+  {
+    const at = (n) => ({ id: `rt_${n}`, number: n, status: n === 28 ? 'resolved' : 'open', anchorState: 'attached', color: 'blue', message: `Comment number ${n} about this element` });
+    const list = [at(17), at(21), at(28)];
+    let picked = null;
+    let closed = false;
+    await render(React.createElement(ui.ReviewCluster, {
+      reviews: list, at: { x: 200, y: 200 },
+      onPick: (id) => { picked = id; }, onClose: () => { closed = true; },
+    }));
+    const menu = $('.review-cluster');
+    check('the chooser appears', !!menu);
+    check('as a listbox', menu.getAttribute('role') === 'listbox');
+    check('saying how many', /3 comments here/.test(menu.textContent));
+    check('with a row each', $$('.review-cluster-row').length === 3);
+    check('each naming its review', /#17/.test(menu.textContent) && /#21/.test(menu.textContent) && /#28/.test(menu.textContent));
+    // Selection only. A chooser that could also resolve things is a second
+    // Inspector that happens to be tiny.
+    check('there is no reply box in it', !$('.review-cluster textarea'));
+    check('and no workflow actions', !/Resolve|Defer|Reopen/.test(menu.textContent));
+
+    await click($$('.review-cluster-row')[1]);
+    check('choosing a row picks that review', picked === 'rt_21', String(picked));
+    check('and never silently the first one', picked !== 'rt_17');
+
+    // Keyboard.
+    picked = null;
+    await render(React.createElement(ui.ReviewCluster, { reviews: list, at: { x: 200, y: 200 }, onPick: (id) => { picked = id; }, onClose: () => { closed = true; } }));
+    const press = async (k) => {
+      await act(async () => {
+        $('.review-cluster').dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+      });
+    };
+    await press('ArrowDown');
+    await press('Enter');
+    check('arrow keys and Enter choose', picked === 'rt_21', String(picked));
+    closed = false;
+    await press('Escape');
+    check('Escape closes it', closed === true);
   }
 
   // ------------------------------------------------------------------

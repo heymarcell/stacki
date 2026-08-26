@@ -1,7 +1,7 @@
 import React from 'react';
 import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
-import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, GripIcon, ExpandIcon, CollapseIcon } from './Icons.jsx';
+import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, BackIcon, MoreIcon } from './Icons.jsx';
 import ReviewMarkdown from './ReviewMarkdown.jsx';
 import { applyMarkdownKey } from './markdownKeys.js';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
@@ -148,6 +148,20 @@ export function CheckoutNote({ review, pinned = true }) {
   );
 }
 
+/**
+ * What to call this review in the Inspector header.
+ *
+ * The innermost component it is inside, which is what somebody recognises —
+ * falling back to the file, and then to the tag, so the header is never empty.
+ */
+export function titleOf(review) {
+  const chain = review?.creationContext?.componentChain || [];
+  if (chain.length > 1) return chain[chain.length - 1];
+  const source = review?.source || null;
+  if (source) return source.split('/').pop().replace(/\.astro$/, '');
+  return review?.creationContext?.tag ? `<${review.creationContext.tag}>` : 'Comment';
+}
+
 /** Where a review is, in one line: the page, the component trail, the breakpoint. */
 export function ReviewWhere({ review, compact = false }) {
   const chain = review?.creationContext?.componentChain || [];
@@ -238,15 +252,16 @@ export default function ReviewThread({
   pinned = true,
   busy = false,
   autoFocusReply = false,
-  // Which of the two reading densities this is. A pin's card is `compact`;
-  // the docked reader is `expanded` and gets more measure and no ceiling of
-  // its own — the panel it sits in is the ceiling.
-  density = 'compact',
-  // Shown only where there is somewhere to expand INTO. The popover has the
-  // Comments panel; the panel is already the expanded surface.
-  onExpand = null,
+  // Back to the Comments index. The Inspector is a detail surface and every
+  // detail surface needs a way out that is not "close everything".
+  onBack = null,
+  // The unsent reply, held by whoever owns the Inspector rather than by this
+  // component. It has to outlive the thread being swapped underneath it:
+  // typing half a reply, going to look at another review and coming back to
+  // find it gone is the kind of loss people do not forgive an editor for.
+  reply = '',
+  onReplyChange = null,
 }) {
-  const [reply, setReply] = React.useState('');
 
   /**
    * ⌘B / ⌘I / ⌘E / ⌘K on a plain textarea.
@@ -277,6 +292,7 @@ export default function ReviewThread({
     return true;
   };
   const [picking, setPicking] = React.useState(false);
+  const [menuOpen, setMenuOpen] = React.useState(false);
   const [deferring, setDeferring] = React.useState(false);
   const [reason, setReason] = React.useState('');
   const [ref, setRef] = React.useState('');
@@ -284,14 +300,18 @@ export default function ReviewThread({
   const [editing, setEditing] = React.useState(null);
   const [draft, setDraft] = React.useState('');
 
+  const setReply = (v) => onReplyChange?.(v);
+
   React.useEffect(() => {
-    setReply('');
     setPicking(false);
+    setMenuOpen(false);
     setDeferring(false);
     setReason('');
     setRef('');
     setEditing(null);
     setDraft('');
+    // Deliberately NOT clearing `reply`: it belongs to the review, not to this
+    // slot, and the owner keeps one per thread.
   }, [review?.id]);
 
   if (!review) return null;
@@ -310,20 +330,23 @@ export default function ReviewThread({
   ].join(' and ');
 
   return (
-    <div className={`review-thread is-${density}`}>
-      {/* The two things that are ABOUT the thread rather than actions on it —
-          throwing it away and closing it — live up here. Down in the action row
-          they made three workflow buttons look like five, and put a delete
-          next to a Resolve. */}
+    <div className="review-thread">
+      {/* The Inspector header.
+
+          Back, what state it is in, what it is called, what it is about, and
+          the one navigation action — going to the thing on the page. Anything
+          rarer than that is behind the overflow, because a header with six
+          controls in it is a header nobody reads.
+
+          What used to be here and is not any more: a drag grip, for a window
+          that no longer floats, and an expand toggle, for a second reading
+          density that no longer exists. */}
       <div className="review-thread-head">
-        {/* Something to take hold of. The header has been draggable all along,
-            which nobody could know by looking at it — a surface that moves
-            when you pull it has to say so. Not a button: it does nothing on
-            click, and announcing it to a screen reader as an action would be
-            a lie about what it is. */}
-        <span className="review-grip" aria-hidden="true" title="Drag to move">
-          <GripIcon size={12} />
-        </span>
+        {onBack && (
+          <button className="review-back" onClick={onBack} title="All comments" aria-label="Back to all comments">
+            <BackIcon size={13} />
+          </button>
+        )}
         {/* The dot is also the way to recolour: it is the thing whose colour is
             being changed, so it is where somebody reaches for it. */}
         {onColor ? (
@@ -344,50 +367,82 @@ export default function ReviewThread({
             name, and it is the same name on the pin, in the list and in
             whatever an agent was asked to fix. */}
         {review.number != null && <span className="review-number">#{review.number}</span>}
-        <ReviewWhere review={review} />
-        {onExpand && (
-          <button
-            className="review-x"
-            title={density === 'expanded' ? 'Show on the canvas' : 'Open in the Comments panel'}
-            onClick={(e) => {
-              e.stopPropagation();
-              onExpand();
-            }}
-          >
-            {density === 'expanded' ? <CollapseIcon size={12} /> : <ExpandIcon size={12} />}
+        <span className="review-head-title">{titleOf(review)}</span>
+        {onFocus && !orphaned && (
+          <button className="review-locate" onClick={onFocus} disabled={busy} title="Go to it on the page">
+            Locate
           </button>
         )}
-        {onDelete && canDeleteThread(review, actorId) && (
-          <button
-            className="review-x review-trash"
-            title="Delete this comment"
-            disabled={busy}
-            onClick={async () => {
-              if (
-                await confirmDialog({
-                  title: 'Delete this comment?',
-                  // On a shared thread "everything said in it" is other
-                  // people's words, on their machines, and somebody agreeing
-                  // to that has a right to know they are agreeing to it.
-                  body: othersHere
-                    ? `Everything said in it goes with it — including ${othersHere}’s — for everyone in this workspace, and it cannot be brought back. To keep the record instead, resolve it.`
-                    : 'Everything said in it goes with it, and it cannot be brought back. To keep the record instead, resolve it.',
-                  confirmLabel: 'Delete',
-                  danger: true,
-                })
-              ) {
-                onDelete();
-              }
-            }}
-          >
-            <TrashIcon size={12} />
-          </button>
+        {(onDelete || onColor) && (
+          <div className="review-overflow">
+            <button
+              className="review-x"
+              title="More"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              onClick={(e) => {
+                e.stopPropagation();
+                setMenuOpen((v) => !v);
+              }}
+            >
+              <MoreIcon size={13} />
+            </button>
+            {menuOpen && (
+              <div className="review-menu" role="menu">
+                {onColor && (
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setPicking((v) => !v);
+                    }}
+                  >
+                    Colour…
+                  </button>
+                )}
+                {onDelete && canDeleteThread(review, actorId) && (
+                  <button
+                    role="menuitem"
+                    className="is-danger"
+                    disabled={busy}
+                    onClick={async () => {
+                      setMenuOpen(false);
+                      if (
+                        await confirmDialog({
+                          title: 'Delete this comment?',
+                          // On a shared thread "everything said in it" is other
+                          // people's words, on their machines, and somebody
+                          // agreeing to that has a right to know it.
+                          body: othersHere
+                            ? `Everything said in it goes with it — including ${othersHere}’s — for everyone in this workspace, and it cannot be brought back. To keep the record instead, resolve it.`
+                            : 'Everything said in it goes with it, and it cannot be brought back. To keep the record instead, resolve it.',
+                          confirmLabel: 'Delete',
+                          danger: true,
+                        })
+                      ) {
+                        onDelete();
+                      }
+                    }}
+                  >
+                    Delete comment…
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
         {onClose && (
           <button className="review-x" onClick={onClose} title="Close">
             <CloseIcon size={12} />
           </button>
         )}
+      </div>
+
+      {/* Where it lives, under the title rather than beside it — the file and
+          the breakpoint are context for everything below, not part of the
+          name. */}
+      <div className="review-thread-context">
+        <ReviewWhere review={review} />
       </div>
 
       {picking && onColor && (

@@ -143,22 +143,4 @@ export const pinnable = (status, filter = 'open', { selected = false } = {}) => 
   return !!selected;
 };
 
-/**
- * Is this thread too long to read in a card?
- *
- * Opening a forty-message conversation in a 348px bubble over the design it is
- * about, and making somebody expand it every time, is a worse default than
- * opening it where it fits. The number is deliberately generous: most comments
- * are a sentence, and a sentence should stay on the canvas next to the thing
- * it is about.
- */
-export const longEnoughToDock = (review) => {
-  if (!review) return false;
-  const messages = review.messages || [];
-  if (messages.length >= 6) return true;
-  const words = messages.reduce((n, m) => n + String(m?.body || '').length, 0);
-  // Roughly a screenful of the compact reader.
-  return words > 900;
-};
-
 export default placePins;

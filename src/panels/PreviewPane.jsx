@@ -120,11 +120,13 @@ export default function PreviewPane({
   commenting = false,
   pinsVisible = true,
   reviewItems,
-  reviewOpenId = null,
-  // True while the Comments panel is showing this thread. The pin stays — it is
-  // what says WHERE — but the card does not, because the conversation is
-  // already on screen somewhere with room for it.
-  reviewExpanded = false,
+  reviewSelectedId = null,
+  // What a pin is showing on hover or focus, and which cluster is asking.
+  reviewPeek = null,
+  reviewCluster = null,
+  onReviewPeek,
+  onReviewCluster,
+  onPickFromCluster,
   reviewDraft = null,
   reviewBusyId = null,
   reviewById,
@@ -760,23 +762,19 @@ export default function PreviewPane({
         </div>
       </div>
 
-      {/* The composer and the opened thread. Deliberately outside the frame:
+      {/* Peek, the cluster chooser and the new-comment composer. Deliberately
+          outside the frame:
           inside it they were clipped by the canvas, and at the phone
-          breakpoint a 288px panel could not fit in a 375px frame at all. */}
+          breakpoint a 375px frame cannot hold any of them. */}
       <ReviewSurface
         pins={reviewPins}
         frameBox={frameBox}
         capturing={capturing}
-        openId={reviewExpanded ? null : reviewOpenId}
-        onOpen={onReviewOpen}
-        onAct={onReviewAct}
-        onFocus={onReviewFocus}
-        onDelete={onReviewDelete}
-        onColor={onReviewColor}
-        onEditMessage={onReviewEditMessage}
-        onDeleteMessage={onReviewDeleteMessage}
+        peek={reviewPeek}
+        cluster={reviewCluster}
+        onPickFromCluster={onPickFromCluster}
+        onCloseCluster={() => onReviewCluster?.(null)}
         reviewById={reviewById}
-        busyId={reviewBusyId}
         draft={reviewDraft}
         onDraftChange={onReviewDraftChange}
         onDraftSubmit={onReviewDraftSubmit}
@@ -897,8 +895,10 @@ export default function PreviewPane({
                 pins={reviewPins}
                 visible={pinsVisible}
                 capturing={capturing}
-                openId={reviewOpenId}
+                openId={reviewSelectedId}
                 onOpen={onReviewOpen}
+                onPeek={onReviewPeek}
+                reviewById={reviewById}
               />
             </div>
             <div className="rz-handle rz-w" onPointerDown={startResize('w')} />

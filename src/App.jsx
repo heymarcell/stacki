@@ -13,7 +13,9 @@ import { buildMcpPayload } from './mcpContext.js';
 import CommentsPanel from './panels/CommentsPanel.jsx';
 import { anchorSteps, checkAnchor, markerPathFor, modelMatchesFile, peerPath, resolveNode } from './reviewAnchor.js';
 import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
-import { pinnable, longEnoughToDock } from './reviewPins.js';
+import { pinnable } from './reviewPins.js';
+import ReviewInspector from './panels/ReviewInspector.jsx';
+import { reviewLayout, clampInspector, INSPECTOR_DEFAULT } from './reviewLayout.js';
 import { mayPin } from './reviewCheckout.js';
 import {
   initialReviewMode,
@@ -3585,15 +3587,52 @@ export default function App() {
   const allReviewsRef = useRef(allReviews);
   allReviewsRef.current = allReviews;
   const [reviewProblem, setReviewProblem] = useState(null);
-  const [reviewOpenId, setReviewOpenId] = useState(null);
-  // Which of the two reading densities the open thread is in.
+  // SELECTION and PRESENTATION are two different things, and conflating them
+  // is what made the old model unpredictable.
   //
-  // A pin's card is the right shape for "the padding is wrong here". It is the
-  // wrong shape for two thousand words about four files, and making the card
-  // taller only trades one problem for another: a panel that covers the design
-  // it is about. So a long thread moves into the Comments panel, where there
-  // is room to read it and the canvas is still visible beside it.
-  const [reviewExpanded, setReviewExpanded] = useState(false);
+  // `reviewSelectedId` is which review is the current one. It survives closing
+  // the Inspector: coming back to the index leaves the row marked, the pin
+  // marked, and a resolved review's normally-hidden marker still on the page —
+  // because you are still looking at that review, you have just stopped
+  // reading it. Deselecting is a separate, deliberate act.
+  //
+  // `reviewPresentation` is where it is being shown. Only two values, and
+  // nothing about the content decides between them: 'index' is the list,
+  // 'inspector' is the reader. Which one you get depends on what you clicked,
+  // never on how long the conversation is.
+  const [reviewSelectedId, setReviewSelectedId] = useState(null);
+  const [reviewPresentation, setReviewPresentation] = useState('index');
+  // What a pin is showing on hover or focus, and which cluster is asking.
+  const [reviewPeek, setReviewPeek] = useState(null);
+  const [reviewCluster, setReviewCluster] = useState(null);
+  // One unsent reply per review, for this session only. Never written to the
+  // project, never synced, never visible to an agent — it is UI state about
+  // something somebody has not said yet.
+  const [reviewDrafts, setReviewDrafts] = useState({});
+  // How wide the reader should be, if there is room for it. A local preference:
+  // it is about this person's screen, not about the project.
+  const [inspectorWidth, setInspectorWidth] = useState(() => {
+    try {
+      return clampInspector(Number(localStorage.getItem('stacki.inspectorWidth')) || INSPECTOR_DEFAULT);
+    } catch {
+      return INSPECTOR_DEFAULT;
+    }
+  });
+  const [viewportW, setViewportW] = useState(() => (typeof window === 'undefined' ? 1440 : window.innerWidth));
+  useEffect(() => {
+    const onResize = () => setViewportW(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const saveInspectorWidth = useCallback((w) => {
+    const next = clampInspector(w);
+    setInspectorWidth(next);
+    try {
+      localStorage.setItem('stacki.inspectorWidth', String(next));
+    } catch {
+      /* a preference that cannot be stored still applies for this session */
+    }
+  }, []);
   const [reviewBusyId, setReviewBusyId] = useState(null);
   const [reviewTick, setReviewTick] = useState(0);
   // Whether these comments are shared, with whom, and how the last catch-up
@@ -3730,7 +3769,7 @@ export default function App() {
     // `selected` is what brings a resolved review's marker back — for as long
     // as it is the one being read, and no longer. Everything else about which
     // pins are drawn is unchanged.
-    .filter((r) => pinnable(r.status, reviewFilter, { selected: r.id === reviewOpenId }) && onReviewPage(r))
+    .filter((r) => pinnable(r.status, reviewFilter, { selected: r.id === reviewSelectedId }) && onReviewPage(r))
     .map((r) => {
       // Where the file IS open the resolved position is used, because that one
       // follows the node if it moved. Everywhere else the anchor's own key is
@@ -3917,7 +3956,10 @@ export default function App() {
   const deleteReview = async (id) => {
     const result = await window.avb.reviewsRemove(id);
     if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
-    if (reviewOpenId === id) setReviewOpenId(null);
+    if (reviewSelectedId === id) {
+      setReviewSelectedId(null);
+      setReviewPresentation('index');
+    }
     setReviewTick((n) => n + 1);
   };
 
@@ -4517,18 +4559,46 @@ export default function App() {
   // whatever density the LAST thread used in place, so a short comment opened
   // from its pin could appear docked in the panel because something long had
   // been read before it.
-  const openReview = useCallback(
-    (id) => {
-      setReviewOpenId(id);
-      setReviewExpanded(id ? longEnoughToDock(allReviewsRef.current.find((r) => r.id === id)) : false);
-    },
-    []
-  );
+  /**
+   * Open a review for reading.
+   *
+   * Every door into a review goes through here — a pin, a row, a choice from a
+   * cluster — and every one of them lands in the same place. Nothing about the
+   * review decides that: not its length, not its message count, not where it
+   * was clicked from. The old model chose between two surfaces by counting
+   * characters, which meant the same gesture did different things and the
+   * reason was invisible.
+   */
+  const openReview = useCallback((id) => {
+    setReviewSelectedId(id);
+    setReviewPresentation(id ? 'inspector' : 'index');
+    setReviewCluster(null);
+    setReviewPeek(null);
+  }, []);
 
-  const reviewOpenIdRef = useRef(reviewOpenId);
-  reviewOpenIdRef.current = reviewOpenId;
-  const reviewExpandedRef = useRef(reviewExpanded);
-  reviewExpandedRef.current = reviewExpanded;
+  /** Out of the reader, back to the list — still on the same review. */
+  const backToIndex = useCallback(() => setReviewPresentation('index'), []);
+
+  const reviewSelected = reviewSelectedId ? allReviews.find((r) => r.id === reviewSelectedId) || null : null;
+
+  const reviewSelectedIdRef = useRef(reviewSelectedId);
+  reviewSelectedIdRef.current = reviewSelectedId;
+  const reviewPresentationRef = useRef(reviewPresentation);
+  reviewPresentationRef.current = reviewPresentation;
+  const reviewClusterRef = useRef(reviewCluster);
+  reviewClusterRef.current = reviewCluster;
+
+  /**
+   * What the layout can afford.
+   *
+   * Recomputed from the window rather than stored, so a resized window is
+   * simply a different answer to the same question.
+   */
+  const reviewShape = reviewLayout({
+    viewportWidth: viewportW,
+    preferredWidth: inspectorWidth,
+    open: leftTab === 'comments' && reviewPresentation === 'inspector' && !!reviewSelectedId,
+  });
   const canCommentRef = useRef(false);
   canCommentRef.current = !!project && !!devUrl && !inPreview;
 
@@ -4557,15 +4627,20 @@ export default function App() {
         // One rung at a time: out of the reader, then not that element, then
         // not commenting. A thread opened from its pin closes first, since
         // that is what is in the way.
-        if (reviewExpandedRef.current && commentModeRef.current.phase === 'off') {
-          // Docked, so nothing is covering the page — the first Escape puts
-          // the conversation back on its pin rather than throwing away the
-          // place somebody had got to in it.
+        // One rung at a time, outermost first: the chooser, then the reader,
+        // then the selection itself, then comment mode. Each Escape undoes the
+        // last thing that happened rather than everything at once.
+        if (reviewClusterRef.current) {
           e.preventDefault();
-          setReviewExpanded(false);
-        } else if (reviewOpenIdRef.current && commentModeRef.current.phase === 'off') {
+          setReviewCluster(null);
+        } else if (reviewPresentationRef.current === 'inspector' && commentModeRef.current.phase === 'off') {
           e.preventDefault();
-          setReviewOpenId(null);
+          setReviewPresentation('index');
+        } else if (reviewSelectedIdRef.current && commentModeRef.current.phase === 'off') {
+          // Still selected after leaving the reader, so a second Escape is what
+          // clears it — and takes a temporarily-shown resolved marker with it.
+          e.preventDefault();
+          setReviewSelectedId(null);
         } else if (commentModeRef.current.phase !== 'off') {
           e.preventDefault();
           commentDispatch({ type: 'escape' });
@@ -4816,7 +4891,10 @@ export default function App() {
             the reading state rather than to the panel, so it goes back the
             moment somebody returns to the list. */}
         {leftTab && (
-          <div className={`panel left${leftTab === 'comments' && reviewExpanded ? ' is-reading' : ''}`}>
+          <div
+            className={`panel left${reviewShape.mode !== 'closed' ? ` is-inspector is-${reviewShape.mode}` : ''}`}
+            style={reviewShape.mode !== 'closed' ? { width: reviewShape.width } : undefined}
+          >
             {leftTab === 'pages' && (
               <PagesPanel
                 scan={scan}
@@ -4914,16 +4992,50 @@ export default function App() {
             {leftTab === 'variables' && (
               <VariablesPanel project={project} selected={varsGroup} onSelect={setVarsGroup} />
             )}
-            {leftTab === 'comments' && (
+            {/* One slot, two surfaces. The Inspector REPLACES the index
+                rather than appearing beside or inside it, so there is never a
+                list of comments wrapped around a conversation, and Back is a
+                real return rather than a collapse. */}
+            {leftTab === 'comments' && reviewPresentation === 'inspector' && reviewSelected && (
+              <ReviewInspector
+                review={reviewSelected}
+                width={reviewShape.width}
+                resizable={reviewShape.mode === 'docked'}
+                onWidthChange={saveInspectorWidth}
+                onBack={backToIndex}
+                actorId={reviewShared?.identity?.actorId || null}
+                pinned={!withheldPins?.has(reviewSelected.id)}
+                busy={reviewBusyId === reviewSelected.id}
+                reply={reviewDrafts[reviewSelected.id] || ''}
+                onReplyChange={(text) =>
+                  setReviewDrafts((d) => ({ ...d, [reviewSelected.id]: text }))
+                }
+                onAct={(action, extra) => {
+                  // A posted reply is no longer unsent, so the draft goes.
+                  if (action === 'reply') {
+                    setReviewDrafts((d) => {
+                      const next = { ...d };
+                      delete next[reviewSelected.id];
+                      return next;
+                    });
+                  }
+                  return actOnReview(reviewSelected.id, action, extra);
+                }}
+                onFocus={() => focusReviewFromUi(reviewSelected)}
+                onDelete={() => deleteReview(reviewSelected.id)}
+                onColor={(c) => recolorReview(reviewSelected.id, c)}
+                onEditMessage={(messageId, message) => editReviewMessage(reviewSelected.id, messageId, message)}
+                onDeleteMessage={(messageId) => deleteReviewMessage(reviewSelected.id, messageId)}
+              />
+            )}
+            {leftTab === 'comments' && !(reviewPresentation === 'inspector' && reviewSelected) && (
               <CommentsPanel
                 reviews={reviewRows}
                 status={reviewFilter}
                 onStatus={setReviewFilter}
                 scope={reviewScope}
                 onScope={setReviewScope}
-                openId={reviewOpenId}
-                expanded={reviewExpanded}
-                onExpand={setReviewExpanded}
+                selectedId={reviewSelectedId}
                 onOpen={(id) => {
                   openReview(id);
                   // Choosing a comment from the list means "show me this" —
@@ -5142,12 +5254,36 @@ export default function App() {
             commenting={wantsCanvasClick(commentMode)}
             pinsVisible={pinsVisible}
             reviewItems={reviewItems}
-            reviewOpenId={reviewOpenId}
-            reviewExpanded={reviewExpanded}
+            reviewSelectedId={reviewSelectedId}
+            reviewPeek={reviewPeek}
+            reviewCluster={reviewCluster}
+            onReviewPeek={setReviewPeek}
+            onReviewCluster={setReviewCluster}
             reviewDraft={reviewDraft}
             reviewBusyId={reviewBusyId}
             reviewById={reviewById}
-            onReviewOpen={openReview}
+            onReviewOpen={(pin) => {
+              // A pin, not an id: a marker can stand for several reviews and
+              // the old code silently opened the first of them. Now one review
+              // opens and a cluster asks which.
+              if (!pin) {
+                openReview(null);
+                return;
+              }
+              if (pin.reviews.length > 1) {
+                setReviewPeek(null);
+                setReviewCluster(pin);
+                return;
+              }
+              openReview(pin.reviews[0]);
+              const picked = allReviewsRef.current.find((r) => r.id === pin.reviews[0]);
+              if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
+            }}
+            onPickFromCluster={(id) => {
+              openReview(id);
+              const picked = allReviewsRef.current.find((r) => r.id === id);
+              if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
+            }}
             onReviewAct={actOnReview}
             onReviewFocus={focusReviewFromUi}
             onReviewDelete={deleteReview}
