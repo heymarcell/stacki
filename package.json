@@ -135,6 +135,7 @@
     "test:agentcanvas": "electron test/agent-canvas.js",
     "test:packaging": "node test/packaging.js",
     "test:updatepolicy": "node test/update-policy.js",
+    "test:updatefeed": "node test/update-feed-acceptance.js",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder",
     "dist:mac": "npm run build && electron-builder --mac",
