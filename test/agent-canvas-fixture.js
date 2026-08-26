@@ -220,6 +220,43 @@ function makeCanvasProject({ log = () => {} } = {}) {
   return root;
 }
 
+/**
+ * Clear what previous runs of this harness left in the temp directory.
+ *
+ * Two things end up there that teardown cannot remove. Electron rewrites a
+ * small userData directory during shutdown — after the harness has deleted it
+ * and checked it is gone — so one reappears per run. And a run that was killed
+ * mid-flight never got to its teardown at all.
+ *
+ * Neither is large, and that is the problem: they accumulate quietly, one per
+ * run, until somebody wonders where their disk went. Sweeping at startup keeps
+ * the count at one rather than at however many times the tests have been run.
+ *
+ * The astro cache is deliberately spared — it is what stops every run
+ * reinstalling astro.
+ */
+function sweepStaleRuns(prefixes = []) {
+  const dir = os.tmpdir();
+  const swept = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return swept;
+  }
+  for (const name of entries) {
+    if (name.includes('astro-cache')) continue;
+    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+    try {
+      fs.rmSync(path.join(dir, name), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+      swept.push(name);
+    } catch {
+      /* something else is using it; leave it alone */
+    }
+  }
+  return swept;
+}
+
 const removeCanvasProject = (root) => {
   try {
     fs.rmSync(root, { recursive: true, force: true });
@@ -228,4 +265,4 @@ const removeCanvasProject = (root) => {
   }
 };
 
-module.exports = { makeCanvasProject, removeCanvasProject, ensureAstro, astroCached, FILES, CACHE };
+module.exports = { makeCanvasProject, removeCanvasProject, ensureAstro, astroCached, sweepStaleRuns, FILES, CACHE };

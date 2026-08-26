@@ -1428,6 +1428,21 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   min-height: 0;
 }
 .panel.left { width: 260px; flex-shrink: 0; }
+/* The left panel while it is showing a docked review thread, and only then.
+   Scoped to this one state on purpose — every other panel keeps 260px.
+
+   The clamp does the work: 30vw gives a comfortable measure on a roomy window
+   and tops out at 420px, past which a line of prose is too long to track. The
+   max-width is the canvas's floor — the site this conversation is ABOUT has to
+   stay visibly on screen, so the reader gives way rather than swallowing it,
+   which is what happens on a small window.
+
+   44px rail + 322px right panel + 200px of canvas is what the subtraction is. */
+.panel.left.is-reading {
+  width: clamp(300px, 30vw, 420px);
+  max-width: calc(100vw - 566px);
+  transition: width 0.16s ease;
+}
 .panel.right { width: 322px; flex-shrink: 0; border-right: none; border-left: 1px solid var(--border); }
 
 .panel-section { display: flex; flex-direction: column; min-height: 0; }

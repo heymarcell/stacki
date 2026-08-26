@@ -43,6 +43,7 @@ const check = (what, condition, detail) => {
     entry,
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
 export { default as ReviewPins, ReviewSurface, clampPoint } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
+export { safeHref } from "/Users/heymarcell/DEV/stacki/src/ui/ReviewMarkdown.jsx";
 export { applyMarkdownKey } from "/Users/heymarcell/DEV/stacki/src/ui/markdownKeys.js";
 export { placePins, pinnable, longEnoughToDock } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
 export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
@@ -53,6 +54,32 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
 `,
     'utf8'
   );
+  // A second, tiny bundle for one measurement: the same ReviewThread, with
+  // react-markdown swapped for something that counts instead of parsing. It
+  // cannot be the main bundle — every other test here asserts on what the real
+  // Markdown renders — so it is built beside it and used once.
+  const countEntry = path.join(buildDir, 'review-count.entry.jsx');
+  fs.writeFileSync(
+    countEntry,
+    `export { default as ReviewThread } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
+export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'counting-markdown.jsx'))};
+`,
+    'utf8'
+  );
+  const countBundlePath = path.join(buildDir, 'review-count.bundle.js');
+  await esbuild.build({
+    entryPoints: [countEntry],
+    outfile: countBundlePath,
+    bundle: true,
+    format: 'cjs',
+    platform: 'node',
+    jsx: 'automatic',
+    external: ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime'],
+    alias: { 'react-markdown': path.join(__dirname, 'fixtures', 'counting-markdown.jsx') },
+    loader: { '.css': 'empty', '.svg': 'empty', '.png': 'empty' },
+    logLevel: 'silent',
+  });
+
   const bundlePath = path.join(buildDir, 'review-ui.bundle.js');
   await esbuild.build({
     entryPoints: [entry],
@@ -107,6 +134,7 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
   global.IS_REACT_ACT_ENVIRONMENT = true;
   dom.window.IS_REACT_ACT_ENVIRONMENT = true;
   const ui = require(bundlePath);
+  const counted = require(countBundlePath);
 
   const container = document.getElementById('root');
   const root = createRoot(container);
@@ -1301,6 +1329,114 @@ export { beginCapture, endCapture } from ${JSON.stringify(path.join(__dirname, '
     check('the header says it can be dragged', !!$('.review-grip'));
     check('and the grip is not a control', $('.review-grip').tagName !== 'BUTTON');
     check('so a screen reader is not told it is one', $('.review-grip').getAttribute('aria-hidden') === 'true');
+  }
+
+  // ------------------------------------------------------------------
+  // Typing a reply must not reparse the conversation
+  // ------------------------------------------------------------------
+  //
+  // ReviewThread owns the reply draft, so every keystroke re-renders the whole
+  // thread. Without memoization that means re-parsing every saved message's
+  // Markdown once per character — forty documents per keypress on a long
+  // agent conversation, for messages nobody has touched.
+  //
+  // Counted rather than reasoned about: the components ReviewMarkdown renders
+  // are the parse's own output, so counting how many times one of them is
+  // constructed counts parses.
+  {
+    // Ten saved messages, each with a link in it, plus one reply box.
+    const many = Array.from({ length: 10 }, (_, i) => ({
+      id: `rm_${i}`,
+      authorType: i % 2 ? 'agent' : 'human',
+      actorId: i % 2 ? 'a' : 'me',
+      actorName: i % 2 ? 'Claude' : 'You',
+      body: `Message ${i} — see https://example.com/${i} for the detail.`,
+      createdAt: Date.now(),
+      editedAt: null,
+    }));
+    const long = {
+      id: 'rt_typing',
+      number: 99,
+      status: 'open',
+      anchorState: 'attached',
+      color: 'blue',
+      page: '/',
+      breakpoint: 'desktop',
+      source: 'src/components/Hero.astro',
+      occurrence: 0,
+      occurrenceCount: 1,
+      updatedAt: Date.now(),
+      createdAt: Date.now(),
+      creationContext: { tag: 'h1', text: 'Hello', componentChain: ['index.astro'] },
+      externalRefs: [],
+      messages: many,
+      replies: 9,
+    };
+
+    counted.counter.renders = 0;
+    await render(React.createElement(counted.ReviewThread, { review: long, onAct: () => {}, actorId: 'me' }));
+    const firstPass = counted.counter.renders;
+    check('the long thread rendered its ten messages once each', firstPass === 10, String(firstPass));
+
+    // Now type into the reply box and count what gets re-rendered. The count
+    // is taken from React's own work: if the memo is doing its job, the saved
+    // bodies are not re-rendered at all.
+    const box = $('.review-reply textarea');
+    check('there is a reply box to type into', !!box);
+
+    counted.counter.renders = 0;
+    for (let i = 0; i < 100; i++) {
+      await type(box, 'x'.repeat(i + 1));
+    }
+    const whileTyping = counted.counter.renders;
+
+    check('the reply box took all hundred characters', box.value.length === 100, String(box.value.length));
+    check('every saved message is still on screen', $$('.counted-md').length === 10, String($$('.counted-md').length));
+    // The number is the whole test. Unmemoized this is ten messages × a
+    // hundred keystrokes; memoized it is nothing at all, because not one of
+    // those bodies changed.
+    check(
+      `typing a hundred characters reparsed nothing (was ${whileTyping})`,
+      whileTyping === 0,
+      `${whileTyping} reparses — unmemoized this would be about 1000`
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // The renderer and the main process agree about links
+  // ------------------------------------------------------------------
+  //
+  // ReviewMarkdown draws a link only for what it believes Stacki will open,
+  // and the main process decides what Stacki will actually open. When those
+  // two disagreed, `mailto:` was drawn as a live link and silently dropped —
+  // so this drives one table through both and fails if they ever part.
+  {
+    const main = require('../electron/externalLinks.js');
+    const table = [
+      ['https://example.com', true],
+      ['http://example.com/a?b=c#d', true],
+      ['mailto:design@example.com', true],
+      ['MAILTO:Design@Example.com', true],
+      ['javascript:alert(1)', false],
+      ['JaVaScRiPt:alert(1)', false],
+      ['data:text/html,<script>', false],
+      ['file:///etc/passwd', false],
+      ['stacki-asset://thing', false],
+      ['vbscript:msgbox', false],
+      ['/relative/path', false],
+      ['example.com', false],
+      ['', false],
+      ['   ', false],
+      ['java\u0000script:alert(1)', false],
+      ['java\nscript:alert(1)', false],
+    ];
+    for (const [url, want] of table) {
+      const rendered = !!ui.safeHref(url);
+      const opened = !!main.openableUrl(url);
+      check(`the renderer is right about ${JSON.stringify(url)}`, rendered === want, String(rendered));
+      check(`the main process agrees about ${JSON.stringify(url)}`, opened === rendered, `renderer ${rendered} vs main ${opened}`);
+    }
+    check('and both name the same three schemes', main.EXTERNAL_SCHEMES.join() === 'http:,https:,mailto:', main.EXTERNAL_SCHEMES.join());
   }
 
   // ------------------------------------------------------------------

@@ -4809,8 +4809,14 @@ export default function App() {
           onSelect={(id) => setLeftTab((t) => (t === id ? null : id))}
         />
 
+        {/* `is-reading` is wider, and only while a review is docked in here.
+            A 260px column is right for a list of comments and wrong for the
+            conversation the list points at: at that measure a sentence about
+            three files breaks into a column of fragments. The width belongs to
+            the reading state rather than to the panel, so it goes back the
+            moment somebody returns to the list. */}
         {leftTab && (
-          <div className="panel left">
+          <div className={`panel left${leftTab === 'comments' && reviewExpanded ? ' is-reading' : ''}`}>
             {leftTab === 'pages' && (
               <PagesPanel
                 scan={scan}

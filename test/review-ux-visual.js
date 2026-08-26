@@ -29,7 +29,7 @@ const { app, BrowserWindow, dialog } = require('electron');
 // updater and its handlers are wired up.
 process.env.STACKI_NO_DIALOGS = '1';
 
-const { makeCanvasProject, removeCanvasProject, astroCached } = require('./agent-canvas-fixture.js');
+const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const OUT = process.argv[2] || path.join(os.tmpdir(), 'stacki-review-ux');
@@ -61,6 +61,11 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
+// What earlier runs left behind. Electron rewrites a small userData during
+// shutdown, after teardown has removed it, so one reappears per run and they
+// pile up quietly. Swept here rather than pretended about.
+sweepStaleRuns(['stacki-ux-user-', 'stacki-canvas-']);
+
 const root = makeCanvasProject({ log: (m) => say(`review-ux-visual: ${m}`) });
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-ux-user-'));
 app.setPath('userData', userData);
@@ -76,71 +81,94 @@ const reviews = require('../electron/review');
 require('../electron/main.js');
 
 /**
- * Stop, then leave.
+ * Stop, then leave — and fail if anything could not be stopped.
  *
- * `app.exit()` skips before-quit, so the Astro dev server this run started
- * outlives it — one orphaned server per run, holding its port and its memory,
- * until somebody notices there are forty of them. It is stopped through the
- * app's own door first.
+ * Cleanup is part of correctness here, not a courtesy. A run that passed every
+ * assertion and left an Astro dev server behind is a run that will be repeated
+ * until the machine has forty of them holding several gigabytes, which is
+ * exactly what happened, and which presents as the machine being slow rather
+ * than as anything to do with tests.
+ *
+ * So every step is attempted even after an earlier one fails — stopping at the
+ * first problem is how the rest of the mess gets left — the problems are
+ * collected, and any of them makes the exit code non-zero however well the
+ * assertions went.
+ *
+ * The screenshots are OUTPUT, not leaked state: they are the point of this
+ * harness and are written where somebody can open them.
  */
 async function teardown(code) {
-  try {
-    const status = mcp.status();
-    if (status?.running && status.url && status.token) {
-      const call = async (args) => {
-        const res = await fetch(status.url, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'application/json, text/event-stream',
-            authorization: `Bearer ${status.token}`,
-          },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 9999, method: 'tools/call', params: { name: 'project', arguments: args } }),
-          signal: AbortSignal.timeout(8000),
-        });
-        const text = await res.text();
-        const line = text.split('\n').find((l) => l.startsWith('data:')) || text;
-        try {
-          return JSON.parse(line.replace(/^data:\s*/, ''))?.result?.structuredContent || null;
-        } catch {
-          return null;
-        }
-      };
-      const where = await call({ action: 'dev_status' });
-      const previewUrl = where?.url || where?.preview?.url || null;
-      await call({ action: 'dev_stop' });
-
-      // `ok` from dev_stop means "asked", not "stopped": Astro 7 daemonizes its
-      // dev server, so Stacki hands the job to `astro dev stop` and returns.
-      // Exiting here would delete the project directory out from under that
-      // command and leave the server running for as long as the machine is up.
-      // So wait for the port to actually go quiet — the real state, not a sleep.
-      if (previewUrl) {
-        const stop = Date.now() + 20000;
-        for (;;) {
-          try {
-            await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
-          } catch {
-            break;
-          }
-          if (Date.now() > stop) {
-            shout(`review-ux-visual: the preview at ${previewUrl} would not stop`);
-            break;
-          }
-          await wait(400);
-        }
-      }
+  const problems = [];
+  const attempt = async (what, fn) => {
+    try {
+      await fn();
+    } catch (err) {
+      problems.push(`${what}: ${String(err?.message || err)}`);
     }
-  } catch (err) {
-    shout(`review-ux-visual: could not stop the preview: ${String(err?.message || err).slice(0, 120)}`);
-  }
-  removeCanvasProject(root);
-  try {
+  };
+
+  await attempt('stopping the preview', async () => {
+    const status = mcp.status();
+    if (!status?.running || !status.url || !status.token) return;
+    const call = async (args) => {
+      const res = await fetch(status.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${status.token}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 9999, method: 'tools/call', params: { name: 'project', arguments: args } }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const text = await res.text();
+      const line = text.split('\n').find((l) => l.startsWith('data:')) || text;
+      try {
+        return JSON.parse(line.replace(/^data:\s*/, ''))?.result?.structuredContent || null;
+      } catch {
+        return null;
+      }
+    };
+    const where = await call({ action: 'dev_status' });
+    const previewUrl = where?.url || where?.preview?.url || null;
+    await call({ action: 'dev_stop' });
+
+    // `ok` from dev_stop means "asked", not "stopped": Astro 7 daemonizes its
+    // dev server, so Stacki hands the job to `astro dev stop` and returns.
+    // Exiting on that ok deletes the project directory out from under the
+    // command and leaves the server running. So wait for the port to actually
+    // go quiet — the real state, not a sleep long enough to usually work.
+    if (!previewUrl) return;
+    const stop = Date.now() + 20000;
+    for (;;) {
+      try {
+        await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
+      } catch {
+        return;
+      }
+      if (Date.now() > stop) throw new Error(`the preview at ${previewUrl} would not stop`);
+      await wait(400);
+    }
+  });
+
+  await attempt('stopping the MCP server', () => mcp.stopMcp());
+  await attempt('closing the windows', () => {
+    for (const w of BrowserWindow.getAllWindows()) w.destroy();
+  });
+  await attempt(`removing the fixture ${root}`, () => {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    if (fs.existsSync(root)) throw new Error('still there');
+  });
+  await attempt(`removing the app data ${userData}`, () => {
     fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-  } catch {
-    /* a temp folder that will not go is not a failure */
+    if (fs.existsSync(userData)) throw new Error('still there');
+  });
+
+  if (problems.length) {
+    shout(`\nreview-ux-visual: ${problems.length} cleanup failure(s) — this is a failing run\n`);
+    for (const p of problems) shout(`  ${p}`);
   }
-  app.exit(code);
+  app.exit(problems.length ? 1 : code);
 }
 
 // --- the conversations that broke the old reader -----------------------------
@@ -349,6 +377,33 @@ const SHOTS = [];
   say(`  opened: ${JSON.stringify(openedWhat)}`);
   await shot('03-long-thread-docked');
 
+  // How wide the reading surface actually is, which is the whole point of
+  // docking. A 260px column is what the list needs; a conversation about four
+  // files needs a measure it can be read at.
+  const geometry = await js(`(() => {
+    const panel = document.querySelector('.panel.left');
+    const body = document.querySelector('.comments-reader .review-body');
+    const canvas = document.querySelector('iframe');
+    return {
+      panel: panel ? Math.round(panel.getBoundingClientRect().width) : null,
+      reading: panel ? panel.classList.contains('is-reading') : null,
+      text: body ? Math.round(body.getBoundingClientRect().width) : null,
+      canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : null,
+      vw: innerWidth,
+      docWidth: document.documentElement.scrollWidth,
+    };
+  })()`);
+  say(`  docked geometry at ${geometry?.vw}px: ${JSON.stringify(geometry)}`);
+  check('the panel is in its reading state', geometry?.reading === true, JSON.stringify(geometry));
+  check(
+    `the docked reader is materially wider than the 260px list (${geometry?.panel}px)`,
+    geometry?.panel >= 380 && geometry?.panel <= 430,
+    JSON.stringify(geometry)
+  );
+  check('the message text gets a real measure', geometry?.text >= 330, String(geometry?.text));
+  check('and the website is still meaningfully visible', geometry?.canvas >= 300, String(geometry?.canvas));
+  check('with no horizontal overflow', geometry?.docWidth <= geometry?.vw + 1, `${geometry?.docWidth} vs ${geometry?.vw}`);
+
   const docked = await js(`(() => {
     const el = document.querySelector('.comments-reader');
     if (!el) return null;
@@ -435,7 +490,14 @@ const SHOTS = [];
   );
 
   // --- a narrow window -----------------------------------------------------
+  // A genuinely small window, with a long thread docked in it — the case the
+  // width has to degrade for. The minimum has to be lowered first: macOS
+  // refuses to make the window narrower than the app's own minimum, and the
+  // measurement silently became a 1024px one when it was not.
+  win.setMinimumSize(600, 400);
   win.setSize(900, 700);
+  await wait(900);
+  check('the long thread has a row at this size', (await pickRow('/spacing on this/i')) === 'clicked');
   await wait(1200);
   await shot('09-narrow-window');
   const narrow = await js(`(() => {
@@ -445,6 +507,23 @@ const SHOTS = [];
     return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top), w: Math.round(r.width), vw: innerWidth, vh: innerHeight };
   })()`);
   check('the reader is still fully on screen in a small window', !!narrow && narrow.left >= -1 && narrow.right <= narrow.vw + 1 && narrow.top >= -1, JSON.stringify(narrow));
+  const tight = await js(`(() => {
+    const panel = document.querySelector('.panel.left');
+    const canvas = document.querySelector('iframe');
+    return {
+      panel: panel ? Math.round(panel.getBoundingClientRect().width) : null,
+      reading: panel ? panel.classList.contains('is-reading') : null,
+      canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : null,
+      vw: innerWidth,
+      docWidth: document.documentElement.scrollWidth,
+    };
+  })()`);
+  say(`  narrow geometry at ${tight?.vw}px: ${JSON.stringify(tight)}`);
+  // On a small window the reader gives way rather than swallowing the canvas:
+  // the site this conversation is ABOUT has to stay on screen.
+  check('a narrow window constrains the reader rather than the canvas', tight?.panel <= 330, String(tight?.panel));
+  check('and the website is still there', tight?.canvas >= 150, String(tight?.canvas));
+  check('and nothing overflows sideways', tight?.docWidth <= tight?.vw + 1, `${tight?.docWidth} vs ${tight?.vw}`);
 
   win.setSize(1600, 1000);
   await wait(900);

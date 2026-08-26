@@ -31,7 +31,14 @@ import remarkGfm from 'remark-gfm';
 //   third time. Nothing here navigates the renderer: the editor following a
 //   link out of its own UI would replace Stacki with a web page.
 
-/** The only schemes a review may link to. */
+// The same three schemes electron/externalLinks.js allows, kept in step by
+// test/review-ui.js, which drives one table of urls through BOTH and fails if
+// they ever disagree.
+//
+// Deliberately a copy rather than an import: that module is CommonJS because
+// the main process requires it, and the renderer bundle cannot consume it as
+// ESM. The main process stays the authority — this is the check that stops a
+// link Stacki would refuse from being drawn as a live one in the first place.
 const SAFE_SCHEME = /^(https?:|mailto:)/i;
 
 /** Anything a person could not have typed into a link: spaces, tabs, newlines, controls. */
@@ -39,18 +46,16 @@ const SAFE_SCHEME = /^(https?:|mailto:)/i;
 const CONTROL_OR_SPACE = /[\u0000-\u0020\u007f]/;
 
 /**
- * A relative link in a comment points at nothing — there is no document to be
- * relative to — so the test is absolute and strict rather than a sanitiser
- * that tries to rescue the string.
+ * The url, if Stacki will open it. Null if it will not.
+ *
+ * A url carrying whitespace or a control character is refused outright rather
+ * than stripped and retried — `java\nscript:` is the oldest trick there is and
+ * it survives a naive prefix test, and sanitising would mean deciding what
+ * somebody meant and then handing the original string on anyway.
  */
 export function safeHref(url) {
-  const raw = String(url ?? '').trim();
+  const raw = typeof url === 'string' ? url.trim() : '';
   if (!raw) return null;
-  // A url carrying whitespace or a control character is not one somebody
-  // typed. `java\nscript:` is the oldest trick there is and it survives a
-  // naive prefix test, so such a url is refused outright rather than
-  // stripped and retried — sanitising would mean deciding what they meant,
-  // and then handing the original string on anyway.
   if (CONTROL_OR_SPACE.test(raw)) return null;
   if (!SAFE_SCHEME.test(raw)) return null;
   return raw;
@@ -168,7 +173,7 @@ const COMPONENTS = {
  * repaired on the way in — what an agent wrote is what is rendered, and what
  * comes back out of the store is still what it wrote.
  */
-export default function ReviewMarkdown({ text }) {
+function ReviewMarkdown({ text }) {
   const body = typeof text === 'string' ? text : '';
   if (!body) return null;
   return (
@@ -179,3 +184,17 @@ export default function ReviewMarkdown({ text }) {
     </div>
   );
 }
+
+/**
+ * Memoized on the words, and it has to be.
+ *
+ * ReviewThread owns the reply draft, so every keystroke in the reply box
+ * re-renders the whole thread — and re-rendering this means parsing the
+ * Markdown again. On a forty-message conversation that is forty documents
+ * re-parsed per character typed, for messages nobody has touched.
+ *
+ * `text` is the only input, so the comparison is the whole story: a body that
+ * has not changed does not re-render. The one being edited is a different
+ * element with different text and re-renders as it should.
+ */
+export default React.memo(ReviewMarkdown, (a, b) => a.text === b.text);

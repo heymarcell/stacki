@@ -60,6 +60,7 @@ const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const { updatePolicy, UPDATE_ENABLED_FIELD } = require('./updatePolicy');
+const { openableUrl, refusalFor } = require('./externalLinks');
 const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('./dialogPolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
@@ -210,7 +211,11 @@ function createWindow() {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    // Same list as the IPC door. Anything that reaches here has been asked for
+    // by a page rather than by a person, so it least deserves the exception —
+    // this used to hand the OS whatever it was given.
+    const safe = openableUrl(url);
+    if (safe) void shell.openExternal(safe);
     return { action: 'deny' };
   });
 
@@ -4918,6 +4923,19 @@ handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
 });
 
 handle('shell:openExternal', async (_e, url) => {
-  if (/^https?:\/\//.test(url)) shell.openExternal(url);
-  return { ok: true };
+  // The authority. The renderer checks first so a dead link is never drawn as
+  // a live one, but this is what actually decides — and it answers honestly:
+  // the old version returned `{ ok: true }` whatever happened, so a mailto
+  // link looked clickable, was clicked, did nothing, and reported success.
+  const safe = openableUrl(url);
+  if (!safe) return refusalFor(url);
+  try {
+    await shell.openExternal(safe);
+    return { ok: true, opened: true };
+  } catch (err) {
+    // The scheme was fine and the system still would not take it — no mail
+    // client, no browser. That is not a refusal, and saying so as one would
+    // send somebody looking at the wrong thing.
+    return { ok: false, code: 'open_failed', message: String(err?.message || err) };
+  }
 });
