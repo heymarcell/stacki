@@ -59,23 +59,63 @@ The signed variants are for maintainers with the release certificates:
 npm run dist:mac   # requires a Developer ID cert + notarization credentials
 ```
 
-## Releases
+**None of these commands produce an app that updates itself**, signed or not.
+See below for why that is deliberate.
 
-Official builds are published by CI, not from anyone's laptop. Pushing a
-`v*` tag runs `.github/workflows/release.yml`, which builds a signed and
-notarized macOS universal build plus a Windows installer, uploads them to
-the `stacki-releases` repo, and only makes the release visible once both
-platforms have landed. Shipped apps auto-update from that feed via
-`electron-updater`.
+## Builds, releases and updates
 
-Signing and notarization credentials live in GitHub Actions secrets. They
-are never in this repository, and GitHub does not expose them to workflows
-triggered from forks — so a fork can build and run everything here, but
-cannot produce a build signed with the official identity. That's intended.
+Running `electron-builder` gives you a working Stacki. It does not give you a
+release, and the difference decides whether the app is allowed to update
+itself.
 
-If you fork this and publish your own builds, change `build.appId` and
-`build.publish` in `package.json` to your own identifiers so your releases
-don't collide with the official update feed.
+| | Auto-updates | Signed | Update feed |
+|---|---|---|---|
+| **Development** (`npm run dev`, `npm start`) | no | n/a | none |
+| **Local or fork build** (`dist:mac`, `dist:mac:unsigned`, `dist:win`) | **no** | only if you have certificates | none — the feed file is removed from the package |
+| **Official release** (CI, on a `v*` tag) | yes | signed and notarized | `stacki-releases` |
+
+A build may update itself only if it says so. The release workflow marks its
+artifacts with `stackiAutoUpdate: true` at build time; nothing else does.
+Missing metadata means no, `false` means no, and a development run is always
+no. So a package built on a laptop never contacts the official feed, never
+starts an update check, and never hands anything to the OS updater.
+
+That is not a precaution against a hypothetical. On macOS `electron-updater`
+stages updates through Squirrel.Mac, which verifies the code signature of what
+it is about to install. An unsigned local build that believed it was a release
+would download an official update, fail that verification, and report
+`Stacki could not check for updates` — a signature error caused entirely by a
+build claiming to be something it was not.
+
+Choosing **File ▸ Check for Updates…** in such a build says so plainly instead:
+this build does not receive automatic updates, install a newer one manually.
+It does not contact the feed to tell you that.
+
+Official builds are published by CI, not from anyone's laptop. Pushing a `v*`
+tag runs `.github/workflows/release.yml`, which builds a signed and notarized
+macOS universal build plus a Windows installer, marks both update-enabled,
+uploads them to the `stacki-releases` repo, and only makes the release visible
+once both platforms have landed.
+
+Signing and notarization credentials live in GitHub Actions secrets. They are
+never in this repository, and GitHub does not expose them to workflows
+triggered from forks — so a fork can build and run everything here, but cannot
+produce a build signed with the official identity. That's intended.
+
+### Publishing your own distribution from a fork
+
+Forking and building is enough to use Stacki. Shipping your own updating app is
+a separate decision, and needs four things of your own:
+
+- **`build.appId`** — change it from `com.stacki.editor`. Sharing the identity
+  means sharing the update and preferences namespace with official Stacki.
+- **`build.publish`** — point it at your own release repo or feed, not
+  `flowtricks/stacki-releases`.
+- **Signing** — a Developer ID for macOS, a code-signing certificate for
+  Windows. Squirrel will refuse to stage an unsigned update however the
+  metadata is marked.
+- **A release pipeline that marks its artifacts update-enabled**, the way
+  `release.yml` does. Ordinary packaging commands deliberately do not.
 
 ## Contributing
 
@@ -150,11 +190,32 @@ the same comment tomorrow as it does now, to you and to your agent.
 > open an issue and defer the comment with the link. If something needs my
 > decision, defer it and say why."
 
-The agent reads them with `get_comments`, calls `comment` with `action: "focus"`
-so Stacki navigates to each one — the page, the breakpoint, the components, the
-element, the copy — then uses `get_context` and `capture` to see it, edits the
-source with its **own** normal tools, lets Stacki refresh, captures again to
-check its work, and resolves or defers.
+The agent reads them with `get_comments` and calls `comment` with
+`action: "focus"`, which sends Stacki to each one — the page, the breakpoint,
+the components drilled into on the way down, the element, the copy — and hands
+back a **`targetRef`**: a handle on that exact source-backed element.
+
+From there it works through Stacki rather than around it:
+
+```
+get_comments → comment(focus) → targetRef
+             → target / style / content   read what it is
+             → semantic edit              through Stacki's own editor
+             → capture                    look at the result
+             → comment(resolve | defer)
+```
+
+Reading through the ref answers the questions an agent would otherwise go
+looking for — the file and line range, the component chain, the props, the
+classes, where the words actually come from, how many copies of the node the
+page is rendering. Edits made this way land on the undo stack you can press
+⌘Z on and save the way any other edit does.
+
+The agent keeps its normal repository tools, and needs them for anything
+outside Stacki's semantic model — build config, a framework component, plain
+TypeScript. That is the fallback, not the first move: searching the repository
+for something Stacki has already identified is how an agent ends up editing a
+different copy of the right-looking markup.
 
 Stacki has no GitHub integration and no credentials. When an agent files an
 issue it does so with its own tooling and hands the URL back as a string:
@@ -425,8 +486,20 @@ projects, and the endpoint does not.
 
 ## How editing works
 
-Pages are parsed into a simple model: optional layout wrapper + a flat list of
-self-closing component instances with props. The editor writes that model back
-as clean `.astro` source. Pages containing arbitrary HTML, expressions, or
-nested children fall back to the built-in code editor — nothing is ever
-rewritten destructively.
+Pages are parsed into a tree, not a list. Stacki models ordinary HTML elements
+with their children and attributes, component instances and their props,
+literal text, `{expressions}`, comments, conditional blocks (`{cond && …}` and
+ternaries, each branch addressable), and `.map()` loops — where one node in the
+source is one node in the tree, rendered as many times as the data says. It
+reads `class` and `class:list`, spread props, frontmatter constants, and
+imports, and follows a bound value back to where it is actually written when it
+can prove where that is.
+
+The editor writes that tree back as `.astro` source, preserving what it did not
+touch.
+
+The boundary is unchanged, and it is the important part: when a page contains
+something Stacki cannot represent safely, it does not guess. The page opens in
+the built-in code editor instead — still with live preview — and Stacki names
+the construct and the line it stopped on. Nothing is ever rewritten
+destructively to make it fit the model.

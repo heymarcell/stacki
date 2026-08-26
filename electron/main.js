@@ -59,6 +59,8 @@ const gitSnapshot = require('./gitSnapshot');
 const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
+const { updatePolicy, UPDATE_ENABLED_FIELD } = require('./updatePolicy');
+const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('./dialogPolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
 const { createAccessStore } = require('./mcp/agent/access');
@@ -576,6 +578,50 @@ function formatAutoUpdateError(error) {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
+/**
+ * Whether this build may update itself, and why.
+ *
+ * The field is read from the packaged package.json — the copy electron-builder
+ * writes into the app — through Electron's own resolver rather than by joining
+ * paths, so it is the same file the runtime is actually running from. In
+ * development there is no packaged metadata and none is looked for: the policy
+ * has already said no by then.
+ *
+ * Recomputed on each call rather than cached at startup. It cannot change
+ * under a running app, but a value that is derived where it is used cannot go
+ * stale in the one direction that matters here.
+ */
+function currentUpdatePolicy() {
+  let declared;
+  try {
+    // require of the app's own manifest: in a packaged app this resolves
+    // inside the asar, which is exactly the metadata the release build wrote.
+    declared = app.isPackaged ? require('../package.json')?.[UPDATE_ENABLED_FIELD] : undefined;
+  } catch {
+    // A manifest that cannot be read is a build that never said it could
+    // update itself, which is already the safe answer.
+    declared = undefined;
+  }
+  return updatePolicy({ isPackaged: app.isPackaged, updateEnabledMetadata: declared });
+}
+
+/**
+ * Show a message box, unless this run has said nobody is watching.
+ *
+ * Every blocking dialog in this process is an updater dialog, and a modal one
+ * stops an automated run dead — the app waits for a click that is not coming.
+ * With STACKI_NO_DIALOGS=1 the dialog becomes a log line and answers itself
+ * with the harmless button, so a script driving Stacki keeps moving and a
+ * failed update never restarts the app out from under it.
+ */
+async function showMessage(parent, options) {
+  if (dialogsSuppressed()) {
+    logAutoUpdate(suppressedLine(options));
+    return { response: suppressedResponse(options), checkboxChecked: false };
+  }
+  return dialog.showMessageBox(parent, options);
+}
+
 function logAutoUpdate(message, details) {
   const detailText =
     details === undefined
@@ -598,7 +644,7 @@ function logAutoUpdate(message, details) {
 
 async function promptToInstallDownloadedUpdate(version) {
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-  const { response } = await dialog.showMessageBox(parent, {
+  const { response } = await showMessage(parent, {
     type: 'info',
     title: 'Update Ready',
     buttons: ['Restart Now', 'Later'],
@@ -642,7 +688,7 @@ function registerAutoUpdaterEvents() {
     autoUpdateErrorDialogShown = true;
 
     const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-    void dialog.showMessageBox(parent, {
+    void showMessage(parent, {
       type: 'warning',
       title: 'Update Check Failed',
       message: 'Stacki could not check for updates.',
@@ -654,7 +700,10 @@ function registerAutoUpdaterEvents() {
 }
 
 async function runAutoUpdateCheck() {
-  if (!app.isPackaged || autoUpdateCheckInFlight) return;
+  // The gate is here as well as in startAutoUpdateChecks, because this is what
+  // the interval calls. Belt and braces on the one function that actually
+  // reaches the network.
+  if (!currentUpdatePolicy().enabled || autoUpdateCheckInFlight) return;
 
   autoUpdateCheckInFlight = true;
   try {
@@ -676,20 +725,33 @@ async function checkForUpdatesFromMenu() {
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
 
   // Nothing to check against: electron-updater reads the feed the installer
-  // was built with, and a dev run has no installer. Saying so beats a check
-  // that silently does nothing.
-  if (!app.isPackaged) {
-    await dialog.showMessageBox(parent, {
+  // was built with, and a build that is not an update-enabled release has no
+  // business asking that feed anything. Saying so beats a check that silently
+  // does nothing — and beats one that contacts the official feed on behalf of
+  // somebody's local build.
+  //
+  // Info, not warning: this is how the build is meant to work, not a failure.
+  // The menu item stays where it is, because removing it only makes somebody
+  // hunt for it.
+  const policy = currentUpdatePolicy();
+  if (!policy.enabled) {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
-      message: 'Updates are only checked in the installed app.',
-      detail: `This is a development build (${app.getVersion()}), which updates when you rebuild it.`,
+      message:
+        policy.reason === 'development'
+          ? 'Updates are only checked in the installed app.'
+          : 'This build does not receive automatic updates.',
+      detail:
+        policy.reason === 'development'
+          ? `This is a development build (${app.getVersion()}), which updates when you rebuild it.`
+          : policy.detail,
     });
     return;
   }
 
   if (autoUpdateCheckInFlight) {
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
       message: 'Already checking for updates.',
@@ -706,7 +768,7 @@ async function checkForUpdatesFromMenu() {
     // what electron-updater does only when it is actually newer.
     if (result?.downloadPromise) {
       logAutoUpdate('Manual check found an update', { version: result.updateInfo?.version });
-      await dialog.showMessageBox(parent, {
+      await showMessage(parent, {
         type: 'info',
         title: 'Update Available',
         message: `Stacki ${result.updateInfo?.version} is downloading.`,
@@ -715,14 +777,14 @@ async function checkForUpdatesFromMenu() {
       return;
     }
     logAutoUpdate('Manual check found no update', { version: app.getVersion() });
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'info',
       title: 'Check for Updates',
       message: `Stacki ${app.getVersion()} is the latest version.`,
     });
   } catch (error) {
     logAutoUpdate('Manual check failed', formatAutoUpdateError(error));
-    await dialog.showMessageBox(parent, {
+    await showMessage(parent, {
       type: 'warning',
       title: 'Check for Updates',
       // The raw error carries response headers and a stack; the log has all of
@@ -737,8 +799,13 @@ async function checkForUpdatesFromMenu() {
 }
 
 function startAutoUpdateChecks() {
-  if (!app.isPackaged) {
-    logAutoUpdate('Skipping auto update checks in development');
+  const policy = currentUpdatePolicy();
+  if (!policy.enabled) {
+    // Nothing is registered, nothing is scheduled, nothing is fetched. An
+    // update-disabled build must not hold an interval or an event handler for
+    // a mechanism it is never going to use — and must not touch the feed to
+    // discover that.
+    logAutoUpdate(`Automatic updates disabled for this build (${policy.reason})`);
     return;
   }
 

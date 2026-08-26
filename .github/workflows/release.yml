@@ -31,7 +31,13 @@ jobs:
         env:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
-      - run: npx electron-builder --mac --publish always
+      # -c.extraMetadata.stackiAutoUpdate=true is what makes this artifact an
+      # update-capable release. It is set HERE and nowhere else: no npm script
+      # sets it, so an ordinary `npm run dist:mac` — signed or not — produces a
+      # build that will not check the update feed. Removing this flag ships a
+      # release that cannot update itself, which is why test/update-policy.js
+      # asserts both release commands still carry it.
+      - run: npx electron-builder --mac --publish always -c.extraMetadata.stackiAutoUpdate=true
         env:
           DEBUG: electron-osx-sign*,electron-builder
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -66,7 +72,7 @@ jobs:
             ${{ runner.os }}-electron-
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --win --publish always
+      - run: npx electron-builder --win --publish always -c.extraMetadata.stackiAutoUpdate=true
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
