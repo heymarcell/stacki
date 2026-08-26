@@ -870,10 +870,23 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     const cssSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'styles.css'), 'utf8');
     check('comment text can be selected and copied', /\.review-body,[\s\S]{0,200}user-select: text/.test(cssSource));
     check('including the reference and the deferral reason', /\.review-note span,[\s\S]{0,200}user-select: text/.test(cssSource));
-    // A resolved pin appears only in the Resolved and All views, and when it
-    // does it has to read as finished rather than as one more thing to do.
-    check('a resolved pin is drawn quietly', /\.review-pin\.is-resolved \{[\s\S]{0,200}opacity: 0\.5;/.test(cssSource));
-    check('and comes up to full strength when it is the one being looked at', /\.review-pin\.is-resolved:hover:not\(:disabled\) \{[^}]*opacity: 1/.test(cssSource));
+    // A resolved pin is only ever on the page while it is the one being read,
+    // so there is nothing to fade it against — and it is green, because that is
+    // what resolved means everywhere else in this UI.
+    check('a resolved pin is green', /\.review-pin\.is-resolved \{[\s\S]{0,120}background: #30c158/.test(cssSource));
+    check('and is not faded, since it only appears when it is wanted', !/\.review-pin\.is-resolved \{[\s\S]{0,200}opacity: 0\.5;/.test(cssSource));
+    // Status and selection are carried by different things: the fill says what
+    // state it is in, the ring says this is the one being read. A selected open
+    // pin must not turn green, and a selected resolved one must stay green.
+    check('selection is a ring, not a change of colour', /\.review-pin\.open \{[\s\S]{0,220}box-shadow: 0 0 0 3px rgba\(0, 153, 255/.test(cssSource));
+    check('and it does not repaint the pin', !/\.review-pin\.open \{[\s\S]{0,220}background:/.test(cssSource));
+    check('a deferred pin is grey', /\.review-pin\.is-deferred \{[\s\S]{0,160}#7d7d82/.test(cssSource));
+    // A cluster can hold reviews in different states, so wearing one of them
+    // would be a claim about all of them.
+    check('a cluster is neutral', /\.review-pin\.many \{[\s\S]{0,120}background: #3f4347/.test(cssSource));
+    // The chooser stays attached to the marker it belongs to, on either side.
+    check('the cluster chooser has a pointer', /\.review-cluster::before \{/.test(cssSource));
+    check('and it moves to the other side when the box flips', /\.review-cluster\.flip-x::before \{[^}]*right: -5px/.test(cssSource));
     // The cluster badge sits BESIDE the pin. In the corner it covered the
     // number, which is the one thing on a pin that has to stay readable — it
     // is how a person and an agent name the same review.
@@ -1386,6 +1399,37 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('the header names the review', !!$('.review-head-title'));
     check('and offers Locate', !!$('.review-locate'));
     check('the file and breakpoint are context beneath it', !!$('.review-thread-context'));
+
+    // Moving through reviews without returning to the list for each one — the
+    // ‹ › every mature review tool has, because triaging a page of feedback is
+    // a sequence rather than eight separate errands.
+    let stepped = null;
+    await render(mdThread(one(FIXTURES.pair), {
+      position: { index: 3, total: 12 },
+      onPrev: () => { stepped = 'prev'; },
+      onNext: () => { stepped = 'next'; },
+    }));
+    check('the header says where you are in the list', /3 of 12/.test($('.review-step').textContent), $('.review-step').textContent);
+    const steps = $$('.review-step button');
+    check('with a way to each neighbour', steps.length === 2);
+    await click(steps[1]);
+    check('and the next one goes forward', stepped === 'next', String(stepped));
+    await click(steps[0]);
+    check('the previous one goes back', stepped === 'prev', String(stepped));
+    // At the ends there is nowhere to go, and it says so rather than doing
+    // nothing when pressed.
+    await render(mdThread(one(FIXTURES.pair), { position: { index: 1, total: 3 }, onNext: () => {} }));
+    check('the first review cannot step back', $$('.review-step button')[0].disabled === true);
+    check('but can step forward', $$('.review-step button')[1].disabled === false);
+    // No list to step through, no control.
+    await render(mdThread(one(FIXTURES.pair)));
+    check('a thread with no list around it shows no stepper', !$('.review-step'));
+    {
+      const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
+      check('the app binds option-arrow to stepping', /e\.altKey/.test(app) && /stepReviewRef\.current\?\.\(to\)/.test(app));
+      check('only while the reader is open', /reviewPresentationRef\.current === 'inspector'/.test(app));
+      check('and not when a modifier that means something else is held', /!e\.metaKey/.test(app) && /!e\.ctrlKey/.test(app));
+    }
   }
 
   // ------------------------------------------------------------------

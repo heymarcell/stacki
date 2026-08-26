@@ -3600,6 +3600,13 @@ export default function App() {
   // nothing about the content decides between them: 'index' is the list,
   // 'inspector' is the reader. Which one you get depends on what you clicked,
   // never on how long the conversation is.
+  // Handles onto functions declared further down, so a statement up here can
+  // reach one without moving its declaration — and everything it closes over —
+  // to the top of the component.
+  const openReviewRef = useRef(null);
+  const focusReviewFromUiRef = useRef(null);
+  const stepReviewRef = useRef(null);
+
   const [reviewSelectedId, setReviewSelectedId] = useState(null);
   const [reviewPresentation, setReviewPresentation] = useState('index');
   // What a pin is showing on hover or focus, and which cluster is asking.
@@ -4548,6 +4555,7 @@ export default function App() {
       setReviewTick((n) => n + 1);
     }
   };
+  focusReviewFromUiRef.current = focusReviewFromUi;
 
   // --- the shortcuts --------------------------------------------------------
 
@@ -4580,10 +4588,39 @@ export default function App() {
   /** Out of the reader, back to the list — still on the same review. */
   const backToIndex = useCallback(() => setReviewPresentation('index'), []);
 
+  /**
+   * The neighbours of the review being read, in the order the list shows them.
+   *
+   * Triaging a page of feedback is a sequence. Without this, working through
+   * eight comments means eight trips back to the index — and the index is
+   * exactly the thing you have already finished with.
+   */
+  const reviewStep = useMemo(() => {
+    if (!reviewSelectedId) return null;
+    const at = reviewRows.findIndex((r) => r.id === reviewSelectedId);
+    if (at < 0) return null;
+    return {
+      index: at + 1,
+      total: reviewRows.length,
+      prev: at > 0 ? reviewRows[at - 1].id : null,
+      next: at < reviewRows.length - 1 ? reviewRows[at + 1].id : null,
+    };
+  }, [reviewRows, reviewSelectedId]);
+  const reviewStepRef = useRef(reviewStep);
+  reviewStepRef.current = reviewStep;
+
+  /** Go to a neighbour, and take the canvas with you. */
+  const stepReview = useCallback((id) => {
+    if (!id) return;
+    openReviewRef.current?.(id);
+    const picked = allReviewsRef.current.find((r) => r.id === id);
+    if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUiRef.current?.(picked);
+  }, []);
+  stepReviewRef.current = stepReview;
+
   // Reached from submitComment, which is declared above this. A ref rather
   // than a reorder: moving the declaration would mean moving everything it
   // closes over with it.
-  const openReviewRef = useRef(null);
   openReviewRef.current = openReview;
 
   const reviewSelected = reviewSelectedId ? allReviews.find((r) => r.id === reviewSelectedId) || null : null;
@@ -4630,10 +4667,27 @@ export default function App() {
         setPinsVisible((v) => !v);
         return;
       }
+      // ⌥↑ / ⌥↓ step through the reviews while the reader is open, the way an
+      // editor moves between problems. Triaging a page of feedback is a
+      // sequence, and going back to the index between every item turns eight
+      // reviews into sixteen navigations. Only while reading, and only with
+      // Option held, so nothing here competes with typing a reply.
+      if (
+        e.altKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        (e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+        reviewPresentationRef.current === 'inspector'
+      ) {
+        const step = reviewStepRef.current;
+        const to = e.key === 'ArrowDown' ? step?.next : step?.prev;
+        if (to) {
+          e.preventDefault();
+          stepReviewRef.current?.(to);
+          return;
+        }
+      }
       if (e.key === 'Escape') {
-        // One rung at a time: out of the reader, then not that element, then
-        // not commenting. A thread opened from its pin closes first, since
-        // that is what is in the way.
         // One rung at a time, outermost first: the chooser, then the reader,
         // then the selection itself, then comment mode. Each Escape undoes the
         // last thing that happened rather than everything at once.
@@ -5013,6 +5067,9 @@ export default function App() {
                 resizable={reviewShape.mode === 'docked'}
                 onWidthChange={saveInspectorWidth}
                 onBack={backToIndex}
+                position={reviewStep ? { index: reviewStep.index, total: reviewStep.total } : null}
+                onPrev={reviewStep?.prev ? () => stepReview(reviewStep.prev) : null}
+                onNext={reviewStep?.next ? () => stepReview(reviewStep.next) : null}
                 actorId={reviewShared?.identity?.actorId || null}
                 pinned={!withheldPins?.has(reviewSelected.id)}
                 busy={reviewBusyId === reviewSelected.id}

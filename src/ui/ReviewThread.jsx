@@ -255,6 +255,14 @@ export default function ReviewThread({
   // Back to the Comments index. The Inspector is a detail surface and every
   // detail surface needs a way out that is not "close everything".
   onBack = null,
+  // Moving through the reviews without going back to the list for each one.
+  // Every mature review tool has this — Figma's ‹ › in a comment, VS Code's
+  // next problem, GitHub's next file — because triaging a page of feedback is
+  // a sequence, and making somebody return to an index between every item
+  // turns eight reviews into sixteen navigations.
+  onPrev = null,
+  onNext = null,
+  position = null,
   // The unsent reply, held by whoever owns the Inspector rather than by this
   // component. It has to outlive the thread being swapped underneath it:
   // typing half a reply, going to look at another review and coming back to
@@ -390,6 +398,33 @@ export default function ReviewThread({
             whatever an agent was asked to fix. */}
         {review.number != null && <span className="review-number">#{review.number}</span>}
         <span className="review-head-title">{titleOf(review)}</span>
+        {position && (
+          <span className="review-step">
+            <button
+              type="button"
+              className="review-x"
+              onClick={onPrev}
+              disabled={!onPrev}
+              title="Previous comment (⌥↑)"
+              aria-label="Previous comment"
+            >
+              ‹
+            </button>
+            <span className="review-step-n" aria-live="polite">
+              {position.index} of {position.total}
+            </span>
+            <button
+              type="button"
+              className="review-x"
+              onClick={onNext}
+              disabled={!onNext}
+              title="Next comment (⌥↓)"
+              aria-label="Next comment"
+            >
+              ›
+            </button>
+          </span>
+        )}
         {onFocus && !orphaned && (
           <button className="review-locate" onClick={onFocus} disabled={busy} title="Go to it on the page">
             Locate

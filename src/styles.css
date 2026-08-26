@@ -1532,6 +1532,18 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Where you are in the list, and the way to the next one. Quiet: it is
+   navigation, not a decision about the review. */
+.review-step { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+.review-step .review-x { padding: 1px 4px; font-size: 14px; line-height: 1; }
+.review-step-n {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 0 2px;
+  white-space: nowrap;
+}
+
 .review-locate {
   padding: 3px 8px;
   font-size: 11px;
@@ -5960,36 +5972,63 @@ textarea::selection {
   filter: brightness(1.15);
   z-index: 8;
 }
-/* The one being read sits above its neighbours. In a cluster of four the
-   selected marker being drawn underneath one of the others is how somebody
-   ends up sure they clicked the wrong comment. */
-.review-pin.open { z-index: 9; }
+/* The one being read.
+
+   Status and selection are two different facts and are carried by two
+   different things: the FILL says what state the review is in, the RING says
+   this is the one you are looking at. A selected open pin does not turn green,
+   and a selected resolved pin stays green and gains a ring — which is why the
+   ring is the accent in both cases rather than the status colour.
+
+   It also sits above its neighbours: in a cluster of four, the selected marker
+   drawn underneath one of the others is how somebody ends up sure they clicked
+   the wrong comment. */
+.review-pin.open {
+  z-index: 9;
+  transform: translate(-4px, -100%) scale(1.06);
+  box-shadow: 0 0 0 3px rgba(0, 153, 255, 0.32), 0 5px 16px rgba(0, 0, 0, 0.42);
+}
+.review-pin.open:hover:not(:disabled) {
+  transform: translate(-4px, -100%) scale(1.12);
+  box-shadow: 0 0 0 3px rgba(0, 153, 255, 0.32), 0 5px 16px rgba(0, 0, 0, 0.42);
+}
 .review-pin:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* A cluster is neutral, because its members can be in different states and
+   wearing one of them would be a claim about all of them. */
+.review-pin.many {
+  background: #3f4347;
+  border-color: rgba(255, 255, 255, 0.92);
+}
+.review-pin.many:hover:not(:disabled) { background: #4a5055; filter: none; }
 /* Deliberately not being done now: hollow, in the same colour. Shape carries
    the state so the colour can stay the person's own.
    White, not the editor's panel colour — this marker sits over somebody's
    WEBSITE, which is usually light, and a dark fill there reads as a solid
    blob rather than as an outline. */
+/* Colour has a job here, and for anything other than an open review the job is
+   the state. The person's own colour is their grouping and applies while a
+   review is open — which is nearly all of them; once a decision has been made
+   about one, what it IS matters more than which pile they filed it in, and
+   Stacki already worked this way for resolved reviews.
+
+   Deliberately not being done now: hollow, so the shape says so too, in the
+   grey the panel and the dots use for deferred. */
 .review-pin.is-deferred {
   background: #fff;
-  color: var(--pin, var(--accent));
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px var(--pin, var(--accent));
+  color: #7d7d82;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px #7d7d82;
 }
 .review-pin.is-deferred:hover:not(:disabled) { background: #fff; filter: none; }
-/* Done. Shown only when the panel is showing resolved reviews, and shown
-   quietly when it is: grey rather than the person's colour, and faded, so a
-   page being checked over reads as "here is where that was" instead of as a
-   page full of outstanding work. Full strength on hover, because at that point
-   it is the one being looked at. */
+/* Done. Only ever on the page while it is the one being read — see
+   src/reviewPins.js — so there is no reason to fade it: at that moment it is
+   the thing somebody is looking for. Green, which is what resolved means
+   everywhere else in this UI. */
 .review-pin.is-resolved {
-  background: #6b7280;
+  background: #30c158;
   color: #fff;
-  opacity: 0.5;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
 }
-.review-pin.is-resolved:hover:not(:disabled) { background: #6b7280; opacity: 1; filter: none; }
-.review-pin.is-resolved.open { opacity: 1; }
-.review-pin.open { outline: 2px solid var(--pin, var(--accent)); outline-offset: 2px; }
+.review-pin.is-resolved:hover:not(:disabled) { background: #30c158; filter: none; }
 /* The number, sat on the pin's OPTICAL centre rather than the centre of its
    box. The two are not the same here: three corners are full quarter-circles
    and the fourth — the tail, bottom-left — is nearly square, so the shape
@@ -6103,6 +6142,24 @@ textarea::selection {
 .review-cluster.flip-x { transform: translate(calc(-100% - 14px), 10px); }
 .review-cluster.flip-y { transform: translate(14px, calc(-100% - 10px)); }
 .review-cluster.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 10px)); }
+/* The pointer, which has to stay attached to the marker this list belongs to.
+   It moves to the other side when the box flips, because a chooser that
+   detached from its pin would be a list of comments about nothing in
+   particular. */
+.review-cluster::before {
+  content: '';
+  position: absolute;
+  top: 16px;
+  width: 9px;
+  height: 9px;
+  background: var(--bg-panel-2);
+  border-left: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+}
+.review-cluster:not(.flip-x)::before { left: -5px; transform: rotate(-45deg); }
+.review-cluster.flip-x::before { right: -5px; transform: rotate(135deg); }
+/* Flipped upward, the pointer belongs at the bottom edge instead. */
+.review-cluster.flip-y::before { top: auto; bottom: 16px; }
 .review-cluster-title {
   padding: 6px 9px 7px;
   font-size: 10px;
