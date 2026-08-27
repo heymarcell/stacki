@@ -2136,6 +2136,49 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('an arrow key moves the active row', $$('.review-cluster-row')[1].className.includes('on'));
     await click($$('.review-cluster-row')[1]);
     check('and choosing it picks that review', picked === 'rt_21', String(picked));
+
+    // A pointer says what it is over. It does not say where the keyboard is.
+    //
+    // Hovering a row used to set `active`, and an effect on `active` called
+    // .focus() — so moving the mouse across this list walked KEYBOARD focus
+    // down it, one row at a time, under somebody who had not touched the
+    // keyboard. Anyone mid-Tab lost their place to a stray pointer, and a
+    // screen reader followed the mouse rather than the person reading with it.
+    const rowsOf = () => $$('.review-cluster-row');
+    await act(async () => {
+      rowsOf()[0].focus();
+    });
+    check('a row takes keyboard focus', document.activeElement === rowsOf()[0]);
+    check('and the marked row is the focused one', rowsOf()[0].className.includes('on'));
+    await act(async () => {
+      // What React builds onMouseEnter out of.
+      const over = rowsOf()[2];
+      over.dispatchEvent(new dom.window.MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+      over.dispatchEvent(new dom.window.MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+    });
+    check(
+      'hovering another row leaves keyboard focus where it was',
+      document.activeElement === rowsOf()[0],
+      String(document.activeElement && document.activeElement.className)
+    );
+    check(
+      'and leaves the marked row alone with it',
+      rowsOf()[0].className.includes('on') && !rowsOf()[2].className.includes('on')
+    );
+    // …while asking for the move, explicitly, still moves it.
+    await press('ArrowDown');
+    check(
+      'an arrow key does move keyboard focus',
+      document.activeElement === rowsOf()[1],
+      String(document.activeElement && document.activeElement.className)
+    );
+    check('and the marking follows the focus', rowsOf()[1].className.includes('on'));
+    await press('ArrowUp');
+    check(
+      'and back again the other way',
+      document.activeElement === rowsOf()[0] && rowsOf()[0].className.includes('on')
+    );
+
     closed = false;
     await press('Escape');
     check('Escape closes it', closed === true);

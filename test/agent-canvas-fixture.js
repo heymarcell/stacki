@@ -31,6 +31,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { ownedTempDir, releaseTempDir, sweepStaleRuns } = require('./support/ownedTemp.js');
 
 const CACHE =
   process.env.STACKI_CANVAS_CACHE || path.join(os.tmpdir(), 'stacki-canvas-astro-cache');
@@ -69,6 +70,11 @@ const FILES = {
 
 .hero h1 {
   font-size: 40px;
+}
+
+.section-title {
+  margin: 24px 0 8px;
+  font-size: 20px;
 }
 `,
 
@@ -137,6 +143,18 @@ import '../styles/site.css';
 </html>
 `,
 
+  // A heading the PAGE owns.
+  //
+  // Everything else on this page is a component — Hero, Card, Panel — and a
+  // rendered node inside a component resolves to the component's usage in the
+  // file that is open, because that is the outermost thing the open file owns.
+  // So index.astro had nothing inner and source-backed of its own, and a review
+  // left anywhere on it anchored to <Hero> or <Base>. Removing one of those to
+  // make an orphan removes the page.
+  //
+  // One heading fixes that: something narrow, declared here, that can be cut
+  // out while the pricing cards and the panel carry on rendering. See
+  // 20-orphaned-review in test/review-ux-export.js.
   'src/pages/index.astro': `---
 import Base from '../layouts/Base.astro';
 import Hero from '../components/Hero.astro';
@@ -153,6 +171,7 @@ const plans = [
 ---
 <Base>
   <Hero heading={site.tagline} />
+  <h2 class="section-title">Plans</h2>
   <div class="pricing-grid">
     {plans.map((plan) => (
       <Card title={plan.title} body={plan.body} />
@@ -195,16 +214,13 @@ function ensureAstro({ log = () => {} } = {}) {
 const astroCached = () => fs.existsSync(path.join(CACHE, 'node_modules', 'astro', 'package.json'));
 
 /** Write the project, with node_modules copied in from the cache. */
-function makeCanvasProject({ log = () => {} } = {}) {
+function makeCanvasProject({ log = () => {}, harness = 'canvas-fixture' } = {}) {
   ensureAstro({ log });
-  // Resolved, because on macOS os.tmpdir() is under /var, which is a symlink to
-  // /private/var. Vite resolves module ids to real paths, so a project opened
-  // at the symlinked spelling has a dev server whose ids never match the paths
-  // the marker plugin is comparing against — and the page renders perfectly
-  // with no markers in it at all, which looks like a broken canvas rather than
-  // a fixture in an unusual place. Somebody's actual project is not under a
-  // symlink; this makes the fixture ordinary in the same way.
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-canvas-')));
+  // Marked as this run's, so a harness starting up beside this one can tell
+  // the difference between a fixture in use and a fixture left by a run that
+  // died. See test/support/ownedTemp.js — the prefix alone used to be the
+  // whole test, and `stacki-canvas-` is the prefix every canvas harness uses.
+  const root = ownedTempDir('stacki-canvas-', { harness });
   for (const [rel, body] of Object.entries(FILES)) {
     const full = path.join(root, rel);
     fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -220,49 +236,7 @@ function makeCanvasProject({ log = () => {} } = {}) {
   return root;
 }
 
-/**
- * Clear what previous runs of this harness left in the temp directory.
- *
- * Two things end up there that teardown cannot remove. Electron rewrites a
- * small userData directory during shutdown — after the harness has deleted it
- * and checked it is gone — so one reappears per run. And a run that was killed
- * mid-flight never got to its teardown at all.
- *
- * Neither is large, and that is the problem: they accumulate quietly, one per
- * run, until somebody wonders where their disk went. Sweeping at startup keeps
- * the count at one rather than at however many times the tests have been run.
- *
- * The astro cache is deliberately spared — it is what stops every run
- * reinstalling astro.
- */
-function sweepStaleRuns(prefixes = []) {
-  const dir = os.tmpdir();
-  const swept = [];
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir);
-  } catch {
-    return swept;
-  }
-  for (const name of entries) {
-    if (name.includes('astro-cache')) continue;
-    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
-    try {
-      fs.rmSync(path.join(dir, name), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-      swept.push(name);
-    } catch {
-      /* something else is using it; leave it alone */
-    }
-  }
-  return swept;
-}
-
-const removeCanvasProject = (root) => {
-  try {
-    fs.rmSync(root, { recursive: true, force: true });
-  } catch {
-    /* a temp folder that will not go is not a test failure */
-  }
-};
+/** A project this run made, removed by the run that made it. */
+const removeCanvasProject = (root) => releaseTempDir(root);
 
 module.exports = { makeCanvasProject, removeCanvasProject, ensureAstro, astroCached, sweepStaleRuns, FILES, CACHE };

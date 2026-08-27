@@ -24,8 +24,10 @@
 // at all.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const Module = require('module');
+const { execFileSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -125,6 +127,68 @@ for (const entry of unpackedFiles) {
       'add it to build.asarUnpack; a module beside the archive cannot require one inside it'
     );
   }
+}
+
+// ── …and the closure has to LOAD out there, not merely be named ─────────────
+//
+// The walk above is a regex over the source: it sees `require('./htmlText')`
+// and nothing else. A specifier built at runtime, a JSON file, a directory
+// resolved through its index — none of them are in it, and each is a module
+// that could be missing from beside the archive with every static check above
+// still passing. Naming is not loading.
+//
+// So the unpacked files are copied into an empty directory and required there,
+// in a plain node process. That directory IS the packaged condition:
+// app.asar.unpacked holds exactly what asarUnpack names and nothing else, and
+// the Astro dev server — plain Node, which cannot read inside the archive — has
+// only that to work with. Anything the entry reaches for that is not there
+// throws here, in this suite, instead of in another process nobody is watching.
+
+check(
+  'the parser the preview config requires is the one that gets unpacked',
+  /astroParser\.js/.test(fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8')),
+  'main.js no longer names it — has the generated config stopped requiring it?'
+);
+
+/** Empty stderr if the entry loads with only its unpacked closure around it. */
+const loadsAlone = (entry) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-packaging-closure-'));
+  try {
+    for (const needed of reachable(entry)) {
+      const neededRel = path.relative(root, needed);
+      // Only what asarUnpack actually names. Anything else is still inside the
+      // archive as far as the dev server is concerned, which is the point.
+      if (!unpacked.includes(neededRel)) continue;
+      const to = path.join(dir, neededRel);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.copyFileSync(needed, to);
+    }
+    execFileSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(dir, path.relative(root, entry)))})`], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    return '';
+  } catch (err) {
+    return String(err.stderr || err.message).split('\n').find((l) => /Error/.test(l)) || 'it threw';
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+// One of them has to reach further than itself, or the walk above is reporting
+// success over nothing. The leaves of the closure — htmlText is one — are
+// rightly lone files; the entry the dev server loads is not.
+check(
+  'an unpacked entry pulls in more than itself, so there is a closure to check',
+  unpackedFiles.some((entry) => reachable(entry).size > 1),
+  unpackedFiles.map((e) => `${path.relative(root, e)}: ${reachable(e).size}`).join(', ')
+);
+
+for (const entry of unpackedFiles) {
+  const rel = path.relative(root, entry);
+  const error = loadsAlone(entry);
+  check(`${rel} loads beside the archive, with only what asarUnpack names around it`, !error, error);
 }
 
 // ── Everything the main process requires is actually shipped ────────────────
