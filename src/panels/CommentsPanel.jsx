@@ -1,6 +1,7 @@
 import React from 'react';
 import { ReviewWhere, ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
 import { SharedReviewsBar, SharedReviewsDialog } from '../ui/SharedReviews.jsx';
+import { SecureShareRow, SecureShareDialog } from '../ui/SecureShare.jsx';
 import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
 
 // The comments panel.
@@ -78,10 +79,24 @@ export default function CommentsPanel({
   onShareJoin,
   onShareDisable,
   onShareInvite,
+  onSecureCreate,
+  onSecureInvite,
+  onSecureLeave,
+  onSecureEnd,
+  onSecureRelay,
+  onCopy,
   onRename,
   syncing = false,
 }) {
   const [setUp, setSetUp] = React.useState(false);
+  // Which face of the secure dialog to open on: `create` from the Share… row,
+  // `manage` from a share that already exists.
+  const [shareMode, setShareMode] = React.useState(null);
+
+  // A project shared through the old plaintext service keeps the old row and
+  // the old dialog, unchanged. Everything else — which is every project
+  // nobody has already set one up on — gets Secure Share.
+  const legacy = shared?.mode === 'legacy';
 
   return (
     <div className="panel-section grow comments-panel">
@@ -105,7 +120,7 @@ export default function CommentsPanel({
         </div>
       </div>
 
-      {shared && (
+      {shared && legacy && (
         <SharedReviewsBar
           shared={shared}
           busy={syncing}
@@ -115,7 +130,17 @@ export default function CommentsPanel({
         />
       )}
 
-      {setUp && shared && (
+      {shared && !legacy && (
+        <SecureShareRow
+          shared={shared}
+          busy={syncing}
+          onShare={() => setShareMode('create')}
+          onManage={() => setShareMode('manage')}
+          onRetry={() => onSync?.('retry')}
+        />
+      )}
+
+      {setUp && shared && legacy && (
         <SharedReviewsDialog
           shared={shared}
           localCount={totalCount}
@@ -125,6 +150,29 @@ export default function CommentsPanel({
           onDisable={onShareDisable}
           onInvite={onShareInvite}
           onRename={onRename}
+        />
+      )}
+
+      {shareMode && shared && !legacy && (
+        <SecureShareDialog
+          shared={shared}
+          localCount={totalCount}
+          mode={shareMode}
+          onClose={() => setShareMode(null)}
+          onCreate={onSecureCreate}
+          onInvite={onSecureInvite}
+          onLeave={async (...args) => {
+            const result = await onSecureLeave?.(...args);
+            if (result?.ok) setShareMode(null);
+            return result;
+          }}
+          onEnd={async (...args) => {
+            const result = await onSecureEnd?.(...args);
+            if (result?.ok) setShareMode(null);
+            return result;
+          }}
+          onRelay={onSecureRelay}
+          onCopy={onCopy}
         />
       )}
 

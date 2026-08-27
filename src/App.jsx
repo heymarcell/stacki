@@ -35,6 +35,7 @@ import GitChip from './panels/GitChip.jsx';
 import HistoryPanel, { relativeTime } from './panels/HistoryPanel.jsx';
 import { ConfirmHost, confirmDialog } from './ui/ConfirmDialog.jsx';
 import McpDialog from './ui/McpDialog.jsx';
+import { JoinShareDialog } from './ui/SecureShare.jsx';
 import { mergeBranchAction, deleteBranchAction } from './gitActions.js';
 import LeftRail from './ui/LeftRail.jsx';
 import CodeWindow from './ui/CodeWindow.jsx';
@@ -3647,6 +3648,10 @@ export default function App() {
   // separately, so the panel and the reviews can never describe different
   // moments.
   const [reviewShared, setReviewShared] = useState(null);
+  // An invitation somebody opened from a link. Set by the main process, never
+  // by anything in here, and it carries what the dialog draws rather than the
+  // capability itself — that stays in the main process until Join is pressed.
+  const [pendingInvite, setPendingInvite] = useState(null);
   const [reviewSyncing, setReviewSyncing] = useState(false);
   const [pinsVisible, setPinsVisible] = useState(true);
   const [pinsHidden, setPinsHidden] = useState(0);
@@ -3949,6 +3954,69 @@ export default function App() {
     if (!window.avb.reviewsSharedInvite) return needsRestart();
     return window.avb.reviewsSharedInvite({});
   };
+
+  // --- Secure Share ---------------------------------------------------------
+  //
+  // Every one of these is something a person did in this window. None of them
+  // is reachable from MCP or the Agent API, and the invitation that comes back
+  // from `secureInvite` lives in the dialog's own state for as long as the
+  // dialog is open and nowhere else — see §61.
+
+  const secureCreate = async (args) => {
+    if (!window.avb.reviewsSecureEnable) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSecureEnable(args || {}));
+  };
+  const secureInvite = async () => {
+    if (!window.avb.reviewsSecureInvite) return needsRestart();
+    return window.avb.reviewsSecureInvite({});
+  };
+  const secureLeave = async () => {
+    if (!window.avb.reviewsSecureLeave) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSecureLeave());
+  };
+  const secureEnd = async () => {
+    if (!window.avb.reviewsSecureEnd) return needsRestart();
+    return afterShareChange(await window.avb.reviewsSecureEnd());
+  };
+  const secureRelay = async (args) => {
+    if (!window.avb.reviewsSecureRelay) return needsRestart();
+    const result = await window.avb.reviewsSecureRelay(args || {});
+    if (result?.ok) {
+      const status = await window.avb.reviewsShared?.();
+      if (status?.shared) setReviewShared(status.shared);
+    }
+    return result;
+  };
+  const secureJoin = async (args) => {
+    if (!window.avb.reviewsSecureJoin) return needsRestart();
+    const result = afterShareChange(await window.avb.reviewsSecureJoin(args || {}));
+    if (result?.ok) setPendingInvite(null);
+    return result;
+  };
+  const secureCancelJoin = () => {
+    setPendingInvite(null);
+    void window.avb.reviewsSecureCancelJoin?.();
+  };
+
+  /** Put something on the clipboard. False when the browser refused. */
+  const copyToClipboard = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // A clipboard that refuses is not worth an error message — the caller
+      // shows the link on screen either way.
+      return false;
+    }
+  };
+
+  // An invitation arrived from the operating system. The main process has
+  // already refused anything that is not exactly a capability; what lands here
+  // is what the dialog needs to draw, and a person still has to press Join.
+  useEffect(() => {
+    if (!window.avb.onReviewInvite) return undefined;
+    return window.avb.onReviewInvite((invite) => setPendingInvite(invite || null));
+  }, []);
   const renameSelf = async (displayName) => {
     if (!window.avb.reviewsSetIdentity) return needsRestart();
     const result = await window.avb.reviewsSetIdentity({ displayName });
@@ -5229,6 +5297,12 @@ export default function App() {
                 onShareJoin={shareJoin}
                 onShareDisable={shareDisable}
                 onShareInvite={shareInvite}
+                onSecureCreate={secureCreate}
+                onSecureInvite={secureInvite}
+                onSecureLeave={secureLeave}
+                onSecureEnd={secureEnd}
+                onSecureRelay={secureRelay}
+                onCopy={copyToClipboard}
                 onRename={renameSelf}
                 hiddenPins={pinsHidden}
                 pinsVisible={pinsVisible}
@@ -5772,6 +5846,16 @@ export default function App() {
       {toast && <Toast toast={toast} />}
       <ConfirmHost />
       {mcpStatus && <McpDialog status={mcpStatus} onClose={() => setMcpStatus(null)} />}
+      {/* An invitation somebody opened. Above everything, because it is the
+          one thing in the app that arrived from outside it — and never
+          automatic: this dialog IS what a deep link does. */}
+      {pendingInvite && (
+        <JoinShareDialog
+          invite={{ ...pendingInvite, localCount: allReviews.length }}
+          onJoin={secureJoin}
+          onCancel={secureCancelJoin}
+        />
+      )}
     </div>
   );
 }
