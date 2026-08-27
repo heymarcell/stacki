@@ -387,8 +387,25 @@ require('../electron/main.js');
     { timeout: 30000 }
   );
   check('and the rendered page picks it up', grew.computed.gap === '48px', short(grew.computed?.gap));
-  const afterShot = await capture({ target: 'selection', paddingPx: 0 });
-  check('and a capture after it is a different picture', (afterShot.meta.pixelSize?.width || 0) !== widthBefore || afterShot.meta.bytes !== beforeShot.meta.bytes, short({ before: widthBefore, after: afterShot.meta.pixelSize?.width }));
+  // Asked until it answers, not once. The computed style is updated before the
+  // frame carrying it has necessarily been painted, so a single capture here
+  // can photograph the layout from before the edit — which showed up as this
+  // check failing inside `npm test` and passing every time on its own. The
+  // grid keeps its own width when the gap changes, so bytes are the difference.
+  let afterShot = beforeShot;
+  let redrawn = false;
+  for (const deadline = Date.now() + 15000; Date.now() < deadline; ) {
+    afterShot = await capture({ target: 'selection', paddingPx: 0 });
+    redrawn =
+      (afterShot.meta.pixelSize?.width || 0) !== widthBefore || afterShot.meta.bytes !== beforeShot.meta.bytes;
+    if (redrawn) break;
+    await wait(300);
+  }
+  check(
+    'and a capture after it is a different picture',
+    redrawn,
+    short({ width: [widthBefore, afterShot.meta.pixelSize?.width], bytes: [beforeShot.meta.bytes, afterShot.meta.bytes] })
+  );
 
   // --- 6. Bound content ----------------------------------------------------
 
