@@ -526,6 +526,29 @@ async function main() {
   check('a room that cannot be decrypted is simply not there', hostile.get(freshRoom.room.roomId) === null);
   check('and does not take the whole registry with it', Array.isArray(hostile.all()) && hostile.all().length === 0);
 
+  // --- posting never waits for the network -----------------------------------
+  //
+  // The event is in the ledger and in the outbox before anything is sent, and
+  // it is sent without anybody pressing anything. The scheduling itself lives
+  // in electron/review/index.js, which needs Electron to load; what is checked
+  // here is the property that makes it safe — a write is complete locally
+  // whether or not the network is there at all.
+  const posting = makePerson('posting', ALICE);
+  const postingRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: posting.rooms });
+  posting.roomId = postingRoom.room.roomId;
+  posting.rooms.link(scopeKey(posting.project), posting.roomId);
+  posting.store.enableShared({ workspaceId: posting.roomId, publishExisting: false });
+
+  const started = Date.now();
+  const written = startReview(posting, 'written without waiting');
+  const took = Date.now() - started;
+  check('writing a comment does not wait for a relay', written.ok !== false && took < 250, `${took}ms`);
+  check('and it is in the ledger immediately', JSON.stringify(posting.store.all()).includes('written without waiting'));
+  check('and in the outbox, waiting to go', posting.store.shared.pending >= 2, `${posting.store.shared.pending}`);
+
+  await sync(posting);
+  check('and the outbox drains when a sync happens', posting.store.shared.pending === 0, `${posting.store.shared.pending}`);
+
   // --- relay choice ----------------------------------------------------------
 
   check('the default relay is used when nothing is chosen', relayFor({ env: {} }) === DEFAULT_RELAY);

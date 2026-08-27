@@ -106,12 +106,51 @@ let mintRef = () => null;
 
 const noProject = () => ({ ok: false, code: 'no_project', message: 'No project is open in Stacki.' });
 
+// How long to wait after a comment is written before sending it.
+//
+// Long enough that typing a reply and immediately resolving the thread is one
+// request rather than two, short enough that nobody watches a spinner. This is
+// what replaces the Sync button: a healthy secure share sends on its own, and
+// a share that needs a person to press something is a share that is not
+// working — which the row says, with a Retry.
+const WRITE_SYNC_MS = 1200;
+let writeSync = null;
+
+/**
+ * Something was written; send it shortly.
+ *
+ * In the main process rather than the panel, so it covers every way an event
+ * gets written — the panel, an MCP tool, an agent — rather than only the one
+ * the renderer knows about. Coalesced to one timer, and it does nothing at all
+ * unless there is something waiting to go.
+ *
+ * Secure shares only. A legacy workspace keeps the Sync button it has always
+ * had; changing when an existing plaintext workspace talks to its server is
+ * not this feature's business.
+ */
+function scheduleWriteSync() {
+  if (!room || !store?.shared?.pending) return;
+  if (writeSync) return;
+  writeSync = setTimeout(() => {
+    writeSync = null;
+    void syncNow('write');
+  }, WRITE_SYNC_MS);
+  writeSync.unref?.();
+}
+
+const cancelWriteSync = () => {
+  if (writeSync) clearTimeout(writeSync);
+  writeSync = null;
+};
+
 function announce(revision) {
   try {
     sendToWindow?.('reviews:changed', { revision });
   } catch {
     /* the window went away; the next open reads from disk anyway */
   }
+  // A write is the one moment a secure share has something to send.
+  scheduleWriteSync();
 }
 
 /** This installation's own person, made on first need and then kept. */
@@ -127,6 +166,7 @@ function openProject(next) {
   if (!resolved || !userData) return null;
   if (store && projectPath === resolved) return store;
   // The previous project's last write must land before its store is dropped.
+  cancelWriteSync();
   store?.flushSync();
   projectPath = resolved;
   checkout = createCheckout({ projectPath: resolved });
@@ -160,6 +200,7 @@ function openProject(next) {
 
 /** Nothing is open. The ledger is closed, not emptied. */
 function closeProject() {
+  cancelWriteSync();
   store?.flushSync();
   store = null;
   projectPath = null;
@@ -918,6 +959,7 @@ function attach(parts = {}) {
 
 /** Everything scheduled, on disk, before the process goes. */
 function flushSync() {
+  cancelWriteSync();
   store?.flushSync();
 }
 

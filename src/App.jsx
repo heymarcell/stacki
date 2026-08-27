@@ -3896,9 +3896,12 @@ export default function App() {
 
   // --- sharing --------------------------------------------------------------
   //
-  // Three moments talk to a server and no others: opening a shared project
-  // (the main process does that one), pressing Sync, and coming back to the
-  // window after a while. There is no poll and no socket — see
+  // Four moments talk to a server and no others: opening a shared project,
+  // writing something (debounced, and only on a secure share), coming back to
+  // the window after a while, and pressing Retry on a share that has stopped.
+  // The first two are the main process's — see scheduleWriteSync in
+  // electron/review/index.js, which covers writes from an agent as well as
+  // from this panel. There is no poll and no socket; see
   // electron/review/sync.js for why that is a decision rather than a gap.
   const syncReviews = useCallback(
     async (reason = 'manual') => {

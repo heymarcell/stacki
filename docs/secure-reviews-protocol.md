@@ -408,6 +408,30 @@ A client that sees a higher cursor runs an ordinary HTTP sync. **No review data
 travels over the WebSocket.** There is one synchronisation protocol; this is a
 doorbell. If the socket never connects, everything still works.
 
+**Stacki's own desktop client does not use it yet.** Both relays implement it
+and both are conformance-tested on it, but Electron 33 bundles Node 20.18,
+which has no `WebSocket` — and closing that gap would mean either a new runtime
+dependency or a hand-written RFC 6455 client, for something this document
+already calls an optimisation. Upgrading Electron for an API convenience is
+explicitly not on the table. So the endpoint is part of the protocol and
+available to any client that can speak it; Stacki catches up when a project is
+opened, when something is written locally (debounced), and when the window
+regains focus. Nothing is lost by the socket's absence — only latency.
+
+### When Stacki syncs
+
+| moment | direction |
+|---|---|
+| a shared project is opened | push then pull |
+| a comment is written, edited, resolved (after ~1.2 s) | push then pull |
+| the window regains focus (at most once a minute) | push then pull |
+| the person presses Retry on a paused share | push then pull |
+
+Posting never waits for the network: an event is written to the local ledger
+and put in the outbox first, and the outbox drains whenever one of the above
+happens. This is why a healthy secure share has no Sync button — and why one
+that is not healthy grows a Retry.
+
 ---
 
 ## 15. Limits

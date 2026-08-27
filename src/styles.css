@@ -7054,14 +7054,20 @@ textarea::selection {
 .share-body .dim { color: var(--text-dim); font-size: 11.5px; line-height: 1.5; margin: 0; }
 .share-body .dim.small { font-size: 10.5px; color: var(--text-faint); }
 
-.share-field { display: flex; flex-direction: column; gap: 4px; }
+/* Same reason. It happens to stack correctly as a block, which is exactly the
+   kind of accident that stops being true the moment somebody adds a second
+   child to it. */
+.modal-body label.share-field { display: flex; flex-direction: column; gap: 4px; }
 .share-field > span { font-size: 10.5px; color: var(--text-faint); }
 .share-field input { width: 100%; }
 
 /* The privacy decision sits with the question rather than after it, and it is
    off. Uploading somebody's back catalogue because a box defaulted to ticked
    is not a mistake that can be taken back. */
-.share-check {
+/* `.modal-body label` wins on specificity and sets `display: block`, which
+   collapses the row and leaves the box jammed against its text — the same trap
+   `.check-row` above already carries a note about. Qualified to beat it. */
+.modal-body label.share-check {
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -7078,7 +7084,7 @@ textarea::selection {
    of it. The result is a control whose box does not match the tick you can
    see, so the 8px gap above lands somewhere invisible and the label ends up
    against the box. Everything is reset here rather than nudged. */
-.share-check input[type='checkbox'] {
+.modal-body label.share-check input[type='checkbox'] {
   width: 13px;
   height: 13px;
   min-width: 13px;
@@ -7092,7 +7098,7 @@ textarea::selection {
 }
 /* The consequence goes on its own line. Run inline it reads as one long
    sentence and the part that matters — what OFF means — disappears into it. */
-.share-check em {
+.modal-body label.share-check em {
   display: block;
   margin-top: 3px;
   color: var(--text-faint);

@@ -443,6 +443,33 @@ app.whenReady().then(async () => {
 
     await click('.share-row .share-link');
     await shot('create-with-comments', `document.querySelector('.share-check')`);
+    // Measured, not eyeballed. The app's global `input` rule is written for
+    // text fields and a checkbox inherits all of it, which once left the label
+    // sitting against the box with the gap landing somewhere invisible.
+    const box = await js(`(() => {
+      const input = document.querySelector('.share-check input');
+      const label = document.querySelector('.share-check span');
+      if (!input || !label) return null;
+      const a = input.getBoundingClientRect();
+      const b = label.getBoundingClientRect();
+      const cs = getComputedStyle(input);
+      const parent = getComputedStyle(input.parentElement);
+      return {
+        gap: Math.round(b.left - a.right),
+        width: Math.round(a.width),
+        height: Math.round(a.height),
+        position: cs.position,
+        display: cs.display,
+        float: cs.cssFloat,
+        parentDisplay: parent.display,
+        parentGap: parent.gap,
+        tag: input.parentElement.tagName,
+        first: input.parentElement.firstElementChild?.tagName,
+      };
+    })()`);
+    check('the consent checkbox has room between it and its label', box && box.gap >= 6, JSON.stringify(box));
+    check('and is the size of a checkbox rather than a text field', box && box.width <= 20 && box.height <= 20, JSON.stringify(box));
+
     const count = await js(`document.querySelector('.share-check')?.textContent || ''`);
     check('the checkbox names how many comments there are', /\d+ existing comment/.test(count), count);
     check('and it is off', await js(`document.querySelector('.share-check input')?.checked === false`));
