@@ -7073,10 +7073,23 @@ textarea::selection {
   color: var(--text-dim);
   cursor: pointer;
 }
-/* `margin: 2px 0 0` rather than `margin-top`, because a checkbox carries the
-   browser's own left and right margins otherwise and the gap above stops
-   being the gap you can see. The same rule the older dialog uses. */
-.share-check input { margin: 2px 0 0; flex-shrink: 0; }
+/* The app's global `input` rule is written for text fields — `width: 100%`,
+   `padding: 6px 8px`, a background and a border — and a checkbox inherits all
+   of it. The result is a control whose box does not match the tick you can
+   see, so the 8px gap above lands somewhere invisible and the label ends up
+   against the box. Everything is reset here rather than nudged. */
+.share-check input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+  min-width: 13px;
+  margin: 2px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 0;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
 /* The consequence goes on its own line. Run inline it reads as one long
    sentence and the part that matters — what OFF means — disappears into it. */
 .share-check em {
@@ -7113,10 +7126,12 @@ textarea::selection {
    paragraph somebody has centred by mistake. So the stacked variant gets a
    border and left-aligned text: three things you can do, that look like it. */
 .share-actions.stacked { flex-direction: column; gap: 6px; }
+/* `justify-content`, not `text-align`: the global button rule is an
+   inline-flex that centres its content, so text-align has nothing to act on. */
 .share-actions.stacked button {
   width: 100%;
   padding: 8px 10px;
-  text-align: left;
+  justify-content: flex-start;
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text);
