@@ -2,7 +2,7 @@
   "name": "stacki",
   "productName": "Stacki",
   "version": "0.1.21",
-  "description": "Stacki \u2014 a visual builder for Astro projects \u2014 pages, layouts, components, props, live preview, and GitHub publishing.",
+  "description": "Stacki — a visual builder for Astro projects — pages, layouts, components, props, live preview, and GitHub publishing.",
   "main": "electron/main.js",
   "author": "Timothy Ricks <hello@timothyricks.com>",
   "license": "MIT",
