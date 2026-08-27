@@ -275,13 +275,23 @@ export function SecureShareDialog({
     }
   };
 
-  const relayLabel = shared?.relay?.label || 'Stacki hosted';
+  // TWO DIFFERENT RELAYS, AND THEY ARE NEVER SHOWN AS ONE.
+  //
+  // `newShareRelay` is where the NEXT share would be created — a preference,
+  // and only meaningful before a room exists. `secure.relay` is where THIS
+  // room actually is, which is fixed for its lifetime: a room cannot move,
+  // because moving it would mean a different secret and a different set of
+  // people who can reach it. Showing the preference in Manage, as this dialog
+  // once did, told somebody their existing encrypted room had moved to a
+  // server it had never been on.
+  const newShareRelayLabel = shared?.newShareRelay?.label || 'Stacki hosted';
+  const currentRelayLabel = shared?.secure?.relay?.label || null;
 
   const relayControls = (
     <>
       <div className="share-relay-now">
-        <span>Relay</span>
-        <strong>{relayLabel}</strong>
+        <span>Relay for new shares</span>
+        <strong>{newShareRelayLabel}</strong>
       </div>
       <label className="share-field">
         <span>Use a custom secure relay</span>
@@ -319,7 +329,7 @@ export function SecureShareDialog({
         >
           Use this relay
         </button>
-        {shared?.relay && !shared.relay.hosted && (
+        {shared?.newShareRelay && !shared.newShareRelay.hosted && (
           <button type="button" className="ghost" disabled={busy} onClick={() => onRelay?.({ relay: null })}>
             Back to Stacki hosted
           </button>
@@ -459,7 +469,10 @@ export function SecureShareDialog({
             <div className="share-facts">
               <div className="share-fact">
                 <span>Relay</span>
-                <strong>{relayLabel}</strong>
+                {/* This room's own relay. Not a control: a share cannot be
+                    moved, and offering to move it would be offering something
+                    that silently means "start again somewhere else". */}
+                <strong>{currentRelayLabel || 'Stacki hosted'}</strong>
               </div>
               <div className="share-fact">
                 <span>People</span>
@@ -543,7 +556,20 @@ export function SecureShareDialog({
             </p>
 
             <Advanced open={advanced} onToggle={() => setAdvanced((v) => !v)}>
-              {relayControls}
+              <div className="share-relay-now">
+                <span>This share’s relay</span>
+                <strong>{currentRelayLabel || 'Stacki hosted'}</strong>
+              </div>
+              {/* No control here on purpose. A share cannot be moved between
+                  relays: the room, its secret and everybody's access belong to
+                  the relay it was created on, and "move it" would silently
+                  mean "abandon this one and start another". Saying so is more
+                  use than a field that appears to do something else. */}
+              <p className="dim small">
+                A secure share stays on the relay it was created on. To use a different one, end this share and create
+                a new one — that makes a new room, a new key and new invitations, which is what changing relay actually
+                means.
+              </p>
             </Advanced>
           </div>
         )}
