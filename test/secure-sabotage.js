@@ -57,8 +57,18 @@ function restoreAll() {
     }
   }
 }
-// Belt and braces: an interrupted run must not leave a sabotaged file behind.
-process.on('exit', restoreAll);
+// Belt and braces: an interrupted run must not leave a sabotaged file — or
+// anything a sabotage wrote — behind.
+process.on('exit', () => {
+  restoreAll();
+  try {
+    for (const name of fs.readdirSync(root)) {
+      if (!rootBefore.has(name)) fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    }
+  } catch {
+    /* nothing more can be done from an exit handler */
+  }
+});
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     restoreAll();
@@ -245,6 +255,31 @@ function runSuite(script) {
   return { passed: result.status === 0, output: `${result.stdout || ''}${result.stderr || ''}` };
 }
 
+/**
+ * What is in the repository root, so anything a sabotage creates can be undone.
+ *
+ * This is not hypothetical. The sabotage that points the secret store at
+ * `process.cwd()` does exactly what it says: it writes a `secure-rooms.json`
+ * full of room secrets into the repository. The suite catches it — that is the
+ * point — and then the file is still sitting there, and the next `git add`
+ * commits it. Restoring the source is not enough; what the sabotaged code did
+ * has to be undone too.
+ */
+const rootBefore = new Set(fs.readdirSync(root));
+
+/** Remove anything a sabotage left in the repository root. */
+function sweepRoot() {
+  const strays = fs.readdirSync(root).filter((name) => !rootBefore.has(name));
+  for (const name of strays) {
+    try {
+      fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    } catch (err) {
+      shout(`  COULD NOT REMOVE ${name}: ${err.message}`);
+    }
+  }
+  return strays;
+}
+
 const results = [];
 let gaps = 0;
 
@@ -286,10 +321,22 @@ try {
       }
     } finally {
       fs.writeFileSync(file, before, 'utf8');
+      // And whatever the broken code wrote while it was broken.
+      const strays = sweepRoot();
+      if (strays.length) say(`              (cleaned up ${strays.join(', ')})`);
     }
   }
 } finally {
   restoreAll();
+}
+
+// Nothing left in the repository root. Checked rather than assumed, because a
+// stray secret store here is exactly the thing this feature is supposed to
+// make impossible and would be committed by the next `git add -A`.
+const strays = fs.readdirSync(root).filter((name) => !rootBefore.has(name));
+if (strays.length) {
+  shout(`  the repository root gained: ${strays.join(', ')}`);
+  gaps += 1;
 }
 
 // Every file back exactly as it was. Checked rather than assumed.
