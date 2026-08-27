@@ -1,5 +1,5 @@
 import React from 'react';
-import { ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
+import { ReviewStatusDot, authorLabel, statusWord } from '../ui/ReviewThread.jsx';
 
 // What a pin is, before you commit to opening it.
 //
@@ -17,6 +17,13 @@ import { ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
 //
 // Two lines of the first message. Enough to recognise a review; not enough to
 // read one, which is the point.
+//
+// It is DECORATIVE to assistive technology, and only that. It used to announce
+// itself as a tooltip and hide itself from the accessibility tree in the same
+// breath, which is two answers to one question. The pin is the control, the
+// pin has focus, and `peekLabel()` puts these same words on the pin's own
+// accessible name — so a screen reader hears the context from the thing it is
+// actually on, and this stays out of the way.
 
 /** Two lines' worth. Clamped in CSS as well; this keeps the DOM small too. */
 const PREVIEW_CHARS = 180;
@@ -61,7 +68,7 @@ export default function ReviewPeek({ review, at, cluster = 0 }) {
         ref={ref}
         className={`review-peek is-cluster${flip.x ? ' flip-x' : ''}${flip.y ? ' flip-y' : ''}`}
         style={{ left: at.x, top: at.y }}
-        role="tooltip"
+        aria-hidden="true"
       >
         <span className="review-peek-count">{cluster} comments here</span>
       </div>
@@ -79,13 +86,10 @@ export default function ReviewPeek({ review, at, cluster = 0 }) {
       ref={ref}
       className={`review-peek${flip.x ? ' flip-x' : ''}${flip.y ? ' flip-y' : ''}`}
       style={{ left: at.x, top: at.y }}
-      role="tooltip"
-      // The whole point of the surface. Without it, moving the pointer across
-      // a pin makes the thing you are pointing at disappear from under it.
       aria-hidden="true"
     >
       <div className="review-peek-head">
-        <ReviewStatusDot status={review.status} anchorState={review.anchorState} color={review.color} />
+        <ReviewStatusDot status={review.status} anchorState={review.anchorState} labelled={false} />
         {review.number != null && <span className="review-peek-n">#{review.number}</span>}
         <span className="review-peek-who">{who}</span>
         <span className="review-peek-age">{ago(review.updatedAt || review.createdAt)}</span>
@@ -108,14 +112,17 @@ export default function ReviewPeek({ review, at, cluster = 0 }) {
  * where focus actually is.
  */
 export function peekLabel(review, cluster = 0) {
-  if (cluster > 1) return `${cluster} comments here`;
+  // Deliberately unlike a single review's name. "Comment 3" and "3 comments
+  // here" have to be different sentences, because the markers are otherwise a
+  // number in a shape and somebody listening cannot see which shape.
+  if (cluster > 1) return `${cluster} comments here. Choose one to open`;
   if (!review) return 'Comment';
   const first = (review.messages || [])[0] || null;
   const body = String(first?.body || review.message || '').replace(/\s+/g, ' ').trim();
   const replies = Math.max(0, (review.messages?.length || 1) - 1);
   const bits = [
     `Comment ${review.number != null ? `#${review.number}` : ''}`.trim(),
-    review.status,
+    statusWord(review.status, review.anchorState),
     authorLabel(first || review.author, null),
     body.slice(0, 120),
     replies > 0 ? `${replies} ${replies === 1 ? 'reply' : 'replies'}` : null,

@@ -2,27 +2,36 @@ import React from 'react';
 import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
 import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, BackIcon, MoreIcon } from './Icons.jsx';
-import ReviewMarkdown from './ReviewMarkdown.jsx';
+import ReviewMarkdown, { safeHref } from './ReviewMarkdown.jsx';
 import { applyMarkdownKey } from './markdownKeys.js';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
+import useDismiss from './useDismiss.js';
 
 // One review, opened.
 //
-// The same component wherever a thread is read — in the panel and in the
-// popover over its pin — because a review that looked like two different
-// things depending on where you clicked it would be two features to learn.
+// There is exactly ONE place a review is read: the Inspector, docked beside
+// the canvas. Not a popover over its pin — hovering a pin gets a passive Peek
+// that cannot be clicked, and clicking one opens this. A conversation that
+// appeared on top of the design was covering the thing it was about, and a
+// component that had to work both as a floating card and as a docked panel
+// was two layouts wearing one name.
 //
-// What it deliberately doesn't have: mentions, reactions, avatars, attachments,
-// rich text. A review is a sentence about an element, and every one of those
-// would be another thing between writing the sentence and the agent reading it.
-// The body is plain text; a person who wants a backtick can type one.
+// What it deliberately doesn't have: mentions, reactions, attachments. A
+// review is a sentence about an element, and each of those is another thing
+// between writing the sentence and the agent reading it.
+//
+// The body IS Markdown — see ReviewMarkdown.jsx. Agents write it whether or
+// not anything renders it, so the choice was between rendering it and showing
+// people raw asterisks. No raw HTML, and links go to the browser rather than
+// navigating the app.
 //
 // Since it can be SHARED it says two more things, and they are the two that
 // stop a shared thread being misread. Who said each line — because "You" means
-// a different person depending on who is looking. And, when it applies, how
-// the thread stands against the source in front of you: a review resolved on a
-// commit this checkout does not have is not a review that has been fixed HERE,
-// and the one thing this must never do is draw a tick over a bug somebody can
+// a different person depending on who is looking, which is also why messages
+// carry an avatar here and nowhere else. And, when it applies, how the thread
+// stands against the source in front of you: a review resolved on a commit
+// this checkout does not have is not a review that has been fixed HERE, and
+// the one thing this must never do is draw a tick over a bug somebody can
 // still see.
 
 const ago = (t) => {
@@ -151,15 +160,60 @@ export function CheckoutNote({ review, pinned = true }) {
 /**
  * What to call this review in the Inspector header.
  *
- * The innermost component it is inside, which is what somebody recognises —
- * falling back to the file, and then to the tag, so the header is never empty.
+ * The innermost component it is inside, which is what somebody recognises,
+ * falling back to the file and then to the tag. The number is already beside
+ * this, so the job here is a NAME, and every step of the ladder now has to
+ * produce one worth reading.
+ *
+ * What it used to do at each step, and why that was not enough:
+ *
+ *  - A chain of exactly one was skipped entirely, on the grounds that the page
+ *    component is not a useful title. It is a better one than the file it came
+ *    from, and it was falling through to that file anyway.
+ *  - Only `.astro` came off the filename, so a review on a `.tsx`, `.vue`,
+ *    `.svelte` or `.md` island was headed "Card.tsx".
+ *  - `index.astro`, `[slug].astro` and `+page.svelte` are filenames that name
+ *    a route rather than a thing, and every one of them rendered as "index" or
+ *    "[slug]". The folder holding them is the name somebody would use out
+ *    loud, so that is what comes back.
+ *  - The last resort was the word "Comment", which is what every review is.
+ *    A page name says more than a category, so it is tried first.
  */
+const ROUTE_FILENAMES = /^(index|_index|page|\+page|\+layout|route|default)$/i;
+const PLACE_FOLDERS = /^(src|pages|components|app|routes|layouts|islands)$/i;
+
+/** A path, or a chain entry that happens to be one, reduced to a name. */
+function nameFromPath(value) {
+  const parts = String(value || '').split('/').filter(Boolean);
+  const file = parts[parts.length - 1] || '';
+  const stem = file.replace(/\.[a-z0-9]+$/i, '');
+  // A route file is named for its position, not its content. Its folder is the
+  // thing with a name: content/blog/index.astro is "blog".
+  if (stem && !ROUTE_FILENAMES.test(stem) && !/^\[.*\]$/.test(stem)) return stem;
+  const folder = parts[parts.length - 2];
+  if (folder && !PLACE_FOLDERS.test(folder)) return folder;
+  return stem || null;
+}
+
 export function titleOf(review) {
-  const chain = review?.creationContext?.componentChain || [];
-  if (chain.length > 1) return chain[chain.length - 1];
-  const source = review?.source || null;
-  if (source) return source.split('/').pop().replace(/\.astro$/, '');
-  return review?.creationContext?.tag ? `<${review.creationContext.tag}>` : 'Comment';
+  const chain = (review?.creationContext?.componentChain || []).filter(Boolean);
+  // A chain entry is usually a component name — "PlanCard" — but the outermost
+  // one is often the file it came from, extension and all. "index.astro" as a
+  // header is a path where a name belongs, so anything that looks like a
+  // filename goes through the same reduction the source path does.
+  if (chain.length) {
+    const leaf = String(chain[chain.length - 1]);
+    return /[./]/.test(leaf) ? nameFromPath(leaf) || leaf : leaf;
+  }
+
+  if (review?.source) {
+    const name = nameFromPath(review.source);
+    if (name) return name;
+  }
+
+  if (review?.creationContext?.tag) return `<${review.creationContext.tag}>`;
+  if (review?.page) return review.page === '/' ? 'Home' : review.page;
+  return 'Comment';
 }
 
 /** Where a review is, in one line: the page, the component trail, the breakpoint. */
@@ -182,29 +236,51 @@ export function ReviewWhere({ review, compact = false }) {
 export const REVIEW_COLORS = ['blue', 'violet', 'teal', 'green', 'amber', 'rose'];
 
 /**
- * The marker that says what state a review is in.
+ * The one word for what state a review is in.
  *
- * SHAPE is the state — filled is open, hollow is deferred, a dashed ring is an
- * anchor Stacki can no longer find, a faint grey ring is done. COLOUR is the
- * person's own grouping and means nothing about any of that. Keeping the two
- * apart is what lets a pin answer "is this done" without a legend while still
- * letting somebody colour their notes however they like.
+ * Four states, one vocabulary: open, deferred, resolved, orphaned. Every
+ * review surface derives its colour, its shape and its accessible name from
+ * this, so the dot in the index, the pin on the canvas and the row in the
+ * cluster chooser can never disagree about what a review is.
  */
-export function ReviewStatusDot({ status, anchorState, color }) {
+export function statusWord(status, anchorState) {
+  if (anchorState === 'orphaned') return 'orphaned';
+  if (status === 'resolved') return 'resolved';
+  if (status === 'deferred') return 'deferred';
+  return 'open';
+}
+
+/**
+ * What state a review is in.
+ *
+ * Colour says the state and nothing else: blue open, grey deferred, green
+ * resolved. It used to say the person's own grouping colour instead, with the
+ * SHAPE carrying the state — which meant a review somebody had filed under
+ * green looked resolved, and a deferred one could be violet. Two facts were
+ * sharing one channel and the more important of them was losing.
+ *
+ * Shape still carries it too, so the dot survives being printed in grey or
+ * looked at by somebody who cannot separate the hues: filled is open, a ring
+ * is deferred, a ring with a tick is resolved, a dashed ring is an anchor
+ * Stacki can no longer find.
+ *
+ * The grouping colour is still stored and still edited — through Colour… in
+ * the Inspector overflow — it is simply no longer pretending to be status.
+ *
+ * `labelled` is for the surfaces where the dot is the ONLY thing saying the
+ * state. Where the control around it already names it, the dot stays out of
+ * the accessibility tree rather than repeating it.
+ */
+export function ReviewStatusDot({ status, anchorState, labelled = true }) {
+  const word = statusWord(status, anchorState);
   const title =
-    anchorState === 'orphaned'
+    word === 'orphaned'
       ? 'Stacki can no longer find what this was about'
-      : status === 'resolved'
-        ? 'Resolved'
-        : status === 'deferred'
-          ? 'Deferred'
-          : 'Open';
+      : word.charAt(0).toUpperCase() + word.slice(1);
   return (
     <span
-      className={`review-dot is-${status} c-${REVIEW_COLORS.includes(color) ? color : 'blue'}${
-        anchorState === 'orphaned' ? ' orphaned' : ''
-      }`}
-      title={title}
+      className={`review-dot is-${word}`}
+      {...(labelled ? { title, role: 'img', 'aria-label': title } : { 'aria-hidden': 'true' })}
     />
   );
 }
@@ -323,6 +399,9 @@ export default function ReviewThread({
   };
   const [picking, setPicking] = React.useState(false);
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const menuRef = React.useRef(null);
+  const menuButtonRef = React.useRef(null);
+  useDismiss(menuRef, menuOpen, () => setMenuOpen(false));
   const [deferring, setDeferring] = React.useState(false);
   const [reason, setReason] = React.useState('');
   const [ref, setRef] = React.useState('');
@@ -377,21 +456,14 @@ export default function ReviewThread({
             <BackIcon size={13} />
           </button>
         )}
-        {/* The dot is also the way to recolour: it is the thing whose colour is
-            being changed, so it is where somebody reaches for it. */}
-        {onColor ? (
-          <button
-            className="review-dot-btn"
-            title="Colour"
-            onClick={(e) => {
-              e.stopPropagation();
-              setPicking((v) => !v);
-            }}
-          >
-            <ReviewStatusDot status={review.status} anchorState={review.anchorState} color={review.color} />
-          </button>
-        ) : (
-          <ReviewStatusDot status={review.status} anchorState={review.anchorState} color={review.color} />
+        {/* The dot says the state. It is not the colour picker any more: it
+            was both, so pressing the thing that told you a review was resolved
+            opened a palette, and the palette then changed the colour the dot
+            had been using to say "resolved". Grouping colour is edited through
+            Colour… in the overflow. */}
+        <ReviewStatusDot status={review.status} anchorState={review.anchorState} />
+        {review.color && review.color !== 'blue' && (
+          <span className={`review-swatch-dot c-${review.color}`} title={`Filed under ${review.color}`} aria-hidden="true" />
         )}
         {/* What to call it out loud. The uuid is the identity; this is the
             name, and it is the same name on the pin, in the list and in
@@ -410,8 +482,21 @@ export default function ReviewThread({
             >
               ‹
             </button>
-            <span className="review-step-n" aria-live="polite">
-              {position.index} of {position.total}
+            {/* `detached` is a review that has left the filtered list while
+                being read — resolved, most often. The count is still true; the
+                ordinal is not, so it goes. */}
+            <span
+              className={`review-step-n${position.detached ? ' is-detached' : ''}`}
+              aria-live="polite"
+              title={
+                position.detached
+                  ? 'This comment is no longer in the current filter. Next carries on from where it was.'
+                  : undefined
+              }
+            >
+              {position.detached
+                ? `${position.total} ${position.total === 1 ? 'other' : 'others'}`
+                : `${position.index} of ${position.total}`}
             </span>
             <button
               type="button"
@@ -431,8 +516,32 @@ export default function ReviewThread({
           </button>
         )}
         {(onDelete || onColor) && (
-          <div className="review-overflow">
+          // A menu that could not be dismissed.
+          //
+          // It had no Escape and no click-away: the only way out was to press
+          // the same ⋯ again, and pressing Escape — which is what anybody does
+          // — fell through to the app, where it closed the whole Inspector.
+          // Somebody who opened this menu to look at it lost the review they
+          // were reading.
+          //
+          // Escape now closes the menu and nothing else, and focus goes back to
+          // the button that opened it. `useDismiss` handles the click-away, and
+          // it is the same one every other popup in the app uses — including
+          // the part that matters here, that a click INTO the canvas iframe
+          // never reaches this document.
+          <div
+            className="review-overflow"
+            ref={menuRef}
+            onKeyDown={(e) => {
+              if (e.key !== 'Escape' || !menuOpen) return;
+              e.preventDefault();
+              e.stopPropagation();
+              setMenuOpen(false);
+              menuButtonRef.current?.focus();
+            }}
+          >
             <button
+              ref={menuButtonRef}
               className="review-x"
               title="More"
               aria-haspopup="menu"
@@ -532,9 +641,9 @@ export default function ReviewThread({
           The shell is `overflow: hidden` and this is the one region inside it
           with `overflow-y: auto`, which is what keeps the header and the reply
           box on screen through a two-thousand-word conversation. Before this,
-          the whole popover scrolled: past the first screenful the number, the
-          location, the close button and the reply box had all gone, and the
-          only way back to any of them was to scroll a wall of text. */}
+          the whole panel scrolled: past the first screenful the number, the
+          location, the stepper and the reply box had all gone, and the only
+          way back to any of them was to scroll a wall of text. */}
       <div className="review-thread-scroll">
       {orphaned && (
         <div className="review-orphan">
@@ -703,21 +812,29 @@ export default function ReviewThread({
           <span>{review.deferredReason}</span>
         </div>
       )}
-      {(review.externalRefs || []).map((r) => (
-        <div key={r} className="review-note review-ref">
-          {/* Openable only when it is actually a web address. An external
-              reference is a free string an agent wrote, so anything else is
-              shown as text rather than dressed up as a link that does nothing
-              — and the main process refuses non-http schemes regardless. */}
-          {/^https?:\/\//.test(r) ? (
-            <button type="button" title={r} onClick={() => window.avb.openExternal(r)}>
-              {r}
-            </button>
-          ) : (
-            <span title={r}>{r}</span>
-          )}
-        </div>
-      ))}
+      {(review.externalRefs || []).map((r) => {
+        // ONE link policy for the whole app. This had its own inline
+        // `/^https?:\/\//` test, which is a second answer to a question
+        // `safeHref` already answers: it let `mailto:` through as dead text
+        // where a comment body renders it as a live link, and it accepted
+        // `https:/\nevil` because a prefix test does not care what follows.
+        // An external ref is a free string an agent wrote, so it gets the same
+        // scrutiny a pasted link gets.
+        const safe = safeHref(r);
+        return (
+          <div key={r} className="review-note review-ref">
+            {safe ? (
+              <button type="button" title={safe} onClick={() => window.avb.openExternal(safe)}>
+                {r}
+              </button>
+            ) : (
+              <span className="review-md-deadlink" title="Stacki only opens http, https and mailto links">
+                {r}
+              </span>
+            )}
+          </div>
+        );
+      })}
 
       </div>
 
@@ -815,34 +932,34 @@ export default function ReviewThread({
             </div>
           </form>
 
-          {/* One row, and it does not wrap. Three verbs at most: where it is,
-              and the two things that can happen to it next. */}
+          {/* One row, and it does not wrap. Two verbs: the things that can
+              happen to this review next.
+
+              There is no second ⋯ down here. There were two, both opening the
+              same menu from opposite ends of the panel, and a menu that can be
+              reached from two places is a menu somebody has to check twice to
+              be sure they have seen all of it. The one in the header stays,
+              next to the thing it acts on. */}
           <div className="review-actions">
-            {onDelete && canDeleteThread(review, actorId) && (
-              <button
-                type="button"
-                className="review-x review-foot-more"
-                title="More"
-                aria-haspopup="menu"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setMenuOpen((v) => !v);
-                }}
-              >
-                <MoreIcon size={13} />
-              </button>
-            )}
             <span className="spacer" />
             {review.status === 'open' ? (
               <>
+                {/* Neutral. Deferring is not an achievement and not a
+                    setback — it is "not now". */}
                 <button className="ghost" onClick={() => setDeferring(true)} disabled={busy}>
                   <DeferIcon size={12} /> Defer
                 </button>
-                <button className="primary" onClick={() => send('resolve', {})} disabled={busy}>
+                {/* Green, and the same green as a resolved dot. The button
+                    that reaches the state and the mark that reports it were
+                    different colours, so nothing on screen connected the act
+                    to its result. */}
+                <button className="review-resolve" onClick={() => send('resolve', {})} disabled={busy}>
                   <ResolveIcon size={12} /> Resolve
                 </button>
               </>
             ) : (
+              /* Deliberately NOT green: reopening undoes resolution, and the
+                 resolve colour on the button that un-resolves is a lie. */
               <button className="primary" onClick={() => send('reopen', {})} disabled={busy}>
                 <ReopenIcon size={12} /> Reopen
               </button>

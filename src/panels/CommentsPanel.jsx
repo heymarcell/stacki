@@ -11,6 +11,14 @@ import { ReviewIcon, PinIcon, OrphanIcon, BackIcon } from '../ui/Icons.jsx';
 // are looking at. Making ordinary feedback sound like ticket triage is how a
 // feature like this stops getting used.
 //
+// This is an INDEX. It lists reviews, filters them, and hands one to the
+// Inspector — it does not act on them. It used to take onAct, onDelete,
+// onColor, onEditMessage, onDeleteMessage and busyId as well, from back when
+// the conversation was docked inside it, and it had stopped using every one of
+// them: nine props threaded through App.jsx to be destructured and dropped.
+// Reading them here suggested a second place where a review could be resolved
+// or deleted, and there is exactly one.
+//
 // Two filters and nothing else. Status, because "what still wants doing" is
 // the question this panel exists to answer, and scope, because a page's worth
 // of comments and a project's worth are both things somebody wants. No
@@ -52,17 +60,6 @@ export default function CommentsPanel({
   // what keeps its pin marked and a resolved marker visible.
   selectedId = null,
   onOpen,
-  // See App.jsx.
-  // conversation is docked here rather than opened in a card over the design.
-  // Which reviews currently have a pin on the canvas.
-  pinnedIds = null,
-  onAct,
-  onFocus,
-  onDelete,
-  onColor,
-  onEditMessage,
-  onDeleteMessage,
-  busyId = null,
   problem = null,
   hiddenPins = 0,
   pinsVisible = true,
@@ -76,7 +73,6 @@ export default function CommentsPanel({
   // the ones already here?" is about all of them.
   totalCount = 0,
   actorId = null,
-  withheldIds = null,
   onSync,
   onShareEnable,
   onShareJoin,
@@ -192,11 +188,17 @@ export default function CommentsPanel({
           // rows grew into threads.
           <button
             key={r.id}
+            // Addressable, so focus can come back here when the Inspector this
+            // row opened is closed again. See restoreReviewFocus in App.jsx.
+            data-review-row={r.id}
             className={`comments-row${r.id === selectedId ? ' on' : ''}`}
             aria-current={r.id === selectedId ? 'true' : undefined}
             onClick={() => onOpen(r.id)}
           >
-            <ReviewStatusDot status={r.status} anchorState={r.anchorState} color={r.color} />
+            <ReviewStatusDot status={r.status} anchorState={r.anchorState} />
+            {r.color && r.color !== 'blue' && (
+              <span className={`review-swatch-dot c-${r.color}`} aria-hidden="true" />
+            )}
             <span className="comments-row-main">
               <span className="comments-row-top">
                 {r.number != null && <span className="review-number">#{r.number}</span>}

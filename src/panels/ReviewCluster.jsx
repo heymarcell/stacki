@@ -1,5 +1,5 @@
 import React from 'react';
-import { ReviewStatusDot } from '../ui/ReviewThread.jsx';
+import { ReviewStatusDot, statusWord } from '../ui/ReviewThread.jsx';
 
 // Which review, when several are in the same place.
 //
@@ -38,9 +38,13 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
     });
   }, [at.x, at.y, reviews?.length]);
 
+  const activeRef = React.useRef(null);
+  // Focus is on the row itself rather than on the box: these are real buttons,
+  // so Enter and Space are the browser's job and the arrows only have to move
+  // focus. Esc restores focus to the marker that opened this — see onClose.
   React.useEffect(() => {
-    ref.current?.focus();
-  }, []);
+    activeRef.current?.focus();
+  }, [active]);
 
   const list = reviews || [];
   const move = (delta) => setActive((i) => (i + delta + list.length) % list.length);
@@ -50,9 +54,17 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
       ref={ref}
       className={`review-cluster${flip.x ? ' flip-x' : ''}${flip.y ? ' flip-y' : ''}`}
       style={{ left: at.x, top: at.y }}
-      role="listbox"
+      // A small non-modal dialog holding ordinary buttons.
+      //
+      // It was a listbox whose options were <button>s, which is two widget
+      // patterns in one element: a listbox owns its own focus and options are
+      // not independently focusable, so nothing could navigate it correctly.
+      // Buttons in a labelled dialog need no roving-focus machinery, Tab and
+      // Enter already work, and the arrow keys below are an extra rather than
+      // the only way in.
+      role="dialog"
+      aria-modal="false"
       aria-label={`${list.length} comments here`}
-      tabIndex={-1}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => {
@@ -70,11 +82,8 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
           e.preventDefault();
           move(-1);
         }
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          const picked = list[active];
-          if (picked) onPick?.(picked.id);
-        }
+        // Enter and Space are the focused button's own behaviour; adding them
+        // here would fire the pick twice.
       }}
     >
       <div className="review-cluster-title">{list.length} comments here</div>
@@ -84,16 +93,19 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
         {list.map((r, i) => (
           <button
             key={r.id}
-            role="option"
-            aria-selected={i === active}
+            ref={i === active ? activeRef : null}
             className={`review-cluster-row${i === active ? ' on' : ''}`}
+            aria-label={`Comment #${r.number}, ${statusWord(r.status, r.anchorState)}. ${String(r.message || '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 80)}`}
             onMouseEnter={() => setActive(i)}
             onClick={(e) => {
               e.stopPropagation();
               onPick?.(r.id);
             }}
           >
-            <ReviewStatusDot status={r.status} anchorState={r.anchorState} color={r.color} />
+            <ReviewStatusDot status={r.status} anchorState={r.anchorState} labelled={false} />
             {r.number != null && <span className="review-cluster-n">#{r.number}</span>}
             <span className="review-cluster-text">
               {String(r.message || '').replace(/\s+/g, ' ').trim().slice(0, EXCERPT)}

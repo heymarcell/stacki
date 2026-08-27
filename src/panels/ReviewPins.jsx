@@ -122,10 +122,16 @@ export default function ReviewPins({ pins, visible, capturing, openId, onOpen, o
         return (
           <button
             key={pin.key}
-            className={`review-pin is-${pin.status} c-${pin.color || 'blue'}${isOpen ? ' open' : ''}${
-              many ? ' many' : ''
-            }`}
+            // One class per fact: `is-<status>` or `is-cluster` for what is
+            // behind the marker, `open` for whether it is the one being read.
+            // A cluster carried both `is-cluster` and `many`, which is two
+            // names for one thing and two places to keep in step.
+            className={`review-pin is-${many ? 'cluster' : pin.status}${isOpen ? ' open' : ''}`}
             style={{ left: pin.x, top: pin.y }}
+            // Which reviews are under this marker, so focus can come back to
+            // it when the surface it opened is closed. See restoreReviewFocus
+            // in App.jsx.
+            data-review-ids={pin.reviews.join(' ')}
             aria-label={peekLabel(only, pin.reviews.length)}
             aria-current={isOpen ? 'true' : undefined}
             onPointerEnter={() => peekSoon(pin)}

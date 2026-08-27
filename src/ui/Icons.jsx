@@ -130,37 +130,6 @@ export const BackIcon = (p) => (
   </I>
 );
 
-export const GripIcon = (p) => (
-  <I {...p} filled>
-    <circle cx="6" cy="4" r="1.15" />
-    <circle cx="10" cy="4" r="1.15" />
-    <circle cx="6" cy="8" r="1.15" />
-    <circle cx="10" cy="8" r="1.15" />
-    <circle cx="6" cy="12" r="1.15" />
-    <circle cx="10" cy="12" r="1.15" />
-  </I>
-);
-
-/* Out of the card and into the panel: arrows pushing apart. */
-export const ExpandIcon = (p) => (
-  <I {...p}>
-    <path d="M9.5 2.5H13.5V6.5" />
-    <path d="M6.5 13.5H2.5V9.5" />
-    <path d="M13.5 2.5 9 7" />
-    <path d="M2.5 13.5 7 9" />
-  </I>
-);
-
-/* Back out of the panel to the pin: arrows pulling together. */
-export const CollapseIcon = (p) => (
-  <I {...p}>
-    <path d="M13 3.5H9.5V7" />
-    <path d="M3 12.5H6.5V9" />
-    <path d="M9.5 6.5 13.5 2.5" />
-    <path d="M6.5 9.5 2.5 13.5" />
-  </I>
-);
-
 export const ComponentPropertiesIcon = (p) => (
   <I {...p} filled>
     <path

@@ -40,6 +40,24 @@ async function until(what, fn, { timeout = 240000, every = 250 } = {}) {
   }
 }
 
+/**
+ * The same wait, for a condition whose absence is a finding rather than a
+ * crash — null instead of a throw, so the caller can record what did not
+ * happen and carry on capturing the rest.
+ */
+until.soft = async (what, timeout, fn, every = 400) => {
+  const stop = Date.now() + timeout;
+  for (;;) {
+    const got = await fn();
+    if (got) return got;
+    if (Date.now() > stop) {
+      shout(`  timed out waiting for ${what}`);
+      return null;
+    }
+    await wait(every);
+  }
+};
+
 app.on('window-all-closed', () => {});
 
 if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
@@ -108,6 +126,19 @@ const SHOTS = [];
 // States this run could not produce. Named in the output and on the contact
 // sheet rather than filled in with a picture of something else.
 const MISSING = [];
+// Claims this run made about what a picture shows, that did not hold.
+//
+// A screenshot is evidence only if something checked that the app was in the
+// state the caption names. "Orphaned review" over a picture of an attached one
+// is worse than no picture: it is a false pass with an image attached. Every
+// entry here makes the run exit non-zero.
+const FAILED = [];
+const must = (claim, ok, detail) => {
+  if (ok) return true;
+  FAILED.push(detail ? `${claim} — ${detail}` : claim);
+  shout(`  FAILED  ${claim}${detail ? ` — ${detail}` : ''}`);
+  return false;
+};
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -226,7 +257,7 @@ const MISSING = [];
 
   // --- the cluster chooser --------------------------------------------------
   await js(`(() => {
-    const pin = [...document.querySelectorAll('.review-pin.many')][0];
+    const pin = [...document.querySelectorAll('.review-pin.is-cluster')][0];
     pin?.click();
     return !!pin;
   })()`);
@@ -251,48 +282,104 @@ const MISSING = [];
     await wait(600);
     commenting = await js(`!!document.querySelector('.frame-clip.commenting')`);
   }
-  if (!commenting) shout('review-ux-export: comment mode would not start — 05 and 06 will not show it');
+  must('comment mode starts', commenting);
   await shot('05-comment-mode', 'Comment mode — click an element to place a comment');
-  // Placing the comment goes through the app's real input path.
+
+  // Placing the comment is a REAL CLICK, dispatched inside the page.
   //
-  // A click dispatched on the <iframe> element reaches the element, not the
-  // document inside it — the first version of this captured a picture with no
-  // composer in it and called it "the composer". What the preview actually
-  // does when somebody clicks in comment mode is post `avb:click-node` to the
-  // window, and PreviewPane listens for exactly that, so this posts the same
-  // message: the same code path, without a physical mouse.
-  const placed = await js(`(() => {
-    const frame = document.querySelector('iframe');
-    if (!frame) return 'no frame';
-    const r = frame.getBoundingClientRect();
-    const rect = { x: 60, y: 90, w: 320, h: 44 };
-    window.postMessage(
-      {
-        type: 'avb:click-node',
-        path: '0.0',
-        occurrence: 0,
-        occurrenceCount: 1,
-        x: rect.x + rect.w / 2,
-        y: rect.y + rect.h / 2,
-        rect,
-      },
-      '*'
-    );
-    return 'posted';
-  })()`);
-  if (placed !== 'posted') shout(`review-ux-export: could not place a draft comment (${placed})`);
-  await wait(1100);
-  // A state that could not be produced is not photographed.
+  // Two earlier versions of this were not real. A click dispatched on the
+  // <iframe> element reaches the element, not the document inside it, and
+  // produced a picture with no composer in it captioned "the composer".
+  // Posting `avb:click-node` by hand fixed the picture and broke the evidence:
+  // it skipped the page's injected listener, the hit-testing, the measurement
+  // and comment mode's own gate, then proved that the half it kept works.
   //
-  // Writing the file anyway would put a picture of something else under a name
-  // that claims otherwise, which is worse than a gap: somebody reviewing these
-  // would take it as evidence. The run says what is missing instead.
-  const hasComposer = await js(`!!document.querySelector('.review-composer')`);
-  if (!hasComposer) {
-    MISSING.push(['06-new-comment-composer', 'the composer did not open from a synthesised canvas click']);
+  // `webContents.sendInputEvent` was the next thing to try, and it does not
+  // work here — measured, not assumed. The preview is an out-of-process iframe
+  // (its own OS process; see `framesInSubtree`), and input injected at the
+  // window's widget never reaches it: with comment mode armed and the page
+  // fully marked, thirteen clicks across the canvas produced no `hover-node`
+  // and no `click-node` at all. That is an Electron limit, not a Stacki bug.
+  //
+  // So the click is dispatched in the frame that owns the document, through
+  // `webFrameMain.executeJavaScript`. From the page's own listener onwards
+  // everything is the real thing: its hit test, its marker lookup, its
+  // measurement of the clicked box, its `postMessage` to the parent,
+  // PreviewPane's listener, comment mode's gate, the pin ratios and the
+  // composer. The one link not exercised is Chromium's event routing into an
+  // OOPIF, which is not our code and which nothing in this process can drive.
+  const frame = await until.soft(
+    'the preview frame',
+    20000,
+    async () =>
+      win.webContents.mainFrame.framesInSubtree.find(
+        (f) => f !== win.webContents.mainFrame && /^https?:/.test(f.url || '')
+      ) || null
+  );
+  must('the preview runs in a frame this can reach', !!frame, String(frame && frame.url));
+
+  let hasComposer = false;
+  let clicked = null;
+  if (frame) {
+    // Something worth commenting on: a heading or a paragraph with real size,
+    // on screen, and never the document element — a comment anchored to <html>
+    // is technically a comment and visually a picture of nothing.
+    clicked = await frame
+      .executeJavaScript(
+        `(() => {
+          const marked = [...document.querySelectorAll('[data-avb-p]')];
+          const fits = (n) => {
+            const b = n.getBoundingClientRect();
+            return b.width > 60 && b.height > 14 && b.top > 8 && b.bottom < innerHeight - 8;
+          };
+          const el =
+            marked.find((n) => /^(H1|H2|H3|P|LI)$/.test(n.tagName) && fits(n)) ||
+            marked.find((n) => n.tagName !== 'HTML' && n.tagName !== 'BODY' && fits(n));
+          if (!el) return { ok: false, why: 'nothing on screen to click', marked: marked.length };
+          const b = el.getBoundingClientRect();
+          const x = Math.round(b.left + b.width / 2);
+          const y = Math.round(b.top + b.height / 2);
+          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
+          }
+          return { ok: true, tag: el.tagName, x, y, marked: marked.length };
+        })()`,
+        true
+      )
+      .catch((err) => ({ ok: false, why: String(err && err.message) }));
+
+    must('the page is marked up for the editor', (clicked?.marked || 0) > 0, JSON.stringify(clicked));
+    must('and a real element was clicked in it', clicked?.ok === true, JSON.stringify(clicked));
+    await wait(1200);
+    hasComposer = await js(`!!document.querySelector('.review-composer')`);
+    if (!hasComposer) {
+      const why = await js(`(() => ({
+        commenting: !!document.querySelector('.frame-clip.commenting'),
+        anchor: !!document.querySelector('.review-draft-anchor'),
+        pins: document.querySelectorAll('.review-pin').length,
+      }))()`);
+      shout(`  clicked ${JSON.stringify(clicked)} but: ${JSON.stringify(why)}`);
+    }
   }
+
+  // This state is REQUIRED. It is the only picture of the one surface that
+  // takes new content over the canvas, and a package of review UX states that
+  // silently omits "leaving a comment" is not a package of review UX states.
+  must('a real click on the canvas opens the composer', hasComposer);
   if (hasComposer) {
+    // Type into it the same way — through the window, not by setting .value —
+    // so the picture shows a composer that has actually been used.
+    await js(`document.querySelector('.review-composer textarea')?.focus()`);
+    await wait(200);
+    for (const ch of 'This heading is too tight on mobile.') {
+      win.webContents.sendInputEvent({ type: 'char', keyCode: ch });
+    }
+    await wait(500);
+    const typed = await js(`(document.querySelector('.review-composer textarea')?.value || '')`);
+    must('and what was typed into it arrived', typed.length > 0, JSON.stringify(typed));
     await shot('06-new-comment-composer', 'New-comment composer — anchored, ~316px, the only content entry over the canvas');
+  } else {
+    MISSING.push(['06-new-comment-composer', 'a real click on the canvas did not open the composer']);
   }
   await js(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   await wait(500);
@@ -361,16 +448,89 @@ const MISSING = [];
   await pickRow('/gap under this/i');
   await shot('19-deferred-review', 'Deferred review — grey status, its reason kept');
 
-  // An orphan: cut the element the review was left on out of the page.
-  const page = path.join(root, 'src/pages/index.astro');
-  const before = fs.readFileSync(page, 'utf8');
-  fs.writeFileSync(page, before.replace(/<h1[\s\S]*?<\/h1>/, ''), 'utf8');
-  await wait(3500);
+  // An orphan, from the source outwards.
+  //
+  // The element the review was left on is cut out of the page file, Astro
+  // rebuilds, and the anchor stops resolving. That part was always real — what
+  // was missing was any check that it had happened, so a rebuild that did not
+  // land, or a review that re-anchored to something else, still produced a
+  // file called `20-orphaned-review`.
+  //
+  // Three things have to be true before the picture is taken, and they are the
+  // three the state IS: the review says it is orphaned, there is no marker for
+  // it on the canvas, and there is no Locate button offering to go to
+  // something that is not there.
+  //
+  // Which file, and which element, comes from the review itself rather than
+  // from a guess. The first version of this cut `<h1>` out of index.astro on
+  // the assumption that was where the review lived; the h1 is in Hero.astro,
+  // index.astro has no h1 at all, and the edit was a no-op that still produced
+  // a file called `20-orphaned-review`. Asking the store where the review is
+  // anchored is both more honest and less brittle.
+  const anchoredAt = (() => {
+    const all = reviews.list({ detail: 'full', status: 'all', limit: 100 });
+    const rows = all?.reviews || [];
+    const row = rows.find((r) => /too tight/i.test(r?.message || r?.messages?.[0]?.body || ''));
+    if (!row) return null;
+    return { id: row.id, file: row.source || null, tag: row.creationContext?.tag || null, state: row.anchorState };
+  })();
+  must('the seeded review is anchored to a real file', !!anchoredAt?.file, JSON.stringify(anchoredAt));
+
+  let page = null;
+  let before = null;
+  if (anchoredAt?.file) {
+    page = path.join(root, anchoredAt.file);
+    before = fs.readFileSync(page, 'utf8');
+    // Take out the element the review names. A tag that appears more than once
+    // would leave the anchor resolvable, so this removes the whole element and
+    // checks the file actually changed.
+    const tag = anchoredAt.tag || 'h1';
+    const whole = new RegExp(`<${tag}\\b[\\s\\S]*?<\\/${tag}>`);
+    let cut = before.replace(whole, '');
+    if (cut === before) cut = before.replace(new RegExp(`<${tag}\\b[^>]*\\/?>`), '');
+    must(`the fixture has a <${tag}> to cut out of ${anchoredAt.file}`, cut !== before, before.slice(0, 200));
+    if (cut !== before) fs.writeFileSync(page, cut, 'utf8');
+  }
   await backToList();
-  await pickRow('/too tight/i');
-  await shot('20-orphaned-review', 'Orphaned review — readable Inspector, nothing to point at');
-  fs.writeFileSync(page, before, 'utf8');
-  await wait(2500);
+
+  // Wait for the state rather than for a number of milliseconds: a rebuild
+  // takes as long as it takes, and a sleep that is usually long enough is a
+  // flake with a timer on it.
+  const orphaned = await until.soft('the review to orphan', 20000, async () => {
+    await pickRow('/too tight/i');
+    const seen = await js(`(() => {
+      const t = document.querySelector('.review-thread');
+      if (!t) return null;
+      return {
+        orphan: !!t.querySelector('.review-orphan'),
+        dot: t.querySelector('.review-dot')?.className || '',
+        locate: !!t.querySelector('.review-locate'),
+        pins: document.querySelectorAll('.review-pin').length,
+      };
+    })()`);
+    return seen && seen.orphan ? seen : null;
+  });
+
+  must('the review reports itself orphaned', !!orphaned, JSON.stringify(orphaned));
+  if (orphaned) {
+    must('and its dot says so', /is-orphaned/.test(orphaned.dot), orphaned.dot);
+    // The two things an orphan must NOT do: claim a place on the page, and
+    // offer to take you to one.
+    must('an orphan has no marker on the canvas to point at', orphaned.pins === 0, `${orphaned.pins} pins`);
+    must('and does not offer to locate what is gone', !orphaned.locate);
+    await shot('20-orphaned-review', 'Orphaned review — readable Inspector, no pin, no Locate');
+  } else {
+    MISSING.push(['20-orphaned-review', 'the review never reported itself orphaned']);
+  }
+
+  if (page && before != null) fs.writeFileSync(page, before, 'utf8');
+  // And back: an orphan is a state the source can leave as well as enter, and
+  // a run that left the fixture cut would take every later state with it.
+  const rejoined = await until.soft('the review to re-anchor', 20000, async () => {
+    const pins = await js(`document.querySelectorAll('.review-pin').length`);
+    return pins > 0 ? pins : null;
+  });
+  must('restoring the source brings the markers back', !!rejoined, String(rejoined));
 
   // --- layout ---------------------------------------------------------------
   await backToList();
@@ -400,6 +560,82 @@ const MISSING = [];
   await device('desktop');
   await wait(1500);
   await shot('25-desktop-preview', 'Desktop preview while reading a review');
+
+  // --- the two surfaces that had never been photographed --------------------
+  //
+  // Both are real states of the Inspector, both are reachable in two presses,
+  // and neither was in this package. The overflow matters more than it used
+  // to: recolouring moved into it when the status dot stopped being the colour
+  // picker, so "how do I change the colour" is now answered entirely by this
+  // menu. And Defer is one of the two verbs in the footer — the deferred
+  // review at 19 shows the result, and nothing showed the form that reaches it.
+  await backToList();
+  await pickRow('/spacing on this/i');
+
+  const openedMenu = await js(`(() => {
+    const b = document.querySelector('.review-overflow button[aria-haspopup="menu"]');
+    b?.click();
+    return !!b;
+  })()`);
+  await wait(500);
+  const menuItems = await js(`[...document.querySelectorAll('.review-menu [role="menuitem"]')].map((b) => b.textContent.trim())`);
+  must('the Inspector overflow opens', openedMenu === true);
+  must('and it is the only place colour is edited from', (menuItems || []).some((t) => /Colour/i.test(t)), JSON.stringify(menuItems));
+  must('and it holds the destructive act', (menuItems || []).some((t) => /Delete/i.test(t)), JSON.stringify(menuItems));
+  await shot('26-inspector-overflow', 'Inspector overflow — Colour… and the one destructive act, both out of the way');
+
+  // Escape from inside the menu closes the MENU. It used to fall through to
+  // the app and close the whole Inspector, so looking in here cost you the
+  // review you were reading — which is also why this run could not reach the
+  // Defer button afterwards.
+  await js(`(() => {
+    const b = document.querySelector('.review-overflow button[aria-haspopup="menu"]');
+    b?.focus();
+    b?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await wait(450);
+  const afterEscape = await js(`(() => ({
+    menu: !!document.querySelector('.review-menu'),
+    thread: !!document.querySelector('.review-thread'),
+  }))()`);
+  must('Escape closes the overflow menu', afterEscape.menu === false, JSON.stringify(afterEscape));
+  must('and leaves the review open behind it', afterEscape.thread === true, JSON.stringify(afterEscape));
+
+  const openedDefer = await js(`(() => {
+    const b = [...document.querySelectorAll('.review-actions button')].find((x) => /Defer/i.test(x.textContent || ''));
+    b?.click();
+    return !!b;
+  })()`);
+  await wait(500);
+  const deferForm = await js(`(() => {
+    const f = document.querySelector('.review-defer');
+    if (!f) return null;
+    return { fields: f.querySelectorAll('textarea, input').length, buttons: [...f.querySelectorAll('button')].map((b) => b.textContent.trim()) };
+  })()`);
+  must('Defer opens its form rather than deferring on the spot', openedDefer === true && !!deferForm, JSON.stringify(deferForm));
+  if (deferForm) {
+    // Deferring without saying why is how a deferred review becomes a review
+    // nobody can pick back up.
+    must('and it asks for a reason and somewhere it is tracked', deferForm.fields >= 2, JSON.stringify(deferForm));
+    must('and it can be backed out of', deferForm.buttons.some((t) => /Cancel/i.test(t)), JSON.stringify(deferForm));
+  }
+  await shot('27-defer-form', 'Defer — a reason and where it is tracked, before anything changes');
+  // Backed out of through its own Cancel, so the review is left exactly as it
+  // was found — a deferral nobody asked for would change every later state.
+  await js(`(() => {
+    const b = [...document.querySelectorAll('.review-defer button')].find((x) => /Cancel/i.test(x.textContent || ''));
+    b?.click();
+    return !!b;
+  })()`);
+  await wait(450);
+  const stillOpen = await js(`(() => ({
+    form: !!document.querySelector('.review-defer'),
+    verbs: [...document.querySelectorAll('.review-actions button')].map((b) => b.textContent.trim()),
+  }))()`);
+  must('Cancel puts the defer form away', stillOpen.form === false, JSON.stringify(stillOpen));
+  must('and the review is still open, not deferred', stillOpen.verbs.some((t) => /Resolve/i.test(t)), JSON.stringify(stillOpen));
+  await backToList();
 
   // --- the display matrix ---------------------------------------------------
   const MATRIX = [
@@ -452,10 +688,12 @@ const MISSING = [];
   figcaption { padding:9px 11px; font-size:12px; color:#ccc; }
   figcaption b { display:block; color:#fff; font-size:11px; font-family:ui-monospace,monospace; margin-bottom:2px; }
   p.missing { margin:0 0 20px; padding:9px 12px; background:#2a2118; border:1px solid #4a3a1e; border-radius:8px; color:#e0c98a; font-size:12px; }
+  p.failed { margin:0 0 20px; padding:9px 12px; background:#2c1618; border:1px solid #5a2226; border-radius:8px; color:#f0a8ad; font-size:12px; }
 </style>
 <h1>Stacki — Visual Review UX states</h1>
 <p class="sub">${SHOTS.length} states, captured from the running app at ${new Date().toISOString().slice(0, 16).replace('T', ' ')}.</p>
 ${MISSING.length ? `<p class="missing"><b>${MISSING.length} state${MISSING.length === 1 ? '' : 's'} not captured:</b> ${MISSING.map(([n, why]) => `${n} — ${why}`).join('; ')}</p>` : ''}
+${FAILED.length ? `<p class="failed"><b>${FAILED.length} claim${FAILED.length === 1 ? '' : 's'} did not hold — do not treat these as evidence:</b> ${FAILED.join('; ')}</p>` : ''}
 <div class="grid">
 ${SHOTS.map((s) => `  <figure><img src="${s.name}.png" alt="${s.caption}"><figcaption><b>${s.name}</b>${s.caption}</figcaption></figure>`).join('\n')}
 </div>
@@ -466,7 +704,11 @@ ${SHOTS.map((s) => `  <figure><img src="${s.name}.png" alt="${s.caption}"><figca
   say(`review-ux-export: ${SHOTS.length} states in ${OUT}`);
   for (const [name, why] of MISSING) shout(`  NOT CAPTURED  ${name} — ${why}`);
   say(`  open ${path.join(OUT, 'index.html')} to look through them`);
-  return teardown(0);
+  if (FAILED.length) {
+    shout(`\nreview-ux-export: ${FAILED.length} claim(s) about these states did not hold\n`);
+    for (const f of FAILED) shout(`  ${f}`);
+  }
+  return teardown(FAILED.length ? 1 : 0);
 })().catch((err) => {
   shout(`review-ux-export: ${err?.stack || err}`);
   void teardown(1);

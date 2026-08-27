@@ -42,15 +42,15 @@ const check = (what, condition, detail) => {
   fs.writeFileSync(
     entry,
     `export { default as CommentsPanel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'))};
-export { default as ReviewInspector } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewInspector.jsx";
-export { default as ReviewPeek, peekLabel } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewPeek.jsx";
-export { default as ReviewCluster } from "/Users/heymarcell/DEV/stacki/src/panels/ReviewCluster.jsx";
-export { reviewLayout, clampInspector, INSPECTOR_MIN, INSPECTOR_MAX, INSPECTOR_DEFAULT } from "/Users/heymarcell/DEV/stacki/src/reviewLayout.js";
+export { default as ReviewInspector } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewInspector.jsx'))};
+export { default as ReviewPeek, peekLabel } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPeek.jsx'))};
+export { default as ReviewCluster } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewCluster.jsx'))};
+export { reviewLayout, clampInspector, INSPECTOR_MIN, INSPECTOR_MAX, INSPECTOR_DEFAULT } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewLayout.js'))};
 export { default as ReviewPins, ReviewSurface, placement } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'))};
-export { safeHref } from "/Users/heymarcell/DEV/stacki/src/ui/ReviewMarkdown.jsx";
-export { applyMarkdownKey } from "/Users/heymarcell/DEV/stacki/src/ui/markdownKeys.js";
+export { safeHref } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewMarkdown.jsx'))};
+export { applyMarkdownKey } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'markdownKeys.js'))};
 export { placePins, pinnable } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'reviewPins.js'))};
-export { default as ReviewThread, authorLabel, CheckoutNote } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
+export { default as ReviewThread, authorLabel, CheckoutNote, titleOf, statusWord, ReviewStatusDot } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ReviewThread.jsx'))};
 export { SharedReviewsBar, SharedReviewsDialog, syncProblemText } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'SharedReviews.jsx'))};
 export { default as PreviewPane } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'panels', 'PreviewPane.jsx'))};
 export { ConfirmHost } from ${JSON.stringify(path.join(__dirname, '..', 'src', 'ui', 'ConfirmDialog.jsx'))};
@@ -335,7 +335,6 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         React.createElement(ui.ReviewThread, {
           review: r,
           onAct: (action, args) => acted.push([action, args]),
-          onFocus: () => acted.push(['focus', null]),
           onFocus: () => acted.push(['focus']),
           onDelete: () => acted.push(['delete']),
           ...extra,
@@ -497,6 +496,23 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     await render(thread(review({ status: 'deferred', externalRefs: ['JIRA-4182', 'file:///etc/passwd'] })));
     check('a non-web reference is not made clickable', $$('.review-ref button').length === 0, String($$('.review-ref button').length));
     check('but it is still shown', /JIRA-4182/.test(container.textContent));
+    check('and it says why it is not a link', $$('.review-ref .review-md-deadlink').length === 2, String($$('.review-ref .review-md-deadlink').length));
+
+    // One link policy, not two. A ref used to run its own `^https?://` test,
+    // so the two surfaces disagreed about the same string.
+    await render(thread(review({ status: 'deferred', externalRefs: ['mailto:design@example.test'] })));
+    check('a mailto ref is a link, like it is in a comment body', !!$('.review-ref button'), $('.review-ref')?.innerHTML?.slice(0, 120));
+    await render(thread(review({ status: 'deferred', externalRefs: ['javascript:alert(1)', 'https:/\u000aevil.test'] })));
+    check('a javascript ref is not', $$('.review-ref button').length === 0, String($$('.review-ref button').length));
+    {
+      // A prefix test passes this. Whitespace inside a url is refused
+      // outright by the shared policy, which is why it is the shared policy.
+      const openedRefs = [];
+      dom.window.avb.openExternal = async (u) => openedRefs.push(u);
+      const refBtns = $$('.review-ref button');
+      for (const b of refBtns) await click(b);
+      check('and neither is a url with a newline hidden in it', openedRefs.length === 0, JSON.stringify(openedRefs));
+    }
 
     // An orphan has to stay useful — it is the review, not a broken row.
     acted.length = 0;
@@ -531,30 +547,56 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     });
     check('an empty reply sends nothing', acted.length === 0, JSON.stringify(acted));
 
-    // Colour is the person's own filing; STATE is the shape. A marker has to
-    // answer "is this done" without a legend, so the two must not share an
-    // encoding.
+    // Status and the person's own filing are two different facts and no longer
+    // share a channel. The dot says the state; the grouping colour is a small
+    // separate mark, and it is edited through Colour… in the overflow rather
+    // than by pressing the thing that tells you a review is resolved.
     acted.length = 0;
     let colored = null;
     await render(thread(review({ color: 'violet' }), { onColor: (c) => (colored = c) }));
-    check('the dot wears the comment\u2019s colour', /c-violet/.test($('.review-dot').className), $('.review-dot').className);
-    check('and an open one is filled', /is-open/.test($('.review-dot').className));
-    await click($('.review-dot-btn'));
-    check('the dot opens the palette', $$('.review-swatch').length === 6, String($$('.review-swatch').length));
+    check('the dot says the status, not the filing colour', /is-open/.test($('.review-dot').className) && !/c-violet/.test($('.review-dot').className), $('.review-dot').className);
+    check('and the dot is not a button', !$('.review-dot-btn'));
+    check('the filing colour is a separate quiet mark', /c-violet/.test($('.review-swatch-dot')?.className || ''), $('.review-swatch-dot')?.className);
+    check('which is decoration, not something to read out', $('.review-swatch-dot').getAttribute('aria-hidden') === 'true');
+    // The contract, not just the current call site: the dot carries no
+    // grouping-colour class at all, whatever it is handed. Anything that puts
+    // one back — a prop, a call site, a helper — puts a review's filing colour
+    // back in charge of what "resolved" looks like.
+    check('the dot carries no colour class of any kind', !/\bc-[a-z]+/.test($('.review-dot').className), $('.review-dot').className);
+    await render(React.createElement(ui.ReviewStatusDot, { status: 'resolved', anchorState: 'attached', color: 'violet' }));
+    check('and ignores a colour handed straight to it', !/\bc-/.test($('.review-dot').className), $('.review-dot').className);
+    check('while still saying the status', /is-resolved/.test($('.review-dot').className));
+
+    // Recolouring lives in the overflow now. It used to be behind the status
+    // dot, so the control that told you a review was resolved was also the one
+    // that changed the colour it said it in.
+    await render(thread(review({ color: 'violet' }), { onColor: (c) => (colored = c) }));
+    await click($('.review-overflow button[aria-haspopup="menu"]'));
+    await click($$('.review-menu [role="menuitem"]').find((b) => /Colour/.test(b.textContent)));
+    check('Colour… opens the palette', $$('.review-swatch').length === 6, String($$('.review-swatch').length));
     check('and shows which one is on', $$('.review-swatch').filter((b) => b.classList.contains('on')).length === 1);
     await click($$('.review-swatch').find((b) => b.classList.contains('c-teal')));
     check('picking one reports it', colored === 'teal');
     check('and closes the palette', $$('.review-swatch').length === 0);
 
     await render(thread(review({ status: 'deferred', color: 'violet' })));
-    check('a deferred review keeps its colour', /c-violet/.test($('.review-dot').className));
-    check('and says so by being hollow rather than by changing colour', /is-deferred/.test($('.review-dot').className));
+    check('a deferred review is grey and says so', /is-deferred/.test($('.review-dot').className), $('.review-dot').className);
+    check('whatever it is filed under', !/c-violet/.test($('.review-dot').className));
+    check('and it is still filed under it', /c-violet/.test($('.review-swatch-dot')?.className || ''));
+    // The whole reason the two were separated: a review somebody filed under
+    // green must not read as resolved.
+    await render(thread(review({ status: 'open', color: 'green' })));
+    check('an open review filed under green is still open', /is-open/.test($('.review-dot').className), $('.review-dot').className);
+    check('and is not marked resolved by its filing colour', !/is-resolved/.test($('.review-dot').className));
     await render(thread(review({ status: 'resolved', color: 'violet' })));
     check('a resolved one is a state, not a grouping', /is-resolved/.test($('.review-dot').className));
     await render(thread(review({ anchorState: 'orphaned', color: 'violet' })));
-    check('and an orphan is marked on top of whatever state it is in', /orphaned/.test($('.review-dot').className) && /is-open/.test($('.review-dot').className));
+    // An orphan is not a fourth status — it is an interruption of whichever
+    // status the review is in, so it replaces the shape rather than the state.
+    check('an orphan is marked as one', /is-orphaned/.test($('.review-dot').className), $('.review-dot').className);
+    check('and says so in words, not only in shape', /no longer find/.test($('.review-dot').getAttribute('aria-label') || ''), $('.review-dot').getAttribute('aria-label'));
     await render(thread(review()));
-    check('a thread with no way to recolour just shows the dot', !$('.review-dot-btn'));
+    check('and it is not a control either way', !$('.review-dot').hasAttribute('onclick') && $('.review-dot').tagName === 'SPAN');
 
     // Deleting is a person's decision and is asked about first.
     acted.length = 0;
@@ -563,7 +605,38 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // Resolve — a header with six controls is a header nobody reads, and a bin
     // next to a Resolve is a fourth workflow verb.
     check('deleting is not in among the workflow buttons', !$$('.review-actions button').some((b) => b.classList.contains('review-trash')));
-    check('the action row holds at most two verbs', $$('.review-actions button:not(.review-foot-more)').length <= 2, String($$('.review-actions button:not(.review-foot-more)').length));
+    check('the action row holds at most two verbs', $$('.review-actions button').length <= 2, String($$('.review-actions button').length));
+    check('and there is exactly one overflow in the whole panel', $$('[aria-haspopup="menu"]').length === 1, String($$('[aria-haspopup="menu"]').length));
+    // A menu with no way out. It had no Escape and no click-away, so the only
+    // exit was the same ⋯ again — and Escape, which is what anybody presses,
+    // fell through to the app and closed the whole Inspector.
+    await click($('.review-overflow button[aria-haspopup="menu"]'));
+    check('the overflow opens a menu', !!$('.review-menu'));
+    {
+      let escapedPastIt = false;
+      const onDoc = () => { escapedPastIt = true; };
+      document.addEventListener('keydown', onDoc);
+      const from = $('.review-menu [role="menuitem"]');
+      await act(async () => {
+        from.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      });
+      document.removeEventListener('keydown', onDoc);
+      check('Escape closes it', !$('.review-menu'));
+      check('and does not carry on to close the review behind it', escapedPastIt === false);
+      check('and focus goes back to the button that opened it', document.activeElement === $('.review-overflow button[aria-haspopup="menu"]'), document.activeElement?.className);
+    }
+    // And a click anywhere else closes it, the way every other popup here does.
+    await click($('.review-overflow button[aria-haspopup="menu"]'));
+    check('the menu opens again', !!$('.review-menu'));
+    await act(async () => {
+      document.body.dispatchEvent(new dom.window.MouseEvent('mousedown', { bubbles: true }));
+    });
+    check('and a click outside closes it', !$('.review-menu'));
+    // The button that reaches a state wears that state's colour, and the one
+    // that undoes it does not.
+    check('Resolve is the resolved colour', $$('.review-actions button').some((b) => b.classList.contains('review-resolve') && /Resolve/.test(b.textContent)));
+    await render(thread(review({ status: 'resolved' })));
+    check('and Reopen is not', !$('.review-actions button').classList.contains('review-resolve'), $('.review-actions button').className);
     const overflow = $('.review-overflow button');
     check('the header has an overflow menu', !!overflow);
     await click(overflow);
@@ -630,10 +703,13 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('a pin is drawn for each review that has a box', $$('.review-pin').length === 2, String($$('.review-pin').length));
     const at = (id) => $$('.review-pin').find((p) => p.style.left === id);
     check('a pin sits where its ratios say', !!at('300px'), $$('.review-pin').map((p) => `${p.style.left},${p.style.top}`).join(' '));
-    check('and wears its own colour', /c-violet/.test(at('300px').className), at('300px').className);
+    // The person's grouping colour is no longer on the marker: status is what
+    // a pin has to say, and a review filed under green looked resolved.
+    check('and does not wear the person\u2019s grouping colour', !/c-/.test(at('300px').className), at('300px').className);
+    check('it wears its status instead', /is-open/.test(at('300px').className), at('300px').className);
     check('and on the copy it was left on', $$('.review-pin').some((p) => p.style.top === '200px'), $$('.review-pin').map((p) => p.style.top).join());
     check('a deferred review reads differently from an open one', $$('.review-pin.is-deferred').length === 1);
-    check('and it is the shape that differs, not the colour', $$('.review-pin.is-deferred')[0].className.includes('c-'), $$('.review-pin.is-deferred')[0].className);
+    check('and a deferred one is marked deferred', $$('.review-pin.is-deferred').length === 1, String($$('.review-pin.is-deferred').length));
     check('an orphan has no pin', $$('.review-pin').length === 2);
     check('and is reported rather than silently dropped', hidden === 1, String(hidden));
 
@@ -664,7 +740,20 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('and says so to a screen reader too', /2 comments here/.test($('.review-pin').getAttribute('aria-label') || ''), $('.review-pin').getAttribute('aria-label'));
     // The count sits in a corner badge rather than in the label, so a cluster
     // is never wider than its number — #128 is a real name and has to fit.
-    check('and is marked as a cluster', $('.review-pin').className.includes('many'));
+    check('and is marked as a cluster', $('.review-pin').className.includes('is-cluster'), $('.review-pin').className);
+    // Addressable, so focus can come back to this marker when the chooser it
+    // opened is closed again. See restoreReviewFocus in App.jsx.
+    check('and says which reviews are under it', ($('.review-pin').getAttribute('data-review-ids') || '').split(' ').length === 2, $('.review-pin').getAttribute('data-review-ids'));
+    {
+      const pinEl = $('.review-pin');
+      check('a pin is focusable', pinEl.tagName === 'BUTTON');
+      pinEl.focus();
+      check('and takes focus when asked', document.activeElement === pinEl);
+    }
+    // One class per fact. It used to carry both `is-cluster` and `many`, which
+    // is two names for the same thing and two places to keep in step.
+    check('with one name for that fact, not two', !/\bmany\b/.test($('.review-pin').className), $('.review-pin').className);
+    check('and no status class, since its members can be in different ones', !/is-(open|deferred|resolved)/.test($('.review-pin').className), $('.review-pin').className);
     await render(pins({ items: [items[0]] }));
     check('a single pin wears its number', $('.review-pin').textContent.trim() === '1', JSON.stringify($('.review-pin').textContent));
 
@@ -873,17 +962,53 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // A resolved pin is only ever on the page while it is the one being read,
     // so there is nothing to fade it against — and it is green, because that is
     // what resolved means everywhere else in this UI.
-    check('a resolved pin is green', /\.review-pin\.is-resolved \{[\s\S]{0,120}background: #30c158/.test(cssSource));
+    check('a resolved pin is green', /\.review-pin\.is-resolved \{[\s\S]{0,120}--review-resolved/.test(cssSource));
     check('and is not faded, since it only appears when it is wanted', !/\.review-pin\.is-resolved \{[\s\S]{0,200}opacity: 0\.5;/.test(cssSource));
     // Status and selection are carried by different things: the fill says what
     // state it is in, the ring says this is the one being read. A selected open
     // pin must not turn green, and a selected resolved one must stay green.
     check('selection is a ring, not a change of colour', /\.review-pin\.open \{[\s\S]{0,220}box-shadow: 0 0 0 3px rgba\(0, 153, 255/.test(cssSource));
+    // Selected and focused are different facts, but drawn in the same blue
+    // around the same box they read as one duplicated selection. Whichever
+    // surface it is, exactly one of them is showing at a time.
+    check('a focused pin does not also wear the selection halo', /\.review-pin\.open:focus-visible \{ box-shadow: 0 5px 16px/.test(cssSource));
+    check('and a focused index row does not also wear the selection bar', /\.comments-row\.on:focus-visible \{ box-shadow: none; \}/.test(cssSource));
+    // The fill still says which row is being read, so nothing is lost.
+    check('the selected row keeps its fill either way', /\.comments-row\.on \{[\s\S]{0,120}background: var\(--bg-active\)/.test(cssSource));
     check('and it does not repaint the pin', !/\.review-pin\.open \{[\s\S]{0,220}background:/.test(cssSource));
-    check('a deferred pin is grey', /\.review-pin\.is-deferred \{[\s\S]{0,160}#7d7d82/.test(cssSource));
+    check('a deferred pin is grey', /\.review-pin\.is-deferred \{[\s\S]{0,200}--review-deferred/.test(cssSource));
+    // One set of tokens, used by every surface, so nobody has to relearn a
+    // colour between the index, the Inspector and the canvas.
+    check('the four status colours are declared once', /--review-open:[\s\S]{0,160}--review-orphan:/.test(cssSource));
     // A cluster can hold reviews in different states, so wearing one of them
     // would be a claim about all of them.
-    check('a cluster is neutral', /\.review-pin\.many \{[\s\S]{0,120}background: #3f4347/.test(cssSource));
+    check('a cluster is neutral', /\.review-pin\.is-cluster \{[\s\S]{0,120}background: #3f4347/.test(cssSource));
+    // And it is a different SHAPE, not the same shape in another colour. A
+    // marker reading "3" for review #3 and one reading "3" for three reviews
+    // are two completely different facts, and colour cannot separate them for
+    // anybody printing this, looking at it in greyscale, or unable to split
+    // those hues. So: square corners against the single pin's pointed tail,
+    // and a second card stacked behind it.
+    {
+      const clusterRule = (cssSource.match(/\.review-pin\.is-cluster \{[^}]*\}/) || [''])[0];
+      const singleRule = (cssSource.match(/\.review-pin \{[^}]*\}/) || [''])[0];
+      check('a cluster has its own silhouette', /border-radius: 6px/.test(clusterRule), clusterRule.slice(0, 200));
+      check('which is not the single pin’s', /border-radius: 11px 11px 11px 3px/.test(singleRule));
+      // The stack is drawn with box-shadow rather than a second element, so it
+      // survives a pin that is only 22px wide.
+      check('and a second card behind it', /3px -3px 0 -1px/.test(clusterRule) && /3px -3px 0 0\.5px #fff/.test(clusterRule), clusterRule.slice(0, 260));
+    }
+    // Distinct in words too: "Comment 3" and "3 comments here" have to be
+    // different sentences, because somebody listening cannot see the shape.
+    {
+      const single = ui.peekLabel({ number: 3, status: 'open', messages: [{ body: 'Too tight.' }] }, 1);
+      const cluster = ui.peekLabel(null, 3);
+      check('a single pin and a cluster are named differently', single !== cluster, `${single} / ${cluster}`);
+      check('and the cluster says what it is', /3 comments here/.test(cluster), cluster);
+      check('and says choosing is what happens next', /Choose one/.test(cluster), cluster);
+      check('while a single one names the review', /Comment #3/.test(single), single);
+      check('and says its state', /open/.test(single), single);
+    }
     // The chooser stays attached to the marker it belongs to, on either side.
     check('the cluster chooser has a pointer', /\.review-cluster::before \{/.test(cssSource));
     check('and it moves to the other side when the box flips', /\.review-cluster\.flip-x::before \{[^}]*right: -5px/.test(cssSource));
@@ -1339,9 +1464,12 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
 
     // --- links are opened, never followed --------------------------------
     opened.length = 0;
+    const wasAt = dom.window.location.href;
     await click($('.review-md-link'));
     check('clicking a link opens it outside Stacki', opened[0] === 'https://example.com/docs', JSON.stringify(opened));
-    check('and the renderer did not navigate', dom.window.location.href.includes('localhost') || true);
+    // The renderer is the app. A link that navigates it replaces Stacki with
+    // whatever somebody pasted into a comment, and there is no way back.
+    check('and the renderer did not navigate', dom.window.location.href === wasAt, `${wasAt} -> ${dom.window.location.href}`);
 
     await render(mdThread(one(FIXTURES.unsafe)));
     check('a javascript: link is not a link', !$('.review-md-link'), $('.review-md')?.innerHTML?.slice(0, 200));
@@ -1368,7 +1496,15 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         actorId: 'a',
       })
     );
-    check('an agent message is not editable by a person', !$('.review-msg-tools button[title="Edit this"]') || true);
+    // The fixture is an agent's message and the actor is a person, so there
+    // must be no pencil on it: editing somebody else's words — an agent's
+    // included — puts things in their mouth that they can then be asked about.
+    check('an agent message is not editable by a person', !$('.review-msg-tools button[title="Edit this"]'), $('.review-msg-tools')?.innerHTML?.slice(0, 160));
+    // And the control does exist when it should, so the check above is not
+    // passing because the selector is simply wrong.
+    await render(mdThread(one([{ ...FIXTURES.markdown[0], authorType: 'human', actorId: 'a' }]), { onEditMessage: (id, text) => edited.push(text), actorId: 'a' }));
+    check('but a person can edit their own', !!$('.review-msg-tools button[title="Edit this"]'));
+    await render(mdThread(one(FIXTURES.markdown), { onEditMessage: (id, text) => edited.push(text), actorId: 'a' }));
 
     // --- one presentation, whatever the content ---------------------------
     //
@@ -1383,7 +1519,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       check(`  with a fixed header`, !!$('.review-thread-head'), name);
       check(`  one scroll region`, $$('.review-thread-scroll').length === 1, name);
       check(`  and a fixed footer`, !!$('.review-thread-foot'), name);
-      check(`  and no density class`, !$('.review-thread.is-compact') && !$('.review-thread.is-expanded'), name);
+      check(`  and no density class`, !$('.review-thread.is-compact'), name);
     }
 
     // --- nothing here is draggable ----------------------------------------
@@ -1396,7 +1532,61 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('there is a way back to the index', !!$('.review-back'));
     await click($('.review-back'));
     check('and it says so', backed === true);
+
+    // --- focus goes back where it came from -------------------------------
+    //
+    // Closing a surface used to put focus nowhere: it fell to <body>, so
+    // Escape out of the Inspector meant tabbing from the top of the window to
+    // reach anything, and a screen reader was left announcing nothing.
+    {
+      const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
+      check('the app restores focus when a review surface closes', /restoreReviewFocus/.test(app));
+      check('and remembers which door was used', /focusOriginRef/.test(app) && /openReview\(id, 'row'\)/.test(app) && /openReview\(pin\.reviews\[0\], 'pin'\)/.test(app));
+      // Two ways out of the Inspector, and both have to put the keyboard back:
+      // the Back button and Escape. Only Escape was covered, so removing the
+      // Back button's half of it went unnoticed.
+      check('the Back button returns focus', /const backToIndex = useCallback\(\(\) => \{[\s\S]{0,320}restoreReviewFocusRef\.current\?\.\(id\)/.test(app));
+      check('and so does Escape', /setReviewPresentation\('index'\);\s*\n\s*restoreReviewFocusRef\.current\?\.\(id\)/.test(app));
+      check('and so does closing the cluster chooser', /setReviewCluster\(null\);\s*\n\s*restoreReviewFocusRef\.current\?\.\([\s\S]{0,40}'pin'\)/.test(app));
+      // The other door has to be findable when the first one has gone: a pin
+      // disappears when its review is resolved, and a row disappears when the
+      // filter stops matching, so each falls back to the other.
+      check('with the other door as a fallback', /want === 'pin' \? row : pin/.test(app));
+      // After the commit, or it focuses the element that is about to unmount.
+      check('after the close has been committed', /requestAnimationFrame\(\(\) => \{[\s\S]{0,700}el\.focus\(\)/.test(app));
+
+      const panel = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'), 'utf8');
+      check('an index row is addressable', /data-review-row=\{r\.id\}/.test(panel));
+      const pinsSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'ReviewPins.jsx'), 'utf8');
+      check('and a pin says which reviews are under it', /data-review-ids=\{pin\.reviews\.join\(' '\)\}/.test(pinsSrc));
+    }
+
     check('the header names the review', !!$('.review-head-title'));
+
+    // titleOf: every rung of the ladder has to produce a name worth reading,
+    // because the number is already sitting next to it.
+    {
+      const name = (r) => ui.titleOf(r);
+      check('the innermost component wins', name({ creationContext: { componentChain: ['Layout', 'Pricing', 'PlanCard'] } }) === 'PlanCard');
+      check('a chain of one is still a name', name({ creationContext: { componentChain: ['BlogPost'] }, source: 'src/pages/blog/index.astro' }) === 'BlogPost');
+      // The outermost chain entry is often the file it came from. A header is
+      // a place for a name, not a path.
+      check('a chain entry that is a filename is reduced too', name({ creationContext: { componentChain: ['index.astro'] }, source: 'src/pages/index.astro' }) === 'index');
+      check('and one that is a path is reduced to its leaf', name({ creationContext: { componentChain: ['src/components/Hero.astro'] } }) === 'Hero');
+      check('a non-astro file loses its extension too', name({ source: 'src/components/Card.tsx' }) === 'Card');
+      check('and so does a svelte one', name({ source: 'src/lib/Nav.svelte' }) === 'Nav');
+      // index.astro is a position, not a thing.
+      check('a route file is named for its folder', name({ source: 'src/pages/pricing/index.astro' }) === 'pricing');
+      check('a dynamic route too', name({ source: 'src/pages/blog/[slug].astro' }) === 'blog');
+      check('and a framework route file', name({ source: 'src/routes/checkout/+page.svelte' }) === 'checkout');
+      // A folder that only says where things live is not a name either.
+      check('but not a folder that says nothing', name({ source: 'src/pages/index.astro' }) === 'index');
+      check('a tag is better than nothing', name({ creationContext: { tag: 'section' } }) === '<section>');
+      check('and a page is better than the word Comment', name({ page: '/pricing' }) === '/pricing');
+      check('with the root page named', name({ page: '/' }) === 'Home');
+      check('and only then the last resort', name({}) === 'Comment');
+      check('an empty chain does not become an empty header', name({ creationContext: { componentChain: [null, ''] }, source: 'src/components/Hero.astro' }) === 'Hero');
+    }
     check('and offers Locate', !!$('.review-locate'));
     check('the file and breakpoint are context beneath it', !!$('.review-thread-context'));
 
@@ -1424,11 +1614,46 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // No list to step through, no control.
     await render(mdThread(one(FIXTURES.pair)));
     check('a thread with no list around it shows no stepper', !$('.review-step'));
+
+    // The targets. Quiet is about weight, not size: these were a 14px glyph in
+    // 1px of padding, wedged between two other controls.
+    await render(mdThread(one(FIXTURES.pair), { position: { index: 2, total: 5 }, onPrev: () => {}, onNext: () => {} }));
+    {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'src', 'styles.css'), 'utf8');
+      const rule = css.slice(css.indexOf('.review-step .review-x {'));
+      const h = Number((rule.match(/height:\s*(\d+)px/) || [])[1]);
+      const w = Number((rule.match(/min-width:\s*(\d+)px/) || [])[1]);
+      check('the stepper targets are big enough to hit', h >= 22 && w >= 22, `${w}x${h}`);
+      check('and not so big they read as buttons', h <= 26 && w <= 26, `${w}x${h}`);
+    }
+
+    // Resolving the review you are reading takes it out of the Open filter.
+    // That is the single most common thing to do in here, and it used to be
+    // the thing that removed the way onward.
+    let went = null;
+    await render(mdThread(one(FIXTURES.pair), {
+      position: { index: null, total: 6, detached: true },
+      onNext: () => { went = 'next'; },
+      onPrev: () => { went = 'prev'; },
+    }));
+    check('a review that has left the list keeps its stepper', !!$('.review-step'));
+    check('and does not claim a position it no longer has', !/of 6/.test($('.review-step').textContent), $('.review-step').textContent);
+    check('but still says how many are left', /6 others/.test($('.review-step').textContent), $('.review-step').textContent);
+    check('and says why the position went', /no longer in the current filter/.test($('.review-step-n').getAttribute('title') || ''));
+    await click($$('.review-step button')[1]);
+    check('and Next carries on from where it was', went === 'next', String(went));
+
     {
       const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.jsx'), 'utf8');
       check('the app binds option-arrow to stepping', /e\.altKey/.test(app) && /stepReviewRef\.current\?\.\(to\)/.test(app));
       check('only while the reader is open', /reviewPresentationRef\.current === 'inspector'/.test(app));
       check('and not when a modifier that means something else is held', /!e\.metaKey/.test(app) && /!e\.ctrlKey/.test(app));
+      // ⌥↑/⌥↓ move by paragraph inside text on macOS, and the reply box is
+      // directly under this shortcut.
+      check('and never while the caret is in a field', /!stepInField/.test(app) && /stepInField =/.test(app));
+      // The stepper walks the list the index is showing, not every review.
+      check('the stepper walks the filtered, scoped list', /reviewRows\.findIndex\(\(r\) => r\.id === reviewSelectedId\)/.test(app));
+      check('which is the order the list itself is in', /const reviewRows = allReviews[\s\S]{0,240}\.sort\(/.test(app));
     }
   }
 
@@ -1772,7 +1997,11 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     await render(React.createElement(ui.ReviewPeek, { review, at: { x: 100, y: 100 }, cluster: 0 }));
     const peek = $('.review-peek');
     check('a peek appears', !!peek);
-    check('it is a tooltip, not a panel', peek.getAttribute('role') === 'tooltip');
+    // One model, not two. It used to announce itself as a tooltip AND hide
+    // itself from the accessibility tree, which is two answers to one
+    // question. It is decoration; the pin carries the words.
+    check('it is decorative to assistive technology', peek.getAttribute('aria-hidden') === 'true');
+    check('and does not also claim to be a tooltip', !peek.getAttribute('role'), peek.getAttribute('role'));
     // The whole point: the pointer goes through it to the pin underneath. The
     // stylesheet is not loaded in jsdom, so the rule is checked where it lives.
     const css = fs.readFileSync(path.join(__dirname, '..', 'src', 'styles.css'), 'utf8');
@@ -1786,15 +2015,20 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('it names the review', /#17/.test(peek.textContent));
     check('and who said it', /Claude/i.test(peek.textContent));
     check('and how many replies', /1 reply/.test(peek.textContent), peek.textContent);
-    check('it is hidden from screen readers, which read the pin instead', peek.getAttribute('aria-hidden') === 'true');
 
     // The pin's accessible name carries the same words, where focus actually is.
     const label = ui.peekLabel(review, 0);
     check('the pin gets an accessible description', /#17/.test(label) && /Claude/.test(label), label);
-    check('a cluster says how many instead', ui.peekLabel(null, 3) === '3 comments here');
+    // A marker reading 3 for review #3 and a marker reading 3 for three reviews
+    // must not sound the same either.
+    check('a cluster says how many instead', /^3 comments here/.test(ui.peekLabel(null, 3)), ui.peekLabel(null, 3));
+    check('and never like a review numbered 3', !/Comment #3/.test(ui.peekLabel(null, 3)));
+    check('while a single review does say its number', /Comment #17/.test(ui.peekLabel(review, 0)));
+    check('and its status in words', /open/.test(ui.peekLabel(review, 0)), ui.peekLabel(review, 0));
 
     await render(React.createElement(ui.ReviewPeek, { review: null, at: { x: 10, y: 10 }, cluster: 4 }));
     check('a cluster peek counts rather than picking one', /4 comments here/.test($('.review-peek').textContent));
+    check('and it is decorative too', $('.review-peek').getAttribute('aria-hidden') === 'true');
   }
 
   // ------------------------------------------------------------------
@@ -1811,7 +2045,12 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     }));
     const menu = $('.review-cluster');
     check('the chooser appears', !!menu);
-    check('as a listbox', menu.getAttribute('role') === 'listbox');
+    // One pattern. It was a listbox whose options were buttons — two widget
+    // models in one element, and neither of them navigable.
+    check('as a labelled non-modal dialog', menu.getAttribute('role') === 'dialog' && menu.getAttribute('aria-modal') === 'false');
+    check('with a name that says what it is', /3 comments here/.test(menu.getAttribute('aria-label') || ''));
+    check('holding ordinary buttons, not options', $$('.review-cluster-row').every((b) => b.tagName === 'BUTTON' && !b.getAttribute('role')));
+    check('each naming its review and status', /#21/.test($$('.review-cluster-row')[1].getAttribute('aria-label') || ''), $$('.review-cluster-row')[1].getAttribute('aria-label'));
     check('saying how many', /3 comments here/.test(menu.textContent));
     check('with a row each', $$('.review-cluster-row').length === 3);
     check('each naming its review', /#17/.test(menu.textContent) && /#21/.test(menu.textContent) && /#28/.test(menu.textContent));
@@ -1832,9 +2071,12 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
         $('.review-cluster').dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
       });
     };
+    // Arrows move focus between real buttons; Enter is then the button's own
+    // behaviour rather than something this has to reimplement.
     await press('ArrowDown');
-    await press('Enter');
-    check('arrow keys and Enter choose', picked === 'rt_21', String(picked));
+    check('an arrow key moves the active row', $$('.review-cluster-row')[1].className.includes('on'));
+    await click($$('.review-cluster-row')[1]);
+    check('and choosing it picks that review', picked === 'rt_21', String(picked));
     closed = false;
     await press('Escape');
     check('Escape closes it', closed === true);

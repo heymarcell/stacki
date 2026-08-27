@@ -3813,10 +3813,6 @@ export default function App() {
       };
     });
 
-  // The reviews that have a marker on the canvas for this render. A thread
-  // whose pin is right there does not also need to be spelled out inside the
-  // list — the popover over the pin is already showing it.
-  const pinnedReviewIds = new Set(reviewItems.map((r) => r.id));
 
   const reviewRows = allReviews
     .filter((r) => (reviewFilter === 'all' ? true : r.status === reviewFilter))
@@ -4578,15 +4574,59 @@ export default function App() {
    * characters, which meant the same gesture did different things and the
    * reason was invisible.
    */
-  const openReview = useCallback((id) => {
+  const openReview = useCallback((id, from = null) => {
+    if (from) focusOriginRef.current = { kind: from, id };
     setReviewSelectedId(id);
     setReviewPresentation(id ? 'inspector' : 'index');
     setReviewCluster(null);
     setReviewPeek(null);
   }, []);
 
+  /**
+   * Where the keyboard goes when a review surface closes.
+   *
+   * Closing something put focus nowhere: it fell back to <body>, so Escape out
+   * of the Inspector meant Tab from the top of the window to get anywhere, and
+   * a screen reader was left announcing nothing at all. The rule everything
+   * else in this app follows is the one used everywhere — focus returns to
+   * whatever opened the thing that just closed.
+   *
+   * `kind` is where it was opened FROM: a row in the index, or a pin on the
+   * canvas. It is honoured first and the other is the fallback, because a pin
+   * can go away while its review is being read — resolving it takes the marker
+   * off the canvas — and a row can be filtered out for exactly the same
+   * reason. Neither being there is not a failure; there is simply nothing to
+   * return to, and focus stays where it is.
+   */
+  const focusOriginRef = useRef(null);
+  const restoreReviewFocus = useCallback((id, prefer = null) => {
+    const want = prefer || focusOriginRef.current?.kind || 'row';
+    const target = id || focusOriginRef.current?.id || null;
+    if (!target) return;
+    // After the commit that closed the surface, or the element being focused
+    // is the one about to be unmounted.
+    requestAnimationFrame(() => {
+      const esc = (v) => (window.CSS?.escape ? window.CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&'));
+      const row = `[data-review-row="${esc(target)}"]`;
+      const pin = `[data-review-ids~="${esc(target)}"]`;
+      const el =
+        document.querySelector(want === 'pin' ? pin : row) ||
+        document.querySelector(want === 'pin' ? row : pin);
+      if (el && typeof el.focus === 'function') el.focus();
+    });
+  }, []);
+  const restoreReviewFocusRef = useRef(restoreReviewFocus);
+  restoreReviewFocusRef.current = restoreReviewFocus;
+
   /** Out of the reader, back to the list — still on the same review. */
-  const backToIndex = useCallback(() => setReviewPresentation('index'), []);
+  const backToIndex = useCallback(() => {
+    const id = reviewSelectedIdRef.current;
+    setReviewPresentation('index');
+    restoreReviewFocusRef.current?.(id);
+  }, []);
+
+  /** Where the review being read last sat in the list. See reviewStep. */
+  const stepAnchorRef = useRef(null);
 
   /**
    * The neighbours of the review being read, in the order the list shows them.
@@ -4598,14 +4638,42 @@ export default function App() {
   const reviewStep = useMemo(() => {
     if (!reviewSelectedId) return null;
     const at = reviewRows.findIndex((r) => r.id === reviewSelectedId);
-    if (at < 0) return null;
+    if (at >= 0) {
+      stepAnchorRef.current = { id: reviewSelectedId, at };
+      return {
+        index: at + 1,
+        total: reviewRows.length,
+        prev: at > 0 ? reviewRows[at - 1].id : null,
+        next: at < reviewRows.length - 1 ? reviewRows[at + 1].id : null,
+        detached: false,
+      };
+    }
+
+    // The review being read has just left the list it was being walked
+    // through — almost always because resolving it dropped it out of the Open
+    // filter, which is the single most common thing to do while triaging.
+    //
+    // Losing the stepper at that exact moment is backwards: it disappeared on
+    // the one action that most wants a "next", stranding somebody in a reader
+    // with no way on but back to the index. So the walk continues from where
+    // this review WAS: Prev is the one before that spot and Next is whatever
+    // slid into it.
+    //
+    // The ordinal goes, though. "3 of 7" about a review that is not one of the
+    // seven is a lie, and the count is the part that is still true.
+    const anchor = stepAnchorRef.current;
+    if (!anchor || anchor.id !== reviewSelectedId) return null;
+    if (!allReviews.some((r) => r.id === reviewSelectedId)) return null;
+    if (reviewRows.length === 0) return null;
+    const k = Math.min(Math.max(0, anchor.at), reviewRows.length);
     return {
-      index: at + 1,
+      index: null,
       total: reviewRows.length,
-      prev: at > 0 ? reviewRows[at - 1].id : null,
-      next: at < reviewRows.length - 1 ? reviewRows[at + 1].id : null,
+      prev: k > 0 ? reviewRows[k - 1].id : null,
+      next: k < reviewRows.length ? reviewRows[k].id : null,
+      detached: true,
     };
-  }, [reviewRows, reviewSelectedId]);
+  }, [reviewRows, reviewSelectedId, allReviews]);
   const reviewStepRef = useRef(reviewStep);
   reviewStepRef.current = reviewStep;
 
@@ -4671,11 +4739,23 @@ export default function App() {
       // editor moves between problems. Triaging a page of feedback is a
       // sequence, and going back to the index between every item turns eight
       // reviews into sixteen navigations. Only while reading, and only with
-      // Option held, so nothing here competes with typing a reply.
+      // Option held.
+      //
+      // Never while the caret is in a field. On macOS ⌥↑ and ⌥↓ move by
+      // paragraph inside text, and the reply box is a textarea directly under
+      // this shortcut: somebody halfway through a paragraph pressing ⌥↑ to get
+      // to its start was jumped to a different review instead, with a
+      // half-written draft left behind. A shortcut that competes with the
+      // system's own text editing is one that only ever fires by accident.
+      const stepTarget = e.target;
+      const stepInField =
+        stepTarget instanceof HTMLElement &&
+        !!(stepTarget.closest('input, textarea, select, [contenteditable="true"]') || stepTarget.isContentEditable);
       if (
         e.altKey &&
         !e.metaKey &&
         !e.ctrlKey &&
+        !stepInField &&
         (e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
         reviewPresentationRef.current === 'inspector'
       ) {
@@ -4693,10 +4773,16 @@ export default function App() {
         // last thing that happened rather than everything at once.
         if (reviewClusterRef.current) {
           e.preventDefault();
+          // Back to the marker that was pressed to open it — the chooser is
+          // keyboard-reachable, so leaving it has to be too.
+          const cluster = reviewClusterRef.current;
           setReviewCluster(null);
+          restoreReviewFocusRef.current?.(cluster.reviews?.[0] || null, 'pin');
         } else if (reviewPresentationRef.current === 'inspector' && commentModeRef.current.phase === 'off') {
           e.preventDefault();
+          const id = reviewSelectedIdRef.current;
           setReviewPresentation('index');
+          restoreReviewFocusRef.current?.(id);
         } else if (reviewSelectedIdRef.current && commentModeRef.current.phase === 'off') {
           // Still selected after leaving the reader, so a second Escape is what
           // clears it — and takes a temporarily-shown resolved marker with it.
@@ -5067,7 +5153,7 @@ export default function App() {
                 resizable={reviewShape.mode === 'docked'}
                 onWidthChange={saveInspectorWidth}
                 onBack={backToIndex}
-                position={reviewStep ? { index: reviewStep.index, total: reviewStep.total } : null}
+                position={reviewStep ? { index: reviewStep.index, total: reviewStep.total, detached: reviewStep.detached } : null}
                 onPrev={reviewStep?.prev ? () => stepReview(reviewStep.prev) : null}
                 onNext={reviewStep?.next ? () => stepReview(reviewStep.next) : null}
                 actorId={reviewShared?.identity?.actorId || null}
@@ -5104,29 +5190,17 @@ export default function App() {
                 onScope={setReviewScope}
                 selectedId={reviewSelectedId}
                 onOpen={(id) => {
-                  openReview(id);
+                  openReview(id, 'row');
                   // Choosing a comment from the list means "show me this" —
                   // reading it and finding it are the same act. An orphan has
                   // nowhere to go, so it just opens.
                   const picked = id ? reviewRows.find((r) => r.id === id) : null;
                   if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
                 }}
-                onAct={actOnReview}
-                onFocus={focusReviewFromUi}
-                onDelete={deleteReview}
-                onColor={recolorReview}
-                onEditMessage={editReviewMessage}
-                onDeleteMessage={deleteReviewMessage}
-                busyId={reviewBusyId}
                 problem={reviewProblem}
                 shared={reviewShared}
                 totalCount={allReviews.length}
                 actorId={reviewShared?.identity?.actorId || null}
-                withheldIds={withheldPins}
-                // Which reviews have a marker on the canvas right now. The
-                // panel needs it to know whether the thread is already being
-                // shown somewhere: if it is, the row is just a row.
-                pinnedIds={pinnedReviewIds}
                 syncing={reviewSyncing}
                 onSync={syncReviews}
                 onShareEnable={shareEnable}
@@ -5342,12 +5416,12 @@ export default function App() {
                 setReviewCluster(pin);
                 return;
               }
-              openReview(pin.reviews[0]);
+              openReview(pin.reviews[0], 'pin');
               const picked = allReviewsRef.current.find((r) => r.id === pin.reviews[0]);
               if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
             }}
             onPickFromCluster={(id) => {
-              openReview(id);
+              openReview(id, 'pin');
               const picked = allReviewsRef.current.find((r) => r.id === id);
               if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
             }}
@@ -5501,11 +5575,20 @@ export default function App() {
             It is what somebody uses to FIX the feedback they just read, so it
             is the third thing protected, not the first — but a 300px canvas is
             not somewhere you can work, and this can be brought back with one
-            click while a crushed canvas cannot. See src/reviewLayout.js. */}
+            click while a crushed canvas cannot. See src/reviewLayout.js.
+
+            The button says what it will DO. It used to promise "Show Style and
+            Settings" and then close the comment you were reading, which is a
+            surprising amount of state to lose from a control that named
+            neither the comment nor closing. Style is only ever hidden because
+            the Inspector is taking the room — propsVisible is true in every
+            other layout — so closing it is the whole mechanism, and there is
+            no reason not to say so. */}
         {pageState?.editable && !previewRef && !reviewShape.propsVisible && (
           <button
             className="props-reveal"
-            title="Show Style and Settings"
+            title="Close the comment to make room for Style and Settings"
+            aria-label="Close the comment to make room for Style and Settings"
             onClick={() => setReviewPresentation('index')}
           >
             Style

@@ -273,7 +273,7 @@ const SHOTS = [];
   // --- the panel -----------------------------------------------------------
   const openPanel = () =>
     js(`(() => {
-      if (document.querySelector('.comments-body') || document.querySelector('.comments-reader')) return 'already';
+      if (document.querySelector('.comments-body')) return 'already';
       // The rail buttons carry no title — the tooltip is a separate element —
       // so this is the last one, which is Comments. See src/ui/LeftRail.jsx.
       const rail = [...document.querySelectorAll('.rail-btn')];
@@ -346,6 +346,8 @@ const SHOTS = [];
       fields: el.querySelectorAll('textarea, input').length,
       links: el.querySelectorAll('a').length,
       role: el.getAttribute('role'),
+      hidden: el.getAttribute('aria-hidden'),
+      pinLabel: document.querySelector('.review-pin[aria-label]')?.getAttribute('aria-label') || '',
       lines: Math.round(el.querySelector('.review-peek-body')?.getBoundingClientRect().height || 0),
     };
   })()`);
@@ -356,7 +358,17 @@ const SHOTS = [];
     check('there is nothing to press', peek.buttons === 0, String(peek.buttons));
     check('nothing to type into', peek.fields === 0, String(peek.fields));
     check('no links to follow', peek.links === 0, String(peek.links));
-    check('and it is a tooltip', peek.role === 'tooltip', peek.role);
+    // ONE accessibility model, not two. It used to announce itself as a
+    // tooltip and hide itself from the accessibility tree in the same breath,
+    // which is two answers to one question — and a tooltip that is aria-hidden
+    // is a tooltip nothing can read.
+    //
+    // It is decoration over a control that already exists. The pin has the
+    // focus and carries the same words on its own accessible name, so a screen
+    // reader hears them from the thing it is actually on.
+    check('it is decoration, with no role of its own', !peek.role, peek.role);
+    check('and it is out of the accessibility tree', peek.hidden === 'true', peek.hidden);
+    check('because the pin says it instead', peek.pinLabel.length > 0, peek.pinLabel);
     check('bounded to about two lines', peek.lines > 0 && peek.lines <= 44, String(peek.lines));
   }
   await js(`document.querySelector('.review-pin')?.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }))`);
