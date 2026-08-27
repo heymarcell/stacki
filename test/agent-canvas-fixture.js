@@ -71,6 +71,11 @@ const FILES = {
 .hero h1 {
   font-size: 40px;
 }
+
+.section-title {
+  margin: 24px 0 8px;
+  font-size: 20px;
+}
 `,
 
   'src/data/site.json': JSON.stringify({ title: 'Canvas fixture', tagline: 'Words that live in a file' }, null, 2),
@@ -138,6 +143,18 @@ import '../styles/site.css';
 </html>
 `,
 
+  // A heading the PAGE owns.
+  //
+  // Everything else on this page is a component — Hero, Card, Panel — and a
+  // rendered node inside a component resolves to the component's usage in the
+  // file that is open, because that is the outermost thing the open file owns.
+  // So index.astro had nothing inner and source-backed of its own, and a review
+  // left anywhere on it anchored to <Hero> or <Base>. Removing one of those to
+  // make an orphan removes the page.
+  //
+  // One heading fixes that: something narrow, declared here, that can be cut
+  // out while the pricing cards and the panel carry on rendering. See
+  // 20-orphaned-review in test/review-ux-export.js.
   'src/pages/index.astro': `---
 import Base from '../layouts/Base.astro';
 import Hero from '../components/Hero.astro';
@@ -154,6 +171,7 @@ const plans = [
 ---
 <Base>
   <Hero heading={site.tagline} />
+  <h2 class="section-title">Plans</h2>
   <div class="pricing-grid">
     {plans.map((plan) => (
       <Card title={plan.title} body={plan.body} />
