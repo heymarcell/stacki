@@ -417,7 +417,7 @@ would be an encrypted file host.
 | open invitations per room | 20 |
 | envelopes per room | 200 000 |
 | stored ciphertext per room | 512 MiB |
-| invitation lifetime | 7 days (minimum 60 s) |
+| invitation lifetime | 7 days (minimum 1 s) |
 
 ## 16. Error codes
 
