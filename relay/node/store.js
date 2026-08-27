@@ -232,7 +232,14 @@ function openStore({ file = ':memory:', now = Date.now } = {}) {
         db.prepare('ROLLBACK').run();
         throw err;
       }
-      return { ok: true, room: { id: roomId, createdAt: room.created_at }, credential: { token } };
+      // `is_owner` is not touched by a rejoin, so somebody who created the room,
+      // left, and was invited back comes back as its owner.
+      return {
+        ok: true,
+        room: { id: roomId, createdAt: room.created_at },
+        credential: { token },
+        isOwner: !!(existing ? existing.is_owner : 0),
+      };
     },
 
     /**

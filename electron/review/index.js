@@ -44,7 +44,7 @@ const { anchorFrom } = require('./anchor');
 const { createCheckout } = require('./checkout');
 const { localActor, setLocalName, suggestName, agentActor, displayName } = require('./actors');
 const { createWorkspaces } = require('./workspaces');
-const { createSyncer, legacyLink } = require('./sync');
+const { createSyncer, createCatchUp, legacyLink } = require('./sync');
 const {
   createWorkspace: createRemoteWorkspace,
   joinWorkspace: joinRemoteWorkspace,
@@ -58,6 +58,7 @@ const {
   createSecureTransport,
   createRoom: createSecureRoom,
   joinRoom: joinSecureRoom,
+  abandonRoom,
 } = require('./secure/transport');
 const { unpackCapability, packCapability, shareLink } = require('./secure/capability');
 const { relayFor, describeRelay, checkRelay, DEFAULT_RELAY } = require('./secure/relays');
@@ -90,6 +91,11 @@ let workspace = null;
 // slot in the ledger and one row in the panel.
 let secureRooms = null;
 let room = null;
+// Whether the window is on screen, so a minimised Stacki is not asking a relay
+// anything. Supplied by main.js; assumed true when nothing said otherwise, so
+// a headless test still catches up.
+let windowVisible = () => true;
+let catchUp = null;
 // Set only while a join confirmation is on screen. Never persisted, never
 // written to disk, and cleared the moment the dialog closes — see §61.
 let pendingJoin = null;
@@ -128,6 +134,17 @@ let writeSync = null;
  * had; changing when an existing plaintext workspace talks to its server is
  * not this feature's business.
  */
+/** Start or stop the periodic catch-up, from whatever just changed. */
+function reviseCatchUp() {
+  let visible = true;
+  try {
+    visible = windowVisible() !== false;
+  } catch {
+    /* a window that cannot be asked is treated as on screen */
+  }
+  catchUp?.set(!!room && !!store?.shared?.workspaceId && visible);
+}
+
 function scheduleWriteSync() {
   if (!room || !store?.shared?.pending) return;
   if (writeSync) return;
@@ -194,6 +211,7 @@ function openProject(next) {
   // Opening a shared project is one of the three moments this app talks to a
   // server. It is deliberately not awaited: the panel shows what is on disk
   // immediately and grows the rest when it arrives.
+  reviseCatchUp();
   if (workspace || room) void syncNow('open');
   return store;
 }
@@ -209,6 +227,7 @@ function closeProject() {
   room = null;
   pendingJoin = null;
   hintCache = null;
+  catchUp?.disarm();
   syncer?.reset();
   announce(0);
 }
@@ -429,7 +448,17 @@ function sharedStatus() {
     workspace: mode === 'legacy' && registry && workspace ? registry.publicOf(workspace) : null,
     // The secure shape. No id, no relay credential, no key material — see the
     // IPC audit in test/secure-share.js, which walks this object.
-    secure: mode === 'secure' && secureRooms ? secureRooms.publicOf(room) : null,
+    //
+    // `secure.relay` is the relay THIS ROOM actually uses, and it is immutable:
+    // a room is created on one relay and stays there, because moving it would
+    // mean a different authorisation boundary and a different set of people
+    // able to reach it. It is deliberately a different field from the
+    // preference below, under a different name, so no screen can show one
+    // while meaning the other.
+    secure:
+      mode === 'secure' && secureRooms
+        ? { ...secureRooms.publicOf(room), relay: describeRelay(room.relay) }
+        : null,
     lastSyncAt: ledger?.lastSyncAt ?? null,
     problem: ledger?.problem ?? null,
     // How much has not left this machine yet. The honest measure of "am I
@@ -444,8 +473,11 @@ function sharedStatus() {
     // Secure Share has no discovery of any kind, and a git remote is a hint
     // and never a key.
     suggestion: mode === 'off' && registry && projectPath ? registry.suggestFor(hintCache) : null,
-    // Where a NEW secure share would be created. Public information.
-    relay: describeRelay(relayFor({ preferred: secureRooms?.preferredRelay?.() })),
+    // Where the NEXT secure share would be created, which has nothing to do
+    // with where an existing one lives. Named for what it is: reading this and
+    // showing it as the current room's relay is the bug this name exists to
+    // make impossible.
+    newShareRelay: describeRelay(relayFor({ preferred: secureRooms?.preferredRelay?.() })),
   };
 }
 
@@ -486,11 +518,31 @@ async function enableSecureShare({ relay = null, publishExisting = false } = {})
 
   const made = await createSecureRoom({ relay: origin.origin, actor, rooms: secureRooms });
   if (!made.ok) return made;
-  secureRooms.link(scopeKey(projectPath), made.room.roomId);
+
+  // From here the room exists on a relay, and every remaining step can fail.
+  // None of them may be allowed to leave a room nobody is in or a ledger
+  // pointed at a share this machine cannot reach — so each is checked and each
+  // failure walks the whole thing back, remotely and locally.
+  const undo = async (why) => {
+    await abandonRoom({ relay: made.room.relay, roomId: made.room.roomId, token: made.room.token, owner: true });
+    secureRooms.unlink(scopeKey(projectPath));
+    secureRooms.forget(made.room.roomId);
+    room = null;
+    reviseCatchUp();
+    return { ok: false, code: 'not_stored', message: why };
+  };
+
+  if (!secureRooms.link(scopeKey(projectPath), made.room.roomId)) {
+    return undo('Stacki could not link this project to the new secure share, so it was not created.');
+  }
   room = made.room;
   workspace = null;
+  reviseCatchUp();
   const turned = store.enableShared({ workspaceId: made.room.roomId, publishExisting });
-  if (!turned.ok) return turned;
+  if (!turned.ok) {
+    await undo(turned.message || 'Stacki could not turn on sharing for this project, so the share was not created.');
+    return turned;
+  }
   const synced = await syncNow('enable');
   return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
 }
@@ -559,11 +611,29 @@ async function joinSecureShare({ publishExisting = false } = {}) {
   pendingJoin = null;
   if (!joined.ok) return joined;
 
-  secureRooms.link(scopeKey(projectPath), joined.room.roomId);
+  // The invitation is spent. Anything that fails now has to give the
+  // membership back rather than leave somebody holding a share they cannot
+  // reach and an invitation they cannot reuse.
+  const undo = async (why) => {
+    await abandonRoom({ relay: joined.room.relay, roomId: joined.room.roomId, token: joined.room.token, owner: false });
+    secureRooms.unlink(scopeKey(projectPath));
+    secureRooms.forget(joined.room.roomId);
+    room = null;
+    reviseCatchUp();
+    return { ok: false, code: 'not_stored', message: why };
+  };
+
+  if (!secureRooms.link(scopeKey(projectPath), joined.room.roomId)) {
+    return undo('Stacki could not link this project to that secure share. Ask for a new invitation.');
+  }
   room = joined.room;
   workspace = null;
+  reviseCatchUp();
   const turned = store.enableShared({ workspaceId: joined.room.roomId, publishExisting });
-  if (!turned.ok) return turned;
+  if (!turned.ok) {
+    await undo(turned.message || 'Stacki could not turn on sharing for this project. Ask for a new invitation.');
+    return turned;
+  }
   const synced = await syncNow('join');
   return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
 }
@@ -603,25 +673,67 @@ async function createSecureInvite({ ttlMs = null } = {}) {
  * was already shared stays shared. The relay credential is revoked and the
  * room's secrets are forgotten here.
  */
+// The refusals that mean "try again in a moment" rather than "this is over".
+// A transport never throws; it answers with one of these, and telling them
+// apart is the whole of the leave semantics below.
+const TRANSIENT = new Set(['offline', 'timeout', 'busy', 'server', 'bad_response', 'unsupported', 'closed']);
+
+/**
+ * Stop this machine talking to the room.
+ *
+ * LEAVING IS A THING THE RELAY HAS TO CONFIRM. The old version called
+ * `transport.leave()`, ignored the answer — transports return a status rather
+ * than throwing, so the catch never fired — and then destroyed the only
+ * credential this machine had. Offline, that meant: the token stayed valid at
+ * the relay, Stacki threw away the only means of ever revoking it, and told
+ * the person they had left. A revocation that did not happen, reported as one
+ * that did.
+ *
+ * So a transient failure leaves everything exactly as it was and says what to
+ * do. `unauthorized` is the other confirmed outcome: the relay is saying this
+ * membership already has no access, which is the state leaving was for.
+ *
+ * Local review history is untouched either way. What survives a confirmed
+ * leave is this member's signing identity, so a later invitation back to the
+ * same room is possible at all — see `retire` in secrets.js.
+ */
 async function leaveSecureShare() {
   if (!store || !room) {
     return { ok: false, code: 'not_shared', message: 'This project is not sharing its comments securely.' };
   }
   const transport = createSecureTransport({ rooms: secureRooms, roomId: room.roomId });
+  let left;
   try {
-    // Best effort. A relay that cannot be reached must not be able to keep
-    // somebody in a share they have decided to leave.
-    await transport.leave();
-  } catch {
-    /* the local forget below is what actually matters */
+    left = await transport.leave();
+  } catch (err) {
+    left = { ok: false, code: 'offline', message: err?.message || null };
   } finally {
     transport.close();
   }
+
+  const confirmed = left?.ok === true || left?.code === 'unauthorized' || left?.code === 'not_found';
+  if (!confirmed) {
+    const transient = TRANSIENT.has(left?.code);
+    store.setSyncProblem(transient ? 'leave_unconfirmed' : left?.code || 'leave_failed', null);
+    return {
+      ok: false,
+      code: transient ? 'leave_unconfirmed' : left?.code || 'leave_failed',
+      message: transient
+        ? 'Connect to the relay to leave this secure share. Nothing has changed here and your comments are safe.'
+        : left?.message || 'Leaving this secure share did not work.',
+      shared: sharedStatus(),
+    };
+  }
+
   secureRooms.unlink(scopeKey(projectPath));
-  secureRooms.forget(room.roomId);
+  // Retired rather than forgotten: the room secret and the token go, the
+  // signing identity stays so a new invitation to this room can be accepted.
+  if (!secureRooms.retire(room.roomId)) secureRooms.forget(room.roomId);
   room = null;
+  reviseCatchUp();
   const turned = store.disableShared();
   if (!turned.ok) return turned;
+  store.setSyncProblem(null);
   return { ok: true, shared: sharedStatus() };
 }
 
@@ -650,6 +762,7 @@ async function endSecureShare() {
   secureRooms.unlink(scopeKey(projectPath));
   secureRooms.forget(room.roomId);
   room = null;
+  reviseCatchUp();
   const turned = store.disableShared();
   if (!turned.ok) return turned;
   return { ok: true, shared: sharedStatus() };
@@ -893,14 +1006,20 @@ async function focus(threadId) {
  * this to read or write anywhere else in userData. The sharing channels take a
  * server address and an invitation, which are the two things a person types.
  */
-function start({ userDataPath, send, protector = null }) {
+function start({ userDataPath, send, protector = null, isVisible = null }) {
   userData = userDataPath;
   sendToWindow = send || null;
+  if (typeof isVisible === 'function') windowVisible = isVisible;
   registry = registry || createWorkspaces({ userDataPath });
   // `protector` is injected by tests and only by tests. In the app it is
   // Electron's safeStorage; nothing automated ever reaches a real Keychain.
   secureRooms = secureRooms || createSecureRooms({ userDataPath, protector });
   syncer = syncer || createSyncer();
+  // The only thing that closes the last gap in "you do not need a Sync
+  // button": somebody who leaves Stacki open and focused all afternoon while a
+  // colleague replies. Armed only for an active secure share on a visible
+  // window — see reviseCatchUp.
+  catchUp = catchUp || createCatchUp({ onDue: (reason) => void syncNow(reason) });
   if (registered) return;
   registered = true;
 
@@ -930,6 +1049,12 @@ function start({ userDataPath, send, protector = null }) {
   ipcMain.handle('reviews:secureLeave', () => leaveSecureShare());
   ipcMain.handle('reviews:secureEnd', () => endSecureShare());
   ipcMain.handle('reviews:secureRelay', (_e, args) => setSecureRelay(args || {}));
+  // The window came back, or went away. Cheap, and it is what stops a
+  // minimised Stacki asking a relay anything.
+  ipcMain.handle('reviews:visibility', () => {
+    reviseCatchUp();
+    return { ok: true };
+  });
   ipcMain.handle('reviews:identity', () => identity());
   ipcMain.handle('reviews:setIdentity', (_e, args) => setIdentity(args || {}));
 }
@@ -960,6 +1085,7 @@ function attach(parts = {}) {
 /** Everything scheduled, on disk, before the process goes. */
 function flushSync() {
   cancelWriteSync();
+  catchUp?.disarm();
   store?.flushSync();
 }
 

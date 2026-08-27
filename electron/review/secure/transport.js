@@ -403,6 +403,33 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
 // --- before there is a room to have a transport for -------------------------
 
 /**
+ * Undo a room this machine created or joined but could not finish setting up.
+ *
+ * A remote mutation that lands while local persistence fails is the one place
+ * this design can leave litter: a room nobody owns, or a redeemed invitation
+ * that bought a membership nobody holds. Neither can be fixed later, because
+ * the credential that could fix them is the thing that was not stored — so it
+ * is used HERE, while it is still in hand, before anything is given up.
+ *
+ * Best effort by nature: if the relay cannot be reached to undo it either, the
+ * caller is told so plainly rather than left to assume. What is left behind in
+ * that case is an empty room holding nothing readable, which the retention
+ * sweep removes.
+ */
+async function abandonRoom({ relay, roomId, token, owner = false, fetchImpl = null, timeoutMs = TIMEOUT_MS } = {}) {
+  if (!relay || !roomId || !token) return fail('nothing_to_undo', null);
+  const path = owner
+    ? `/v2/rooms/${encodeURIComponent(roomId)}`
+    : `/v2/rooms/${encodeURIComponent(roomId)}/membership/me`;
+  try {
+    return await request(relay, path, { method: 'DELETE', token, fetchImpl, timeoutMs });
+  } catch (err) {
+    return fail('offline', err?.message || null);
+  }
+}
+
+
+/**
  * Start a secure share.
  *
  * Everything secret is made here, on this machine, before a single request:
@@ -444,7 +471,18 @@ async function createRoom({ relay, actor, rooms, fetchImpl = null, timeoutMs = T
     pins: { [senderId]: publicKey },
     names: {},
   });
-  if (!stored) return fail('not_stored', 'Stacki could not store this secure share.');
+  if (!stored) {
+    // The room exists on the relay and this machine cannot remember it. Undo
+    // it now, with the credential still in hand — a moment later there is no
+    // way to reach it at all.
+    const undone = await abandonRoom({ relay: origin, roomId, token, owner: true, fetchImpl, timeoutMs });
+    return fail(
+      'not_stored',
+      undone.ok
+        ? 'Stacki could not store this secure share, so it was not created.'
+        : 'Stacki could not store this secure share. An empty room may remain on the relay; it holds nothing readable and is removed automatically.'
+    );
+  }
   return { ok: true, room: stored };
 }
 
@@ -464,7 +502,21 @@ async function joinRoom({ capability, actor, rooms, fetchImpl = null, timeoutMs 
 
   const keys = deriveKeys(invitation.secret, invitation.roomId);
   const senderId = senderIdFor(keys, actor.id);
-  const { publicKey, privateKey } = newSigningKeys();
+
+  // COMING BACK TO A ROOM THIS MACHINE HAS LEFT.
+  //
+  // A sender id is derived from the room secret and the actor id, so somebody
+  // invited back to the same room returns as the same sender — and a member's
+  // signing key is fixed for the life of the room, at the relay and in every
+  // peer's pin map. Generating a fresh keypair here would be refused by both,
+  // correctly, as a key substitution: rejoining would fail for the one person
+  // it is most likely to be offered to. So a kept identity is reused, and only
+  // when it really is the same room and the same actor.
+  const kept = rooms?.dormantFor?.(invitation.roomId) || null;
+  const reusable = kept && kept.senderId === senderId && (!kept.actorId || kept.actorId === actor.id);
+  const { publicKey, privateKey } = reusable
+    ? { publicKey: kept.publicKey, privateKey: kept.privateKey }
+    : newSigningKeys();
 
   const answer = await request(invitation.relay, '/v2/join', {
     method: 'POST',
@@ -480,12 +532,19 @@ async function joinRoom({ capability, actor, rooms, fetchImpl = null, timeoutMs 
   // the one point where the relay is trusted about who is who — it is telling
   // this machine what it will be told again later, and from here on a change
   // is refused.
-  const pins = { [senderId]: publicKey };
+  // Anything already pinned from before survives: a key this machine once
+  // accepted for a sender is the key it goes on accepting, and a rejoin is not
+  // an occasion to start trusting the relay's word again.
+  const pins = { ...(reusable ? kept.pins : {}), [senderId]: publicKey };
   for (const member of Array.isArray(answer.body.members) ? answer.body.members : []) {
-    if (member?.senderId && member?.publicKey) pins[member.senderId] = member.publicKey;
+    if (!member?.senderId || !member?.publicKey) continue;
+    if (pins[member.senderId] && pins[member.senderId] !== member.publicKey) {
+      return fail('key_changed', 'A member of this secure share is presenting a different signing key.');
+    }
+    pins[member.senderId] = member.publicKey;
   }
 
-  const stored = rooms.remember({
+  const remembered = {
     roomId: invitation.roomId,
     relay: invitation.relay,
     secret: invitation.secret,
@@ -494,11 +553,32 @@ async function joinRoom({ capability, actor, rooms, fetchImpl = null, timeoutMs 
     publicKey,
     senderId,
     actorId: actor.id,
-    isOwner: false,
+    // The relay decides who owns a room, and it remembers across a leave: a
+    // member row keeps `is_owner` when its token is replaced. Asking rather
+    // than assuming, so somebody rejoining their own share is still its owner.
+    isOwner: answer.body?.member?.isOwner === true || (reusable && kept.isOwner === true),
     pins,
     names: {},
-  });
-  if (!stored) return fail('not_stored', 'Stacki could not store this secure share.');
+  };
+  const stored = rooms.remember(remembered);
+  if (!stored) {
+    // The invitation is spent and the membership exists. Give it back now,
+    // while the token that can is still in hand.
+    const undone = await abandonRoom({
+      relay: invitation.relay,
+      roomId: invitation.roomId,
+      token,
+      owner: false,
+      fetchImpl,
+      timeoutMs,
+    });
+    return fail(
+      'not_stored',
+      undone.ok
+        ? 'Stacki could not store this secure share, so it did not join. Ask for a new invitation.'
+        : 'Stacki could not store this secure share. Ask for a new invitation.'
+    );
+  }
   return { ok: true, room: stored };
 }
 
@@ -506,6 +586,7 @@ module.exports = {
   createSecureTransport,
   createRoom,
   joinRoom,
+  abandonRoom,
   request,
   TIMEOUT_MS,
   MAX_BATCH,

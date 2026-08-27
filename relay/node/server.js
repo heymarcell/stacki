@@ -353,6 +353,11 @@ function createSecureRelay({
       return sendJson(res, 200, {
         room: joined.room,
         credential: joined.credential,
+        // Who this member now is, which matters for somebody REJOINING: a
+        // member row keeps its ownership when its token is replaced, so an
+        // owner who left and was invited back is still the owner and the
+        // client should not have to guess.
+        member: { senderId, isOwner: joined.isOwner === true },
         members: store.membersOf(roomId).map((m) => ({ senderId: m.senderId, publicKey: m.publicKey })),
       });
     }

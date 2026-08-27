@@ -281,6 +281,9 @@ export class Room extends DurableObject {
       ok: true,
       room: { id: meta.id, createdAt: meta.created_at },
       credential: { token },
+      // Ownership survives a leave — a member row keeps `is_owner` when its
+      // token is replaced — so an owner invited back is still the owner.
+      member: { senderId, isOwner: !!(existing && existing.is_owner) },
       members: this.members().map((m) => ({ senderId: m.senderId, publicKey: m.publicKey })),
     };
   }
