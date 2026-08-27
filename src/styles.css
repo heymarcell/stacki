@@ -6236,6 +6236,9 @@ textarea::selection {
   color: var(--text);
   cursor: pointer;
 }
+.review-cluster-row:hover { background: var(--bg-hover); }
+/* Where the keyboard is. Hover above says where the pointer is; they are
+   different questions and no longer share an answer. */
 .review-cluster-row.on { background: var(--bg-active); }
 .review-cluster-n { font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--accent); flex-shrink: 0; }
 .review-cluster-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }

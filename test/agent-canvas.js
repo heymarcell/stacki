@@ -33,6 +33,8 @@ const { dialog } = require('electron');
 process.env.STACKI_NO_DIALOGS = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
+const { readDevLock, awaitDevServerGone } = require('./support/devServer.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const failures = [];
@@ -107,13 +109,21 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
-// What earlier runs left behind. Electron rewrites a small userData during
+// What DEAD runs left behind. Electron rewrites a small userData during
 // shutdown, after teardown has removed it, so one reappears per run and they
-// pile up quietly. Swept here rather than pretended about.
-sweepStaleRuns(['stacki-canvas-user-']);
+// pile up quietly.
+//
+// Only dead ones. Every temp root a harness makes carries a marker naming the
+// run and the pid that owns it, and this walks past anything it cannot prove is
+// finished — see test/support/ownedTemp.js. It used to delete by name prefix
+// alone, which meant a second harness starting up could take the Astro fixture
+// out from under a run already using it. `stacki-canvas-` is the prefix all of
+// them use.
+const sweptRuns = sweepStaleRuns(['stacki-canvas-user-', 'stacki-canvas-']);
+for (const s of sweptRuns.swept) console.log(`agent-canvas: swept ${s.name} (dead ${s.harness} pid ${s.pid})`);
 
-const root = makeCanvasProject({ log: (m) => console.log(`agent-canvas: ${m}`) });
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-canvas-user-'));
+const root = makeCanvasProject({ harness: 'agent-canvas', log: (m) => console.log(`agent-canvas: ${m}`) });
+const userData = ownedTempDir('stacki-canvas-user-', { harness: 'agent-canvas' });
 app.setPath('userData', userData);
 
 // Two things written before the app starts, because they are the two things a
@@ -377,8 +387,25 @@ require('../electron/main.js');
     { timeout: 30000 }
   );
   check('and the rendered page picks it up', grew.computed.gap === '48px', short(grew.computed?.gap));
-  const afterShot = await capture({ target: 'selection', paddingPx: 0 });
-  check('and a capture after it is a different picture', (afterShot.meta.pixelSize?.width || 0) !== widthBefore || afterShot.meta.bytes !== beforeShot.meta.bytes, short({ before: widthBefore, after: afterShot.meta.pixelSize?.width }));
+  // Asked until it answers, not once. The computed style is updated before the
+  // frame carrying it has necessarily been painted, so a single capture here
+  // can photograph the layout from before the edit — which showed up as this
+  // check failing inside `npm test` and passing every time on its own. The
+  // grid keeps its own width when the gap changes, so bytes are the difference.
+  let afterShot = beforeShot;
+  let redrawn = false;
+  for (const deadline = Date.now() + 15000; Date.now() < deadline; ) {
+    afterShot = await capture({ target: 'selection', paddingPx: 0 });
+    redrawn =
+      (afterShot.meta.pixelSize?.width || 0) !== widthBefore || afterShot.meta.bytes !== beforeShot.meta.bytes;
+    if (redrawn) break;
+    await wait(300);
+  }
+  check(
+    'and a capture after it is a different picture',
+    redrawn,
+    short({ width: [widthBefore, afterShot.meta.pixelSize?.width], bytes: [beforeShot.meta.bytes, afterShot.meta.bytes] })
+  );
 
   // --- 6. Bound content ----------------------------------------------------
 
@@ -551,8 +578,9 @@ require('../electron/main.js');
     }
   };
 
-  const where = await call('project', { action: 'dev_status' }).catch(() => null);
-  const previewUrl = where?.url || where?.preview?.url || null;
+  // Which process holds the port. Read before anything is stopped, because the
+  // record lives in the project directory that is removed further down.
+  const devLock = readDevLock(root);
 
   await attempt('stopping the preview', async () => {
     const stopped = await stopPreview();
@@ -563,20 +591,14 @@ require('../electron/main.js');
   // stopDevServer hands the job to `astro dev stop` and returns. Exiting on
   // that ok deletes the project directory out from under the command and
   // leaves the server running for as long as the machine is up.
-  if (previewUrl) {
-    await attempt('waiting for the preview to stop answering', async () => {
-      const deadline = Date.now() + 20000;
-      for (;;) {
-        try {
-          await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
-        } catch {
-          return;
-        }
-        if (Date.now() > deadline) throw new Error(`${previewUrl} would not stop`);
-        await wait(400);
-      }
-    });
-  }
+  //
+  // What was checked was whether the URL still answered. A dev server whose
+  // project has been deleted answers 500 rather than refusing the connection,
+  // so the fetch resolves and "it threw" never happens. The pid is the question.
+  await attempt('waiting for the preview to actually be gone', async () => {
+    const gone = await awaitDevServerGone(devLock);
+    say(`  preview: ${gone.how} [port ${devLock?.port ?? "none"}]`);
+  });
 
   await attempt('closing the windows', () => {
     for (const w of BrowserWindow.getAllWindows()) w.destroy();
@@ -587,7 +609,7 @@ require('../electron/main.js');
     if (fs.existsSync(root)) throw new Error('still there');
   });
   await attempt(`removing the app data ${userData}`, () => {
-    fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    releaseTempDir(userData);
     if (fs.existsSync(userData)) throw new Error('still there');
   });
 

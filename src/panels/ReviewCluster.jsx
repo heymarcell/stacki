@@ -38,16 +38,38 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
     });
   }, [at.x, at.y, reviews?.length]);
 
-  const activeRef = React.useRef(null);
+  const listRef = React.useRef(null);
+  const rows = () => [...(listRef.current?.querySelectorAll('.review-cluster-row') || [])];
+
   // Focus is on the row itself rather than on the box: these are real buttons,
   // so Enter and Space are the browser's job and the arrows only have to move
   // focus. Esc restores focus to the marker that opened this — see onClose.
+  //
+  // ONCE, on opening. It used to run on every change of `active`, and `active`
+  // was also what a mouse set on hover — so moving the pointer across the list
+  // moved KEYBOARD focus, row by row, under a person who had not touched the
+  // keyboard. Someone reading with a screen reader had the pointer drag their
+  // focus out from under them; anyone mid-Tab lost their place to a stray
+  // mouse. A pointer says what it is over. It does not say where the keyboard
+  // is.
+  //
+  // So there is one focus model here, and it is the DOM's: the arrows move
+  // focus, focus reports back as `active`, and hover is a hover.
   React.useEffect(() => {
-    activeRef.current?.focus();
-  }, [active]);
+    rows()[0]?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const list = reviews || [];
-  const move = (delta) => setActive((i) => (i + delta + list.length) % list.length);
+  /** Move keyboard focus by `delta` rows, wrapping — the arrows' whole job. */
+  const move = (delta) => {
+    const items = rows();
+    if (!items.length) return;
+    // Where focus actually is, not where this component last thought it was.
+    const from = items.indexOf(typeof document === 'undefined' ? null : document.activeElement);
+    const base = from >= 0 ? from : active;
+    items[(base + delta + items.length) % items.length]?.focus();
+  };
 
   return (
     <div
@@ -89,17 +111,19 @@ export default function ReviewCluster({ reviews, at, onPick, onClose }) {
       <div className="review-cluster-title">{list.length} comments here</div>
       {/* Native scrolling, and only when a cluster is unusually large. Most
           are two or three. */}
-      <div className="review-cluster-list">
+      <div className="review-cluster-list" ref={listRef}>
         {list.map((r, i) => (
           <button
             key={r.id}
-            ref={i === active ? activeRef : null}
             className={`review-cluster-row${i === active ? ' on' : ''}`}
             aria-label={`Comment #${r.number}, ${statusWord(r.status, r.anchorState)}. ${String(r.message || '')
               .replace(/\s+/g, ' ')
               .trim()
               .slice(0, 80)}`}
-            onMouseEnter={() => setActive(i)}
+            // Which row is marked follows the keyboard, and only the keyboard.
+            // Hover has its own appearance in CSS, which is what a pointer is
+            // entitled to say.
+            onFocus={() => setActive(i)}
             onClick={(e) => {
               e.stopPropagation();
               onPick?.(r.id);
