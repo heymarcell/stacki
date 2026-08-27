@@ -86,6 +86,9 @@ function readJson(req) {
     let size = 0;
     const chunks = [];
     req.on('data', (chunk) => {
+      // Bytes: `chunk` is a Buffer, so `length` is its byte length. Counting
+      // characters instead would under-count multibyte UTF-8 by up to a
+      // factor of two — see the note in the Worker's reader.
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
         resolve({ ok: false, code: 'too_large' });

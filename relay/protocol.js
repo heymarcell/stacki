@@ -56,7 +56,35 @@ const MAX_CIPHERTEXT_BYTES = 66 * 1024;
 
 const MAX_BATCH = 100; // envelopes per push
 const MAX_PAGE = 200; // envelopes per pull
-const MAX_BODY_BYTES = 8 * 1024 * 1024; // one request, all of it
+
+// The largest an envelope can be once it is JSON on the wire.
+//
+// base64url costs four characters per three bytes, and the fixed fields — the
+// two identifiers, the nonce, the signature, the field names, the quotes and
+// the commas — are a known constant. Computed rather than guessed, because the
+// number below depends on it.
+const B64_LEN = (bytes) => Math.ceil(bytes / 3) * 4;
+const ENVELOPE_FRAME_BYTES =
+  B64_LEN(ENVELOPE_ID_BYTES) +
+  B64_LEN(SENDER_ID_BYTES) +
+  B64_LEN(NONCE_BYTES) +
+  B64_LEN(SIGNATURE_BYTES) +
+  // {"v":2,"envelopeId":"","senderId":"","nonce":"","ciphertext":"","signature":""}
+  80;
+const MAX_ENVELOPE_JSON_BYTES = B64_LEN(MAX_CIPHERTEXT_BYTES) + ENVELOPE_FRAME_BYTES;
+
+/**
+ * The largest request body a relay will read.
+ *
+ * DERIVED, not chosen. It was 8 MiB while a legal maximum batch encoded to
+ * about 8.6 MiB, which meant the protocol forbade something it also permitted:
+ * a client sending exactly what the limits allowed got `too_large`, and no
+ * amount of retrying would have helped. Two constants that have to agree
+ * should not be two constants somebody has to remember to change together, so
+ * this one is computed from the other two and there is a test that recomputes
+ * it from a real maximum batch.
+ */
+const MAX_BODY_BYTES = MAX_BATCH * MAX_ENVELOPE_JSON_BYTES + 4096; // + the wrapper and slack
 const MAX_MEMBERS = 50; // people in one room
 const MAX_OPEN_INVITES = 20; // unredeemed, unexpired, at once
 const MAX_ROOM_ENVELOPES = 200_000; // one room's history
@@ -316,6 +344,7 @@ module.exports = {
   MAX_BATCH,
   MAX_PAGE,
   MAX_BODY_BYTES,
+  MAX_ENVELOPE_JSON_BYTES,
   MAX_MEMBERS,
   MAX_OPEN_INVITES,
   MAX_ROOM_ENVELOPES,

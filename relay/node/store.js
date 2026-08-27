@@ -114,6 +114,7 @@ function openStore({ file = ':memory:', now = Date.now } = {}) {
       `INSERT INTO envelopes (room_id, envelope_id, sender_id, nonce, ciphertext, signature, received_at)
        VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(room_id, envelope_id) DO NOTHING`
     ),
+    hasEnvelope: db.prepare('SELECT 1 AS yes FROM envelopes WHERE room_id = ? AND envelope_id = ?'),
     after: db.prepare('SELECT * FROM envelopes WHERE room_id = ? AND seq > ? ORDER BY seq LIMIT ?'),
     head: db.prepare('SELECT MAX(seq) AS head FROM envelopes WHERE room_id = ?'),
     bump: db.prepare('UPDATE rooms SET envelope_count = envelope_count + ?, stored_bytes = stored_bytes + ? WHERE id = ?'),
@@ -249,6 +250,19 @@ function openStore({ file = ':memory:', now = Date.now } = {}) {
      * sure you have this" — is satisfied either way, and telling it "rejected"
      * would make it retry forever.
      */
+    /**
+     * Store a batch, atomically, skipping any already held.
+     *
+     * THE CAP APPLIES TO WHAT IS ACTUALLY ADDED. A retry is how this protocol
+     * recovers from a push whose answer was lost, so a room near its limit
+     * must not start refusing retries of envelopes it already has: that would
+     * turn the last few hundred comments of a room into ones nobody could
+     * confirm were delivered, and the client would retry them forever.
+     *
+     * So the duplicates are identified first — inside the same transaction
+     * that does the insert, so nothing can slip in between — and only the
+     * genuinely new ones are weighed against the limit.
+     */
     appendEnvelopes({ roomId, envelopes }) {
       const at = now();
       const room = q.room.get(roomId);
@@ -256,12 +270,15 @@ function openStore({ file = ':memory:', now = Date.now } = {}) {
       let added = 0;
       let bytes = 0;
       const size = (e) => e.ciphertext.length + e.nonce.length + e.signature.length;
-      const total = envelopes.reduce((n, e) => n + size(e), 0);
-      if (room.envelope_count + envelopes.length > MAX_ROOM_ENVELOPES) return { ok: false, code: 'room_full' };
-      if (room.stored_bytes + total > MAX_ROOM_BYTES) return { ok: false, code: 'room_full' };
 
       db.prepare('BEGIN IMMEDIATE').run();
       try {
+        const fresh = envelopes.filter((e) => !q.hasEnvelope.get(roomId, e.envelopeId));
+        const incoming = fresh.reduce((n, e) => n + size(e), 0);
+        if (room.envelope_count + fresh.length > MAX_ROOM_ENVELOPES || room.stored_bytes + incoming > MAX_ROOM_BYTES) {
+          db.prepare('ROLLBACK').run();
+          return { ok: false, code: 'room_full' };
+        }
         for (const e of envelopes) {
           const done = q.insertEnvelope.run(roomId, e.envelopeId, e.senderId, e.nonce, e.ciphertext, e.signature, at);
           accepted.push(e.envelopeId);

@@ -366,12 +366,26 @@ export class Room extends DurableObject {
     let bytes = 0;
     if (good.length) {
       const size = (e) => e.ciphertext.length + e.nonce.length + e.signature.length;
-      const total = good.reduce((n, e) => n + size(e), 0);
-      if (meta.envelope_count + good.length > MAX_ROOM_ENVELOPES) return bad('room_full');
+      // THE CAP APPLIES TO WHAT IS ACTUALLY ADDED. A retry is how this
+      // protocol recovers from a push whose answer was lost, so a room near
+      // its limit must not begin refusing retries of envelopes it already
+      // holds — the client would retry them forever and nobody could confirm
+      // the last comments were delivered. Only the genuinely new ones are
+      // weighed. Reading and writing without an await between them is what
+      // makes this atomic here; see the note at the top of the file.
+      const fresh = good.filter(
+        (e) => !this.sql.exec('SELECT 1 FROM envelopes WHERE envelope_id = ?', e.envelopeId).toArray().length
+      );
+      const total = fresh.reduce((n, e) => n + size(e), 0);
+      if (meta.envelope_count + fresh.length > MAX_ROOM_ENVELOPES) return bad('room_full');
       if (meta.stored_bytes + total > MAX_ROOM_BYTES) return bad('room_full');
       const at = Date.now();
-      for (const e of good) {
-        const done = this.sql.exec(
+      // Only the new ones are inserted, and `fresh` is what the counters move
+      // by. `rowsWritten` is not consulted: this runtime reports a written row
+      // for an INSERT that took the ON CONFLICT branch, which would count a
+      // duplicate against the room and make a retry near the limit fatal.
+      for (const e of fresh) {
+        this.sql.exec(
           `INSERT INTO envelopes (envelope_id, sender_id, nonce, ciphertext, signature, received_at)
            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(envelope_id) DO NOTHING`,
           e.envelopeId,
@@ -381,15 +395,13 @@ export class Room extends DurableObject {
           e.signature,
           at
         );
-        // A duplicate is accepted rather than refused: the client's intent —
-        // "make sure you have this" — is satisfied either way, and telling it
-        // "rejected" would make it retry forever.
-        accepted.push(e.envelopeId);
-        if (done.rowsWritten) {
-          added += 1;
-          bytes += size(e);
-        }
       }
+      added = fresh.length;
+      bytes = total;
+      // Every envelope in the batch is accepted, duplicates included: the
+      // client's intent — "make sure you have this" — is satisfied either way,
+      // and telling it "rejected" would make it retry forever.
+      for (const e of good) accepted.push(e.envelopeId);
       if (added) this.sql.exec('UPDATE room_meta SET envelope_count = envelope_count + ?, stored_bytes = stored_bytes + ?', added, bytes);
       this.touch(at);
     }

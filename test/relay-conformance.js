@@ -21,7 +21,16 @@
 // has no reason to encrypt — the "ciphertext" below is random bytes, which is
 // exactly what a relay is supposed to think every ciphertext is.
 
-const { signingBytes, toBase64Url, fromBase64Url, MAX_CIPHERTEXT_BYTES, MAX_BATCH, MAX_PAGE } = require('../relay/protocol.js');
+const {
+  signingBytes,
+  toBase64Url,
+  fromBase64Url,
+  MAX_CIPHERTEXT_BYTES,
+  MAX_BATCH,
+  MAX_PAGE,
+  MAX_BODY_BYTES,
+  MAX_ENVELOPE_JSON_BYTES,
+} = require('../relay/protocol.js');
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -31,7 +40,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 // early — an endpoint that 500s and takes a whole section with it, a helper
 // that starts returning undefined — fails instead of reporting the checks it
 // did get to as a pass. Raise it when you add a check; that is the point.
-const CONFORMANCE_CHECKS = 80;
+const CONFORMANCE_CHECKS = 89;
 
 // `getRandomValues` refuses more than 64 KiB at a time, and the oversized
 // ciphertext this suite deliberately builds is larger than that.
@@ -244,6 +253,20 @@ async function runConformance({ call, label = 'relay' }) {
   const tooBig = await json(`/v2/rooms/${roomId}/envelopes`, asMember(aliceToken, { method: 'POST', body: { envelopes: [oversized] } }));
   check('an oversized ciphertext is refused', tooBig.body?.rejected?.[0]?.code === 'too_large' || tooBig.status === 413, JSON.stringify(tooBig.body).slice(0, 120));
 
+  // --- the limits have to agree with each other -----------------------------
+  //
+  // A protocol that forbids what it also permits is a protocol nobody can
+  // implement: a client sending exactly the documented maximum would get
+  // `too_large` and no amount of retrying would help. Built here rather than
+  // reasoned about — a real envelope at the documented ciphertext maximum,
+  // measured, multiplied by the documented batch maximum.
+  const biggest = await envelopeFrom(alice, roomId, { size: MAX_CIPHERTEXT_BYTES - 16 });
+  const oneEncoded = JSON.stringify(biggest).length;
+  check('one maximum envelope fits the documented per-envelope size', oneEncoded <= MAX_ENVELOPE_JSON_BYTES, `${oneEncoded} vs ${MAX_ENVELOPE_JSON_BYTES}`);
+  const worstBody = JSON.stringify({ envelopes: Array.from({ length: MAX_BATCH }, () => biggest) }).length;
+  check('a maximum legal batch fits the maximum legal body', worstBody <= MAX_BODY_BYTES, `${worstBody} vs ${MAX_BODY_BYTES}`);
+  check('and the body limit is not wastefully larger than it needs to be', MAX_BODY_BYTES < worstBody * 1.2, `${MAX_BODY_BYTES} vs ${worstBody}`);
+
   // --- pulling --------------------------------------------------------------
 
   const batch = await Promise.all(Array.from({ length: 12 }, () => envelopeFrom(bob, roomId)));
@@ -273,6 +296,29 @@ async function runConformance({ call, label = 'relay' }) {
     'a pull page is capped',
     (await json(`/v2/rooms/${roomId}/envelopes?after=0&limit=99999`, asMember(aliceToken))).body.envelopes.length <= MAX_PAGE
   );
+
+  // --- a retry near the limit -----------------------------------------------
+  //
+  // A room cannot start refusing retries of envelopes it already holds just
+  // because it is close to full: a retry adds nothing, and refusing it would
+  // make the client retry forever with no way to confirm delivery. This does
+  // not fill a room to its real cap — that would take two hundred thousand
+  // envelopes — it checks the property that matters, which is that a duplicate
+  // moves neither the cursor nor the stored count.
+  const beforeRetry = await json(`/v2/rooms/${roomId}`, asMember(aliceToken));
+  const retried = await json(`/v2/rooms/${roomId}/envelopes`, asMember(aliceToken, { method: 'POST', body: { envelopes: [first] } }));
+  check('an envelope already held is accepted again', retried.status === 200 && retried.body?.accepted?.[0] === first.envelopeId);
+  const afterRetry = await json(`/v2/rooms/${roomId}`, asMember(aliceToken));
+  check('a retry does not move the cursor', afterRetry.body?.head === beforeRetry.body?.head, `${beforeRetry.body?.head} then ${afterRetry.body?.head}`);
+  check('a retry does not count against the room', afterRetry.body?.room?.envelopeCount === beforeRetry.body?.room?.envelopeCount, `${beforeRetry.body?.room?.envelopeCount} then ${afterRetry.body?.room?.envelopeCount}`);
+  check('a retry does not add stored bytes', afterRetry.body?.room?.storedBytes === beforeRetry.body?.room?.storedBytes, `${beforeRetry.body?.room?.storedBytes} then ${afterRetry.body?.room?.storedBytes}`);
+
+  // A batch of duplicates mixed with one new envelope adds exactly one.
+  const oneNew = await envelopeFrom(alice, roomId);
+  const mixed = await json(`/v2/rooms/${roomId}/envelopes`, asMember(aliceToken, { method: 'POST', body: { envelopes: [first, oneNew, first] } }));
+  check('a mixed batch is accepted whole', mixed.status === 200 && (mixed.body?.accepted || []).length === 3);
+  const afterMixed = await json(`/v2/rooms/${roomId}`, asMember(aliceToken));
+  check('and only the new one counts', afterMixed.body?.room?.envelopeCount === beforeRetry.body?.room?.envelopeCount + 1, `${afterMixed.body?.room?.envelopeCount}`);
 
   // --- leaving --------------------------------------------------------------
 

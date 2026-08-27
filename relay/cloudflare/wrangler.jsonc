@@ -18,20 +18,36 @@
   // it from at runtime, and this keeps one copy of the page for both relays.
   "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
 
-  // Deliberate rather than default. `logs` keeps operational codes for a short
-  // window; `head_sampling_rate` is 1 because the volume is tiny and a sampled
-  // log of a rare failure is a log of nothing. Nothing that reaches this sink
-  // carries a credential or a ciphertext — see the logging policy in
-  // docs/secure-reviews-protocol.md.
+  // Deliberate rather than default, and narrower than the default.
+  //
+  // `logs.invocation_logs` is what records a line for every request — method,
+  // URL, status, timing — and for this relay that is a per-room, per-member
+  // access log nobody asked for. It is switched OFF. What stays on is the
+  // Worker's own output, which is a handful of coarse codes and never a
+  // credential, a capability, a ciphertext or a URL; see §19 of
+  // docs/secure-reviews-protocol.md for the full list.
+  //
+  // Cloudflare's own infrastructure still sees what any reverse proxy sees —
+  // the connecting address, the timing, the size. That is stated in the threat
+  // model rather than wished away.
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false
+    }
   }
 
   // Rate limiting for room creation is configured per deployment, because the
   // binding needs an account-level namespace id and everything here must run
   // locally without one. See README.md.
   //
+  // An OFFICIAL public deployment must set BOTH of these: the Worker refuses
+  // to create rooms when it is told it is official and the limiter is missing,
+  // so a forgotten binding makes the relay useless rather than unlimited.
+  //
+  // "vars": { "STACKI_OFFICIAL_RELAY": "1" },
   // "ratelimits": [
   //   { "name": "ROOM_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
   // ]

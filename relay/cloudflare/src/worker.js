@@ -95,18 +95,61 @@ const bearerOf = (header) => {
   return m ? m[1] : null;
 };
 
-/** A JSON body, bounded, or a refusal. */
+/**
+ * A JSON body, bounded in BYTES, read a chunk at a time.
+ *
+ * `await request.text()` was the wrong shape twice over. It buffers the whole
+ * body before anything is checked — and Cloudflare's own request limit is 100
+ * MB, more than ten times what this relay will ever accept, so "read it all
+ * then measure it" is precisely the memory pattern their guidance warns
+ * against. And `text.length` counts UTF-16 code units, not bytes: a body of
+ * astral-plane characters is twice the bytes its length reports, so the check
+ * could pass on something over the limit.
+ *
+ * So: refuse a declared length over the cap without reading anything, then
+ * read incrementally and stop the moment the byte count passes it. The stream
+ * is cancelled rather than drained — there is no reason to finish receiving
+ * something already refused.
+ */
 async function readJson(request) {
   const declared = Number(request.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return { ok: false, code: 'too_large' };
+  if (!request.body) return { ok: true, body: {} };
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      size += value.byteLength;
+      if (size > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, code: 'too_large' };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    return { ok: false, code: 'bad_request' };
+  }
+
+  if (!size) return { ok: true, body: {} };
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.byteLength;
+  }
   let text;
   try {
-    text = await request.text();
+    text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   } catch {
     return { ok: false, code: 'bad_request' };
   }
-  if (text.length > MAX_BODY_BYTES) return { ok: false, code: 'too_large' };
-  if (!text) return { ok: true, body: {} };
+  if (!text.trim()) return { ok: true, body: {} };
   try {
     const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, code: 'bad_json' };
@@ -117,16 +160,27 @@ async function readJson(request) {
 }
 
 /**
- * Room creation, rate limited at the edge when the binding is configured.
+ * Room creation, rate limited at the edge.
  *
- * Optional on purpose: the binding needs an account-level namespace, and
- * everything in this repository has to be runnable and testable locally by
- * somebody with no Cloudflare account at all. Where it is absent this is a
- * no-op and the README says to put a WAF rate-limiting rule in front instead.
- * Rate limiting is not authorisation and nothing here treats it as such.
+ * OPTIONAL EVERYWHERE EXCEPT AN OFFICIAL DEPLOYMENT. The binding needs an
+ * account-level namespace, and everything in this repository has to be
+ * runnable and testable by somebody with no Cloudflare account at all — so
+ * locally, in tests, and for a self-hoster, its absence is fine and the README
+ * explains the WAF alternative.
+ *
+ * A deployment that sets `STACKI_OFFICIAL_RELAY` is saying it is Stacki's own
+ * public one, and that one must not quietly become an unlimited public
+ * encrypted-storage endpoint because a binding was forgotten in a config file.
+ * So there it is required, and its absence closes room creation rather than
+ * opening it. Forgetting it makes the relay useless, which is noticed; the
+ * other way round is not.
+ *
+ * Rate limiting is not authorisation and nothing here treats it as such — it
+ * bounds how fast strangers can make rooms, nothing more.
  */
 async function allowRoomCreation(request, env) {
-  if (!env.ROOM_LIMITER?.limit) return true;
+  const official = String(env.STACKI_OFFICIAL_RELAY || '') === '1';
+  if (!env.ROOM_LIMITER?.limit) return !official;
   const who = request.headers.get('cf-connecting-ip') || 'unknown';
   const { success } = await env.ROOM_LIMITER.limit({ key: `rooms:${who}` });
   return success !== false;
