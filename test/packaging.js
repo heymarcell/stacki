@@ -434,6 +434,24 @@ if (fs.existsSync(relayDir)) {
   }
 }
 
+// ── The bundle has to tell the operating system about the scheme ────────────
+//
+// A runtime `setAsDefaultProtocolClient` call cannot make an unlaunched bundle
+// reachable: Launch Services routes a URL scheme by what the BUNDLE declares.
+// Without this the packaged app received nothing at all, and clicking an
+// invitation did nothing and reported nothing. test/packaged-deeplink.js proves
+// the round trip against a built app; this is the fast check that the
+// configuration which makes it possible is still there.
+
+const protocols = Array.isArray(pkg.build?.protocols) ? pkg.build.protocols : pkg.build?.protocols ? [pkg.build.protocols] : [];
+check('the build declares a URL protocol', protocols.length > 0, JSON.stringify(pkg.build?.protocols));
+const joinProtocol = protocols.find((p) => (Array.isArray(p.schemes) ? p.schemes : []).includes('stacki'));
+check('and it is the stacki scheme', !!joinProtocol, JSON.stringify(protocols));
+check('with a name a person could recognise', typeof joinProtocol?.name === 'string' && joinProtocol.name.length > 3, joinProtocol?.name);
+// One scheme, because this app answers for exactly one thing.
+const declaredSchemes = protocols.flatMap((p) => (Array.isArray(p.schemes) ? p.schemes : []));
+check('and it is the only scheme claimed', declaredSchemes.length === 1, JSON.stringify(declaredSchemes));
+
 // ── The join link is a join link ────────────────────────────────────────────
 //
 // `stacki://join#…` is the one thing the custom protocol does, and the danger

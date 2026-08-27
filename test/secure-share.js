@@ -40,7 +40,7 @@ const check = (what, condition, detail) => {
 };
 
 const { createSecureRelay } = require('../relay/node/server.js');
-const { createSecureRooms } = require('../electron/review/secure/secrets.js');
+const { createSecureRooms, isProtectedBackend } = require('../electron/review/secure/secrets.js');
 const { createSecureTransport, createRoom, joinRoom, leaveOutcome } = require('../electron/review/secure/transport.js');
 const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSigningKeys } = require('../electron/review/secure/crypto.js');
 const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
@@ -784,6 +784,15 @@ async function main() {
       // protection nobody has.
       check(`${name}: nothing pretends to be sealed`, !onDisk.includes('"protected": true'), onDisk.slice(0, 120));
     }
+  }
+
+  // The decision itself, for every name Electron can return. Injected
+  // protectors exercise the storage; this exercises the judgement.
+  for (const backend of ['keychain', 'dpapi', 'gnome_libsecret', 'kwallet', 'kwallet5', 'kwallet6']) {
+    check(`${backend} counts as keeping a secret`, isProtectedBackend(backend) === true);
+  }
+  for (const backend of ['basic_text', 'unknown', 'none', '', null, undefined]) {
+    check(`${JSON.stringify(backend)} does not count as keeping a secret`, isProtectedBackend(backend) === false);
   }
 
   const weak = backendCase('weakreport', { available: true, protects: false, backend: 'basic_text', encrypt: seal, decrypt: unseal });

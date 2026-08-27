@@ -290,6 +290,55 @@ async function main() {
 
   await capRelay.stop();
 
+  // --- a full room still takes a retry --------------------------------------
+  //
+  // The real cap is two hundred thousand envelopes, which no test can drive, so
+  // this relay is given a cap of three. The property is the one that matters
+  // near any cap: an envelope already held costs nothing, so a retry must not
+  // be the thing that tips a room over.
+  const tightRelay = createSecureRelay({
+    port: 0,
+    host: '127.0.0.1',
+    onError: () => {},
+    limits: { maxEnvelopes: 3 },
+    rateLimits: { rooms: 1000, join: 1000 },
+  });
+  await tightRelay.start();
+  const tightBase = `http://127.0.0.1:${tightRelay.address.port}`;
+  const tightCall = async (pathname, options = {}) => {
+    const response = await fetch(`${tightBase}${pathname}`, {
+      method: options.method || 'GET',
+      headers: { accept: 'application/json', ...(options.body != null ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) },
+      ...(options.body != null ? { body: JSON.stringify(options.body) } : {}),
+    });
+    const text = await response.text();
+    return { status: response.status, body: text ? JSON.parse(text) : null };
+  };
+
+  const tightOwner = await newMember();
+  const tightRoom = toBase64Url(randomBytes(16));
+  const tightToken = (await tightCall('/v2/rooms', { method: 'POST', body: { roomId: tightRoom, senderId: tightOwner.senderId, publicKey: tightOwner.publicKey } })).body.credential.token;
+  const tightAuth = { authorization: `Bearer ${tightToken}` };
+
+  const three = await Promise.all([0, 1, 2].map(() => envelopeFrom(tightOwner, tightRoom)));
+  const filled = await tightCall(`/v2/rooms/${tightRoom}/envelopes`, { method: 'POST', body: { envelopes: three }, headers: tightAuth });
+  check('a room fills to its cap', filled.status === 200 && filled.body.accepted.length === 3, JSON.stringify(filled.body).slice(0, 120));
+  const atCap = await tightCall(`/v2/rooms/${tightRoom}`, { headers: tightAuth });
+  check('and is at it', atCap.body.room.envelopeCount === 3, `${atCap.body.room.envelopeCount}`);
+
+  const retryAtCap = await tightCall(`/v2/rooms/${tightRoom}/envelopes`, { method: 'POST', body: { envelopes: [three[0]] }, headers: tightAuth });
+  check('a retry of something already held is still accepted at the cap', retryAtCap.status === 200 && retryAtCap.body.accepted?.length === 1, JSON.stringify(retryAtCap.body).slice(0, 140));
+  const afterRetryAtCap = await tightCall(`/v2/rooms/${tightRoom}`, { headers: tightAuth });
+  check('and costs the room nothing', afterRetryAtCap.body.room.envelopeCount === 3, `${afterRetryAtCap.body.room.envelopeCount}`);
+  check('nor any bytes', afterRetryAtCap.body.room.storedBytes === atCap.body.room.storedBytes);
+
+  const oneMore = await envelopeFrom(tightOwner, tightRoom);
+  const overflow = await tightCall(`/v2/rooms/${tightRoom}/envelopes`, { method: 'POST', body: { envelopes: [oneMore] }, headers: tightAuth });
+  check('but a genuinely new envelope past the cap is refused', overflow.status === 413 && overflow.body.error === 'room_full', JSON.stringify(overflow.body));
+  const afterOverflow = await tightCall(`/v2/rooms/${tightRoom}`, { headers: tightAuth });
+  check('and the room is unchanged by the attempt', afterOverflow.body.room.envelopeCount === 3);
+  await tightRelay.stop();
+
   // --- retention ------------------------------------------------------------
 
   const sweepStore = openStore({ file: ':memory:', now: () => clock });

@@ -11,3 +11,13 @@ release/
 *.pem
 *.key
 *.mobileprovision
+
+# Secret registries and relay databases belong in an application-support or
+# temporary directory, never beside the source. A harness that writes one here
+# is a harness with the wrong path, and test/secure-sabotage.js fails the run
+# if the repository root gains anything — this is only the second line of
+# defence, so that a mistake cannot become a commit.
+/secure-rooms.json
+/relay.db
+/relay.db-wal
+/relay.db-shm

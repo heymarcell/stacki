@@ -44,7 +44,17 @@ const hash = (token) => crypto.createHash('sha256').update(String(token), 'utf8'
 const newToken = () => toBase64Url(crypto.randomBytes(TOKEN_BYTES));
 const newInvite = () => toBase64Url(crypto.randomBytes(INVITE_BYTES));
 
-function openStore({ file = ':memory:', now = Date.now } = {}) {
+/**
+ * Open (or create) the database.
+ *
+ * `limits` exists so a room's caps can be made small enough to reach. The real
+ * ones are two hundred thousand envelopes and half a gigabyte, which no test
+ * can drive — and a cap nothing ever reaches is a cap nothing ever checks.
+ * Self-hosters have a legitimate use for it too.
+ */
+function openStore({ file = ':memory:', now = Date.now, limits = {} } = {}) {
+  const maxEnvelopes = Number.isInteger(limits.maxEnvelopes) ? limits.maxEnvelopes : MAX_ROOM_ENVELOPES;
+  const maxBytes = Number.isInteger(limits.maxBytes) ? limits.maxBytes : MAX_ROOM_BYTES;
   if (file !== ':memory:') fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL');
@@ -275,7 +285,7 @@ function openStore({ file = ':memory:', now = Date.now } = {}) {
       try {
         const fresh = envelopes.filter((e) => !q.hasEnvelope.get(roomId, e.envelopeId));
         const incoming = fresh.reduce((n, e) => n + size(e), 0);
-        if (room.envelope_count + fresh.length > MAX_ROOM_ENVELOPES || room.stored_bytes + incoming > MAX_ROOM_BYTES) {
+        if (room.envelope_count + fresh.length > maxEnvelopes || room.stored_bytes + incoming > maxBytes) {
           db.prepare('ROLLBACK').run();
           return { ok: false, code: 'room_full' };
         }

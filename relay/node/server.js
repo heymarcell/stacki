@@ -238,8 +238,10 @@ function createSecureRelay({
   // in for it — see the protocol document — so a relay behind somebody's own
   // firewall is entitled to a different number here.
   rateLimits = RATE_LIMITS,
+  // Room caps, for a test that needs one small enough to reach.
+  limits = {},
 } = {}) {
-  const store = openStore({ file, now });
+  const store = openStore({ file, now, limits });
   const limiter = createLimiter({ now, limits: rateLimits });
   // roomId -> Set of sockets. Nothing durable; a relay restart drops every
   // watcher and every client falls back to HTTP, which is the design.

@@ -51,6 +51,16 @@ const fileFor = (userDataPath) => path.join(userDataPath, FILE);
 const OS_BACKED_LINUX = new Set(['gnome_libsecret', 'kwallet', 'kwallet5', 'kwallet6']);
 
 /**
+ * Whether a named backend actually keeps a secret.
+ *
+ * Exported and pure, so the one decision this file makes about what counts as
+ * encryption can be checked directly. It used to live inside the closure that
+ * only a real Electron process ever builds, which meant every test injected a
+ * protector and the decision itself was never exercised at all.
+ */
+const isProtectedBackend = (backend) => backend === 'keychain' || backend === 'dpapi' || OS_BACKED_LINUX.has(backend);
+
+/**
  * The real protector, built lazily.
  *
  * Lazily because this module is required by tests that have no Electron, and
@@ -110,9 +120,7 @@ function electronProtector() {
     },
     /** Whether that backend is somewhere a secret is genuinely kept. */
     get protects() {
-      const backend = backendOf();
-      if (backend === 'keychain' || backend === 'dpapi') return true;
-      return OS_BACKED_LINUX.has(backend);
+      return isProtectedBackend(backendOf());
     },
     encrypt: (text) => safeStorage.encryptString(text).toString('base64'),
     decrypt: (blob) => safeStorage.decryptString(Buffer.from(blob, 'base64')),
@@ -553,4 +561,13 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
   };
 }
 
-module.exports = { createSecureRooms, reviveRoom, fileFor, electronProtector, FILE, MAX_ROOMS, MAX_PROJECTS };
+module.exports = {
+  createSecureRooms,
+  reviveRoom,
+  fileFor,
+  electronProtector,
+  isProtectedBackend,
+  FILE,
+  MAX_ROOMS,
+  MAX_PROJECTS,
+};
