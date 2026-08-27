@@ -3928,11 +3928,31 @@ export default function App() {
   // Coming back to the window. Cheap and quiet: the main process throttles it,
   // so two visits a minute apart are one request, and a project that shares
   // nothing makes none at all.
+  //
+  // `online` is the one that makes the offline promise true. The panel says
+  // comments "will send when you're connected", and until this listener
+  // existed that only happened if the person also happened to click away and
+  // back. A machine that reconnects while Stacki sits there is the ordinary
+  // case — a laptop waking up, a tunnel coming back — and it needs no click.
+  //
+  // `visibilitychange` tells the main process whether to run its periodic
+  // catch-up; a minimised Stacki asks a relay nothing.
   useEffect(() => {
     if (!project || !reviewShared?.enabled) return undefined;
     const onFocus = () => void syncReviews('focus');
+    const onOnline = () => void syncReviews('online');
+    const onVisibility = () => {
+      void window.avb.reviewsVisibility?.();
+      if (document.visibilityState === 'visible') void syncReviews('focus');
+    };
     window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [project, reviewShared?.enabled, syncReviews]);
 
   const afterShareChange = (result) => {
@@ -4946,6 +4966,19 @@ export default function App() {
         {busy && <BusyOverlay message={busy} />}
         {toast && <Toast toast={toast} />}
         <ConfirmHost />
+        {/* An invitation can arrive before a project is open — in fact that is
+            the likeliest way, because the link comes from somebody else and
+            the first thing it does is launch Stacki. Without this the click
+            did nothing at all: the dialog lived only in the project view, so
+            the one case it was written for was the one it never reached. It
+            says which project to open; see JoinShareDialog. */}
+        {pendingInvite && (
+          <JoinShareDialog
+            invite={{ ...pendingInvite, localCount: 0 }}
+            onJoin={secureJoin}
+            onCancel={secureCancelJoin}
+          />
+        )}
       </div>
     );
   }

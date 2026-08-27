@@ -199,6 +199,15 @@
     "appId": "com.stacki.editor",
     "productName": "Stacki",
     "afterPack": "./scripts/afterPack.js",
+    "protocols": [
+      {
+        "name": "Stacki secure share invitation",
+        "role": "Viewer",
+        "schemes": [
+          "stacki"
+        ]
+      }
+    ],
     "files": [
       "electron/**/*",
       "dist/**/*",
