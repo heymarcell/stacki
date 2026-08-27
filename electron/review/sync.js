@@ -249,4 +249,69 @@ function createSyncer({ now = Date.now } = {}) {
   };
 }
 
-module.exports = { syncOnce, createSyncer, legacyLink, FOCUS_QUIET_MS, MAX_PAGES };
+// How often an ACTIVE secure share looks for somebody else's comments while
+// the window is on screen.
+//
+// The window is jittered so that a room full of people does not turn into a
+// room full of clients asking at the same instant, and it is minutes rather
+// than seconds because a review is written in minutes and read in hours. This
+// is not presence and it is not streaming: it is the answer to a real gap,
+// which is that somebody who leaves Stacki focused all afternoon would
+// otherwise never learn a colleague had replied.
+const CATCH_UP_MIN_MS = 30_000;
+const CATCH_UP_MAX_MS = 60_000;
+
+/**
+ * A repeating, jittered catch-up.
+ *
+ * Deliberately a tiny state machine with injected time, because "it polls
+ * about every 45 seconds" is otherwise a property nothing can test without
+ * sitting there for 45 seconds. `armed` is the only state; `due` is the only
+ * effect.
+ */
+function createCatchUp({
+  onDue,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  random = Math.random,
+  minMs = CATCH_UP_MIN_MS,
+  maxMs = CATCH_UP_MAX_MS,
+} = {}) {
+  let timer = null;
+
+  const wait = () => minMs + Math.floor(random() * Math.max(0, maxMs - minMs));
+
+  function arm() {
+    if (timer) return;
+    timer = setTimer(() => {
+      timer = null;
+      // The effect first, then re-arm: a catch-up that threw would otherwise
+      // stop the loop for the rest of the session.
+      try {
+        onDue?.('catchup');
+      } finally {
+        arm();
+      }
+    }, wait());
+    timer?.unref?.();
+  }
+
+  function disarm() {
+    if (timer) clearTimer(timer);
+    timer = null;
+  }
+
+  return {
+    /** Run while a secure share is open AND the window is on screen. */
+    set(active) {
+      if (active) arm();
+      else disarm();
+    },
+    get armed() {
+      return timer !== null;
+    },
+    disarm,
+  };
+}
+
+module.exports = { syncOnce, createSyncer, createCatchUp, legacyLink, FOCUS_QUIET_MS, MAX_PAGES, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS };

@@ -567,7 +567,13 @@ app.whenReady().then(() => {
   // Visual Review's ledger. Also for the app rather than for a project — the
   // door is registered once, and which project's reviews are behind it moves
   // with whatever is open (see project:scan below).
-  reviews.start({ userDataPath: app.getPath('userData'), send });
+  reviews.start({
+    userDataPath: app.getPath('userData'),
+    send,
+    // Whether there is a window a person could be looking at. A minimised or
+    // hidden Stacki does not ask a relay anything — see reviseCatchUp.
+    isVisible: () => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !mainWindow.isMinimized(),
+  });
   // Claim the scheme. In development the executable is Electron itself, so the
   // path and an argument have to be given explicitly or the OS registers the
   // wrong program.

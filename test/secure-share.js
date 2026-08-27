@@ -46,7 +46,7 @@ const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSign
 const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
 const { checkRelay, describeRelay, relayFor, DEFAULT_RELAY } = require('../electron/review/secure/relays.js');
 const { createReviewStore, scopeKey, fileFor } = require('../electron/review/store.js');
-const { syncOnce, createSyncer } = require('../electron/review/sync.js');
+const { syncOnce, createSyncer, createCatchUp, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS } = require('../electron/review/sync.js');
 const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
 const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION } = require('../relay/protocol.js');
@@ -647,6 +647,85 @@ async function main() {
 
   await sync(posting);
   check('and the outbox drains when a sync happens', posting.store.shared.pending === 0, `${posting.store.shared.pending}`);
+
+  // --- the periodic catch-up --------------------------------------------------
+  //
+  // Fake timers throughout. "It asks about every forty-five seconds" is
+  // otherwise a property nothing can check without sitting there for
+  // forty-five seconds, and a test that sleeps is a test people delete.
+  {
+    const timers = new Map();
+    let nextId = 1;
+    const setTimer = (fn, ms) => {
+      const id = nextId++;
+      timers.set(id, { fn, at: ms });
+      return id;
+    };
+    const clearTimer = (id) => timers.delete(id);
+    /** Fire whatever is due, the way a clock would. */
+    const tick = () => {
+      const due = [...timers.entries()];
+      timers.clear();
+      for (const [, t] of due) t.fn();
+    };
+
+    const fired = [];
+    let roll = 0;
+    const catchUp = createCatchUp({
+      onDue: (reason) => fired.push(reason),
+      setTimer,
+      clearTimer,
+      random: () => {
+        roll += 0.5;
+        return roll % 1;
+      },
+    });
+
+    check('a catch-up does nothing until it is armed', catchUp.armed === false && timers.size === 0);
+    catchUp.set(false);
+    check('and staying off arms nothing', catchUp.armed === false);
+
+    catchUp.set(true);
+    check('an active secure share arms it', catchUp.armed === true);
+    const waits = [...timers.values()].map((t) => t.at);
+    check('the first wait is inside the documented window', waits[0] >= CATCH_UP_MIN_MS && waits[0] <= CATCH_UP_MAX_MS, `${waits[0]}`);
+
+    tick();
+    check('it comes due', fired.length === 1 && fired[0] === 'catchup', JSON.stringify(fired));
+    check('and arms itself again', catchUp.armed === true);
+    const second = [...timers.values()].map((t) => t.at)[0];
+    check('the next wait is inside the window too', second >= CATCH_UP_MIN_MS && second <= CATCH_UP_MAX_MS, `${second}`);
+    check('and it is jittered rather than fixed', second !== waits[0], `${waits[0]} then ${second}`);
+
+    tick();
+    tick();
+    check('it keeps going', fired.length === 3, `${fired.length}`);
+
+    catchUp.set(false);
+    check('a window that goes away disarms it', catchUp.armed === false && timers.size === 0);
+    tick();
+    check('and nothing fires after that', fired.length === 3, `${fired.length}`);
+
+    // A catch-up whose work throws must not stop the loop for the session.
+    const angry = [];
+    const survivor = createCatchUp({
+      onDue: (reason) => {
+        angry.push(reason);
+        throw new Error('the relay was rude');
+      },
+      setTimer,
+      clearTimer,
+      random: () => 0,
+    });
+    survivor.set(true);
+    try {
+      tick();
+    } catch {
+      /* the throw escapes the tick, which is the caller's problem, not the loop's */
+    }
+    check('a failing catch-up still re-arms', survivor.armed === true, `${angry.length} fired`);
+    survivor.disarm();
+  }
 
   // --- relay choice ----------------------------------------------------------
 

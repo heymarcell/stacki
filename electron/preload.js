@@ -1865,6 +1865,7 @@ contextBridge.exposeInMainWorld('avb', {
     ipcRenderer.on('reviews:invite', listener);
     return () => ipcRenderer.removeListener('reviews:invite', listener);
   },
+  reviewsVisibility: invoke('reviews:visibility'),
   reviewsIdentity: invoke('reviews:identity'),
   reviewsSetIdentity: invoke('reviews:setIdentity'),
   onReviewsChanged: (cb) => {
