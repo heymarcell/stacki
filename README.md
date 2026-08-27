@@ -233,6 +233,59 @@ against the source while that file is open or when it is focused; until then it
 keeps the health it last had. Screenshots taken with `capture` never include
 pins, the composer or any other editor chrome — they are pictures of the site.
 
+### Reading them yourself
+
+**C**, then click anything on the page. A pin marks where the comment is.
+
+Pins are the spatial part and only the spatial part:
+
+- **Hover or focus a pin** for a two-line preview — enough to recognise a
+  review without opening it. It is passive: nothing in it can be clicked, so it
+  never moves away as you reach for it.
+- **Click it** to open the **Review Inspector** in the Comments panel: the
+  whole conversation, in Markdown, with the reply box and the workflow buttons
+  always in view however long the thread is.
+- **Several comments on one spot** ask which one you meant rather than opening
+  the first. A cluster is drawn as a stack rather than as a pin in another
+  colour, so "three comments here" and "comment #3" never look alike.
+
+Every review opens the same way, whatever it contains. The Inspector is
+resizable, and on a small window it floats over the canvas rather than
+squeezing it — the Style panel gives way first, because a crushed canvas is not
+somewhere you can work.
+
+**⌥↑ / ⌥↓** step to the previous and next comment without going back to the
+list, in whatever order the list is showing — triaging a page of feedback is a
+sequence. **Esc** backs out one rung at a time: the chooser, then the reader,
+then the selection. Whatever closes, the keyboard goes back to whatever opened
+it.
+
+### What a colour means
+
+One system, everywhere a comment appears — the dot in the list, the pin on the
+page, the row in a cluster:
+
+| | |
+| --- | --- |
+| **blue, filled** | open |
+| **grey ring** | deferred — valid, deliberately not now |
+| **green ring with a tick** | resolved |
+| **amber dashed ring** | Stacki can no longer find what this was about |
+| **blue ring around it** | this is the one you are reading — never a change of colour, so a selected comment still says whether it is done |
+
+Shape carries the same four states as colour does, so a comment still reads
+correctly printed in grey or to somebody who cannot separate those hues. Green
+means resolved and nothing else: the **Resolve** button wears it, **Reopen**
+deliberately does not, and red is kept for deleting.
+
+You can also **file your own comments under a colour** — Colour… in the
+Inspector's ⋯ menu. That is grouping, not status: it shows as a small separate
+mark beside the number and never changes what the dot says.
+
+Resolved comments keep no marker on the page. They stay in the Comments panel
+under **Resolved** or **All**, and selecting one brings its marker back for as
+long as you are looking at it.
+
 ## Sharing comments with other people
 
 **Off unless you turn it on, per project.** A project that has not been shared

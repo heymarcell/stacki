@@ -28,7 +28,11 @@ const { app, BrowserWindow } = require('electron');
 
 const { dialog } = require('electron');
 
-const { makeCanvasProject, removeCanvasProject, astroCached } = require('./agent-canvas-fixture.js');
+// Nobody is watching an automated run, and a modal dialog would stop it dead
+// waiting for a click that is never coming. Set before main.js is required.
+process.env.STACKI_NO_DIALOGS = '1';
+
+const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const failures = [];
@@ -50,6 +54,11 @@ const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 // pattern test/thumbs.js already uses, for the same two reasons.
 const say = (text) => fs.writeSync(1, `${text}\n`);
 const shout = (text) => fs.writeSync(2, `${text}\n`);
+// `app.exit()` skips before-quit, so the Astro dev server this run started
+// outlives it — one orphaned server, holding its port and its memory, per run.
+// main.js takes it down by hand for the same reason; so does this, in the
+// report section below, while the MCP server it calls through is still up.
+let stopPreview = async () => {};
 const done = (code) => {
   app.exit(code);
 };
@@ -97,6 +106,11 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   console.log('agent-canvas: skipped (no astro cache and STACKI_CANVAS_OFFLINE is set)');
   process.exit(0);
 }
+
+// What earlier runs left behind. Electron rewrites a small userData during
+// shutdown, after teardown has removed it, so one reappears per run and they
+// pile up quietly. Swept here rather than pretended about.
+sweepStaleRuns(['stacki-canvas-user-']);
 
 const root = makeCanvasProject({ log: (m) => console.log(`agent-canvas: ${m}`) });
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-canvas-user-'));
@@ -177,6 +191,8 @@ require('../electron/main.js');
     const image = (body.result?.content || []).find((c) => c.type === 'image') || null;
     return { meta: body.result?.structuredContent || {}, image };
   };
+
+  stopPreview = () => call('project', { action: 'dev_stop' });
 
   const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 
@@ -516,17 +532,77 @@ require('../electron/main.js');
 
   // --- the report ----------------------------------------------------------
 
-  for (const w of BrowserWindow.getAllWindows()) w.destroy();
-  await mcp.stopMcp().catch(() => {});
-  removeCanvasProject(root);
+  // The preview goes first, and it has to: the two lines under this one take
+  // the windows and the MCP server away, and dev_stop is a call THROUGH that
+  // server. Stopping it afterwards fails with "fetch failed" and leaves an
+  // Astro process running for as long as the machine is up — one per run.
+  // Cleanup is part of correctness. A run that passed every assertion and left
+  // an Astro dev server behind is a run that will be repeated until the machine
+  // has forty of them holding several gigabytes — which is what happened, and
+  // which presents as the machine being slow rather than as anything to do with
+  // tests. So every step below is attempted even after an earlier one fails,
+  // and any failure makes this a failing run however well the assertions went.
+  const cleanupProblems = [];
+  const attempt = async (what, fn) => {
+    try {
+      await fn();
+    } catch (err) {
+      cleanupProblems.push(`${what}: ${String(err?.message || err)}`);
+    }
+  };
+
+  const where = await call('project', { action: 'dev_status' }).catch(() => null);
+  const previewUrl = where?.url || where?.preview?.url || null;
+
+  await attempt('stopping the preview', async () => {
+    const stopped = await stopPreview();
+    if (!stopped || stopped.ok === false) throw new Error(JSON.stringify(stopped ?? null).slice(0, 140));
+  });
+
+  // `ok` means "asked", not "stopped": Astro 7 daemonizes its dev server, so
+  // stopDevServer hands the job to `astro dev stop` and returns. Exiting on
+  // that ok deletes the project directory out from under the command and
+  // leaves the server running for as long as the machine is up.
+  if (previewUrl) {
+    await attempt('waiting for the preview to stop answering', async () => {
+      const deadline = Date.now() + 20000;
+      for (;;) {
+        try {
+          await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
+        } catch {
+          return;
+        }
+        if (Date.now() > deadline) throw new Error(`${previewUrl} would not stop`);
+        await wait(400);
+      }
+    });
+  }
+
+  await attempt('closing the windows', () => {
+    for (const w of BrowserWindow.getAllWindows()) w.destroy();
+  });
+  await attempt('stopping the MCP server', () => mcp.stopMcp());
+  await attempt(`removing the fixture ${root}`, () => {
+    removeCanvasProject(root);
+    if (fs.existsSync(root)) throw new Error('still there');
+  });
+  await attempt(`removing the app data ${userData}`, () => {
+    fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    if (fs.existsSync(userData)) throw new Error('still there');
+  });
 
   if (failures.length) {
     shout(`\nagent-canvas: ${failures.length} failed, ${checked - failures.length} passed\n`);
     shout(failures.join('\n') + '\n');
-    return done(1);
   }
-  say(`agent-canvas: ${checked} passed  [a real page, a real edit, a real picture]`);
-  return done(0);
+  if (cleanupProblems.length) {
+    shout(`\nagent-canvas: ${cleanupProblems.length} cleanup failure(s) — this is a failing run\n`);
+    for (const problem of cleanupProblems) shout(`  ${problem}`);
+  }
+  if (!failures.length && !cleanupProblems.length) {
+    say(`agent-canvas: ${checked} passed  [a real page, a real edit, a real picture]`);
+  }
+  return done(failures.length || cleanupProblems.length ? 1 : 0);
 })().catch((err) => {
   shout(`agent-canvas: ${err && (err.stack || err)}`);
   done(1);

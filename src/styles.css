@@ -1428,6 +1428,201 @@ textarea { font-family: inherit; font-size: 12px; line-height: 1.5; resize: none
   min-height: 0;
 }
 .panel.left { width: 260px; flex-shrink: 0; }
+/* --- the Review Inspector ------------------------------------------------
+
+   The left slot holds one of two surfaces: the Comments index at its ordinary
+   navigation width, or the Inspector at a reading width. It is never both, and
+   never one inside the other.
+
+   The width comes from src/reviewLayout.js, which decides it from the room
+   available rather than from the length of the conversation. */
+.panel.left.is-inspector { width: 440px; transition: width 0.14s ease; }
+.panel.left.is-inspector.is-resizing { transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  .panel.left.is-inspector { transition: none; }
+}
+/* Not enough room to sit beside the canvas without ruining it, so it floats
+   over the canvas instead — non-modal, no scrim, the site still there behind
+   it and still scrollable. */
+.panel.left.is-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 44px;
+  z-index: 40;
+  box-shadow: 0 0 0 1px var(--border-strong), 18px 0 44px rgba(0, 0, 0, 0.5);
+}
+
+/* Style/Settings, while the reader has its room. Closing the reader brings the
+   panel back, which is what this says and does. */
+.props-reveal {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 30;
+  padding: 4px 10px;
+  font-size: 11px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.props-reveal:hover { color: var(--text); }
+
+.review-inspector {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  width: 100%;
+}
+.review-inspector .review-thread { flex: 1; min-height: 0; }
+/* The divider. Visually a hairline, physically wide enough to grab: a 1px
+   target is a target people miss. */
+.review-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -4px;
+  width: 9px;
+  cursor: col-resize;
+  z-index: 5;
+  background: none;
+  border: none;
+  padding: 0;
+}
+.review-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+  transition: background 0.12s;
+}
+.review-resizer:hover::after,
+.review-resizer:focus-visible::after,
+.is-resizing .review-resizer::after { background: var(--accent); }
+.review-resizer:focus-visible { outline: none; }
+
+/* --- the Inspector header ------------------------------------------------
+   Back, state, name, what it is about, one navigation action, overflow. The
+   file and breakpoint go underneath as context rather than beside it as more
+   title. */
+.review-back {
+  padding: 3px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  border-radius: 4px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.review-back:hover { color: var(--text); background: var(--bg-hover); }
+.review-head-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Where you are in the list, and the way to the next one. Quiet: it is
+   navigation, not a decision about the review.
+
+   Quiet is about weight, not size. These were 1px of padding around a 14px
+   glyph — a target roughly 16 by 12, well under the ~24 a fingertip or an
+   unsteady hand needs, and sitting between two other controls so a miss lands
+   on something else. They are 24 square now and still weightless: no fill, no
+   border, the chevron is the same size it was. */
+.review-step { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+.review-step .review-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+.review-step-n {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 0 2px;
+  white-space: nowrap;
+}
+
+.review-locate {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-active);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.review-locate:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.review-thread-context {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  padding: 2px 10px 8px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  min-width: 0;
+}
+.review-source-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-context-dot { opacity: 0.6; }
+/* Provenance is header furniture, not conversation: it belongs above the
+   messages and outside the region that scrolls away. */
+.review-thread > .review-prov {
+  flex-shrink: 0;
+  margin: 0 10px 8px;
+}
+/* Rare and destructive things live behind this rather than in the header. */
+.review-overflow { position: relative; flex-shrink: 0; }
+.review-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  min-width: 160px;
+  margin-top: 4px;
+  padding: 3px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+}
+.review-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 11.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.review-menu button:hover:not(:disabled) { background: var(--bg-hover); }
+.review-menu button.is-danger { color: var(--red); }
+.review-menu button:disabled { opacity: 0.4; }
+
 .panel.right { width: 322px; flex-shrink: 0; border-right: none; border-left: 1px solid var(--border); }
 
 .panel-section { display: flex; flex-direction: column; min-height: 0; }
@@ -5716,14 +5911,21 @@ textarea::selection {
   box-shadow: inset 0 0 0 2px var(--accent-soft);
 }
 
-/* --- colour, and what it is NOT ------------------------------------ */
+/* --- the grouping palette, and what it is NOT ----------------------- */
 /*
-   Colour is the person's own filing: it groups their notes and says nothing
-   about state. STATE is the shape — filled is open, hollow is deferred, a
-   dashed ring is an anchor Stacki can no longer find, a faint grey ring is
-   done. Keeping them apart is what lets a marker answer "is this finished"
-   at a glance without a legend, while still letting somebody colour a page's
-   worth of notes however they like.
+   These are the colours a person can file their own notes under. They are
+   SECONDARY metadata and they no longer carry state.
+
+   They used to. Status was the shape and the person's colour was the fill, so
+   a review filed under green looked resolved, a deferred one could be violet,
+   and the marker could not answer "is this done" without a legend. Both facts
+   were sharing one channel and the more important of them was losing.
+
+   Now status owns colour AND shape — see `--review-open` and friends — and
+   this palette appears as a small separate mark beside the number
+   (`.review-swatch-dot`). Grouping is still there, still editable through
+   Colour… in the Inspector overflow; it is simply no longer pretending to be
+   status.
 */
 .c-blue { --pin: #0099ff; }
 .c-violet { --pin: #a855f7; }
@@ -5746,8 +5948,6 @@ textarea::selection {
 .review-swatch:hover:not(:disabled) { background: var(--pin); transform: scale(1.12); }
 .review-swatch.on { border-color: var(--text); }
 /* The dot is the handle for changing its own colour. */
-.review-dot-btn { padding: 2px; background: none; border-radius: 50%; flex-shrink: 0; }
-.review-dot-btn:hover:not(:disabled) { background: var(--bg-hover); }
 
 /* --- the pin ------------------------------------------------------- */
 
@@ -5760,14 +5960,13 @@ textarea::selection {
      cover the line above it. */
   transform: translate(-4px, -100%);
   /* Grows with the number and nothing else: #7, #42 and #128 are all real
-     names and all have to be readable, but a marker that also carried a
-     cluster count inline got wide enough to cover the thing it points at. */
+     names and all have to be readable. */
   min-width: 22px;
   height: 22px;
   padding: 0 6px;
   border: 1.5px solid #fff;
   border-radius: 11px 11px 11px 3px;
-  background: var(--pin, var(--accent));
+  background: var(--review-open);
   color: #fff;
   font-size: 10.5px;
   font-weight: 700;
@@ -5777,44 +5976,94 @@ textarea::selection {
   cursor: pointer;
   transition: transform 0.08s ease;
 }
-.review-pin:hover:not(:disabled) {
-  background: var(--pin, var(--accent));
-  transform: translate(-4px, -100%) scale(1.12);
-  filter: brightness(1.15);
+@media (prefers-reduced-motion: reduce) {
+  .review-pin { transition: none; }
 }
-/* Deliberately not being done now: hollow, in the same colour. Shape carries
-   the state so the colour can stay the person's own.
-   White, not the editor's panel colour — this marker sits over somebody's
-   WEBSITE, which is usually light, and a dark fill there reads as a solid
-   blob rather than as an outline. */
+/* A few pixels of reach on every side, without drawing anything: the marker is
+   small so it covers as little of the page as possible, and a small target is
+   a hard one to hit. */
+.review-pin::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 14px;
+}
+.review-pin:hover:not(:disabled) {
+  transform: translate(-4px, -100%) scale(1.12);
+  filter: brightness(1.12);
+  z-index: 8;
+}
+/* Same rule as the index row: the selected pin's soft blue halo and the focus
+   ring are both blue and land on top of each other, so the focused pin shows
+   the ring alone. Its scale and drop shadow still say it is the one open. */
+.review-pin:focus-visible { outline: 2px solid var(--review-open); outline-offset: 3px; }
+.review-pin.open:focus-visible { box-shadow: 0 5px 16px rgba(0, 0, 0, 0.42); }
+
+/* --- status ------------------------------------------------------------
+   The same four states, the same four colours, as everywhere else. Shape
+   carries them too: filled open, hollow deferred, a tick for resolved. */
 .review-pin.is-deferred {
   background: #fff;
-  color: var(--pin, var(--accent));
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px var(--pin, var(--accent));
+  color: var(--review-deferred);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 0 0 2px var(--review-deferred);
 }
 .review-pin.is-deferred:hover:not(:disabled) { background: #fff; filter: none; }
-/* Done. Shown only when the panel is showing resolved reviews, and shown
-   quietly when it is: grey rather than the person's colour, and faded, so a
-   page being checked over reads as "here is where that was" instead of as a
-   page full of outstanding work. Full strength on hover, because at that point
-   it is the one being looked at. */
-.review-pin.is-resolved {
-  background: #6b7280;
-  color: #fff;
-  opacity: 0.5;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+/* Only ever on the page while it is the one being read — see reviewPins.js —
+   so there is nothing to fade it against. */
+.review-pin.is-resolved { background: var(--review-resolved); color: #fff; }
+.review-pin.is-resolved:hover:not(:disabled) { background: var(--review-resolved); filter: brightness(1.08); }
+
+/* --- selection ---------------------------------------------------------
+   A ring, never a change of colour. Status and selection are two different
+   facts: a selected open pin must not turn green, and a selected resolved one
+   must stay green. It also sits above its neighbours — in a cluster of four,
+   the selected marker drawn underneath one of the others is how somebody ends
+   up sure they clicked the wrong comment. */
+.review-pin.open {
+  z-index: 9;
+  transform: translate(-4px, -100%) scale(1.06);
+  box-shadow: 0 0 0 3px rgba(0, 153, 255, 0.32), 0 5px 16px rgba(0, 0, 0, 0.42);
 }
-.review-pin.is-resolved:hover:not(:disabled) { background: #6b7280; opacity: 1; filter: none; }
-.review-pin.is-resolved.open { opacity: 1; }
-.review-pin.open { outline: 2px solid var(--pin, var(--accent)); outline-offset: 2px; }
-/* The number, sat on the pin's OPTICAL centre rather than the centre of its
-   box. The two are not the same here: three corners are full quarter-circles
-   and the fourth — the tail, bottom-left — is nearly square, so the shape
-   carries more colour on that side and its centre of area is down and left of
-   the middle. A digit placed dead centre reads as pushed up and to the right,
-   which is what it was doing. Half a pixel each way is one device pixel on a
-   retina screen, and it is the difference between a number sitting in the pin
-   and a number posted through it. */
+.review-pin.open:hover:not(:disabled) {
+  transform: translate(-4px, -100%) scale(1.12);
+  box-shadow: 0 0 0 3px rgba(0, 153, 255, 0.32), 0 5px 16px rgba(0, 0, 0, 0.42);
+}
+
+/* --- a cluster ---------------------------------------------------------
+   A different SHAPE, not the same circle in another colour. A marker reading
+   "3" for review #3 and a marker reading "3" for three reviews were telling
+   two completely different facts in the same silhouette, and colour alone
+   cannot separate them — not in greyscale, and not for anybody who cannot
+   split those hues.
+
+   So a cluster is a stack: a second card peeking out behind the first, and
+   square corners rather than the single pin's pointed tail. Neutral charcoal,
+   because its members can be in different states and wearing one of them
+   would be a claim about all of them. */
+.review-pin.is-cluster {
+  background: #3f4347;
+  color: #fff;
+  border-radius: 6px;
+  transform: translate(-4px, -100%);
+  box-shadow:
+    3px -3px 0 -1px #3f4347,
+    3px -3px 0 0.5px #fff,
+    0 2px 6px rgba(0, 0, 0, 0.35);
+}
+.review-pin.is-cluster:hover:not(:disabled) {
+  background: #4a5055;
+  filter: none;
+  transform: translate(-4px, -100%) scale(1.1);
+}
+.review-pin.is-cluster.open {
+  transform: translate(-4px, -100%) scale(1.06);
+  box-shadow:
+    3px -3px 0 -1px #3f4347,
+    3px -3px 0 0.5px #fff,
+    0 0 0 3px rgba(0, 153, 255, 0.32),
+    0 5px 16px rgba(0, 0, 0, 0.42);
+}
+
 .review-pin-n {
   display: block;
   transform: translate(-0.5px, 0.5px);
@@ -5847,49 +6096,186 @@ textarea::selection {
   line-height: 1;
 }
 
-/* --- the box you type into, and the thread you open ---------------- */
+/* --- the surfaces over the canvas ----------------------------------------
 
-/* Fixed, not absolute: these are drawn in the window rather than in the
+   Three, all small, all transient, and only one of them takes input. The
+   conversation used to be a fourth — a draggable window with its own scrollbar
+   sitting on top of the design it was about — and it is gone: reading a review
+   happens in the Inspector, which is a panel and does not cover anything.
+
+   Fixed, not absolute: these are drawn in the window rather than in the
    preview frame, so a comment near the edge of a 375px phone canvas still
-   opens a panel you can read instead of one the frame cuts in half. */
-.review-composer,
-.review-popover {
+   opens something readable rather than something the frame cuts in half. */
+
+/* Peek: what a pin is, before you commit to opening it. Read-only, and the
+   pointer goes straight through it — a surface that appears on hover and can
+   be clicked is one that moves away as you reach for it. */
+.review-peek {
   position: fixed;
-  z-index: 60;
-  width: 288px;
-  max-height: 70%;
+  z-index: 62;
+  width: 240px;
+  pointer-events: none;
+  transform: translate(14px, 10px);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  padding: 7px 9px 8px;
+  font-size: 11.5px;
+  animation: review-peek-in 90ms ease-out;
+}
+@keyframes review-peek-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .review-peek { animation: none; }
+}
+.review-peek.flip-x { transform: translate(calc(-100% - 14px), 10px); }
+.review-peek.flip-y { transform: translate(14px, calc(-100% - 10px)); }
+.review-peek.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 10px)); }
+.review-peek-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.review-peek-n { font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--accent); }
+.review-peek-who { font-size: 10px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-dim); }
+.review-peek-age { margin-left: auto; font-size: 10px; color: var(--text-faint); }
+/* Two lines. Enough to recognise a review, not enough to read one — which is
+   the whole point of the surface. */
+.review-peek-body {
+  color: var(--text);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.review-peek-more { margin-top: 5px; font-size: 10px; color: var(--text-faint); }
+.review-peek.is-cluster { width: auto; padding: 6px 10px; }
+.review-peek-count { font-size: 11px; color: var(--text); }
+
+/* The cluster chooser: which review, when several share a spot. Selection
+   only — no conversation, no reply box, no workflow actions. */
+.review-cluster {
+  position: fixed;
+  z-index: 63;
+  width: 250px;
+  max-height: 260px;
+  display: flex;
+  flex-direction: column;
+  /* NOT `overflow: hidden`.
+     The pointer below is a ::before at `left: -5px` — deliberately outside the
+     box, because that is where the marker is. Clipping the box clipped the
+     pointer with it, so the chooser has been floating unattached next to its
+     pin this whole time while a test asserting the rule exists passed happily.
+     The scrolling belongs to the list inside, which is the part that scrolls;
+     the rounded corners it needs are its own. */
+  overflow: visible;
+  transform: translate(14px, 10px);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5);
+}
+.review-cluster:focus { outline: none; }
+.review-cluster.flip-x { transform: translate(calc(-100% - 14px), 10px); }
+.review-cluster.flip-y { transform: translate(14px, calc(-100% - 10px)); }
+.review-cluster.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 10px)); }
+/* The pointer, which has to stay attached to the marker this list belongs to.
+   It moves to the other side when the box flips, because a chooser that
+   detached from its pin would be a list of comments about nothing in
+   particular. */
+.review-cluster::before {
+  content: '';
+  position: absolute;
+  top: 16px;
+  width: 9px;
+  height: 9px;
+  background: var(--bg-panel-2);
+  border-left: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+}
+.review-cluster:not(.flip-x)::before { left: -5px; transform: rotate(-45deg); }
+.review-cluster.flip-x::before { right: -5px; transform: rotate(135deg); }
+/* Flipped upward, the pointer belongs at the bottom edge instead. */
+.review-cluster.flip-y::before { top: auto; bottom: 16px; }
+.review-cluster-title {
+  /* Above the pointer, so the arrow's seam is covered by the title's own fill
+     rather than showing as a notch in the border. */
+  position: relative;
+  z-index: 1;
+  border-top-left-radius: 7px;
+  border-top-right-radius: 7px;
+  background: var(--bg-panel-2);
+  padding: 6px 9px 7px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+/* Native scrolling, and only when a cluster is unusually large. The rounded
+   bottom corners live here now that the container no longer clips: without
+   them a scrolled row paints square over the chooser's own curve. */
+.review-cluster-list {
   overflow-y: auto;
-  /* Hanging off the point, clear of the pin that marks it. A box drawn over
-     its own marker hides the thing it is about. */
-  transform: translate(14px, 8px);
+  min-height: 0;
+  padding: 3px;
+  border-bottom-left-radius: 7px;
+  border-bottom-right-radius: 7px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.review-cluster-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 7px;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  text-align: left;
+  font-size: 11.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.review-cluster-row.on { background: var(--bg-active); }
+.review-cluster-n { font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--accent); flex-shrink: 0; }
+.review-cluster-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+
+/* The new-comment composer: the only content entry left over the canvas,
+   because writing a comment IS spatial — you are saying "this thing here". */
+.review-composer {
+  position: fixed;
+  z-index: 61;
+  width: 316px;
+  transform: translate(14px, 10px);
   background: var(--bg-panel-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-  padding: 10px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5);
+  padding: 9px 10px 10px;
   cursor: default;
 }
-/* Near an edge of the WINDOW it opens inwards. */
-.review-composer.flip-x,
-.review-popover.flip-x { transform: translate(calc(-100% - 14px), 8px); }
-.review-composer.flip-y,
-.review-popover.flip-y { transform: translate(14px, calc(-100% - 8px)); }
-.review-composer.flip-x.flip-y,
-.review-popover.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 8px)); }
+.review-composer.flip-x { transform: translate(calc(-100% - 14px), 10px); }
+.review-composer.flip-y { transform: translate(14px, calc(-100% - 10px)); }
+.review-composer.flip-x.flip-y { transform: translate(calc(-100% - 14px), calc(-100% - 10px)); }
 .review-composer form { display: flex; flex-direction: column; gap: 8px; }
-/* The header is a handle: a comment opens on top of the thing it is about,
-   which is exactly where you cannot see it from. The PIN never moves — it is
-   the anchor — and the offset is forgotten when the thread closes. */
-.review-drag,
-.review-popover .review-thread-head { cursor: grab; user-select: none; }
-.review-drag:active,
-.review-popover .review-thread-head:active { cursor: grabbing; }
-.review-popover .review-thread-head button,
-.review-drag code { cursor: default; }
-.review-popover .review-thread-head .review-x { cursor: pointer; }
-/* Once moved, it is a panel rather than a bubble pointing at something. */
-.review-composer.moved,
-.review-popover.moved { box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55); }
+.review-composer-head { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; font-size: 11px; }
+.review-composer-head strong { font-weight: 650; color: var(--text); }
+.review-composer-head .review-x { margin-left: auto; }
+/* The point being commented on, marked while the composer is up, so what you
+   get is never a surprise. */
+.review-draft-anchor {
+  position: fixed;
+  z-index: 60;
+  width: 11px;
+  height: 11px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
 .review-composer-target {
   display: flex;
   align-items: center;
@@ -5908,17 +6294,76 @@ textarea::selection {
 }
 .review-composer-target .dim { color: var(--text-faint); }
 .review-hint { font-size: 10px; color: var(--text-faint); margin-right: auto; }
+/* Discoverability without a toolbar. */
+.review-md-hint { font-size: 10px; color: var(--text-faint); margin-right: auto; }
 
 /* --- a thread, wherever it is read --------------------------------- */
 
-.review-thread { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+/* --- the three regions -------------------------------------------------
+   Header and footer are fixed; the middle scrolls. This is the whole point of
+   the structure: a reply box you have to scroll two thousand words to reach is
+   a reply box that is not there. */
+.review-thread {
+  display: flex;
+  flex-direction: column;
+  /* Fills the shell so the scroll region has a height to be bounded by. */
+  min-height: 0;
+  flex: 1;
+  font-size: 12.5px;
+}
 .review-thread-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-bottom: 8px;
+  flex-shrink: 0;
+  padding: 9px 10px;
   border-bottom: 1px solid var(--border);
+  /* The header IS the drag handle, so it must not become a text selection
+     when somebody pulls it. The message bodies opt back in below. */
+  user-select: none;
 }
+.review-thread-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  /* A quiet Mac-style bar rather than the Chromium default, which inside a
+     dark panel reads as an embedded web page. Native scrolling is untouched —
+     this is only how the bar is painted. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.review-thread-scroll::-webkit-scrollbar { width: 9px; }
+.review-thread-scroll::-webkit-scrollbar-track { background: transparent; }
+.review-thread-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 6px;
+  /* Inset, so the thumb runs beside the text rather than through it. */
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.review-thread-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-faint); background-clip: content-box; }
+.review-thread-scroll::-webkit-scrollbar-thumb:active { background: var(--text-dim); background-clip: content-box; }
+.review-thread-foot {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel-2);
+}
+/* Says the conversation continues, without a heavy gradient over the words. */
+.review-thread-scroll { --edge: rgba(0, 0, 0, 0.28); }
+.review-thread-head { box-shadow: 0 1px 0 rgba(0, 0, 0, 0.18); }
+
+
+
 
 /* The name a person says out loud. Tabular so a column of them lines up. */
 .review-number {
@@ -5947,24 +6392,60 @@ textarea::selection {
    until it is being reached for. */
 .review-trash:hover:not(:disabled) { color: var(--red); }
 
+/* --- status, in one colour system --------------------------------------
+
+   These four tokens are the whole contract, and every review surface uses
+   them: the dot in the index and the Inspector, the pin on the canvas, the
+   rows in the cluster chooser. Nobody should have to relearn what a colour
+   means between one surface and the next.
+
+   Colour is not the only cue. Filled / ring / ring-with-tick / dashed carries
+   the same four states, so the dot still works printed in grey. */
+:root {
+  --review-open: #0099ff;
+  --review-deferred: #7d7d82;
+  --review-resolved: #30c158;
+  --review-orphan: #d8c86f;
+}
+
 .review-dot {
   width: 9px;
   height: 9px;
   border-radius: 5px;
   flex-shrink: 0;
   box-sizing: border-box;
-  background: var(--pin, var(--accent));
+  background: var(--review-open);
   border: 1.5px solid transparent;
+  position: relative;
 }
-/* Hollow: valid, deliberately not now. */
-.review-dot.is-deferred { background: transparent; border-color: var(--pin, var(--accent)); }
-/* Done is done — a decision was reached, and that is a state rather than a
-   grouping, so it drops the colour. */
-.review-dot.is-resolved { background: transparent; border-color: var(--text-faint); }
-/* An anchor that no longer resolves is not a status — it is drawn on top of
-   whichever status the review is in, dashed, because it is not a decision
-   anybody made. */
-.review-dot.orphaned { background: transparent; border-style: dashed; border-color: var(--red); }
+/* A ring: valid, deliberately not now. */
+.review-dot.is-deferred { background: transparent; border-color: var(--review-deferred); }
+/* A ring with a tick through it — green, and still legible without the green. */
+.review-dot.is-resolved { background: transparent; border-color: var(--review-resolved); }
+.review-dot.is-resolved::after {
+  content: '';
+  position: absolute;
+  left: 1.5px;
+  top: 2.5px;
+  width: 3px;
+  height: 1.5px;
+  border-left: 1.5px solid var(--review-resolved);
+  border-bottom: 1.5px solid var(--review-resolved);
+  transform: rotate(-45deg);
+}
+/* An anchor that no longer resolves. Not a decision anybody made, so it is
+   drawn as an interruption of the shape rather than as a fourth status. */
+.review-dot.is-orphaned { background: transparent; border-style: dashed; border-color: var(--review-orphan); }
+
+/* The person's own grouping colour, where it is still worth seeing: a small
+   mark beside the number, not the thing carrying the state. */
+.review-swatch-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  background: var(--pin, var(--accent));
+}
 
 .review-orphan {
   display: flex;
@@ -5972,12 +6453,17 @@ textarea::selection {
   align-items: flex-start;
   padding: 8px;
   border-radius: 6px;
-  background: rgba(255, 69, 58, 0.1);
+  /* Amber, and the same amber as the orphan dot. Red is what Delete wears,
+     and an anchor Stacki can no longer resolve is not a destructive act
+     somebody just took — it is a fact about the source that has drifted. It
+     was in the alert colour, which put "you are about to lose this" and "this
+     no longer points anywhere" in one palette. */
+  background: rgba(216, 200, 111, 0.12);
   color: var(--text-dim);
   font-size: 11px;
   line-height: 1.45;
 }
-.review-orphan svg { color: var(--red); margin-top: 1px; flex-shrink: 0; }
+.review-orphan svg { color: var(--review-orphan); margin-top: 1px; flex-shrink: 0; }
 .review-orphan strong { color: var(--text); font-weight: 600; }
 
 .review-target {
@@ -6012,14 +6498,31 @@ textarea::selection {
    long one — especially when both are "You". Each gets a rule down its side in
    its author's colour, so where one ends and the next begins is a shape rather
    than a line of small grey text. */
-.review-messages { display: flex; flex-direction: column; gap: 12px; }
-.review-msg {
-  padding-left: 9px;
-  border-left: 2px solid var(--accent);
-  border-radius: 1px;
+/* A conversation, not a stack of cards.
+   The coloured rule down each message marked all of them as important and told
+   you nothing; who said it is the thing that actually differs, so that is what
+   is marked. Messages are separated by a hairline instead. */
+.review-messages { display: flex; flex-direction: column; }
+.review-msg { position: relative; padding: 7px 0 11px; }
+.review-msg + .review-msg {
+  margin-top: 10px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
-.review-msg.is-agent { border-left-color: var(--component-green); }
-.review-msg-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 3px; }
+.review-msg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.review-avatar {
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  font-size: 8px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, #5f93ff, #9b62d9);
+}
+.review-avatar.is-agent { background: linear-gradient(135deg, #30a463, #67d28c); }
 .review-author {
   font-size: 10px;
   font-weight: 700;
@@ -6027,7 +6530,8 @@ textarea::selection {
   text-transform: uppercase;
   color: var(--accent);
 }
-.review-msg.is-agent .review-author { color: var(--component-green); }
+.review-author.is-agent { color: #75d994; }
+.review-author.is-human { color: #63c5ff; }
 .review-time { font-size: 10px; color: var(--text-faint); }
 /* Said out loud, and quietly. A message that changed after somebody replied to
    it is a different thing from one nobody touched — but it is a footnote about
@@ -6058,9 +6562,147 @@ textarea::selection {
 /* Disabled means "there is nothing else in this review", which is a state
    worth seeing rather than a control worth hiding. */
 .review-msg-tools button:disabled { opacity: 0.25; }
-.review-body { color: var(--text); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* --- a saved message ---------------------------------------------------
+   Rendered Markdown now, so `white-space: pre-wrap` would fight the block
+   layout. Wrapping stays aggressive: a URL or a hashed filename with no space
+   in it must not push the panel wider than the window. */
+.review-body {
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  /* Never justified: ragged-right is easier to read at this measure, and
+     justification opens rivers in a 340px column. */
+  text-align: left;
+}
+.review-md > :first-child { margin-top: 0; }
+.review-md > :last-child { margin-bottom: 0; }
+.review-md p { margin: 0 0 0.62em; }
+.review-md-h { margin: 0.9em 0 0.35em; font-weight: 650; color: var(--text); }
+.review-md ul, .review-md ol { margin: 0 0 0.62em; padding-left: 1.35em; }
+.review-md li { margin: 0.16em 0; }
+.review-md li::marker { color: var(--text-faint); }
+.review-md blockquote {
+  margin: 0 0 0.62em;
+  padding: 1px 0 1px 9px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.review-md hr { border: 0; border-top: 1px solid var(--border); margin: 0.8em 0; }
+.review-md strong { font-weight: 650; color: var(--text); }
+.review-md em { font-style: italic; }
+.review-md del { text-decoration: line-through; color: var(--text-dim); }
+.review-md code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--bg-active);
+  border-radius: 4px;
+  padding: 0.1em 0.34em;
+  overflow-wrap: anywhere;
+}
+/* A fenced block scrolls sideways rather than widening the panel. */
+.review-md-pre-wrap { position: relative; margin: 0 0 0.62em; }
+.review-md-pre {
+  margin: 0;
+  padding: 8px 9px;
+  background: var(--bg-active);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.review-md-pre code { background: none; padding: 0; font-size: inherit; }
+.review-md-pre::-webkit-scrollbar { height: 9px; }
+.review-md-pre::-webkit-scrollbar-track { background: transparent; }
+.review-md-pre::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.review-md-copy {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 2px 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.review-md-pre-wrap:hover .review-md-copy,
+.review-md-copy:focus-visible { opacity: 1; }
+.review-md-copy:hover { color: var(--text); }
+/* A link has to look like one, and has to stay selectable as text. */
+.review-md-link {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.review-md-link:hover { border-bottom-color: var(--accent); }
+.review-md-link:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+/* Something that parsed as a link but is not one Stacki will open. Shown as
+   the words somebody wrote, and inert. */
+.review-md-deadlink { color: var(--text-dim); text-decoration: underline dotted; }
+.review-md table { border-collapse: collapse; margin: 0 0 0.62em; display: block; overflow-x: auto; }
+.review-md th, .review-md td { border: 1px solid var(--border); padding: 3px 7px; text-align: left; }
+.review-md th { background: var(--bg-active); font-weight: 650; }
+
+/* --- provenance, in one line ------------------------------------------- */
+.review-prov { border-radius: 6px; overflow: hidden; }
+.review-prov-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 7px;
+  background: var(--bg-active);
+  border: none;
+  border-radius: 6px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+.review-prov-strip:hover { background: var(--bg-hover); }
+.review-prov-icon { display: inline-flex; flex-shrink: 0; color: var(--text-faint); }
+.review-prov-line { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-prov-more { flex-shrink: 0; color: var(--text-faint); text-decoration: underline; }
+.review-prov-detail {
+  padding: 6px 8px 7px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+/* Uncertainty is marked. Not shouted — but a resolution this checkout cannot
+   see must never read as a settled tick. */
+.review-prov.is-unproven .review-prov-strip,
+.review-prov.is-unproven .review-prov-detail { background: rgba(255, 193, 7, 0.1); }
+.review-prov.is-unproven .review-prov-icon { color: var(--amber); }
+/* Amber, not red. Red is reserved for destructive acts — deleting a thread,
+   deleting a message — and a review resolved on a commit this checkout does
+   not have is a thing to check, not damage somebody just did. Sharing the
+   alarm colour with Delete trained people to ignore it in both places. It is
+   the same amber as `is-unproven` because it is the same kind of fact: what
+   the thread claims cannot be confirmed from what is here. */
+.review-prov.is-behind .review-prov-strip,
+.review-prov.is-behind .review-prov-detail { background: rgba(255, 193, 7, 0.12); }
+.review-prov.is-behind .review-prov-icon { color: var(--amber); }
+/* The ordinary case stays quiet. */
+.review-prov.is-note .review-prov-strip { background: var(--bg-active); }
 /* Editing in place, so the words stay where they were while they change. */
-.review-msg.editing { border-left-color: var(--amber); }
+.review-msg.editing { background: rgba(255, 193, 7, 0.05); border-radius: 6px; }
 .review-edit { display: flex; flex-direction: column; gap: 6px; }
 .review-edit .review-actions { margin-top: 0; }
 
@@ -6070,11 +6712,20 @@ textarea::selection {
    was filed under are all things people copy — so they are opted in here.
    The header stays unselectable: it is a drag handle. */
 .review-body,
+.review-body *,
 .review-edit textarea,
 .review-target-text,
 .review-note span,
 .review-note button,
+.review-prov-line,
+.review-prov-detail,
 .review-messages { user-select: text; -webkit-user-select: text; cursor: auto; }
+/* Except the things inside a body that are controls rather than words. */
+.review-md-link { cursor: pointer; }
+.review-md-copy { cursor: pointer; user-select: none; }
+/* The whole scroll region is readable text, so a drag started inside it is a
+   selection. Only the header moves the panel. */
+.review-thread-scroll { user-select: text; -webkit-user-select: text; }
 
 .review-note {
   display: flex;
@@ -6110,15 +6761,44 @@ textarea::selection {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
 }
+/* Three marks, what it understands, and how to send — one line. */
+.review-reply-bar { display: flex; align-items: center; gap: 4px; }
+.review-reply-bar .review-md-hint { margin-right: 0; }
+.review-reply-spacer { flex: 1; }
+.review-tool {
+  min-width: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  line-height: 1.4;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.review-tool:hover { color: var(--text); background: var(--bg-hover); }
+.review-tool b, .review-tool i { font-family: var(--font); }
+/* A normal button, not a full-width bar. Sending a reply is an ordinary act. */
+.review-send { min-width: 0; padding: 4px 12px; }
 .review-defer { display: flex; flex-direction: column; gap: 6px; }
 /* One line, always. Three narrow buttons that wrap read as a broken panel,
    and the panel is only 260px wide. */
 .review-actions { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
 .review-actions .spacer { flex: 1; min-width: 0; }
 .review-actions button { font-size: 11px; padding: 4px 9px; white-space: nowrap; flex-shrink: 0; gap: 4px; }
+/* The act and its result in one colour. Pressing this makes the dot green, so
+   the button is that green — it used to be the generic accent blue, which is
+   also the colour of "open", the state it takes the review OUT of. */
+.review-resolve {
+  background: var(--review-resolved);
+  color: #08210f;
+  border: 1px solid transparent;
+  font-weight: 600;
+}
+.review-resolve:hover:not(:disabled) { background: #3fd268; }
+.review-resolve:disabled { opacity: 0.5; }
 
 /* --- the panel ----------------------------------------------------- */
 
@@ -6171,13 +6851,36 @@ textarea::selection {
   cursor: pointer;
 }
 .comments-row:hover:not(:disabled) { background: var(--bg-hover); }
+/* The one being read. Unmistakable without being loud: the row it is, and a
+   rule down its leading edge in the accent so the eye finds it in a list of
+   twenty without having to read any of them. */
+.comments-row.on {
+  background: var(--bg-active);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+/* One blue mark at a time.
+   "Selected" and "focused" are different facts, but on this row they were the
+   same colour around the same box: the accent bar down the leading edge and
+   the accent focus ring, drawn together, read as one duplicated selection.
+   Nothing was wrong with either on its own — they simply never co-occurred
+   until focus started returning here when the Inspector closes.
+   While the row has focus the ring says "you are here" and the fill still says
+   "this is the one being read", so the bar is redundant and stands down. It
+   comes back the moment focus moves on. */
+.comments-row.on:focus-visible { box-shadow: none; }
+.comments-row.on:hover:not(:disabled) { background: var(--bg-active); }
+.comments-row.on .comments-excerpt { color: var(--text); }
 .comments-row .review-dot { margin-top: 5px; }
 .comments-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 /* Where it is and what it is called go ABOVE the words. Underneath, they read
    as part of the comment; above, they read as its label. */
 .comments-row-top { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .comments-row-top .spacer { flex: 1; min-width: 4px; }
-.comments-row-top svg { color: var(--red); flex-shrink: 0; }
+/* The orphan mark in a row. Amber, like the orphan dot beside it and like the
+   banner the Inspector shows for the same review — it was red here and amber
+   two surfaces away, which is the same fact wearing the colour of Delete in
+   one place and the colour of "cannot be confirmed" in the other. */
+.comments-row-top svg { color: var(--review-orphan); flex-shrink: 0; }
 .comments-excerpt {
   color: var(--text);
   font-size: 12px;
@@ -6368,24 +7071,12 @@ textarea::selection {
    `is-behind` is the one that matters: the thread says resolved and this
    checkout does not contain the revision it was resolved on, so what is on
    screen may still be the bug. It is drawn as a warning and never as a tick. */
-.review-checkout {
-  display: flex;
-  align-items: flex-start;
-  gap: 7px;
-  margin: 0 0 8px;
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(255, 214, 10, 0.1);
-  color: var(--text-dim);
-  font-size: 11px;
-  line-height: 1.5;
-}
-.review-checkout svg { color: var(--yellow, #ffd60a); margin-top: 1px; flex-shrink: 0; }
-.review-checkout strong { color: var(--text); font-weight: 600; }
-.review-checkout.is-behind { background: rgba(255, 69, 58, 0.1); }
-.review-checkout.is-behind svg { color: var(--red); }
+
 /* Written elsewhere and found anyway. Context, not a warning — in the alert
    colour it reads as a problem, and after a merge every review from the
    merged branch would wear a permanent yellow alert about nothing. */
-.review-checkout.is-note { background: var(--bg-input); color: var(--text-faint); }
-.review-checkout.is-note svg { color: var(--text-faint); }
+
+/* The stepper's readout when the review being read has left the filtered
+   list. Quieter still: it is telling you the position is gone, not shouting
+   about it. */
+.review-step-n.is-detached { font-style: italic; opacity: 0.8; }

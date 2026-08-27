@@ -1,8 +1,10 @@
 import React from 'react';
 import AutoTextarea from '../ui/AutoTextarea.jsx';
-import ReviewThread from '../ui/ReviewThread.jsx';
+import ReviewPeek, { peekLabel } from './ReviewPeek.jsx';
+import ReviewCluster from './ReviewCluster.jsx';
+import { applyMarkdownKey, restoreCaret } from '../ui/markdownKeys.js';
 
-// The markers on the canvas, and the box you type into.
+// The markers on the canvas, and the one thing that is still typed over it.
 //
 // These are two different layers, and the difference matters:
 //
@@ -11,23 +13,33 @@ import ReviewThread from '../ui/ReviewThread.jsx';
 //   below the fold must not float over the toolbar. It lives inside the frame's
 //   overlay, beside the selection outlines.
 //
-//   A POPOVER belongs to the editor. It is a panel that happens to be pointing
-//   at something. Drawn inside the frame it was clipped by it, and at the phone
-//   breakpoint — a 375px frame — a 288px panel simply could not be read. So it
-//   is drawn in the window instead, at the pin's window coordinates, and can
-//   hang over the canvas edge like any other floating panel.
+//   Everything else here belongs to the editor and is drawn in the window, at
+//   the pin's window coordinates, so a 375px phone frame cannot cut it in half.
 //
-// Neither is ever inside the previewed document. A marker injected into the
-// page would be in the DOM an agent reads back and in the picture `capture`
-// takes, and Stacki would have started editing the website in order to describe
-// it. Both take themselves off for a capture for the same reason.
+// What used to be here and is gone: the conversation. Clicking a pin opened a
+// draggable window containing the whole thread, its replies, its workflow
+// buttons and its own scrollbar — on top of the design it was about. It could
+// be moved, which meant it had to be moved, and reading a review meant covering
+// the thing the review was about.
+//
+// A pin says WHERE. The conversation lives in the Review Inspector, which has
+// room for it and does not sit on the website. So the three surfaces that
+// remain over the canvas are all small, all transient, and only one of them
+// takes any input:
+//
+//   Peek     read-only, on hover or focus. Says what a pin is.
+//   Cluster  selection only. Says which review, when several share a spot.
+//   Composer the new-comment box. The only content entry left over the canvas,
+//            because writing a comment is inherently spatial — you are saying
+//            "this thing here".
+//
+// Nothing here is draggable any more.
 
-// How much room a popover needs. Only used to decide which side of a pin to
-// open on, so it is an estimate rather than a measurement — and a generous one,
-// because opening inwards when there was room is invisible while opening
-// outwards when there wasn't is a box you cannot read.
-const BOX_W = 300;
-const BOX_H = 320;
+// How much room the composer needs, to decide which side of the point to open
+// on. An estimate, and a generous one: opening inwards when there was room is
+// invisible, opening outwards when there wasn't is a box you cannot read.
+const BOX_W = 330;
+const BOX_H = 260;
 const GAP = 14;
 
 /** Which way a box hanging off a point has to open to stay on screen. */
@@ -51,83 +63,97 @@ const toWindow = (x, y, frameBox) => ({
   y: (Number(frameBox?.top) || 0) + (Number(y) || 0),
 });
 
-/**
- * Let the panel be pushed out of the way.
- *
- * A comment about an element opens on top of that element, which is exactly
- * where you cannot see it from — you want to read the note AND look at the
- * thing. So the header is a handle. The PIN never moves: it is the anchor, and
- * a marker that wandered would stop meaning anything. And the offset is
- * forgotten when the thread closes, because where somebody shoved a panel for
- * ten seconds is not a preference worth remembering.
- */
-function useDragOffset(key) {
-  const [offset, setOffset] = React.useState({ dx: 0, dy: 0 });
-  React.useEffect(() => setOffset({ dx: 0, dy: 0 }), [key]);
-  const start = (e) => {
-    // Not from the buttons in the header — closing and deleting are clicks.
-    if (e.target.closest('button')) return;
-    e.preventDefault();
-    const from = { x: e.clientX, y: e.clientY, ...offset };
-    const move = (ev) => setOffset({ dx: from.dx + ev.clientX - from.x, dy: from.dy + ev.clientY - from.y });
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  };
-  return [offset, start];
-}
+/** How much of a surface has to stay on screen to be usable. */
+const KEEP = 60;
 
-/** Keep a dragged panel on screen — a note shoved off the edge is a note lost. */
-function onScreen(x, y) {
+/**
+ * Keep a surface reachable near the edges of the window.
+ *
+ * Flipping decides which side of the point it opens on; this catches what
+ * flipping cannot — a point so close to an edge that even the flipped box
+ * hangs off it. A composer whose Post button is off the screen is a comment
+ * nobody can leave.
+ */
+export function clampToWindow(x, y, w = BOX_W) {
   if (typeof window === 'undefined') return { x, y };
   return {
-    x: Math.min(Math.max(x, -BOX_W + 80), window.innerWidth - 60),
-    y: Math.min(Math.max(y, 8), window.innerHeight - 60),
+    x: Math.min(Math.max(x, -(w - KEEP)), window.innerWidth - KEEP),
+    y: Math.min(Math.max(y, 8), Math.max(8, window.innerHeight - KEEP)),
   };
 }
+
+/**
+ * Long enough that crossing a pin on the way somewhere else does not flash a
+ * preview, short enough that pausing on one feels immediate.
+ */
+const PEEK_DELAY_MS = 280;
 
 /**
  * The markers.
  *
  * `pins` is already laid out — PreviewPane does that once and hands the same
- * list to both layers, so a popover and its pin can never disagree about where
- * they are.
+ * list to both layers, so a marker and anything pointing at it can never
+ * disagree about where they are.
  */
-export default function ReviewPins({ pins, visible, capturing, openId, onOpen }) {
+export default function ReviewPins({ pins, visible, capturing, openId, onOpen, onPeek, reviewById }) {
+  const timer = React.useRef(null);
+  React.useEffect(() => () => clearTimeout(timer.current), []);
   if (capturing || !visible) return null;
+
+  const peekSoon = (pin) => {
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => onPeek?.(pin), PEEK_DELAY_MS);
+  };
+  const peekNow = (pin) => {
+    clearTimeout(timer.current);
+    onPeek?.(pin);
+  };
+  const peekOff = () => {
+    clearTimeout(timer.current);
+    onPeek?.(null);
+  };
+
   return (
     <>
       {pins.map((pin) => {
         const isOpen = pin.reviews.includes(openId);
         const many = pin.reviews.length > 1;
+        const only = many ? null : reviewById?.(pin.reviews[0]) || null;
         return (
           <button
             key={pin.key}
-            className={`review-pin is-${pin.status} c-${pin.color || 'blue'}${isOpen ? ' open' : ''}${
-              many ? ' many' : ''
-            }`}
+            // One class per fact: `is-<status>` or `is-cluster` for what is
+            // behind the marker, `open` for whether it is the one being read.
+            // A cluster carried both `is-cluster` and `many`, which is two
+            // names for one thing and two places to keep in step.
+            className={`review-pin is-${many ? 'cluster' : pin.status}${isOpen ? ' open' : ''}`}
             style={{ left: pin.x, top: pin.y }}
-            title={
-              many
-                ? `${pin.reviews.length} comments here — #${pin.numbers.join(', #')}`
-                : `Comment #${pin.numbers[0]}`
-            }
+            // Which reviews are under this marker, so focus can come back to
+            // it when the surface it opened is closed. See restoreReviewFocus
+            // in App.jsx.
+            data-review-ids={pin.reviews.join(' ')}
+            aria-label={peekLabel(only, pin.reviews.length)}
+            aria-current={isOpen ? 'true' : undefined}
+            onPointerEnter={() => peekSoon(pin)}
+            onPointerLeave={peekOff}
+            // Keyboard focus gets the same context, immediately: somebody
+            // tabbing to a pin has already decided to look at it.
+            onFocus={() => peekNow(pin)}
+            onBlur={peekOff}
             onClick={(e) => {
               e.stopPropagation();
-              // A cluster opens its first review; the panel is where the rest
-              // of a busy element is read.
-              onOpen(isOpen ? null : pin.reviews[0]);
+              peekOff();
+              // One rule, whatever is behind the marker: a single review opens
+              // in the Inspector, a cluster asks which one first. It never
+              // picks for you.
+              onOpen(pin);
             }}
           >
             {/* The number, so the pin on the page, the row in the panel and the
                 thing an agent was told to fix are all called the same thing.
                 In its own element because it gets nudged onto the pin's
                 optical centre, which is not the centre of its box. */}
-            <span className="review-pin-n">{pin.numbers[0] ?? ''}</span>
-            {many && <span className="review-pin-more">+{pin.reviews.length - 1}</span>}
+            <span className="review-pin-n">{many ? pin.reviews.length : pin.numbers[0] ?? ''}</span>
           </button>
         );
       })}
@@ -136,121 +162,138 @@ export default function ReviewPins({ pins, visible, capturing, openId, onOpen })
 }
 
 /**
- * The composer and the opened thread, in the window rather than in the frame.
+ * The three transient surfaces, in the window rather than in the frame.
  *
  * `frameBox` is where the preview frame sits on screen, so a pin's canvas
- * coordinates can be turned into window ones. Without it nothing is drawn:
- * a panel at 0,0 in the corner of the app is worse than no panel.
+ * coordinates can be turned into window ones. Without it nothing is drawn: a
+ * panel at 0,0 in the corner of the app is worse than no panel.
  */
 export function ReviewSurface({
   pins,
   frameBox,
   capturing,
-  openId,
-  onOpen,
-  onAct,
-  onFocus,
-  onDelete,
-  onColor,
-  onEditMessage,
-  onDeleteMessage,
+  peek,
+  cluster,
+  onPickFromCluster,
+  onCloseCluster,
   reviewById,
-  busyId,
   draft,
   onDraftChange,
   onDraftSubmit,
   onDraftCancel,
 }) {
-  const openPin = openId ? pins.find((p) => p.reviews.includes(openId)) : null;
-  const openReview = openId ? reviewById?.(openId) : null;
-  // One hook, whichever panel is up, so the rules of hooks are kept while the
-  // two branches below can still return early.
-  const [offset, startDrag] = useDragOffset(draft ? 'draft' : openId);
-
   if (capturing || !frameBox) return null;
 
   const screen =
-    typeof window === 'undefined'
-      ? null
-      : { width: window.innerWidth, height: window.innerHeight };
-  const place = (x, y) => {
-    const at = onScreen(x + offset.dx, y + offset.dy);
-    return { left: at.x, top: at.y };
-  };
+    typeof window === 'undefined' ? null : { width: window.innerWidth, height: window.innerHeight };
 
+  // --- the new-comment composer --------------------------------------------
+  //
+  // The only surface here that takes input, and the only one that should:
+  // writing a comment IS spatial. The draft anchor beside it shows exactly
+  // which point is being commented on, so what you get is never a surprise.
   if (draft) {
-    const at = toWindow(draft.x, draft.y, frameBox);
+    const point = toWindow(draft.x, draft.y, frameBox);
+    // The anchor stays on the point; only the box is pulled back on screen, so
+    // the marker never lies about which element is being commented on.
+    const at = clampToWindow(point.x, point.y);
     return (
-      <div
-        className={`review-composer${sideClass(at.x, at.y, screen)}${offset.dx || offset.dy ? ' moved' : ''}`}
-        style={place(at.x, at.y)}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="review-composer-target review-drag" onPointerDown={startDrag}>
-          <code>{draft.label}</code>
-          {draft.breakpoint && draft.breakpoint !== 'desktop' && <span className="dim">{draft.breakpoint}</span>}
-          {draft.occurrenceCount > 1 && Number.isInteger(draft.occurrence) && (
-            <span className="dim">
-              copy {draft.occurrence + 1}/{draft.occurrenceCount}
-            </span>
-          )}
-        </div>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            onDraftSubmit();
-          }}
+      <>
+        <span className="review-draft-anchor" style={{ left: point.x, top: point.y }} aria-hidden="true" />
+        <div
+          className={`review-composer${sideClass(at.x, at.y, screen)}`}
+          style={{ left: at.x, top: at.y }}
+          onClick={(e) => e.stopPropagation()}
+          role="dialog"
+          aria-label="New comment"
         >
-          <AutoTextarea
-            value={draft.body}
-            minRows={2}
-            autoFocus
-            placeholder="What’s wrong with this?"
-            onChange={(e) => onDraftChange(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                onDraftSubmit();
-              }
-            }}
-          />
-          <div className="review-actions">
-            <span className="review-hint">⌘↩ to post</span>
-            <button type="button" className="ghost" onClick={onDraftCancel}>
-              Cancel
-            </button>
-            <button type="submit" className="primary" disabled={!draft.body.trim()}>
-              Comment
+          <div className="review-composer-head">
+            <strong>New comment</strong>
+            <span className="review-composer-target">
+              <code>{draft.label}</code>
+              {draft.breakpoint && draft.breakpoint !== 'desktop' && <span className="dim">{draft.breakpoint}</span>}
+              {draft.occurrenceCount > 1 && Number.isInteger(draft.occurrence) && (
+                <span className="dim">
+                  copy {draft.occurrence + 1}/{draft.occurrenceCount}
+                </span>
+              )}
+            </span>
+            <button type="button" className="review-x" onClick={onDraftCancel} title="Cancel" aria-label="Cancel">
+              ✕
             </button>
           </div>
-        </form>
-      </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              onDraftSubmit();
+            }}
+          >
+            <AutoTextarea
+              value={draft.body}
+              minRows={3}
+              maxRows={10}
+              autoFocus
+              placeholder="Leave a comment…"
+              onChange={(e) => onDraftChange(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                  e.preventDefault();
+                  onDraftSubmit();
+                  return;
+                }
+                // The same four shortcuts the reply box has. A composer where
+                // ⌘B did nothing, next to one where it worked, would be the
+                // kind of inconsistency people stop trusting.
+                const field = e.currentTarget;
+                const next = applyMarkdownKey(
+                  { value: field.value, selectionStart: field.selectionStart, selectionEnd: field.selectionEnd },
+                  e
+                );
+                if (!next) return;
+                e.preventDefault();
+                onDraftChange(next.value);
+                restoreCaret(field, next);
+              }}
+            />
+            <div className="review-actions">
+              <span className="review-md-hint">Markdown supported</span>
+              <button type="button" className="ghost" onClick={onDraftCancel}>
+                Cancel
+              </button>
+              <button type="submit" className="primary" disabled={!draft.body.trim()}>
+                Post
+              </button>
+            </div>
+          </form>
+        </div>
+      </>
     );
   }
 
-  if (!openPin || !openReview) return null;
-  const at = toWindow(openPin.x, openPin.y, frameBox);
-  return (
-    <div
-      className={`review-popover${sideClass(at.x, at.y, screen)}${offset.dx || offset.dy ? ' moved' : ''}`}
-      style={place(at.x, at.y)}
-      onClick={(e) => e.stopPropagation()}
-      onPointerDown={(e) => {
-        // The header is the handle; everything below it is a control.
-        if (e.target.closest('.review-thread-head')) startDrag(e);
-      }}
-    >
-      <ReviewThread
-        review={openReview}
-        busy={busyId === openReview.id}
-        onAct={(action, extra) => onAct(openReview.id, action, extra)}
-        onFocus={() => onFocus(openReview)}
-        onDelete={() => onDelete(openReview.id)}
-        onColor={(c) => onColor?.(openReview.id, c)}
-        onEditMessage={onEditMessage ? (messageId, message) => onEditMessage(openReview.id, messageId, message) : null}
-        onDeleteMessage={onDeleteMessage ? (messageId) => onDeleteMessage(openReview.id, messageId) : null}
-        onClose={() => onOpen(null)}
+  // --- the cluster chooser --------------------------------------------------
+  if (cluster) {
+    const at = toWindow(cluster.x, cluster.y, frameBox);
+    return (
+      <ReviewCluster
+        at={at}
+        reviews={cluster.reviews.map((id) => reviewById?.(id)).filter(Boolean)}
+        onPick={onPickFromCluster}
+        onClose={onCloseCluster}
       />
-    </div>
-  );
+    );
+  }
+
+  // --- the passive peek -----------------------------------------------------
+  if (peek) {
+    const at = toWindow(peek.x, peek.y, frameBox);
+    return (
+      <ReviewPeek
+        at={at}
+        cluster={peek.reviews.length}
+        review={peek.reviews.length > 1 ? null : reviewById?.(peek.reviews[0]) || null}
+      />
+    );
+  }
+
+  return null;
 }

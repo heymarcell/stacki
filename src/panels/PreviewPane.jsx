@@ -120,7 +120,13 @@ export default function PreviewPane({
   commenting = false,
   pinsVisible = true,
   reviewItems,
-  reviewOpenId = null,
+  reviewSelectedId = null,
+  // What a pin is showing on hover or focus, and which cluster is asking.
+  reviewPeek = null,
+  reviewCluster = null,
+  onReviewPeek,
+  onReviewCluster,
+  onPickFromCluster,
   reviewDraft = null,
   reviewBusyId = null,
   reviewById,
@@ -518,8 +524,8 @@ export default function PreviewPane({
   liveRef.current = { rects, selPath, selOcc, selRect, url };
 
   // The pins, laid out once and handed to both layers — the markers inside the
-  // frame and the popover outside it — so the two can never disagree about
-  // where a comment is.
+  // frame and the Peek and cluster chooser drawn outside it — so the two can
+  // never disagree about where a comment is.
   const { pins: reviewPins, hidden: reviewHidden } = React.useMemo(
     () => placePins(reviewItems, rects),
     [reviewItems, rects]
@@ -531,9 +537,9 @@ export default function PreviewPane({
     onReviewHiddenRef.current?.(hiddenKey ? hiddenKey.split(',').length : 0);
   }, [hiddenKey]);
 
-  // Where the preview frame sits in the window. The popover is drawn in the
-  // window rather than in the frame — see ReviewPins — so it needs this to
-  // turn a pin's canvas position into a screen one.
+  // Where the preview frame sits in the window. The Peek and the cluster
+  // chooser are drawn in the window rather than in the frame — see ReviewPins
+  // — so they need this to turn a pin's canvas position into a screen one.
   const [frameBox, setFrameBox] = React.useState(null);
 
   const onCanvasReportRef = React.useRef(onCanvasReport);
@@ -756,23 +762,19 @@ export default function PreviewPane({
         </div>
       </div>
 
-      {/* The composer and the opened thread. Deliberately outside the frame:
+      {/* Peek, the cluster chooser and the new-comment composer. Deliberately
+          outside the frame:
           inside it they were clipped by the canvas, and at the phone
-          breakpoint a 288px panel could not fit in a 375px frame at all. */}
+          breakpoint a 375px frame cannot hold any of them. */}
       <ReviewSurface
         pins={reviewPins}
         frameBox={frameBox}
         capturing={capturing}
-        openId={reviewOpenId}
-        onOpen={onReviewOpen}
-        onAct={onReviewAct}
-        onFocus={onReviewFocus}
-        onDelete={onReviewDelete}
-        onColor={onReviewColor}
-        onEditMessage={onReviewEditMessage}
-        onDeleteMessage={onReviewDeleteMessage}
+        peek={reviewPeek}
+        cluster={reviewCluster}
+        onPickFromCluster={onPickFromCluster}
+        onCloseCluster={() => onReviewCluster?.(null)}
         reviewById={reviewById}
-        busyId={reviewBusyId}
         draft={reviewDraft}
         onDraftChange={onReviewDraftChange}
         onDraftSubmit={onReviewDraftSubmit}
@@ -884,7 +886,7 @@ export default function PreviewPane({
                     </div>
                   ));
                 })}
-              {/* Comment pins and their popovers. Last, so a marker sits over
+              {/* Comment pins and what hovering one shows. Last, so a marker sits over
                   the outlines rather than under them, and inside frame-clip so
                   it scrolls and clips with the canvas — but still the editor's
                   layer, never the page's. `capturing` takes them off for a
@@ -893,8 +895,10 @@ export default function PreviewPane({
                 pins={reviewPins}
                 visible={pinsVisible}
                 capturing={capturing}
-                openId={reviewOpenId}
+                openId={reviewSelectedId}
                 onOpen={onReviewOpen}
+                onPeek={onReviewPeek}
+                reviewById={reviewById}
               />
             </div>
             <div className="rz-handle rz-w" onPointerDown={startResize('w')} />

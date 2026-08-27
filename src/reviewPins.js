@@ -101,7 +101,19 @@ export function placePins(items, rects) {
       continue;
     }
     groups.push({
-      key: `${p.path}@${p.occurrence ?? 'n'}@${Math.round(p.x)},${Math.round(p.y)}`,
+      // Identity, not position.
+      //
+      // This used to include the marker's rounded x,y — so every reflow that
+      // moved a pin by a pixel produced a different key, and React tore the
+      // button down and built a new one. Which meant the marker could not hold
+      // anything across a layout change: not keyboard focus, not hover, not a
+      // transition. Closing the Inspector widens the canvas and moves every
+      // pin, so returning focus to the marker you opened a review from
+      // reliably focused an element that was destroyed in the same commit.
+      //
+      // Filled in below once the group is complete — a marker IS the reviews
+      // under it, and that survives the page moving around beneath it.
+      key: null,
       path: p.path,
       occurrence: p.occurrence,
       x: p.x,
@@ -116,33 +128,35 @@ export function placePins(items, rects) {
       numbers: [p.number].filter((n) => n != null),
     });
   }
+  // The identity of each marker: the reviews it covers, in a fixed order so
+  // that the same set always produces the same key however they were merged.
+  for (const g of groups) g.key = [...g.reviews].sort().join('+');
+
   return { pins: groups, hidden };
 }
 
 /**
  * Whether a review's marker is drawn at all.
  *
- * Two rules, and the second one exists because the first was being applied to
- * a question nobody asked:
+ * Open and deferred are always marked. Both still want something from
+ * somebody, and they stay on the canvas whatever the panel is filtered to,
+ * because "what is left to do here" is not a filter — it is what a marker on a
+ * page is for.
  *
- *   Anything that still wants something from somebody is always marked. Open
- *   and deferred both do — a deferred one differently, since it is
- *   deliberately not being acted on — and they stay on the canvas whatever the
- *   panel is filtered to, because "what is left to do here" is not a filter,
- *   it is what a marker on a page is for.
+ * Resolved is not marked. Not by default, and not because the panel is showing
+ * resolved reviews either: after a week of work a page ends up wearing dozens
+ * of finished pins, and every one of them is in the way of the ones that are
+ * not finished. The panel is where resolved work is found.
  *
- *   A resolved review is marked when the panel is SHOWING resolved reviews.
- *   Hiding it unconditionally was the wrong half of a good instinct: a page
- *   covered in finished pins after a week of work is noise, but the fix for
- *   that is the default filter, not a canvas that ignores the filter. Asking
- *   for Resolved and getting a list whose items have no position on the page
- *   is a control that does not do what it says — and the moment somebody most
- *   wants to see where a resolved review WAS is the moment they are checking
- *   whether it was really fixed.
+ * With one exception, which is the case the old rule was reaching for. When
+ * somebody SELECTS a resolved review, its marker comes back for exactly as
+ * long as it is selected — because the moment you most want to see where a
+ * resolved review was is the moment you are checking whether it was really
+ * fixed. Deselect it and the canvas is clean again.
  */
-export const pinnable = (status, filter = 'open') => {
+export const pinnable = (status, filter = 'open', { selected = false } = {}) => {
   if (status === 'open' || status === 'deferred') return true;
-  return filter === 'resolved' || filter === 'all';
+  return !!selected;
 };
 
 export default placePins;

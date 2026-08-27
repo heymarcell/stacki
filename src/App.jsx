@@ -14,6 +14,8 @@ import CommentsPanel from './panels/CommentsPanel.jsx';
 import { anchorSteps, checkAnchor, markerPathFor, modelMatchesFile, peerPath, resolveNode } from './reviewAnchor.js';
 import { focusPlan, focusNote, hostPathFor, nothingRestored } from './reviewFocus.js';
 import { pinnable } from './reviewPins.js';
+import ReviewInspector from './panels/ReviewInspector.jsx';
+import { reviewLayout, clampInspector, INSPECTOR_DEFAULT } from './reviewLayout.js';
 import { mayPin } from './reviewCheckout.js';
 import {
   initialReviewMode,
@@ -3579,8 +3581,65 @@ export default function App() {
   const [reviewFilter, setReviewFilter] = useState('open');
   const [reviewScope, setReviewScope] = useState('project');
   const [allReviews, setAllReviews] = useState([]);
+  // Read through a ref by openReview, which must not be rebuilt every time a
+  // review changes — it is handed to the preview pane, and a new identity on
+  // every keystroke in a thread would re-render the canvas with it.
+  const allReviewsRef = useRef(allReviews);
+  allReviewsRef.current = allReviews;
   const [reviewProblem, setReviewProblem] = useState(null);
-  const [reviewOpenId, setReviewOpenId] = useState(null);
+  // SELECTION and PRESENTATION are two different things, and conflating them
+  // is what made the old model unpredictable.
+  //
+  // `reviewSelectedId` is which review is the current one. It survives closing
+  // the Inspector: coming back to the index leaves the row marked, the pin
+  // marked, and a resolved review's normally-hidden marker still on the page —
+  // because you are still looking at that review, you have just stopped
+  // reading it. Deselecting is a separate, deliberate act.
+  //
+  // `reviewPresentation` is where it is being shown. Only two values, and
+  // nothing about the content decides between them: 'index' is the list,
+  // 'inspector' is the reader. Which one you get depends on what you clicked,
+  // never on how long the conversation is.
+  // Handles onto functions declared further down, so a statement up here can
+  // reach one without moving its declaration — and everything it closes over —
+  // to the top of the component.
+  const openReviewRef = useRef(null);
+  const focusReviewFromUiRef = useRef(null);
+  const stepReviewRef = useRef(null);
+
+  const [reviewSelectedId, setReviewSelectedId] = useState(null);
+  const [reviewPresentation, setReviewPresentation] = useState('index');
+  // What a pin is showing on hover or focus, and which cluster is asking.
+  const [reviewPeek, setReviewPeek] = useState(null);
+  const [reviewCluster, setReviewCluster] = useState(null);
+  // One unsent reply per review, for this session only. Never written to the
+  // project, never synced, never visible to an agent — it is UI state about
+  // something somebody has not said yet.
+  const [reviewDrafts, setReviewDrafts] = useState({});
+  // How wide the reader should be, if there is room for it. A local preference:
+  // it is about this person's screen, not about the project.
+  const [inspectorWidth, setInspectorWidth] = useState(() => {
+    try {
+      return clampInspector(Number(localStorage.getItem('stacki.inspectorWidth')) || INSPECTOR_DEFAULT);
+    } catch {
+      return INSPECTOR_DEFAULT;
+    }
+  });
+  const [viewportW, setViewportW] = useState(() => (typeof window === 'undefined' ? 1440 : window.innerWidth));
+  useEffect(() => {
+    const onResize = () => setViewportW(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const saveInspectorWidth = useCallback((w) => {
+    const next = clampInspector(w);
+    setInspectorWidth(next);
+    try {
+      localStorage.setItem('stacki.inspectorWidth', String(next));
+    } catch {
+      /* a preference that cannot be stored still applies for this session */
+    }
+  }, []);
   const [reviewBusyId, setReviewBusyId] = useState(null);
   const [reviewTick, setReviewTick] = useState(0);
   // Whether these comments are shared, with whom, and how the last catch-up
@@ -3714,7 +3773,10 @@ export default function App() {
   // the wrong card is the one failure nobody ever notices.
   const withheldPins = new Set(allReviews.map((r) => r.id));
   const reviewItems = allReviews
-    .filter((r) => pinnable(r.status, reviewFilter) && onReviewPage(r))
+    // `selected` is what brings a resolved review's marker back — for as long
+    // as it is the one being read, and no longer. Everything else about which
+    // pins are drawn is unchanged.
+    .filter((r) => pinnable(r.status, reviewFilter, { selected: r.id === reviewSelectedId }) && onReviewPage(r))
     .map((r) => {
       // Where the file IS open the resolved position is used, because that one
       // follows the node if it moved. Everywhere else the anchor's own key is
@@ -3750,6 +3812,7 @@ export default function App() {
         anchorState: found && !found.id ? 'orphaned' : r.anchorState,
       };
     });
+
 
   const reviewRows = allReviews
     .filter((r) => (reviewFilter === 'all' ? true : r.status === reviewFilter))
@@ -3896,7 +3959,10 @@ export default function App() {
   const deleteReview = async (id) => {
     const result = await window.avb.reviewsRemove(id);
     if (!result?.ok) showToast(result?.message || 'That comment could not be deleted.', 'error');
-    if (reviewOpenId === id) setReviewOpenId(null);
+    if (reviewSelectedId === id) {
+      setReviewSelectedId(null);
+      setReviewPresentation('index');
+    }
     setReviewTick((n) => n + 1);
   };
 
@@ -3980,7 +4046,8 @@ export default function App() {
     commentDispatch({ type: 'submitted' });
     setDraftBody('');
     setReviewTick((n) => n + 1);
-    setReviewOpenId(result.review?.id || null);
+    // What was just written is what you want to look at.
+    openReviewRef.current?.(result.review?.id || null);
   };
 
   // --- going back to one ----------------------------------------------------
@@ -4205,7 +4272,7 @@ export default function App() {
       return done('orphaned', 'moved_away');
     }
 
-    if (threadId) setReviewOpenId(threadId);
+    if (threadId) setReviewSelectedId(threadId);
     return done('attached', null);
   };
   focusReviewRef.current = focusReview;
@@ -4484,13 +4551,188 @@ export default function App() {
       setReviewTick((n) => n + 1);
     }
   };
+  focusReviewFromUiRef.current = focusReviewFromUi;
 
   // --- the shortcuts --------------------------------------------------------
 
   const commentModeRef = useRef(commentMode);
   commentModeRef.current = commentMode;
-  const reviewOpenIdRef = useRef(reviewOpenId);
-  reviewOpenIdRef.current = reviewOpenId;
+  // Opening a review, from wherever.
+  //
+  // Both doors — a pin on the canvas and a row in the panel — have to decide
+  // the reading density, and decide it the same way. Setting the id alone left
+  // whatever density the LAST thread used in place, so a short comment opened
+  // from its pin could appear docked in the panel because something long had
+  // been read before it.
+  /**
+   * Open a review for reading.
+   *
+   * Every door into a review goes through here — a pin, a row, a choice from a
+   * cluster — and every one of them lands in the same place. Nothing about the
+   * review decides that: not its length, not its message count, not where it
+   * was clicked from. The old model chose between two surfaces by counting
+   * characters, which meant the same gesture did different things and the
+   * reason was invisible.
+   */
+  const openReview = useCallback((id, from = null) => {
+    if (from) focusOriginRef.current = { kind: from, id };
+    setReviewSelectedId(id);
+    setReviewPresentation(id ? 'inspector' : 'index');
+    setReviewCluster(null);
+    setReviewPeek(null);
+  }, []);
+
+  /**
+   * Where the keyboard goes when a review surface closes.
+   *
+   * Closing something put focus nowhere: it fell back to <body>, so Escape out
+   * of the Inspector meant Tab from the top of the window to get anywhere, and
+   * a screen reader was left announcing nothing at all. The rule everything
+   * else in this app follows is the one used everywhere — focus returns to
+   * whatever opened the thing that just closed.
+   *
+   * `kind` is where it was opened FROM: a row in the index, or a pin on the
+   * canvas. It is honoured first and the other is the fallback, because a pin
+   * can go away while its review is being read — resolving it takes the marker
+   * off the canvas — and a row can be filtered out for exactly the same
+   * reason. Neither being there is not a failure; there is simply nothing to
+   * return to, and focus stays where it is.
+   */
+  const focusOriginRef = useRef(null);
+  const pendingFocusRef = useRef(null);
+  const restoreReviewFocus = useCallback((id, prefer = null) => {
+    const kind = prefer || focusOriginRef.current?.kind || 'row';
+    const target = id || focusOriginRef.current?.id || null;
+    if (!target) return;
+    // Recorded here, done in the effect below. It cannot happen now: the thing
+    // to focus is not on screen yet, and the thing that IS on screen is about
+    // to be unmounted.
+    pendingFocusRef.current = { kind, id: target };
+  }, []);
+
+  // The move itself, after the commit that put the target on screen.
+  //
+  // This was a requestAnimationFrame, which looked equivalent and is not.
+  // Chromium throttles — and Electron, with backgroundThrottling on by
+  // default, can stop — rAF whenever the window is not frontmost, so the
+  // callback fired late or never and focus was quietly left on <body>. A
+  // frame is a painting concern; this is a commit concern, and an effect is
+  // the thing that runs once per commit whatever the compositor is doing.
+  //
+  // No dependency array on purpose: it is the NEXT commit that matters,
+  // whichever state caused it, and it costs one null check when there is
+  // nothing waiting.
+  useEffect(() => {
+    const want = pendingFocusRef.current;
+    if (!want) return;
+    pendingFocusRef.current = null;
+    const esc = (v) => (window.CSS?.escape ? window.CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&'));
+    const row = `[data-review-row="${esc(want.id)}"]`;
+    const pin = `[data-review-ids~="${esc(want.id)}"]`;
+    // The door it came from first, the other one as a fallback: a pin goes
+    // away when its review is resolved and a row goes away when the filter
+    // stops matching, and either can happen while the review is being read.
+    const el =
+      document.querySelector(want.kind === 'pin' ? pin : row) ||
+      document.querySelector(want.kind === 'pin' ? row : pin);
+    if (el && typeof el.focus === 'function') el.focus();
+  });
+  const restoreReviewFocusRef = useRef(restoreReviewFocus);
+  restoreReviewFocusRef.current = restoreReviewFocus;
+
+  /** Out of the reader, back to the list — still on the same review. */
+  const backToIndex = useCallback(() => {
+    const id = reviewSelectedIdRef.current;
+    setReviewPresentation('index');
+    restoreReviewFocusRef.current?.(id);
+  }, []);
+
+  /** Where the review being read last sat in the list. See reviewStep. */
+  const stepAnchorRef = useRef(null);
+
+  /**
+   * The neighbours of the review being read, in the order the list shows them.
+   *
+   * Triaging a page of feedback is a sequence. Without this, working through
+   * eight comments means eight trips back to the index — and the index is
+   * exactly the thing you have already finished with.
+   */
+  const reviewStep = useMemo(() => {
+    if (!reviewSelectedId) return null;
+    const at = reviewRows.findIndex((r) => r.id === reviewSelectedId);
+    if (at >= 0) {
+      stepAnchorRef.current = { id: reviewSelectedId, at };
+      return {
+        index: at + 1,
+        total: reviewRows.length,
+        prev: at > 0 ? reviewRows[at - 1].id : null,
+        next: at < reviewRows.length - 1 ? reviewRows[at + 1].id : null,
+        detached: false,
+      };
+    }
+
+    // The review being read has just left the list it was being walked
+    // through — almost always because resolving it dropped it out of the Open
+    // filter, which is the single most common thing to do while triaging.
+    //
+    // Losing the stepper at that exact moment is backwards: it disappeared on
+    // the one action that most wants a "next", stranding somebody in a reader
+    // with no way on but back to the index. So the walk continues from where
+    // this review WAS: Prev is the one before that spot and Next is whatever
+    // slid into it.
+    //
+    // The ordinal goes, though. "3 of 7" about a review that is not one of the
+    // seven is a lie, and the count is the part that is still true.
+    const anchor = stepAnchorRef.current;
+    if (!anchor || anchor.id !== reviewSelectedId) return null;
+    if (!allReviews.some((r) => r.id === reviewSelectedId)) return null;
+    if (reviewRows.length === 0) return null;
+    const k = Math.min(Math.max(0, anchor.at), reviewRows.length);
+    return {
+      index: null,
+      total: reviewRows.length,
+      prev: k > 0 ? reviewRows[k - 1].id : null,
+      next: k < reviewRows.length ? reviewRows[k].id : null,
+      detached: true,
+    };
+  }, [reviewRows, reviewSelectedId, allReviews]);
+  const reviewStepRef = useRef(reviewStep);
+  reviewStepRef.current = reviewStep;
+
+  /** Go to a neighbour, and take the canvas with you. */
+  const stepReview = useCallback((id) => {
+    if (!id) return;
+    openReviewRef.current?.(id);
+    const picked = allReviewsRef.current.find((r) => r.id === id);
+    if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUiRef.current?.(picked);
+  }, []);
+  stepReviewRef.current = stepReview;
+
+  // Reached from submitComment, which is declared above this. A ref rather
+  // than a reorder: moving the declaration would mean moving everything it
+  // closes over with it.
+  openReviewRef.current = openReview;
+
+  const reviewSelected = reviewSelectedId ? allReviews.find((r) => r.id === reviewSelectedId) || null : null;
+
+  const reviewSelectedIdRef = useRef(reviewSelectedId);
+  reviewSelectedIdRef.current = reviewSelectedId;
+  const reviewPresentationRef = useRef(reviewPresentation);
+  reviewPresentationRef.current = reviewPresentation;
+  const reviewClusterRef = useRef(reviewCluster);
+  reviewClusterRef.current = reviewCluster;
+
+  /**
+   * What the layout can afford.
+   *
+   * Recomputed from the window rather than stored, so a resized window is
+   * simply a different answer to the same question.
+   */
+  const reviewShape = reviewLayout({
+    viewportWidth: viewportW,
+    preferredWidth: inspectorWidth,
+    open: leftTab === 'comments' && reviewPresentation === 'inspector' && !!reviewSelectedId,
+  });
   const canCommentRef = useRef(false);
   canCommentRef.current = !!project && !!devUrl && !inPreview;
 
@@ -4515,12 +4757,59 @@ export default function App() {
         setPinsVisible((v) => !v);
         return;
       }
-      if (e.key === 'Escape') {
-        // One rung at a time: not that element, then not commenting. A thread
-        // opened from its pin closes first, since that is what is in the way.
-        if (reviewOpenIdRef.current && commentModeRef.current.phase === 'off') {
+      // ⌥↑ / ⌥↓ step through the reviews while the reader is open, the way an
+      // editor moves between problems. Triaging a page of feedback is a
+      // sequence, and going back to the index between every item turns eight
+      // reviews into sixteen navigations. Only while reading, and only with
+      // Option held.
+      //
+      // Never while the caret is in a field. On macOS ⌥↑ and ⌥↓ move by
+      // paragraph inside text, and the reply box is a textarea directly under
+      // this shortcut: somebody halfway through a paragraph pressing ⌥↑ to get
+      // to its start was jumped to a different review instead, with a
+      // half-written draft left behind. A shortcut that competes with the
+      // system's own text editing is one that only ever fires by accident.
+      const stepTarget = e.target;
+      const stepInField =
+        stepTarget instanceof HTMLElement &&
+        !!(stepTarget.closest('input, textarea, select, [contenteditable="true"]') || stepTarget.isContentEditable);
+      if (
+        e.altKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !stepInField &&
+        (e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+        reviewPresentationRef.current === 'inspector'
+      ) {
+        const step = reviewStepRef.current;
+        const to = e.key === 'ArrowDown' ? step?.next : step?.prev;
+        if (to) {
           e.preventDefault();
-          setReviewOpenId(null);
+          stepReviewRef.current?.(to);
+          return;
+        }
+      }
+      if (e.key === 'Escape') {
+        // One rung at a time, outermost first: the chooser, then the reader,
+        // then the selection itself, then comment mode. Each Escape undoes the
+        // last thing that happened rather than everything at once.
+        if (reviewClusterRef.current) {
+          e.preventDefault();
+          // Back to the marker that was pressed to open it — the chooser is
+          // keyboard-reachable, so leaving it has to be too.
+          const cluster = reviewClusterRef.current;
+          setReviewCluster(null);
+          restoreReviewFocusRef.current?.(cluster.reviews?.[0] || null, 'pin');
+        } else if (reviewPresentationRef.current === 'inspector' && commentModeRef.current.phase === 'off') {
+          e.preventDefault();
+          const id = reviewSelectedIdRef.current;
+          setReviewPresentation('index');
+          restoreReviewFocusRef.current?.(id);
+        } else if (reviewSelectedIdRef.current && commentModeRef.current.phase === 'off') {
+          // Still selected after leaving the reader, so a second Escape is what
+          // clears it — and takes a temporarily-shown resolved marker with it.
+          e.preventDefault();
+          setReviewSelectedId(null);
         } else if (commentModeRef.current.phase !== 'off') {
           e.preventDefault();
           commentDispatch({ type: 'escape' });
@@ -4535,7 +4824,10 @@ export default function App() {
   // that only gets noticed by the person it happens to.
   useEffect(() => {
     commentDispatch({ type: 'context-lost' });
-    setReviewOpenId(null);
+    setReviewSelectedId(null);
+    setReviewPresentation('index');
+    setReviewPeek(null);
+    setReviewCluster(null);
   }, [reviewPageFile, project?.path]);
 
   // Drilling into a component is not leaving the page — the canvas still shows
@@ -4764,8 +5056,17 @@ export default function App() {
           onSelect={(id) => setLeftTab((t) => (t === id ? null : id))}
         />
 
+        {/* `is-reading` is wider, and only while a review is docked in here.
+            A 260px column is right for a list of comments and wrong for the
+            conversation the list points at: at that measure a sentence about
+            three files breaks into a column of fragments. The width belongs to
+            the reading state rather than to the panel, so it goes back the
+            moment somebody returns to the list. */}
         {leftTab && (
-          <div className="panel left">
+          <div
+            className={`panel left${reviewShape.mode !== 'closed' ? ` is-inspector is-${reviewShape.mode}` : ''}`}
+            style={reviewShape.mode !== 'closed' ? { width: reviewShape.width } : undefined}
+          >
             {leftTab === 'pages' && (
               <PagesPanel
                 scan={scan}
@@ -4863,34 +5164,65 @@ export default function App() {
             {leftTab === 'variables' && (
               <VariablesPanel project={project} selected={varsGroup} onSelect={setVarsGroup} />
             )}
-            {leftTab === 'comments' && (
+            {/* One slot, two surfaces. The Inspector REPLACES the index
+                rather than appearing beside or inside it, so there is never a
+                list of comments wrapped around a conversation, and Back is a
+                real return rather than a collapse. */}
+            {leftTab === 'comments' && reviewPresentation === 'inspector' && reviewSelected && (
+              <ReviewInspector
+                review={reviewSelected}
+                width={reviewShape.width}
+                resizable={reviewShape.mode === 'docked'}
+                onWidthChange={saveInspectorWidth}
+                onBack={backToIndex}
+                position={reviewStep ? { index: reviewStep.index, total: reviewStep.total, detached: reviewStep.detached } : null}
+                onPrev={reviewStep?.prev ? () => stepReview(reviewStep.prev) : null}
+                onNext={reviewStep?.next ? () => stepReview(reviewStep.next) : null}
+                actorId={reviewShared?.identity?.actorId || null}
+                pinned={!withheldPins?.has(reviewSelected.id)}
+                busy={reviewBusyId === reviewSelected.id}
+                reply={reviewDrafts[reviewSelected.id] || ''}
+                onReplyChange={(text) =>
+                  setReviewDrafts((d) => ({ ...d, [reviewSelected.id]: text }))
+                }
+                onAct={(action, extra) => {
+                  // A posted reply is no longer unsent, so the draft goes.
+                  if (action === 'reply') {
+                    setReviewDrafts((d) => {
+                      const next = { ...d };
+                      delete next[reviewSelected.id];
+                      return next;
+                    });
+                  }
+                  return actOnReview(reviewSelected.id, action, extra);
+                }}
+                onFocus={() => focusReviewFromUi(reviewSelected)}
+                onDelete={() => deleteReview(reviewSelected.id)}
+                onColor={(c) => recolorReview(reviewSelected.id, c)}
+                onEditMessage={(messageId, message) => editReviewMessage(reviewSelected.id, messageId, message)}
+                onDeleteMessage={(messageId) => deleteReviewMessage(reviewSelected.id, messageId)}
+              />
+            )}
+            {leftTab === 'comments' && !(reviewPresentation === 'inspector' && reviewSelected) && (
               <CommentsPanel
                 reviews={reviewRows}
                 status={reviewFilter}
                 onStatus={setReviewFilter}
                 scope={reviewScope}
                 onScope={setReviewScope}
-                openId={reviewOpenId}
+                selectedId={reviewSelectedId}
                 onOpen={(id) => {
-                  setReviewOpenId(id);
+                  openReview(id, 'row');
                   // Choosing a comment from the list means "show me this" —
                   // reading it and finding it are the same act. An orphan has
                   // nowhere to go, so it just opens.
                   const picked = id ? reviewRows.find((r) => r.id === id) : null;
                   if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
                 }}
-                onAct={actOnReview}
-                onFocus={focusReviewFromUi}
-                onDelete={deleteReview}
-                onColor={recolorReview}
-                onEditMessage={editReviewMessage}
-                onDeleteMessage={deleteReviewMessage}
-                busyId={reviewBusyId}
                 problem={reviewProblem}
                 shared={reviewShared}
                 totalCount={allReviews.length}
                 actorId={reviewShared?.identity?.actorId || null}
-                withheldIds={withheldPins}
                 syncing={reviewSyncing}
                 onSync={syncReviews}
                 onShareEnable={shareEnable}
@@ -5085,11 +5417,36 @@ export default function App() {
             commenting={wantsCanvasClick(commentMode)}
             pinsVisible={pinsVisible}
             reviewItems={reviewItems}
-            reviewOpenId={reviewOpenId}
+            reviewSelectedId={reviewSelectedId}
+            reviewPeek={reviewPeek}
+            reviewCluster={reviewCluster}
+            onReviewPeek={setReviewPeek}
+            onReviewCluster={setReviewCluster}
             reviewDraft={reviewDraft}
             reviewBusyId={reviewBusyId}
             reviewById={reviewById}
-            onReviewOpen={setReviewOpenId}
+            onReviewOpen={(pin) => {
+              // A pin, not an id: a marker can stand for several reviews and
+              // the old code silently opened the first of them. Now one review
+              // opens and a cluster asks which.
+              if (!pin) {
+                openReview(null);
+                return;
+              }
+              if (pin.reviews.length > 1) {
+                setReviewPeek(null);
+                setReviewCluster(pin);
+                return;
+              }
+              openReview(pin.reviews[0], 'pin');
+              const picked = allReviewsRef.current.find((r) => r.id === pin.reviews[0]);
+              if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
+            }}
+            onPickFromCluster={(id) => {
+              openReview(id, 'pin');
+              const picked = allReviewsRef.current.find((r) => r.id === id);
+              if (picked && picked.anchorState !== 'orphaned') void focusReviewFromUi(picked);
+            }}
             onReviewAct={actOnReview}
             onReviewFocus={focusReviewFromUi}
             onReviewDelete={deleteReview}
@@ -5120,11 +5477,12 @@ export default function App() {
                 focusPath,
                 scope: editedRel ? `${editedRel}|` : '',
               });
-              // Picking something else means you are done with the comment
-              // that was open. Without this its panel stays over the canvas,
-              // swallowing the clicks that land on it — which reads as the
-              // editor having stopped selecting.
-              setReviewOpenId(null);
+              // Anything transient over the canvas goes. The Inspector is a
+              // panel and does not swallow clicks, so it stays where it is —
+              // selecting an element while reading a review about it is a
+              // perfectly reasonable thing to be doing.
+              setReviewPeek(null);
+              setReviewCluster(null);
               if (kind === 'nothing') return;
               if (kind === 'close') { closeComponent(); return; }
               if (kind === 'layout') { reveal(model && findNodeById(model.nodes, 'layout')); return; }
@@ -5234,7 +5592,31 @@ export default function App() {
           </div>
         )}
 
-        {pageState?.editable && !previewRef && (
+        {/* Style/Settings gives way before the canvas does.
+
+            It is what somebody uses to FIX the feedback they just read, so it
+            is the third thing protected, not the first — but a 300px canvas is
+            not somewhere you can work, and this can be brought back with one
+            click while a crushed canvas cannot. See src/reviewLayout.js.
+
+            The button says what it will DO. It used to promise "Show Style and
+            Settings" and then close the comment you were reading, which is a
+            surprising amount of state to lose from a control that named
+            neither the comment nor closing. Style is only ever hidden because
+            the Inspector is taking the room — propsVisible is true in every
+            other layout — so closing it is the whole mechanism, and there is
+            no reason not to say so. */}
+        {pageState?.editable && !previewRef && !reviewShape.propsVisible && (
+          <button
+            className="props-reveal"
+            title="Close the comment to make room for Style and Settings"
+            aria-label="Close the comment to make room for Style and Settings"
+            onClick={() => setReviewPresentation('index')}
+          >
+            Style
+          </button>
+        )}
+        {pageState?.editable && !previewRef && reviewShape.propsVisible && (
           <div className="panel right">
             <div className="right-tabs">
               {rightTabInd && <span className="right-tabs-indicator" style={rightTabInd} />}

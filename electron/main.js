@@ -60,6 +60,7 @@ const previewWorktree = require('./previewWorktree');
 const { registerTerminalHandlers, cleanupTerminals } = require('./terminal');
 const { autoUpdater } = require('electron-updater');
 const { updatePolicy, UPDATE_ENABLED_FIELD } = require('./updatePolicy');
+const { openableUrl, refusalFor } = require('./externalLinks');
 const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('./dialogPolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
@@ -185,9 +186,24 @@ function createWindow() {
     // sized window is a fine thing to fall back to.
     bounds = openingBounds({ width: 1480, height: 940 });
   }
+  // A window the test harnesses can drive without taking over the screen.
+  //
+  // The visual and export harnesses open a real Stacki window, and every run
+  // put it in front of whatever the person was doing and took their keyboard
+  // with it — several times a run, for minutes at a time. A window that is
+  // never shown captures identically (`capturePage` reads the renderer's own
+  // surface, not the screen: same bytes, same pixels, measured), so the
+  // harnesses ask for one and nothing appears.
+  //
+  // Off by default, and set by the harnesses alone. `backgroundThrottling` has
+  // to go with it: an unshown window is a background one, and Chromium slows
+  // timers and stops rAF in those — which would make the harness measure a
+  // throttled app rather than the app.
+  const hidden = process.env.STACKI_HIDDEN_WINDOW === '1';
   mainWindow = new BrowserWindow({
     ...bounds,
     title: 'Stacki',
+    show: !hidden,
     backgroundColor: '#111111',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     // Windows/Linux taskbar + window chrome; macOS uses the Dock icon above.
@@ -200,6 +216,7 @@ function createWindow() {
       // page height for the canvas view (the preload guards what each
       // frame type gets).
       nodeIntegrationInSubFrames: true,
+      ...(hidden ? { backgroundThrottling: false } : {}),
     },
   });
 
@@ -210,7 +227,11 @@ function createWindow() {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    // Same list as the IPC door. Anything that reaches here has been asked for
+    // by a page rather than by a person, so it least deserves the exception —
+    // this used to hand the OS whatever it was given.
+    const safe = openableUrl(url);
+    if (safe) void shell.openExternal(safe);
     return { action: 'deny' };
   });
 
@@ -4918,6 +4939,19 @@ handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
 });
 
 handle('shell:openExternal', async (_e, url) => {
-  if (/^https?:\/\//.test(url)) shell.openExternal(url);
-  return { ok: true };
+  // The authority. The renderer checks first so a dead link is never drawn as
+  // a live one, but this is what actually decides — and it answers honestly:
+  // the old version returned `{ ok: true }` whatever happened, so a mailto
+  // link looked clickable, was clicked, did nothing, and reported success.
+  const safe = openableUrl(url);
+  if (!safe) return refusalFor(url);
+  try {
+    await shell.openExternal(safe);
+    return { ok: true, opened: true };
+  } catch (err) {
+    // The scheme was fine and the system still would not take it — no mail
+    // client, no browser. That is not a refusal, and saying so as one would
+    // send somebody looking at the wrong thing.
+    return { ok: false, code: 'open_failed', message: String(err?.message || err) };
+  }
 });
