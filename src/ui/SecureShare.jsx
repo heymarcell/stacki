@@ -139,6 +139,13 @@ export function SecureShareRow({ shared, onShare, onManage, onRetry, busy = fals
         <button type="button" className="share-link" onClick={onRetry} disabled={busy}>
           {busy ? 'Retrying…' : 'Retry'}
         </button>
+        {/* Manage stays reachable. A paused share used to offer Retry and
+            nothing else, which meant the one state where somebody most wants
+            to leave — it has stopped working and they want out — was the one
+            state with no way to get to Leave. */}
+        <button type="button" className="share-link" onClick={onManage}>
+          Manage
+        </button>
         {/* A sentence, on its own line, because it is something to act on
             rather than a badge. `role="alert"` so it is announced when it
             appears rather than only when somebody happens to be reading. */}

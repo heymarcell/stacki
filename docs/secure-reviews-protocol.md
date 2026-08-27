@@ -287,6 +287,88 @@ in the room. This is exactly the rule the legacy plaintext service enforces.
 
 ---
 
+## 12a. Leaving, rejoining, and who owns a room
+
+**Leaving is something the relay has to confirm.** A transient failure —
+offline, timeout, a relay that answers 500 — establishes nothing, so Stacki
+changes nothing locally and says *"Connect to the relay to leave this secure
+share."* Anything else would be the failure this once had: the token stays
+valid, the only credential that could revoke it is destroyed, and the person is
+told they left. `401` counts as confirmed, because the relay is saying the
+membership already has no access.
+
+**A confirmed leave keeps the signing identity and nothing else.** A sender ID
+is derived from the room secret and the actor ID, so somebody invited back to
+the same room returns as the *same sender* — and a member's public key is fixed
+for the life of the room, at the relay and in every peer's pin map. A fresh
+keypair on rejoin would be refused by both, correctly, as key substitution. So
+a departed room keeps:
+
+| kept | given up |
+|---|---|
+| room ID | room master secret |
+| room-specific Ed25519 keypair | member bearer token |
+| sender ID, actor binding | the project link |
+| peers already pinned | — |
+
+That is enough to be recognised and not enough to read anything. The new
+invitation carries the room secret again.
+
+**Ownership survives.** A member row keeps `is_owner` when its token is
+replaced, so an owner who leaves and is invited back is still the owner and can
+still end the share. Both relays report `member.isOwner` on join so the client
+does not have to guess.
+
+**The privacy decision survives too.** Turning sharing off records which share
+it was and which threads were being kept back, so returning to the *same* share
+restores that decision rather than marking every thread private — which would
+have silently stopped replies to previously shared threads from ever being sent.
+
+## 12b. When Stacki syncs
+
+| moment | direction |
+|---|---|
+| a shared project is opened | push then pull |
+| a comment is written, edited, resolved (after ~1.2 s) | push then pull |
+| the window regains focus (at most once a minute) | push then pull |
+| **connectivity returns**, with no click at all | push then pull |
+| **every 30–60 s, jittered**, while an active secure share's window is visible | push then pull |
+| the person presses Retry on a paused share | push then pull |
+
+Posting never waits for the network. The last two rows are what make the
+product's own wording true: "your comments will send when you're connected"
+needs no click, and somebody who leaves Stacki focused all afternoon still
+learns that a colleague replied. Nothing polls for a local-only project, a
+legacy workspace, or a minimised window.
+
+## 12c. A room cannot move
+
+A room belongs to the relay it was created on. Its secret, its members and
+their access all live there, so there is no migration and no control that
+offers one — changing relay means **end this share and create a new one**, which
+is a new room, a new key and new invitations. Stacki keeps the two ideas under
+two names, `secure.relay` (this room's, immutable) and `newShareRelay` (where
+the next one would be created), so no screen can show one while meaning the
+other.
+
+## 12d. When the remote worked and the local did not
+
+A relay mutation that lands while local persistence fails is the one place this
+design can leave litter. There is no distributed transaction; there is explicit
+compensation, performed while the credential that can perform it is still in
+hand:
+
+| what happened | what Stacki does |
+|---|---|
+| room created, cannot be stored locally | owner-deletes the room |
+| invitation redeemed, cannot be stored locally | leaves the membership |
+| stored, but the project link fails | undoes both |
+| linked, but the ledger refuses | undoes both |
+| the undo itself cannot be delivered | says so: an empty room may remain, holding nothing readable, and the retention sweep removes it |
+
+The last row is the honest one. Stacki does not claim to have cleaned up
+something it could not reach.
+
 ## 13. Revocation, and what leaving actually does
 
 **Leave** revokes that member's relay credential. They can no longer read or
@@ -451,6 +533,17 @@ would be an encrypted file host.
 | stored ciphertext per room | 512 MiB |
 | invitation lifetime | 7 days (minimum 1 s) |
 
+`MAX_BODY_BYTES` is **derived** from the two above it — a maximum legal batch of
+maximum legal envelopes, base64url-expanded and JSON-framed, plus the wrapper.
+It was an independently chosen 8 MiB while that worst case encoded to about
+8.6 MiB, which meant the protocol forbade something it also permitted. A
+conformance check builds a real maximum batch and measures it.
+
+**Duplicates cost nothing.** A room's caps apply to envelopes actually added,
+not to everything in an incoming batch — otherwise a room near its limit would
+begin refusing the retries this protocol depends on, and a client would retry
+forever with no way to confirm delivery.
+
 ## 16. Error codes
 
 `bad_request` `bad_json` `bad_envelope` `bad_signature` `bad_sender` `bad_room`
@@ -539,6 +632,13 @@ take it out of the visible URL. `Open Stacki` happens only on an explicit click.
 stacki://join#stacki2....
 ```
 
+The packaged application **declares the scheme in its bundle** — `CFBundleURLTypes`
+on macOS, `x-scheme-handler/stacki` in the `.desktop` entry on Linux — because
+Launch Services routes a URL by what the bundle says, and a runtime
+`setAsDefaultProtocolClient` call cannot make an unlaunched app reachable.
+Windows keeps the runtime registration; electron-builder's NSIS target does not
+write scheme associations from `protocols`.
+
 `join` is the only action this protocol has. A deep link cannot execute a shell,
 open a file, modify a project, invoke MCP, run git, or edit source — there is no
 code path from the handler to any of those. Everything else about the URL is
@@ -559,10 +659,27 @@ encrypted with Electron `safeStorage` when the platform provides an OS-backed
 backend (macOS Keychain, Windows DPAPI, and on Linux whichever of
 kwallet/gnome-libsecret is present).
 
-**Linux honestly:** where no keyring backend is available, `safeStorage` reports
-so and Stacki falls back to the `0600` file without encryption rather than
-refusing to run. That is weaker, it is reported in diagnostics, and it is not
-described to the user as if it were the same thing.
+**Linux honestly, and it is narrower than it looks.**
+`safeStorage.isEncryptionAvailable()` returns **true** on Linux even when
+Electron has fallen back to `basic_text` — read its own note on
+`setUsePlainTextEncryption`: the key is derived from an in-memory password
+because no OS password manager could be determined. That is a reversible
+encoding, not a secret store, and anybody who can read the file can read the
+room secrets in it.
+
+So Stacki asks a narrower question than "is encryption available":
+
+| backend | treated as |
+|---|---|
+| `keychain` (macOS), `dpapi` (Windows) | protected |
+| `gnome_libsecret`, `kwallet`, `kwallet5`, `kwallet6` | protected |
+| `basic_text` | **not protected** — stored unsealed in the `0600` file, reported as a weak backend |
+| `unknown`, none at all | not protected — same fallback |
+
+Nothing refuses to run, and nothing is described as encrypted at rest that is
+not. Diagnostics distinguish "Electron would encrypt but the key is nowhere"
+from "there is no keyring at all", because they are different situations and
+rounding them together loses the one worth knowing.
 
 Tests inject a deterministic in-memory protector and never touch a real
 keychain.

@@ -58,12 +58,19 @@ under Advanced.
 
 ### Rate limiting
 
-Room creation should be rate limited in production. The Worker uses a
-`ROOM_LIMITER` binding **if one is configured** and is a no-op otherwise, so
-that everything in this repository stays runnable and testable by somebody with
-no Cloudflare account. Uncomment the `ratelimits` block in `wrangler.jsonc` and
-give it a namespace id, or put a WAF rate-limiting rule in front of
-`POST /v2/rooms`.
+Room creation must be rate limited on a public deployment, and the Worker is
+built so that forgetting it fails safe rather than open:
+
+- **Locally, in tests, and for a self-hoster** the `ROOM_LIMITER` binding is
+  optional. Its absence is a no-op, so everything here runs without a
+  Cloudflare account.
+- **An official deployment** sets `STACKI_OFFICIAL_RELAY: "1"`. With that set
+  and no limiter bound, the Worker **refuses to create rooms** — a forgotten
+  binding makes the relay useless, which somebody notices, rather than making
+  it unlimited public encrypted storage, which nobody does.
+
+Uncomment both blocks in `wrangler.jsonc` together, or put a WAF rate-limiting
+rule in front of `POST /v2/rooms` and leave the flag unset.
 
 Invitation brute force is bounded inside each room's Durable Object and needs
 no configuration. Neither mechanism is authorisation and nothing treats it as
@@ -71,11 +78,19 @@ such.
 
 ### Observability
 
-`wrangler.jsonc` enables Workers Logs deliberately rather than by default.
-Nothing that reaches that sink carries a credential, a capability, a room
-secret, a ciphertext or a nonce — the logging policy is in §19 of the protocol
-document, and `test/secure-relay.js` proves the equivalent for the Node relay
-by running a whole share and grepping the log stream for every secret it made.
+`wrangler.jsonc` configures Workers Logs deliberately and **narrower than the
+default**: `logs.invocation_logs` is `false`. That setting is what records a
+line per request — method, URL, status, timing — which for this relay would be
+a per-room, per-member access log nobody asked for. What remains is the
+Worker's own output: a handful of coarse codes, never a credential, a
+capability, a room secret, a ciphertext, a nonce or a URL. The policy is §19 of
+the protocol document, and `test/secure-relay.js` proves the equivalent for the
+Node relay by running a whole share and grepping the log stream for every
+secret it made.
+
+Cloudflare's infrastructure still sees what any reverse proxy sees — the
+connecting address, the timing, the size of a request. That is in the threat
+model rather than wished away, and it is why nothing here claims anonymity.
 
 ### Retention
 

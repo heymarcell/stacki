@@ -319,7 +319,14 @@ part of a URL a browser never sends to a server.
 
 **Your comments are always yours.** Leaving a share, ending one, or losing
 access to the relay never removes a comment from your machine. Written with no
-network, they are saved locally and sent when you are back.
+network, they are saved locally and sent when you are connected again — Stacki
+notices that on its own, with no click. Leaving needs the relay to confirm it:
+offline, Stacki says so rather than telling you it revoked something it could
+not reach.
+
+**A share stays on the relay it was created on.** There is no migration —
+changing relay means ending the share and creating a new one, which is a new
+room and a new key. Manage always shows the relay that share actually uses.
 
 **Self-hosting is first class.** Run a relay of your own:
 
@@ -357,9 +364,11 @@ In either case a **workspace is a thing you create, never something Stacki
 discovers**. A matching git remote will say *"this repository may already have a
 workspace"*; it will never join one. A public clone must not be a key to
 somebody's private comments. Credentials live in Stacki's own
-application-support directory — encrypted with your operating system's keychain
-where there is one — and are never written into your project, your git config
-or your repository.
+application-support directory and are never written into your project, your git
+config or your repository. They are encrypted with your operating system's own
+key store where there genuinely is one — macOS Keychain, Windows DPAPI, a Linux
+keyring — and where there is not, Stacki keeps them in a `0600` file and says
+so rather than describing them as encrypted.
 
 Turning sharing off keeps every comment. It only stops this computer talking to
 the workspace.

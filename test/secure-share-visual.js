@@ -27,9 +27,16 @@ const path = require('path');
 const { app, dialog } = require('electron');
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
+// PR #8's discipline: a temp directory this run OWNS, marked, so a concurrent
+// harness never deletes it and a leak can be attributed. Deleting by name
+// prefix used to take another run's fixtures with it.
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
+const { createSecureRooms } = require('../electron/review/secure/secrets.js');
+const { createRoom, createSecureTransport } = require('../electron/review/secure/transport.js');
 
-const OUT = process.argv[2] || path.join(os.tmpdir(), 'stacki-secure-share-ux');
+const RUN_STAMP = `${process.pid}`;
+const OUT = process.argv[2] || path.join(os.tmpdir(), `stacki-secure-share-ux-${RUN_STAMP}`);
 
 const failures = [];
 let checked = 0;
@@ -69,10 +76,11 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
-sweepStaleRuns(['stacki-share-ux-user-', 'stacki-canvas-']);
+const sweptRuns = sweepStaleRuns(['stacki-share-ux-user-', 'stacki-canvas-']);
+if (sweptRuns) say(`secure-share-visual: swept ${sweptRuns} stale run(s)`);
 
-const root = makeCanvasProject({ log: (m) => say(`secure-share-visual: ${m}`) });
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-share-ux-user-'));
+const root = makeCanvasProject({ harness: 'secure-share-visual', log: (m) => say(`secure-share-visual: ${m}`) });
+const userData = ownedTempDir('stacki-share-ux-user-', { harness: 'secure-share-visual' });
 app.setPath('userData', userData);
 fs.writeFileSync(
   path.join(userData, 'settings.json'),
@@ -94,7 +102,7 @@ const { spawn, execFileSync } = require('child_process');
 
 const SIGNUP = 'a-signup-token-long-enough';
 const children = [];
-const relayData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-share-ux-relay-'));
+const relayData = ownedTempDir('stacki-share-ux-relay-', { harness: 'secure-share-visual' });
 
 /**
  * Free ports, synchronously.
@@ -226,9 +234,13 @@ async function teardown(code) {
     const still = children.filter((c) => c.exitCode === null && !c.killed);
     if (still.length) throw new Error(`${still.length} relay process(es) would not stop`);
   });
-  await attempt('removing relay data', () => fs.rmSync(relayData, { recursive: true, force: true }));
+  await attempt('removing relay data', () => {
+    if (!releaseTempDir(relayData)) throw new Error('the relay data directory would not go');
+  });
   await attempt('removing the project', () => removeCanvasProject(root));
-  await attempt('removing userData', () => fs.rmSync(userData, { recursive: true, force: true }));
+  await attempt('removing userData', () => {
+    if (!releaseTempDir(userData)) throw new Error('the userData directory would not go');
+  });
 
   if (problems.length) {
     shout(`\nsecure-share-visual: could not clean up\n${problems.map((p) => `  ${p}`).join('\n')}\n`);
@@ -257,6 +269,9 @@ const REQUIRED = [
   'join-used',
   'access-lost',
   'advanced-relay',
+  'relay-truth',
+  'leave-offline',
+  'non-owner',
   'legacy-workspace',
 ];
 
@@ -574,6 +589,45 @@ app.whenReady().then(async () => {
       await js(`document.querySelector('.share-row svg')?.getAttribute('aria-hidden') === 'true'`)
     );
 
+    // --- the relay a room is actually on -----------------------------------
+    //
+    // The bug this photographs the absence of: Manage read the preference for
+    // FUTURE shares and displayed it as this room's relay, so changing the
+    // default made an existing encrypted room appear to have moved to a server
+    // it had never been on.
+    const currentRelay = await js(`document.querySelector('.share-facts')?.textContent || ''`);
+    void currentRelay;
+    const changed = await reviews.setSecureRelay({ relay: 'https://somewhere-else.example' });
+    check('the future default can be changed', changed?.ok === true, JSON.stringify(changed));
+    await reviews.syncNow('manual').catch(() => {});
+    await wait(400);
+    await click('.share-row .share-link');
+    await shot('relay-truth', `document.querySelector('.share-facts')?.textContent.includes('Relay')`);
+    const shownRelay = await js(`(() => {
+      const rows = [...document.querySelectorAll('.share-fact')];
+      const row = rows.find((r) => r.querySelector('span')?.textContent.trim() === 'Relay');
+      return row ? row.querySelector('strong')?.textContent.trim() : null;
+    })()`);
+    check('Manage names the relay the room is actually on', shownRelay === 'On this computer', String(shownRelay));
+    check('and not the one the next share would use', shownRelay !== 'somewhere-else.example', String(shownRelay));
+    check(
+      'Advanced says a share cannot move rather than offering to move it',
+      await js(`(() => { const d = document.querySelector('.share-disclosure'); if (d) d.click(); return true; })()`)
+    );
+    await wait(300);
+    check(
+      'and explains what changing relay would actually mean',
+      await js(`/end this share and create a new one/i.test(document.querySelector('.share-advanced-body')?.textContent || '')`),
+      await js(`document.querySelector('.share-advanced-body')?.textContent?.slice(0, 120)`)
+    );
+    check(
+      'with no control that implies migration',
+      await js(`!document.querySelector('.share-advanced-body input')`)
+    );
+    await reviews.setSecureRelay({ relay: null });
+    await escape();
+    await wait(300);
+
     // --- 8. offline, with things waiting -----------------------------------
 
     await stopRelay();
@@ -633,6 +687,92 @@ app.whenReady().then(async () => {
         await js(`document.querySelector('.share-problem')?.getAttribute('role') === 'alert' || document.querySelector('[role="alert"]')`)
       );
     }
+
+    // --- leaving without a relay to confirm it -----------------------------
+    //
+    // The failure this replaces silently destroyed the only credential and
+    // reported success. Now it changes nothing and says what to do.
+    await stopRelay();
+    await reviews.syncNow('manual').catch(() => {});
+    await wait(600);
+    // Manage, not Retry: a paused row offers both, and it is Manage that has
+    // to still be there — see the note in SecureShare.jsx.
+    const openedManage = await js(`(() => {
+      const b = [...document.querySelectorAll('.share-row .share-link')].find((x) => x.textContent.trim() === 'Manage');
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    check('Manage is reachable even when sharing has stopped', openedManage);
+    await wait(400);
+    const leaveFailed = await clickText('Leave secure share');
+    check('Leave can be pressed while the relay is away', leaveFailed);
+    await until.soft('the leave to be refused', 25000, () => js(`!!document.querySelector('.share-dialog .share-error')`));
+    await shot('leave-offline', `document.querySelector('.share-dialog .share-error')`);
+    const leaveText = await js(`document.querySelector('.share-dialog .share-error')?.textContent || ''`);
+    check('and it says to connect rather than claiming success', /connect to the relay/i.test(leaveText), leaveText);
+    check('and reassures that nothing was lost', /safe|nothing has changed/i.test(leaveText), leaveText);
+    check('the share is still on', await js(`/Shared securely|Offline|Sharing paused/.test(document.querySelector('.share-row')?.textContent || '')`));
+    await escape();
+    await wait(300);
+    try {
+      await restartRelay();
+    } catch (err) {
+      shout(`  could not restart the relay after the leave test: ${err.message}`);
+    }
+
+    // --- somebody who is not the owner --------------------------------------
+    //
+    // A real membership, not a redrawn owner view: the harness creates a room
+    // of its own against the relay, invites the app into it, and the app joins
+    // through the confirmation a person would use. Then Manage is a member's
+    // Manage, and the one privilege in this design — ending it for everybody —
+    // is absent because the app genuinely does not have it.
+    const guestData = ownedTempDir('stacki-share-ux-guest-', { harness: 'secure-share-visual' });
+    const guestRooms = createSecureRooms({
+      userDataPath: guestData,
+      protector: {
+        available: true,
+        protects: true,
+        backend: 'harness',
+        encrypt: (t) => Buffer.from(t, 'utf8').toString('base64'),
+        decrypt: (b) => Buffer.from(b, 'base64').toString('utf8'),
+      },
+    });
+    const guestActor = { id: '11111111-2222-4333-8444-555555555555', kind: 'human', displayName: 'Somebody Else' };
+    const guestRoom = await createRoom({ relay: process.env.STACKI_SECURE_RELAY, actor: guestActor, rooms: guestRooms });
+    check('the harness can host a room of its own', guestRoom.ok === true, JSON.stringify(guestRoom).slice(0, 160));
+
+    if (guestRoom.ok) {
+      // The app has to be out of its own share before it can join another.
+      await reviews.leaveSecureShare().catch(() => {});
+      await wait(500);
+      const guestInvite = await createSecureTransport({ rooms: guestRooms, roomId: guestRoom.room.roomId }).createInvite({});
+      check('and can invite the app into it', guestInvite.ok === true, guestInvite.code);
+      reviews.offerInvite(guestInvite.capability);
+      await until.soft('the join confirmation', 8000, () => js(`!!document.querySelector('.share-dialog')`));
+      await clickText('Join');
+      const joined = await until.soft('the app to become a member', 25000, () =>
+        js(`/Shared securely/.test(document.querySelector('.share-row')?.textContent || '')`)
+      );
+      check('the app joins a share somebody else owns', !!joined);
+
+      await click('.share-row .share-link');
+      await shot('non-owner', `document.querySelector('.share-dialog')?.textContent.includes('Leave secure share')`);
+      check('a member is offered Leave', await js(`/Leave secure share/.test(document.querySelector('.share-dialog')?.textContent || '')`));
+      check(
+        'and is NOT offered to end it for everybody',
+        await js(`!/End secure share/.test(document.querySelector('.share-dialog')?.textContent || '')`),
+        await js(`document.querySelector('.share-dialog')?.textContent?.slice(0, 200)`)
+      );
+      check(
+        'and is told leaving keeps their comments',
+        await js(`/keeps every comment you have/.test(document.querySelector('.share-dialog')?.textContent || '')`)
+      );
+      await escape();
+      await wait(300);
+    }
+    releaseTempDir(guestData);
 
     // --- 15. an invitation that has been used ------------------------------
 
