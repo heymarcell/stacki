@@ -42,7 +42,7 @@ const check = (what, condition, detail) => {
 const { createSecureRelay } = require('../relay/node/server.js');
 const { createSecureRooms } = require('../electron/review/secure/secrets.js');
 const { createSecureTransport, createRoom, joinRoom } = require('../electron/review/secure/transport.js');
-const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, newSigningKeys } = require('../electron/review/secure/crypto.js');
+const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSigningKeys } = require('../electron/review/secure/crypto.js');
 const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
 const { checkRelay, describeRelay, relayFor, DEFAULT_RELAY } = require('../electron/review/secure/relays.js');
 const { createReviewStore, scopeKey, fileFor } = require('../electron/review/store.js');
@@ -332,6 +332,24 @@ async function main() {
   check('a sync that saw one says so rather than reporting a clean run', annAfter.unverified >= 1 || ann.store.shared.problem?.kind === 'unverified_events', JSON.stringify(ann.store.shared.problem));
   check('and it never reaches the fold', !JSON.stringify(ann.store.all()).includes('Ann never said this.'));
 
+  // --- a resolution travels too -------------------------------------------
+  //
+  // Not just messages. The status of a review is an event like any other, and
+  // it has to arrive and fold the same way — otherwise one machine thinks a
+  // thread is done and the other is still looking at it.
+  const resolving = ann.store.apply({ action: 'resolve', threadId: onlyThread(ann) });
+  check('a review can be resolved', resolving.ok !== false, JSON.stringify(resolving));
+  await sync(ann);
+  await sync(ben);
+  check('and the resolution arrives', ben.store.all().find((t) => t.id === onlyThread(ben))?.status === 'resolved', JSON.stringify(ben.store.all().map((t) => t.status)));
+  check('and it says who resolved it', !!ben.store.all()[0]?.resolvedBy?.actorId);
+
+  const reopening = ben.store.apply({ action: 'reopen', threadId: onlyThread(ben) });
+  check('and the other side can reopen it', reopening.ok !== false);
+  await sync(ben);
+  await sync(ann);
+  check('which arrives back', ann.store.all()[0]?.status === 'open', ann.store.all()[0]?.status);
+
   // --- an envelope that lies about what is inside it ------------------------
   //
   // Built with the raw primitives rather than through `sealEvent`, because
@@ -446,6 +464,25 @@ async function main() {
   check('a new share has a different secret', freshRoom.room.secret !== room.room.secret);
   check('a new share gives the same person a different sender id', freshRoom.room.senderId !== room.room.senderId);
   check('a new share has a different signing key', freshRoom.room.publicKey !== room.room.publicKey);
+
+  // A new room is a NEW cryptographic boundary, which is the honest answer to
+  // "can I remove somebody". The old secret opens nothing in it — not because
+  // anybody forgot anything, but because none of it was ever encrypted under
+  // that key.
+  const freshT = createSecureTransport({ rooms: fresh.rooms, roomId: freshRoom.room.roomId });
+  const freshEvent = makeEvent({ type: 'message.created', threadId: 'n1', actor: ALICE, lamport: 1, at: Date.now(), payload: { messageId: 'n1m', body: 'said in the new room' } });
+  await freshT.pushEvents([freshEvent]);
+  const freshPage = await fetch(`${liveBase}/v2/rooms/${freshRoom.room.roomId}/envelopes?after=0`, {
+    headers: { authorization: `Bearer ${freshRoom.room.token}` },
+  });
+  const freshEnvelopes = (await freshPage.json()).envelopes || [];
+  check('the new room has an envelope in it', freshEnvelopes.length === 1, `${freshEnvelopes.length}`);
+  const withOldKeys = deriveKeys(room.room.secret, freshRoom.room.roomId);
+  const opened = openEnvelope({ keys: withOldKeys, envelope: freshEnvelopes[0], publicKey: freshRoom.room.publicKey });
+  check('the ended room’s secret cannot open the new room', opened.ok === false, JSON.stringify(opened));
+  const oldCapability = benInvite.capability;
+  const rejoinAttempt = await joinRoom({ capability: oldCapability, actor: BOB, rooms: makePerson('rejoin', BOB).rooms });
+  check('and an invitation to the ended room cannot be redeemed', rejoinAttempt.ok === false, JSON.stringify(rejoinAttempt));
 
   // --- what may cross IPC ---------------------------------------------------
   //
