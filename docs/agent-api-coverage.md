@@ -172,6 +172,7 @@ says so.
 | `assets:upload` | human-only | Copies files in from anywhere on the machine. Its input is a picker result or a drag, neither of which an agent has. |
 | `shell:openExternal` | human-only | Opens a browser on this machine. An agent that wants a page read has its own way to fetch one. |
 | `native:copy`<br>`native:paste`<br>`native:undo`<br>`native:redo` | human-only | The operating system’s edit menu acting on whichever text field has focus. project.undo is the editor’s own stack, which is the one that means something here. |
+| `clipboard:write` | human-only | Puts text on the machine’s clipboard, for the one thing that needs it: a person pressing Copy on a secure share invitation. An agent that could write the clipboard could put an invitation somewhere nobody chose to put it. |
 | `settings:get` | redundant | Application preferences — the sound setting, and this API’s own permission mode, which get_capabilities already reports. |
 | `settings:setAgentMode`<br>`settings:agentAccess` | human-only | How much of Stacki an agent may move, and what it currently is. An agent that could raise its own permission level would not have one; get_capabilities tells it what it has. |
 | `terminal:start`<br>`terminal:resize`<br>`terminal:close` | unsafe | An agent connected to Stacki already has its own shell. A second one behind this endpoint would widen what a stolen token is worth and buy nothing visual. |
@@ -198,4 +199,4 @@ says so.
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
 - 31 land on Stacki's own undo stack.
-- 52 capabilities deliberately kept out.
+- 53 capabilities deliberately kept out.
