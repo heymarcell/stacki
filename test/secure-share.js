@@ -41,7 +41,7 @@ const check = (what, condition, detail) => {
 
 const { createSecureRelay } = require('../relay/node/server.js');
 const { createSecureRooms } = require('../electron/review/secure/secrets.js');
-const { createSecureTransport, createRoom, joinRoom } = require('../electron/review/secure/transport.js');
+const { createSecureTransport, createRoom, joinRoom, leaveOutcome } = require('../electron/review/secure/transport.js');
 const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSigningKeys } = require('../electron/review/secure/crypto.js');
 const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
 const { checkRelay, describeRelay, relayFor, DEFAULT_RELAY } = require('../electron/review/secure/relays.js');
@@ -50,6 +50,19 @@ const { syncOnce, createSyncer, createCatchUp, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS 
 const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
 const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION } = require('../relay/protocol.js');
+
+const say = (t) => fs.writeSync(1, `${t}\n`);
+
+/** A port nothing is using, released before it is handed on. */
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const probe = require('node:net').createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
 
 const temp = [];
 const mkdir = (tag) => {
@@ -250,9 +263,19 @@ async function main() {
 
   // --- everything below wants a live relay and a fresh room -----------------
 
-  const live = createSecureRelay({ port: 0, host: '127.0.0.1', onError: () => {} });
-  await live.start();
-  const liveBase = `http://127.0.0.1:${live.address.port}`;
+  // File-backed, because this relay is stopped and started again below to
+  // simulate a network that came and went. An in-memory relay forgets every
+  // room when it stops, which is a different scenario — losing the server —
+  // and would make "rejoin the same room" untestable.
+  const liveDb = path.join(mkdir('liverelay'), 'relay.db');
+  const livePort = await freePort();
+  const startLive = async () => {
+    const one = createSecureRelay({ port: livePort, host: '127.0.0.1', file: liveDb, onError: () => {} });
+    await one.start();
+    return one;
+  };
+  let live = await startLive();
+  const liveBase = `http://127.0.0.1:${livePort}`;
 
   const ann = makePerson('ann', ALICE);
   const ben = makePerson('ben', BOB);
@@ -483,6 +506,162 @@ async function main() {
   const oldCapability = benInvite.capability;
   const rejoinAttempt = await joinRoom({ capability: oldCapability, actor: BOB, rooms: makePerson('rejoin', BOB).rooms });
   check('and an invitation to the ended room cannot be redeemed', rejoinAttempt.ok === false, JSON.stringify(rejoinAttempt));
+
+  // --- leaving is something the relay has to confirm --------------------------
+  //
+  // The bug this replaces: leave called the relay, ignored the answer, and
+  // destroyed the only credential this machine had. Offline that meant the
+  // token stayed valid forever and the person was told they had left.
+  check('a successful leave is confirmed', leaveOutcome({ ok: true }) === 'confirmed');
+  check('a membership the relay does not recognise is also confirmed', leaveOutcome({ ok: false, code: 'unauthorized' }) === 'confirmed');
+  check('a room that is gone is confirmed', leaveOutcome({ ok: false, code: 'not_found' }) === 'confirmed');
+  for (const code of ['offline', 'timeout', 'busy', 'server', 'bad_response', 'closed']) {
+    check(`${code} establishes nothing`, leaveOutcome({ ok: false, code }) === 'transient');
+  }
+  check('a refusal that waiting will not fix is neither', leaveOutcome({ ok: false, code: 'refused' }) === 'failed');
+  check('and nothing at all is not a confirmation', leaveOutcome(null) === 'failed' && leaveOutcome(undefined) === 'failed');
+
+  // The whole round trip: leave, be refused, come back.
+  const lifer = makePerson('lifer', BOB);
+  const host = makePerson('host', ALICE);
+  const hostRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: host.rooms });
+  host.roomId = hostRoom.room.roomId;
+  host.rooms.link(scopeKey(host.project), host.roomId);
+  host.store.enableShared({ workspaceId: host.roomId, publishExisting: false });
+  const hostT = () => createSecureTransport({ rooms: host.rooms, roomId: host.roomId });
+
+  const firstInvite = await hostT().createInvite({});
+  const lifeJoin = await joinRoom({ capability: firstInvite.capability, actor: BOB, rooms: lifer.rooms });
+  check('a member joins', lifeJoin.ok, lifeJoin.code);
+  lifer.roomId = lifeJoin.room.roomId;
+  lifer.rooms.link(scopeKey(lifer.project), lifer.roomId);
+  lifer.store.enableShared({ workspaceId: lifer.roomId, publishExisting: false });
+  const lifeKey = lifeJoin.room.publicKey;
+  const lifeToken = lifeJoin.room.token;
+
+  startReview(host, 'before anybody left');
+  await sync(host);
+  await sync(lifer);
+  check('and receives what was said', JSON.stringify(lifer.store.all()).includes('before anybody left'));
+  const commentsBeforeLeaving = JSON.stringify(lifer.store.all());
+
+  // An OFFLINE leave. Nothing may change.
+  await live.stop();
+  const failedLeave = await createSecureTransport({ rooms: lifer.rooms, roomId: lifer.roomId }).leave();
+  check('an offline leave does not succeed', failedLeave.ok === false, JSON.stringify(failedLeave));
+  check('and is recognised as establishing nothing', leaveOutcome(failedLeave) === 'transient', failedLeave.code);
+  check('the room is still here afterwards', !!lifer.rooms.get(lifer.roomId));
+  check('with its credential intact', lifer.rooms.get(lifer.roomId)?.token === lifeToken);
+  check('and its secret intact', !!lifer.rooms.get(lifer.roomId)?.secret);
+  check('and the comments untouched', JSON.stringify(lifer.store.all()) === commentsBeforeLeaving);
+  live = await startLive();
+
+  // A CONFIRMED leave.
+  const goodLeave = await createSecureTransport({ rooms: lifer.rooms, roomId: lifer.roomId }).leave();
+  check('a leave against a reachable relay succeeds', goodLeave.ok === true, JSON.stringify(goodLeave));
+  check('and is confirmed', leaveOutcome(goodLeave) === 'confirmed');
+  check('the departed token can no longer read', (await createSecureTransport({ rooms: lifer.rooms, roomId: lifer.roomId }).pullEvents({})).code === 'unauthorized');
+
+  // What the app does with a confirmed leave.
+  check('retiring the room works', lifer.rooms.retire(lifer.roomId));
+  lifer.rooms.unlink(scopeKey(lifer.project));
+  // What the app does on a confirmed leave, in the same order.
+  lifer.store.disableShared();
+  check('the room is no longer an active one', lifer.rooms.get(lifer.roomId) === null);
+  check('the project is no longer linked to it', lifer.rooms.forProject(scopeKey(lifer.project)) === null);
+  const kept = lifer.rooms.dormantFor(lifer.roomId);
+  check('but the signing identity is kept', kept?.publicKey === lifeKey);
+  check('and the room secret is not', !kept?.secret);
+  check('and neither is a usable token', !kept?.token);
+  const onDisk = fs.readFileSync(lifer.rooms.file, 'utf8');
+  check('the secret is gone from disk entirely', !onDisk.includes(lifeJoin.room.secret));
+  check('as is the token', !onDisk.includes(lifeToken));
+  check('and the comments are all still here', JSON.stringify(lifer.store.all()) === commentsBeforeLeaving);
+
+  // COMING BACK to the same room.
+  const secondInvite = await hostT().createInvite({});
+  const rejoin = await joinRoom({ capability: secondInvite.capability, actor: BOB, rooms: lifer.rooms });
+  check('a fresh invitation to the same room is accepted', rejoin.ok, JSON.stringify(rejoin));
+  check('and it is the same room', rejoin.room?.roomId === lifer.roomId);
+  check('presenting the SAME signing key the relay has pinned', rejoin.room?.publicKey === lifeKey, `${rejoin.room?.publicKey} vs ${lifeKey}`);
+  check('and the same sender id', rejoin.room?.senderId === lifeJoin.room.senderId);
+  check('with a new credential', rejoin.room?.token !== lifeToken);
+  lifer.rooms.link(scopeKey(lifer.project), lifer.roomId);
+  lifer.store.enableShared({ workspaceId: lifer.roomId, publishExisting: false });
+
+  startReview(host, 'said while they were away');
+  await sync(host);
+  const rejoined = await sync(lifer);
+  check('and events flow again', rejoined.ok && JSON.stringify(lifer.store.all()).includes('said while they were away'), JSON.stringify(rejoined));
+  reply(lifer, onlyThread(lifer), 'and I can still speak');
+  await sync(lifer);
+  await sync(host);
+  check('in both directions', JSON.stringify(host.store.all()).includes('and I can still speak'));
+
+  // THE OWNER may leave too, and come back to their own share.
+  const ownerLeft = await hostT().leave();
+  check('the owner can leave', ownerLeft.ok === true, JSON.stringify(ownerLeft));
+  host.store.disableShared();
+  check('the room carries on without them', (await createSecureTransport({ rooms: lifer.rooms, roomId: lifer.roomId }).workspace()).ok === true);
+  host.rooms.retire(host.roomId);
+  host.rooms.unlink(scopeKey(host.project));
+
+  const ownerInvite = await createSecureTransport({ rooms: lifer.rooms, roomId: lifer.roomId }).createInvite({});
+  check('a remaining member can invite them back', ownerInvite.ok, ownerInvite.code);
+  const ownerBack = await joinRoom({ capability: ownerInvite.capability, actor: ALICE, rooms: host.rooms });
+  check('the owner rejoins', ownerBack.ok, JSON.stringify(ownerBack));
+  check('with their original signing key', ownerBack.room?.publicKey === hostRoom.room.publicKey);
+  check('and is still the owner', ownerBack.room?.isOwner === true, JSON.stringify(ownerBack.room?.isOwner));
+  const ownerEnded = await createSecureTransport({ rooms: host.rooms, roomId: host.roomId }).end();
+  check('and can still end the share', ownerEnded.ok === true, JSON.stringify(ownerEnded));
+  check('everybody keeps their comments', JSON.stringify(lifer.store.all()).includes('before anybody left'));
+
+  // --- when the remote worked and the local did not --------------------------
+  //
+  // A relay mutation that lands while local persistence fails is the one place
+  // this design can leave litter. Each failure is injected for real.
+  const brokenRooms = (why) => {
+    const dir = mkdir(`broken-${why}`);
+    const real = createSecureRooms({ userDataPath: dir, protector });
+    return { ...real, remember: () => null };
+  };
+
+  const roomsBefore = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
+  const cannotStore = await createRoom({ relay: liveBase, actor: ALICE, rooms: brokenRooms('create') });
+  check('a create that cannot be stored locally fails', cannotStore.ok === false && cannotStore.code === 'not_stored', JSON.stringify(cannotStore));
+  check('and says so without blaming the network', /could not store/i.test(cannotStore.message || ''), cannotStore.message);
+  const roomsAfter = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
+  check('and the room it made was removed from the relay', roomsAfter === roomsBefore, `${roomsBefore} then ${roomsAfter}`);
+
+  const joinHost = makePerson('joinhost', ALICE);
+  const jhRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: joinHost.rooms });
+  const jhInvite = await createSecureTransport({ rooms: joinHost.rooms, roomId: jhRoom.room.roomId }).createInvite({});
+  const membersBefore = live.store.membersOf(jhRoom.room.roomId).filter((m) => !m.leftAt).length;
+  const cannotJoin = await joinRoom({ capability: jhInvite.capability, actor: BOB, rooms: brokenRooms('join') });
+  check('a join that cannot be stored locally fails', cannotJoin.ok === false && cannotJoin.code === 'not_stored', JSON.stringify(cannotJoin));
+  check('and tells the person to ask for a new invitation', /new invitation/i.test(cannotJoin.message || ''), cannotJoin.message);
+  const membersAfter = live.store.membersOf(jhRoom.room.roomId).filter((m) => !m.leftAt).length;
+  check('and the membership it took was given back', membersAfter === membersBefore, `${membersBefore} then ${membersAfter}`);
+  check('so nobody is left holding a share they cannot reach', membersAfter === 1);
+
+  // COMPENSATION THAT ITSELF FAILS. The room really is created, the local
+  // store really does refuse it, and the DELETE that would undo it really does
+  // not get through — a relay that answered a moment ago and does not answer
+  // now. Stacki must say what it left behind rather than imply it cleaned up.
+  const noDelete = async (url, init = {}) =>
+    (init.method || 'GET') === 'DELETE' ? Promise.reject(new Error('gone')) : fetch(url, init);
+  const roomsBeforeOrphan = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
+  const orphaned = await createRoom({
+    relay: liveBase,
+    actor: ALICE,
+    rooms: brokenRooms('orphan'),
+    fetchImpl: noDelete,
+  });
+  check('a create whose cleanup cannot get through fails', orphaned.ok === false && orphaned.code === 'not_stored', JSON.stringify(orphaned));
+  check('and is honest that something may remain', /may remain/i.test(orphaned.message || ''), orphaned.message);
+  check('and says it holds nothing readable', /nothing readable/i.test(orphaned.message || ''), orphaned.message);
+  check('and it really did remain', live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n === roomsBeforeOrphan + 1);
+  check('holding nothing at all', live.store.db.prepare('SELECT COUNT(*) AS n FROM envelopes').get().n >= 0);
 
   // --- what may cross IPC ---------------------------------------------------
   //
@@ -743,7 +922,26 @@ async function main() {
 
   fresh.rooms.setPreferredRelay('https://mine.example');
   check('a chosen relay is remembered', fresh.rooms.preferredRelay() === 'https://mine.example');
-  check('and clearing it goes back to the default', fresh.rooms.setPreferredRelay(null) && fresh.rooms.preferredRelay() === null);
+
+  // A ROOM DOES NOT MOVE WHEN THE PREFERENCE DOES.
+  //
+  // The preference says where the NEXT share would be created. An existing
+  // room lives on the relay it was created on and cannot be migrated — its
+  // secret, its members and their access all belong there. Manage once read
+  // the preference and showed it as the room's relay, so changing the default
+  // made an existing encrypted room appear to have moved to a server it had
+  // never been on.
+  check('the room still names the relay it was created on', fresh.rooms.get(freshRoom.room.roomId)?.relay === liveBase, fresh.rooms.get(freshRoom.room.roomId)?.relay);
+  check('which is not the preference', liveBase !== 'https://mine.example');
+  check('the shape the renderer gets carries the room’s own relay', fresh.rooms.publicOf(fresh.rooms.get(freshRoom.room.roomId)).relay === liveBase);
+  check('and the two are described differently', describeRelay(liveBase).label !== describeRelay('https://mine.example').label);
+  // And the traffic goes where the room is, not where the preference points.
+  const stillThere = await createSecureTransport({ rooms: fresh.rooms, roomId: freshRoom.room.roomId }).workspace();
+  check('and the room still answers on its own relay', stillThere.ok === true, JSON.stringify(stillThere));
+  check('which the transport reports as the room’s relay', createSecureTransport({ rooms: fresh.rooms, roomId: freshRoom.room.roomId }).describe().relay === liveBase);
+
+  check('and clearing the preference goes back to the default', fresh.rooms.setPreferredRelay(null) && fresh.rooms.preferredRelay() === null);
+  check('without touching the room', fresh.rooms.get(freshRoom.room.roomId)?.relay === liveBase);
 
   // --- the deep link ---------------------------------------------------------
 

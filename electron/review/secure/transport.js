@@ -400,6 +400,29 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
   };
 }
 
+// The refusals that mean "try again in a moment" rather than "this is over".
+const TRANSIENT = new Set(['offline', 'timeout', 'busy', 'server', 'bad_response', 'unsupported', 'closed']);
+
+/**
+ * What a leave attempt actually established.
+ *
+ *   confirmed — the relay has revoked this membership, or is saying it has no
+ *               such membership, which is the state leaving was for.
+ *   transient — nothing was established. Change nothing.
+ *   failed    — the relay refused for a reason waiting will not fix.
+ *
+ * A pure decision, exported so it can be checked without an Electron process
+ * around it: getting this wrong is how Stacki once told somebody they had left
+ * a share whose token was still valid.
+ */
+function leaveOutcome(result) {
+  if (result?.ok === true) return 'confirmed';
+  const code = result?.code;
+  if (code === 'unauthorized' || code === 'not_found') return 'confirmed';
+  if (TRANSIENT.has(code)) return 'transient';
+  return 'failed';
+}
+
 // --- before there is a room to have a transport for -------------------------
 
 /**
@@ -587,6 +610,7 @@ module.exports = {
   createRoom,
   joinRoom,
   abandonRoom,
+  leaveOutcome,
   request,
   TIMEOUT_MS,
   MAX_BATCH,

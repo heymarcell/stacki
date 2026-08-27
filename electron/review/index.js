@@ -59,6 +59,7 @@ const {
   createRoom: createSecureRoom,
   joinRoom: joinSecureRoom,
   abandonRoom,
+  leaveOutcome,
 } = require('./secure/transport');
 const { unpackCapability, packCapability, shareLink } = require('./secure/capability');
 const { relayFor, describeRelay, checkRelay, DEFAULT_RELAY } = require('./secure/relays');
@@ -673,11 +674,6 @@ async function createSecureInvite({ ttlMs = null } = {}) {
  * was already shared stays shared. The relay credential is revoked and the
  * room's secrets are forgotten here.
  */
-// The refusals that mean "try again in a moment" rather than "this is over".
-// A transport never throws; it answers with one of these, and telling them
-// apart is the whole of the leave semantics below.
-const TRANSIENT = new Set(['offline', 'timeout', 'busy', 'server', 'bad_response', 'unsupported', 'closed']);
-
 /**
  * Stop this machine talking to the room.
  *
@@ -711,9 +707,9 @@ async function leaveSecureShare() {
     transport.close();
   }
 
-  const confirmed = left?.ok === true || left?.code === 'unauthorized' || left?.code === 'not_found';
-  if (!confirmed) {
-    const transient = TRANSIENT.has(left?.code);
+  const outcome = leaveOutcome(left);
+  if (outcome !== 'confirmed') {
+    const transient = outcome === 'transient';
     store.setSyncProblem(transient ? 'leave_unconfirmed' : left?.code || 'leave_failed', null);
     return {
       ok: false,
