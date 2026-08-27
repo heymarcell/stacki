@@ -34,6 +34,7 @@ process.env.STACKI_NO_DIALOGS = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
+const { readDevLock, awaitDevServerGone } = require('./support/devServer.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const failures = [];
@@ -560,8 +561,9 @@ require('../electron/main.js');
     }
   };
 
-  const where = await call('project', { action: 'dev_status' }).catch(() => null);
-  const previewUrl = where?.url || where?.preview?.url || null;
+  // Which process holds the port. Read before anything is stopped, because the
+  // record lives in the project directory that is removed further down.
+  const devLock = readDevLock(root);
 
   await attempt('stopping the preview', async () => {
     const stopped = await stopPreview();
@@ -572,20 +574,14 @@ require('../electron/main.js');
   // stopDevServer hands the job to `astro dev stop` and returns. Exiting on
   // that ok deletes the project directory out from under the command and
   // leaves the server running for as long as the machine is up.
-  if (previewUrl) {
-    await attempt('waiting for the preview to stop answering', async () => {
-      const deadline = Date.now() + 20000;
-      for (;;) {
-        try {
-          await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
-        } catch {
-          return;
-        }
-        if (Date.now() > deadline) throw new Error(`${previewUrl} would not stop`);
-        await wait(400);
-      }
-    });
-  }
+  //
+  // What was checked was whether the URL still answered. A dev server whose
+  // project has been deleted answers 500 rather than refusing the connection,
+  // so the fetch resolves and "it threw" never happens. The pid is the question.
+  await attempt('waiting for the preview to actually be gone', async () => {
+    const gone = await awaitDevServerGone(devLock);
+    say(`  preview: ${gone.how} [port ${devLock?.port ?? "none"}]`);
+  });
 
   await attempt('closing the windows', () => {
     for (const w of BrowserWindow.getAllWindows()) w.destroy();

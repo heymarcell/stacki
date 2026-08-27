@@ -35,6 +35,7 @@ process.env.STACKI_HIDDEN_WINDOW = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
+const { readDevLock, awaitDevServerGone } = require('./support/devServer.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const OUT = process.argv[2] || path.join(os.tmpdir(), 'stacki-review-ux');
@@ -120,9 +121,27 @@ async function teardown(code) {
     }
   };
 
+  // Read BEFORE anything is asked to stop, and long before the fixture goes:
+  // this is the only record of which process holds the port, and it lives
+  // inside the directory that is about to be deleted.
+  const devLock = readDevLock(root);
+
   await attempt('stopping the preview', async () => {
+    // Through the app's own bridge first — `window.avb.stopDevServer` is the
+    // same call the editor makes when a project is closed, and unlike the MCP
+    // route it does not need a server this harness never turns on. Asking
+    // through MCP was the only route before, so on every run where MCP was not
+    // up the whole step returned early and reported success.
+    const live = BrowserWindow.getAllWindows()[0];
+    if (live && !live.isDestroyed()) {
+      await live.webContents.executeJavaScript('window.avb?.stopDevServer?.()', true).catch(() => null);
+    }
     const status = mcp.status();
-    if (!status?.running || !status.url || !status.token) return;
+    if (!status?.running || !status.url || !status.token) {
+      const gone = await awaitDevServerGone(devLock);
+      say(`  preview: ${gone.how} [port ${devLock?.port ?? "none"}]`);
+      return;
+    }
     const call = async (args) => {
       const res = await fetch(status.url, {
         method: 'POST',
@@ -142,26 +161,22 @@ async function teardown(code) {
         return null;
       }
     };
-    const where = await call({ action: 'dev_status' });
-    const previewUrl = where?.url || where?.preview?.url || null;
     await call({ action: 'dev_stop' });
 
     // `ok` from dev_stop means "asked", not "stopped": Astro 7 daemonizes its
-    // dev server, so Stacki hands the job to `astro dev stop` and returns.
-    // Exiting on that ok deletes the project directory out from under the
-    // command and leaves the server running. So wait for the port to actually
-    // go quiet — the real state, not a sleep long enough to usually work.
-    if (!previewUrl) return;
-    const stop = Date.now() + 20000;
-    for (;;) {
-      try {
-        await fetch(previewUrl, { signal: AbortSignal.timeout(1000) });
-      } catch {
-        return;
-      }
-      if (Date.now() > stop) throw new Error(`the preview at ${previewUrl} would not stop`);
-      await wait(400);
-    }
+    // dev server, so Stacki hands the job to `astro dev stop` and returns. What
+    // was checked next was whether the URL still answered — and a dev server
+    // whose project directory has been deleted does not refuse connections, it
+    // answers 500. fetch resolves, so "it threw" was never going to be true, and
+    // the step above it returned early and silently whenever the MCP server was
+    // not up. Five runs, five orphaned servers, one per run, each holding the
+    // next port up.
+    //
+    // The process is the question. Waiting for it HERE also fixes the order:
+    // `astro dev stop` needs the project it is stopping to still exist, and the
+    // fixture is removed a few lines below.
+    const gone = await awaitDevServerGone(devLock);
+    say(`  preview: ${gone.how} [port ${devLock?.port ?? "none"}]`);
   });
 
   await attempt('stopping the MCP server', () => mcp.stopMcp());
