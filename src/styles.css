@@ -7073,8 +7073,19 @@ textarea::selection {
   color: var(--text-dim);
   cursor: pointer;
 }
-.share-check input { margin-top: 2px; flex-shrink: 0; }
-.share-check em { color: var(--text-faint); font-style: normal; }
+/* `margin: 2px 0 0` rather than `margin-top`, because a checkbox carries the
+   browser's own left and right margins otherwise and the gap above stops
+   being the gap you can see. The same rule the older dialog uses. */
+.share-check input { margin: 2px 0 0; flex-shrink: 0; }
+/* The consequence goes on its own line. Run inline it reads as one long
+   sentence and the part that matters — what OFF means — disappears into it. */
+.share-check em {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-faint);
+  font-style: normal;
+  font-size: 10.5px;
+}
 
 .share-facts { display: flex; flex-direction: column; gap: 8px; }
 .share-fact {
@@ -7097,8 +7108,22 @@ textarea::selection {
 .share-invite { display: flex; flex-direction: column; gap: 8px; }
 
 .share-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.share-actions.stacked { flex-direction: column; }
-.share-actions.stacked button { width: 100%; }
+/* Stacked, these are a LIST OF ACTIONS rather than a row of buttons, and a
+   plain ghost button has no edge — full width and centred it reads as a
+   paragraph somebody has centred by mistake. So the stacked variant gets a
+   border and left-aligned text: three things you can do, that look like it. */
+.share-actions.stacked { flex-direction: column; gap: 6px; }
+.share-actions.stacked button {
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+.share-actions.stacked button:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--text-faint); }
+.share-actions.stacked button.danger { color: var(--red, #ff453a); }
+.share-actions.stacked button.danger:hover:not(:disabled) { border-color: var(--red, #ff453a); }
 .share-body button.wide {
   width: 100%;
   display: flex;
@@ -7135,6 +7160,16 @@ textarea::selection {
 .share-caret.open { transform: rotate(90deg); }
 .share-advanced-body { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .share-advanced-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* Same reason as the stacked actions: a transparent ghost button beside
+   another one reads as two words, not two things to press. */
+.share-advanced-actions button {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+}
+.share-advanced-actions button:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--text-faint); }
+.share-advanced-actions button:disabled { color: var(--text-faint); border-color: var(--border); }
 .share-relay-now {
   display: flex;
   align-items: baseline;

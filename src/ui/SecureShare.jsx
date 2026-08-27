@@ -129,7 +129,13 @@ export function SecureShareRow({ shared, onShare, onManage, onRetry, busy = fals
   if (problem) {
     return (
       <div className="share-row has-problem">
-        <span className="share-state is-paused">Sharing paused</span>
+        {/* The count belongs here MOST of all. Suppressing it exactly when
+            something has gone wrong would hide the one number that says how
+            much has not left this machine. */}
+        <span className="share-state is-paused">
+          Sharing paused
+          {pending > 0 ? ` · ${plural(pending, 'comment', 'comments')} waiting` : ''}
+        </span>
         <button type="button" className="share-link" onClick={onRetry} disabled={busy}>
           {busy ? 'Retrying…' : 'Retry'}
         </button>

@@ -292,6 +292,61 @@ for (const [what, url] of [
   check(`a deep link with ${what} is refused`, cap.readDeepLink(url) === null);
 }
 
+// A JSON object with the same key twice. `JSON.parse` keeps the last, so
+// without an exact field-set check a capability could carry two relays and be
+// read as whichever one the parser preferred.
+const duplicated = `stacki2.${Buffer.from(
+  `{"r":"https://evil.example","r":"https://relay.example","id":"${ROOM_ID}","i":"${inviteToken}","k":"${VECTORS.roomSecret}","e":0}`,
+  'utf8'
+).toString('base64url')}`;
+const dupRead = cap.unpackCapability(duplicated);
+check('a capability with a duplicated field cannot name two relays', dupRead === null || dupRead.relay === 'https://relay.example', JSON.stringify(dupRead));
+
+// --- one character at a time ------------------------------------------------
+//
+// Every single-character mutation of a valid capability must either be refused
+// or come back meaning something DIFFERENT. A mutation that decodes to the
+// same invitation would be an alias: a second string that unlocks the same
+// room, which is a second string to leak and a second one to have to revoke.
+//
+// (A mutation that is accepted and means something else is fine and expected —
+// it names a room that does not exist, and the relay says so.)
+const original = cap.unpackCapability(capability);
+const ALPHABET = 'ABCXYZabcxyz0189-_.';
+let mutated = 0;
+let accepted = 0;
+const aliases = [];
+for (let i = 0; i < capability.length; i++) {
+  for (const ch of ALPHABET) {
+    if (capability[i] === ch) continue;
+    const candidate = `${capability.slice(0, i)}${ch}${capability.slice(i + 1)}`;
+    mutated += 1;
+    const read = cap.unpackCapability(candidate);
+    if (!read) continue;
+    accepted += 1;
+    if (JSON.stringify(read) === JSON.stringify(original)) aliases.push(candidate);
+  }
+}
+check('the mutation sweep actually ran', mutated > 2000, `${mutated} mutations`);
+check('mutations are mostly refused outright', accepted < mutated / 2, `${accepted} of ${mutated} accepted`);
+
+// THE PART THAT GRANTS ACCESS IS EXACTLY DETERMINED. No mutation may leave the
+// room, the invitation or the secret unchanged while changing any of them —
+// those three are the bearer parts and they are compared byte for byte.
+//
+// A handful of aliases DO exist and they are all the same thing: a hostname
+// written in different case. `new URL()` lowercases it, because a hostname is
+// case-insensitive and `relAy.example` genuinely is `relay.example`. That is
+// one address written two ways, not two secrets — the same invitation token,
+// revoked once. Asserted here rather than waved at.
+for (const alias of aliases) {
+  const decoded = JSON.parse(Buffer.from(alias.slice(cap.PREFIX.length), 'base64url').toString('utf8'));
+  const before = JSON.parse(Buffer.from(capability.slice(cap.PREFIX.length), 'base64url').toString('utf8'));
+  check('an alias never changes the room, the invitation or the secret', decoded.id === before.id && decoded.i === before.i && decoded.k === before.k, alias);
+  check('an alias differs only in the relay it names', decoded.r !== before.r, alias);
+  check('and only in the case of its hostname', String(decoded.r).toLowerCase() === String(before.r).toLowerCase(), `${decoded.r} vs ${before.r}`);
+}
+
 if (failures.length) {
   console.error(`\nsecure-crypto: ${failures.length} failed, ${checked - failures.length} passed\n`);
   console.error(failures.join('\n') + '\n');

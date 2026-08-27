@@ -370,6 +370,36 @@ if (fs.existsSync(relayDir)) {
   }
 }
 
+// ── The join link is a join link ────────────────────────────────────────────
+//
+// `stacki://join#…` is the one thing the custom protocol does, and the danger
+// with a URL handler is not that it is wrong today — it is that somebody adds
+// a second action to it later, and a link from a web page becomes a way to run
+// something. So the handler's body is read, and it may not mention any of the
+// verbs that would make it one.
+
+const mainText = fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8');
+const handler = /function handleJoinUrl\(url\) \{[\s\S]*?\n\}/.exec(mainText);
+check('the join link handler is where the test expects it', !!handler, 'if this moved, this check needs to move with it');
+if (handler) {
+  const body = handler[0];
+  for (const [what, pattern] of [
+    ['spawn a process', /\bspawn\b|\bexec\b|execFile|child_process/],
+    ['open a file', /readFile|writeFile|createReadStream|shell\.openPath/],
+    ['open an external URL', /shell\.openExternal/],
+    ['run git', /\bgit\b/],
+    ['reach MCP', /\bmcp\b/i],
+    ['evaluate anything', /executeJavaScript|\beval\(|new Function/],
+    ['load a URL into the window', /loadURL|loadFile/],
+  ]) {
+    check(`the join link handler cannot ${what}`, !pattern.test(body), body.slice(0, 200));
+  }
+  check('and its only effect is to offer the invitation to a person', /reviews\.offerInvite\(/.test(body), body.slice(0, 200));
+}
+// Nothing else in the main process may claim the scheme for another purpose.
+const schemeUses = [...mainText.matchAll(/setAsDefaultProtocolClient\(([^)]*)\)/g)].map((m) => m[1]);
+check('the app claims exactly one custom scheme', schemeUses.length >= 1 && schemeUses.every((u) => u.includes('JOIN_SCHEME')), JSON.stringify(schemeUses));
+
 // ── The archive contains the app ────────────────────────────────────────────
 
 check('the main process is packaged', files.includes('electron/**/*'), JSON.stringify(files));

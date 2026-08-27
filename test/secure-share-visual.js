@@ -466,9 +466,22 @@ app.whenReady().then(async () => {
     });
     await clickText('Create secure share');
     await shot('creating', `[...document.querySelectorAll('.share-dialog button')].some((b) => b.textContent.includes('Creating'))`);
-    await new Promise((resolve) => {
-      blackHole.close(resolve);
-      blackHole.closeAllConnections?.();
+    // Bounded: a socket the runtime will not let go of must not take the whole
+    // run with it. The port is then waited for explicitly, because binding it
+    // again a moment too early is an EADDRINUSE nobody would look for here.
+    blackHole.closeAllConnections?.();
+    await Promise.race([new Promise((resolve) => blackHole.close(resolve)), wait(3000)]);
+    await until.soft('the port to come free', 15000, async () => {
+      try {
+        await new Promise((resolve, reject) => {
+          const probe = net.createServer();
+          probe.once('error', reject);
+          probe.listen(RELAY_PORT, '127.0.0.1', () => probe.close(resolve));
+        });
+        return true;
+      } catch {
+        return false;
+      }
     });
     await until.soft('the failed creation to settle', 25000, () => js(`!!document.querySelector('.share-error')`));
     await escape();
@@ -571,6 +584,11 @@ app.whenReady().then(async () => {
       await wait(700);
       await shot('sharing-paused', `document.querySelector('.share-row.has-problem')`);
       check('a paused share offers Retry', await js(`/Retry/.test(document.querySelector('.share-row')?.textContent || '')`));
+      check(
+        'and still says how much has not left this machine',
+        await js(`/waiting/.test(document.querySelector('.share-row')?.textContent || '')`),
+        await js(`document.querySelector('.share-row')?.textContent`)
+      );
       await shot(
         'access-lost',
         `document.querySelector('.share-problem')?.textContent.includes('no longer has access')`
