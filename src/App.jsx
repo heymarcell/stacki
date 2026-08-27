@@ -3998,14 +3998,24 @@ export default function App() {
     void window.avb.reviewsSecureCancelJoin?.();
   };
 
-  /** Put something on the clipboard. False when the browser refused. */
+  /**
+   * Put something on the clipboard. False when it could not be done.
+   *
+   * The main process first: `navigator.clipboard` refuses whenever the
+   * document is not focused, which is a real state a window is in, and a Copy
+   * button that silently does nothing is worse than one that is not there.
+   */
   const copyToClipboard = async (text) => {
+    try {
+      const done = await window.avb.writeClipboard?.(text);
+      if (done?.ok) return true;
+    } catch {
+      /* fall through to the browser's own clipboard */
+    }
     try {
       await navigator.clipboard.writeText(text);
       return true;
     } catch {
-      // A clipboard that refuses is not worth an error message — the caller
-      // shows the link on screen either way.
       return false;
     }
   };

@@ -375,6 +375,7 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
         roomId: room.roomId,
         invite: answer.body.invite,
         secret: room.secret,
+        expiresAt: Number.isSafeInteger(answer.body.expiresAt) ? answer.body.expiresAt : 0,
       });
       if (!capability) return fail('bad_response', 'The secure relay sent an invitation Stacki could not use.');
       return { ok: true, capability, expiresAt: answer.body.expiresAt ?? null, relay: room.relay };

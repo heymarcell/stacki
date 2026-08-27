@@ -221,8 +221,22 @@ const capability = cap.packCapability({ relay: 'https://relay.example', roomId: 
 const unpacked = cap.unpackCapability(capability);
 check('a capability round trips', unpacked && unpacked.roomId === ROOM_ID && unpacked.secret === VECTORS.roomSecret && unpacked.invite === inviteToken);
 check('a capability is bounded', capability.length < cap.MAX_CAPABILITY);
+const dated = cap.packCapability({ relay: 'https://relay.example', roomId: ROOM_ID, invite: inviteToken, secret: VECTORS.roomSecret, expiresAt: 1893456000000 });
+check('a capability carries the invitation expiry', cap.unpackCapability(dated)?.expiresAt === 1893456000000);
+check('a capability with no expiry says so rather than guessing', cap.unpackCapability(capability)?.expiresAt === null);
 check('the share link puts everything after the fragment', cap.shareLink({ shareOrigin: 'https://share.example', capability }) === `https://share.example/#${capability}`);
 check('the share link carries nothing in path or query', !cap.shareLink({ shareOrigin: 'https://share.example', capability }).split('#')[0].includes(ROOM_ID));
+
+// A payload that IS a valid v2 capability, behind a prefix that is not v2.
+// This is the one input that separates "the version is checked" from "the
+// fields happen to be wrong anyway" — every other malformed capability below
+// would be refused for a second reason even if the prefix were ignored.
+const validPayload = capability.slice(cap.PREFIX.length);
+check('a capability with a future version prefix is refused', cap.unpackCapability(`stacki3.${validPayload}`) === null);
+check('a capability with a past version prefix is refused', cap.unpackCapability(`stacki1.${validPayload}`) === null);
+check('a capability with no version prefix is refused', cap.unpackCapability(validPayload) === null);
+check('and the same payload under its own prefix is still accepted', cap.unpackCapability(`stacki2.${validPayload}`) !== null);
+check('a deep link with a future version prefix is refused', cap.readDeepLink(`stacki://join#stacki3.${validPayload}`) === null);
 
 for (const [what, value] of [
   ['a legacy stacki1 invitation', 'stacki1.eyJzIjoiaHR0cDovL3gifQ'],
@@ -233,15 +247,17 @@ for (const [what, value] of [
   ['a capability of the wrong alphabet', 'stacki2.abc+def'],
   ['a capability that is not JSON', `stacki2.${Buffer.from('not json').toString('base64url')}`],
   ['a capability that is an array', `stacki2.${Buffer.from('[1,2]').toString('base64url')}`],
-  ['a capability with a missing field', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken })).toString('base64url')}`],
-  ['a capability with an extra field', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, extra: 1 })).toString('base64url')}`],
-  ['a capability with a short secret', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: p.toBase64Url(Buffer.alloc(16)) })).toString('base64url')}`],
-  ['a capability with a short room id', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: p.toBase64Url(Buffer.alloc(8)), i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
-  ['a capability naming a remote plaintext relay', `stacki2.${Buffer.from(JSON.stringify({ r: 'http://relay.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
-  ['a capability naming a javascript url', `stacki2.${Buffer.from(JSON.stringify({ r: 'javascript:alert(1)', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
-  ['a capability naming a file url', `stacki2.${Buffer.from(JSON.stringify({ r: 'file:///etc/passwd', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
-  ['a capability naming a data url', `stacki2.${Buffer.from(JSON.stringify({ r: 'data:text/html,x', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
-  ['a capability with credentials in the relay url', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://user:pass@relay.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
+  ['a capability with a missing field', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret })).toString('base64url')}`],
+  ['a capability with an extra field', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0, extra: 1 })).toString('base64url')}`],
+  ['a capability with a short secret', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: p.toBase64Url(Buffer.alloc(16)), e: 0 })).toString('base64url')}`],
+  ['a capability with a short room id', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: p.toBase64Url(Buffer.alloc(8)), i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
+  ['a capability with a non integer expiry', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 'soon' })).toString('base64url')}`],
+  ['a capability with a negative expiry', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://x.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: -1 })).toString('base64url')}`],
+  ['a capability naming a remote plaintext relay', `stacki2.${Buffer.from(JSON.stringify({ r: 'http://relay.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
+  ['a capability naming a javascript url', `stacki2.${Buffer.from(JSON.stringify({ r: 'javascript:alert(1)', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
+  ['a capability naming a file url', `stacki2.${Buffer.from(JSON.stringify({ r: 'file:///etc/passwd', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
+  ['a capability naming a data url', `stacki2.${Buffer.from(JSON.stringify({ r: 'data:text/html,x', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
+  ['a capability with credentials in the relay url', `stacki2.${Buffer.from(JSON.stringify({ r: 'https://user:pass@relay.example', id: ROOM_ID, i: inviteToken, k: VECTORS.roomSecret, e: 0 })).toString('base64url')}`],
   ['an oversized capability', `stacki2.${'A'.repeat(4000)}`],
 ]) {
   check(`${what} is refused`, cap.unpackCapability(value) === null);

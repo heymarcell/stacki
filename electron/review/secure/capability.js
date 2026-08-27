@@ -48,10 +48,19 @@ const MAX_RELAY = 200;
 // that turns two different strings into the same origin.
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
-// Exactly these four, and no more. An extra field is refused rather than
+// Exactly these five, and no more. An extra field is refused rather than
 // ignored — a capability carrying something this version does not understand
 // is either a newer Stacki (which should say so plainly) or somebody probing.
-const FIELDS = ['r', 'id', 'i', 'k'];
+//
+// `e` is when the invitation expires, and it is here rather than asked of the
+// relay for a reason worth writing down. The relay gives ONE answer for every
+// unusable invitation — wrong, used, expired — so that guessing at them tells
+// you nothing. That is right, and it costs the recipient a true sentence:
+// Stacki would only ever be able to say "this cannot be used". Carrying the
+// expiry in the capability gives it back. It leaks nothing, because whoever
+// holds this string already holds the invitation, and it lets Stacki say "this
+// expired" before it contacts anybody at all.
+const FIELDS = ['r', 'id', 'i', 'k', 'e'];
 
 /**
  * Whether Stacki will send a bearer credential to this address.
@@ -93,13 +102,14 @@ const isLoopbackRelay = (origin) => {
   }
 };
 
-/** The four things a recipient needs, as one thing to paste. */
-function packCapability({ relay, roomId, invite, secret }) {
+/** The five things a recipient needs, as one thing to paste. */
+function packCapability({ relay, roomId, invite, secret, expiresAt = 0 }) {
   const origin = relayOrigin(relay);
   if (!origin || !isRoomId(roomId) || !isCredential(invite)) return null;
   const key = typeof secret === 'string' ? secret : toBase64Url(secret);
   if (!fromBase64Url(key, ROOM_SECRET_BYTES)) return null;
-  const payload = JSON.stringify({ r: origin, id: roomId, i: invite, k: key });
+  const expires = Number.isSafeInteger(expiresAt) && expiresAt > 0 ? expiresAt : 0;
+  const payload = JSON.stringify({ r: origin, id: roomId, i: invite, k: key, e: expires });
   return `${PREFIX}${Buffer.from(payload, 'utf8').toString('base64url')}`;
 }
 
@@ -150,8 +160,12 @@ function unpackCapability(text) {
   if (!isRoomId(parsed.id)) return null;
   if (!isCredential(parsed.i)) return null;
   if (!fromBase64Url(parsed.k, ROOM_SECRET_BYTES)) return null;
+  // A hint about this invitation and nothing anybody is trusted about. Zero
+  // means "not stated"; anything that is not a plain positive integer is not a
+  // timestamp and the capability is refused rather than half-read.
+  if (!Number.isSafeInteger(parsed.e) || parsed.e < 0) return null;
 
-  return { version: VERSION, relay, roomId: parsed.id, invite: parsed.i, secret: parsed.k };
+  return { version: VERSION, relay, roomId: parsed.id, invite: parsed.i, secret: parsed.k, expiresAt: parsed.e || null };
 }
 
 // --- the two forms it travels in -------------------------------------------

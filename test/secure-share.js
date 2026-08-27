@@ -49,7 +49,7 @@ const { createReviewStore, scopeKey, fileFor } = require('../electron/review/sto
 const { syncOnce, createSyncer } = require('../electron/review/sync.js');
 const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
-const { signingBytes, toBase64Url, fromBase64Url } = require('../relay/protocol.js');
+const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION } = require('../relay/protocol.js');
 
 const temp = [];
 const mkdir = (tag) => {
@@ -127,6 +127,9 @@ const reply = (person, threadId, message, actor = null) =>
 const onlyThread = (person) => person.store.all()[0]?.id;
 
 async function main() {
+  // What the repository looks like before any of this runs. Compared at the
+  // end: no secret store, no database, no stray file.
+  const cwdBefore = fs.readdirSync(process.cwd()).sort().join('\n');
   const relay = createSecureRelay({ port: 0, host: '127.0.0.1', onError: () => {} });
   await relay.start();
   const base = `http://127.0.0.1:${relay.address.port}`;
@@ -329,6 +332,55 @@ async function main() {
   check('a sync that saw one says so rather than reporting a clean run', annAfter.unverified >= 1 || ann.store.shared.problem?.kind === 'unverified_events', JSON.stringify(ann.store.shared.problem));
   check('and it never reaches the fold', !JSON.stringify(ann.store.all()).includes('Ann never said this.'));
 
+  // --- an envelope that lies about what is inside it ------------------------
+  //
+  // Built with the raw primitives rather than through `sealEvent`, because
+  // that is what an attacker has: encrypt event A, but label the envelope with
+  // the id of event B, consistently — in the associated data and in the
+  // signature. Everything verifies and everything decrypts. The only thing
+  // that catches it is the recipient re-deriving the envelope id from the
+  // event it actually got.
+  const realEvent = makeEvent({
+    type: 'message.created',
+    threadId: forgedThread,
+    actor: BOB,
+    lamport: 101,
+    at: Date.now(),
+    payload: { messageId: 'mislabelled', body: 'filed under another event' },
+  });
+  const wrongId = envelopeIdFor(benKeys, 'a-completely-different-event');
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', benKeys.content, nonce);
+  cipher.setAAD(Buffer.from(aadFor({ roomId: ben.roomId, envelopeId: wrongId, senderId: benRoom.senderId })));
+  const sealedBody = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(realEvent), 'utf8')), cipher.final()]);
+  const mislabelled = Buffer.concat([sealedBody, cipher.getAuthTag()]);
+  const mislabelledEnvelope = {
+    v: VERSION,
+    envelopeId: wrongId,
+    senderId: benRoom.senderId,
+    nonce: toBase64Url(nonce),
+    ciphertext: toBase64Url(mislabelled),
+    signature: require('../electron/review/secure/crypto.js').signBytes(
+      benRoom.privateKey,
+      signingBytes({ roomId: ben.roomId, envelopeId: wrongId, senderId: benRoom.senderId, nonce: toBase64Url(nonce), ciphertext: mislabelled })
+    ),
+  };
+  const mislabelledSent = await fetch(`${liveBase}/v2/rooms/${ben.roomId}/envelopes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${benRoom.token}` },
+    body: JSON.stringify({ envelopes: [mislabelledEnvelope] }),
+  });
+  const mislabelledBody = await mislabelledSent.json();
+  check('a well signed envelope filed under another event id is stored', mislabelledBody.accepted?.length === 1, JSON.stringify(mislabelledBody));
+
+  const annSeesMislabelled = await createSecureTransport({ rooms: ann.rooms, roomId: ann.roomId }).pullEvents({ after: null });
+  check(
+    'but the recipient refuses it, because the envelope does not name the event inside it',
+    !annSeesMislabelled.events.some((e) => e.payload?.body === 'filed under another event'),
+    JSON.stringify(annSeesMislabelled.events.map((e) => e.payload?.body))
+  );
+  check('and counts it as unverified rather than dropping it silently', annSeesMislabelled.unverified >= 1, `${annSeesMislabelled.unverified}`);
+
   // --- tampering ------------------------------------------------------------
 
   const good = sealEvent({
@@ -441,6 +493,13 @@ async function main() {
     check(`${person.tag}'s project has no .stacki credential file`, !names.includes('.stacki'));
     check(`${person.tag}'s project gained no files at all`, found.length === 1 && found[0][0].endsWith('index.html'), names);
   }
+
+  // Nothing was written into the working directory either. This is the version
+  // of the project scan that catches a registry pointed somewhere it should
+  // not be — a secret file that lands beside the repository rather than inside
+  // a project would pass the walk above and fail here.
+  const cwdAfter = fs.readdirSync(process.cwd()).sort().join('\n');
+  check('the working directory gained no files', cwdAfter === cwdBefore, 'a secret written next to the repository is still a secret in the repository');
 
   // --- secret storage --------------------------------------------------------
 

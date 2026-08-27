@@ -32,16 +32,6 @@ import { ResolveIcon, CloseIcon, OrphanIcon, LockIcon } from './Icons.jsx';
 // is true, and it is two lines because a person deciding whether to click a
 // button is not reading a threat model.
 
-const shortAgo = (t) => {
-  if (!t) return 'never';
-  const m = Math.round((Date.now() - t) / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
-};
-
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 /**
@@ -62,10 +52,15 @@ export function secureProblemText(problem) {
     case 'timeout':
       return 'The relay didn’t answer. Nothing is lost — Stacki will try again.';
     case 'unauthorized':
-      return 'This Mac no longer has access to this secure share. Ask for a new invitation.';
     case 'not_found':
     case 'room_ended':
-      return 'This secure share has ended. Your local comments are still here.';
+      // One sentence for both, because the relay gives one answer for both and
+      // Stacki should not guess. A room that has ended and a membership that
+      // was revoked look identical from here — every way of not being in a
+      // room answers the same, which is what stops one credential being used
+      // to find out which rooms exist. So this says what is certainly true,
+      // and the second half is the part somebody actually needs.
+      return 'This Mac no longer has access to this secure share — it may have ended, or access may have been removed. Your local comments are still here.';
     case 'key_changed':
       return 'Stacki could not verify part of this shared review history, so it has stopped syncing. Your local comments are still here.';
     case 'unverified_events':
@@ -583,14 +578,14 @@ export function JoinShareDialog({ invite, onJoin, onCancel }) {
         <div className="modal-body share-body">
           {problem ? (
             <>
+              {/* The only thing Stacki can know before contacting anybody:
+                  the capability carries its own expiry. Everything else about
+                  an unusable invitation comes back from the join attempt, as
+                  the inline error below. */}
               <p className="dim">
                 {problem === 'expired'
                   ? 'This invitation has expired. Ask for a new one.'
-                  : problem === 'used'
-                    ? 'This invitation can no longer be used. Ask for a new one.'
-                    : problem === 'ended'
-                      ? 'This secure share has ended.'
-                      : 'This invitation could not be read. Ask for a new one.'}
+                  : 'This invitation could not be read. Ask for a new one.'}
               </p>
               <div className="share-actions">
                 <button type="button" className="primary" data-autofocus onClick={onCancel}>
@@ -663,7 +658,19 @@ export function JoinShareDialog({ invite, onJoin, onCancel }) {
                     setError(null);
                     try {
                       const result = await onJoin({ publishExisting });
-                      if (!result?.ok) setError(result?.message || 'Joining did not work.');
+                      if (!result?.ok) {
+                        // The relay answers the same way for a wrong, a used
+                        // and an expired invitation, which is right — telling
+                        // them apart is how somebody probes at them. So this
+                        // says the one thing true of all three. An invitation
+                        // Stacki can see has expired is caught before this,
+                        // from the timestamp the capability carries.
+                        setError(
+                          result?.code === 'bad_invite'
+                            ? 'This invitation can no longer be used. Ask for a new one.'
+                            : result?.message || 'Joining did not work.'
+                        );
+                      }
                     } catch {
                       setError('Joining did not work.');
                     } finally {

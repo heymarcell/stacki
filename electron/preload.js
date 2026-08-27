@@ -1849,6 +1849,7 @@ contextBridge.exposeInMainWorld('avb', {
   // they asked for. What never comes back: the room id, the room secret, the
   // member token, or any signing key. There is a test that walks every object
   // this returns looking for them.
+  writeClipboard: invoke('clipboard:write'),
   reviewsSecureEnable: invoke('reviews:secureEnable'),
   reviewsSecureInvite: invoke('reviews:secureInvite'),
   reviewsSecureJoin: invoke('reviews:secureJoin'),

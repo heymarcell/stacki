@@ -59,7 +59,7 @@ const {
   createRoom: createSecureRoom,
   joinRoom: joinSecureRoom,
 } = require('./secure/transport');
-const { unpackCapability, shareLink } = require('./secure/capability');
+const { unpackCapability, packCapability, shareLink } = require('./secure/capability');
 const { relayFor, describeRelay, checkRelay, DEFAULT_RELAY } = require('./secure/relays');
 
 // Focusing a review can mean loading a page, drilling into two components and
@@ -467,6 +467,10 @@ function inspectInvite(capability) {
     return { ok: false, code: 'bad_capability', message: 'That invitation could not be read.' };
   }
   pendingJoin = invitation;
+  // Said before anybody is contacted. The relay answers the same way for a
+  // used invitation and an expired one — on purpose — so this is the only
+  // place a true sentence about which can come from.
+  const expired = !!invitation.expiresAt && invitation.expiresAt < Date.now();
   return {
     ok: true,
     invite: {
@@ -475,6 +479,8 @@ function inspectInvite(capability) {
       // actually being asked. Null when nothing is open.
       project: projectPath ? path.basename(projectPath) : null,
       alreadyShared: !!store?.shared?.workspaceId,
+      expiresAt: invitation.expiresAt || null,
+      problem: expired ? 'expired' : null,
     },
   };
 }
@@ -501,10 +507,13 @@ async function joinSecureShare({ publishExisting = false } = {}) {
     return { ok: false, code: 'already_shared', message: 'This project’s comments are already shared.' };
   }
 
-  const capability = `stacki2.${Buffer.from(
-    JSON.stringify({ r: pendingJoin.relay, id: pendingJoin.roomId, i: pendingJoin.invite, k: pendingJoin.secret }),
-    'utf8'
-  ).toString('base64url')}`;
+  const capability = packCapability({
+    relay: pendingJoin.relay,
+    roomId: pendingJoin.roomId,
+    invite: pendingJoin.invite,
+    secret: pendingJoin.secret,
+    expiresAt: pendingJoin.expiresAt || 0,
+  });
   const joined = await joinSecureRoom({ capability, actor, rooms: secureRooms });
   pendingJoin = null;
   if (!joined.ok) return joined;

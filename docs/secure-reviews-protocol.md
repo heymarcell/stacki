@@ -482,12 +482,21 @@ stacki2.<base64url(JSON)>
 where the JSON is exactly four fields:
 
 ```json
-{ "r": "<relay origin>", "id": "<roomId>", "i": "<invitation>", "k": "<room secret>" }
+{ "r": "<relay origin>", "id": "<roomId>", "i": "<invitation>",
+  "k": "<room secret>", "e": <expiresAt ms, or 0> }
 ```
 
 Any extra field, any missing field, a non-canonical encoding, a room ID or
-secret of the wrong length, or a relay origin that is not HTTPS-or-loopback is
-refused outright.
+secret of the wrong length, an `e` that is not a non-negative safe integer, or
+a relay origin that is not HTTPS-or-loopback is refused outright.
+
+`e` is the invitation's expiry, carried here rather than asked of the relay.
+The relay gives **one** answer for every unusable invitation — wrong, used,
+expired — so that guessing at them reveals nothing, and that costs the
+recipient a true sentence: Stacki could otherwise only ever say "this cannot be
+used". The expiry leaks nothing, because whoever holds the capability already
+holds the invitation, and it lets Stacki say "this invitation has expired"
+before contacting anybody at all.
 
 ### As a link
 

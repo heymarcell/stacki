@@ -415,6 +415,24 @@ handle('project:pending', () => {
   return p && fs.existsSync(p) ? p : null;
 });
 
+/**
+ * Put text on the clipboard.
+ *
+ * Through the main process rather than `navigator.clipboard`, which in an
+ * Electron renderer refuses whenever the document is not focused — so "Copy
+ * invite link" would silently do nothing for anybody whose window had lost
+ * focus, and did exactly that under the visual harness. The renderer still
+ * falls back to `navigator.clipboard` for a build where this handler is
+ * missing.
+ */
+handle('clipboard:write', (_e, text) => {
+  if (typeof text !== 'string' || !text) return { ok: false, code: 'nothing_to_copy' };
+  // Bounded: this is called with an invitation, not with a file.
+  if (text.length > 8192) return { ok: false, code: 'too_large' };
+  clipboard.writeText(text);
+  return { ok: true };
+});
+
 // Native clipboard actions on the focused element, requested by the renderer
 // when a menu Copy/Paste lands while a text field has focus.
 handle('native:copy', () => {

@@ -263,6 +263,113 @@ if (fs.existsSync(serviceDir)) {
   }
 }
 
+// ── The relays are NOT the app, and one shared file is ──────────────────────
+//
+// `relay/` holds two programs somebody runs somewhere else — a Node server with
+// a database, and a Cloudflare Worker with Wrangler and a Vitest toolchain in
+// its own package.json. None of that belongs inside a desktop application, and
+// the Cloudflare half in particular would drag a deployment CLI into every
+// install of Stacki.
+//
+// Exactly ONE file crosses: `relay/protocol.js`, the envelope format. It is
+// shared rather than duplicated because three implementations of "is this
+// envelope well formed" is three different answers, and the two that are wrong
+// are a client whose comments a relay silently drops and a relay that stores
+// whatever it is handed.
+
+const relayDir = path.join(root, 'relay');
+if (fs.existsSync(relayDir)) {
+  check('the shared envelope format is packaged', files.includes('relay/protocol.js'), JSON.stringify(files));
+  check(
+    'the Node relay is not packaged',
+    !files.some((f) => f.startsWith('relay/node')),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check(
+    'the Cloudflare Worker is not packaged',
+    !files.some((f) => f.startsWith('relay/cloudflare')),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check(
+    'no relay directory is packaged wholesale',
+    !files.some((f) => /^relay\/(\*|\*\*)/.test(f) || f === 'relay' || f === 'relay/**/*'),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check('no relay file is unpacked beside the archive', !unpacked.some((f) => f.startsWith('relay')), JSON.stringify(unpacked));
+
+  // Cloudflare's toolchain lives in its own package.json and must not leak
+  // into the app's. Wrangler in `dependencies` would be shipped; in
+  // `devDependencies` it would still be somebody's mistake waiting to happen.
+  for (const name of ['wrangler', '@cloudflare/vitest-plugin', '@cloudflare/vitest-pool-workers', '@cloudflare/workers-types', 'miniflare', 'vitest']) {
+    check(`${name} is not a dependency of the app`, !deps[name], 'Cloudflare tooling has its own package.json in relay/cloudflare');
+    check(`${name} is not a dev dependency of the app either`, !devDeps[name], 'it belongs to relay/cloudflare, not to Stacki');
+  }
+  const cfPkg = path.join(relayDir, 'cloudflare', 'package.json');
+  if (fs.existsSync(cfPkg)) {
+    const cf = JSON.parse(fs.readFileSync(cfPkg, 'utf8'));
+    check('the Cloudflare package keeps its own tooling', !!(cf.devDependencies || {}).wrangler, JSON.stringify(cf.devDependencies));
+    check('and is marked private so it is never published', cf.private === true);
+    check('and has no runtime dependencies at all', Object.keys(cf.dependencies || {}).length === 0, JSON.stringify(cf.dependencies));
+  }
+  // A deployment config with credentials in it would be a secret in the repo
+  // and, if the glob ever widened, a secret in the shipped app.
+  const wrangler = path.join(relayDir, 'cloudflare', 'wrangler.jsonc');
+  if (fs.existsSync(wrangler)) {
+    const text = fs.readFileSync(wrangler, 'utf8');
+    check('the Cloudflare config carries no account id', !/account_id/.test(text), 'deployment credentials do not belong in the repository');
+    check('nor an API token', !/api_token|CLOUDFLARE_API/.test(text));
+    check('nor a production route', !/"routes"|"route"/.test(text), 'routes are attached at deploy time, deliberately');
+  }
+  // No relay database, ever, anywhere near the build.
+  for (const stray of ['relay.db', 'relay.db-wal', 'relay.db-shm']) {
+    check(`no ${stray} is committed`, !fs.existsSync(path.join(relayDir, 'node', stray)));
+  }
+
+  // THE RELAY CANNOT READ A REVIEW, and this is the check that says so about
+  // the code rather than about the intention: neither implementation imports
+  // Stacki's event model. A relay that could parse a review event is a relay
+  // that could be asked to.
+  const relayFiles = [];
+  const walkRelay = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.wrangler') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walkRelay(full);
+      else if (/\.(js|mjs|jsx)$/.test(entry.name)) relayFiles.push(full);
+    }
+  };
+  walkRelay(relayDir);
+  check('there is a relay to check', relayFiles.length >= 4, `${relayFiles.length} files`);
+  for (const file of relayFiles) {
+    const text = fs.readFileSync(file, 'utf8');
+    const where = path.relative(root, file);
+    // An IMPORT, not a mention: these files explain in their own comments why
+    // they must not do this, and a grep for the path alone would flag the
+    // explanation.
+    check(
+      `${where} does not import Stacki's review events`,
+      !/(?:require\(\s*|from\s+)['"][^'"]*review\/events/.test(text),
+      'a relay that can parse a review event is a relay that could be asked to'
+    );
+    check(
+      `${where} does not reach into electron/`,
+      !/require\(\s*['"][^'"]*electron\//.test(text) && !/from\s+['"][^'"]*electron\//.test(text),
+      'the relay runs on machines that have never had Stacki installed'
+    );
+  }
+
+  // The shared file has to run in Node AND in a Worker, so it may require
+  // nothing at all.
+  const protocol = path.join(relayDir, 'protocol.js');
+  check('the shared envelope format exists', fs.existsSync(protocol));
+  if (fs.existsSync(protocol)) {
+    const text = fs.readFileSync(protocol, 'utf8');
+    check('the shared envelope format requires nothing', !/\brequire\(/.test(text), 'it runs unchanged in Node and in workerd');
+    check('and imports nothing', !/^\s*import\s/m.test(text));
+    check('and knows nothing about review events', !/thread|actorKind|lamport/.test(text));
+  }
+}
+
 // ── The archive contains the app ────────────────────────────────────────────
 
 check('the main process is packaged', files.includes('electron/**/*'), JSON.stringify(files));

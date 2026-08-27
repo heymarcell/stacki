@@ -123,7 +123,7 @@
     try { parsed = JSON.parse(bytes); } catch (e) { return false; }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
     var keys = Object.keys(parsed).sort().join(',');
-    if (keys !== 'i,id,k,r') return false;
+    if (keys !== 'e,i,id,k,r') return false;
     if (typeof parsed.r !== 'string' || !/^https:\/\/|^http:\/\/(localhost|127\.0\.0\.1|\[::1\])/.test(parsed.r)) return false;
     var secret = b64urlBytes(parsed.k);
     return !!secret && secret.length === 32;
