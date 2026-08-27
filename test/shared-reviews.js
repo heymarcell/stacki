@@ -49,7 +49,7 @@ const {
 } = require('../electron/review/transport.js');
 const { createWorkspaces } = require('../electron/review/workspaces.js');
 const { createReviewStore, scopeKey } = require('../electron/review/store.js');
-const { syncOnce, createSyncer } = require('../electron/review/sync.js');
+const { syncOnce, createSyncer, legacyLink } = require('../electron/review/sync.js');
 const { makeEvent, projectThreads } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
 
@@ -270,12 +270,12 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     const made = aliceLedger.apply({ action: 'create', message: 'This CTA is too close to the copy.', anchor });
     check('a comment on a shared project is queued to send', aliceLedger.shared.pending === 2, String(aliceLedger.shared.pending));
 
-    const pushed = await syncOnce({ store: aliceLedger, workspace: aliceCred });
+    const pushed = await syncOnce({ store: aliceLedger, link: legacyLink(aliceCred) });
     check('a sync pushes it', pushed.ok === true && pushed.pushed === 2, JSON.stringify(pushed));
     check('and the outbox empties', aliceLedger.shared.pending === 0);
     check('and it says when it last caught up', typeof aliceLedger.shared.lastSyncAt === 'number');
 
-    const pulled = await syncOnce({ store: bobLedger, workspace: bobCred });
+    const pulled = await syncOnce({ store: bobLedger, link: legacyLink(bobCred) });
     check('the other person’s first sync pulls it', pulled.ok === true && pulled.pulled === 2, JSON.stringify(pulled));
     const bobSees = bobLedger.all();
     check('and they see the thread', bobSees.length === 1 && bobSees[0].messages[0].body === 'This CTA is too close to the copy.', JSON.stringify(bobSees.map((t) => t.messages.map((m) => m.body))));
@@ -288,8 +288,8 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
 
     // Bob replies; Alice sees it.
     bobLedger.apply({ action: 'reply', threadId: bobSees[0].id, message: 'Agreed — and the button is small.' });
-    await syncOnce({ store: bobLedger, workspace: bobCred });
-    await syncOnce({ store: aliceLedger, workspace: aliceCred });
+    await syncOnce({ store: bobLedger, link: legacyLink(bobCred) });
+    await syncOnce({ store: aliceLedger, link: legacyLink(aliceCred) });
     const aliceSees = aliceLedger.get(made.thread.id);
     check('a reply comes back the other way', aliceSees.messages.length === 2, String(aliceSees.messages.length));
     check('signed by the person who wrote it', aliceSees.messages[1].actorName === 'Bob');
@@ -310,17 +310,17 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     const dead = { id: shared.workspace.id, server: 'http://127.0.0.1:1', token: shared.credential.token };
     const wrote = aliceLedger.apply({ action: 'reply', threadId: thread.id, message: 'written with no network' });
     check('a comment can be written with no server', wrote.ok === true);
-    const failed = await syncOnce({ store: aliceLedger, workspace: dead });
+    const failed = await syncOnce({ store: aliceLedger, link: legacyLink(dead) });
     check('and the sync says what went wrong', failed.ok === false && ['offline', 'timeout'].includes(failed.code), JSON.stringify(failed));
     check('the panel is told, by name', ['offline', 'timeout'].includes(aliceLedger.shared.problem?.kind), JSON.stringify(aliceLedger.shared.problem));
     check('nothing was thrown away', aliceLedger.shared.pending === 1, String(aliceLedger.shared.pending));
     check('and the comment is still readable', aliceLedger.get(thread.id).messages.some((m) => m.body === 'written with no network'));
 
     // Back on the network.
-    const recovered = await syncOnce({ store: aliceLedger, workspace: aliceCred });
+    const recovered = await syncOnce({ store: aliceLedger, link: legacyLink(aliceCred) });
     check('reconnecting sends what was waiting', recovered.ok === true && recovered.pushed === 1, JSON.stringify(recovered));
     check('and the problem clears', aliceLedger.shared.problem === null);
-    await syncOnce({ store: bobLedger, workspace: bobCred });
+    await syncOnce({ store: bobLedger, link: legacyLink(bobCred) });
     check('and the other person gets it', bobLedger.get(thread.id).messages.some((m) => m.body === 'written with no network'));
   }
 
@@ -364,7 +364,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     check('along with the workspace it belongs to', reopened.shared.workspaceId === shared.workspace.id);
     check('and the reviews', reopened.all().length === aliceLedger.all().length);
     // A second sync from the restored cursor is a no-op, not a re-download.
-    const after = await syncOnce({ store: reopened, workspace: aliceCred });
+    const after = await syncOnce({ store: reopened, link: legacyLink(aliceCred) });
     check('and a sync from it pulls nothing new', after.ok === true && after.pulled === 0, JSON.stringify(after));
   }
 
@@ -375,7 +375,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     const store = ledgerFor('revoked', ALICE);
     store.enableShared({ workspaceId: shared.workspace.id, publishExisting: false });
     store.apply({ action: 'create', message: 'still mine', anchor });
-    const result = await syncOnce({ store, workspace: revoked });
+    const result = await syncOnce({ store, link: legacyLink(revoked) });
     check('a refused credential is reported as such', result.ok === false && result.code === 'unauthorized', JSON.stringify(result));
     check('and said in a way a person can act on', store.shared.problem?.kind === 'unauthorized');
     check('while the comment stays exactly where it is', store.all().length === 1 && store.shared.pending === 2);
@@ -392,11 +392,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     const local = ledgerFor('local-only', ALICE);
     local.apply({ action: 'create', message: 'nobody else sees this', anchor });
     local.apply({ action: 'reply', threadId: local.all()[0].id, message: 'and nor this' });
-    const skipped = await syncOnce({
-      store: local,
-      workspace: null,
-      makeTransport: (config) => createTransport({ ...config, fetchImpl: countingFetch }),
-    });
+    const skipped = await syncOnce({ store: local, link: legacyLink(null) });
     check('syncing an unshared project does nothing', skipped.ok === true && skipped.skipped === 'not_shared', JSON.stringify(skipped));
     // The guarantee. Review comments are candid; the only thing that makes
     // "they never leave your machine" true is that no code path reaches a
@@ -407,7 +403,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     // told to share refuses.
     check(
       'a credential alone does not make a project shared',
-      (await syncOnce({ store: local, workspace: aliceCred, makeTransport: () => { calls += 1; throw new Error('should not be built'); } })).skipped === 'not_shared'
+      (await syncOnce({ store: local, link: legacyLink(aliceCred, () => { calls += 1; throw new Error('should not be built'); }) })).skipped === 'not_shared'
     );
     check('and still no request was made', calls === 0, `${calls} request(s)`);
   }
@@ -417,7 +413,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
   {
     const store = ledgerFor('mismatch', ALICE);
     store.enableShared({ workspaceId: 'some-other-workspace', publishExisting: false });
-    const result = await syncOnce({ store, workspace: aliceCred });
+    const result = await syncOnce({ store, link: legacyLink(aliceCred) });
     check('a project linked to one workspace will not sync with another', result.ok === false && result.code === 'workspace_mismatch', JSON.stringify(result));
   }
 
@@ -437,8 +433,10 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     const result = await syncOnce({
       store,
       // Alice's credential, Bob's ledger.
-      workspace: { ...aliceCred, actorId: ALICE.id },
-      makeTransport: (config) => { calls += 1; return createTransport(config); },
+      link: legacyLink({ ...aliceCred, actorId: ALICE.id }, (config) => {
+        calls += 1;
+        return createTransport(config);
+      }),
     });
     check('an identity that does not match the membership refuses to sync', result.ok === false && result.code === 'identity_mismatch', JSON.stringify(result));
     check('before making any request at all', calls === 0, `${calls} request(s)`);
@@ -462,7 +460,7 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
       pullEvents: async () => ({ ok: true, events: [], cursor: 0, hasMore: false }),
       close() {},
     });
-    const result = await syncOnce({ store, workspace: aliceCred, makeTransport: refusing });
+    const result = await syncOnce({ store, link: legacyLink(aliceCred, refusing) });
     check('a refused push still empties the outbox', store.shared.pending === 0, String(store.shared.pending));
     check('and is counted rather than swallowed', result.refused === 2, JSON.stringify(result));
     check('and said out loud', store.shared.problem?.kind === 'refused_events', JSON.stringify(store.shared.problem));
@@ -477,14 +475,14 @@ const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} 
     store.enableShared({ workspaceId: shared.workspace.id, publishExisting: false });
     store.apply({ action: 'create', message: 'concurrent', anchor });
     const [a, b] = await Promise.all([
-      syncer.sync({ store, workspace: aliceCred }),
-      syncer.sync({ store, workspace: aliceCred }),
+      syncer.sync({ store, link: legacyLink(aliceCred) }),
+      syncer.sync({ store, link: legacyLink(aliceCred) }),
     ]);
     check('two syncs at once are one sync', a === b || JSON.stringify(a) === JSON.stringify(b), `${JSON.stringify(a)}\n    ${JSON.stringify(b)}`);
     check('and it worked', a.ok === true, JSON.stringify(a));
     // A focus is a hint. Coming back to the window a moment later is not a
     // reason to talk to a server again.
-    const soon = await syncer.sync({ store, workspace: aliceCred, reason: 'focus' });
+    const soon = await syncer.sync({ store, link: legacyLink(aliceCred), reason: 'focus' });
     check('a focus straight after a sync is skipped', soon.skipped === 'too_soon', JSON.stringify(soon));
   }
 

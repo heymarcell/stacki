@@ -44,7 +44,7 @@ const { anchorFrom } = require('./anchor');
 const { createCheckout } = require('./checkout');
 const { localActor, setLocalName, suggestName, agentActor, displayName } = require('./actors');
 const { createWorkspaces } = require('./workspaces');
-const { createSyncer } = require('./sync');
+const { createSyncer, legacyLink } = require('./sync');
 const {
   createWorkspace: createRemoteWorkspace,
   joinWorkspace: joinRemoteWorkspace,
@@ -53,6 +53,14 @@ const {
   unpackInvite,
 } = require('./transport');
 const { remoteHint, git } = require('./provenance');
+const { createSecureRooms } = require('./secure/secrets');
+const {
+  createSecureTransport,
+  createRoom: createSecureRoom,
+  joinRoom: joinSecureRoom,
+} = require('./secure/transport');
+const { unpackCapability, shareLink } = require('./secure/capability');
+const { relayFor, describeRelay, checkRelay, DEFAULT_RELAY } = require('./secure/relays');
 
 // Focusing a review can mean loading a page, drilling into two components and
 // waiting for the canvas to scroll. The context questions get 4 seconds; this
@@ -77,6 +85,14 @@ let hintCache = null;
 // The workspace this project belongs to, credential and all. Never leaves the
 // main process: `publicOf` is what the renderer gets.
 let workspace = null;
+// The secure room this project belongs to, if it has one. A project is either
+// legacy-shared or securely shared and never both — there is one `shared`
+// slot in the ledger and one row in the panel.
+let secureRooms = null;
+let room = null;
+// Set only while a join confirmation is on screen. Never persisted, never
+// written to disk, and cleared the moment the dialog closes — see §61.
+let pendingJoin = null;
 
 // Handed over by the MCP wiring, which already owns both.
 let ask = null;
@@ -118,7 +134,10 @@ function openProject(next) {
   // A hint and nothing else — see workspaces.js. Read once here rather than on
   // every list, because it is two `git` calls.
   hintCache = remoteHint(resolved);
-  workspace = registry ? registry.forProject(scopeKey(resolved)) : null;
+  // Secure first: a project that has a room is not consulted about a legacy
+  // workspace, so the two can never both be live for one project.
+  room = secureRooms ? secureRooms.forProject(scopeKey(resolved)) : null;
+  workspace = room ? null : registry ? registry.forProject(scopeKey(resolved)) : null;
   const actor = me();
   store = createReviewStore({
     file: fileFor(userData, resolved),
@@ -130,12 +149,12 @@ function openProject(next) {
   // project was closed, say. The registry is the one holding the credential,
   // so it decides, and the ledger is told to stop sharing rather than left
   // queueing events nothing will ever send.
-  if (store.shared.workspaceId && !workspace) store.disableShared();
+  if (store.shared.workspaceId && !workspace && !room) store.disableShared();
   announce(store.revision);
   // Opening a shared project is one of the three moments this app talks to a
   // server. It is deliberately not awaited: the panel shows what is on disk
   // immediately and grows the rest when it arrives.
-  if (workspace) void syncNow('open');
+  if (workspace || room) void syncNow('open');
   return store;
 }
 
@@ -146,6 +165,8 @@ function closeProject() {
   projectPath = null;
   checkout = null;
   workspace = null;
+  room = null;
+  pendingJoin = null;
   hintCache = null;
   syncer?.reset();
   announce(0);
@@ -330,37 +351,271 @@ function noteAgent(name) {
   if (shown) agentNameHint = shown;
 }
 
-/** What the panel shows in its Shared Reviews strip. Never a credential. */
+/**
+ * How this project is shared, for the sync loop. Null when it is not.
+ *
+ * The one place that knows there are two kinds. Everything downstream — the
+ * syncer, the retry, the problem codes — deals in this shape and never asks
+ * which it got.
+ */
+function linkFor() {
+  if (room) {
+    return {
+      kind: 'secure',
+      id: room.roomId,
+      actorId: room.actorId,
+      make: () => createSecureTransport({ rooms: secureRooms, roomId: room.roomId }),
+    };
+  }
+  return legacyLink(workspace);
+}
+
+/**
+ * What the panel shows. Never a credential, never a room id, never a secret.
+ *
+ * `mode` is what the row switches on: `off` is a project nobody has shared,
+ * `secure` is the one people get now, and `legacy` is a plaintext workspace
+ * somebody set up before this existed and which goes on working untouched.
+ */
 function sharedStatus() {
   const ledger = store ? store.shared : null;
   const who = userData ? me() : null;
+  const mode = ledger?.workspaceId ? (room ? 'secure' : workspace ? 'legacy' : 'off') : 'off';
   return {
-    enabled: !!(ledger?.workspaceId && workspace),
-    workspace: registry && workspace ? registry.publicOf(workspace) : null,
+    mode,
+    enabled: mode !== 'off',
+    // The legacy shape, kept exactly as it was so nothing that reads it breaks.
+    workspace: mode === 'legacy' && registry && workspace ? registry.publicOf(workspace) : null,
+    // The secure shape. No id, no relay credential, no key material — see the
+    // IPC audit in test/secure-share.js, which walks this object.
+    secure: mode === 'secure' && secureRooms ? secureRooms.publicOf(room) : null,
     lastSyncAt: ledger?.lastSyncAt ?? null,
     problem: ledger?.problem ?? null,
     // How much has not left this machine yet. The honest measure of "am I
     // caught up", and the thing that makes offline visible rather than silent.
     pending: ledger?.pending ?? 0,
-    // Threads deliberately kept off the workspace when sharing was enabled.
+    // Threads deliberately kept off the share when sharing was enabled.
     private: ledger?.excluded ?? 0,
     syncing: !!syncer?.busy,
     identity: who ? { actorId: who.id, displayName: who.displayName } : null,
     // A workspace this repository might already belong to. A suggestion for a
-    // person to look at and nothing else — see workspaces.js.
-    suggestion: !ledger?.workspaceId && registry && projectPath ? registry.suggestFor(hintCache) : null,
+    // person to look at and nothing else — see workspaces.js. Legacy only:
+    // Secure Share has no discovery of any kind, and a git remote is a hint
+    // and never a key.
+    suggestion: mode === 'off' && registry && projectPath ? registry.suggestFor(hintCache) : null,
+    // Where a NEW secure share would be created. Public information.
+    relay: describeRelay(relayFor({ preferred: secureRooms?.preferredRelay?.() })),
   };
 }
 
-/** Catch up with the workspace, if there is one. */
+/** Catch up, whichever kind of share this is. */
 async function syncNow(reason = 'manual') {
   if (!store) return noProject();
-  if (!workspace || !store.shared.workspaceId) {
+  const link = linkFor();
+  if (!link || !store.shared.workspaceId) {
     return { ok: true, skipped: 'not_shared', shared: sharedStatus() };
   }
-  const result = await syncer.sync({ store, workspace, reason });
+  const result = await syncer.sync({ store, link, reason });
   announce(store.revision);
   return { ...result, shared: sharedStatus() };
+}
+
+// --- secure share -----------------------------------------------------------
+
+/**
+ * Start sharing this project's comments securely.
+ *
+ * Everything secret is made on this machine before a request goes anywhere:
+ * the room id, the room secret, this member's room-scoped sender id and its
+ * room-specific signing key. The relay is told three values and none of those.
+ *
+ * `publishExisting` is the privacy decision and it is asked, not assumed —
+ * exactly as the legacy path asks it. Off means every comment written before
+ * this moment stays on this machine for good.
+ */
+async function enableSecureShare({ relay = null, publishExisting = false } = {}) {
+  if (!store || !projectPath) return noProject();
+  const actor = me();
+  if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to share as.' };
+  if (store.shared.workspaceId) {
+    return { ok: false, code: 'already_shared', message: 'This project’s comments are already shared.' };
+  }
+  const origin = relay ? checkRelay(relay) : { ok: true, origin: relayFor({ preferred: secureRooms.preferredRelay() }) };
+  if (!origin.ok) return origin;
+
+  const made = await createSecureRoom({ relay: origin.origin, actor, rooms: secureRooms });
+  if (!made.ok) return made;
+  secureRooms.link(scopeKey(projectPath), made.room.roomId);
+  room = made.room;
+  workspace = null;
+  const turned = store.enableShared({ workspaceId: made.room.roomId, publishExisting });
+  if (!turned.ok) return turned;
+  const synced = await syncNow('enable');
+  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+}
+
+/**
+ * Look at an invitation without accepting it.
+ *
+ * Joining is never automatic and never silent. This is what the confirmation
+ * dialog is drawn from, and the capability is held in this process only —
+ * the renderer is told what the invitation is FOR, not what it contains.
+ */
+function inspectInvite(capability) {
+  const invitation = unpackCapability(capability);
+  if (!invitation) {
+    return { ok: false, code: 'bad_capability', message: 'That invitation could not be read.' };
+  }
+  pendingJoin = invitation;
+  return {
+    ok: true,
+    invite: {
+      relay: describeRelay(invitation.relay),
+      // The project this would attach to, which is the question a person is
+      // actually being asked. Null when nothing is open.
+      project: projectPath ? path.basename(projectPath) : null,
+      alreadyShared: !!store?.shared?.workspaceId,
+    },
+  };
+}
+
+/** Nothing was accepted. Let go of it. */
+function cancelInvite() {
+  pendingJoin = null;
+  return { ok: true };
+}
+
+/**
+ * Accept the invitation currently being confirmed.
+ *
+ * It takes no capability argument on purpose: the only thing that can be
+ * joined is the one a person has been shown and has said yes to. A renderer
+ * that has been talked into calling this cannot name a different room.
+ */
+async function joinSecureShare({ publishExisting = false } = {}) {
+  if (!store || !projectPath) return noProject();
+  if (!pendingJoin) return { ok: false, code: 'no_invite', message: 'There is no invitation to accept.' };
+  const actor = me();
+  if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to join as.' };
+  if (store.shared.workspaceId) {
+    return { ok: false, code: 'already_shared', message: 'This project’s comments are already shared.' };
+  }
+
+  const capability = `stacki2.${Buffer.from(
+    JSON.stringify({ r: pendingJoin.relay, id: pendingJoin.roomId, i: pendingJoin.invite, k: pendingJoin.secret }),
+    'utf8'
+  ).toString('base64url')}`;
+  const joined = await joinSecureRoom({ capability, actor, rooms: secureRooms });
+  pendingJoin = null;
+  if (!joined.ok) return joined;
+
+  secureRooms.link(scopeKey(projectPath), joined.room.roomId);
+  room = joined.room;
+  workspace = null;
+  const turned = store.enableShared({ workspaceId: joined.room.roomId, publishExisting });
+  if (!turned.ok) return turned;
+  const synced = await syncNow('join');
+  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+}
+
+/**
+ * A single-use way in for one more person.
+ *
+ * A human action in the app's own window, never an MCP one. The capability
+ * crosses to the renderer because somebody asked for something to copy, and it
+ * is not stored anywhere on the way.
+ */
+async function createSecureInvite({ ttlMs = null } = {}) {
+  if (!store || !room) {
+    return { ok: false, code: 'not_shared', message: 'This project is not sharing its comments securely.' };
+  }
+  const transport = createSecureTransport({ rooms: secureRooms, roomId: room.roomId });
+  try {
+    const made = await transport.createInvite({ ttlMs });
+    if (!made.ok) return made;
+    return {
+      ok: true,
+      capability: made.capability,
+      // The ordinary form: an https link whose whole payload is after the `#`,
+      // so the page it opens is fetched without it.
+      link: shareLink({ shareOrigin: made.relay, capability: made.capability }),
+      expiresAt: made.expiresAt,
+    };
+  } finally {
+    transport.close();
+  }
+}
+
+/**
+ * Stop this machine talking to the room.
+ *
+ * Local review history is untouched — every comment stays readable, and what
+ * was already shared stays shared. The relay credential is revoked and the
+ * room's secrets are forgotten here.
+ */
+async function leaveSecureShare() {
+  if (!store || !room) {
+    return { ok: false, code: 'not_shared', message: 'This project is not sharing its comments securely.' };
+  }
+  const transport = createSecureTransport({ rooms: secureRooms, roomId: room.roomId });
+  try {
+    // Best effort. A relay that cannot be reached must not be able to keep
+    // somebody in a share they have decided to leave.
+    await transport.leave();
+  } catch {
+    /* the local forget below is what actually matters */
+  } finally {
+    transport.close();
+  }
+  secureRooms.unlink(scopeKey(projectPath));
+  secureRooms.forget(room.roomId);
+  room = null;
+  const turned = store.disableShared();
+  if (!turned.ok) return turned;
+  return { ok: true, shared: sharedStatus() };
+}
+
+/**
+ * End it for everybody.
+ *
+ * The relay's copy of every envelope goes. What does not go — and what the UI
+ * says plainly — is the copy each person already decrypted onto their own
+ * machine. Ending a share is not a way to unsay something.
+ */
+async function endSecureShare() {
+  if (!store || !room) {
+    return { ok: false, code: 'not_shared', message: 'This project is not sharing its comments securely.' };
+  }
+  if (!room.isOwner) {
+    return { ok: false, code: 'not_owner', message: 'Only the person who started this share can end it.' };
+  }
+  const transport = createSecureTransport({ rooms: secureRooms, roomId: room.roomId });
+  let ended;
+  try {
+    ended = await transport.end();
+  } finally {
+    transport.close();
+  }
+  if (!ended?.ok) return ended || { ok: false, code: 'sync_failed', message: 'Ending this share did not work.' };
+  secureRooms.unlink(scopeKey(projectPath));
+  secureRooms.forget(room.roomId);
+  room = null;
+  const turned = store.disableShared();
+  if (!turned.ok) return turned;
+  return { ok: true, shared: sharedStatus() };
+}
+
+/** Which relay new shares go to. A preference, not a credential. */
+function setSecureRelay({ relay = null } = {}) {
+  if (!secureRooms) return { ok: false, code: 'no_identity', message: 'Stacki has nowhere to keep that.' };
+  if (relay == null || relay === '') {
+    secureRooms.setPreferredRelay(null);
+    return { ok: true, relay: describeRelay(relayFor({})) };
+  }
+  const checked = checkRelay(relay);
+  if (!checked.ok) return checked;
+  secureRooms.setPreferredRelay(checked.origin);
+  return { ok: true, relay: describeRelay(checked.origin) };
 }
 
 /**
@@ -372,6 +627,9 @@ async function syncNow(reason = 'manual') {
  */
 async function enableShared({ server, signupToken, displayName: shown, publishExisting = false } = {}) {
   if (!store || !projectPath) return noProject();
+  // Legacy plaintext sharing stays available for the workspaces people already
+  // have. It is not a thing to start on top of a secure share.
+  if (room) return { ok: false, code: 'already_shared', message: 'This project’s comments are already shared securely.' };
   const actor = me();
   if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to share as.' };
   const hint = hintCache;
@@ -409,6 +667,7 @@ async function enableShared({ server, signupToken, displayName: shown, publishEx
 /** Accept an invitation to somebody else's workspace, for this project. */
 async function joinShared({ invite, publishExisting = false } = {}) {
   if (!store || !projectPath) return noProject();
+  if (room) return { ok: false, code: 'already_shared', message: 'This project’s comments are already shared securely.' };
   const actor = me();
   if (!actor) return { ok: false, code: 'no_identity', message: 'Stacki has no identity to join as.' };
   const unpacked = unpackInvite(invite);
@@ -442,6 +701,11 @@ async function joinShared({ invite, publishExisting = false } = {}) {
  */
 function disableShared() {
   if (!store || !projectPath) return noProject();
+  // A secure share is left or ended, never "stopped": one revokes a credential
+  // at the relay and the other ends the room for everybody, and quietly
+  // dropping the local link instead would leave this machine in a room it has
+  // stopped listening to.
+  if (room) return { ok: false, code: 'secure_share', message: 'Leave or end the secure share instead.' };
   registry.unlink(scopeKey(projectPath));
   workspace = null;
   const turned = store.disableShared();
@@ -579,10 +843,13 @@ async function focus(threadId) {
  * this to read or write anywhere else in userData. The sharing channels take a
  * server address and an invitation, which are the two things a person types.
  */
-function start({ userDataPath, send }) {
+function start({ userDataPath, send, protector = null }) {
   userData = userDataPath;
   sendToWindow = send || null;
   registry = registry || createWorkspaces({ userDataPath });
+  // `protector` is injected by tests and only by tests. In the app it is
+  // Electron's safeStorage; nothing automated ever reaches a real Keychain.
+  secureRooms = secureRooms || createSecureRooms({ userDataPath, protector });
   syncer = syncer || createSyncer();
   if (registered) return;
   registered = true;
@@ -601,8 +868,35 @@ function start({ userDataPath, send }) {
   ipcMain.handle('reviews:sharedJoin', (_e, args) => joinShared(args || {}));
   ipcMain.handle('reviews:sharedDisable', () => disableShared());
   ipcMain.handle('reviews:sharedInvite', (_e, args) => createInvite(args || {}));
+  // Secure Share. Every one of these is a person doing something in the app's
+  // own window: there is no MCP tool and no Agent API route that reaches any
+  // of them, which is the same rule the legacy sharing verbs have and matters
+  // more here because the thing behind them is a decryption key.
+  ipcMain.handle('reviews:secureEnable', (_e, args) => enableSecureShare(args || {}));
+  ipcMain.handle('reviews:secureInspect', (_e, args) => inspectInvite(args?.capability));
+  ipcMain.handle('reviews:secureCancelJoin', () => cancelInvite());
+  ipcMain.handle('reviews:secureJoin', (_e, args) => joinSecureShare(args || {}));
+  ipcMain.handle('reviews:secureInvite', (_e, args) => createSecureInvite(args || {}));
+  ipcMain.handle('reviews:secureLeave', () => leaveSecureShare());
+  ipcMain.handle('reviews:secureEnd', () => endSecureShare());
+  ipcMain.handle('reviews:secureRelay', (_e, args) => setSecureRelay(args || {}));
   ipcMain.handle('reviews:identity', () => identity());
   ipcMain.handle('reviews:setIdentity', (_e, args) => setIdentity(args || {}));
+}
+
+/**
+ * An invitation arrived from the operating system.
+ *
+ * The deep link handler in main.js has already checked the URL; this checks
+ * the capability itself and then asks a PERSON. Nothing joins on its own —
+ * see joinSecureShare, which takes no capability argument precisely so that
+ * the only room that can be joined is the one somebody was shown.
+ */
+function offerInvite(capability) {
+  const looked = inspectInvite(capability);
+  if (!looked.ok) return looked;
+  sendToWindow?.('reviews:invite', looked.invite);
+  return looked;
 }
 
 /** The MCP wiring, handing over the things only it has. */
@@ -639,6 +933,17 @@ module.exports = {
   joinShared,
   disableShared,
   createInvite,
+  // secure share
+  enableSecureShare,
+  inspectInvite,
+  cancelInvite,
+  joinSecureShare,
+  createSecureInvite,
+  leaveSecureShare,
+  endSecureShare,
+  setSecureRelay,
+  offerInvite,
+  DEFAULT_RELAY,
   identity,
   setIdentity,
   noteAgent,

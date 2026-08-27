@@ -344,11 +344,31 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     return true;
   }
 
+  /**
+   * Which relay this installation creates new shares against.
+   *
+   * A preference and not a credential: it is stored unencrypted beside the
+   * rooms, it may be read by anything that can read the file, and a bad value
+   * is ignored rather than fatal. See relays.js for the order it is consulted
+   * in.
+   */
+  const preferredRelay = () => relayOrigin(read().preferredRelay);
+
+  function setPreferredRelay(origin) {
+    const data = read();
+    const normalized = origin ? relayOrigin(origin) : null;
+    if (origin && !normalized) return false;
+    write({ ...data, version: 2, preferredRelay: normalized });
+    return true;
+  }
+
   return {
     file: fileFor(userDataPath),
     all,
     get,
     publicOf,
+    preferredRelay,
+    setPreferredRelay,
     remember,
     update,
     pin,

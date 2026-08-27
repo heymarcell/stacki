@@ -182,7 +182,7 @@ const deepLink = (capability) => (capability ? `stacki://join#${capability}` : n
  * routed, and the payload is fed straight into `unpackCapability` — so the
  * worst a hostile deep link can do is fail to be an invitation.
  */
-function readDeepLink(url) {
+function deepLinkCapability(url) {
   if (typeof url !== 'string' || !url || url.length > MAX_CAPABILITY + 64) return null;
   if (CONTROL.test(url)) return null;
   let parsed;
@@ -202,8 +202,13 @@ function readDeepLink(url) {
   // decode, and only when there is something encoded to decode — never a loop,
   // which is how a double-encoded payload gets a second reading.
   const candidate = fragment.includes('%') ? safeDecode(fragment) : fragment;
-  return unpackCapability(candidate);
+  // Validated before it is handed back, so a caller cannot get a string out of
+  // here that `unpackCapability` would refuse.
+  return unpackCapability(candidate) ? candidate.trim() : null;
 }
+
+/** The same, as the invitation it names. */
+const readDeepLink = (url) => unpackCapability(deepLinkCapability(url));
 
 const safeDecode = (text) => {
   try {
@@ -224,4 +229,5 @@ module.exports = {
   shareLink,
   deepLink,
   readDeepLink,
+  deepLinkCapability,
 };

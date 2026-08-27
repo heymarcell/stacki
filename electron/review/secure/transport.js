@@ -253,13 +253,22 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
 
       const raw = Array.isArray(answer.body.envelopes) ? answer.body.envelopes : [];
       const events = [];
+      // Names observed on decrypted events, so Manage can say "Alice" rather
+      // than "a member". Collected here and written once at the end — a member
+      // writes many events and this is a file on disk.
+      const names = new Map();
       let unverified = 0;
       let pending = [];
+
+      const take = (got) => {
+        events.push(got.event);
+        if (got.event.actorKind === 'human' && got.event.actorName) names.set(got.senderId, got.event.actorName);
+      };
 
       for (const one of raw) {
         const got = openOne(one);
         if (got.ok) {
-          events.push(got.event);
+          take(got);
           continue;
         }
         if (got.code === 'unknown_sender') pending.push(one);
@@ -274,13 +283,19 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
         pending = [];
         for (const one of again) {
           const got = openOne(one);
-          if (got.ok) events.push(got.event);
+          if (got.ok) take(got);
           else unverified += 1;
         }
       }
       // Anything still from an unknown sender after a refresh is an envelope
       // from somebody the relay will not vouch for. Counted, not taken.
       unverified += pending.length;
+
+      // A display name is never sent to a relay, so this is the ONLY way this
+      // machine can learn one: out of a review event it was able to decrypt.
+      // Somebody who has joined and never written anything stays "another
+      // member", which is the honest answer.
+      for (const [senderId, shown] of names) rooms.learnName(room.roomId, senderId, shown);
 
       return {
         ok: true,

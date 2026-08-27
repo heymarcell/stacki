@@ -64,6 +64,7 @@ const { openableUrl, refusalFor } = require('./externalLinks');
 const { dialogsSuppressed, suppressedResponse, suppressedLine } = require('./dialogPolicy');
 const mcp = require('./mcp');
 const reviews = require('./review');
+const { deepLinkCapability } = require('./review/secure/capability');
 const { createAccessStore } = require('./mcp/agent/access');
 
 let mainWindow = null;
@@ -436,6 +437,87 @@ handle('native:redo', () => {
   return { ok: true };
 });
 
+// ---------------------------------------------------------------------------
+// The join link
+//
+// `stacki://join#stacki2....` is the ONE thing this protocol does. It is not a
+// command channel and it must never become one: there is no path from here to
+// a shell, a file, a git command, an MCP tool or a source edit. The handler
+// below hands a string to `reviews.offerInvite`, which parses it, refuses
+// anything that is not exactly a capability, and then ASKS A PERSON. Nothing
+// joins on its own.
+//
+// Three delivery paths, because three operating systems disagree:
+//
+//   macOS      `open-url`, on a running app or on a cold start
+//   Windows    in argv of a SECOND launch, handed over by `second-instance`
+//   Linux      the same, via the .desktop entry the packager writes
+//
+// The single-instance lock is what makes the second and third work at all —
+// without it a link would start a second Stacki holding the same userData,
+// which is a good way to lose a review ledger.
+
+const JOIN_SCHEME = 'stacki';
+
+/** The first `stacki://` argument in a command line, if there is one. */
+function joinUrlIn(argv) {
+  if (!Array.isArray(argv)) return null;
+  for (const arg of argv) {
+    if (typeof arg === 'string' && arg.length < 4096 && arg.toLowerCase().startsWith(`${JOIN_SCHEME}://`)) return arg;
+  }
+  return null;
+}
+
+/**
+ * Offer an invitation to the person at the keyboard.
+ *
+ * The window is raised because a link they clicked in a browser should bring
+ * the app forward — but nothing is accepted, and the capability never reaches
+ * the renderer: it is held in the main process until they say yes or the
+ * dialog closes. See electron/review/index.js.
+ */
+function handleJoinUrl(url) {
+  // One parser, and it validates. Anything this returns is a capability the
+  // review module will also accept; anything it refuses stops here.
+  const capability = deepLinkCapability(url);
+  if (!capability) return false;
+  if (!mainWindow) createWindow();
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    // The harnesses run a window that was never shown; showing it here would
+    // be the one thing that takes the screen.
+    if (process.env.STACKI_HIDDEN_WINDOW !== '1') mainWindow.show();
+    mainWindow.focus();
+  }
+  reviews.offerInvite(capability);
+  return true;
+}
+
+// A URL that arrived before the app was ready, held until it is.
+let queuedJoinUrl = null;
+
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  // Another Stacki owns this userData. Hand it whatever we were opened with
+  // and get out of the way rather than run a second copy of the app.
+  app.quit();
+} else {
+  app.on('second-instance', (_event, argv) => {
+    const url = joinUrlIn(argv);
+    if (url) handleJoinUrl(url);
+    else if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (app.isReady()) handleJoinUrl(url);
+  else queuedJoinUrl = url;
+});
+
 app.whenReady().then(() => {
   // Before the menu, which draws the sound item's tick from it.
   settings = readSettings();
@@ -468,6 +550,23 @@ app.whenReady().then(() => {
   // door is registered once, and which project's reviews are behind it moves
   // with whatever is open (see project:scan below).
   reviews.start({ userDataPath: app.getPath('userData'), send });
+  // Claim the scheme. In development the executable is Electron itself, so the
+  // path and an argument have to be given explicitly or the OS registers the
+  // wrong program.
+  try {
+    if (process.defaultApp && process.argv.length >= 2) {
+      app.setAsDefaultProtocolClient(JOIN_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+    } else {
+      app.setAsDefaultProtocolClient(JOIN_SCHEME);
+    }
+  } catch {
+    /* a platform that will not register it still works; the link just will not open Stacki */
+  }
+  // Anything that arrived before there was an app to show it in, and — on
+  // Windows and Linux — a link that started this process in the first place.
+  const opening = queuedJoinUrl || joinUrlIn(process.argv);
+  queuedJoinUrl = null;
+  if (opening) setTimeout(() => handleJoinUrl(opening), 0);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

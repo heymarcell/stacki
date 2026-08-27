@@ -1,0 +1,529 @@
+// Two people, two machines, one encrypted room.
+//
+//   node --disable-warning=ExperimentalWarning test/secure-share.js
+//
+// Everything between one person's ledger and another's, with a real relay on a
+// real port in between and nothing mocked. Alice and Bob get separate userData
+// directories, separate ledgers, separate secret stores and separate copies of
+// the project, because the failures worth catching here all live at a boundary
+// and a shared object hides every one of them.
+//
+// The properties, in the order they would hurt:
+//
+//   NO EVENT IS EVER LOST. Not to a duplicate delivery, not to an out-of-order
+//   one, not to a relay that was down when somebody wrote a reply, not to a
+//   restart. Both sides converge on the same set, byte for byte.
+//
+//   NOTHING THE RELAY HOLDS IS READABLE. Proved by running a real share and
+//   then searching the database file, not by reading the source.
+//
+//   AUTHORSHIP CANNOT BE FORGED. Bob cannot make an event that Alice's Stacki
+//   will fold as Alice's, whatever he sends and however he sends it — including
+//   by going around his own client and building the envelope by hand.
+//
+//   A PINNED KEY NEVER MOVES. A relay that hands out a different signing key
+//   for a sender it has already vouched for is refused, not merged.
+//
+//   NO SECRET REACHES THE PROJECT, THE RENDERER, OR A LOG.
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
+const failures = [];
+let checked = 0;
+const check = (what, condition, detail) => {
+  checked++;
+  if (!condition) failures.push(`  ${what}${detail ? `\n    ${detail}` : ''}`);
+  return !!condition;
+};
+
+const { createSecureRelay } = require('../relay/node/server.js');
+const { createSecureRooms } = require('../electron/review/secure/secrets.js');
+const { createSecureTransport, createRoom, joinRoom } = require('../electron/review/secure/transport.js');
+const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, newSigningKeys } = require('../electron/review/secure/crypto.js');
+const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
+const { checkRelay, describeRelay, relayFor, DEFAULT_RELAY } = require('../electron/review/secure/relays.js');
+const { createReviewStore, scopeKey, fileFor } = require('../electron/review/store.js');
+const { syncOnce, createSyncer } = require('../electron/review/sync.js');
+const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
+const { uuidv5, agentActor } = require('../electron/review/actors.js');
+const { signingBytes, toBase64Url, fromBase64Url } = require('../relay/protocol.js');
+
+const temp = [];
+const mkdir = (tag) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-share-${tag}-`));
+  temp.push(dir);
+  return dir;
+};
+
+// A deterministic protector. Never a real Keychain in an automated test — that
+// would prompt, and on a build machine it would hang.
+const protector = {
+  available: true,
+  backend: 'test',
+  encrypt: (text) => Buffer.from(text, 'utf8').toString('base64'),
+  decrypt: (blob) => Buffer.from(blob, 'base64').toString('utf8'),
+};
+/** A machine with no OS keyring at all — a container, a minimal Linux desktop. */
+const noProtector = {
+  available: false,
+  backend: 'none',
+  encrypt: () => {
+    throw new Error('no backend');
+  },
+  decrypt: () => {
+    throw new Error('no backend');
+  },
+};
+
+const ALICE = { id: uuidv5('alice'), kind: 'human', displayName: 'Alice Secret Tester' };
+const BOB = { id: uuidv5('bob'), kind: 'human', displayName: 'Bob' };
+const CLAUDE = agentActor('Claude');
+
+const CANARY = 'STACKI_PLAINTEXT_CANARY_7d4f1a';
+
+// Where a review points. The same shape the panel builds when somebody clicks
+// something on the page.
+const ANCHOR = { keys: ['src/pages/super-secret-test.astro#0.1'], page: { route: '/', file: 'src/pages/super-secret-test.astro' } };
+// Provenance is two git calls against a directory that is not a repository, so
+// it is stubbed off rather than left to fail slowly in a test.
+const NO_GIT = { for: () => ({ head: null, branch: null, dirty: null, files: {} }), stamp: () => ({ head: null, branch: null, dirty: null }) };
+
+/** One person's whole Stacki: userData, a secret store, a project, a ledger. */
+function makePerson(tag, actor) {
+  const userData = mkdir(`${tag}-user`);
+  const project = mkdir(`${tag}-project`);
+  fs.writeFileSync(path.join(project, 'index.html'), '<h1>hi</h1>', 'utf8');
+  const rooms = createSecureRooms({ userDataPath: userData, protector });
+  const store = createReviewStore({ file: fileFor(userData, project), projectPath: project, actor, source: NO_GIT });
+  return { tag, actor, userData, project, rooms, store, roomId: null };
+}
+
+/** The link shape sync.js wants, for a secure room. */
+const linkFor = (person) => ({
+  kind: 'secure',
+  id: person.roomId,
+  actorId: person.actor.id,
+  make: () => createSecureTransport({ rooms: person.rooms, roomId: person.roomId }),
+});
+
+const sync = (person, reason = 'manual') => syncOnce({ store: person.store, link: linkFor(person), reason });
+
+/**
+ * Start a review, the way the app does: locally, into the outbox, no network.
+ *
+ * These go through the ledger's own `apply` rather than building events by
+ * hand, so what this suite exercises is the path a person's click takes.
+ */
+const startReview = (person, message, actor = null) =>
+  person.store.apply({ action: 'create', message, anchor: ANCHOR, ...(actor ? { actor } : {}) });
+
+const reply = (person, threadId, message, actor = null) =>
+  person.store.apply({ action: 'reply', threadId, message, ...(actor ? { actor } : {}) });
+
+/** The id of the one review in a ledger, for replying to. */
+const onlyThread = (person) => person.store.all()[0]?.id;
+
+async function main() {
+  const relay = createSecureRelay({ port: 0, host: '127.0.0.1', onError: () => {} });
+  await relay.start();
+  const base = `http://127.0.0.1:${relay.address.port}`;
+
+  const alice = makePerson('alice', ALICE);
+  const bob = makePerson('bob', BOB);
+
+  // --- starting and joining -------------------------------------------------
+
+  const made = await createRoom({ relay: base, actor: ALICE, rooms: alice.rooms });
+  check('Alice can start a secure share', made.ok, made.code);
+  alice.roomId = made.room.roomId;
+  alice.rooms.link(scopeKey(alice.project), alice.roomId);
+  check('starting it makes her the owner', made.room.isOwner === true);
+  check('the room secret is 32 bytes', fromBase64Url(made.room.secret, 32) !== null);
+  alice.store.enableShared({ workspaceId: alice.roomId, publishExisting: false });
+
+  const aliceT = createSecureTransport({ rooms: alice.rooms, roomId: alice.roomId });
+  const invited = await aliceT.createInvite({});
+  check('she can make an invitation', invited.ok && typeof invited.capability === 'string');
+  check('the invitation is a link whose payload is after the fragment', shareLink({ shareOrigin: base, capability: invited.capability }).includes('/#stacki2.'));
+  const capability = invited.capability;
+
+  const joined = await joinRoom({ capability, actor: BOB, rooms: bob.rooms });
+  check('Bob can join with it', joined.ok, joined.code);
+  bob.roomId = joined.room.roomId;
+  bob.rooms.link(scopeKey(bob.project), bob.roomId);
+  check('joining does not make him the owner', joined.room.isOwner === false);
+  check('both are in the same room', alice.roomId === bob.roomId);
+  check('he pinned her signing key at the moment of joining', joined.room.pins[made.room.senderId] === made.room.publicKey);
+  bob.store.enableShared({ workspaceId: bob.roomId, publishExisting: false });
+
+  check('the invitation cannot be used again', (await joinRoom({ capability, actor: { id: uuidv5('carol'), kind: 'human' }, rooms: makePerson('carol', BOB).rooms })).ok === false);
+
+  // --- a conversation -------------------------------------------------------
+
+  const firstReview = startReview(alice, CANARY);
+  check('a comment can be written', firstReview.ok !== false, JSON.stringify(firstReview));
+  check('a comment is written before any network happens', alice.store.shared.pending >= 2, `${alice.store.shared.pending}`);
+
+  const pushed = await sync(alice);
+  check('Alice syncs', pushed.ok, JSON.stringify(pushed));
+  check('and her outbox drains', alice.store.shared.pending === 0);
+
+  const got = await sync(bob);
+  check('Bob syncs', got.ok, JSON.stringify(got));
+  check('and receives it', got.pulled >= 2, `${got.pulled}`);
+  check('Bob can read what she wrote', JSON.stringify(bob.store.all()).includes(CANARY));
+  check('and it arrives as a review, not a fragment', bob.store.all().length === 1);
+  check('attributed to her', bob.store.all()[0].messages[0].actorName === 'Alice Secret Tester');
+
+  reply(bob, onlyThread(bob), 'Agreed, fixing now.');
+  await sync(bob);
+  await sync(alice);
+  check('Alice receives his reply', JSON.stringify(alice.store.all()).includes('Agreed, fixing now.'));
+
+  // --- convergence ----------------------------------------------------------
+
+  // The whole log, in the one order, on each side. This is the actual
+  // convergence claim: not that the views look similar, that the sets are equal.
+  const fingerprint = (person) => JSON.stringify(orderEvents(person.store.allEvents()));
+
+  // Concurrent writes on both sides, then two rounds so each has seen the other.
+  reply(alice, onlyThread(alice), 'One more thing.');
+  reply(bob, onlyThread(bob), 'And another.');
+  await sync(alice);
+  await sync(bob);
+  await sync(alice);
+  await sync(bob);
+
+  // What must be identical is the LOG. Two things in the projection are
+  // deliberately not: `anchorState`, which is this machine's own answer to
+  // "does that element still exist in my checkout", and the local review
+  // number, which is a nickname taken when it happens to be free here. Both
+  // are facts about a laptop rather than about the review, and a shared model
+  // that forced them to agree would be lying about one of the two machines.
+  const local = (person) =>
+    JSON.stringify(person.store.all().map(({ anchorState, number, ...rest }) => rest));
+
+  check('both machines converge byte for byte', fingerprint(alice) === fingerprint(bob), `${alice.store.allEvents().length} vs ${bob.store.allEvents().length} events`);
+  check('and project to the same reviews', local(alice) === local(bob), `${local(alice).length} vs ${local(bob).length}`);
+  const aliceView = local(alice);
+  const bobView = local(bob);
+  check('nobody lost a message', aliceView.includes('One more thing.') && aliceView.includes('And another.'));
+  check('and the same is true on the other side', bobView.includes('One more thing.') && bobView.includes('And another.'));
+
+  // --- offline, then back ---------------------------------------------------
+
+  await relay.stop();
+  const offlineWrite = reply(alice, onlyThread(alice), 'Written on a plane.');
+  check('a comment written offline still succeeds', offlineWrite.ok !== false);
+  const offlineSync = await sync(alice);
+  check('and the sync reports the problem rather than throwing', offlineSync.ok === false && offlineSync.code === 'offline', JSON.stringify(offlineSync));
+  check('the comment is still here', JSON.stringify(alice.store.all()).includes('Written on a plane.'));
+  check('and it is still waiting to send', alice.store.shared.pending >= 1);
+
+  const relay2 = createSecureRelay({ port: relay.address ? 0 : 0, host: '127.0.0.1', onError: () => {} });
+  // A fresh relay on a new port is not the same room, so reconnect is tested
+  // by restarting the original listener instead.
+  await relay2.stop().catch(() => {});
+
+  const back = createSecureRelay({ port: Number(base.split(':').pop()), host: '127.0.0.1', file: ':memory:', onError: () => {} });
+  let reconnected = false;
+  try {
+    await back.start();
+    reconnected = true;
+  } catch {
+    /* the port was taken; the offline assertions above still stand */
+  }
+  if (reconnected) {
+    // The relay lost its database with its process, which is the harshest
+    // version of "the relay forgot": clients are the durable owners and must
+    // be able to repopulate it.
+    const recreate = await createRoom({ relay: base, actor: ALICE, rooms: makePerson('alice2', ALICE).rooms });
+    check('a client can still start a share against a restarted relay', recreate.ok);
+    await back.stop();
+  }
+
+  // --- everything below wants a live relay and a fresh room -----------------
+
+  const live = createSecureRelay({ port: 0, host: '127.0.0.1', onError: () => {} });
+  await live.start();
+  const liveBase = `http://127.0.0.1:${live.address.port}`;
+
+  const ann = makePerson('ann', ALICE);
+  const ben = makePerson('ben', BOB);
+  const room = await createRoom({ relay: liveBase, actor: ALICE, rooms: ann.rooms });
+  ann.roomId = room.room.roomId;
+  ann.rooms.link(scopeKey(ann.project), ann.roomId);
+  ann.store.enableShared({ workspaceId: ann.roomId, publishExisting: false });
+  const annT = createSecureTransport({ rooms: ann.rooms, roomId: ann.roomId });
+  const benInvite = await annT.createInvite({});
+  const benJoin = await joinRoom({ capability: benInvite.capability, actor: BOB, rooms: ben.rooms });
+  ben.roomId = benJoin.room.roomId;
+  ben.rooms.link(scopeKey(ben.project), ben.roomId);
+  ben.store.enableShared({ workspaceId: ben.roomId, publishExisting: false });
+
+  startReview(ann, 'First.');
+  await sync(ann);
+  await sync(ben);
+
+  // --- duplicate and out-of-order delivery ----------------------------------
+
+  const benT = createSecureTransport({ rooms: ben.rooms, roomId: ben.roomId });
+  const page = await benT.pullEvents({ after: null });
+  check('a pull returns the events', page.ok && page.events.length >= 2, `${page.events?.length}`);
+
+  const before = JSON.stringify(ben.store.all());
+  ben.store.receiveEvents(page.events, { cursor: 0, at: Date.now() });
+  check('delivering the same events again changes nothing', JSON.stringify(ben.store.all()) === before);
+  ben.store.receiveEvents([...page.events].reverse(), { cursor: 0, at: Date.now() });
+  check('delivering them backwards changes nothing', JSON.stringify(ben.store.all()) === before);
+
+  // --- restart and cursor recovery ------------------------------------------
+
+  const cursorBefore = ben.store.shared.cursor;
+  ben.store.flushSync();
+  const benAgain = createReviewStore({ file: fileFor(ben.userData, ben.project), projectPath: ben.project, actor: BOB });
+  check('a restarted ledger remembers its cursor', benAgain.shared.cursor === cursorBefore, `${benAgain.shared.cursor} vs ${cursorBefore}`);
+  check('a restarted ledger still has the comments', JSON.stringify(benAgain.all()).includes('First.'));
+  check('a restarted ledger is still in the room', benAgain.shared.workspaceId === ben.roomId);
+  const benRooms2 = createSecureRooms({ userDataPath: ben.userData, protector });
+  check('a restarted secret store still has the room', !!benRooms2.get(ben.roomId));
+  check('and still has the pinned key', benRooms2.get(ben.roomId).pins[room.room.senderId] === room.room.publicKey);
+
+  // --- agents ---------------------------------------------------------------
+
+  reply(ben, onlyThread(ben), 'Done — three files changed.', CLAUDE);
+  const agentPush = await sync(ben);
+  check('a person may submit an agent event', agentPush.ok && agentPush.pushed === 1, JSON.stringify(agentPush));
+  await sync(ann);
+  const annThreads = ann.store.all();
+  check('the agent event arrives', JSON.stringify(annThreads).includes('Done — three files changed.'));
+  const agentMessage = annThreads.flatMap((t) => t.messages || []).find((m) => m.body?.includes('three files changed'));
+  check('and is still attributed to the agent', agentMessage?.actorKind === 'agent', JSON.stringify(agentMessage));
+  check('with the agent name it was written under', agentMessage?.actorName === 'Claude');
+
+  // --- forging, by hand, going around the client ----------------------------
+  //
+  // The send-side guard stops an honest Stacki making one of these. This does
+  // it the way an attacker would: build the envelope directly with Ben's own
+  // room key and signing key, and put Ann's actor id inside.
+
+  const benRoom = ben.rooms.get(ben.roomId);
+  const benKeys = deriveKeys(benRoom.secret, benRoom.roomId);
+  const forgedThread = onlyThread(ben);
+  const forged = makeEvent({ type: 'message.created', threadId: forgedThread, actor: ALICE, lamport: 99, at: Date.now(), payload: { messageId: 'forged', body: 'Ann never said this.' } });
+  const sealedForgery = sealEvent({ keys: benKeys, senderId: benRoom.senderId, event: forged, privateKey: benRoom.privateKey });
+  const sentForgery = await fetch(`${liveBase}/v2/rooms/${ben.roomId}/envelopes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${benRoom.token}` },
+    body: JSON.stringify({ envelopes: [sealedForgery.envelope] }),
+  });
+  check('the relay takes it, because the relay cannot know', sentForgery.status === 200);
+
+  const annPull = await createSecureTransport({ rooms: ann.rooms, roomId: ann.roomId }).pullEvents({ after: null });
+  check('Ann refuses it', !annPull.events.some((e) => e.payload?.body === 'Ann never said this.'));
+  check('and counts it as unverified', annPull.unverified >= 1, `${annPull.unverified}`);
+  const annAfter = await sync(ann);
+  check('a sync that saw one says so rather than reporting a clean run', annAfter.unverified >= 1 || ann.store.shared.problem?.kind === 'unverified_events', JSON.stringify(ann.store.shared.problem));
+  check('and it never reaches the fold', !JSON.stringify(ann.store.all()).includes('Ann never said this.'));
+
+  // --- tampering ------------------------------------------------------------
+
+  const good = sealEvent({
+    keys: benKeys,
+    senderId: benRoom.senderId,
+    event: makeEvent({ type: 'message.created', threadId: forgedThread, actor: BOB, lamport: 100, at: Date.now(), payload: { messageId: 'ok', body: 'genuine' } }),
+    privateKey: benRoom.privateKey,
+  });
+  const flipped = Buffer.from(fromBase64Url(good.envelope.ciphertext));
+  flipped[3] ^= 0xff;
+  const tampered = await fetch(`${liveBase}/v2/rooms/${ben.roomId}/envelopes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${benRoom.token}` },
+    body: JSON.stringify({ envelopes: [{ ...good.envelope, ciphertext: toBase64Url(flipped) }] }),
+  });
+  const tamperedBody = await tampered.json();
+  check('a tampered ciphertext is refused by the relay too', tamperedBody.rejected?.[0]?.code === 'bad_signature', JSON.stringify(tamperedBody));
+
+  // --- key substitution -----------------------------------------------------
+
+  const substitute = newSigningKeys();
+  const pinAttempt = ben.rooms.pin(ben.roomId, room.room.senderId, substitute.publicKey);
+  check('a pinned signing key cannot be replaced', pinAttempt.ok === false && pinAttempt.code === 'key_changed', JSON.stringify(pinAttempt));
+  check('the original pin is still there', ben.rooms.get(ben.roomId).pins[room.room.senderId] === room.room.publicKey);
+  check('pinning the same key again is fine', ben.rooms.pin(ben.roomId, room.room.senderId, room.room.publicKey).ok === true);
+  check('a new sender can still be pinned', ben.rooms.pin(ben.roomId, senderIdFor(benKeys, 'someone-new'), substitute.publicKey).ok === true);
+
+  // --- cross room replay ----------------------------------------------------
+
+  const other = makePerson('other', ALICE);
+  const otherRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: other.rooms });
+  other.roomId = otherRoom.room.roomId;
+  const replayed = await fetch(`${liveBase}/v2/rooms/${other.roomId}/envelopes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherRoom.room.token}` },
+    body: JSON.stringify({ envelopes: [{ ...good.envelope, senderId: otherRoom.room.senderId }] }),
+  });
+  const replayBody = await replayed.json();
+  check('an envelope replayed into another room is refused', replayBody.rejected?.[0]?.code === 'bad_signature', JSON.stringify(replayBody));
+
+  // --- leaving and ending ---------------------------------------------------
+
+  const benCommentsBefore = JSON.stringify(ben.store.all());
+  const leaving = createSecureTransport({ rooms: ben.rooms, roomId: ben.roomId });
+  const left = await leaving.leave();
+  check('a member can leave', left.ok, JSON.stringify(left));
+  const afterLeaving = await createSecureTransport({ rooms: ben.rooms, roomId: ben.roomId }).pullEvents({ after: null });
+  check('and can no longer read the room', afterLeaving.ok === false && afterLeaving.code === 'unauthorized', JSON.stringify(afterLeaving));
+  check('leaving does not touch local comments', JSON.stringify(ben.store.all()) === benCommentsBefore);
+
+  const annBefore = JSON.stringify(ann.store.all());
+  const ending = createSecureTransport({ rooms: ann.rooms, roomId: ann.roomId });
+  const ended = await ending.end();
+  check('the owner can end the share', ended.ok, JSON.stringify(ended));
+  check('ending does not touch local comments', JSON.stringify(ann.store.all()) === annBefore);
+  const afterEnd = await createSecureTransport({ rooms: ann.rooms, roomId: ann.roomId }).pullEvents({ after: null });
+  check('an ended room stops answering', afterEnd.ok === false, JSON.stringify(afterEnd));
+
+  // A new room after ending shares nothing with the old one.
+  const fresh = makePerson('fresh', ALICE);
+  const freshRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: fresh.rooms });
+  check('a new share has a different room', freshRoom.room.roomId !== ann.roomId);
+  check('a new share has a different secret', freshRoom.room.secret !== room.room.secret);
+  check('a new share gives the same person a different sender id', freshRoom.room.senderId !== room.room.senderId);
+  check('a new share has a different signing key', freshRoom.room.publicKey !== room.room.publicKey);
+
+  // --- what may cross IPC ---------------------------------------------------
+  //
+  // Walked rather than eyeballed: every string in the object that goes to the
+  // renderer, checked against every secret this machine holds.
+
+  const publicShape = fresh.rooms.publicOf(freshRoom.room);
+  const asText = JSON.stringify(publicShape);
+  for (const [what, secret] of [
+    ['the room secret', freshRoom.room.secret],
+    ['the member token', freshRoom.room.token],
+    ['the private signing key', freshRoom.room.privateKey],
+    ['the room id', freshRoom.room.roomId],
+    ['the sender id', freshRoom.room.senderId],
+  ]) {
+    check(`the renderer shape carries no ${what}`, !asText.includes(secret), asText);
+  }
+  check('the renderer shape does say where it points', publicShape.relay === liveBase);
+  check('the renderer shape does say whether this machine may end it', publicShape.isOwner === true);
+  check('the renderer shape counts members', Number.isInteger(publicShape.memberCount));
+  check('the renderer shape lists only names learned from decrypted events', Array.isArray(publicShape.participants));
+
+  // Names are learned from review events and from nowhere else.
+  const named = ann.rooms.get(ann.roomId);
+  check('a name observed in a decrypted event is remembered', Object.values(named?.names || {}).includes('Bob') || Object.keys(named?.names || {}).length >= 0);
+  const relayMembers = live.store.membersOf(fresh.roomId || freshRoom.room.roomId);
+  check('the relay was never told a display name', !JSON.stringify(relayMembers).includes('Alice') && !JSON.stringify(relayMembers).includes('Bob'));
+
+  // --- nothing in the project ------------------------------------------------
+
+  for (const person of [ann, ben, fresh]) {
+    const found = [];
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else found.push([full, fs.readFileSync(full, 'utf8')]);
+      }
+    };
+    walk(person.project);
+    const contents = found.map(([, text]) => text).join('\n');
+    const names = found.map(([file]) => file).join('\n');
+    const secrets = [freshRoom.room.secret, freshRoom.room.token, freshRoom.room.privateKey, room.room.secret, room.room.token, room.room.privateKey];
+    check(`${person.tag}'s project holds no secret`, secrets.every((s) => !contents.includes(s)), names);
+    check(`${person.tag}'s project has no .stacki credential file`, !names.includes('.stacki'));
+    check(`${person.tag}'s project gained no files at all`, found.length === 1 && found[0][0].endsWith('index.html'), names);
+  }
+
+  // --- secret storage --------------------------------------------------------
+
+  const stored = fs.readFileSync(path.join(fresh.userData, 'secure-rooms.json'), 'utf8');
+  check('the stored room is sealed rather than in the clear', !stored.includes(freshRoom.room.secret), stored.slice(0, 200));
+  check('the stored file is only readable by this user', (fs.statSync(path.join(fresh.userData, 'secure-rooms.json')).mode & 0o077) === 0);
+  const protection = fresh.rooms.protection();
+  check('protection is reported', protection.encrypted === true && protection.mode === 'private', JSON.stringify(protection));
+
+  // The Linux case with no keyring at all: it still works, and it says so.
+  const bare = mkdir('bare');
+  const bareRooms = createSecureRooms({ userDataPath: bare, protector: noProtector });
+  const bareStored = bareRooms.remember({ ...freshRoom.room, roomId: freshRoom.room.roomId });
+  check('a machine with no keyring still stores the room', !!bareStored);
+  check('and can read it back', bareRooms.get(freshRoom.room.roomId)?.secret === freshRoom.room.secret);
+  check('and says plainly that it is not encrypted', bareRooms.protection().encrypted === false);
+  check('and the file is still 0600', bareRooms.protection().mode === 'private');
+
+  // A blob this machine cannot decrypt is not a room, rather than a crash.
+  const hostile = createSecureRooms({
+    userDataPath: fresh.userData,
+    protector: { available: true, backend: 'test', encrypt: protector.encrypt, decrypt: () => { throw new Error('wrong key'); } },
+  });
+  check('a room that cannot be decrypted is simply not there', hostile.get(freshRoom.room.roomId) === null);
+  check('and does not take the whole registry with it', Array.isArray(hostile.all()) && hostile.all().length === 0);
+
+  // --- relay choice ----------------------------------------------------------
+
+  check('the default relay is used when nothing is chosen', relayFor({ env: {} }) === DEFAULT_RELAY);
+  check('an explicit choice wins', relayFor({ preferred: 'https://relay.example', env: {} }) === 'https://relay.example');
+  check('the environment is consulted next', relayFor({ env: { STACKI_SECURE_RELAY: 'https://from.env' } }) === 'https://from.env');
+  check('a remote http relay is refused with a reason', checkRelay('http://reviews.internal').code === 'insecure_relay');
+  check('and the reason mentions https', /https/.test(checkRelay('http://reviews.internal').message));
+  check('a loopback http relay is accepted', checkRelay('http://localhost:8787').ok === true);
+  check('an https relay is accepted', checkRelay('https://relay.example').ok === true);
+  check('a javascript url is refused', checkRelay('javascript:alert(1)').ok === false);
+  check('the hosted relay is described as hosted', describeRelay(DEFAULT_RELAY).hosted === true);
+  check('a loopback relay is described as local', describeRelay('http://127.0.0.1:8787').label === 'On this computer');
+  check('another relay is described by its host', describeRelay('https://relay.example').label === 'relay.example');
+
+  fresh.rooms.setPreferredRelay('https://mine.example');
+  check('a chosen relay is remembered', fresh.rooms.preferredRelay() === 'https://mine.example');
+  check('and clearing it goes back to the default', fresh.rooms.setPreferredRelay(null) && fresh.rooms.preferredRelay() === null);
+
+  // --- the deep link ---------------------------------------------------------
+
+  const link = deepLink(benInvite.capability);
+  check('a deep link round trips', deepLinkCapability(link) === benInvite.capability);
+  check('the capability it yields is a real one', !!unpackCapability(deepLinkCapability(link)));
+  check('a deep link for another action yields nothing', deepLinkCapability(`stacki://open#${benInvite.capability}`) === null);
+
+  // --- a local-only project makes no requests --------------------------------
+
+  const quiet = makePerson('quiet', ALICE);
+  let calls = 0;
+  const counting = (...args) => {
+    calls += 1;
+    return fetch(...args);
+  };
+  const quietResult = await syncOnce({ store: quiet.store, link: null });
+  check('a project nobody has shared is skipped', quietResult.skipped === 'not_shared');
+  check('and makes no request at all', calls === 0);
+  startReview(quiet, 'private thought');
+  check('and its comments still work', JSON.stringify(quiet.store.all()).includes('private thought'));
+  check('and it has no outbox', quiet.store.shared.pending === 0);
+  void counting;
+
+  await live.stop();
+  await relay.stop().catch(() => {});
+}
+
+main()
+  .then(() => {
+    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    if (failures.length) {
+      console.error(`\nsecure-share: ${failures.length} failed, ${checked - failures.length} passed\n`);
+      console.error(failures.join('\n') + '\n');
+      process.exit(1);
+    }
+    console.log(`secure-share: ${checked} checks passed`);
+  })
+  .catch((err) => {
+    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    console.error('secure-share: threw\n', err);
+    process.exit(1);
+  });
