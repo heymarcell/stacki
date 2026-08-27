@@ -33,6 +33,7 @@ const { dialog } = require('electron');
 process.env.STACKI_NO_DIALOGS = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const failures = [];
@@ -107,13 +108,21 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
-// What earlier runs left behind. Electron rewrites a small userData during
+// What DEAD runs left behind. Electron rewrites a small userData during
 // shutdown, after teardown has removed it, so one reappears per run and they
-// pile up quietly. Swept here rather than pretended about.
-sweepStaleRuns(['stacki-canvas-user-']);
+// pile up quietly.
+//
+// Only dead ones. Every temp root a harness makes carries a marker naming the
+// run and the pid that owns it, and this walks past anything it cannot prove is
+// finished — see test/support/ownedTemp.js. It used to delete by name prefix
+// alone, which meant a second harness starting up could take the Astro fixture
+// out from under a run already using it. `stacki-canvas-` is the prefix all of
+// them use.
+const sweptRuns = sweepStaleRuns(['stacki-canvas-user-', 'stacki-canvas-']);
+for (const s of sweptRuns.swept) console.log(`agent-canvas: swept ${s.name} (dead ${s.harness} pid ${s.pid})`);
 
-const root = makeCanvasProject({ log: (m) => console.log(`agent-canvas: ${m}`) });
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-canvas-user-'));
+const root = makeCanvasProject({ harness: 'agent-canvas', log: (m) => console.log(`agent-canvas: ${m}`) });
+const userData = ownedTempDir('stacki-canvas-user-', { harness: 'agent-canvas' });
 app.setPath('userData', userData);
 
 // Two things written before the app starts, because they are the two things a
@@ -587,7 +596,7 @@ require('../electron/main.js');
     if (fs.existsSync(root)) throw new Error('still there');
   });
   await attempt(`removing the app data ${userData}`, () => {
-    fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    releaseTempDir(userData);
     if (fs.existsSync(userData)) throw new Error('still there');
   });
 

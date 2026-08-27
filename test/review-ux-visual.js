@@ -34,6 +34,7 @@ process.env.STACKI_NO_DIALOGS = '1';
 process.env.STACKI_HIDDEN_WINDOW = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const OUT = process.argv[2] || path.join(os.tmpdir(), 'stacki-review-ux');
@@ -65,13 +66,21 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
-// What earlier runs left behind. Electron rewrites a small userData during
+// What DEAD runs left behind. Electron rewrites a small userData during
 // shutdown, after teardown has removed it, so one reappears per run and they
-// pile up quietly. Swept here rather than pretended about.
-sweepStaleRuns(['stacki-ux-user-', 'stacki-canvas-']);
+// pile up quietly.
+//
+// Only dead ones. Every temp root a harness makes carries a marker naming the
+// run and the pid that owns it, and this walks past anything it cannot prove is
+// finished — see test/support/ownedTemp.js. It used to delete by name prefix
+// alone, which meant a second harness starting up could take the Astro fixture
+// out from under a run already using it. `stacki-canvas-` is the prefix all of
+// them use.
+const sweptRuns = sweepStaleRuns(['stacki-ux-user-', 'stacki-canvas-']);
+for (const s of sweptRuns.swept) say(`review-ux-visual: swept ${s.name} (dead ${s.harness} pid ${s.pid})`);
 
-const root = makeCanvasProject({ log: (m) => say(`review-ux-visual: ${m}`) });
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-ux-user-'));
+const root = makeCanvasProject({ harness: 'review-ux-visual', log: (m) => say(`review-ux-visual: ${m}`) });
+const userData = ownedTempDir('stacki-ux-user-', { harness: 'review-ux-visual' });
 app.setPath('userData', userData);
 fs.writeFileSync(
   path.join(userData, 'settings.json'),
@@ -160,11 +169,11 @@ async function teardown(code) {
     for (const w of BrowserWindow.getAllWindows()) w.destroy();
   });
   await attempt(`removing the fixture ${root}`, () => {
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    removeCanvasProject(root);
     if (fs.existsSync(root)) throw new Error('still there');
   });
   await attempt(`removing the app data ${userData}`, () => {
-    fs.rmSync(userData, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    releaseTempDir(userData);
     if (fs.existsSync(userData)) throw new Error('still there');
   });
 
