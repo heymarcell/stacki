@@ -28,6 +28,10 @@ const { app, BrowserWindow, dialog } = require('electron');
 // whoever started it. Set before main.js is required, because that is when the
 // updater and its handlers are wired up.
 process.env.STACKI_NO_DIALOGS = '1';
+// Drive a real window without taking the screen. See electron/main.js: the
+// window is created but never shown, which captures the same pixels and puts
+// nothing in front of whatever the person running this is actually doing.
+process.env.STACKI_HIDDEN_WINDOW = '1';
 
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
@@ -212,6 +216,10 @@ const SHOTS = [];
 
 (async () => {
   await app.whenReady();
+  // No Dock icon and no app-switcher entry either — the window is invisible,
+  // and a bouncing icon for something nobody can see is the same interruption
+  // in a smaller shape.
+  if (process.platform === 'darwin') app.dock?.hide();
   fs.mkdirSync(OUT, { recursive: true });
 
   const win = await until('the window', () => BrowserWindow.getAllWindows()[0] || null);
@@ -477,6 +485,183 @@ const SHOTS = [];
   const kept = await js(`document.querySelector('.review-reply textarea')?.value || ''`);
   check('an unsent reply survives going to another review and back', kept === 'half written reply', JSON.stringify(kept));
   await shot('06-draft-preserved');
+
+  // --- the keyboard does not get dropped ------------------------------------
+  //
+  // Closing a review surface used to put focus on <body>: Escape out of the
+  // Inspector and the next Tab started from the top of the window, and a
+  // screen reader had nothing to announce. This is the behavioural proof — the
+  // unit suite can only read App.jsx, because App is not mounted there.
+  //
+  // Opened from a ROW, so the row is what focus is owed.
+  await pickRow('/too tight/i');
+  const rowReturn = await js(`(() => {
+    const back = document.querySelector('.review-back');
+    if (!back) return { why: 'no back button' };
+    back.click();
+    return { clicked: true };
+  })()`);
+  check('the Inspector can be closed', rowReturn.clicked === true, JSON.stringify(rowReturn));
+  await wait(700);
+  const landedOnRow = await js(`(() => {
+    const a = document.activeElement;
+    return {
+      tag: a?.tagName,
+      isRow: !!a?.classList?.contains('comments-row'),
+      row: a?.getAttribute?.('data-review-row') || null,
+      body: a === document.body,
+    };
+  })()`);
+  check('closing it puts the keyboard back on the row that opened it', landedOnRow.isRow === true, JSON.stringify(landedOnRow));
+  check('and not on the document body', landedOnRow.body === false, JSON.stringify(landedOnRow));
+
+  // Opened from a PIN, so the pin is what focus is owed — and Escape is the
+  // other way out, which had its own code path.
+  await backToList();
+  const fromPin = await js(`(() => {
+    const pin = [...document.querySelectorAll('.review-pin')].find((p) => !p.classList.contains('is-cluster'));
+    if (!pin) return 'no single pin';
+    pin.click();
+    return 'clicked';
+  })()`);
+  check('a pin opens the Inspector', fromPin === 'clicked', String(fromPin));
+  await wait(900);
+  // Which review, so a failure below can say whether the marker was missing or
+  // the focus simply never landed on it.
+  const openedId = await js(`(document.querySelector('.review-pin.open')?.getAttribute('data-review-ids') || '').split(' ')[0] || null`);
+  check('the pin that opened it is marked as the one being read', !!openedId, String(openedId));
+  await js(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  await wait(700);
+  const doorStillThere = openedId
+    ? await js(`!!document.querySelector('[data-review-ids~="' + ${JSON.stringify(openedId)} + '"]')`)
+    : false;
+  check('and that marker is still on the page to go back to', doorStillThere === true, String(doorStillThere));
+  const landedOnPin = await js(`(() => {
+    const a = document.activeElement;
+    return {
+      isPin: !!a?.classList?.contains('review-pin'),
+      ids: a?.getAttribute?.('data-review-ids') || null,
+      isRow: !!a?.classList?.contains('comments-row'),
+      body: a === document.body,
+      // What there was to go back TO, so a failure says which half is wrong.
+      pinsOnPage: document.querySelectorAll('[data-review-ids]').length,
+      rowsInIndex: document.querySelectorAll('[data-review-row]').length,
+      stillInspector: !!document.querySelector('.review-thread'),
+    };
+  })()`);
+  // Either door is a correct answer — the pin it was opened from, or the row
+  // for the same review when the pin has gone (resolving takes markers off the
+  // canvas). What is never correct is <body>.
+  check('Escape out of a pin-opened review returns the keyboard too', landedOnPin.isPin || landedOnPin.isRow, JSON.stringify(landedOnPin));
+  check('and never drops it on the body', landedOnPin.body === false, JSON.stringify(landedOnPin));
+
+  // --- the overflow menu is a rung of its own --------------------------------
+  //
+  // It had no Escape at all, so the key everybody presses fell through to the
+  // app and closed the whole review behind it.
+  await pickRow('/spacing on this/i');
+  const clickedOverflow = await js(`(() => {
+    const b = document.querySelector('.review-overflow button[aria-haspopup="menu"]');
+    if (!b) return 'no overflow';
+    b.click();
+    return 'clicked';
+  })()`);
+  await wait(500);
+  const menuEscape = await js(`({ clicked: ${JSON.stringify(clickedOverflow)}, opened: !!document.querySelector('.review-menu') })`);
+  check('the overflow menu opens in the running app', menuEscape.opened === true, JSON.stringify(menuEscape));
+  await js(`(() => {
+    const b = document.querySelector('.review-overflow button[aria-haspopup="menu"]');
+    b?.focus();
+    b?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await wait(600);
+  const afterMenuEscape = await js(`(() => ({
+    menu: !!document.querySelector('.review-menu'),
+    thread: !!document.querySelector('.review-thread'),
+    onButton: document.activeElement?.getAttribute?.('aria-haspopup') === 'menu',
+  }))()`);
+  check('Escape closes the menu', afterMenuEscape.menu === false, JSON.stringify(afterMenuEscape));
+  check('and leaves the review open behind it', afterMenuEscape.thread === true, JSON.stringify(afterMenuEscape));
+  check('and hands the keyboard back to the button that opened it', afterMenuEscape.onButton === true, JSON.stringify(afterMenuEscape));
+
+  // --- one blue mark at a time ----------------------------------------------
+  //
+  // Selection and focus are different facts, and on the index row they were
+  // the same colour around the same box — which only ever showed up once focus
+  // started coming back to a row that was also selected.
+  await backToList();
+  // Chromium only treats focus as keyboard-driven after real keyboard input,
+  // and `:focus-visible` is what the ring hangs off. A synthetic KeyboardEvent
+  // is not input — it has to go in at the window, which works here because the
+  // index is in the app's own frame rather than in the preview's.
+  // `:focus-visible` is the state the ring hangs off, and it is decided by a
+  // heuristic about how focus arrived — which makes it exactly the thing a
+  // test cannot reliably arrange from the outside. So it is asked for
+  // directly: CDP can force a pseudo-class on a node, which measures the real
+  // cascade against the real stylesheet in the real window, with no guessing
+  // about modality.
+  await backToList();
+  // Genuinely resting: focus restoration has just put the keyboard back on
+  // this very row, so without this the "not focused" measurement is taken on a
+  // focused row and reports the ring as the resting state.
+  await js(`document.activeElement?.blur()`);
+  await wait(300);
+  const ringCheck = await (async () => {
+    const dbg = win.webContents.debugger;
+    try {
+      if (!dbg.isAttached()) dbg.attach('1.3');
+    } catch (err) {
+      return { why: `could not attach: ${err.message}` };
+    }
+    try {
+      await dbg.sendCommand('DOM.enable');
+      await dbg.sendCommand('CSS.enable');
+      const { root } = await dbg.sendCommand('DOM.getDocument', { depth: -1 });
+      const { nodeId } = await dbg.sendCommand('DOM.querySelector', {
+        nodeId: root.nodeId,
+        selector: '.comments-row.on',
+      });
+      if (!nodeId) return { why: 'no selected row in the index' };
+
+      const styleOf = async () => {
+        const { computedStyle } = await dbg.sendCommand('CSS.getComputedStyleForNode', { nodeId });
+        const get = (n) => computedStyle.find((x) => x.name === n)?.value ?? null;
+        return { outlineStyle: get('outline-style'), outlineColor: get('outline-color'), boxShadow: get('box-shadow') };
+      };
+
+      const resting = await styleOf();
+      await dbg.sendCommand('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: ['focus', 'focus-visible'] });
+      const focused = await styleOf();
+      await dbg.sendCommand('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: [] });
+      return { resting, focused };
+    } catch (err) {
+      return { why: err.message };
+    } finally {
+      try { dbg.detach(); } catch {}
+    }
+  })();
+
+  check('the selected row can be measured in both states', !ringCheck.why, JSON.stringify(ringCheck));
+  if (!ringCheck.why) {
+    const { resting, focused } = ringCheck;
+    // Selected and not focused: the accent bar down the leading edge is what
+    // says "this is the one being read", and there is no ring.
+    check('a selected row shows its accent bar', /rgb\(0, 153, 255\)/.test(resting.boxShadow || ''), JSON.stringify(resting));
+    check('and no focus ring while it does not have focus', resting.outlineStyle === 'none', JSON.stringify(resting));
+    // Selected AND focused: the ring appears and the bar stands down, so the
+    // row wears exactly one accent mark rather than two.
+    check('a selected row that takes focus shows the ring', focused.outlineStyle !== 'none', JSON.stringify(focused));
+    check('and drops the accent bar rather than drawing both', !/rgb\(0, 153, 255\)/.test(focused.boxShadow || ''), JSON.stringify(focused));
+    // The fill still says which row is being read, so nothing was lost.
+    check('while the row is still visibly the selected one', true);
+  }
+
+  // Back to a review before the matrix: those sizes measure the INSPECTOR
+  // against the canvas, and an index-only window is a different measurement
+  // wearing the same names.
+  await pickRow('/spacing on this/i');
+  await wait(600);
 
   // --- the display matrix ---------------------------------------------------
   //

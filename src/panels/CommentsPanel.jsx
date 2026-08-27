@@ -1,7 +1,7 @@
 import React from 'react';
 import { ReviewWhere, ReviewStatusDot, authorLabel } from '../ui/ReviewThread.jsx';
 import { SharedReviewsBar, SharedReviewsDialog } from '../ui/SharedReviews.jsx';
-import { ReviewIcon, PinIcon, OrphanIcon, BackIcon } from '../ui/Icons.jsx';
+import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
 
 // The comments panel.
 //
@@ -196,12 +196,17 @@ export default function CommentsPanel({
             onClick={() => onOpen(r.id)}
           >
             <ReviewStatusDot status={r.status} anchorState={r.anchorState} />
-            {r.color && r.color !== 'blue' && (
-              <span className={`review-swatch-dot c-${r.color}`} aria-hidden="true" />
-            )}
             <span className="comments-row-main">
               <span className="comments-row-top">
                 {r.number != null && <span className="review-number">#{r.number}</span>}
+                {/* Beside the number, exactly where the Inspector puts it. It
+                    was a second dot out in the gutter next to the status dot,
+                    which is two dots competing in the narrowest column in the
+                    app — and the one that matters least was the one aligned to
+                    the top of the row rather than to the text. */}
+                {r.color && r.color !== 'blue' && (
+                  <span className={`review-swatch-dot c-${r.color}`} aria-hidden="true" />
+                )}
                 <ReviewWhere review={r} compact />
                 <span className="spacer" />
                 {r.anchorState === 'orphaned' && <OrphanIcon size={11} />}

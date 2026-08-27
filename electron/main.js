@@ -186,9 +186,24 @@ function createWindow() {
     // sized window is a fine thing to fall back to.
     bounds = openingBounds({ width: 1480, height: 940 });
   }
+  // A window the test harnesses can drive without taking over the screen.
+  //
+  // The visual and export harnesses open a real Stacki window, and every run
+  // put it in front of whatever the person was doing and took their keyboard
+  // with it — several times a run, for minutes at a time. A window that is
+  // never shown captures identically (`capturePage` reads the renderer's own
+  // surface, not the screen: same bytes, same pixels, measured), so the
+  // harnesses ask for one and nothing appears.
+  //
+  // Off by default, and set by the harnesses alone. `backgroundThrottling` has
+  // to go with it: an unshown window is a background one, and Chromium slows
+  // timers and stops rAF in those — which would make the harness measure a
+  // throttled app rather than the app.
+  const hidden = process.env.STACKI_HIDDEN_WINDOW === '1';
   mainWindow = new BrowserWindow({
     ...bounds,
     title: 'Stacki',
+    show: !hidden,
     backgroundColor: '#111111',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     // Windows/Linux taskbar + window chrome; macOS uses the Dock icon above.
@@ -201,6 +216,7 @@ function createWindow() {
       // page height for the canvas view (the preload guards what each
       // frame type gets).
       nodeIntegrationInSubFrames: true,
+      ...(hidden ? { backgroundThrottling: false } : {}),
     },
   });
 

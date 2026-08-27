@@ -3,7 +3,7 @@ import AutoTextarea from './AutoTextarea.jsx';
 import { confirmDialog } from './ConfirmDialog.jsx';
 import { ResolveIcon, DeferIcon, ReopenIcon, OrphanIcon, TrashIcon, CloseIcon, PencilIcon, PinIcon, BackIcon, MoreIcon } from './Icons.jsx';
 import ReviewMarkdown, { safeHref } from './ReviewMarkdown.jsx';
-import { applyMarkdownKey } from './markdownKeys.js';
+import { applyMarkdownKey, restoreCaret } from './markdownKeys.js';
 import { canDeleteMessage, canDeleteThread, canEditMessage, checkoutNote } from '../reviewCheckout.js';
 import useDismiss from './useDismiss.js';
 
@@ -367,14 +367,7 @@ export default function ReviewThread({
     );
     if (!next) return;
     setReply(next.value);
-    requestAnimationFrame(() => {
-      try {
-        field.setSelectionRange(next.selectionStart, next.selectionEnd);
-        field.focus();
-      } catch {
-        /* the field went away while the frame was pending */
-      }
-    });
+    restoreCaret(field, next);
   };
 
   const markdownKeys = (setter) => (e) => {
@@ -386,15 +379,7 @@ export default function ReviewThread({
     if (!next) return false;
     e.preventDefault();
     setter(next.value);
-    // After React has written the new value, not before it.
-    requestAnimationFrame(() => {
-      try {
-        field.setSelectionRange(next.selectionStart, next.selectionEnd);
-        field.focus();
-      } catch {
-        /* the field went away while the frame was pending */
-      }
-    });
+    restoreCaret(field, next);
     return true;
   };
   const [picking, setPicking] = React.useState(false);

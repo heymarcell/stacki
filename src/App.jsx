@@ -4599,22 +4599,44 @@ export default function App() {
    * return to, and focus stays where it is.
    */
   const focusOriginRef = useRef(null);
+  const pendingFocusRef = useRef(null);
   const restoreReviewFocus = useCallback((id, prefer = null) => {
-    const want = prefer || focusOriginRef.current?.kind || 'row';
+    const kind = prefer || focusOriginRef.current?.kind || 'row';
     const target = id || focusOriginRef.current?.id || null;
     if (!target) return;
-    // After the commit that closed the surface, or the element being focused
-    // is the one about to be unmounted.
-    requestAnimationFrame(() => {
-      const esc = (v) => (window.CSS?.escape ? window.CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&'));
-      const row = `[data-review-row="${esc(target)}"]`;
-      const pin = `[data-review-ids~="${esc(target)}"]`;
-      const el =
-        document.querySelector(want === 'pin' ? pin : row) ||
-        document.querySelector(want === 'pin' ? row : pin);
-      if (el && typeof el.focus === 'function') el.focus();
-    });
+    // Recorded here, done in the effect below. It cannot happen now: the thing
+    // to focus is not on screen yet, and the thing that IS on screen is about
+    // to be unmounted.
+    pendingFocusRef.current = { kind, id: target };
   }, []);
+
+  // The move itself, after the commit that put the target on screen.
+  //
+  // This was a requestAnimationFrame, which looked equivalent and is not.
+  // Chromium throttles — and Electron, with backgroundThrottling on by
+  // default, can stop — rAF whenever the window is not frontmost, so the
+  // callback fired late or never and focus was quietly left on <body>. A
+  // frame is a painting concern; this is a commit concern, and an effect is
+  // the thing that runs once per commit whatever the compositor is doing.
+  //
+  // No dependency array on purpose: it is the NEXT commit that matters,
+  // whichever state caused it, and it costs one null check when there is
+  // nothing waiting.
+  useEffect(() => {
+    const want = pendingFocusRef.current;
+    if (!want) return;
+    pendingFocusRef.current = null;
+    const esc = (v) => (window.CSS?.escape ? window.CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&'));
+    const row = `[data-review-row="${esc(want.id)}"]`;
+    const pin = `[data-review-ids~="${esc(want.id)}"]`;
+    // The door it came from first, the other one as a fallback: a pin goes
+    // away when its review is resolved and a row goes away when the filter
+    // stops matching, and either can happen while the review is being read.
+    const el =
+      document.querySelector(want.kind === 'pin' ? pin : row) ||
+      document.querySelector(want.kind === 'pin' ? row : pin);
+    if (el && typeof el.focus === 'function') el.focus();
+  });
   const restoreReviewFocusRef = useRef(restoreReviewFocus);
   restoreReviewFocusRef.current = restoreReviewFocus;
 

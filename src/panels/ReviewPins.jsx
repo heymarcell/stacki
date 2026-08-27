@@ -2,7 +2,7 @@ import React from 'react';
 import AutoTextarea from '../ui/AutoTextarea.jsx';
 import ReviewPeek, { peekLabel } from './ReviewPeek.jsx';
 import ReviewCluster from './ReviewCluster.jsx';
-import { applyMarkdownKey } from '../ui/markdownKeys.js';
+import { applyMarkdownKey, restoreCaret } from '../ui/markdownKeys.js';
 
 // The markers on the canvas, and the one thing that is still typed over it.
 //
@@ -252,14 +252,7 @@ export function ReviewSurface({
                 if (!next) return;
                 e.preventDefault();
                 onDraftChange(next.value);
-                requestAnimationFrame(() => {
-                  try {
-                    field.setSelectionRange(next.selectionStart, next.selectionEnd);
-                    field.focus();
-                  } catch {
-                    /* the field went away while the frame was pending */
-                  }
-                });
+                restoreCaret(field, next);
               }}
             />
             <div className="review-actions">

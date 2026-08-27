@@ -65,4 +65,28 @@ export function applyMarkdownKey(state, event) {
   return { value: next, selectionStart: bodyAt, selectionEnd: bodyAt + body.length };
 }
 
+/**
+ * Put the caret back after a Markdown shortcut has rewritten the field.
+ *
+ * The field is controlled, so the new text is written by React on the commit
+ * that follows — restoring the selection any earlier restores it into the old
+ * value. A frame later is after that commit, and the try/catch is for the case
+ * where the thread was closed in between and the field is no longer there.
+ *
+ * Extracted because it was three identical copies: two in ReviewThread (the
+ * reply box's keyboard shortcuts and its toolbar buttons) and one in the
+ * composer. Three copies of a timing rule is three places for it to drift.
+ */
+export function restoreCaret(field, next) {
+  if (!field || !next) return;
+  requestAnimationFrame(() => {
+    try {
+      field.setSelectionRange(next.selectionStart, next.selectionEnd);
+      field.focus();
+    } catch {
+      /* the field went away while the frame was pending */
+    }
+  });
+}
+
 export default applyMarkdownKey;

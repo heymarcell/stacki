@@ -741,6 +741,24 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // The count sits in a corner badge rather than in the label, so a cluster
     // is never wider than its number — #128 is a real name and has to fit.
     check('and is marked as a cluster', $('.review-pin').className.includes('is-cluster'), $('.review-pin').className);
+    // A marker's React key is its identity — the reviews under it — not where
+    // it happens to be. It used to carry the rounded x,y, so every reflow that
+    // moved a pin a pixel tore the button down and built a new one: nothing
+    // could survive a layout change, keyboard focus included, and closing the
+    // Inspector moves every pin on the page.
+    {
+      const laid = ui.placePins(items, rects);
+      const moved = ui.placePins(
+        items,
+        Object.fromEntries(Object.entries(rects).map(([k, boxes]) => [
+          k,
+          boxes.map((b) => ({ ...b, x: b.x + 37, y: b.y + 21 })),
+        ]))
+      );
+      check('the same reviews keep the same marker key when the page moves', laid.pins.map((p) => p.key).join('|') === moved.pins.map((p) => p.key).join('|'), `${laid.pins.map((p) => p.key)} vs ${moved.pins.map((p) => p.key)}`);
+      check('and the key carries no coordinates', !/\d+,\d+/.test(laid.pins.map((p) => p.key).join('|')), laid.pins.map((p) => p.key).join('|'));
+      check('while two different markers still differ', new Set(laid.pins.map((p) => p.key)).size === laid.pins.length);
+    }
     // Addressable, so focus can come back to this marker when the chooser it
     // opened is closed again. See restoreReviewFocus in App.jsx.
     check('and says which reviews are under it', ($('.review-pin').getAttribute('data-review-ids') || '').split(' ').length === 2, $('.review-pin').getAttribute('data-review-ids'));
@@ -980,6 +998,26 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     // One set of tokens, used by every surface, so nobody has to relearn a
     // colour between the index, the Inspector and the canvas.
     check('the four status colours are declared once', /--review-open:[\s\S]{0,160}--review-orphan:/.test(cssSource));
+
+    // Red means one thing: this destroys something. Not "resolved on a commit
+    // you do not have", not "the anchor no longer resolves" — both of those
+    // are amber, because they are facts to check rather than damage somebody
+    // is about to do. Enumerated rather than spot-checked: the orphan mark in
+    // the index row stayed red through a pass that turned the same mark amber
+    // two surfaces away, and nothing noticed.
+    {
+      const DESTRUCTIVE = [/\.review-menu button\.is-danger/, /\.review-trash:hover/];
+      const reds = cssSource
+        .split('\n')
+        .filter((l) => /var\(--red\)|#ff453a|255, 69, 58/.test(l))
+        .filter((l) => /review|comments/.test(l))
+        .filter((l) => !l.trim().startsWith('/*') && !l.trim().startsWith('*'));
+      const wrong = reds.filter((l) => !DESTRUCTIVE.some((d) => d.test(l)));
+      check('red is only ever a destructive act', wrong.length === 0, wrong.join(' | '));
+      // And it is genuinely still used where it belongs, so the check above is
+      // not passing because red left the stylesheet altogether.
+      check('and Delete still wears it', reds.length >= 2, String(reds.length));
+    }
     // A cluster can hold reviews in different states, so wearing one of them
     // would be a claim about all of them.
     check('a cluster is neutral', /\.review-pin\.is-cluster \{[\s\S]{0,120}background: #3f4347/.test(cssSource));
@@ -1011,6 +1049,22 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     }
     // The chooser stays attached to the marker it belongs to, on either side.
     check('the cluster chooser has a pointer', /\.review-cluster::before \{/.test(cssSource));
+    // And can actually draw it. The pointer is deliberately OUTSIDE the box —
+    // `left: -5px`, because that is where the marker is — so a container that
+    // clips its overflow clips the pointer away entirely. It did, for the
+    // whole life of this component, while this very rule sat in the
+    // stylesheet and a test asserting the rule existed passed every run.
+    {
+      // Declarations only: the comment explaining why the box must not clip
+      // says the words "overflow: hidden", and a rule read with its comments
+      // in is a rule that can fail on its own explanation.
+      const box = (cssSource.match(/\.review-cluster \{[^}]*\}/) || [''])[0].replace(/\/\*[\s\S]*?\*\//g, '');
+      check('and does not clip it away', !/overflow:\s*hidden/.test(box), box.slice(0, 240));
+      check('with the scrolling on the list instead', /\.review-cluster-list \{[^}]*overflow-y:\s*auto/.test(cssSource));
+      // Which means the list has to round its own bottom corners, or a row
+      // paints square over the chooser's curve.
+      check('and the list rounding its own corners', /\.review-cluster-list \{[^}]*border-bottom-left-radius/.test(cssSource));
+    }
     check('and it moves to the other side when the box flips', /\.review-cluster\.flip-x::before \{[^}]*right: -5px/.test(cssSource));
     // The cluster badge sits BESIDE the pin. In the corner it covered the
     // number, which is the one thing on a pin that has to stay readable — it
@@ -1551,9 +1605,14 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       // The other door has to be findable when the first one has gone: a pin
       // disappears when its review is resolved, and a row disappears when the
       // filter stops matching, so each falls back to the other.
-      check('with the other door as a fallback', /want === 'pin' \? row : pin/.test(app));
-      // After the commit, or it focuses the element that is about to unmount.
-      check('after the close has been committed', /requestAnimationFrame\(\(\) => \{[\s\S]{0,700}el\.focus\(\)/.test(app));
+      check('with the other door as a fallback', /want\.kind === 'pin' \? row : pin/.test(app));
+      // After the commit that put the target on screen — and NOT on a frame.
+      // This was a requestAnimationFrame, which Chromium throttles and
+      // Electron can stop outright while the window is not frontmost, so the
+      // focus move happened late or never. review-ux-visual proves the
+      // behaviour in a real window; this keeps the mechanism from sliding back.
+      check('the move happens on a commit', /pendingFocusRef\.current = \{ kind, id: target \}/.test(app) && /const want = pendingFocusRef\.current;[\s\S]{0,900}el\.focus\(\)/.test(app));
+      check('and not on an animation frame', !/requestAnimationFrame[\s\S]{0,200}\.focus\(\)/.test(app));
 
       const panel = fs.readFileSync(path.join(__dirname, '..', 'src', 'panels', 'CommentsPanel.jsx'), 'utf8');
       check('an index row is addressable', /data-review-row=\{r\.id\}/.test(panel));

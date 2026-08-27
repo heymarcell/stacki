@@ -15,6 +15,10 @@
 // easy to do differently each time.
 
 process.env.STACKI_NO_DIALOGS = '1';
+// Drive a real window without taking the screen. See electron/main.js: the
+// window is created but never shown, which captures the same pixels and puts
+// nothing in front of whatever the person running this is actually doing.
+process.env.STACKI_HIDDEN_WINDOW = '1';
 
 const fs = require('fs');
 const os = require('os');
@@ -143,6 +147,10 @@ const must = (claim, ok, detail) => {
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
   await app.whenReady();
+  // No Dock icon and no app-switcher entry either — the window is invisible,
+  // and a bouncing icon for something nobody can see is the same interruption
+  // in a smaller shape.
+  if (process.platform === 'darwin') app.dock?.hide();
 
   const win = await until('the window', () => BrowserWindow.getAllWindows()[0] || null);
   await until('the window to load', () => (win.webContents.isLoading() ? null : true));

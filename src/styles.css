@@ -6158,7 +6158,14 @@ textarea::selection {
   max-height: 260px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* NOT `overflow: hidden`.
+     The pointer below is a ::before at `left: -5px` — deliberately outside the
+     box, because that is where the marker is. Clipping the box clipped the
+     pointer with it, so the chooser has been floating unattached next to its
+     pin this whole time while a test asserting the rule exists passed happily.
+     The scrolling belongs to the list inside, which is the part that scrolls;
+     the rounded corners it needs are its own. */
+  overflow: visible;
   transform: translate(14px, 10px);
   background: var(--bg-panel-2);
   border: 1px solid var(--border-strong);
@@ -6188,6 +6195,13 @@ textarea::selection {
 /* Flipped upward, the pointer belongs at the bottom edge instead. */
 .review-cluster.flip-y::before { top: auto; bottom: 16px; }
 .review-cluster-title {
+  /* Above the pointer, so the arrow's seam is covered by the title's own fill
+     rather than showing as a notch in the border. */
+  position: relative;
+  z-index: 1;
+  border-top-left-radius: 7px;
+  border-top-right-radius: 7px;
+  background: var(--bg-panel-2);
   padding: 6px 9px 7px;
   font-size: 10px;
   font-weight: 650;
@@ -6196,8 +6210,18 @@ textarea::selection {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-/* Native scrolling, and only when a cluster is unusually large. */
-.review-cluster-list { overflow-y: auto; min-height: 0; padding: 3px; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+/* Native scrolling, and only when a cluster is unusually large. The rounded
+   bottom corners live here now that the container no longer clips: without
+   them a scrolled row paints square over the chooser's own curve. */
+.review-cluster-list {
+  overflow-y: auto;
+  min-height: 0;
+  padding: 3px;
+  border-bottom-left-radius: 7px;
+  border-bottom-right-radius: 7px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
 .review-cluster-row {
   display: flex;
   align-items: center;
@@ -6852,7 +6876,11 @@ textarea::selection {
    as part of the comment; above, they read as its label. */
 .comments-row-top { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .comments-row-top .spacer { flex: 1; min-width: 4px; }
-.comments-row-top svg { color: var(--red); flex-shrink: 0; }
+/* The orphan mark in a row. Amber, like the orphan dot beside it and like the
+   banner the Inspector shows for the same review — it was red here and amber
+   two surfaces away, which is the same fact wearing the colour of Delete in
+   one place and the colour of "cannot be confirmed" in the other. */
+.comments-row-top svg { color: var(--review-orphan); flex-shrink: 0; }
 .comments-excerpt {
   color: var(--text);
   font-size: 12px;

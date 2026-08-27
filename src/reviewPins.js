@@ -101,7 +101,19 @@ export function placePins(items, rects) {
       continue;
     }
     groups.push({
-      key: `${p.path}@${p.occurrence ?? 'n'}@${Math.round(p.x)},${Math.round(p.y)}`,
+      // Identity, not position.
+      //
+      // This used to include the marker's rounded x,y — so every reflow that
+      // moved a pin by a pixel produced a different key, and React tore the
+      // button down and built a new one. Which meant the marker could not hold
+      // anything across a layout change: not keyboard focus, not hover, not a
+      // transition. Closing the Inspector widens the canvas and moves every
+      // pin, so returning focus to the marker you opened a review from
+      // reliably focused an element that was destroyed in the same commit.
+      //
+      // Filled in below once the group is complete — a marker IS the reviews
+      // under it, and that survives the page moving around beneath it.
+      key: null,
       path: p.path,
       occurrence: p.occurrence,
       x: p.x,
@@ -116,6 +128,10 @@ export function placePins(items, rects) {
       numbers: [p.number].filter((n) => n != null),
     });
   }
+  // The identity of each marker: the reviews it covers, in a fixed order so
+  // that the same set always produces the same key however they were merged.
+  for (const g of groups) g.key = [...g.reviews].sort().join('+');
+
   return { pins: groups, hidden };
 }
 
