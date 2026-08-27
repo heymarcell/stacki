@@ -46,12 +46,29 @@ const MAX_NAMES = 60;
 
 const fileFor = (userDataPath) => path.join(userDataPath, FILE);
 
+// The Linux backends that are a real secret store. Electron names them; these
+// are the ones where the key is held by something outside this process.
+const OS_BACKED_LINUX = new Set(['gnome_libsecret', 'kwallet', 'kwallet5', 'kwallet6']);
+
 /**
  * The real protector, built lazily.
  *
  * Lazily because this module is required by tests that have no Electron, and
  * `require('electron')` outside an Electron process throws. Every test injects
  * its own protector; nothing automated ever reaches a real Keychain.
+ *
+ * `isEncryptionAvailable()` IS NOT THE QUESTION. On Linux it answers true even
+ * when Electron has fallen back to `basic_text`, which — read Electron's own
+ * description of `setUsePlainTextEncryption` — derives the key from an
+ * in-memory password because no OS password manager could be determined. That
+ * is a reversible encoding, not a secret store: anybody who can read the file
+ * can read the room secrets in it. Treating it as protection would mean
+ * telling somebody their secrets are encrypted at rest when they are not,
+ * which is the one thing a security feature must never do.
+ *
+ * So `protects` is narrower than `available`, and it is `protects` that
+ * decides whether anything is sealed. Where it is false the room is stored in
+ * the 0600 file unsealed and `protection()` says so out loud.
  */
 function electronProtector() {
   let safeStorage = null;
@@ -60,7 +77,27 @@ function electronProtector() {
   } catch {
     safeStorage = null;
   }
+
+  /** What the platform is actually using. Never a key, never a secret. */
+  const backendOf = () => {
+    try {
+      if (!safeStorage) return 'none';
+      if (!safeStorage.isEncryptionAvailable()) return 'none';
+      if (process.platform === 'darwin') return 'keychain';
+      if (process.platform === 'win32') return 'dpapi';
+      if (process.platform === 'linux') {
+        return typeof safeStorage.getSelectedStorageBackend === 'function'
+          ? safeStorage.getSelectedStorageBackend()
+          : 'unknown';
+      }
+      return 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  };
+
   return {
+    /** Whether encrypt/decrypt can be called at all. */
     get available() {
       try {
         return !!safeStorage?.isEncryptionAvailable();
@@ -68,17 +105,14 @@ function electronProtector() {
         return false;
       }
     },
-    /** What the OS is actually using, for diagnostics. Never a key, never a secret. */
     get backend() {
-      try {
-        if (!safeStorage) return 'none';
-        if (process.platform === 'linux' && safeStorage.getSelectedStorageBackend) {
-          return safeStorage.getSelectedStorageBackend();
-        }
-        return safeStorage.isEncryptionAvailable() ? (process.platform === 'darwin' ? 'keychain' : 'dpapi') : 'none';
-      } catch {
-        return 'unknown';
-      }
+      return backendOf();
+    },
+    /** Whether that backend is somewhere a secret is genuinely kept. */
+    get protects() {
+      const backend = backendOf();
+      if (backend === 'keychain' || backend === 'dpapi') return true;
+      return OS_BACKED_LINUX.has(backend);
     },
     encrypt: (text) => safeStorage.encryptString(text).toString('base64'),
     decrypt: (blob) => safeStorage.decryptString(Buffer.from(blob, 'base64')),
@@ -140,6 +174,54 @@ function reviveRoom(raw) {
 }
 
 /**
+ * What is kept about a room this machine has LEFT.
+ *
+ * Leaving revokes a credential. It does not, and must not, throw away this
+ * member's signing identity — because a sender id is derived from the room
+ * secret and the actor id, so somebody who leaves and is later invited back to
+ * the SAME room comes back as the same sender. If a fresh keypair were
+ * generated then, the relay would refuse it (a member's key is fixed for the
+ * life of the room) and every peer would refuse it too, correctly, as a key
+ * substitution. Rejoining would be impossible for the one person it is most
+ * likely to be offered to.
+ *
+ * So a departed room keeps exactly what is needed to be recognised again:
+ *
+ *   the room id, the signing keypair, the sender id, the actor it belongs to,
+ *   and the keys of peers already pinned.
+ *
+ * And nothing else. NOT the room master secret — a new invitation carries that
+ * again — and NOT a bearer token, which the relay has revoked. Holding a room
+ * secret for a room this machine has left would be keeping the ability to read
+ * a conversation it has walked out of.
+ */
+function reviveDormant(raw) {
+  if (!raw || typeof raw !== 'object' || raw.dormant !== true) return null;
+  const roomId = str(raw.roomId, 64);
+  if (!roomId || !isRoomId(roomId)) return null;
+  if (!fromBase64Url(raw.privateKey, 32)) return null;
+  if (!isPublicKey(raw.publicKey)) return null;
+  if (!isSenderId(raw.senderId)) return null;
+
+  const pins = {};
+  for (const [sender, key] of Object.entries(raw.pins || {})) {
+    if (isSenderId(sender) && isPublicKey(key)) pins[sender] = key;
+  }
+  return {
+    dormant: true,
+    roomId,
+    relay: relayOrigin(raw.relay),
+    privateKey: raw.privateKey,
+    publicKey: raw.publicKey,
+    senderId: raw.senderId,
+    actorId: str(raw.actorId, 100),
+    isOwner: raw.isOwner === true,
+    pins,
+    leftAt: Number.isInteger(raw.leftAt) ? raw.leftAt : 0,
+  };
+}
+
+/**
  * The room registry.
  *
  * A thin object over one file, like the legacy workspace registry beside it,
@@ -179,9 +261,18 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     fs.renameSync(tmp, file);
   };
 
-  /** One room entry, sealed if the platform can seal it. */
+  /**
+   * Whether this protector is somewhere a secret is genuinely kept.
+   *
+   * `protects` when the protector says so; an injected test protector that
+   * only says `available` is taken at its word. Never `isEncryptionAvailable`
+   * alone — see electronProtector.
+   */
+  const protects = () => (typeof keeper.protects === 'boolean' ? keeper.protects : !!keeper.available);
+
+  /** One room entry, sealed if the platform can genuinely keep a secret. */
   const seal = (room) => {
-    if (!keeper.available) return { protected: false, room };
+    if (!protects()) return { protected: false, room };
     try {
       return { protected: true, blob: keeper.encrypt(JSON.stringify(room)) };
     } catch {
@@ -191,11 +282,24 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     }
   };
 
+  /** The stored object, whether it was sealed or not. Null if unreadable. */
+  const opened = (entry) => {
+    if (!entry || typeof entry !== 'object') return null;
+    if (entry.protected !== true) return entry.room || null;
+    try {
+      return JSON.parse(keeper.decrypt(entry.blob));
+    } catch {
+      return null;
+    }
+  };
+
+  /** An ACTIVE room. A dormant identity is not one and never answers as one. */
   const unseal = (entry) => {
     if (!entry || typeof entry !== 'object') return null;
-    if (entry.protected !== true) return reviveRoom(entry.room);
+    if (entry.protected !== true) return entry.room?.dormant ? null : reviveRoom(entry.room);
     try {
-      return reviveRoom(JSON.parse(keeper.decrypt(entry.blob)));
+      const raw = JSON.parse(keeper.decrypt(entry.blob));
+      return raw?.dormant ? null : reviveRoom(raw);
     } catch {
       // A blob this machine can no longer decrypt — a restored backup, a
       // different user account, a reset keychain. It is not recoverable and
@@ -301,10 +405,54 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
   }
 
   /**
-   * Forget a room and every project pointed at it.
+   * Step out of a room, keeping only enough to be recognised if invited back.
    *
-   * Local review history is untouched. This drops the credential, the secret
-   * and the mapping — nothing that is a comment.
+   * This is what a CONFIRMED leave does. The room master secret and the bearer
+   * token go — this machine can no longer read the room and no longer has a
+   * way in — and the signing identity stays, because the relay and every peer
+   * have it pinned for the life of the room. See reviveDormant.
+   *
+   * Local review history is untouched, as ever. Nothing here is a comment.
+   */
+  function retire(roomId) {
+    const room = get(roomId);
+    if (!room) return false;
+    const data = read();
+    const rooms = data.rooms && typeof data.rooms === 'object' ? { ...data.rooms } : {};
+    const identity = reviveDormant({
+      dormant: true,
+      roomId: room.roomId,
+      relay: room.relay,
+      privateKey: room.privateKey,
+      publicKey: room.publicKey,
+      senderId: room.senderId,
+      actorId: room.actorId,
+      isOwner: room.isOwner,
+      pins: room.pins,
+      leftAt: now(),
+    });
+    if (!identity) return false;
+    rooms[roomId] = seal(identity);
+    const projects = { ...(data.projects || {}) };
+    for (const [key, value] of Object.entries(projects)) {
+      if (value?.roomId === roomId) delete projects[key];
+    }
+    write({ ...data, version: 2, rooms, projects });
+    return true;
+  }
+
+  /** The signing identity kept from a room this machine has left, if any. */
+  function dormantFor(roomId) {
+    if (!roomId) return null;
+    return reviveDormant(opened(read().rooms?.[roomId])) || null;
+  }
+
+  /**
+   * Forget a room and every project pointed at it, entirely.
+   *
+   * Used when there is nothing to come back to — the room has ended. Local
+   * review history is untouched. This drops the credential, the secret, the
+   * signing identity and the mapping — nothing that is a comment.
    */
   function forget(roomId) {
     const data = read();
@@ -371,17 +519,28 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     setPreferredRelay,
     remember,
     update,
+    retire,
+    dormantFor,
     pin,
     learnName,
     forget,
     forProject,
     link,
     unlink,
-    /** How well this machine can keep a secret. For diagnostics, never for the renderer. */
+    /**
+     * How well this machine can keep a secret. For diagnostics, never for the
+     * renderer, and never rounded up: `encrypted` means an OS-backed key held
+     * outside this process, not merely that a call succeeded.
+     */
     protection() {
+      const backend = keeper.backend || (protects() ? 'os' : 'file');
       return {
-        encrypted: !!keeper.available,
-        backend: keeper.backend || (keeper.available ? 'os' : 'file'),
+        encrypted: protects(),
+        // True when Electron would encrypt but the key is not really kept
+        // anywhere — Linux with no password manager. Reported rather than
+        // rounded to either answer.
+        weakBackend: !!keeper.available && !protects(),
+        backend,
         mode: (() => {
           try {
             return (fs.statSync(fileFor(userDataPath)).mode & 0o077) === 0 ? 'private' : 'loose';

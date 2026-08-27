@@ -563,6 +563,68 @@ async function main() {
   check('a room that cannot be decrypted is simply not there', hostile.get(freshRoom.room.roomId) === null);
   check('and does not take the whole registry with it', Array.isArray(hostile.all()) && hostile.all().length === 0);
 
+  // --- what "encrypted at rest" is allowed to mean ---------------------------
+  //
+  // Electron's `isEncryptionAvailable()` answers true on Linux even when it
+  // has fallen back to `basic_text` — a key derived from an in-memory password
+  // because no OS password manager could be found. That is a reversible
+  // encoding, not a secret store, and calling it encryption would be telling
+  // somebody their secrets are protected when anybody who can read the file
+  // can read them.
+  const backendCase = (name, keeper) => createSecureRooms({ userDataPath: mkdir(`store-${name}`), protector: keeper });
+  const roundTrip = (rooms) => {
+    const kept = rooms.remember({ ...freshRoom.room });
+    return kept && rooms.get(freshRoom.room.roomId)?.secret === freshRoom.room.secret;
+  };
+  const seal = (t) => Buffer.from(t, 'utf8').toString('base64');
+  const unseal = (b) => Buffer.from(b, 'base64').toString('utf8');
+
+  const backends = [
+    ['macOS keychain', { available: true, protects: true, backend: 'keychain', encrypt: seal, decrypt: unseal }, true],
+    ['Windows dpapi', { available: true, protects: true, backend: 'dpapi', encrypt: seal, decrypt: unseal }, true],
+    ['gnome libsecret', { available: true, protects: true, backend: 'gnome_libsecret', encrypt: seal, decrypt: unseal }, true],
+    ['kwallet6', { available: true, protects: true, backend: 'kwallet6', encrypt: seal, decrypt: unseal }, true],
+    // The one that matters. Electron WOULD encrypt; the key is nowhere.
+    ['Linux basic_text', { available: true, protects: false, backend: 'basic_text', encrypt: seal, decrypt: unseal }, false],
+    ['an unknown backend', { available: true, protects: false, backend: 'unknown', encrypt: seal, decrypt: unseal }, false],
+    ['no backend at all', noProtector, false],
+  ];
+  for (const [name, keeper, shouldProtect] of backends) {
+    const rooms = backendCase(name.replace(/\W+/g, ''), keeper);
+    check(`${name}: the room stores and reads back`, roundTrip(rooms));
+    const report = rooms.protection();
+    check(`${name}: reported as ${shouldProtect ? 'encrypted' : 'NOT encrypted'}`, report.encrypted === shouldProtect, JSON.stringify(report));
+    check(`${name}: the backend is named honestly`, report.backend === (keeper.backend || 'file'), JSON.stringify(report));
+    check(`${name}: the file is 0600 either way`, report.mode === 'private', JSON.stringify(report));
+    const onDisk = fs.readFileSync(path.join(rooms.file), 'utf8');
+    if (shouldProtect) {
+      check(`${name}: the secret is not in the clear on disk`, !onDisk.includes(freshRoom.room.secret));
+    } else {
+      // Not sealed — and that is the point: it is stored the way the honest
+      // report says it is, rather than wrapped in an encoding that suggests
+      // protection nobody has.
+      check(`${name}: nothing pretends to be sealed`, !onDisk.includes('"protected": true'), onDisk.slice(0, 120));
+    }
+  }
+
+  const weak = backendCase('weakreport', { available: true, protects: false, backend: 'basic_text', encrypt: seal, decrypt: unseal });
+  check('a weak backend is called out as weak rather than merely absent', weak.protection().weakBackend === true, JSON.stringify(weak.protection()));
+  check('and a real one is not', fresh.rooms.protection().weakBackend === false, JSON.stringify(fresh.rooms.protection()));
+  check('and a missing one is not called weak either', backendCase('none2', noProtector).protection().weakBackend === false);
+
+  // A keychain that refuses at the moment of writing must not lose the room.
+  const refusing = backendCase('refusing', {
+    available: true,
+    protects: true,
+    backend: 'keychain',
+    encrypt: () => {
+      throw new Error('the keychain said no');
+    },
+    decrypt: unseal,
+  });
+  check('a protector that throws while sealing still stores the room', roundTrip(refusing));
+  check('and the room is readable afterwards', refusing.get(freshRoom.room.roomId)?.secret === freshRoom.room.secret);
+
   // --- posting never waits for the network -----------------------------------
   //
   // The event is in the ledger and in the outbox before anything is sent, and
