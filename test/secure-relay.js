@@ -28,7 +28,7 @@ const check = (what, condition, detail) => {
 
 const { createSecureRelay, WS_SUBPROTOCOL, createLimiter, bearerOf } = require('../relay/node/server.js');
 const { openStore, hash } = require('../relay/node/store.js');
-const { runConformance, newMember, envelopeFrom, randomBytes } = require('./relay-conformance.js');
+const { runConformance, newMember, envelopeFrom, randomBytes, CONFORMANCE_CHECKS } = require('./relay-conformance.js');
 const { createSecureRooms } = require('../electron/review/secure/secrets.js');
 const { createSecureTransport, createRoom, joinRoom } = require('../electron/review/secure/transport.js');
 const { makeEvent } = require('../electron/review/events.js');
@@ -100,6 +100,7 @@ async function main() {
   const conformance = await runConformance({ call, label: 'node' });
   checked += conformance.checked;
   failures.push(...conformance.failures);
+  check('the whole conformance suite ran', conformance.checked === CONFORMANCE_CHECKS, `${conformance.checked} of ${CONFORMANCE_CHECKS}`);
 
   check('the relay answers a health check', (await call('/health')).body?.ok === true);
 

@@ -25,6 +25,14 @@ const { signingBytes, toBase64Url, fromBase64Url, MAX_CIPHERTEXT_BYTES, MAX_BATC
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// How many checks a complete run makes.
+//
+// Asserted by both relays' test suites, so that a run which quietly stops
+// early — an endpoint that 500s and takes a whole section with it, a helper
+// that starts returning undefined — fails instead of reporting the checks it
+// did get to as a pass. Raise it when you add a check; that is the point.
+const CONFORMANCE_CHECKS = 80;
+
 // `getRandomValues` refuses more than 64 KiB at a time, and the oversized
 // ciphertext this suite deliberately builds is larger than that.
 const randomBytes = (n) => {
@@ -109,11 +117,12 @@ async function runConformance({ call, label = 'relay' }) {
   check('a room can be read by its member', (await json(`/v2/rooms/${roomId}`, asMember(aliceToken))).status === 200);
 
   const unknownRoom = toBase64Url(randomBytes(16));
-  // 404 rather than 403: a 403 would confirm the room exists, which turns the
-  // endpoint into a way to find out which rooms do.
+  // Every way of not being in a room answers the same. Anything that told a
+  // wrong credential apart from a valid one for a different room would let
+  // somebody holding one token find out which other rooms exist.
   check(
-    'a room this credential is not in answers not found, not forbidden',
-    (await json(`/v2/rooms/${unknownRoom}`, asMember(aliceToken))).status === 404
+    'a room this credential is not in refuses without confirming it exists',
+    (await json(`/v2/rooms/${unknownRoom}`, asMember(aliceToken))).status === 401
   );
 
   const status = await json(`/v2/rooms/${roomId}`, asMember(aliceToken));
@@ -297,12 +306,12 @@ async function runConformance({ call, label = 'relay' }) {
   check('the owner can end the room', (await json(`/v2/rooms/${roomId}`, asMember(aliceToken, { method: 'DELETE' }))).status === 200);
 
   const gone = await json(`/v2/rooms/${roomId}`, asMember(aliceToken));
-  check('an ended room refuses its owner', gone.status === 401 || gone.status === 404, `${gone.status}`);
-  check('an ended room refuses its members', [401, 404].includes((await json(`/v2/rooms/${roomId}`, asMember(bobToken))).status));
+  check('an ended room refuses its owner', gone.status === 401, `${gone.status}`);
+  check('an ended room refuses its members', (await json(`/v2/rooms/${roomId}`, asMember(bobToken))).status === 401);
   const orphan = await envelopeFrom(alice, roomId);
   check(
     'an ended room takes no more envelopes',
-    [401, 404, 409].includes((await json(`/v2/rooms/${roomId}/envelopes`, asMember(aliceToken, { method: 'POST', body: { envelopes: [orphan] } }))).status)
+    (await json(`/v2/rooms/${roomId}/envelopes`, asMember(aliceToken, { method: 'POST', body: { envelopes: [orphan] } }))).status === 401
   );
   check(
     'an invitation to an ended room cannot be redeemed',
@@ -319,4 +328,4 @@ async function runConformance({ call, label = 'relay' }) {
   return { checked, failures };
 }
 
-module.exports = { runConformance, newMember, envelopeFrom, randomBytes };
+module.exports = { runConformance, newMember, envelopeFrom, randomBytes, CONFORMANCE_CHECKS };

@@ -283,14 +283,16 @@ function createSecureRelay({
   /** The member a request is made by, plus the room, or a refusal. */
   function authenticate(req, roomId) {
     const member = store.memberFor(bearerOf(req.headers.authorization));
-    if (!member) return { ok: false, code: 'unauthorized' };
-    // A credential for another room answers 404 rather than 403: a 403 would
-    // confirm the room exists, which turns the endpoint into a way to find out
-    // which rooms do.
-    if (member.room_id !== roomId) return { ok: false, code: 'not_found' };
+    // ONE ANSWER FOR EVERY WAY OF NOT BEING IN THIS ROOM. A wrong credential,
+    // a credential for a different room, a room that was never created and a
+    // room that has ended all answer 401 — because any code that told them
+    // apart would tell somebody holding one valid token which other rooms
+    // exist. The Cloudflare relay gives the same answer for a structural
+    // reason as well: a room is its own Durable Object, and it genuinely
+    // cannot distinguish a stranger's token from another room's.
+    if (!member || member.room_id !== roomId) return { ok: false, code: 'unauthorized' };
     const room = store.roomFor(roomId);
-    if (!room) return { ok: false, code: 'not_found' };
-    if (room.ended_at) return { ok: false, code: 'room_ended' };
+    if (!room || room.ended_at) return { ok: false, code: 'unauthorized' };
     return { ok: true, member, room };
   }
 

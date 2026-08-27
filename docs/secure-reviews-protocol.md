@@ -313,6 +313,14 @@ All bodies are JSON. All member operations authenticate with
 `Authorization: Bearer <token>`. Errors are `{ "error": "<code>", "message": "..." }`
 with the stable codes in §16. No stack traces, ever.
 
+**One answer for every way of not being in a room.** A wrong credential, a
+credential for a different room, a room that was never created, and a room that
+has ended all answer `401 unauthorized`. Anything that distinguished them would
+let somebody holding one valid token discover which other rooms exist. The
+Cloudflare relay gives the same answer for a structural reason too: a room is
+its own Durable Object and genuinely cannot tell a stranger's token from another
+room's.
+
 | method | path | auth | purpose |
 |---|---|---|---|
 | `GET` | `/health` | — | liveness |
