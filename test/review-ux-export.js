@@ -28,6 +28,7 @@ const { app, BrowserWindow, dialog } = require('electron');
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { readDevLock, awaitDevServerGone } = require('./support/devServer.js');
+const { createState } = require('./support/assertedState.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
 
 const OUT = process.argv[2] || path.join(os.homedir(), 'Downloads', 'stacki-review-ux-states');
@@ -329,38 +330,27 @@ const REQUIRED = [
   /**
    * Set the state up, assert it IS that state, and only then photograph it.
    *
-   * `claims` runs after whatever setup preceded this call and returns the things
-   * this picture asserts are true, as `[what, ok, detail]`. If any of them does
-   * not hold, nothing is captured: a caption over a picture of something else is
-   * not weaker evidence than no picture, it is false evidence, and it reads as a
-   * pass to everybody downstream.
-   *
-   * The claims are about what is ON SCREEN, not about pixels. This is not
-   * screenshot diffing and is not meant to become it — it is the difference
-   * between "the Inspector is open at 440px" and "some panel was 260px wide".
+   * The discipline lives in test/support/assertedState.js so it can be proved
+   * without a window — see test/asserted-state.js. What matters here is the
+   * fourth argument: a state that supplies a `read` gets one capture-time
+   * object, shared by its claims and its caption, so the words under a picture
+   * and the pixels in it are about the same moment.
    */
-  const state = async (name, caption, claims = async () => []) => {
-    await wait(650);
-    let held;
-    try {
-      held = (await claims()) || [];
-    } catch (err) {
-      held = [['the state could be read at all', false, String(err?.stack || err)]];
-    }
-    const broken = held.filter((c) => !c[1]);
-    if (broken.length) {
-      for (const [what, , detail] of broken) {
-        FAILED.push(`${name}: ${what}${detail ? ` — ${detail}` : ''}`);
-        shout(`  FAILED  ${name}: ${what}${detail ? ` — ${detail}` : ''}`);
-      }
-      return false;
-    }
-    const image = await win.webContents.capturePage();
-    fs.writeFileSync(path.join(OUT, `${name}.png`), image.toPNG());
-    SHOTS.push({ name, caption });
-    say(`  ${name}`);
-    return true;
-  };
+  const state = createState({
+    settle: () => wait(650),
+    capture: async (name) => {
+      const image = await win.webContents.capturePage();
+      fs.writeFileSync(path.join(OUT, `${name}.png`), image.toPNG());
+    },
+    onCaptured: (shot) => {
+      SHOTS.push(shot);
+      say(`  ${shot.name}`);
+    },
+    onFailed: (name, what, detail) => {
+      FAILED.push(`${name}: ${what}${detail ? ` — ${detail}` : ''}`);
+      shout(`  FAILED  ${name}: ${what}${detail ? ` — ${detail}` : ''}`);
+    },
+  });
 
   await until(
     'the canvas',
@@ -1253,19 +1243,28 @@ const REQUIRED = [
     return JSON.parse(last);
   };
 
+  // The fields the caption quotes and the claims are about. If any of them has
+  // moved between settling and the shutter, the picture is of a window this
+  // caption was not written for, and the state fails rather than being
+  // relabelled with numbers nobody checked.
+  const CAPTIONED = ['vw', 'vh', 'mode', 'inspector', 'inspectorW', 'panelW', 'canvasW', 'propsW', 'propsVisible', 'overflowX'];
+  const captionedOnly = (g) => Object.fromEntries(CAPTIONED.map((k) => [k, g?.[k]]));
+
   say('');
   say('  display matrix — mode, Inspector, canvas, Style panel, overflow');
   for (const [slug, w, h] of MATRIX) {
     win.setSize(w, h);
     await wait(250);
-    const g = await settled();
-    say(
-      `    ${`${w}×${h}`.padEnd(11)} ${String(g.mode).padEnd(7)} inspector ${String(g.inspectorW).padStart(4)}  canvas ${String(g.canvasW).padStart(4)}  style ${g.propsVisible ? `${g.propsW}` : 'hidden'}  overflowX ${g.overflowX}`
-    );
-    await state(
+    // Stabilised here so the resize is over before anything is claimed…
+    const target = await settled();
+    // …and read AGAIN at capture time, inside state(), which waits before it
+    // takes the picture. The geometry below is that second read: it is what the
+    // claims are about, what the caption says, and — because nothing happens
+    // between it and the shutter — what the PNG contains.
+    const ok = await state(
       `matrix-${slug}`,
-      `${w}×${h} — ${g.mode}, Inspector ${g.inspectorW}px, canvas ${g.canvasW}px, Style ${g.propsVisible ? `${g.propsW}px` : 'collapsed'}`,
-      async () => [
+      (g) => `${w}×${h} — ${g.mode}, Inspector ${g.inspectorW}px, canvas ${g.canvasW}px, Style ${g.propsVisible ? `${g.propsW}px` : 'collapsed'}`,
+      async (g) => [
         ['the Review Inspector is open', g.inspector === true, JSON.stringify(g)],
         ['the left panel is presenting it, not the Comments Index', g.mode !== 'index' && g.indexRows === 0, JSON.stringify({ mode: g.mode, rows: g.indexRows })],
         ['there is a conversation in it', g.thread === true],
@@ -1281,8 +1280,17 @@ const REQUIRED = [
         ['the Style panel is measured, not assumed', g.propsVisible === g.propsW > 0, JSON.stringify({ visible: g.propsVisible, w: g.propsW })],
         ['Style collapses before the canvas is crushed', g.propsVisible === false || g.canvasW >= 600, JSON.stringify({ props: g.propsW, canvas: g.canvasW })],
         ['and nothing overflows the window sideways', g.overflowX === false, JSON.stringify({ vw: g.vw })],
-      ]
+        // And the window is still the one that settled a moment ago.
+        [
+          'the geometry at the shutter is the geometry that settled',
+          CAPTIONED.every((k) => g?.[k] === target?.[k]),
+          JSON.stringify({ settled: captionedOnly(target), atCapture: captionedOnly(g) }),
+        ],
+      ],
+      settled
     );
+    // Printed from what the picture actually claims, not from the earlier read.
+    if (ok) say(`    ${SHOTS[SHOTS.length - 1].caption}`);
   }
   win.setSize(1512, 982);
 
