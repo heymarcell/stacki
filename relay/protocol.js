@@ -77,7 +77,11 @@ const MAX_ROOM_BYTES = 512 * 1024 * 1024; // one room's stored ciphertext
 const IDLE_ROOM_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // §29, and the UI says it out loud
-const MIN_INVITE_TTL_MS = 60 * 1000;
+// The shortest invitation anybody may ask for. A second is a legitimate thing
+// to want — it is also what makes "an expired invitation cannot be redeemed"
+// a property a test can actually observe on every implementation rather than
+// one asserted by reading the code.
+const MIN_INVITE_TTL_MS = 1000;
 
 // --- the error vocabulary --------------------------------------------------
 //
@@ -225,6 +229,11 @@ const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 // relay does not understand or somebody probing, and storing it would mean
 // serving it back to peers who also do not understand it.
 const ENVELOPE_FIELDS = ['v', 'envelopeId', 'senderId', 'nonce', 'ciphertext', 'signature'];
+// The two a relay is allowed to add on the way OUT, and only on the way out.
+// Neither is signed and neither is trusted: `seq` is a pagination cursor and
+// `receivedAt` is a timestamp for nothing in particular. A client accepts them
+// on arrival and a relay accepts them from nobody.
+const SERVED_FIELDS = ['seq', 'receivedAt'];
 
 /**
  * Check one envelope off the wire.
@@ -234,11 +243,15 @@ const ENVELOPE_FIELDS = ['v', 'envelopeId', 'senderId', 'nonce', 'ciphertext', '
  * it before a byte is stored and before a signature is checked, because a
  * signature check on unbounded input is a way to spend a relay's CPU.
  */
-function readEnvelope(raw) {
+function readEnvelope(raw, { served = false } = {}) {
   if (!isPlainObject(raw)) return { ok: false, code: 'bad_envelope' };
+  // `served` widens the field set by exactly two, for a client reading a pull
+  // page. A relay reading a push NEVER passes it: an inbound envelope carrying
+  // a `seq` is a client trying to choose its own place in the ordering.
+  const allowed = served ? [...ENVELOPE_FIELDS, ...SERVED_FIELDS] : ENVELOPE_FIELDS;
   const keys = Object.keys(raw);
-  if (keys.length !== ENVELOPE_FIELDS.length) return { ok: false, code: 'bad_envelope' };
-  for (const key of keys) if (!ENVELOPE_FIELDS.includes(key)) return { ok: false, code: 'bad_envelope' };
+  for (const key of keys) if (!allowed.includes(key)) return { ok: false, code: 'bad_envelope' };
+  for (const key of ENVELOPE_FIELDS) if (!keys.includes(key)) return { ok: false, code: 'bad_envelope' };
   if (raw.v !== VERSION) return { ok: false, code: 'bad_envelope' };
 
   const envelopeId = fromBase64Url(raw.envelopeId, ENVELOPE_ID_BYTES);
@@ -324,4 +337,5 @@ module.exports = {
   isPublicKey,
   isCredential,
   ENVELOPE_FIELDS,
+  SERVED_FIELDS,
 };
