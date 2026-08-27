@@ -150,6 +150,41 @@ try {
   sweepStaleRuns([PREFIX, 'stacki-owned-'], { dir: yard });
   check('a prefix that was not asked for is left alone', fs.existsSync(rename));
 
+  // ── a removal that fails keeps the directory AND the ownership ────────────
+  //
+  // OWNED.delete() used to happen first, so a removal that threw left a real
+  // directory on disk that ownedTempRoots() then swore this run no longer held.
+  // Lifecycle accounting reads that list; a leak it cannot see is the one kind
+  // worth being careful about.
+  //
+  // Made to fail by taking write permission off the PARENT, which is what
+  // unlinking an entry needs. Nothing outside this run's own yard is touched,
+  // and the permission goes straight back.
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    check('(skipped: running as root, which ignores the permissions this needs)', true);
+  } else {
+    const stubborn = ownedTempDir(PREFIX, { harness: 'temp-ownership', dir: yard });
+    const pen = fs.mkdirSync(path.join(yard, 'pen'), { recursive: true });
+    void pen;
+    // A directory of its own, so only this one entry becomes unremovable.
+    const locked = ownedTempDir('stacki-owned-locked-', { harness: 'temp-ownership', dir: path.join(yard, 'pen') });
+    fs.chmodSync(path.join(yard, 'pen'), 0o500);
+    let released;
+    try {
+      released = releaseTempDir(locked);
+      check('a removal that cannot finish answers false', released === false, String(released));
+      check('the directory is still there', fs.existsSync(locked));
+      check('and this run still owns it, so accounting can report it', ownedTempRoots().includes(locked), JSON.stringify(ownedTempRoots()));
+    } finally {
+      fs.chmodSync(path.join(yard, 'pen'), 0o700);
+    }
+    // …and once it can go, it goes, and the ownership goes with it.
+    check('the same call succeeds once the obstacle is gone', releaseTempDir(locked) === true);
+    check('and it is no longer held', !ownedTempRoots().includes(locked));
+    check('a second, unobstructed directory is unaffected', fs.existsSync(stubborn));
+    releaseTempDir(stubborn);
+  }
+
   // ── and a run removes its own, normally ───────────────────────────────────
   const removed = releaseTempDir(mine);
   check('a run can remove its own fixture', removed === true);

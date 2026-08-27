@@ -128,17 +128,31 @@ function ownedTempDir(prefix, { harness = 'stacki', dir = os.tmpdir() } = {}) {
   return root;
 }
 
-/** Remove a directory this run made. Its own; no ceremony required. */
+/**
+ * Remove a directory this run made. Its own; no ceremony required.
+ *
+ * Ownership is given up only when the directory is actually gone. It used to be
+ * dropped from OWNED first, so a removal that threw — a read-only parent, a
+ * file another process still has open on a filesystem that minds — left a real
+ * directory on disk that `ownedTempRoots()` then swore this run no longer held.
+ * That is a leak the lifecycle accounting cannot see, which is the one kind
+ * worth being careful about.
+ *
+ * @returns {boolean} whether the directory is gone. False means it is still
+ *   this run's, still on disk, and still in ownedTempRoots() to be reported.
+ */
 function releaseTempDir(root) {
-  OWNED.delete(root);
   try {
     fs.rmSync(root, { recursive: true, force: true });
-    return true;
   } catch {
-    // A temp folder that will not go is not a test failure on its own; the
-    // caller's lifecycle accounting is what decides that.
     return false;
   }
+  // rmSync can return without throwing and without having finished — force
+  // swallows ENOENT, and a partial recursive removal leaves the root behind.
+  // The question is whether it is there, not whether the call complained.
+  if (fs.existsSync(root)) return false;
+  OWNED.delete(root);
+  return true;
 }
 
 /** What this run made and has not released — for teardown to account for. */
