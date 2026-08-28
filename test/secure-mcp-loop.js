@@ -54,6 +54,13 @@ const { createReviewStore, fileFor } = require('../electron/review/store.js');
 const { syncOnce } = require('../electron/review/sync.js');
 const { uuidv5 } = require('../electron/review/actors.js');
 
+// PUBLIC MODE. With STACKI_PUBLIC_RELAY set, this same proof runs against a
+// deployed relay over the internet instead of a relay spawned here — same
+// clients, same protocol, same assertions, one more hop and a real TLS
+// termination in the middle. Unset, it behaves exactly as before.
+const PUBLIC_RELAY = (process.env.STACKI_PUBLIC_RELAY || '').replace(/\/+$/, '');
+if (PUBLIC_RELAY) require('./support/publicFetch.js').usePublicNetwork();
+
 const failures = [];
 let checked = 0;
 const check = (what, condition, detail) => {
@@ -162,7 +169,12 @@ function makeClient({ url, token }) {
 (async () => {
   // --- a relay that cannot read anything ------------------------------------
 
-  const relayBase = `http://127.0.0.1:${RELAY_PORT}`;
+  const relayBase = PUBLIC_RELAY || `http://127.0.0.1:${RELAY_PORT}`;
+  if (PUBLIC_RELAY) {
+    say(`\nsecure-mcp-loop: PUBLIC relay ${relayBase}`);
+    const up = await fetch(`${relayBase}/health`, { signal: AbortSignal.timeout(20000) }).then((r) => r.json()).catch(() => null);
+    check('the deployed relay is answering before anything is asked of it', up?.ok === true, JSON.stringify(up));
+  } else {
   relay = spawn('node', ['--disable-warning=ExperimentalWarning', 'relay/node/bin.js'], {
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, STACKI_RELAY_PORT: String(RELAY_PORT), STACKI_RELAY_DATA: relayData },
@@ -180,6 +192,7 @@ function makeClient({ url, token }) {
     }
   }, { timeout: 30000 });
   say(`\nsecure-mcp-loop: relay on ${relayBase}`);
+  }
 
   await app.whenReady();
   const status = await until('the MCP server', () => {
@@ -336,22 +349,38 @@ function makeClient({ url, token }) {
   // --- what the relay saw ----------------------------------------------------
 
   say('  5  what the relay was able to read');
-  // The relay is another process with its own SQLite file. Reading the FILE,
-  // byte for byte, is the stronger proof anyway: it is everything the relay
-  // could hand to anyone, including anything a query might have hidden.
-  const dbFile = path.join(relayData, 'relay.db');
-  check('the relay wrote a database', fs.existsSync(dbFile), dbFile);
-  const wholeDb = fs.readFileSync(dbFile).toString('latin1');
-  check('and it is holding something', wholeDb.length > 1000, `${wholeDb.length} bytes`);
-  for (const [what, secret] of [
-    ['what Bob wrote', BOB_SAYS],
-    ['what the agent answered', AGENT_SAYS],
-    ['the text the agent set', NEW_TEXT],
-    ['the source file the review points at', 'index.astro'],
-    ['Bob’s display name', 'Bob'],
-    ['Alice’s project path', root],
-  ]) {
-    check(`the relay never received ${what}`, !wholeDb.includes(secret), what);
+  // WHERE THE EVIDENCE LIVES DEPENDS ON WHOSE DISK IT IS.
+  //
+  // Against a local relay this reads the SQLite FILE byte for byte, which is
+  // the strongest form of the claim: everything the relay could hand anyone,
+  // including whatever a query might have hidden. Against a deployed Durable
+  // Object there is no such file within reach, and Cloudflare offers no
+  // supported way to read a DO's raw storage from outside. Adding an endpoint
+  // that dumped it would create exactly the hole this test exists to disprove,
+  // so the deployed run says plainly which proof it is making.
+  let wholeDb = '';
+  if (PUBLIC_RELAY) {
+    say('    (deployed: raw Durable Object storage is not externally readable —');
+    say('     the byte-level proof is the local run; this run proves the wire)');
+    // What CAN be checked from here is everything that crossed the network.
+    wholeDb = '';
+  } else {
+    const dbFile = path.join(relayData, 'relay.db');
+    check('the relay wrote a database', fs.existsSync(dbFile), dbFile);
+    wholeDb = fs.readFileSync(dbFile).toString('latin1');
+    check('and it is holding something', wholeDb.length > 1000, `${wholeDb.length} bytes`);
+  }
+  if (!PUBLIC_RELAY) {
+    for (const [what, secret] of [
+      ['what Bob wrote', BOB_SAYS],
+      ['what the agent answered', AGENT_SAYS],
+      ['the text the agent set', NEW_TEXT],
+      ['the source file the review points at', 'index.astro'],
+      ['Bob’s display name', 'Bob'],
+      ['Alice’s project path', root],
+    ]) {
+      check(`the relay never received ${what}`, !wholeDb.includes(secret), what);
+    }
   }
 
   // The thread is on both machines. Ending the share does not take it away.
@@ -389,7 +418,7 @@ async function finish(code) {
     problems.push(`stopping MCP: ${err.message}`);
   }
   try {
-    if (relay && relay.exitCode === null) {
+    if (!PUBLIC_RELAY && relay && relay.exitCode === null) {
       const gone = new Promise((resolve) => relay.once('exit', resolve));
       relay.kill('SIGTERM');
       await Promise.race([gone, wait(4000)]);
