@@ -119,9 +119,6 @@ export function placePins(items, rects) {
       x: p.x,
       y: p.y,
       status: p.status,
-      // The person's own colour. A cluster wears the first one's — it is a
-      // grouping, not a state, so there is nothing to reconcile.
-      color: p.color || 'blue',
       reviews: [p.id],
       // The short numbers in the cluster, so a marker can wear the same name
       // the panel and an agent use for it.

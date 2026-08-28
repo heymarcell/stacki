@@ -547,47 +547,47 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     });
     check('an empty reply sends nothing', acted.length === 0, JSON.stringify(acted));
 
-    // Status and the person's own filing are two different facts and no longer
-    // share a channel. The dot says the state; the grouping colour is a small
-    // separate mark, and it is edited through Colour… in the overflow rather
-    // than by pressing the thing that tells you a review is resolved.
+    // A review has ONE colour and status owns it. There used to be a second —
+    // a palette of six the user filed a note under, a `Colour…` item in the
+    // overflow, a swatch dot beside the number — and it is gone: it said
+    // nothing status was not already saying, at a size nobody could read.
+    //
+    // These checks are the contract rather than the current call site. A prop,
+    // a helper or a call site that puts a `c-*` class back is a review's own
+    // colour taking charge of what "resolved" looks like again, which is the
+    // bug the split was made to fix.
     acted.length = 0;
-    let colored = null;
-    await render(thread(review({ color: 'violet' }), { onColor: (c) => (colored = c) }));
-    check('the dot says the status, not the filing colour', /is-open/.test($('.review-dot').className) && !/c-violet/.test($('.review-dot').className), $('.review-dot').className);
+    await render(thread(review({ color: 'violet' })));
+    check('the dot says the status', /is-open/.test($('.review-dot').className), $('.review-dot').className);
     check('and the dot is not a button', !$('.review-dot-btn'));
-    check('the filing colour is a separate quiet mark', /c-violet/.test($('.review-swatch-dot')?.className || ''), $('.review-swatch-dot')?.className);
-    check('which is decoration, not something to read out', $('.review-swatch-dot').getAttribute('aria-hidden') === 'true');
-    // The contract, not just the current call site: the dot carries no
-    // grouping-colour class at all, whatever it is handed. Anything that puts
-    // one back — a prop, a call site, a helper — puts a review's filing colour
-    // back in charge of what "resolved" looks like.
-    check('the dot carries no colour class of any kind', !/\bc-[a-z]+/.test($('.review-dot').className), $('.review-dot').className);
+    check('a colour on a review is ignored, not drawn', !/\bc-[a-z]+/.test($('.review-dot').className), $('.review-dot').className);
+    check('there is no swatch beside the number', !$('.review-swatch-dot'));
+    check('and no palette anywhere in the thread', $$('.review-swatch').length === 0 && !$('.review-palette'));
     await render(React.createElement(ui.ReviewStatusDot, { status: 'resolved', anchorState: 'attached', color: 'violet' }));
-    check('and ignores a colour handed straight to it', !/\bc-/.test($('.review-dot').className), $('.review-dot').className);
+    check('and the dot ignores a colour handed straight to it', !/\bc-/.test($('.review-dot').className), $('.review-dot').className);
     check('while still saying the status', /is-resolved/.test($('.review-dot').className));
+    check('the component that drew the palette is gone too', typeof ui.ReviewPalette === 'undefined' && typeof ui.REVIEW_COLORS === 'undefined');
 
-    // Recolouring lives in the overflow now. It used to be behind the status
-    // dot, so the control that told you a review was resolved was also the one
-    // that changed the colour it said it in.
-    await render(thread(review({ color: 'violet' }), { onColor: (c) => (colored = c) }));
+    // The overflow menu still opens, and no longer offers a colour.
+    await render(thread(review({ color: 'violet' })));
     await click($('.review-overflow button[aria-haspopup="menu"]'));
-    await click($$('.review-menu [role="menuitem"]').find((b) => /Colour/.test(b.textContent)));
-    check('Colour… opens the palette', $$('.review-swatch').length === 6, String($$('.review-swatch').length));
-    check('and shows which one is on', $$('.review-swatch').filter((b) => b.classList.contains('on')).length === 1);
-    await click($$('.review-swatch').find((b) => b.classList.contains('c-teal')));
-    check('picking one reports it', colored === 'teal');
-    check('and closes the palette', $$('.review-swatch').length === 0);
+    const items = $$('.review-menu [role="menuitem"]').map((b) => b.textContent);
+    check('the overflow menu still has something in it', items.length > 0, items.join(' | '));
+    check('and Colour… is not one of them', !items.some((t) => /Colour/i.test(t)), items.join(' | '));
+    // Shut again, so the next block starts from a closed menu — the palette
+    // used to close it on the way out and nothing else here does.
+    await click($('.review-overflow button[aria-haspopup="menu"]'));
+    check('and it closes again', !$('.review-menu'));
 
     await render(thread(review({ status: 'deferred', color: 'violet' })));
     check('a deferred review is grey and says so', /is-deferred/.test($('.review-dot').className), $('.review-dot').className);
-    check('whatever it is filed under', !/c-violet/.test($('.review-dot').className));
-    check('and it is still filed under it', /c-violet/.test($('.review-swatch-dot')?.className || ''));
-    // The whole reason the two were separated: a review somebody filed under
-    // green must not read as resolved.
+    check('whatever colour it was handed', !/c-violet/.test($('.review-dot').className));
+    check('and nothing else on the row is wearing it', !$('.review-swatch-dot'));
+    // The reason the two were separated in the first place: a review somebody
+    // had filed under green must not read as resolved.
     await render(thread(review({ status: 'open', color: 'green' })));
-    check('an open review filed under green is still open', /is-open/.test($('.review-dot').className), $('.review-dot').className);
-    check('and is not marked resolved by its filing colour', !/is-resolved/.test($('.review-dot').className));
+    check('an open review carrying green is still open', /is-open/.test($('.review-dot').className), $('.review-dot').className);
+    check('and is not marked resolved by it', !/is-resolved/.test($('.review-dot').className));
     await render(thread(review({ status: 'resolved', color: 'violet' })));
     check('a resolved one is a state, not a grouping', /is-resolved/.test($('.review-dot').className));
     await render(thread(review({ anchorState: 'orphaned', color: 'violet' })));
@@ -703,9 +703,11 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
     check('a pin is drawn for each review that has a box', $$('.review-pin').length === 2, String($$('.review-pin').length));
     const at = (id) => $$('.review-pin').find((p) => p.style.left === id);
     check('a pin sits where its ratios say', !!at('300px'), $$('.review-pin').map((p) => `${p.style.left},${p.style.top}`).join(' '));
-    // The person's grouping colour is no longer on the marker: status is what
-    // a pin has to say, and a review filed under green looked resolved.
-    check('and does not wear the person\u2019s grouping colour', !/c-/.test(at('300px').className), at('300px').className);
+    // A marker wears its status and nothing else. It used to wear the
+    // person's own filing colour, which meant a review filed under green
+    // looked resolved. The colour is gone from the model; this review is
+    // handed one anyway, because the check is that nothing draws it.
+    check('and does not wear a colour handed to it', !/c-/.test(at('300px').className), at('300px').className);
     check('it wears its status instead', /is-open/.test(at('300px').className), at('300px').className);
     check('and on the copy it was left on', $$('.review-pin').some((p) => p.style.top === '200px'), $$('.review-pin').map((p) => p.style.top).join());
     check('a deferred review reads differently from an open one', $$('.review-pin.is-deferred').length === 1);
@@ -777,7 +779,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
 
     // Three digits is a real number once a project has been reviewed for a
     // while, and it has to read as a name rather than as a smudge.
-    await render(pins({ items: [{ id: 'rt_big', number: 128, color: 'blue', path: '0.1', occurrence: 0, pin: { xRatio: 0.5, yRatio: 0.5 }, status: 'open', anchorState: 'attached' }] }));
+    await render(pins({ items: [{ id: 'rt_big', number: 128, path: '0.1', occurrence: 0, pin: { xRatio: 0.5, yRatio: 0.5 }, status: 'open', anchorState: 'attached' }] }));
     check('a three-digit number is shown in full', $('.review-pin').textContent === '128', $('.review-pin').textContent);
 
     await render(pins({ visible: false }));
@@ -1264,7 +1266,6 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       number: 7,
       status: 'open',
       anchorState: 'attached',
-      color: 'blue',
       author: { actorId: 'them', actorKind: 'human', actorName: 'Alice' },
       messages: [
         { id: 'm1', authorType: 'human', actorId: 'them', actorName: 'Alice', body: 'This CTA is too close.', createdAt: Date.now(), editedAt: null },
@@ -1416,7 +1417,6 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       number: 42,
       status: 'open',
       anchorState: 'attached',
-      color: 'blue',
       page: '/',
       breakpoint: 'desktop',
       source: 'src/components/HeroSection.astro',
@@ -1744,7 +1744,6 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
       number: 99,
       status: 'open',
       anchorState: 'attached',
-      color: 'blue',
       page: '/',
       breakpoint: 'desktop',
       source: 'src/components/Hero.astro',
@@ -1946,7 +1945,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
 
     const msg = (body) => ({ id: 'm1', authorType: 'human', actorId: 'me', actorName: 'You', body, createdAt: Date.now(), editedAt: null });
     const one = {
-      id: 'rt_resize', number: 5, status: 'open', anchorState: 'attached', color: 'blue',
+      id: 'rt_resize', number: 5, status: 'open', anchorState: 'attached',
       page: '/', breakpoint: 'desktop', source: 'src/components/Hero.astro',
       occurrence: 0, occurrenceCount: 1, updatedAt: Date.now(), createdAt: Date.now(),
       creationContext: { tag: 'h1', text: 'Hi', componentChain: ['index.astro', 'Hero'] },
@@ -2044,7 +2043,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
   // ------------------------------------------------------------------
   {
     const review = {
-      id: 'rt_peek', number: 17, status: 'open', anchorState: 'attached', color: 'blue',
+      id: 'rt_peek', number: 17, status: 'open', anchorState: 'attached',
       updatedAt: Date.now() - 72e5,
       author: { actorId: 'c', actorKind: 'agent', actorName: 'Claude' },
       message: 'The accent colour looks off here on dark background.',
@@ -2094,7 +2093,7 @@ export { counter } from ${JSON.stringify(path.join(__dirname, 'fixtures', 'count
   // The cluster chooser — never picking for you
   // ------------------------------------------------------------------
   {
-    const at = (n) => ({ id: `rt_${n}`, number: n, status: n === 28 ? 'resolved' : 'open', anchorState: 'attached', color: 'blue', message: `Comment number ${n} about this element` });
+    const at = (n) => ({ id: `rt_${n}`, number: n, status: n === 28 ? 'resolved' : 'open', anchorState: 'attached', message: `Comment number ${n} about this element` });
     const list = [at(17), at(21), at(28)];
     let picked = null;
     let closed = false;

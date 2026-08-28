@@ -175,6 +175,27 @@ function createWorkspaces({ userDataPath, now = Date.now } = {}) {
   }
 
   /**
+   * Every workspace and mapping this installation holds. Gone.
+   *
+   * Not `all()` walked and forgotten one by one: `all()` answers through
+   * `reviveWorkspace`, so an entry it cannot make sense of would survive that
+   * and survive nothing else. This clears the two keys outright and leaves the
+   * rest of the file — the local person, above all — untouched.
+   *
+   * One caller, the review epoch reset. Turning sharing off for a project is
+   * `unlink`; leaving a workspace is `forget`.
+   */
+  function wipe() {
+    const data = read();
+    const had = Object.keys(data.workspaces || {}).length;
+    const kept = { ...data };
+    delete kept.workspaces;
+    delete kept.projects;
+    write(kept);
+    return had;
+  }
+
+  /**
    * A workspace this repository might already belong to.
    *
    * A SUGGESTION for a person to look at, and the only thing a git remote is
@@ -196,6 +217,7 @@ function createWorkspaces({ userDataPath, now = Date.now } = {}) {
     forProject,
     link,
     unlink,
+    wipe,
     suggestFor,
     /** Whether the credential file is only readable by this user. */
     secure() {

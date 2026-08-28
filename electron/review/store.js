@@ -69,13 +69,13 @@ const {
   makeEvent,
   projectThreads,
 } = require('./events');
-const { uuidv5, legacyAgentActor, agentActor, DEFAULT_AGENT_NAME } = require('./actors');
+const { uuidv5, agentActor, DEFAULT_AGENT_NAME } = require('./actors');
 const { provenanceFor, sourceStamp } = require('./provenance');
 
 // 1 was one mutable thread list per project. 2 is the event log. An older
 // Stacki refuses to touch a file it does not recognise (see loadFile), which
 // is what keeps a downgrade from silently erasing everything written since.
-const VERSION = 2;
+const VERSION = 3;
 
 // Bounds. Every one of these is a user-controlled string that ends up in an
 // agent's context window, and one pathological review must not be able to cost
@@ -104,17 +104,12 @@ const MAX_DETAIL_MESSAGES = 50;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 
 const STATUSES = ['open', 'resolved', 'deferred'];
-// The colours a comment can be. A fixed set rather than a free picker: these
-// have to stay legible as a 22px marker over an arbitrary website, and a
-// palette somebody can only choose badly from is not a choice worth offering.
-//
-// Colour is the person's own way of grouping their notes — it says nothing
-// about state. State is the marker's SHAPE: filled is open, hollow is deferred,
-// a dashed ring is an anchor Stacki can no longer find. That split is the whole
-// point, because a pin has to answer "is this done" before it answers anything
-// else, and it has to answer it without a legend.
-const COLORS = ['blue', 'violet', 'teal', 'green', 'amber', 'rose'];
-const DEFAULT_COLOR = 'blue';
+// A review's colour is its STATUS and nothing else, and the store has no say
+// in it — it stores the status and the renderer paints it. There used to be a
+// second colour here, six of them, the person's own way of grouping notes. It
+// meant a marker could not answer "is this done" without a legend, and at the
+// size it was drawn nobody could read it anyway. See epoch.js for what became
+// of the reviews that carried one.
 // `unknown` is new, and it is the whole of what makes a shared review honest.
 // A review that arrived from somebody else's machine has never been checked
 // against THIS checkout, and calling it attached because it was attached for
@@ -157,201 +152,6 @@ const fileFor = (userDataPath, projectPath) =>
   path.join(userDataPath, 'reviews', `${scopeKey(projectPath)}.json`);
 
 // --- reading what is on disk ------------------------------------------------
-
-/**
- * A version-1 thread from disk, checked field by field. Null for anything
- * unusable.
- *
- * Kept for exactly one purpose now: turning an old ledger into events. It is
- * still exported because it is the definition of what an old file could
- * legally contain, and the migration below is only as trustworthy as this is.
- */
-function reviveThread(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-  const id = str(raw.id, 100);
-  if (!id) return null;
-  const anchor = raw.anchor && typeof raw.anchor === 'object' ? raw.anchor : null;
-  if (!anchor || !Array.isArray(anchor.keys) || !anchor.keys.length) return null;
-  const messages = (Array.isArray(raw.messages) ? raw.messages : [])
-    .map((m) => {
-      const text = body(m?.body, MAX_BODY);
-      if (!text) return null;
-      return {
-        id: str(m.id, 100) || `rm_${crypto.randomUUID()}`,
-        authorType: authorOf(m.authorType),
-        body: text,
-        createdAt: int(m.createdAt) || 0,
-        // When somebody rewrote it, if they did. Kept across a reload, because
-        // "(edited)" disappearing on restart would make the record quietly
-        // less true than it was.
-        editedAt: int(m.editedAt) || null,
-      };
-    })
-    .filter(Boolean)
-    .slice(0, MAX_MESSAGES);
-  // A thread with nothing said in it is not a review.
-  if (!messages.length) return null;
-  return {
-    id,
-    // The short handle a person says out loud. The uuid is the identity; this
-    // is the name — see `nextNumber` below.
-    number: Number.isInteger(raw.number) && raw.number > 0 ? raw.number : null,
-    color: COLORS.includes(raw.color) ? raw.color : DEFAULT_COLOR,
-    status: STATUSES.includes(raw.status) ? raw.status : 'open',
-    anchorState: ANCHOR_STATES.includes(raw.anchorState) ? raw.anchorState : 'attached',
-    anchor,
-    creationContext: raw.creationContext && typeof raw.creationContext === 'object' ? raw.creationContext : {},
-    messages,
-    deferredReason: body(raw.deferredReason, MAX_REASON),
-    externalRefs: (Array.isArray(raw.externalRefs) ? raw.externalRefs : [])
-      .map((r) => body(r, MAX_REF))
-      .filter(Boolean)
-      .slice(0, MAX_REFS),
-    createdAt: int(raw.createdAt) || messages[0].createdAt,
-    updatedAt: int(raw.updatedAt) || messages[messages.length - 1].createdAt,
-  };
-}
-
-/**
- * Turn a version-1 ledger into events.
- *
- * Everything here is a restatement of what the old file already said. The one
- * thing an old file does NOT say is who wrote a message: `authorType: 'human'`
- * names a category, not a person. It is mapped to this installation's own
- * actor, and that is safe for exactly one reason — a version-1 ledger is
- * single-writer by construction. It lives in one machine's application-support
- * directory, it was never shared with anybody, and the only human who could
- * have written in it is the human sitting here. `agent` becomes a legacy agent
- * actor with no name attached, because which agent it was is genuinely not
- * recorded and inventing one would be inventing a fact.
- *
- * Every migrated event is marked `legacy: true` and carries `provenance: null`.
- * Old reviews are never given guessed provenance: nobody knows what the source
- * looked like on the day they were written, and a plausible-looking commit SHA
- * is worse than an admitted absence.
- *
- * Event ids are DERIVED from the thread and message ids, so migrating the same
- * file twice produces the same events. That matters: a union by id turns a
- * repeated migration into a no-op instead of a doubled history.
- */
-function eventsFromLegacy(threads, { human, agent = legacyAgentActor() } = {}) {
-  const events = [];
-  const numbers = {};
-  const anchors = {};
-  let lamport = 1;
-  const id = (kind, ...parts) => uuidv5(`stacki:migration:${kind}:${parts.join(':')}`);
-  const actorFor = (authorType) => (authorType === 'agent' ? agent : human);
-
-  const ordered = [...threads].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
-  for (const t of ordered) {
-    if (t.number) numbers[t.id] = t.number;
-    if (t.anchorState) anchors[t.id] = { anchorState: t.anchorState, keys: null };
-    const opener = actorFor(t.messages[0].authorType);
-    events.push(
-      makeEvent({
-        id: id('thread', t.id),
-        type: 'thread.created',
-        threadId: t.id,
-        actor: opener,
-        lamport: lamport++,
-        at: t.createdAt,
-        payload: {
-          color: t.color,
-          anchor: t.anchor,
-          creationContext: t.creationContext,
-          provenance: null,
-          number: t.number || null,
-          legacy: true,
-        },
-      })
-    );
-    for (const m of t.messages) {
-      events.push(
-        makeEvent({
-          id: id('message', t.id, m.id),
-          type: 'message.created',
-          threadId: t.id,
-          actor: actorFor(m.authorType),
-          lamport: lamport++,
-          at: m.createdAt,
-          payload: { messageId: m.id, body: m.body },
-        })
-      );
-      if (m.editedAt) {
-        // The "edited" mark is part of the record — a message somebody replied
-        // to and then changed is a different thing from one nobody touched —
-        // so it is restated as the edit event that would have produced it.
-        events.push(
-          makeEvent({
-            id: id('edit', t.id, m.id),
-            type: 'message.edited',
-            threadId: t.id,
-            actor: actorFor(m.authorType),
-            lamport: lamport++,
-            at: m.editedAt,
-            payload: { messageId: m.id, body: m.body },
-          })
-        );
-      }
-    }
-    // A deferral reason and any external references live on defer events in
-    // the new model, so a thread that has either gets one — followed by
-    // whatever put it into the state it is actually in.
-    const hadDeferral = !!t.deferredReason || t.externalRefs.length > 0;
-    if (hadDeferral) {
-      events.push(
-        makeEvent({
-          id: id('defer', t.id),
-          type: 'thread.deferred',
-          threadId: t.id,
-          actor: opener,
-          lamport: lamport++,
-          at: t.updatedAt,
-          payload: { reason: t.deferredReason, externalRef: t.externalRefs[0] || null, refs: t.externalRefs },
-        })
-      );
-      for (let i = 1; i < t.externalRefs.length; i++) {
-        events.push(
-          makeEvent({
-            id: id('defer-ref', t.id, String(i)),
-            type: 'thread.deferred',
-            threadId: t.id,
-            actor: opener,
-            lamport: lamport++,
-            at: t.updatedAt,
-            payload: { reason: t.deferredReason, externalRef: t.externalRefs[i] },
-          })
-        );
-      }
-    }
-    const finalType =
-      t.status === 'resolved'
-        ? 'thread.resolved'
-        : t.status === 'deferred'
-          ? hadDeferral
-            ? null
-            : 'thread.deferred'
-          : hadDeferral
-            ? 'thread.reopened'
-            : null;
-    if (finalType) {
-      events.push(
-        makeEvent({
-          id: id('status', t.id),
-          type: finalType,
-          threadId: t.id,
-          actor: opener,
-          lamport: lamport++,
-          at: t.updatedAt,
-          // The source a migrated resolution landed on is not recorded
-          // anywhere, so it is null rather than today's HEAD.
-          payload: finalType === 'thread.resolved' ? { resolvedAtSource: null } : {},
-        })
-      );
-    }
-  }
-  return { events: events.filter(Boolean), numbers, anchors };
-}
 
 const EMPTY_SHARED = () => ({
   workspaceId: null,
@@ -404,18 +204,7 @@ const emptyLedger = (over = {}) => ({
 
 const badFile = (detail) => emptyLedger({ problem: { kind: 'corrupt', detail, quarantine: true } });
 
-/**
- * The person a version-1 ledger's `human` messages are attributed to when the
- * caller did not say who is reading.
- *
- * The store always passes the real local actor. This exists so that `loadFile`
- * on its own — a test, a repair tool — produces a complete, foldable event set
- * rather than silently dropping every message it cannot attribute.
- */
-const LEGACY_HUMAN = () => ({ id: uuidv5('human:legacy'), kind: 'human', displayName: null });
-
-function loadFile(file, { human = null } = {}) {
-  const reader = human || LEGACY_HUMAN();
+function loadFile(file) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -441,27 +230,30 @@ function loadFile(file, { human = null } = {}) {
 
   const highWater = Number.isInteger(parsed.nextNumber) && parsed.nextNumber > 0 ? parsed.nextNumber : 1;
 
-  // --- version 1: a list of mutable threads ---------------------------------
-  if (version === 1) {
-    if (!Array.isArray(parsed.threads)) return badFile('threads is not a list');
-    const threads = parsed.threads.map(reviveThread).filter(Boolean);
-    const dropped = parsed.threads.length - threads.length;
-    const { events, numbers, anchors } = eventsFromLegacy(threads, { human: reader });
+  // --- versions 1 and 2: a previous alpha, deliberately not carried over -----
+  //
+  // Reviews from before version 3 are DISCARDED, not migrated. The review model
+  // changed shape during alpha — filing colours went, and with them the event
+  // that set them — and carrying that data forward would have meant keeping
+  // migration code, a dead event type and a dead field alive to serve reviews
+  // nobody was relying on yet.
+  //
+  // This is the one destructive branch in this file, and it is bounded: it
+  // fires only for versions this build KNOWS are obsolete. A version it does
+  // not recognise is handled above, read-only, and never rewritten — a
+  // downgrade must not eat a newer file.
+  if (version < VERSION) {
     return emptyLedger({
-      events,
-      numbers,
-      anchors,
-      nextNumber: highWater,
-      // Deliberately NOT the digest of the file that was read: this ledger no
-      // longer describes those bytes, and the next write must be recognised as
-      // a rewrite of them rather than mistaken for an untouched file.
+      nextNumber: 1,
+      // Not the digest of what was read: this ledger does not describe those
+      // bytes, so the next write must be recognised as replacing them.
       digest: digest(text),
       migrated: true,
-      problem: dropped ? { kind: 'partial', detail: `${dropped} unreadable thread(s) dropped` } : null,
+      problem: { kind: 'reset', detail: `reviews from version ${version} were discarded when the review model changed` },
     });
   }
 
-  // --- version 2: the event log ---------------------------------------------
+  // --- version 3: the event log ---------------------------------------------
   if (!Array.isArray(parsed.events)) return badFile('events is not a list');
   const events = parsed.events.map(reviveEvent).filter(Boolean);
   const dropped = parsed.events.length - events.length;
@@ -792,7 +584,7 @@ function createReviewStore({
    * a view of it.
    */
   function readFresh() {
-    const loaded = loadFile(file, { human: localActor() });
+    const loaded = loadFile(file);
     events = loaded.events;
     numbers = loaded.numbers;
     anchors = loaded.anchors;
@@ -1039,7 +831,6 @@ function createReviewStore({
           threadId,
           who,
           {
-            color: COLORS.includes(req.color) ? req.color : DEFAULT_COLOR,
             anchor: req.anchor,
             creationContext: req.creationContext || {},
             provenance: stamped || null,
@@ -1112,26 +903,6 @@ function createReviewStore({
     }
 
     const saved = append(list);
-    if (!saved.ok) return saved;
-    return { ok: true, thread: find(thread.id) };
-  }
-
-  /**
-   * Recolour a review.
-   *
-   * Deliberately not an `apply` action, for the same reason delete is not: this
-   * is a person organising their own notes, and an agent quietly recolouring
-   * somebody's comments would be changing something it has no opinion worth
-   * having about. Not an edit either — the colour is not part of what was said,
-   * so `updatedAt` stays where it is.
-   */
-  function setColor(ref, color, as = null) {
-    if (!writable) return readOnly();
-    if (!COLORS.includes(color)) return fail('bad_color', `A colour must be one of ${COLORS.join(', ')}.`);
-    const thread = find(str(ref, 100));
-    if (!thread) return fail('no_thread', `No review called ${ref || '(none)'}.`);
-    if (thread.color === color) return { ok: true, thread: { ...thread } };
-    const saved = append([event('thread.color.changed', thread.id, actorOf(as), { color }, now())]);
     if (!saved.ok) return saved;
     return { ok: true, thread: find(thread.id) };
   }
@@ -1453,8 +1224,7 @@ function createReviewStore({
     },
     apply,
     remove,
-    setColor,
-    editMessage,
+      editMessage,
     removeMessage,
     syncAnchors,
     // sharing
@@ -1558,7 +1328,6 @@ function summarize(thread, localId = null) {
     // What to call it in a sentence. Either this or the id works everywhere a
     // review is named.
     number: thread.number || null,
-    color: thread.color || DEFAULT_COLOR,
     status: thread.status,
     anchorState: thread.anchorState,
     message: excerptOf(first?.body),
@@ -1782,15 +1551,11 @@ module.exports = {
   fileFor,
   loadFile,
   writeAtomic,
-  reviveThread,
-  eventsFromLegacy,
   wireProvenance,
   wireStamp,
   wireActor,
   VERSION,
   STATUSES,
-  COLORS,
-  DEFAULT_COLOR,
   ANCHOR_STATES,
   ACTIONS,
   AUTHORS,

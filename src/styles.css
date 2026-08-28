@@ -5911,43 +5911,13 @@ textarea::selection {
   box-shadow: inset 0 0 0 2px var(--accent-soft);
 }
 
-/* --- the grouping palette, and what it is NOT ----------------------- */
-/*
-   These are the colours a person can file their own notes under. They are
-   SECONDARY metadata and they no longer carry state.
-
-   They used to. Status was the shape and the person's colour was the fill, so
-   a review filed under green looked resolved, a deferred one could be violet,
-   and the marker could not answer "is this done" without a legend. Both facts
-   were sharing one channel and the more important of them was losing.
-
-   Now status owns colour AND shape — see `--review-open` and friends — and
-   this palette appears as a small separate mark beside the number
-   (`.review-swatch-dot`). Grouping is still there, still editable through
-   Colour… in the Inspector overflow; it is simply no longer pretending to be
-   status.
-*/
-.c-blue { --pin: #0099ff; }
-.c-violet { --pin: #a855f7; }
-.c-teal { --pin: #14b8a6; }
-.c-green { --pin: #22c55e; }
-.c-amber { --pin: #f59e0b; }
-.c-rose { --pin: #f43f5e; }
-
-.review-palette { display: flex; gap: 6px; padding: 2px 0 2px; }
-.review-swatch {
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  min-width: 0;
-  border-radius: 8px;
-  background: var(--pin);
-  border: 2px solid transparent;
-  cursor: pointer;
-}
-.review-swatch:hover:not(:disabled) { background: var(--pin); transform: scale(1.12); }
-.review-swatch.on { border-color: var(--text); }
-/* The dot is the handle for changing its own colour. */
+/* A review has exactly one colour, and status owns it — see `--review-open`
+   and friends. There used to be a second one: a palette of six the user could
+   file a note under, drawn as a 6px dot beside the number. Status had the
+   shape, filing had the fill, so a review filed under green looked resolved
+   and a deferred one could be violet. Splitting them fixed the lie and left
+   the palette saying nothing anybody could read at that size. It is gone —
+   the `.c-*` classes, `--pin`, the swatches and the dot with it. */
 
 /* --- the pin ------------------------------------------------------- */
 
@@ -5989,6 +5959,15 @@ textarea::selection {
   border-radius: 14px;
 }
 .review-pin:hover:not(:disabled) {
+  /* RE-ASSERTED, and it has to be. `button:hover` above sets
+     `background: var(--bg-active)` for every button in the editor, and with
+     `:where()` contributing nothing that selector is (0,2,1) — stronger than
+     the (0,1,0) `.review-pin` rule its colour lives on. Without this line an
+     open pin turned into a 9%-white wash on hover, with its white number
+     invisible against the page. The deferred, resolved and cluster rules below
+     were never affected only because they happen to set backgrounds of their
+     own. test/review-pin-hover.js measures all five. */
+  background: var(--review-open);
   transform: translate(-4px, -100%) scale(1.12);
   filter: brightness(1.12);
   z-index: 8;
@@ -6439,16 +6418,6 @@ textarea::selection {
 /* An anchor that no longer resolves. Not a decision anybody made, so it is
    drawn as an interruption of the shape rather than as a fourth status. */
 .review-dot.is-orphaned { background: transparent; border-style: dashed; border-color: var(--review-orphan); }
-
-/* The person's own grouping colour, where it is still worth seeing: a small
-   mark beside the number, not the thing carrying the state. */
-.review-swatch-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 3px;
-  flex-shrink: 0;
-  background: var(--pin, var(--accent));
-}
 
 .review-orphan {
   display: flex;

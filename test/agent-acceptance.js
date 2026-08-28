@@ -777,7 +777,6 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     const thread = {
       id: 't1',
       number: 1,
-      color: 'blue',
       status: 'open',
       anchorState: 'attached',
       createdAt: 1,

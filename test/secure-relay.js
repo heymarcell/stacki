@@ -133,7 +133,6 @@ async function main() {
     lamport: 1,
     at: 1,
     payload: {
-      color: 'blue',
       anchor: { path: CANARY.file, trail: ['main', 'section', 'h1'] },
       provenance: { branch: CANARY.branch, commit: 'deadbeefdeadbeefdeadbeef' },
     },

@@ -64,6 +64,7 @@ const {
 } = require('./secure/transport');
 const { unpackCapability, packCapability, shareLink } = require('./secure/capability');
 const { relayFor, describeRelay, checkRelay, DEFAULT_RELAY } = require('./secure/relays');
+const { resetReviewEpoch } = require('./epoch');
 
 // Focusing a review can mean loading a page, drilling into two components and
 // waiting for the canvas to scroll. The context questions get 4 seconds; this
@@ -355,13 +356,6 @@ function act(input = {}) {
 /** One review, in full, with everything this checkout can say about it. */
 const reviewOf = (thread) =>
   thread ? detail(thread, resolveTrail, checkout ? (t) => checkout.forThread(t) : null) : null;
-
-/** A person colouring their own notes. Never reachable from MCP — see the store. */
-function recolor(threadId, color) {
-  if (!store) return noProject();
-  const result = store.setColor(threadId, color, me());
-  return result.ok ? { ok: true, review: reviewOf(result.thread), revision: store.revision } : result;
-}
 
 /**
  * A person rewording what they wrote. Never reachable from MCP — see the store.
@@ -1046,6 +1040,21 @@ function start({ userDataPath, send, protector = null, isVisible = null }) {
   // `protector` is injected by tests and only by tests. In the app it is
   // Electron's safeStorage; nothing automated ever reaches a real Keychain.
   secureRooms = secureRooms || createSecureRooms({ userDataPath, protector });
+
+  // The alpha's reviews, discarded once. BEFORE the syncer exists and before
+  // any project is open, because the whole point of it is that no ledger is
+  // read and nothing connects to a relay in between — see epoch.js. It is a
+  // no-op on every launch after the first.
+  const discarded = resetReviewEpoch({
+    userDataPath,
+    rooms: secureRooms,
+    workspaces: registry,
+    transportFor: (roomId) => createSecureTransport({ rooms: secureRooms, roomId }),
+    log: (m) => console.warn(`[stacki] ${m}`),
+  });
+  // Nothing waits on the goodbyes; an unhandled rejection is still not on.
+  if (discarded.ran) discarded.notified.catch(() => {});
+
   syncer = syncer || createSyncer();
   // The only thing that closes the last gap in "you do not need a Sync
   // button": somebody who leaves Stacki open and focused all afternoon while a
@@ -1058,7 +1067,6 @@ function start({ userDataPath, send, protector = null, isVisible = null }) {
   ipcMain.handle('reviews:list', (_e, args) => list({ ...(args || {}), withSource: false }));
   ipcMain.handle('reviews:act', (_e, args) => act(args || {}));
   ipcMain.handle('reviews:remove', (_e, threadId) => remove(threadId));
-  ipcMain.handle('reviews:recolor', (_e, args) => recolor(args?.threadId, args?.color));
   ipcMain.handle('reviews:editMessage', (_e, args) => editMessage(args || {}));
   ipcMain.handle('reviews:removeMessage', (_e, args) => removeMessage(args || {}));
   ipcMain.handle('reviews:syncAnchors', (_e, args) => syncAnchors(args));
@@ -1129,7 +1137,6 @@ module.exports = {
   list,
   act,
   remove,
-  recolor,
   editMessage,
   removeMessage,
   syncAnchors,

@@ -3807,7 +3807,6 @@ export default function App() {
       return {
         id: r.id,
         number: r.number ?? null,
-        color: r.color || 'blue',
         path,
         occurrence: Number.isInteger(r.anchor?.occurrence) ? r.anchor.occurrence : null,
         pin: r.anchor?.pin || null,
@@ -3854,12 +3853,6 @@ export default function App() {
     } finally {
       setReviewBusyId(null);
     }
-  };
-
-  const recolorReview = async (id, color) => {
-    const result = await window.avb.reviewsRecolor({ threadId: id, color });
-    if (!result?.ok) showToast(result?.message || 'That colour could not be set.', 'error');
-    setReviewTick((n) => n + 1);
   };
 
   // Rewording and pruning are a person tidying their own notes. Neither goes
@@ -5312,7 +5305,6 @@ export default function App() {
                 }}
                 onFocus={() => focusReviewFromUi(reviewSelected)}
                 onDelete={() => deleteReview(reviewSelected.id)}
-                onColor={(c) => recolorReview(reviewSelected.id, c)}
                 onEditMessage={(messageId, message) => editReviewMessage(reviewSelected.id, messageId, message)}
                 onDeleteMessage={(messageId) => deleteReviewMessage(reviewSelected.id, messageId)}
               />
@@ -5570,7 +5562,6 @@ export default function App() {
             onReviewAct={actOnReview}
             onReviewFocus={focusReviewFromUi}
             onReviewDelete={deleteReview}
-            onReviewColor={recolorReview}
             onReviewEditMessage={editReviewMessage}
             onReviewDeleteMessage={deleteReviewMessage}
             onReviewDraftChange={setDraftBody}

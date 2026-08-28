@@ -47,7 +47,6 @@ directions and compares the results byte for byte.
 | edit vs delete | **delete is terminal**, in either order — which is what gives the pair an answer at all |
 | resolve vs reopen | highest-ordered status event wins |
 | defer vs resolve | same; a deferral with no reason does not erase an earlier reason |
-| colour changed twice | highest-ordered wins; never moves `updatedAt` |
 | duplicate event id | ignored; the copy already held wins, so a resend cannot redefine an event |
 | unknown event type | kept in the log, ignored by the fold |
 | a delete that would empty a thread | the earliest message survives its own tombstone |
@@ -72,7 +71,7 @@ a HUMAN event only under their own actor id.
 | the thread, its anchor, its provenance | `anchorState` — whether the anchor resolves *here* |
 | every message, edit and tombstone | the re-anchored keys after a node moved *here* |
 | status changes and the revision a resolution landed on | the short number `#17` |
-| colour | the sync cursor, the outbox, the workspace link |
+| | the sync cursor, the outbox, the workspace link |
 
 `anchorState` is the important one. Bob's tree is not Alice's, so inheriting her
 anchor state would be exactly how a review gets a pin on markup he does not
@@ -182,18 +181,33 @@ therefore kept free of Electron and of node_modules.
   event size, events per workspace.
 - Nothing that could be a comment is logged.
 
-## Migration
+## The version 3 epoch
 
-Ledger v1 (a list of mutable threads) → v2 (events), on first open, written
-back once. `authorType: 'human'` maps to this installation's own actor — safe
-because a v1 ledger is single-writer by construction — and is marked
-`legacy: true`. `agent` becomes a legacy agent actor with no name, because
-which agent it was is genuinely not recorded. Provenance stays `null`: nobody
-knows what the tree looked like on the day those were written, and today's HEAD
-is not an answer to that question.
+There is no migration. Ledgers below version 3 are **discarded**, and so is the
+review-sharing membership that could pull their events back.
 
-Migration event ids are derived (uuidv5 of the thread/message id), so migrating
-twice is a union no-op rather than a doubled history.
+The review model changed shape during alpha: a comment carried a filing colour
+the user picked, with `thread.color.changed` behind it and a `color` field on
+every projection. Both are gone. Keeping them alive as migration code — a dead
+event type and a dead field, folded on every read, forever — to serve reviews
+written in a build nobody was yet relying on was the worse trade.
+
+So `loadFile` returns an empty, writable ledger for any version below the
+current one, reporting `problem: { kind: 'reset' }` rather than corruption, and
+`electron/review/epoch.js` runs once at startup to remove the files themselves
+along with every room registration, dormant identity, workspace credential and
+project mapping. Membership goes first: a machine that keeps its old comments
+and cannot sync them is recoverable, and one with an empty ledger and a live
+subscription refilling it is not.
+
+Two things it does **not** touch. The local actor — every comment ever written
+from this machine is attributed to that uuid, and a new one would make somebody
+a stranger to their own past. And the preferred relay, which is a setting.
+
+A version **above** the current one is still read-only and never rewritten. The
+discard fires only for versions this build knows are obsolete; a downgrade must
+not eat a newer file. `test/review-epoch.js` measures both halves and the
+boundary between them.
 
 ## Files
 
@@ -205,6 +219,7 @@ twice is a union no-op rather than a doubled history.
 | `electron/review/checkout.js` | how a review stands against *this* tree |
 | `electron/review/actors.js` | identity, names, ownership rules |
 | `electron/review/workspaces.js` | which project is shared, and the credentials |
+| `electron/review/epoch.js` | the one-time discard of the alpha's review data |
 | `electron/review/transport.js` | the boundary, and one HTTP implementation |
 | `electron/review/sync.js` | push, pull, union, refold |
 | `electron/review/index.js` | the app around all of it |

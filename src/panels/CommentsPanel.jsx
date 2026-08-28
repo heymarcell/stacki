@@ -14,7 +14,7 @@ import { ReviewIcon, PinIcon, OrphanIcon } from '../ui/Icons.jsx';
 //
 // This is an INDEX. It lists reviews, filters them, and hands one to the
 // Inspector — it does not act on them. It used to take onAct, onDelete,
-// onColor, onEditMessage, onDeleteMessage and busyId as well, from back when
+// onEditMessage, onDeleteMessage and busyId as well, from back when
 // the conversation was docked inside it, and it had stopped using every one of
 // them: nine props threaded through App.jsx to be destructured and dropped.
 // Reading them here suggested a second place where a review could be resolved
@@ -183,11 +183,13 @@ export default function CommentsPanel({
         <div className="comments-problem">
           {problem.kind === 'newer'
             ? 'These comments were saved by a newer version of Stacki, so this one is leaving them alone. Update Stacki to read them.'
-            : problem.kind === 'corrupt'
-              ? 'The saved comments could not be read, so they have been set aside rather than deleted. New comments will save normally.'
-              : problem.kind === 'write_failed'
-                ? 'Comments are not being saved to disk right now — they will be lost when Stacki closes.'
-                : 'The comment file could not be opened.'}
+            : problem.kind === 'reset'
+              ? 'Comments from an earlier alpha were discarded when the comment format changed. New comments save normally.'
+              : problem.kind === 'corrupt'
+                ? 'The saved comments could not be read, so they have been set aside rather than deleted. New comments will save normally.'
+                : problem.kind === 'write_failed'
+                  ? 'Comments are not being saved to disk right now — they will be lost when Stacki closes.'
+                  : 'The comment file could not be opened.'}
         </div>
       )}
 
@@ -247,14 +249,6 @@ export default function CommentsPanel({
             <span className="comments-row-main">
               <span className="comments-row-top">
                 {r.number != null && <span className="review-number">#{r.number}</span>}
-                {/* Beside the number, exactly where the Inspector puts it. It
-                    was a second dot out in the gutter next to the status dot,
-                    which is two dots competing in the narrowest column in the
-                    app — and the one that matters least was the one aligned to
-                    the top of the row rather than to the text. */}
-                {r.color && r.color !== 'blue' && (
-                  <span className={`review-swatch-dot c-${r.color}`} aria-hidden="true" />
-                )}
                 <ReviewWhere review={r} compact />
                 <span className="spacer" />
                 {r.anchorState === 'orphaned' && <OrphanIcon size={11} />}

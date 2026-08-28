@@ -59,7 +59,6 @@ const ev = (id, type, actor, lamport, payload = {}, threadId = T) =>
 
 const created = (actor = ALICE, lamport = 1, over = {}) =>
   ev('e-created', 'thread.created', actor, lamport, {
-    color: 'blue',
     anchor: { keys: ['src/pages/index.astro#0.1'], page: { route: '/', file: 'src/pages/index.astro' } },
     creationContext: { tag: 'section', text: 'Hero' },
     provenance: { head: 'abc1234', branch: 'main', dirty: false, files: {} },
@@ -176,10 +175,9 @@ function stable(what, events, inspect) {
   const redefined = projectThreads([
     created(),
     opened(),
-    ev('e-created-2', 'thread.created', BOB, 9, { anchor: { keys: ['somewhere/else.astro#9'] }, color: 'rose' }),
+    ev('e-created-2', 'thread.created', BOB, 9, { anchor: { keys: ['somewhere/else.astro#9'] } }),
   ])[0];
   check('a second creation event cannot move the anchor', redefined.anchor.keys[0] === 'src/pages/index.astro#0.1');
-  check('nor recolour it by the back door', redefined.color === 'blue');
 }
 
 // ── A: two replies, written offline, at the same moment ─────────────────────
@@ -348,25 +346,36 @@ function stable(what, events, inspect) {
   check('and the state is open', reopened.status === 'open');
 }
 
-// ── Colour ──────────────────────────────────────────────────────────────────
+// ── The colour that used to be here ─────────────────────────────────────────
+//
+// `thread.color.changed` was a real event type in the alpha, and this is what
+// happened to it. A user-chosen filing colour sat beside the status colour,
+// meaning nothing that status was not already saying better, and both are not
+// worth two colours on one review. The event, the field and the palette went
+// together.
+//
+// The vocabulary is CLOSED, and that is what makes these two checks worth
+// keeping rather than deleting with the feature: an event this build does not
+// recognise is dropped, not projected, whether it is a retired word or a word
+// from a future it has never heard of. A ledger or a peer holding an old
+// colour event must fold to a review with no colour on it and no crash.
 
 {
-  const t = stable(
-    'a recolour',
-    [
-      created(),
-      opened(),
-      ev('e-color-a', 'thread.color.changed', ALICE, 4, { color: 'teal' }),
-      ev('e-color-b', 'thread.color.changed', BOB, 5, { color: 'rose' }),
-    ],
-    (thread) => {
-      check('the newest colour wins', thread.color === 'rose', thread.color);
-      // Colour is somebody filing their own notes, and has never been a thing
-      // that says the review was worked on.
-      check('and recolouring does not count as the review being touched', thread.updatedAt === thread.messages[0].createdAt, `${thread.updatedAt} vs ${thread.messages[0].createdAt}`);
-    }
-  );
-  check('recolouring produced a thread', !!t);
+  // The same two events either way — built once, so the comparison below is
+  // about the unknown events and not about two `created()` calls having been
+  // stamped a moment apart.
+  const base = [created(), opened()];
+  const withRetired = projectThreads([
+    ...base,
+    ev('e-color-a', 'thread.color.changed', ALICE, 4, { color: 'teal' }),
+    ev('e-invented', 'thread.priority.set', BOB, 5, { priority: 'high' }),
+  ]);
+  check('a retired event does not stop the review folding', withRetired.length === 1);
+  const thread = withRetired[0];
+  check('and leaves no colour on it', !('color' in thread), Object.keys(thread).join(','));
+  check('nor anything else it was carrying', !('priority' in thread));
+  check('the review is otherwise exactly what it was', JSON.stringify(thread) === JSON.stringify(projectThreads(base)[0]));
+  check('and no word outside the vocabulary is in it', !EVENT_TYPES.includes('thread.color.changed') && !EVENT_TYPES.includes('thread.priority.set'));
 }
 
 // ── E: a delete, and what comes after it ────────────────────────────────────
@@ -532,7 +541,7 @@ function stable(what, events, inspect) {
   const two = [
     created(ALICE, 1),
     opened(),
-    makeEvent({ id: 'e-t2', type: 'thread.created', threadId: 'rt_two', actor: BOB, lamport: 2, at: 500, payload: { color: 'rose', anchor: { keys: ['a#0'] } } }),
+    makeEvent({ id: 'e-t2', type: 'thread.created', threadId: 'rt_two', actor: BOB, lamport: 2, at: 500, payload: { anchor: { keys: ['a#0'] } } }),
     makeEvent({ id: 'e-t2m', type: 'message.created', threadId: 'rt_two', actor: BOB, lamport: 3, at: 500, payload: { messageId: 'x1', body: 'Bob’s review' } }),
   ];
   const threads = projectThreads(two);

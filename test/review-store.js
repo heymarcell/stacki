@@ -40,7 +40,6 @@ const {
   scopeKey,
   fileFor,
   loadFile,
-  reviveThread,
   VERSION,
   MAX_BODY,
   MAX_REASON,
@@ -48,7 +47,6 @@ const {
   MAX_REFS,
   MAX_MESSAGES,
   ACTIONS,
-  COLORS,
   MAX_DETAIL_MESSAGES,
 } = require('../electron/review/store.js');
 const { anchorFrom, leafKey, fileOfKey, sameTarget } = require('../electron/review/anchor.js');
@@ -299,34 +297,17 @@ const anchorOf = (over) => {
     return store.get(t.id).updatedAt === before;
   })());
 
-  // Colour is the person's own filing, and state is the marker's shape. So a
-  // colour is never a status and can never be set by an agent naming an action.
-  check('a review starts in the default colour', store.all()[0].color === 'blue', store.all()[0].color);
-  check('a colour can be chosen at creation', store.apply({ action: 'create', message: 'violet one', anchor: built.anchor, color: 'violet' }).thread.color === 'violet');
-  check('a colour nobody defined falls back rather than sticking', store.apply({ action: 'create', message: 'x', anchor: built.anchor, color: 'chartreuse' }).thread.color === 'blue');
-  check('a review can be recoloured', (() => {
-    const t = store.all()[0];
-    return store.setColor(t.id, 'teal').ok && store.get(t.id).color === 'teal';
+  // A review has no colour of its own. It used to: a palette of six the user
+  // filed a note under, with an event that set it and a field that carried it.
+  // It is gone, and gone means the store cannot be talked into it either — not
+  // by an action name, not by a field on a create, not by a leftover method.
+  check('a review has no colour field', !('color' in store.all()[0]), Object.keys(store.all()[0]).join(','));
+  check('a colour passed to create is ignored rather than stored', (() => {
+    const made = store.apply({ action: 'create', message: 'violet one', anchor: built.anchor, color: 'violet' });
+    return made.ok && !('color' in made.thread);
   })());
-  check('by its number too', (() => {
-    const t = store.all()[0];
-    return store.setColor(`#${t.number}`, 'rose').ok && store.get(t.id).color === 'rose';
-  })());
-  check('a colour outside the palette is refused', store.setColor(store.all()[0].id, '#ff0000').code === 'bad_color');
-  check('recolouring is not an edit — nothing was said', (() => {
-    const t = store.all()[0];
-    const was = store.get(t.id).updatedAt;
-    store.setColor(t.id, 'green');
-    return store.get(t.id).updatedAt === was;
-  })());
-  check('and it is not an action an agent can name', !ACTIONS.includes('color') && !ACTIONS.includes('recolor'));
-  check('setting the same colour twice costs nothing', (() => {
-    const t = store.all()[0];
-    const before = store.revision;
-    store.setColor(t.id, store.get(t.id).color);
-    return store.revision === before;
-  })());
-  check('the palette is small enough to choose from', COLORS.length >= 4 && COLORS.length <= 8, String(COLORS.length));
+  check('there is no method to set one', typeof store.setColor === 'undefined');
+  check('and no action an agent can name', !ACTIONS.includes('color') && !ACTIONS.includes('recolor'));
 
   // Deleting is a person's decision, and is not an action an agent can name.
   const target = store.apply({ action: 'create', message: 'delete me', anchor: built.anchor }).thread;
@@ -528,19 +509,21 @@ const anchorOf = (over) => {
     store = freshStore(file);
     check('an emptied ledger still remembers how far it got', store.apply({ action: 'create', message: 'after the purge', anchor }).thread.number === 6);
 
-    // A file that somehow names two reviews the same thing: "#n" has to mean
-    // exactly one review, so the later one is renamed rather than left
-    // ambiguous.
+    // Two reviews proposing the same number. It happens for real: two people
+    // create a review offline, both propose #2 because #2 was next on their
+    // own machine, and then the ledgers meet. "#n" has to mean exactly one
+    // review, so the older keeps it and the later is renamed.
     const dupe = path.join(home, 'dupes.json');
+    const pair = (threadId, body, lamport, at, number) => [
+      { id: `re_${threadId}_c`, threadId, actorId: 'a1', actorKind: 'human', actorName: 'A', type: 'thread.created', lamport, createdAt: at, payload: { anchor: { keys: [`a#${lamport}`] }, number } },
+      { id: `re_${threadId}_m`, threadId, actorId: 'a1', actorKind: 'human', actorName: 'A', type: 'message.created', lamport: lamport + 1, createdAt: at, payload: { messageId: `m_${threadId}`, body } },
+    ];
     fs.writeFileSync(
       dupe,
       JSON.stringify({
-        version: 1,
+        version: 3,
         nextNumber: 3,
-        threads: [
-          { id: 'rt_a', number: 2, anchor: { keys: ['a#0'] }, messages: [{ id: 'm1', body: 'older', createdAt: 10 }], createdAt: 10, updatedAt: 10 },
-          { id: 'rt_b', number: 2, anchor: { keys: ['a#1'] }, messages: [{ id: 'm2', body: 'newer', createdAt: 20 }], createdAt: 20, updatedAt: 20 },
-        ],
+        events: [...pair('rt_a', 'older', 1, 10, 2), ...pair('rt_b', 'newer', 3, 20, 2)],
       }),
       'utf8'
     );
@@ -635,7 +618,8 @@ const anchorOf = (over) => {
       ['a string', '"hello"'],
       ['no version', '{"threads":[]}'],
       ['a nonsense version', '{"version":"one","threads":[]}'],
-      ['threads that are not a list', '{"version":1,"threads":{}}'],
+      ['events that are not a list', '{"version":3,"events":{}}'],
+      ['a version below zero', '{"version":0,"events":[]}'],
     ];
     for (const [what, text] of cases) {
       const file = path.join(home, `shape-${what.replace(/\W+/g, '-')}.json`);
@@ -663,25 +647,36 @@ const anchorOf = (over) => {
     check('nothing was written over it', fs.readFileSync(file, 'utf8') === original);
   }
 
-  // Threads that are individually unusable are dropped; the rest are somebody's
-  // actual review and are kept.
+  // Events that are individually unusable are dropped; the rest are somebody's
+  // actual review and are kept. A ledger is not all-or-nothing.
   {
     const file = path.join(home, 'partial.json');
-    const good = { id: 'rt_1', status: 'open', anchor: { keys: ['a#0'] }, messages: [{ id: 'rm_1', body: 'keep me', createdAt: 5 }], createdAt: 5, updatedAt: 5 };
+    const ev = (over) => ({ id: 're_1', threadId: 'rt_1', actorId: 'a1', actorKind: 'human', actorName: 'A', lamport: 1, createdAt: 5, ...over });
     fs.writeFileSync(
       file,
       JSON.stringify({
-        version: 1,
-        threads: [good, null, {}, { id: 'rt_2', anchor: { keys: [] }, messages: [{ body: 'x' }] }, { id: 'rt_3', anchor: { keys: ['a#0'] }, messages: [] }],
+        version: 3,
+        events: [
+          ev({ type: 'thread.created', payload: { anchor: { keys: ['a#0'] }, number: 1 } }),
+          ev({ id: 're_2', type: 'message.created', lamport: 2, payload: { messageId: 'rm_1', body: 'keep me' } }),
+          null,
+          {},
+          ev({ id: 're_3', type: 'thread.color.changed', lamport: 3, payload: { color: 'violet' } }),
+          ev({ id: 're_4', type: 'nonsense', lamport: 4 }),
+          ev({ id: 're_5', type: 'message.created', lamport: 5, threadId: null, payload: { body: 'no thread' } }),
+        ],
       }),
       'utf8'
     );
     const store = freshStore(file);
-    check('the readable threads survive', store.size === 1 && store.all()[0].messages[0].body === 'keep me');
+    check('the readable events survive', store.size === 1 && store.all()[0].messages[0].body === 'keep me');
     check('and the damage is reported', store.problem?.kind === 'partial', JSON.stringify(store.problem));
-    check('a status nobody recognises falls back to open', reviveThread({ ...good, status: 'approved' }).status === 'open');
-    check('an anchor state nobody recognises falls back to attached', reviveThread({ ...good, anchorState: 'lost' }).anchorState === 'attached');
-    check('an author nobody recognises falls back to human', reviveThread({ ...good, messages: [{ body: 'x', authorType: 'robot' }] }).messages[0].authorType === 'human');
+    check('a review with a dropped event is otherwise intact', store.all()[0].status === 'open' && store.all()[0].number === 1);
+    // The colour event is the point of this one. `thread.color.changed` was a
+    // real event type in the alpha, and a stray file or an out-of-date peer can
+    // still hold one. It must be dropped like any other word this build does
+    // not know — not projected onto the review, and not crashed on.
+    check('the retired colour event is dropped like any other unknown', !('color' in store.all()[0]), Object.keys(store.all()[0]).join(','));
   }
 
   // The write itself: previous contents survive a failure, and a burst of
@@ -820,7 +815,6 @@ const anchorOf = (over) => {
       check('a defer is on disk the moment it answers', S.apply({ action: 'defer', threadId: t1.id, reason: 'later' }).ok && onDisk().threads[0].status === 'deferred');
       check('a reopen is on disk the moment it answers', S.apply({ action: 'reopen', threadId: t1.id }).ok && onDisk().threads[0].status === 'open');
       check('a resolve is on disk the moment it answers', S.apply({ action: 'resolve', threadId: t1.id }).ok && onDisk().threads[0].status === 'resolved');
-      check('a recolour is on disk the moment it answers', S.setColor(t1.id, 'teal').ok && onDisk().threads[0].color === 'teal');
       check('an anchor sync is on disk the moment it answers', S.syncAnchors([{ id: t1.id, anchorState: 'orphaned' }]).ok && onDisk().threads[0].anchorState === 'orphaned');
       check('a delete is on disk the moment it answers', S.remove(t1.id).ok && onDisk().threads.length === 0);
       check('and the number it used stays used', onDisk().nextNumber === 2, String(onDisk().nextNumber));

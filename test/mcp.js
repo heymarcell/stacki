@@ -1227,8 +1227,13 @@ const rawPost = (hostHeader, body) =>
     check('a full read carries the messages', fullList.reviews[0].messages.length > 0);
     check('and the anchor', fullList.reviews[0].anchor.keys.length > 0);
     check('and the creation snapshot', !!fullList.reviews[0].creationContext);
-    check('and the user\u2019s own colour, which is filing rather than state', typeof fullList.reviews[0].color === 'string');
-    check('but no way for an agent to change it', !REVIEW_ACTIONS.some((a) => /colou?r/i.test(a)));
+    // No colour, in either direction. A review used to carry the colour the
+    // user had filed it under, and an agent could read it while having no way
+    // to set it — a field on the wire that meant nothing to the only thing
+    // reading it. It is gone from the model, so it is gone from the schema.
+    check('and no colour, because a review no longer has one', !('color' in fullList.reviews[0]), Object.keys(fullList.reviews[0]).join(','));
+    check('nor on a summary row', !('color' in row), Object.keys(row).join(','));
+    check('and no action naming one', !REVIEW_ACTIONS.some((a) => /colou?r/i.test(a)));
 
     // Bounds, so one pathological review cannot cost an agent its context.
     const huge = 'x'.repeat(9000);

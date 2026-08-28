@@ -186,7 +186,6 @@ says so.
 | `reviews:identity`<br>`reviews:setIdentity` | unsafe | Changing whose name is on a comment. An agent signs with its own, and cannot sign with anybody else’s. |
 | `reviews:editMessage`<br>`reviews:removeMessage` | human-only | Rewording and pruning are a person tidying their own notes. An agent that could rewrite the conversation is an agent whose record of it means nothing. |
 | `reviews:remove` | unsafe | Deleting somebody’s feedback. An agent that disagrees resolves the thread with its reasoning, which leaves them able to disagree back. |
-| `reviews:recolor` | human-only | The colour the user files a comment under. Their filing, not a state to act on. |
 | `reviews:sync`<br>`reviews:syncAnchors`<br>`reviews:shared` | redundant | Housekeeping the window does for itself; get_comments already reports the result of all of it. |
 | `reviews:list`<br>`reviews:act` | exposed elsewhere | These ARE get_comments and comment, which existed before this feature and are unchanged by it. |
 | `selection:copy` | redundant | Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data. |
@@ -199,4 +198,4 @@ says so.
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
 - 31 land on Stacki's own undo stack.
-- 53 capabilities deliberately kept out.
+- 52 capabilities deliberately kept out.
