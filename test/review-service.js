@@ -145,6 +145,54 @@ const ledgerDir = path.join(userData, 'reviews');
 check('the ledger lives in userData', fs.existsSync(ledgerDir) && fs.readdirSync(ledgerDir).some((f) => f.endsWith('.json')), fs.existsSync(ledgerDir) ? fs.readdirSync(ledgerDir).join() : 'no dir');
 check('and nothing was written into the project', fs.readdirSync(ROOT).length === 0, fs.readdirSync(ROOT).join());
 
+// ── The shared status, against the schema MCP publishes for it ──────────────
+//
+// `sharedStatus()` is one object with two consumers: the renderer over IPC,
+// and `get_comments` over MCP. The MCP side declares its shape by hand in
+// electron/mcp/reviewTools.js, and a hand-maintained mirror drifts — this has
+// now broken twice.
+//
+// It is not a soft failure. The SDK turns that Zod schema into JSON Schema
+// with `additionalProperties: false` and the CLIENT validates the response
+// against it, so ONE undeclared key makes a strict client throw the entire
+// answer away. Every local test still passed both times, because none of them
+// validated the real object against the published schema. This one does.
+{
+  const { CommentsOutput } = require('../electron/mcp/reviewTools.js');
+  const live = via('reviews:shared').shared;
+
+  check('the shared status is reachable', !!live && typeof live === 'object', JSON.stringify(live));
+
+  // Parsed rather than eyeballed: Zod strips what it does not declare, so a
+  // key that survives the round trip is a key the schema knows about.
+  const parsed = CommentsOutput.safeParse({
+    ok: true,
+    revision: 1,
+    status: 'all',
+    scope: 'project',
+    total: 0,
+    returned: 0,
+    truncated: false,
+    reviews: [],
+    problem: null,
+    shared: live,
+  });
+  check('a get_comments response carrying it validates', parsed.success === true, parsed.success ? '' : JSON.stringify(parsed.error?.issues));
+
+  const dropped = parsed.success ? Object.keys(live).filter((k) => !(k in parsed.data.shared)) : Object.keys(live);
+  check(
+    'EVERY key sharedStatus() sends is declared in the MCP schema',
+    dropped.length === 0,
+    dropped.length ? `undeclared, so a strict client rejects the whole response: ${dropped.join(', ')}` : ''
+  );
+
+  // The three that were missing, named, so a future removal is deliberate
+  // rather than accidental.
+  for (const key of ['mode', 'secure', 'newShareRelay']) {
+    check(`  including \`${key}\``, parsed.success && key in parsed.data.shared);
+  }
+}
+
 // Focus needs a renderer to answer; with none attached it must refuse rather
 // than hang or throw.
 (async () => {

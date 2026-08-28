@@ -197,6 +197,13 @@ const Full = Summary.extend({
 
 const Review = z.union([Full, Summary]);
 
+// What `describeRelay()` answers: an origin and a human label, or a refusal.
+// Both shapes are real and both reach this schema, so both are declared.
+const Relay = z.union([
+  z.object({ ok: z.literal(true), hosted: z.boolean(), origin: z.string(), label: z.string() }),
+  z.object({ ok: z.literal(false), code: z.string(), message: z.string() }),
+]);
+
 const CommentsOutput = z.object({
   ok: z.boolean(),
   revision: z.number().int(),
@@ -218,8 +225,20 @@ const CommentsOutput = z.object({
     .optional(),
   // Whether this project's comments are shared with anybody, and how the last
   // catch-up went. Always present; `enabled: false` is an ordinary project.
+  //
+  // THIS OBJECT IS NOT WRITTEN HERE. It is whatever `sharedStatus()` in
+  // electron/review/index.js builds, sent verbatim, and every key it has must
+  // be declared here or a strict client throws the whole response away — the
+  // same failure the `problem` note above records, which happened a second
+  // time because this mirror was hand-maintained and `sharedStatus()` grew
+  // three fields it never heard about. test/mcp.js now walks the real object
+  // against this schema so the two cannot drift apart again.
   shared: z
     .object({
+      // 'off' | 'legacy' | 'secure'. Which KIND of sharing, which `enabled`
+      // alone cannot say: a plaintext workspace and an end-to-end encrypted
+      // room are both "on" and are not the same thing to reason about.
+      mode: z.string(),
       enabled: z.boolean(),
       workspace: z
         .object({
@@ -240,6 +259,21 @@ const CommentsOutput = z.object({
       syncing: z.boolean(),
       identity: z.object({ actorId: z.string(), displayName: z.string() }).nullable(),
       suggestion: z.looseObject({}).nullable(),
+      // The secure room this project is in, if it is in one. No room id, no
+      // credential and no key material — this is `publicOf`, the same shape
+      // the renderer gets, audited by the IPC walk in test/secure-share.js.
+      secure: z
+        .object({
+          relay: Relay,
+          isOwner: z.boolean(),
+          joinedAt: z.number().int().nullable(),
+          memberCount: z.number().int(),
+          participants: z.array(z.string()),
+        })
+        .nullable(),
+      // Where the NEXT share would be created. Nothing to do with where an
+      // existing room lives — see the note on the field in sharedStatus().
+      newShareRelay: Relay,
     })
     .nullable()
     .optional(),

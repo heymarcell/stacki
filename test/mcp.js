@@ -716,9 +716,17 @@ const rawPost = (hostHeader, body) =>
       scope,
       problem: ledger.problem || null,
       // What the service always sends: whether these comments are shared, and
-      // how the last catch-up went. Present here so the declared schema is
-      // exercised with it rather than only without it.
+      // how the last catch-up went.
+      //
+      // EVERY KEY `sharedStatus()` REALLY SENDS, and that is the point of it.
+      // This was a nine-key approximation of a twelve-key object, so the
+      // schema was exercised against a shape the app never produces and
+      // `get_comments` was unusable from a strict client while this passed.
+      // The SDK validates output on the way out, so a fixture that drifts from
+      // electron/review/index.js now fails HERE too — and test/review-service.js
+      // holds the real object against the same schema.
       shared: {
+        mode: 'legacy',
         enabled: true,
         workspace: { id: 'ws-1', server: 'http://127.0.0.1:43822', displayName: 'lenuri-web', actorId: 'a-1', repositoryHint: null, joinedAt: 1 },
         lastSyncAt: 1700000000000,
@@ -728,6 +736,8 @@ const rawPost = (hostHeader, body) =>
         syncing: false,
         identity: { actorId: 'a-1', displayName: 'Alice' },
         suggestion: null,
+        secure: null,
+        newShareRelay: { ok: true, hosted: true, origin: 'https://stacki-relay.neongod.io', label: 'Hosted relay' },
       },
       ...projectReviews(picked, { detail: level, resolver: fakeTrail, checkout: () => CHECKOUT }),
     };
@@ -1109,6 +1119,20 @@ const rawPost = (hostHeader, body) =>
 
     const stillOpen = structured(await call('get_comments', { status: 'open' }));
     check('a resolved review is no longer open', !stillOpen.reviews.some((r) => r.id === A), JSON.stringify(stillOpen.reviews));
+
+    // The sharing status survives the round trip WHOLE.
+    //
+    // Not decoration: the SDK validates structuredContent against the declared
+    // schema on the way out and a strict client validates it again on the way
+    // in, so an undeclared key is not a missing field — it is the entire
+    // response thrown away, which is how get_comments came to fail with
+    // "data/shared must NOT have additional properties" against a real client
+    // while this suite passed. Anything the service sends must arrive.
+    check('the sharing status comes back at all', !!stillOpen.shared, JSON.stringify(stillOpen.shared));
+    for (const key of ['mode', 'enabled', 'workspace', 'lastSyncAt', 'problem', 'pending', 'private', 'syncing', 'identity', 'suggestion', 'secure', 'newShareRelay']) {
+      check(`  with \`${key}\` intact`, key in (stillOpen.shared || {}), Object.keys(stillOpen.shared || {}).join(','));
+    }
+    check('and the relay descriptor arrives whole', stillOpen.shared?.newShareRelay?.origin === 'https://stacki-relay.neongod.io', JSON.stringify(stillOpen.shared?.newShareRelay));
     const asResolved = structured(await call('get_comments', { status: 'resolved' }));
     check('and is in the resolved list', asResolved.reviews.some((r) => r.id === A));
     check('the summary says what state it is in', asResolved.reviews[0].status === 'resolved' && asResolved.reviews[0].anchorState === 'attached');
