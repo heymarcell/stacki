@@ -18,20 +18,17 @@
 // the only question that matters: at the option's own coordinates, is the
 // option what you would hit?
 
-// A REAL DISPLAY, NOT A VIRTUAL ONE.
+// NOT ON A HOSTED RUNNER.
 //
-// This suite opens a real window and synthesises pointer input with
-// `sendInputEvent`. A window server delivers that; a virtual display does not
-// deliver it the same way, and some of it depends on the size of the screen
-// the window is actually on. On a hosted runner the checks that measure those
-// things fail while the feature is perfectly fine.
+// This one is a local gate, because it measures a box against the size of the screen the window is on, and a
+// hosted runner's screen is not a desk's.
 //
-// So it stays mandatory on a developer's machine — plain `npm test` runs it,
-// with no variable set — and CI, which has no window server, says so out loud
-// instead of quietly passing. Nothing here is weakened; see
-// .github/workflows/ci.yml.
-if (process.env.STACKI_NO_SYNTHETIC_INPUT) {
-  process.stdout.write('popover-dropdown: skipped (STACKI_NO_SYNTHETIC_INPUT — this one needs a real display)\n');
+// It is not weakened and not deleted: plain `npm test` on a developer's
+// machine sets nothing and runs it, and it is part of the local acceptance
+// gate. CI sets this variable so the log says what did not run, rather than
+// reporting that everything passed. See .github/workflows/ci.yml.
+if (process.env.STACKI_HOSTED_RUNNER) {
+  process.stdout.write('popover-dropdown: skipped (STACKI_HOSTED_RUNNER — this one is a local gate)\n');
   process.exit(0);
 }
 
