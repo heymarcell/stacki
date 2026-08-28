@@ -48,6 +48,7 @@ const {
   leaveOutcome,
   undoSetup,
   retryCleanups,
+  readBounded,
   request,
 } = require('../electron/review/secure/transport.js');
 const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSigningKeys } = require('../electron/review/secure/crypto.js');
@@ -826,11 +827,61 @@ async function main() {
     const cap = MAX_BODY_BYTES;
     let sentBytes = 0;
     let mode = 'exact';
+    // Anything this server starts and does not finish, so the suite can take
+    // it all back at the end rather than leaving the process held open.
+    const timers = new Set();
+    const stalled = new Set();
     const hostile = http.createServer((req, res) => {
       const write = (buf) => {
         sentBytes += buf.length;
         return res.write(buf);
       };
+      const hold = () => {
+        stalled.add(res);
+        res.on('close', () => stalled.delete(res));
+      };
+
+      // --- the ones that answer, and then do not finish answering ----------
+      //
+      // Each of these is a complete, valid beginning of an HTTP response. The
+      // fetch resolves; the body never does.
+      if (mode === 'headers-only') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return hold();
+      }
+      if (mode === 'half') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        write(Buffer.from('{"ok":tr'));
+        return hold();
+      }
+      if (mode === 'dribble') {
+        // Never over the cap, never finished: a size bound cannot see this.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        let open = true;
+        const tick = setInterval(() => {
+          if (!open) return clearInterval(tick);
+          write(Buffer.from('    '));
+        }, 40);
+        timers.add(tick);
+        res.on('close', () => {
+          open = false;
+          clearInterval(tick);
+        });
+        return hold();
+      }
+      if (mode === 'slow-ok') {
+        // Slow, but finishes well inside the deadline. Must succeed — a
+        // timeout that covers the body must not become a timeout that trips
+        // over a merely unhurried relay.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        write(Buffer.from('{"ok":'));
+        const later = setTimeout(() => {
+          write(Buffer.from('true}'));
+          res.end();
+        }, 120);
+        timers.add(later);
+        return;
+      }
       if (mode === 'exact') {
         // Valid JSON of exactly the cap, so the boundary itself is legal.
         const head = '{"ok":true,"pad":"';
@@ -923,6 +974,89 @@ async function main() {
       sentBytes < cap * 8,
       `${sentBytes} bytes were sent for a ${cap}-byte cap`
     );
+
+    // --- A SIZE BOUND IS NOT A TIME BOUND ----------------------------------
+    //
+    // The deadline used to be cleared the moment the response HEADERS
+    // arrived, and the body was then read with none at all. So a relay that
+    // answered `200`, sent half an object and stopped talking held the read
+    // open for as long as it kept the socket — and nothing here is ever over
+    // the cap, so the byte bound never fires. The sync loop waits behind it.
+    //
+    // Each of these must come back promptly, named `timeout`, and leave the
+    // transport able to make the next call.
+    const askWith = async (ms) => {
+      const began = Date.now();
+      const answer = await request(`http://127.0.0.1:${hostilePort}`, '/health', { timeoutMs: ms });
+      return { ...answer, took: Date.now() - began };
+    };
+    const PATIENCE = 400;
+    // Generous enough that a slow machine does not fail it, tight enough that
+    // "it returned" and "it hung" cannot be confused.
+    const promptly = (took) => took < PATIENCE * 10;
+
+    for (const [what, stallMode] of [
+      ['sends headers and then stops', 'headers-only'],
+      ['sends half an object and then stops', 'half'],
+      ['keeps sending without ever finishing', 'dribble'],
+    ]) {
+      mode = stallMode;
+      sentBytes = 0;
+      const stuck = await askWith(PATIENCE);
+      check(`a relay that ${what} is given up on`, stuck.ok === false, JSON.stringify(stuck).slice(0, 120));
+      check('  named a timeout, not an unreadable answer', stuck.code === 'timeout', `${stuck.code} after ${stuck.took}ms`);
+      check('  and it returned rather than hung', promptly(stuck.took), `${stuck.took}ms for a ${PATIENCE}ms deadline`);
+    }
+
+    // A slow relay that does finish in time is NOT a timeout.
+    mode = 'slow-ok';
+    const unhurried = await askWith(4000);
+    check('a slow answer that arrives in time is still read', unhurried.ok === true, JSON.stringify(unhurried).slice(0, 120));
+
+    // AND THE LAYER IS NOT POISONED. A timeout must leave nothing stuck
+    // behind it — the next call to a healthy relay has to work.
+    mode = 'headers-only';
+    const poisoning = await askWith(PATIENCE);
+    check('a stalled request times out', poisoning.code === 'timeout', poisoning.code);
+    mode = 'slow-ok';
+    const afterwards = await askWith(4000);
+    check('and the very next request still succeeds', afterwards.ok === true, JSON.stringify(afterwards).slice(0, 120));
+    const liveAfter = await request(liveBase, '/health', { timeoutMs: 4000 });
+    check('as does one to the real relay', liveAfter.ok === true, JSON.stringify(liveAfter).slice(0, 120));
+
+    // --- what the bounded reader says on its own ---------------------------
+    //
+    // `request()` knows perfectly well whether its own timer fired, so it
+    // reports a timeout correctly whatever the reader thinks. That makes the
+    // reader's own answer easy to get wrong and never notice — a sabotage run
+    // proved exactly that, walking past every test above. But `readBounded` is
+    // exported and has a contract of its own, and "the deadline passed" and
+    // "this relay is talking nonsense" are different facts that back off
+    // differently. So it is asked directly.
+    {
+      const endlessBody = () => new ReadableStream({ start() {} }); // never enqueues, never closes
+      const cut = new AbortController();
+      setTimeout(() => cut.abort(), 50);
+      const cutShort = await readBounded({ headers: new Headers(), body: endlessBody() }, 4096, { signal: cut.signal });
+      check('a bounded read cut short by the deadline reports a timeout', cutShort.ok === false && cutShort.code === 'timeout', JSON.stringify(cutShort));
+
+      const brokenBody = new ReadableStream({
+        start(c) {
+          c.error(new Error('the connection went away'));
+        },
+      });
+      const broke = await readBounded({ headers: new Headers(), body: brokenBody }, 4096, {});
+      check('and one that simply breaks reports an unreadable answer', broke.ok === false && broke.code === 'bad_response', JSON.stringify(broke));
+
+      // A deadline that has already passed is honoured before any reading.
+      const already = new AbortController();
+      already.abort();
+      const tooLate = await readBounded({ headers: new Headers(), body: endlessBody() }, 4096, { signal: already.signal });
+      check('a deadline that has already passed stops it before it starts', tooLate.ok === false && tooLate.code === 'timeout', JSON.stringify(tooLate));
+    }
+
+    for (const timer of timers) clearInterval(timer);
+    for (const res of stalled) res.destroy();
 
     await new Promise((resolve) => {
       hostile.close(resolve);

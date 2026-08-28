@@ -70,10 +70,13 @@ const fail = (code, message) => ({ ok: false, code, message });
  * that is not trusted for anything, so what it says about its own size is a
  * hint and what it actually sends is what gets counted.
  */
-async function readBounded(response, cap) {
+async function readBounded(response, cap, { signal = null } = {}) {
   const declared = Number(response.headers?.get?.('content-length'));
   // Refused before a byte is consumed, when it is honest enough to say.
   if (Number.isFinite(declared) && declared > cap) return { ok: false, code: 'too_large' };
+
+  // Whether the deadline, rather than the relay, ended this.
+  const expired = () => signal?.aborted === true;
 
   const body = response.body;
   if (!body || typeof body.getReader !== 'function') {
@@ -83,13 +86,30 @@ async function readBounded(response, cap) {
       const text = await response.text();
       return Buffer.byteLength(text, 'utf8') > cap ? { ok: false, code: 'too_large' } : { ok: true, text };
     } catch {
-      return { ok: false, code: 'bad_response' };
+      return { ok: false, code: expired() ? 'timeout' : 'bad_response' };
     }
   }
 
   const reader = body.getReader();
   const chunks = [];
   let size = 0;
+
+  // THE DEADLINE REACHES IN HERE.
+  //
+  // A real fetch ties the response body to the same signal, so aborting makes
+  // a pending read reject on its own. An injected fetch in a test need not,
+  // and neither need every runtime, so the reader is cancelled explicitly too.
+  // Cancelling resolves a pending read as `done` — an orderly end that looks
+  // exactly like a complete body — so whether the deadline passed is asked
+  // again after the loop rather than inferred from how the loop ended.
+  const stop = () => {
+    reader.cancel().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) stop();
+    else signal.addEventListener('abort', stop, { once: true });
+  }
+
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -105,8 +125,12 @@ async function readBounded(response, cap) {
     }
   } catch {
     await reader.cancel().catch(() => {});
-    return { ok: false, code: 'bad_response' };
+    return { ok: false, code: expired() ? 'timeout' : 'bad_response' };
+  } finally {
+    signal?.removeEventListener?.('abort', stop);
   }
+
+  if (expired()) return { ok: false, code: 'timeout' };
   return { ok: true, text: Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString('utf8') };
 }
 
@@ -121,59 +145,85 @@ async function readBounded(response, cap) {
 async function request(base, path, { method = 'GET', token = null, body = null, timeoutMs = TIMEOUT_MS, fetchImpl } = {}) {
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== 'function') return fail('unsupported', 'This build of Stacki cannot make network requests.');
+
+  const outgoing = body == null ? null : JSON.stringify(body);
+  // Bytes, not characters — the same reason as `readBounded` above.
+  if (outgoing && Buffer.byteLength(outgoing, 'utf8') > MAX_RESPONSE_BYTES) {
+    return fail('too_large', 'That is too much to send in one request.');
+  }
+
+  // THE DEADLINE COVERS THE WHOLE CALL, BODY INCLUDED.
+  //
+  // It used to be cleared in the `finally` of the fetch alone — so it expired
+  // the moment the response HEADERS arrived, and the body was then read with
+  // no deadline at all. A relay that answered `200`, sent half a JSON object
+  // and then simply stopped talking would leave `reader.read()` waiting for
+  // as long as the socket stayed open, with the syncer stuck behind it. The
+  // byte cap does not help: nothing was ever over the cap, it just never
+  // ended. A size bound and a time bound are different bounds.
+  //
+  // So one controller and one timer span connect, headers AND body, and the
+  // timer is cleared only when there is nothing left to read.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
   try {
-    const text = body == null ? null : JSON.stringify(body);
-    // Bytes, not characters — the same reason as `readBounded` below.
-    if (text && Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
-      return fail('too_large', 'That is too much to send in one request.');
+    let response;
+    try {
+      response = await doFetch(`${base}${path}`, {
+        method,
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(outgoing ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(outgoing ? { body: outgoing } : {}),
+      });
+    } catch (err) {
+      if (timedOut || err?.name === 'AbortError') return fail('timeout', 'The secure relay did not answer in time.');
+      return fail('offline', 'Stacki could not reach the secure relay.');
     }
-    response = await doFetch(`${base}${path}`, {
-      method,
-      signal: controller.signal,
-      headers: {
-        accept: 'application/json',
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...(text ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(text ? { body: text } : {}),
-    });
-  } catch (err) {
-    if (err?.name === 'AbortError') return fail('timeout', 'The secure relay did not answer in time.');
-    return fail('offline', 'Stacki could not reach the secure relay.');
+
+    const read = await readBounded(response, MAX_RESPONSE_BYTES, { signal: controller.signal });
+    if (!read.ok) {
+      if (read.code === 'timeout' || timedOut) {
+        // Distinct from `bad_response` on purpose: this relay is answering,
+        // just not finishing, which is worth waiting and retrying for.
+        return fail('timeout', 'The secure relay stopped part way through answering.');
+      }
+      return read.code === 'too_large'
+        ? fail('too_large', 'The secure relay sent more than Stacki will read.')
+        : fail('bad_response', 'The secure relay sent something unreadable.');
+    }
+    const text = read.text;
+    let parsed = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        if (response.ok) return fail('bad_response', 'The secure relay did not answer in JSON.');
+      }
+    }
+    if (response.status === 401 || response.status === 403) {
+      return fail(parsed?.error === 'bad_invite' ? 'bad_invite' : 'unauthorized', parsed?.message || null);
+    }
+    if (response.status === 404) return fail('not_found', parsed?.message || null);
+    if (response.status === 409) return fail(parsed?.error === 'room_ended' ? 'room_ended' : 'conflict', parsed?.message || null);
+    if (response.status === 413) return fail('too_large', parsed?.message || null);
+    if (response.status === 429) return fail('busy', parsed?.message || null);
+    if (!response.ok) {
+      return fail(response.status >= 500 ? 'server' : 'refused', parsed?.message || `The secure relay answered ${response.status}.`);
+    }
+    if (!parsed || typeof parsed !== 'object') return fail('bad_response', 'The secure relay sent no answer.');
+    return { ok: true, body: parsed };
   } finally {
     clearTimeout(timer);
   }
-
-  const read = await readBounded(response, MAX_RESPONSE_BYTES);
-  if (!read.ok) {
-    return read.code === 'too_large'
-      ? fail('too_large', 'The secure relay sent more than Stacki will read.')
-      : fail('bad_response', 'The secure relay sent something unreadable.');
-  }
-  const text = read.text;
-  let parsed = null;
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      if (response.ok) return fail('bad_response', 'The secure relay did not answer in JSON.');
-    }
-  }
-  if (response.status === 401 || response.status === 403) {
-    return fail(parsed?.error === 'bad_invite' ? 'bad_invite' : 'unauthorized', parsed?.message || null);
-  }
-  if (response.status === 404) return fail('not_found', parsed?.message || null);
-  if (response.status === 409) return fail(parsed?.error === 'room_ended' ? 'room_ended' : 'conflict', parsed?.message || null);
-  if (response.status === 413) return fail('too_large', parsed?.message || null);
-  if (response.status === 429) return fail('busy', parsed?.message || null);
-  if (!response.ok) {
-    return fail(response.status >= 500 ? 'server' : 'refused', parsed?.message || `The secure relay answered ${response.status}.`);
-  }
-  if (!parsed || typeof parsed !== 'object') return fail('bad_response', 'The secure relay sent no answer.');
-  return { ok: true, body: parsed };
 }
 
 /**
