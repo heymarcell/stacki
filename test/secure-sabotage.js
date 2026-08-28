@@ -41,6 +41,7 @@ const TOUCHED = [
   'relay/node/store.js',
   'relay/node/server.js',
   'relay/cloudflare/src/worker.js',
+  'test/secure-lifecycle.js',
 ];
 const ORIGINAL = new Map(TOUCHED.map((f) => [f, fs.readFileSync(rel(f), 'utf8')]));
 
@@ -319,13 +320,56 @@ const SABOTAGES = [
     replace: "  if (!request.body) return { ok: true, body: {} };\n  {\n    const all = await request.text();\n    if (all.length > MAX_BODY_BYTES) return { ok: false, code: 'too_large' };\n    if (!all.trim()) return { ok: true, body: {} };\n    try {\n      const parsed = JSON.parse(all);\n      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, code: 'bad_json' };\n      return { ok: true, body: parsed };\n    } catch {\n      return { ok: false, code: 'bad_json' };\n    }\n  }\n\n  const reader = request.body.getReader();",
     suite: 'relay:cf:test',
   },
+
+  // --- the last correctness pass --------------------------------------------
+
   {
-    name: 'an official deployment without a rate limiter creates rooms anyway',
-    why: 'the public relay becomes unlimited encrypted storage because a binding was forgotten',
+    name: 'the create walk-back ignores whether the relay actually deleted it',
+    why: 'a room nobody owns is left behind and the credential that could remove it is thrown away',
+    file: 'electron/review/secure/transport.js',
+    find: '  if (undone?.ok) {\n    rooms.forget(room.roomId);\n    return { cleaned: true, retained: false };\n  }',
+    replace: '  rooms.forget(room.roomId);\n  return { cleaned: true, retained: false };',
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'a failed walk-back keeps nothing to retry with',
+    why: 'the remote room stays and nothing anywhere can ever remove it',
+    file: 'electron/review/secure/transport.js',
+    find: "  const retained = rooms.rememberCleanup?.({",
+    replace: "  const retained = false && rooms.rememberCleanup?.({",
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'a debt that could not be settled is dropped anyway',
+    why: 'the retry path forgets what it failed to clean, so it never happens',
+    file: 'electron/review/secure/transport.js',
+    find: "    if (undone?.ok || undone?.code === 'unauthorized' || undone?.code === 'not_found') {",
+    replace: '    if (true) {',
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'the desktop reads a whole relay response before measuring it',
+    why: 'an untrusted relay decides how much memory Stacki spends',
+    file: 'electron/review/secure/transport.js',
+    find: '  const body = response.body;\n  if (!body || typeof body.getReader !== \'function\') {',
+    replace: "  const body = null;\n  if (!body || typeof body.getReader !== 'function') {",
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'a Cloudflare relay with neither limiter nor opt-out creates rooms',
+    why: 'a plain deploy publishes an unlimited public encrypted-storage endpoint',
     file: 'relay/cloudflare/src/worker.js',
-    find: '  if (!env.ROOM_LIMITER?.limit) return !official;',
-    replace: '  if (!env.ROOM_LIMITER?.limit) return true;',
+    find: "  return String(env.STACKI_ALLOW_UNLIMITED_RELAY || '') === '1';",
+    replace: '  return true;',
     suite: 'relay:cf:test',
+  },
+  {
+    name: 'lifecycle accounting counts a fixture whose owner is still running',
+    why: 'a parallel session makes this run report a leak it had nothing to do with',
+    file: 'test/secure-lifecycle.js',
+    find: '    if (pidAlive(owner.pid)) continue; // somebody is still using it',
+    replace: '    // sabotaged: a live owner is counted as a leak',
+    suite: 'test:securelifecycle',
   },
 
   {
@@ -343,8 +387,10 @@ function runSuite(script) {
   const result = spawnSync('npm', ['run', '--silent', script], {
     cwd: root,
     encoding: 'utf8',
-    env: { ...process.env, STACKI_CANVAS_OFFLINE: '1' },
-    timeout: 300000,
+    // One lifecycle pass is enough to see whether the accounting is wrong;
+    // five would be five times the runtime to learn the same thing.
+    env: { ...process.env, STACKI_CANVAS_OFFLINE: '1', STACKI_LIFECYCLE_RUNS: '1' },
+    timeout: 600000,
   });
   return { passed: result.status === 0, output: `${result.stdout || ''}${result.stderr || ''}` };
 }
