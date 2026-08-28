@@ -913,9 +913,71 @@ async function main() {
 
   // Names are learned from review events and from nowhere else.
   const named = ann.rooms.get(ann.roomId);
-  check('a name observed in a decrypted event is remembered', Object.values(named?.names || {}).includes('Bob') || Object.keys(named?.names || {}).length >= 0);
+  // The old form of this was `includes('Bob') || Object.keys(names).length >= 0`,
+  // whose right-hand side is true of every object there has ever been. It
+  // passed for four years of nothing working. Ask it properly: the name is
+  // learned, and it is filed under the opaque sender id rather than under
+  // anything the relay could read.
+  const learned = named?.names || {};
+  check('a name observed in a decrypted event is remembered', Object.values(learned).includes('Bob'), JSON.stringify(learned));
+  check('and it is filed under an opaque sender id, not a person', Object.keys(learned).every((k) => /^[A-Za-z0-9_-]{43}$/.test(k)), JSON.stringify(Object.keys(learned)));
   const relayMembers = live.store.membersOf(fresh.roomId || freshRoom.room.roomId);
-  check('the relay was never told a display name', !JSON.stringify(relayMembers).includes('Alice') && !JSON.stringify(relayMembers).includes('Bob'));
+
+  // THE RELAY'S RECORD OF A MEMBER HAS NO ROOM FOR A NAME — asked
+  // structurally, not by substring.
+  //
+  // The companion to this is in test/secure-relay.js, which sweeps the whole
+  // relay database and log stream for a canary set. Note which name is in that
+  // set: 'Alice Secret Tester' and never 'Bob'. A canary has to be a string
+  // that cannot occur by accident, and this is the other half of the same
+  // lesson.
+  //
+  // The version this replaces asked whether the member rows contained the text
+  // "Bob". They never did, and it still failed about once in every 1,600 runs,
+  // because "Bob" is three characters drawn from the base64url alphabet and a
+  // pair of members is around 170 positions of random key material: chance
+  // spells it roughly that often. A privacy assertion that goes red at random
+  // is worse than no assertion at all — it teaches whoever sees it red to
+  // shrug, which is exactly the reflex a real leak needs in order to ship.
+  //
+  // So ask the question that cannot collide. The relay's whole idea of a
+  // member is five fields; each is a flag, a timestamp, or an opaque value of
+  // one exact length. Proving every field IS one of those proves no field is
+  // carrying a name — for every name, not only for the two this test happens
+  // to use, and without depending on what the random bytes spelled today.
+  const OPAQUE_32 = /^[A-Za-z0-9_-]{43}$/; // 32 bytes, base64url, unpadded
+  const MEMBER_FIELDS = ['senderId', 'publicKey', 'joinedAt', 'leftAt', 'isOwner'];
+  const memberShapeOf = (m) => ({
+    keys: Object.keys(m).sort().join(','),
+    senderId: OPAQUE_32.test(m.senderId),
+    publicKey: OPAQUE_32.test(m.publicKey),
+    joinedAt: Number.isInteger(m.joinedAt),
+    leftAt: m.leftAt === null || Number.isInteger(m.leftAt),
+    isOwner: typeof m.isOwner === 'boolean',
+  });
+  const expectedKeys = [...MEMBER_FIELDS].sort().join(',');
+
+  check('the relay holds members to talk about at all', relayMembers.length > 0, JSON.stringify(relayMembers));
+  for (const [i, member] of relayMembers.entries()) {
+    const shape = memberShapeOf(member);
+    check(`member ${i}: the relay knows these five things and nothing else`, shape.keys === expectedKeys, shape.keys);
+    check(`member ${i}: its sender id is 32 opaque bytes, not a name`, shape.senderId, String(member.senderId));
+    check(`member ${i}: its public key is 32 opaque bytes, not a name`, shape.publicKey, String(member.publicKey));
+    check(`member ${i}: the rest is a timestamp, a timestamp or null, and a flag`, shape.joinedAt && shape.leftAt && shape.isOwner, JSON.stringify(member));
+  }
+
+  // And the check can still see a leak when there is one. A structural
+  // assertion that passes on everything proves nothing, so here is a row that
+  // does carry a name, through each field in turn, and it must be caught every
+  // time. This is the guard's own test.
+  for (const field of MEMBER_FIELDS) {
+    const leaked = { ...relayMembers[0], [field]: 'Bob' };
+    const shape = memberShapeOf(leaked);
+    const caught = shape.keys !== expectedKeys || !shape.senderId || !shape.publicKey || !shape.joinedAt || !shape.leftAt || !shape.isOwner;
+    check(`a name smuggled into ${field} would be caught`, caught, JSON.stringify(leaked));
+  }
+  const extra = { ...relayMembers[0], displayName: 'Bob' };
+  check('and so would a name in a field nobody declared', memberShapeOf(extra).keys !== expectedKeys, JSON.stringify(extra));
 
   // --- nothing in the project ------------------------------------------------
 
