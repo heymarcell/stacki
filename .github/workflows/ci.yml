@@ -66,6 +66,21 @@ jobs:
             xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
             libdrm2 libxkbcommon0 libatk-bridge2.0-0 libatk1.0-0 libcups2
       - run: npm ci
+      # CHROMIUM KEEPS ITS SANDBOX.
+      #
+      # Electron ships a setuid helper, `chrome-sandbox`, and refuses to start
+      # unless it is owned by root with mode 4755 — "rather than run without
+      # sandboxing I'm aborting now". npm unpacks it as the runner user, so on
+      # a fresh Linux runner every real-browser harness dies on it.
+      #
+      # The fix everybody reaches for is `--no-sandbox`, which turns the
+      # sandbox off for the whole run. This gives the helper the ownership it
+      # is asking for instead, so the tests run with the same isolation a real
+      # user's Electron has. macOS needs none of this.
+      - name: Let Electron keep its sandbox
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
       - name: npm test
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm test
 
@@ -91,6 +106,21 @@ jobs:
             xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
             libdrm2 libxkbcommon0 libatk-bridge2.0-0 libatk1.0-0 libcups2
       - run: npm ci
+      # CHROMIUM KEEPS ITS SANDBOX.
+      #
+      # Electron ships a setuid helper, `chrome-sandbox`, and refuses to start
+      # unless it is owned by root with mode 4755 — "rather than run without
+      # sandboxing I'm aborting now". npm unpacks it as the runner user, so on
+      # a fresh Linux runner every real-browser harness dies on it.
+      #
+      # The fix everybody reaches for is `--no-sandbox`, which turns the
+      # sandbox off for the whole run. This gives the helper the ownership it
+      # is asking for instead, so the tests run with the same isolation a real
+      # user's Electron has. macOS needs none of this.
+      - name: Let Electron keep its sandbox
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
       # The Worker's own dependencies, including the workerd runtime the
       # conformance suite runs inside.
       - run: npm ci --prefix relay/cloudflare
