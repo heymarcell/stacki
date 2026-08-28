@@ -53,6 +53,12 @@ const MARKER = '.stacki-temp-owner.json';
 const KIND = 'stacki-harness-temp';
 
 /**
+ * The environment variable an orchestrating suite sets on the harnesses it
+ * spawns, so it can tell its own children's fixtures from a parallel run's.
+ */
+const SUITE_ENV = 'STACKI_SUITE_ID';
+
+/**
  * Long enough that a directory created while a sweep is walking past it is
  * never mistaken for a dead run's leftovers, short enough to be no use to
  * anyone as a hiding place. The marker is written immediately after mkdtemp,
@@ -121,7 +127,29 @@ function ownedTempDir(prefix, { harness = 'stacki', dir = os.tmpdir() } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(dir, prefix)));
   fs.writeFileSync(
     path.join(root, MARKER),
-    `${JSON.stringify({ kind: KIND, harness, runId: RUN_ID, pid: process.pid, createdAt: Date.now() }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        kind: KIND,
+        harness,
+        runId: RUN_ID,
+        // WHICH SUITE RUN THIS BELONGS TO, when one is orchestrating.
+        //
+        // `runId` and `pid` identify this PROCESS, which is not enough for a
+        // suite that spawns harnesses and then audits what they left: every
+        // child is a different process, so the parent cannot recognise its own
+        // children's fixtures by either. It set this in their environment
+        // instead, so everything one run produces carries one mark and a
+        // concurrent run's leftovers can never be counted against it.
+        //
+        // Read at write time rather than captured at import, so it does not
+        // matter whether the environment was set before this module loaded.
+        suite: process.env[SUITE_ENV] || null,
+        pid: process.pid,
+        createdAt: Date.now(),
+      },
+      null,
+      2
+    )}\n`,
     'utf8'
   );
   OWNED.add(root);
@@ -225,6 +253,7 @@ function sweepStaleRuns(prefixes = [], { dir = os.tmpdir(), graceMs = GRACE_MS, 
 module.exports = {
   MARKER,
   KIND,
+  SUITE_ENV,
   GRACE_MS,
   RUN_ID,
   ownedTempDir,

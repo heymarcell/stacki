@@ -46,29 +46,54 @@ const FLOWS = [
   { name: 'the share page in a browser', script: 'test/share-page-privacy.js', node: false },
 ];
 
-const { readOwner, pidAlive, MARKER } = require('./support/ownedTemp.js');
+const { readOwner, pidAlive, MARKER, SUITE_ENV } = require('./support/ownedTemp.js');
 
 /** The harnesses these flows run, as they stamp their own fixtures. */
 const OUR_HARNESSES = new Set(['secure-relay', 'secure-share', 'share-page-privacy', 'packaged-deeplink']);
 
 /**
- * Fixtures left behind by a run of one of THESE flows that has finished.
+ * THIS run of this suite, told to every harness it starts.
  *
- * Ownership, not name matching. The version this replaces listed every
- * directory in the temp folder whose name began with one of a few prefixes,
- * which meant a second Stacki checkout — or a parallel session doing exactly
- * this — could make this run report a leak it had nothing to do with. PR #8
- * put a marker in every owned directory for precisely this reason; the answer
- * is to read it.
+ * Set in the environment before anything is spawned; `ownedTempDir` reads it
+ * at write time and stamps it into every marker. Nothing else on the machine
+ * has this string.
+ */
+const SUITE_ID = `lifecycle-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+process.env[SUITE_ENV] = SUITE_ID;
+
+/**
+ * Fixtures left behind by THIS run.
  *
- * A directory counts as leaked only when all three are true:
+ * Ownership, not name matching, and not harness names either.
  *
- *   it carries an ownership marker      — no marker is somebody else's business
- *   the harness is one of ours          — another harness is not this suite
- *   the owning process is gone          — a live one is a run still using it
+ * The first version listed every directory whose name began with one of a few
+ * prefixes, so a second checkout could make this run report a leak it had
+ * nothing to do with. The second version read PR #8's ownership marker and
+ * asked whether the harness was one of ours and its process gone — better, and
+ * still wrong in a way that only shows up when two of these run at once:
  *
- * A concurrent run's fixture fails the third test while that run is alive, so
- * it is never counted here and never touched.
+ *   run A starts, and leaves a fixture; A's process is alive
+ *   run B starts, and takes its baseline — A is alive, so B ignores it
+ *   A dies badly, leaving the fixture behind
+ *   B finishes a pass and looks again — A's pid is dead now, and A's harness
+ *   is one of the four names B also uses, so B counts A's leak as its own
+ *
+ * B then fails, having leaked nothing. The identity was too coarse: "one of
+ * these four harnesses, no longer running" describes every run there has ever
+ * been, not this one.
+ *
+ * So each run of this suite mints an id and puts it in the environment of the
+ * harnesses it spawns. A directory counts only when all of these hold:
+ *
+ *   it carries an ownership marker  — no marker is somebody else's business
+ *   the suite id is THIS run's      — a parallel run is not this run, alive or dead
+ *   the harness is one of ours      — a stray mark from elsewhere is not a flow
+ *   the owning process is gone      — a live one is a child still working
+ *
+ * The second is what makes the accounting run-specific, and it holds whether
+ * or not the other run is still breathing. This is accounting, not collection:
+ * nothing here deletes anything. The global stale-run sweep in
+ * `sweepStaleRuns` is untouched and still the only thing that removes.
  */
 const fixtures = () => {
   const out = [];
@@ -87,8 +112,9 @@ const fixtures = () => {
     } catch {
       continue;
     }
-    if (!owner || !OUR_HARNESSES.has(owner.harness)) continue;
-    if (pidAlive(owner.pid)) continue; // somebody is still using it
+    if (!owner || owner.suite !== SUITE_ID) continue; // another run's, alive or dead
+    if (!OUR_HARNESSES.has(owner.harness)) continue;
+    if (pidAlive(owner.pid)) continue; // a child still using it
     out.push(name);
   }
   return out.sort();
@@ -133,7 +159,7 @@ function run(flow) {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 300000,
-      env: { ...process.env, STACKI_CANVAS_OFFLINE: '1' },
+      env: { ...process.env, STACKI_CANVAS_OFFLINE: '1', [SUITE_ENV]: SUITE_ID },
     });
     return { ok: true };
   } catch (err) {
@@ -148,32 +174,66 @@ function run(flow) {
 {
   const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 
-  // Somebody else's run of the same harness, still going: this process is
-  // alive, so its fixture belongs to it.
-  const theirs = ownedTempDir('stacki-share-parallel-', { harness: 'secure-share' });
-  check('a fixture whose owner is still running is not counted as a leak', !fixtures().includes(path.basename(theirs)), path.basename(theirs));
+  // A pid that cannot be running. 1 is init, and never one of these harnesses,
+  // so a very high one this machine has not reached is used instead.
+  const GONE = 4194303;
+  const restamp = (dir, patch) => {
+    const marker = path.join(dir, MARKER);
+    fs.writeFileSync(marker, JSON.stringify({ ...JSON.parse(fs.readFileSync(marker, 'utf8')), ...patch }), 'utf8');
+    return dir;
+  };
+  /** A fixture made as though by another run of this same suite. */
+  const otherRun = (prefix, harness, suite) => {
+    const was = process.env[SUITE_ENV];
+    process.env[SUITE_ENV] = suite;
+    try {
+      return ownedTempDir(prefix, { harness });
+    } finally {
+      process.env[SUITE_ENV] = was;
+    }
+  };
+  const counted = (dir) => fixtures().includes(path.basename(dir));
+
+  // Our own child, still working. Alive, so not a leak.
+  const ours = ownedTempDir('stacki-share-mine-', { harness: 'secure-share' });
+  check('a fixture whose owner is still running is not counted as a leak', !counted(ours), path.basename(ours));
 
   // A directory with the same prefix and no marker at all — another checkout,
   // an older Stacki, somebody's mkdtemp. Not ours to count and not ours to touch.
   const unmarked = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-share-unmarked-'));
-  check('an unmarked directory of the same shape is somebody else’s business', !fixtures().includes(path.basename(unmarked)));
+  check('an unmarked directory of the same shape is somebody else’s business', !counted(unmarked));
 
   // A fixture from a harness that is not one of these flows.
   const other = ownedTempDir('stacki-share-other-', { harness: 'review-ux-visual' });
-  check('another harness’s fixture is not counted either', !fixtures().includes(path.basename(other)));
+  check('another harness’s fixture is not counted either', !counted(other));
 
-  // And one whose owner is gone: that IS a leak, and it must be seen.
-  const dead = ownedTempDir('stacki-share-dead-', { harness: 'secure-share' });
-  const marker = path.join(dead, MARKER);
-  const stamped = JSON.parse(fs.readFileSync(marker, 'utf8'));
-  // A pid that cannot be running: 1 is init, and never one of these harnesses,
-  // so instead use a very high one this machine has not reached.
-  fs.writeFileSync(marker, JSON.stringify({ ...stamped, pid: 4194303 }), 'utf8');
-  check('a fixture whose owner has gone IS counted', fixtures().includes(path.basename(dead)), path.basename(dead));
+  // THE ONE THE OLD MODEL GOT WRONG.
+  //
+  // Run A is a parallel run of THIS suite: same four harness names, same
+  // shape of directory. While A is alive, both models ignore it. Then A dies
+  // badly and leaves the fixture — and the old model, which asked only
+  // "one of our harnesses, and is the process gone?", started counting it as
+  // this run's leak. It is not: it carries A's suite id, not ours.
+  const runA = otherRun('stacki-share-parallel-', 'secure-share', 'lifecycle-someone-else');
+  check('a parallel run of this same suite is not counted while it is alive', !counted(runA), path.basename(runA));
+  restamp(runA, { pid: GONE });
+  check('AND IS STILL NOT COUNTED ONCE IT DIES', !counted(runA), path.basename(runA));
 
-  releaseTempDir(theirs);
+  // A fixture from a run with no suite id at all — a harness started by hand,
+  // or an older build. Also not this run's.
+  const loose = otherRun('stacki-share-loose-', 'secure-share', '');
+  restamp(loose, { pid: GONE });
+  check('nor is a dead fixture that belongs to no suite run', !counted(loose), path.basename(loose));
+
+  // And one of OURS whose owner is gone: that IS a leak, and it must be seen.
+  const dead = restamp(ownedTempDir('stacki-share-dead-', { harness: 'secure-share' }), { pid: GONE });
+  check('a fixture of THIS run whose owner has gone IS counted', counted(dead), path.basename(dead));
+
+  releaseTempDir(ours);
   releaseTempDir(other);
   releaseTempDir(dead);
+  releaseTempDir(runA);
+  releaseTempDir(loose);
   fs.rmSync(unmarked, { recursive: true, force: true });
   check('and the proof cleaned up after itself', fixtures().length === 0, JSON.stringify(fixtures()));
 }
