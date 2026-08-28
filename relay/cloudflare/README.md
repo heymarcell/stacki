@@ -53,22 +53,58 @@ as-is gives you a relay that serves existing rooms and declines to make new
 ones — which is a deployment you notice within a minute, rather than one you
 notice when somebody has filled it.
 
-So there are two paths, and the safe one is the plain one:
+So a public deployment gets its limiter from a **named environment**, and the
+bare top level stays the one that refuses.
 
-**1 — a public relay.** Bind the rate limiter first, then deploy:
+**Public staging**, on workers.dev — production-equivalent in everything that
+decides behaviour, with only the hostname and the isolation different:
 
 ```bash
-# in wrangler.jsonc, uncomment "ratelimits" and give it a namespace id
 npx wrangler login
-npx wrangler deploy
+npx wrangler deploy --env staging
 ```
 
-**2 — a private or experimental relay, knowingly unlimited.** Say so out loud;
+That publishes `stacki-secure-relay-staging.<your-subdomain>.workers.dev`. It
+has the rate limiter, the SQLite Durable Object, the same body limits and the
+same logging policy, and it deliberately does **not** carry the development
+opt-out. It is a real public service; treat it as one.
+
+**Production** will be `relay.stacki.app`, from an environment of its own with
+its own limiter namespace. It is **not deployed yet** — see the bottom of this
+file.
+
+**A private or experimental relay, knowingly unlimited.** Say so out loud;
 there is no way to get here by forgetting something:
 
 ```bash
 npx wrangler deploy --var STACKI_ALLOW_UNLIMITED_RELAY:1
 ```
+
+To take a staging deployment down again (`--dry-run` first if you want to see
+what it would do):
+
+```bash
+npx wrangler delete --env staging
+```
+
+### Two things about environments that cost an afternoon each
+
+**`durable_objects` is not inherited.** Wrangler's inheritable keys include
+`migrations` and `observability`; its non-inheritable ones include
+`durable_objects` and `vars`. An environment that does not repeat its Durable
+Object binding deploys a Worker with no `env.ROOM` at all, and every room
+request dies on it. Wrangler warns, and the warning is easy to scroll past —
+`npm run dev` shipped in exactly that state until a staging deploy noticed.
+Both named environments here declare the binding themselves.
+
+**A limiter `namespace_id` is a number, not a resource.** Nothing provisions
+it. Any two rate-limit bindings in the same Cloudflare account that pick the
+same integer **share their counters**, across unrelated Workers. Cloudflare's
+own example uses `"1001"`, which is therefore the most contended integer on any
+busy account — on the account this was first deployed to it was already taken
+by an unrelated waitlist form *and* an unrelated bug reporter. Sharing a
+counter with a stranger's contact form is not rate limiting. Staging uses
+`770001`; production must use a different one again.
 
 Then set the relay origin Stacki should offer as its default (see
 `electron/review/secure/relays.js`), or leave it and let people paste their own
@@ -83,6 +119,13 @@ Room creation is **refused unless something explicitly permits it**. In order:
 | `ROOM_LIMITER` bound | the limiter decides |
 | no limiter, `STACKI_ALLOW_UNLIMITED_RELAY=1` | allowed — somebody said so in writing |
 | no limiter, nothing said | **refused** |
+
+| environment | limiter | namespace | unlimited opt-out |
+|---|---|---|---|
+| top level (`wrangler deploy`) | none | — | no — **refuses to create rooms** |
+| `--env staging` | 20 / 60s | `770001` | no |
+| `--env development` | none | — | yes, on purpose, locally |
+| production (not yet deployed) | planned | must differ from staging | no |
 
 The last row is the default, and it is the point. An earlier version had this
 the other way round — protection was opt-in behind a flag — which meant
@@ -126,6 +169,14 @@ Ending a share deletes its relay state immediately, always.
 
 ## Deployment status in this repository
 
-**Hosted production deployment: NOT EXECUTED.** There are no Cloudflare
-credentials on this machine and none were created. Everything above has been
-run locally against workerd.
+**Public staging: configured, deploy on demand.** `--env staging` publishes a
+production-equivalent relay to workers.dev whenever somebody runs it. Whether
+one is running right now is a property of the account, not of this file, so
+this file does not claim one is.
+
+**Hosted production deployment: NOT EXECUTED.** `relay.stacki.app` does not
+exist yet. The blocker is not code and not credentials: the `stacki.app` zone
+is not present in the authenticated Cloudflare account, so no custom domain can
+be attached to it from here. `DEFAULT_RELAY` still points at
+`relay.stacki.app` because that remains the intended endpoint — it is simply
+not answering yet.

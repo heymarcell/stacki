@@ -459,6 +459,61 @@ if (fs.existsSync(wranglerPath)) {
   );
   // And the flag that used to make protection opt-IN is gone entirely.
   check('the old opt-in flag is not consulted any more', !/STACKI_OFFICIAL_RELAY/.test(fs.readFileSync(path.join(root, 'relay', 'cloudflare', 'src', 'worker.js'), 'utf8')));
+
+  // ── The public staging environment ──────────────────────────────────────
+  //
+  // Staging is the rehearsal for production, so it is only worth having if it
+  // is production-equivalent in everything that decides behaviour. What may
+  // differ is the hostname and the isolation; what may not is the limiter, the
+  // storage engine, the logging policy, or whether room creation is guarded.
+  const staging = config.env?.staging;
+  check('there is a public staging environment', !!staging, JSON.stringify(Object.keys(config.env || {})));
+  check('and it publishes on workers.dev', staging?.workers_dev === true, JSON.stringify(staging?.workers_dev));
+
+  // NON-INHERITABLE. `durable_objects` does not reach an environment from the
+  // top level — wrangler warns and deploys a Worker with no ROOM binding, and
+  // every room call then dies on `env.ROOM`. Both named environments have to
+  // say it themselves, so this asserts it for both rather than for staging
+  // alone: `npm run dev` shipped without one until this was noticed.
+  for (const [name, env] of [
+    ['staging', staging],
+    ['development', config.env?.development],
+  ]) {
+    const bindings = env?.durable_objects?.bindings || [];
+    check(`${name} declares its own Durable Object binding`, bindings.length === 1, JSON.stringify(env?.durable_objects));
+    check(`  named ROOM, on the Room class`, bindings[0]?.name === 'ROOM' && bindings[0]?.class_name === 'Room', JSON.stringify(bindings[0]));
+  }
+
+  // The limiter is the whole reason a public deployment is allowed to create
+  // rooms at all, so staging must carry one.
+  const limiters = staging?.ratelimits || [];
+  check('staging binds a rate limiter', limiters.length === 1, JSON.stringify(limiters));
+  const limiter = limiters[0] || {};
+  check('  under the name the Worker actually reads', limiter.name === 'ROOM_LIMITER', String(limiter.name));
+  check('  with a limit and a window', Number.isInteger(limiter.simple?.limit) && limiter.simple.limit > 0, JSON.stringify(limiter.simple));
+  // Cloudflare accepts only these two windows.
+  check('  and a window Cloudflare accepts', [10, 60].includes(limiter.simple?.period), String(limiter.simple?.period));
+  check('  the namespace id is a positive integer, as a string', typeof limiter.namespace_id === 'string' && /^[1-9][0-9]*$/.test(limiter.namespace_id), JSON.stringify(limiter.namespace_id));
+
+  // A NAMESPACE ID IS NOT A RESOURCE — it is a number, and two bindings
+  // anywhere in one Cloudflare account that pick the same number share their
+  // counters. "1001" is the number Cloudflare's own example uses, so it is the
+  // one most likely to be taken by something unrelated; on the account this
+  // was first deployed to it was already in use twice. Sharing a counter with
+  // a stranger's contact form is not rate limiting.
+  check('  and is not the example id everyone else also copied', limiter.namespace_id !== '1001', limiter.namespace_id);
+  check('  nor is that id suggested anywhere in the file any more', !/namespace_id"?\s*:\s*"1001"/.test(raw), 'the commented example would collide');
+
+  // Staging is public. The development bypass must not follow it there.
+  check('staging does NOT carry the unlimited-relay bypass', staging?.vars?.STACKI_ALLOW_UNLIMITED_RELAY === undefined, JSON.stringify(staging?.vars));
+  check('and nothing outside env.development carries it at all', (raw.match(/STACKI_ALLOW_UNLIMITED_RELAY/g) || []).length === (JSON.stringify(config.env?.development?.vars || {}).includes('STACKI_ALLOW_UNLIMITED_RELAY') ? 2 : 0), 'the opt-out belongs to development and its comment only');
+
+  // Inheritable, and deliberately left at the top level — so assert they are
+  // still there rather than quietly duplicated per environment.
+  check('the SQLite migration is still declared once, at the top', Array.isArray(config.migrations) && config.migrations[0]?.new_sqlite_classes?.includes('Room'), JSON.stringify(config.migrations));
+  check('and staging does not fork the migration history', staging?.migrations === undefined, JSON.stringify(staging?.migrations));
+  check('invocation logging stays off for every environment', config.observability?.logs?.invocation_logs === false, JSON.stringify(config.observability));
+  check('and staging does not override observability', staging?.observability === undefined, JSON.stringify(staging?.observability));
 }
 
 // ── The bundle has to tell the operating system about the scheme ────────────

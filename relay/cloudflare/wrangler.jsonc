@@ -46,16 +46,49 @@
   // not create rooms. That is the intended failure: a deployment missing its
   // abuse protection should be useless, not generous.
   //
-  // A PUBLIC deployment uncomments this and gives it a namespace id:
+  // A public deployment gets its limiter from a named environment below, not
+  // from here. See relay/cloudflare/README.md.
   //
-  // "ratelimits": [
-  //   { "name": "ROOM_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
-  // ]
+  // NAMESPACE IDS ARE ACCOUNT-WIDE AND SHARED BY VALUE.
   //
-  // Local development opts out explicitly instead, in an environment that is
-  // never what `wrangler deploy` publishes by default:
+  // `namespace_id` is not a resource anybody provisions — it is an integer you
+  // pick, and two bindings anywhere in the same Cloudflare account that pick
+  // the same integer SHARE THE SAME COUNTERS. An earlier version of this file
+  // suggested "1001" as the example, which on the account this was first
+  // deployed to was already taken twice, by an unrelated waitlist form and an
+  // unrelated bug reporter. Following that comment would have let traffic to
+  // somebody else's website exhaust this relay's room-creation budget, and the
+  // other way round. The ids below are Stacki's own, and staging and
+  // production deliberately differ so their counters never meet.
   "env": {
+    // PUBLIC STAGING, on workers.dev. Production-equivalent in every way that
+    // affects behaviour or security; only the hostname and the isolation
+    // differ. There is deliberately no STACKI_ALLOW_UNLIMITED_RELAY here.
+    //
+    //   npx wrangler deploy --env staging
+    //
+    "staging": {
+      "workers_dev": true,
+      // NOT INHERITED. `durable_objects` is a non-inheritable key, so an
+      // environment that does not repeat it deploys with no ROOM binding at
+      // all and every room call fails. `migrations` and `observability` are
+      // inheritable and are deliberately left at the top level.
+      "durable_objects": {
+        "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+      },
+      "ratelimits": [
+        { "name": "ROOM_LIMITER", "namespace_id": "770001", "simple": { "limit": 20, "period": 60 } }
+      ]
+    },
+    // Local development opts out explicitly, in an environment that is never
+    // what `wrangler deploy` publishes by default:
     "development": {
+      // Same non-inheritance rule as staging: without this, `npm run dev`
+      // brought up a relay with no Durable Object and every request died on
+      // `env.ROOM`.
+      "durable_objects": {
+        "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+      },
       "vars": {
         // Unlimited room creation, on purpose, on somebody's own machine.
         "STACKI_ALLOW_UNLIMITED_RELAY": "1"
