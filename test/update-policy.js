@@ -102,6 +102,15 @@ const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
       script
     );
   }
+
+  // AND THE TEST BUILD NEVER PUBLISHES.
+  //
+  // electron-builder decides for itself when nothing says otherwise, and on a
+  // push to a branch it decides to publish — then fails asking for a GH_TOKEN
+  // that CI is right not to have. The first run of the CI workflow on main did
+  // exactly that. An unsigned build is for looking at, so it now says so.
+  const unsigned = pkg.scripts['dist:mac:unsigned'];
+  check('the unsigned build refuses to publish', !!unsigned && unsigned.includes('--publish never'), unsigned);
 }
 
 {
