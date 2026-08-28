@@ -58,7 +58,6 @@ const {
   createSecureTransport,
   createRoom: createSecureRoom,
   joinRoom: joinSecureRoom,
-  abandonRoom,
   undoSetup,
   retryCleanups,
   leaveOutcome,
