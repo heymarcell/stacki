@@ -333,11 +333,15 @@ describe('the request body is bounded in bytes', () => {
   });
 });
 
-describe('an official deployment needs its rate limiter', () => {
-  // Locally and for a self-hoster the limiter is optional — everything here
-  // has to run without a Cloudflare account. A deployment that declares itself
-  // Stacki's official public relay must not quietly become unlimited public
-  // storage because a binding was left out of a config file.
+describe('room creation is refused unless something permits it', () => {
+  // Safe by default. A relay with no limiter creates rooms for anybody who can
+  // reach it, forever — so that is the case that must fail closed. Permission
+  // comes from a bound limiter, or from an explicit opt-out that a person had
+  // to write down.
+  //
+  // The suite as a whole runs with the opt-out set (see vitest.config.js),
+  // which is why these tests build their own env rather than using the
+  // ambient one.
   const make = async (envOver) => {
     const owner = await newMember();
     const roomId = toBase64Url(randomBytes(16));
@@ -349,23 +353,38 @@ describe('an official deployment needs its rate limiter', () => {
     return worker.fetch(request, { ...env, ...envOver });
   };
 
-  it('creates rooms freely when nothing claims to be official', async () => {
-    expect((await make({})).status).toBe(200);
-  });
-
-  it('refuses to create rooms when it is official and has no limiter', async () => {
-    const res = await make({ STACKI_OFFICIAL_RELAY: '1' });
+  // THE DEFAULT. Nothing bound, nothing opted out — the shape a plain
+  // `wrangler deploy` of the committed config produces.
+  it('refuses with neither a limiter nor an opt-out', async () => {
+    const res = await make({ ROOM_LIMITER: undefined, STACKI_ALLOW_UNLIMITED_RELAY: undefined });
     expect(res.status).toBe(429);
     expect((await res.json()).error).toBe('rate_limited');
   });
 
-  it('creates rooms when it is official and the limiter allows it', async () => {
-    const res = await make({ STACKI_OFFICIAL_RELAY: '1', ROOM_LIMITER: { limit: async () => ({ success: true }) } });
+  it('refuses when the opt-out is anything other than an explicit yes', async () => {
+    for (const value of ['0', 'true', 'yes', '', 'false']) {
+      const res = await make({ ROOM_LIMITER: undefined, STACKI_ALLOW_UNLIMITED_RELAY: value });
+      expect(res.status, `opt-out ${JSON.stringify(value)}`).toBe(429);
+    }
+  });
+
+  it('allows when a limiter is bound and permits it', async () => {
+    const res = await make({ ROOM_LIMITER: { limit: async () => ({ success: true }) }, STACKI_ALLOW_UNLIMITED_RELAY: undefined });
     expect(res.status).toBe(200);
   });
 
-  it('and refuses when the limiter says no', async () => {
-    const res = await make({ STACKI_OFFICIAL_RELAY: '1', ROOM_LIMITER: { limit: async () => ({ success: false }) } });
+  it('refuses when a bound limiter says no', async () => {
+    const res = await make({ ROOM_LIMITER: { limit: async () => ({ success: false }) }, STACKI_ALLOW_UNLIMITED_RELAY: undefined });
+    expect(res.status).toBe(429);
+  });
+
+  it('allows when somebody explicitly opted out, as local development does', async () => {
+    const res = await make({ ROOM_LIMITER: undefined, STACKI_ALLOW_UNLIMITED_RELAY: '1' });
+    expect(res.status).toBe(200);
+  });
+
+  it('lets a bound limiter overrule the opt-out', async () => {
+    const res = await make({ ROOM_LIMITER: { limit: async () => ({ success: false }) }, STACKI_ALLOW_UNLIMITED_RELAY: '1' });
     expect(res.status).toBe(429);
   });
 });

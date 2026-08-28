@@ -12,6 +12,12 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: './wrangler.jsonc' },
+      // The test runtime opts out of the abuse guard explicitly, exactly as a
+      // local `wrangler dev --env development` does. Room creation is refused
+      // by default now, so a suite that wants rooms has to say so — which is
+      // the point: the default is the safe one and every exception is written
+      // down somewhere a person can read.
+      miniflare: { bindings: { STACKI_ALLOW_UNLIMITED_RELAY: '1' } },
     }),
   ],
   test: {

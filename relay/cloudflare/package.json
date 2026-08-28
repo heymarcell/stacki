@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --env development",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

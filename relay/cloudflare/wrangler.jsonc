@@ -37,18 +37,29 @@
       "enabled": true,
       "invocation_logs": false
     }
-  }
+  },
 
-  // Rate limiting for room creation is configured per deployment, because the
-  // binding needs an account-level namespace id and everything here must run
-  // locally without one. See README.md.
+  // ROOM CREATION IS REFUSED UNLESS SOMETHING HERE PERMITS IT.
   //
-  // An OFFICIAL public deployment must set BOTH of these: the Worker refuses
-  // to create rooms when it is told it is official and the limiter is missing,
-  // so a forgotten binding makes the relay useless rather than unlimited.
+  // There is deliberately no rate limiter and no opt-out at this level, which
+  // means a plain `wrangler deploy` of this file produces a relay that will
+  // not create rooms. That is the intended failure: a deployment missing its
+  // abuse protection should be useless, not generous.
   //
-  // "vars": { "STACKI_OFFICIAL_RELAY": "1" },
+  // A PUBLIC deployment uncomments this and gives it a namespace id:
+  //
   // "ratelimits": [
   //   { "name": "ROOM_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
   // ]
+  //
+  // Local development opts out explicitly instead, in an environment that is
+  // never what `wrangler deploy` publishes by default:
+  "env": {
+    "development": {
+      "vars": {
+        // Unlimited room creation, on purpose, on somebody's own machine.
+        "STACKI_ALLOW_UNLIMITED_RELAY": "1"
+      }
+    }
+  }
 }

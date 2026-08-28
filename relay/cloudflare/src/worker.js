@@ -160,30 +160,38 @@ async function readJson(request) {
 }
 
 /**
- * Room creation, rate limited at the edge.
+ * Room creation, rate limited at the edge. SAFE BY DEFAULT.
  *
- * OPTIONAL EVERYWHERE EXCEPT AN OFFICIAL DEPLOYMENT. The binding needs an
- * account-level namespace, and everything in this repository has to be
- * runnable and testable by somebody with no Cloudflare account at all — so
- * locally, in tests, and for a self-hoster, its absence is fine and the README
- * explains the WAF alternative.
+ * A relay with no limiter creates rooms for anybody who can reach it, forever.
+ * The previous version made that the default and asked a deployment to opt IN
+ * to protection with an `official` flag — so forgetting two settings instead
+ * of one published an unlimited public encrypted-storage endpoint, silently.
+ * Defaults have to fail the safe way round: forgetting something should make
+ * a relay useless, which somebody notices within a minute, rather than
+ * generous, which nobody notices at all.
  *
- * A deployment that sets `STACKI_OFFICIAL_RELAY` is saying it is Stacki's own
- * public one, and that one must not quietly become an unlimited public
- * encrypted-storage endpoint because a binding was forgotten in a config file.
- * So there it is required, and its absence closes room creation rather than
- * opening it. Forgetting it makes the relay useless, which is noticed; the
- * other way round is not.
+ * So the order is now:
+ *
+ *   a limiter is bound        → it decides
+ *   no limiter, opted out     → allowed, because somebody said so in writing
+ *   no limiter, nothing said  → REFUSED
+ *
+ * `STACKI_ALLOW_UNLIMITED_RELAY` is the opt-out, and it exists for exactly two
+ * situations: a local `wrangler dev`/test runtime, and a self-hoster who has
+ * read what it means and wants it anyway. It is deliberately not in the
+ * top-level config, so an ordinary `wrangler deploy` cannot pick it up by
+ * accident — see relay/cloudflare/README.md.
  *
  * Rate limiting is not authorisation and nothing here treats it as such — it
  * bounds how fast strangers can make rooms, nothing more.
  */
 async function allowRoomCreation(request, env) {
-  const official = String(env.STACKI_OFFICIAL_RELAY || '') === '1';
-  if (!env.ROOM_LIMITER?.limit) return !official;
-  const who = request.headers.get('cf-connecting-ip') || 'unknown';
-  const { success } = await env.ROOM_LIMITER.limit({ key: `rooms:${who}` });
-  return success !== false;
+  if (env.ROOM_LIMITER?.limit) {
+    const who = request.headers.get('cf-connecting-ip') || 'unknown';
+    const { success } = await env.ROOM_LIMITER.limit({ key: `rooms:${who}` });
+    return success !== false;
+  }
+  return String(env.STACKI_ALLOW_UNLIMITED_RELAY || '') === '1';
 }
 
 export default {

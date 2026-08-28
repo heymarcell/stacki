@@ -434,6 +434,33 @@ if (fs.existsSync(relayDir)) {
   }
 }
 
+// ── A plain deploy of the committed relay config is the safe one ────────────
+//
+// A relay with no limiter creates rooms for anybody who can reach it, forever.
+// So the shape `wrangler deploy` publishes by default must be the refusing
+// one, and the opt-out must live somewhere a default deploy does not reach.
+// Read from the file, because this is a claim about what is committed.
+
+const wranglerPath = path.join(root, 'relay', 'cloudflare', 'wrangler.jsonc');
+if (fs.existsSync(wranglerPath)) {
+  const raw = fs.readFileSync(wranglerPath, 'utf8');
+  // JSONC: whole-line comments only, which is all this file uses.
+  const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ''));
+  check('the deployed level binds no rate limiter', config.ratelimits === undefined, JSON.stringify(config.ratelimits));
+  check(
+    'and does not opt out of the abuse guard',
+    config.vars?.STACKI_ALLOW_UNLIMITED_RELAY === undefined,
+    JSON.stringify(config.vars)
+  );
+  check(
+    'so the opt-out exists only in an environment a default deploy does not publish',
+    config.env?.development?.vars?.STACKI_ALLOW_UNLIMITED_RELAY === '1',
+    JSON.stringify(config.env)
+  );
+  // And the flag that used to make protection opt-IN is gone entirely.
+  check('the old opt-in flag is not consulted any more', !/STACKI_OFFICIAL_RELAY/.test(fs.readFileSync(path.join(root, 'relay', 'cloudflare', 'src', 'worker.js'), 'utf8')));
+}
+
 // ── The bundle has to tell the operating system about the scheme ────────────
 //
 // A runtime `setAsDefaultProtocolClient` call cannot make an unlaunched bundle

@@ -47,9 +47,27 @@ loopback only.
 Nothing here deploys itself, and there is no hard-wired hostname anywhere in
 Stacki or in this Worker.
 
+**A relay that will create a room for anybody, forever, is the thing to avoid**,
+so this configuration is committed in the state that refuses. Deploying it
+as-is gives you a relay that serves existing rooms and declines to make new
+ones — which is a deployment you notice within a minute, rather than one you
+notice when somebody has filled it.
+
+So there are two paths, and the safe one is the plain one:
+
+**1 — a public relay.** Bind the rate limiter first, then deploy:
+
 ```bash
+# in wrangler.jsonc, uncomment "ratelimits" and give it a namespace id
 npx wrangler login
 npx wrangler deploy
+```
+
+**2 — a private or experimental relay, knowingly unlimited.** Say so out loud;
+there is no way to get here by forgetting something:
+
+```bash
+npx wrangler deploy --var STACKI_ALLOW_UNLIMITED_RELAY:1
 ```
 
 Then set the relay origin Stacki should offer as its default (see
@@ -58,19 +76,25 @@ under Advanced.
 
 ### Rate limiting
 
-Room creation must be rate limited on a public deployment, and the Worker is
-built so that forgetting it fails safe rather than open:
+Room creation is **refused unless something explicitly permits it**. In order:
 
-- **Locally, in tests, and for a self-hoster** the `ROOM_LIMITER` binding is
-  optional. Its absence is a no-op, so everything here runs without a
-  Cloudflare account.
-- **An official deployment** sets `STACKI_OFFICIAL_RELAY: "1"`. With that set
-  and no limiter bound, the Worker **refuses to create rooms** — a forgotten
-  binding makes the relay useless, which somebody notices, rather than making
-  it unlimited public encrypted storage, which nobody does.
+| state | room creation |
+|---|---|
+| `ROOM_LIMITER` bound | the limiter decides |
+| no limiter, `STACKI_ALLOW_UNLIMITED_RELAY=1` | allowed — somebody said so in writing |
+| no limiter, nothing said | **refused** |
 
-Uncomment both blocks in `wrangler.jsonc` together, or put a WAF rate-limiting
-rule in front of `POST /v2/rooms` and leave the flag unset.
+The last row is the default, and it is the point. An earlier version had this
+the other way round — protection was opt-in behind a flag — which meant
+forgetting two settings instead of one published an unlimited public
+encrypted-storage endpoint and said nothing about it. Defaults have to fail the
+safe way round.
+
+`npm run dev` uses `--env development`, which carries the opt-out; so does the
+test runtime, in `vitest.config.js`. Neither is what `wrangler deploy`
+publishes. A WAF rate-limiting rule in front of `POST /v2/rooms` is a fine
+alternative to the binding — pair it with the explicit opt-out so the Worker
+knows the protection is elsewhere.
 
 Invitation brute force is bounded inside each room's Durable Object and needs
 no configuration. Neither mechanism is authorisation and nothing treats it as
