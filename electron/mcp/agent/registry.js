@@ -245,7 +245,6 @@ const EXCLUDED = [
   { channels: ['reviews:identity', 'reviews:setIdentity'], why: 'unsafe', reason: 'Changing whose name is on a comment. An agent signs with its own, and cannot sign with anybody else’s.' },
   { channels: ['reviews:editMessage', 'reviews:removeMessage'], why: 'human-only', reason: 'Rewording and pruning are a person tidying their own notes. An agent that could rewrite the conversation is an agent whose record of it means nothing.' },
   { channels: ['reviews:remove'], why: 'unsafe', reason: 'Deleting somebody’s feedback. An agent that disagrees resolves the thread with its reasoning, which leaves them able to disagree back.' },
-  { channels: ['reviews:recolor'], why: 'human-only', reason: 'The colour the user files a comment under. Their filing, not a state to act on.' },
   { channels: ['reviews:sync', 'reviews:syncAnchors', 'reviews:shared'], why: 'redundant', reason: 'Housekeeping the window does for itself; get_comments already reports the result of all of it.' },
   { channels: ['reviews:list', 'reviews:act'], why: 'exposed elsewhere', reason: 'These ARE get_comments and comment, which existed before this feature and are unchanged by it.' },
 

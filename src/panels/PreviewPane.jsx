@@ -134,7 +134,6 @@ export default function PreviewPane({
   onReviewAct,
   onReviewFocus,
   onReviewDelete,
-  onReviewColor,
   onReviewEditMessage,
   onReviewDeleteMessage,
   onReviewDraftChange,

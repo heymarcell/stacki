@@ -54,7 +54,6 @@ const {
   displayName,
   uuidv5,
   agentActor,
-  legacyAgentActor,
   suggestName,
   reviveActor,
   isActorId,
@@ -257,7 +256,6 @@ const FIRST = run(['rev-parse', 'HEAD']).trim();
   check('regardless of how it was capitalised', agentActor('claude').id === claude.id);
   check('and a different agent is a different one', agentActor('Codex').id !== claude.id);
   check('an unnamed agent has a name anyway', agentActor(null).displayName === 'AI Agent');
-  check('a legacy agent is named for what it is', legacyAgentActor().displayName === 'Agent' && legacyAgentActor().kind === 'agent');
 
   check('a suggestion prefers the git author', suggestName({ run: git, projectPath: REPO }) === 'Test Person', suggestName({ run: git, projectPath: REPO }));
   // The email is never used. It is the one field of a git identity that is a
@@ -353,48 +351,58 @@ const FIRST = run(['rev-parse', 'HEAD']).trim();
   check('Alice can delete her own', store.remove(made.thread.id, alice).ok === true);
 }
 
-// ── Old reviews are never given provenance they never had ───────────────────
+// ── Reviews from the old model are discarded, not migrated ─────────────────
+//
+// A ledger written before version 3 is not read, not repaired and not carried
+// across. The review model changed shape during alpha and the alternative was
+// keeping migration code and a dead field alive forever to serve reviews from
+// a build nobody was running in earnest.
+//
+// What this checks is that the discard is CLEAN: the ledger comes up empty and
+// writable, it says what happened rather than looking like a corrupt file, and
+// the very next review written into it is an ordinary one — with provenance,
+// with an actor, with a number.
 
 {
   const file = path.join(home, 'legacy.json');
-  fs.writeFileSync(
-    file,
-    JSON.stringify({
-      version: 1,
-      nextNumber: 2,
-      threads: [
-        {
-          id: 'rt_old',
-          number: 1,
-          status: 'open',
-          anchor: { keys: ['src/pages/index.astro#0.1'] },
-          creationContext: { branch: 'some-old-branch', tag: 'h1' },
-          messages: [{ id: 'm1', authorType: 'human', body: 'from before all this', createdAt: 10 }],
-          createdAt: 10,
-          updatedAt: 10,
-        },
-      ],
-    }),
-    'utf8'
-  );
+  const before = JSON.stringify({
+    version: 1,
+    nextNumber: 2,
+    threads: [
+      {
+        id: 'rt_old',
+        number: 1,
+        status: 'open',
+        color: 'violet',
+        anchor: { keys: ['src/pages/index.astro#0.1'] },
+        creationContext: { branch: 'some-old-branch', tag: 'h1' },
+        messages: [{ id: 'm1', authorType: 'human', body: 'from before all this', createdAt: 10 }],
+        createdAt: 10,
+        updatedAt: 10,
+      },
+    ],
+  });
+  fs.writeFileSync(file, before, 'utf8');
+
   const alice = { id: uuidv5('legacy-alice'), kind: 'human', displayName: 'Alice' };
   const store = createReviewStore({ file, projectPath: REPO, actor: alice });
-  const old = store.all()[0];
-  check('an old review survives the move to events', !!old && old.messages[0].body === 'from before all this');
-  // The rule: nobody knows what the tree looked like on the day it was
-  // written, and today's HEAD is not an answer to that question.
-  check('and is given no provenance at all', old.provenance === null, JSON.stringify(old.provenance));
-  check('it is marked as coming from before authorship was recorded', old.author.legacy === true);
-  check('and attributed to this installation’s own person', old.author.actorId === alice.id);
-  check('the branch it recorded at the time is still readable', old.creationContext.branch === 'some-old-branch');
-  // A review it has never looked at is not "attached" — but this one carried a
-  // recorded state from the old file, which is this machine's own finding.
-  check('and its old anchor state came across', old.anchorState === 'attached', old.anchorState);
+  check('a ledger from the old model comes up empty', store.size === 0, String(store.size));
+  check('and says so, as a reset rather than as damage', store.problem?.kind === 'reset', JSON.stringify(store.problem));
+  check('naming the version it discarded', /version 1/.test(store.problem?.detail || ''), store.problem?.detail);
+  check('it is not quarantined — nothing was salvageable to set aside', !store.problem?.movedTo);
+  check('and the ledger is writable, not read-only', store.apply({ action: 'create', message: 'after the reset', anchor: { keys: ['src/pages/index.astro#0.2'] } }).ok === true);
 
-  // A new review in the same ledger DOES get provenance: nothing about the
-  // migration turns the feature off.
-  const fresh = store.apply({ action: 'create', message: 'a new one', anchor: { keys: ['src/pages/index.astro#0.2'] } });
-  check('a new review in a migrated ledger still records provenance', !!fresh.thread.provenance?.head);
+  const fresh = store.all()[0];
+  check('a review written after a reset is an ordinary one', fresh.messages[0].body === 'after the reset');
+  check('with provenance', !!fresh.provenance?.head);
+  check('with this installation’s person on it', fresh.author.actorId === alice.id);
+  check('and numbering that starts over', fresh.number === 1, String(fresh.number));
+  check('no colour came across, because there is nowhere for it to land', !('color' in fresh));
+
+  // The same file, opened by a second store: the reset is a fact on disk now,
+  // not something re-derived from bytes that are no longer there.
+  const again = createReviewStore({ file, projectPath: REPO, actor: alice });
+  check('and the reset is not re-applied to the new reviews', again.size === 1 && again.problem === null, JSON.stringify(again.problem));
 }
 
 fs.rmSync(home, { recursive: true, force: true });

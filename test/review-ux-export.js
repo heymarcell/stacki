@@ -1113,17 +1113,17 @@ const REQUIRED = [
   await wait(500);
   const menuItems = await js(`[...document.querySelectorAll('.review-menu [role="menuitem"]')].map((b) => b.textContent.trim())`);
   must('the Inspector overflow opens', openedMenu === true);
-  must('and it is the only place colour is edited from', (menuItems || []).some((t) => /Colour/i.test(t)), JSON.stringify(menuItems));
+  must('and it does not offer a colour', !(menuItems || []).some((t) => /Colour/i.test(t)), JSON.stringify(menuItems));
   must('and it holds the destructive act', (menuItems || []).some((t) => /Delete/i.test(t)), JSON.stringify(menuItems));
-  await state('26-inspector-overflow', 'Inspector overflow — Colour… and the one destructive act, both out of the way', async () => {
+  await state('26-inspector-overflow', 'Inspector overflow — the one destructive act, out of the way', async () => {
     const s = await look();
     return [
       ['the Review Inspector is open', s.inspector === true, JSON.stringify({ mode: s.mode, panelW: s.panelW, inspectorW: s.inspectorW })],
       ['the left panel is presenting it, not the Comments Index', s.mode !== 'index' && s.indexRows === 0, JSON.stringify({ mode: s.mode, rows: s.indexRows })],
       ['and there is a conversation in it', s.thread === true],
       ['the overflow menu is open', s.menu.length > 0, JSON.stringify(s.menu)],
-      ['it is where colour is edited from', s.menu.some((x) => /Colour/i.test(x)), JSON.stringify(s.menu)],
-      ['and where the destructive act lives', s.menu.some((x) => /Delete/i.test(x)), JSON.stringify(s.menu)],
+      ['and it is where the destructive act lives', s.menu.some((x) => /Delete/i.test(x)), JSON.stringify(s.menu)],
+      ['and nothing in it is about colour', !s.menu.some((x) => /Colour/i.test(x)), JSON.stringify(s.menu)],
     ];
   });
 

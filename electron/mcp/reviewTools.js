@@ -75,9 +75,6 @@ const Summary = z.object({
   // The short handle the user sees on the pin and in the panel. Either this or
   // the id names a review in `comment` — and this is the one they will say.
   number: z.number().int().nullable(),
-  // The user's own colour for this note. Their filing, not a state and not
-  // something to act on — there is no action here that sets it.
-  color: z.string(),
   status: Status,
   anchorState: AnchorState,
   message: z.string(),

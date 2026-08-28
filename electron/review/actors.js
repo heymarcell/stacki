@@ -95,15 +95,6 @@ function agentActor(name) {
 }
 
 /**
- * The actor an old, pre-actor review is attributed to.
- *
- * Derived like an agent's, and named as what it is. A message written before
- * Stacki recorded who wrote things is not evidence that any particular agent
- * wrote it, so it does not get to borrow a name.
- */
-const legacyAgentActor = () => ({ id: uuidv5('agent:legacy'), kind: 'agent', displayName: 'Agent' });
-
-/**
  * A name to suggest, from what the machine already knows.
  *
  * `git config user.name` first — it is what this person calls themselves in
@@ -264,7 +255,6 @@ module.exports = {
   displayName,
   uuidv5,
   agentActor,
-  legacyAgentActor,
   suggestName,
   reviveActor,
   isActorId,

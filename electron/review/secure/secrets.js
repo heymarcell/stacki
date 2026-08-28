@@ -549,6 +549,28 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     return true;
   }
 
+  /**
+   * Every room, mapping and pending cleanup this installation holds. Gone.
+   *
+   * NOT the same as forgetting each room in turn, and that is the whole reason
+   * it exists. `all()` answers with active, decryptable rooms only — a dormant
+   * signing identity is not one, and neither is a blob this machine can no
+   * longer decrypt. Walking `all()` and forgetting each would leave exactly
+   * the entries nothing can see and nothing can clean up.
+   *
+   * `preferredRelay` stays: it is a setting somebody typed, not a room.
+   *
+   * There is one caller — the review epoch reset — and it is destructive on
+   * purpose. Nothing in the ordinary product lifecycle may use this; leaving a
+   * share is `retire`, and ending one is `forget`.
+   */
+  function wipe() {
+    const data = read();
+    const had = Object.keys(data.rooms || {}).length + Object.keys(data.cleanups || {}).length;
+    write({ version: 2, preferredRelay: data.preferredRelay ?? null, rooms: {}, projects: {}, cleanups: {} });
+    return had;
+  }
+
   const forProject = (key) => {
     if (!key) return null;
     const roomId = str(read().projects?.[key]?.roomId, 64);
@@ -598,6 +620,7 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     get,
     publicOf,
     preferredRelay,
+    wipe,
     setPreferredRelay,
     remember,
     update,

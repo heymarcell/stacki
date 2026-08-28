@@ -231,10 +231,6 @@ export function ReviewWhere({ review, compact = false }) {
   return <span className={`review-where${compact ? ' compact' : ''}`}>{bits.join(' · ')}</span>;
 }
 
-// The colours a person can file their own notes under. Mirrors the store's
-// list, which is what actually enforces it.
-export const REVIEW_COLORS = ['blue', 'violet', 'teal', 'green', 'amber', 'rose'];
-
 /**
  * The one word for what state a review is in.
  *
@@ -264,8 +260,11 @@ export function statusWord(status, anchorState) {
  * is deferred, a ring with a tick is resolved, a dashed ring is an anchor
  * Stacki can no longer find.
  *
- * The grouping colour is still stored and still edited — through Colour… in
- * the Inspector overflow — it is simply no longer pretending to be status.
+ * There is no second colour on a review any more. A user-chosen filing colour
+ * used to sit alongside this one and earned nothing: it painted a 6px dot
+ * nobody could read, competed with the state this dot exists to say, and left
+ * every review surface ambiguous about which colour meant what. It is gone,
+ * and this is the only colour a review has.
  *
  * `labelled` is for the surfaces where the dot is the ONLY thing saying the
  * state. Where the control around it already names it, the dot stays out of
@@ -285,26 +284,6 @@ export function ReviewStatusDot({ status, anchorState, labelled = true }) {
   );
 }
 
-/** Pick which of your notes this one belongs with. */
-export function ReviewPalette({ value, onPick }) {
-  return (
-    <div className="review-palette" role="group" aria-label="Comment colour">
-      {REVIEW_COLORS.map((c) => (
-        <button
-          key={c}
-          type="button"
-          className={`review-swatch c-${c}${value === c ? ' on' : ''}`}
-          title={c}
-          onClick={(e) => {
-            e.stopPropagation();
-            onPick(c);
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
 /**
  * The whole thread: what was said, who said it, and the four things that can
  * happen to it next.
@@ -319,7 +298,6 @@ export default function ReviewThread({
   onFocus,
   onDelete,
   onClose,
-  onColor,
   onEditMessage,
   onDeleteMessage,
   // Who is reading. Without it every human message would be signed "You",
@@ -382,7 +360,6 @@ export default function ReviewThread({
     restoreCaret(field, next);
     return true;
   };
-  const [picking, setPicking] = React.useState(false);
   const [menuOpen, setMenuOpen] = React.useState(false);
   const menuRef = React.useRef(null);
   const menuButtonRef = React.useRef(null);
@@ -397,7 +374,6 @@ export default function ReviewThread({
   const setReply = (v) => onReplyChange?.(v);
 
   React.useEffect(() => {
-    setPicking(false);
     setMenuOpen(false);
     setDeferring(false);
     setReason('');
@@ -441,15 +417,12 @@ export default function ReviewThread({
             <BackIcon size={13} />
           </button>
         )}
-        {/* The dot says the state. It is not the colour picker any more: it
-            was both, so pressing the thing that told you a review was resolved
-            opened a palette, and the palette then changed the colour the dot
-            had been using to say "resolved". Grouping colour is edited through
-            Colour… in the overflow. */}
+        {/* The dot says the state, and only the state. It used to be the
+            colour picker as well, so pressing the thing that told you a review
+            was resolved opened a palette that then changed the colour it had
+            been saying "resolved" with. Both it and the filing colour it set
+            are gone. */}
         <ReviewStatusDot status={review.status} anchorState={review.anchorState} />
-        {review.color && review.color !== 'blue' && (
-          <span className={`review-swatch-dot c-${review.color}`} title={`Filed under ${review.color}`} aria-hidden="true" />
-        )}
         {/* What to call it out loud. The uuid is the identity; this is the
             name, and it is the same name on the pin, in the list and in
             whatever an agent was asked to fix. */}
@@ -500,7 +473,7 @@ export default function ReviewThread({
             Locate
           </button>
         )}
-        {(onDelete || onColor) && (
+        {onDelete && (
           // A menu that could not be dismissed.
           //
           // It had no Escape and no click-away: the only way out was to press
@@ -540,17 +513,6 @@ export default function ReviewThread({
             </button>
             {menuOpen && (
               <div className="review-menu" role="menu">
-                {onColor && (
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      setPicking((v) => !v);
-                    }}
-                  >
-                    Colour…
-                  </button>
-                )}
                 {onDelete && canDeleteThread(review, actorId) && (
                   <button
                     role="menuitem"
@@ -610,16 +572,6 @@ export default function ReviewThread({
       {/* Provenance sits here, above the conversation and below the name,
           because it changes how everything under it should be read. */}
       <CheckoutNote review={review} pinned={pinned} />
-
-      {picking && onColor && (
-        <ReviewPalette
-          value={review.color}
-          onPick={(c) => {
-            onColor(c);
-            setPicking(false);
-          }}
-        />
-      )}
 
       {/* The ONLY thing that scrolls.
 

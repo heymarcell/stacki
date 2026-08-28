@@ -51,7 +51,6 @@ const EVENT_TYPES = [
   'thread.resolved',
   'thread.deferred',
   'thread.reopened',
-  'thread.color.changed',
   'thread.deleted',
 ];
 
@@ -255,7 +254,6 @@ function projectThreads(events, { bounds = {} } = {}) {
         deletedBy: null,
         messages: new Map(),
         statusEvent: null,
-        colorEvent: null,
         deferEvents: [],
         reopenAt: null, // the ordering position of the newest reopen
         updatedAt: 0,
@@ -349,12 +347,6 @@ function projectThreads(events, { bounds = {} } = {}) {
       continue;
     }
 
-    if (event.type === 'thread.color.changed') {
-      if (!t.colorEvent || compareEvents(event, t.colorEvent) > 0) t.colorEvent = event;
-      // Colour is somebody filing their own notes, not something said. It has
-      // never moved updatedAt and it does not start now.
-      continue;
-    }
   }
 
   const out = [];
@@ -406,12 +398,6 @@ function projectThreads(events, { bounds = {} } = {}) {
       // on this machine and otherwise ignored — see the note on nicknames in
       // store.js.
       proposedNumber: Number.isInteger(payload.number) && payload.number > 0 ? payload.number : null,
-      // The newest colour anybody chose, or the one it was created with.
-      // A last-writer-wins register, and the one piece of state where a
-      // disagreement genuinely does not matter.
-      color: (t.colorEvent && typeof t.colorEvent.payload?.color === 'string' ? t.colorEvent.payload.color : null) ||
-        payload.color ||
-        'blue',
       status,
       anchor: isPlainObject(payload.anchor) ? payload.anchor : null,
       creationContext: isPlainObject(payload.creationContext) ? payload.creationContext : {},
@@ -423,7 +409,6 @@ function projectThreads(events, { bounds = {} } = {}) {
         actorId: t.created.actorId,
         actorKind: t.created.actorKind,
         actorName: t.created.actorName,
-        legacy: payload.legacy === true,
       },
       messages: surviving.map((m) => ({
         id: m.id,

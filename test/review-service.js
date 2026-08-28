@@ -74,7 +74,7 @@ reviews.attach({
   resolveTrail: (keys) => (keys || []).map((k) => ({ file: k.split('#')[0], startLine: 1, endLine: 2 })),
 });
 
-check('every IPC channel the preload invokes is registered', ['reviews:list', 'reviews:act', 'reviews:remove', 'reviews:recolor', 'reviews:editMessage', 'reviews:removeMessage', 'reviews:syncAnchors'].every((c) => handlers.has(c)), [...handlers.keys()].join());
+check('every IPC channel the preload invokes is registered', ['reviews:list', 'reviews:act', 'reviews:remove', 'reviews:editMessage', 'reviews:removeMessage', 'reviews:syncAnchors'].every((c) => handlers.has(c)), [...handlers.keys()].join());
 
 // Nothing open yet.
 check('with no project open, a read still answers in the promised shape', (() => {
@@ -121,8 +121,10 @@ check('and hands back the shortened thread', pruned.review?.messages?.length ===
 const last = via('reviews:removeMessage', { threadId: id, messageId });
 check('the only message is refused, by name', last.ok === false && last.code === 'last_message', JSON.stringify(last));
 
-const colored = via('reviews:recolor', { threadId: id, color: 'teal' });
-check('recolor answers ok with the review', colored.ok === true && colored.review?.color === 'teal', JSON.stringify(colored));
+// The channel a filing colour was set through. Gone with the colour, and gone
+// means unregistered rather than answering with an error — a preload that
+// still invoked it would be a renderer talking to nothing.
+check('there is no recolour channel left to invoke', !handlers.has('reviews:recolor'), [...handlers.keys()].join());
 
 const synced = via('reviews:syncAnchors', [{ id, anchorState: 'orphaned' }]);
 check('syncAnchors answers ok', synced.ok === true && synced.changed === 1, JSON.stringify(synced));

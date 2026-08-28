@@ -278,9 +278,9 @@ correctly printed in grey or to somebody who cannot separate those hues. Green
 means resolved and nothing else: the **Resolve** button wears it, **Reopen**
 deliberately does not, and red is kept for deleting.
 
-You can also **file your own comments under a colour** — Colour… in the
-Inspector's ⋯ menu. That is grouping, not status: it shows as a small separate
-mark beside the number and never changes what the dot says.
+A comment has one colour and status owns it. There is no palette to file your
+own comments under — there was, in an earlier alpha, and it said nothing the
+status was not already saying at a size nobody could read.
 
 Resolved comments keep no marker on the page. They stay in the Comments panel
 under **Resolved** or **All**, and selecting one brings its marker back for as
