@@ -300,16 +300,16 @@ const SABOTAGES = [
     name: 'a room create that cannot be stored locally is not undone',
     why: 'a room nobody owns is left on the relay with no credential able to remove it',
     file: 'electron/review/secure/transport.js',
-    find: "    const undone = await abandonRoom({ relay: origin, roomId, token, owner: true, fetchImpl, timeoutMs });",
-    replace: '    const undone = { ok: false };',
+    find: '  const undone = await abandon({\n    relay: room.relay,\n    roomId: room.roomId,\n    token: room.token,\n    owner,\n    fetchImpl,\n    timeoutMs,\n  });',
+    replace: '  const undone = { ok: true };',
     suite: 'test:secureshare',
   },
   {
     name: 'a join that cannot be stored locally keeps the membership',
     why: 'the invitation is spent and somebody holds a share they cannot reach',
     file: 'electron/review/secure/transport.js',
-    find: "    const undone = await abandonRoom({\n      relay: invitation.relay,",
-    replace: "    const undone = { ok: false };\n    const unusedAbandon = () => abandonRoom({\n      relay: invitation.relay,",
+    find: '  const outcome = await storeOrUndo({ rooms, room: remembered, owner: false, fetchImpl, timeoutMs });',
+    replace: '  const outcome = { ok: false, cleaned: true, retained: false };',
     suite: 'test:secureshare',
   },
   {
@@ -327,24 +327,24 @@ const SABOTAGES = [
     name: 'the create walk-back ignores whether the relay actually deleted it',
     why: 'a room nobody owns is left behind and the credential that could remove it is thrown away',
     file: 'electron/review/secure/transport.js',
-    find: '  if (undone?.ok) {\n    rooms.forget(room.roomId);\n    return { cleaned: true, retained: false };\n  }',
-    replace: '  rooms.forget(room.roomId);\n  return { cleaned: true, retained: false };',
+    find: '  if (undone?.ok) {\n    forgetQuietly(rooms, room.roomId);\n    return { cleaned: true, retained: false, held: false };\n  }',
+    replace: '  forgetQuietly(rooms, room.roomId);\n  return { cleaned: true, retained: false, held: false };',
     suite: 'test:secureshare',
   },
   {
     name: 'a failed walk-back keeps nothing to retry with',
     why: 'the remote room stays and nothing anywhere can ever remove it',
     file: 'electron/review/secure/transport.js',
-    find: "  const retained = rooms.rememberCleanup?.({",
-    replace: "  const retained = false && rooms.rememberCleanup?.({",
+    find: '    retained = rooms.rememberCleanup?.({\n      roomId: room.roomId,\n      relay: room.relay,\n      token: room.token,\n      owner,\n    }) === true;',
+    replace: '    retained = false;',
     suite: 'test:secureshare',
   },
   {
     name: 'a debt that could not be settled is dropped anyway',
     why: 'the retry path forgets what it failed to clean, so it never happens',
     file: 'electron/review/secure/transport.js',
-    find: "    if (undone?.ok || undone?.code === 'unauthorized' || undone?.code === 'not_found') {",
-    replace: '    if (true) {',
+    find: '    if (settled(undone)) {\n      rooms.forgetCleanup(one.roomId);',
+    replace: '    if (true) {\n      rooms.forgetCleanup(one.roomId);',
     suite: 'test:secureshare',
   },
   {
@@ -367,8 +367,16 @@ const SABOTAGES = [
     name: 'lifecycle accounting counts a fixture whose owner is still running',
     why: 'a parallel session makes this run report a leak it had nothing to do with',
     file: 'test/secure-lifecycle.js',
-    find: '    if (pidAlive(owner.pid)) continue; // somebody is still using it',
+    find: '    if (pidAlive(owner.pid)) continue; // a child still using it',
     replace: '    // sabotaged: a live owner is counted as a leak',
+    suite: 'test:securelifecycle',
+  },
+  {
+    name: 'lifecycle accounting counts any dead run, not only its own',
+    why: 'a parallel run of this suite dying makes this run report a leak it never had',
+    file: 'test/secure-lifecycle.js',
+    find: "    if (!owner || owner.suite !== SUITE_ID) continue; // another run's, alive or dead",
+    replace: '    if (!owner) continue;',
     suite: 'test:securelifecycle',
   },
 
@@ -380,17 +388,67 @@ const SABOTAGES = [
     replace: '  // sabotaged: unknown fields are allowed through',
     suite: 'test:securerelay',
   },
+  {
+    name: 'a local write that THROWS skips the walk-back',
+    why: 'a full disk leaves a room on the relay with no credential able to remove it',
+    file: 'electron/review/secure/transport.js',
+    patches: [
+      {
+        find: '  try {\n    stored = rooms.remember(room);\n  } catch {\n    stored = null;',
+        replace: '  {\n    stored = rooms.remember(room);\n  } if (false) {\n    stored = null;',
+      },
+    ],
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'a failed walk-back throws the credential away at the lower level',
+    why: 'the only token that could delete the room goes with the failure',
+    file: 'electron/review/secure/transport.js',
+    find: "    retained = rooms.rememberCleanup?.({ roomId: room.roomId, relay: room.relay, token: room.token, owner }) === true;",
+    replace: '    retained = false;',
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'a cleanup note that could not be written still costs the last credential',
+    why: 'the disk that refused the room refuses the note, and then the room is unreachable forever',
+    file: 'electron/review/secure/transport.js',
+    find: "  return { cleaned: false, retained: false, held: true, code: undone?.code || 'offline' };",
+    replace: "  forgetQuietly(rooms, room.roomId);\n  return { cleaned: false, retained: false, held: true, code: undone?.code || 'offline' };",
+    suite: 'test:secureshare',
+  },
+  {
+    name: 'the request deadline stops when the response headers arrive',
+    why: 'a relay that answers and then stops talking holds the syncer open indefinitely',
+    file: 'electron/review/secure/transport.js',
+    find: '    const read = await readBounded(response, MAX_RESPONSE_BYTES, { signal: controller.signal });',
+    replace: '    clearTimeout(timer);\n    const read = await readBounded(response, MAX_RESPONSE_BYTES);',
+    suite: 'test:secureshare',
+    // This one fails by hanging, which is the bug exactly. See runSuite.
+    timeoutMs: 60000,
+  },
+  {
+    name: 'the bounded reader is never told the deadline passed',
+    why: 'a stall is reported as an unreadable answer, which backs off differently and blames the wrong thing',
+    file: 'electron/review/secure/transport.js',
+    find: '  const expired = () => signal?.aborted === true;',
+    replace: '  const expired = () => false;',
+    suite: 'test:secureshare',
+  },
 ];
 
 /** Run one npm suite, quietly. Answers whether it PASSED. */
-function runSuite(script) {
+function runSuite(script, timeoutMs = 600000) {
   const result = spawnSync('npm', ['run', '--silent', script], {
     cwd: root,
     encoding: 'utf8',
     // One lifecycle pass is enough to see whether the accounting is wrong;
     // five would be five times the runtime to learn the same thing.
     env: { ...process.env, STACKI_CANVAS_OFFLINE: '1', STACKI_LIFECYCLE_RUNS: '1' },
-    timeout: 600000,
+    // Some guards fail by HANGING rather than by failing — removing a deadline
+    // is the obvious one — so a case may ask for a shorter leash. The suite it
+    // runs takes a couple of seconds; a minute is twenty times that and still
+    // ten times faster than waiting out the default.
+    timeout: timeoutMs,
   });
   return { passed: result.status === 0, output: `${result.stdout || ''}${result.stderr || ''}` };
 }
@@ -450,7 +508,7 @@ try {
       let broken = before;
       for (const patch of patches) broken = broken.replace(patch.find, patch.replace);
       fs.writeFileSync(file, broken, 'utf8');
-      const { passed } = runSuite(sabotage.suite);
+      const { passed } = runSuite(sabotage.suite, sabotage.timeoutMs);
       const caught = !passed;
       results.push({ ...sabotage, outcome: caught ? 'caught' : 'NOT CAUGHT' });
       if (caught) {
