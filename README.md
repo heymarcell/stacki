@@ -312,12 +312,14 @@ Press **Share…**, then **Create secure share**, and copy the invite link. The
 person you send it to opens it, confirms which local project it belongs to, and
 joins. There is **no account**, no sign-up, no email and no dashboard.
 
-> **The hosted relay is not running yet.** Stacki ships pointing at
-> `relay.stacki.app`, and that address does not answer — nothing has been
-> deployed to it. Until it is, use **Share… → Advanced → Use custom secure
-> relay** and give it a relay of your own; `node relay/node/bin.js` is one
-> command and needs no account. That is the same path self-hosting uses, which
-> is why it is a supported path and not a workaround.
+> **Where the comments go by default.** This fork ships pointing at
+> `stacki-relay.neongod.io`, a hosted Secure Share relay operated by this
+> fork's maintainer. It is not official Stacki infrastructure, and the app does
+> not call it that — it says "Hosted relay". It stores encrypted envelopes and
+> can read none of them, exactly like any other relay.
+>
+> If you would rather not use it: **Share… → Advanced → Use custom secure
+> relay**. `node relay/node/bin.js` is one command and needs no account.
 
 An invite link **works once and expires in seven days**. Anyone holding it can
 read and write that project's comments, so send it the way you would send a

@@ -293,7 +293,7 @@ export function SecureShareDialog({
   // people who can reach it. Showing the preference in Manage, as this dialog
   // once did, told somebody their existing encrypted room had moved to a
   // server it had never been on.
-  const newShareRelayLabel = shared?.newShareRelay?.label || 'Stacki hosted';
+  const newShareRelayLabel = shared?.newShareRelay?.label || 'Hosted relay';
   const currentRelayLabel = shared?.secure?.relay?.label || null;
 
   const relayControls = (
@@ -340,7 +340,7 @@ export function SecureShareDialog({
         </button>
         {shared?.newShareRelay && !shared.newShareRelay.hosted && (
           <button type="button" className="ghost" disabled={busy} onClick={() => onRelay?.({ relay: null })}>
-            Back to Stacki hosted
+            Back to the hosted relay
           </button>
         )}
       </div>
@@ -481,7 +481,7 @@ export function SecureShareDialog({
                 {/* This room's own relay. Not a control: a share cannot be
                     moved, and offering to move it would be offering something
                     that silently means "start again somewhere else". */}
-                <strong>{currentRelayLabel || 'Stacki hosted'}</strong>
+                <strong>{currentRelayLabel || 'Hosted relay'}</strong>
               </div>
               <div className="share-fact">
                 <span>People</span>
@@ -567,7 +567,7 @@ export function SecureShareDialog({
             <Advanced open={advanced} onToggle={() => setAdvanced((v) => !v)}>
               <div className="share-relay-now">
                 <span>This share’s relay</span>
-                <strong>{currentRelayLabel || 'Stacki hosted'}</strong>
+                <strong>{currentRelayLabel || 'Hosted relay'}</strong>
               </div>
               {/* No control here on purpose. A share cannot be moved between
                   relays: the room, its secret and everybody's access belong to
@@ -648,7 +648,7 @@ export function JoinShareDialog({ invite, onJoin, onCancel }) {
                 </div>
                 <div className="share-fact">
                   <span>Relay</span>
-                  <strong>{invite?.relay?.label || 'Stacki hosted'}</strong>
+                  <strong>{invite?.relay?.label || 'Hosted relay'}</strong>
                 </div>
               </div>
 

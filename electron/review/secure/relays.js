@@ -25,7 +25,17 @@ const { relayOrigin, isLoopbackRelay } = require('./capability.js');
 // Stacki's own hosted relay. A subdomain of the product's existing domain
 // rather than a new one, and an address rather than an account: there is
 // nothing to sign up for and no token to find.
-const DEFAULT_RELAY = 'https://relay.stacki.app';
+// THE HOSTED RELAY FOR THIS FORK.
+//
+// Upstream Stacki intends `relay.stacki.app`; this repository is a fork and
+// does not own that domain, so shipping it as the default meant Share… pointed
+// at an address that does not answer. This one is operated by the fork
+// maintainer and is a real service. It is not official Stacki infrastructure,
+// and nothing in the product says it is — see the label below.
+//
+// Self-hosting remains first class: a capability carries its own relay origin,
+// so nothing here is load-bearing for anybody who runs their own.
+const DEFAULT_RELAY = 'https://stacki-relay.neongod.io';
 
 // An escape hatch for development and for a team that has already stood one
 // up and does not want to click through Advanced on every machine.
@@ -50,7 +60,10 @@ function relayFor({ preferred = null, env = process.env } = {}) {
 function describeRelay(origin) {
   const normalized = relayOrigin(origin);
   if (!normalized) return { ok: false, code: 'bad_relay', message: 'That is not an address Stacki can use.' };
-  if (normalized === DEFAULT_RELAY) return { ok: true, hosted: true, origin: normalized, label: 'Stacki hosted' };
+  // "Hosted relay", not "Stacki hosted": this fork's default is run by the
+  // fork's maintainer, and calling it Stacki's would be a claim about who
+  // operates it that is not true.
+  if (normalized === DEFAULT_RELAY) return { ok: true, hosted: true, origin: normalized, label: 'Hosted relay' };
   if (isLoopbackRelay(normalized)) return { ok: true, hosted: false, origin: normalized, label: 'On this computer' };
   return { ok: true, hosted: false, origin: normalized, label: new URL(normalized).host };
 }

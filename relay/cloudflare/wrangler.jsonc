@@ -61,6 +61,29 @@
   // other way round. The ids below are Stacki's own, and staging and
   // production deliberately differ so their counters never meet.
   "env": {
+    // THE HOSTED RELAY FOR THIS FORK.
+    //
+    // Not official Stacki infrastructure. `relay.stacki.app` is the endpoint
+    // upstream intends to run one day; this repository is a fork and does not
+    // own that domain, so it operates its own at a hostname it does control.
+    // Same Worker, same protocol, same limits — a different operator.
+    //
+    //   npx wrangler deploy --env hosted
+    //
+    "hosted": {
+      // A custom domain rather than workers.dev: this is the address the app
+      // ships pointing at, so it has to be one the fork controls.
+      "routes": [{ "pattern": "stacki-relay.neongod.io", "custom_domain": true }],
+      // NOT INHERITED — see the note on staging below.
+      "durable_objects": {
+        "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+      },
+      // A DIFFERENT namespace from staging, so a test run cannot spend the
+      // hosted service's room budget or the other way round.
+      "ratelimits": [
+        { "name": "ROOM_LIMITER", "namespace_id": "770002", "simple": { "limit": 20, "period": 60 } }
+      ]
+    },
     // PUBLIC STAGING, on workers.dev. Production-equivalent in every way that
     // affects behaviour or security; only the hostname and the isolation
     // differ. There is deliberately no STACKI_ALLOW_UNLIMITED_RELAY here.
