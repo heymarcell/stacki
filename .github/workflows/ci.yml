@@ -227,3 +227,53 @@ jobs:
       # proves one layer; this proves they join up.
       - name: a real MCP client, end to end
         run: npm run test:mcpdogfood
+
+  # TEMPORARY. Runs every suite in the `npm test` chain independently and
+  # reports which ones a hosted runner cannot support, in one pass instead of
+  # one CI cycle per discovery. Removed once the set is known.
+  survey:
+    name: survey (temporary)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/electron
+          key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.astro-cache
+          key: ${{ runner.os }}-astro-fixture-v1
+      - run: npm ci
+      - name: Give git an identity to commit as
+        run: |
+          git config --global user.name "Stacki CI"
+          git config --global user.email "ci@stacki.invalid"
+      - name: every suite, independently
+        run: |
+          node -e '
+            const { execSync } = require("child_process");
+            const s = require("./package.json").scripts;
+            const names = s.test.split("&&").map((x) => x.trim().replace("npm run ", "")).filter(Boolean);
+            const bad = [];
+            for (const n of names) {
+              try {
+                execSync(`npm run --silent ${n}`, { stdio: "pipe", timeout: 600000 });
+              } catch (e) {
+                const out = `${e.stdout || ""}${e.stderr || ""}`.trim().split("\n").slice(-6).join(" | ");
+                bad.push(`${n} :: ${out.slice(0, 300)}`);
+                console.log(`FAILED ${n}`);
+              }
+            }
+            console.log("\n===== SUITES A HOSTED RUNNER COULD NOT RUN =====");
+            for (const b of bad) console.log(b);
+            console.log(`===== ${bad.length} of ${names.length} =====`);
+          '
