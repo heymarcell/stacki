@@ -4,10 +4,11 @@
 # `release.yml` only fires on a `v*` tag, so until this existed nothing on
 # GitHub ever ran the suite. Three jobs, split by what they actually need:
 #
-#   core     — the whole suite, on Linux, where 128 of 131 files run
-#   protocol — the encryption, both relays, and the workerd runtime
-#   macos    — the parts that are genuinely about macOS: the packaged bundle,
-#              the built app, and Launch Services
+#   core     — the whole suite, unabridged, on the platform Stacki ships to
+#   protocol — the encryption, both relays, the workerd runtime and the
+#              sabotage campaign, on Linux, where none of it is platform-bound
+#   macos    — the packaged bundle, the built app, Launch Services, the Secure
+#              Share states, and a real MCP client driving the whole system
 #
 # WHAT THIS MUST NOT TOUCH: a real keychain, a real Cloudflare account, Apple
 # signing material, the user's projects, or a real userData directory. Every
@@ -41,16 +42,13 @@ env:
 
 jobs:
   core:
-    name: core suite (linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: core suite (macos)
+    runs-on: macos-latest
+    timeout-minutes: 60
     env:
-      # The three canvas suites install Astro and drive a real dev server. They
-      # are run for real on macOS below, where the rendering this project is
-      # about actually happens; here they would double the job to re-prove the
-      # same thing on a platform Stacki does not ship to yet. Set explicitly and
-      # named, rather than left to a default, so the skip is a decision.
-      STACKI_CANVAS_OFFLINE: '1'
+      # No skips on this job. The canvas suites install Astro once into this
+      # directory and copy from it; the cache means only the first run pays.
+      STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -59,44 +57,34 @@ jobs:
           cache: npm
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/electron
+          path: ~/Library/Caches/electron
           key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
           restore-keys: ${{ runner.os }}-electron-
-      # Electron needs a handful of shared libraries that the runner image does
-      # not carry, and a display. Three of the 131 suites drive the real binary;
-      # the rest load electron/main.js with a stub and need neither.
-      - name: Libraries Electron links against
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
-            libdrm2 libxkbcommon0 libatk-bridge2.0-0 libatk1.0-0 libcups2
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.astro-cache
+          key: ${{ runner.os }}-astro-fixture-v1
       - run: npm ci
-      # CHROMIUM KEEPS ITS SANDBOX.
-      #
-      # Electron ships a setuid helper, `chrome-sandbox`, and refuses to start
-      # unless it is owned by root with mode 4755 — "rather than run without
-      # sandboxing I'm aborting now". npm unpacks it as the runner user, so on
-      # a fresh Linux runner every real-browser harness dies on it.
-      #
-      # The fix everybody reaches for is `--no-sandbox`, which turns the
-      # sandbox off for the whole run. This gives the helper the ownership it
-      # is asking for instead, so the tests run with the same isolation a real
-      # user's Electron has. macOS needs none of this.
-      - name: Let Electron keep its sandbox
-        run: |
-          sudo chown root:root node_modules/electron/dist/chrome-sandbox
-          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
       # Stacki's "start a new site" flow makes the first commit for you, and
       # `git commit` refuses without an identity. A developer's machine has
-      # one; a fresh runner does not, so test/starter.js failed on `git
-      # rev-list HEAD` with nothing to count.
+      # one; a fresh runner does not, so test/starter.js failed on
+      # `git rev-list HEAD` with nothing to count.
       - name: Give git an identity to commit as
         run: |
           git config --global user.name "Stacki CI"
           git config --global user.email "ci@stacki.invalid"
+      # All 131 files, nothing excluded.
+      #
+      # WHY NOT LINUX. It was on ubuntu first, and 130 of the 131 passed there.
+      # The one that did not is test/vars-row-height.js, which opens a real
+      # window and synthesises a mouse drag with `sendInputEvent`; through xvfb
+      # the pointer sequence does not arrive the way a real window server
+      # delivers it, and six of its twenty-three checks fail. The test is
+      # right and the display is the problem — so rather than weaken it or
+      # skip it, the suite runs where Stacki actually ships. Linux keeps the
+      # protocol job below, which is platform-independent by construction.
       - name: npm test
-        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm test
+        run: npm test
 
   protocol:
     name: secure protocol + cloudflare (linux)
@@ -216,12 +204,6 @@ jobs:
       # asserts the DOM it is about to photograph.
       - name: the Secure Share states
         run: npm run test:secureshareui
-
-      # The Agent API against a page that genuinely rendered: computed styles
-      # from an engine, classes from a page that ran, captures that are
-      # photographs.
-      - name: the agent, against a real canvas
-        run: npm run test:agentcanvas
 
       # THE SEAM. A person comments in Stacki, a real MCP client finds that
       # comment, is handed the exact object it is anchored to, changes it,
