@@ -1,0 +1,65 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stacki-secure-relay",
+  "main": "src/worker.js",
+  // Durable Objects with SQLite storage need a recent compatibility date; this
+  // one is well past the 2024-04-03 that RPC methods require.
+  "compatibility_date": "2025-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+  },
+  // new_sqlite_classes, not new_classes: the room keeps its state in the
+  // object's own SQLite database, which is what makes a cursor a WHERE clause.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+
+  // The landing page is imported as text. A Worker has no filesystem to read
+  // it from at runtime, and this keeps one copy of the page for both relays.
+  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
+
+  // Deliberate rather than default, and narrower than the default.
+  //
+  // `logs.invocation_logs` is what records a line for every request — method,
+  // URL, status, timing — and for this relay that is a per-room, per-member
+  // access log nobody asked for. It is switched OFF. What stays on is the
+  // Worker's own output, which is a handful of coarse codes and never a
+  // credential, a capability, a ciphertext or a URL; see §19 of
+  // docs/secure-reviews-protocol.md for the full list.
+  //
+  // Cloudflare's own infrastructure still sees what any reverse proxy sees —
+  // the connecting address, the timing, the size. That is stated in the threat
+  // model rather than wished away.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false
+    }
+  },
+
+  // ROOM CREATION IS REFUSED UNLESS SOMETHING HERE PERMITS IT.
+  //
+  // There is deliberately no rate limiter and no opt-out at this level, which
+  // means a plain `wrangler deploy` of this file produces a relay that will
+  // not create rooms. That is the intended failure: a deployment missing its
+  // abuse protection should be useless, not generous.
+  //
+  // A PUBLIC deployment uncomments this and gives it a namespace id:
+  //
+  // "ratelimits": [
+  //   { "name": "ROOM_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
+  // ]
+  //
+  // Local development opts out explicitly instead, in an environment that is
+  // never what `wrangler deploy` publishes by default:
+  "env": {
+    "development": {
+      "vars": {
+        // Unlimited room creation, on purpose, on somebody's own machine.
+        "STACKI_ALLOW_UNLIMITED_RELAY": "1"
+      }
+    }
+  }
+}

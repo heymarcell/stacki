@@ -327,6 +327,188 @@ if (fs.existsSync(serviceDir)) {
   }
 }
 
+// ── The relays are NOT the app, and one shared file is ──────────────────────
+//
+// `relay/` holds two programs somebody runs somewhere else — a Node server with
+// a database, and a Cloudflare Worker with Wrangler and a Vitest toolchain in
+// its own package.json. None of that belongs inside a desktop application, and
+// the Cloudflare half in particular would drag a deployment CLI into every
+// install of Stacki.
+//
+// Exactly ONE file crosses: `relay/protocol.js`, the envelope format. It is
+// shared rather than duplicated because three implementations of "is this
+// envelope well formed" is three different answers, and the two that are wrong
+// are a client whose comments a relay silently drops and a relay that stores
+// whatever it is handed.
+
+const relayDir = path.join(root, 'relay');
+if (fs.existsSync(relayDir)) {
+  check('the shared envelope format is packaged', files.includes('relay/protocol.js'), JSON.stringify(files));
+  check(
+    'the Node relay is not packaged',
+    !files.some((f) => f.startsWith('relay/node')),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check(
+    'the Cloudflare Worker is not packaged',
+    !files.some((f) => f.startsWith('relay/cloudflare')),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check(
+    'no relay directory is packaged wholesale',
+    !files.some((f) => /^relay\/(\*|\*\*)/.test(f) || f === 'relay' || f === 'relay/**/*'),
+    JSON.stringify(files.filter((f) => f.includes('relay')))
+  );
+  check('no relay file is unpacked beside the archive', !unpacked.some((f) => f.startsWith('relay')), JSON.stringify(unpacked));
+
+  // Cloudflare's toolchain lives in its own package.json and must not leak
+  // into the app's. Wrangler in `dependencies` would be shipped; in
+  // `devDependencies` it would still be somebody's mistake waiting to happen.
+  for (const name of ['wrangler', '@cloudflare/vitest-plugin', '@cloudflare/vitest-pool-workers', '@cloudflare/workers-types', 'miniflare', 'vitest']) {
+    check(`${name} is not a dependency of the app`, !deps[name], 'Cloudflare tooling has its own package.json in relay/cloudflare');
+    check(`${name} is not a dev dependency of the app either`, !devDeps[name], 'it belongs to relay/cloudflare, not to Stacki');
+  }
+  const cfPkg = path.join(relayDir, 'cloudflare', 'package.json');
+  if (fs.existsSync(cfPkg)) {
+    const cf = JSON.parse(fs.readFileSync(cfPkg, 'utf8'));
+    check('the Cloudflare package keeps its own tooling', !!(cf.devDependencies || {}).wrangler, JSON.stringify(cf.devDependencies));
+    check('and is marked private so it is never published', cf.private === true);
+    check('and has no runtime dependencies at all', Object.keys(cf.dependencies || {}).length === 0, JSON.stringify(cf.dependencies));
+  }
+  // A deployment config with credentials in it would be a secret in the repo
+  // and, if the glob ever widened, a secret in the shipped app.
+  const wrangler = path.join(relayDir, 'cloudflare', 'wrangler.jsonc');
+  if (fs.existsSync(wrangler)) {
+    const text = fs.readFileSync(wrangler, 'utf8');
+    check('the Cloudflare config carries no account id', !/account_id/.test(text), 'deployment credentials do not belong in the repository');
+    check('nor an API token', !/api_token|CLOUDFLARE_API/.test(text));
+    check('nor a production route', !/"routes"|"route"/.test(text), 'routes are attached at deploy time, deliberately');
+  }
+  // No relay database, ever, anywhere near the build.
+  for (const stray of ['relay.db', 'relay.db-wal', 'relay.db-shm']) {
+    check(`no ${stray} is committed`, !fs.existsSync(path.join(relayDir, 'node', stray)));
+  }
+
+  // THE RELAY CANNOT READ A REVIEW, and this is the check that says so about
+  // the code rather than about the intention: neither implementation imports
+  // Stacki's event model. A relay that could parse a review event is a relay
+  // that could be asked to.
+  const relayFiles = [];
+  const walkRelay = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.wrangler') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walkRelay(full);
+      else if (/\.(js|mjs|jsx)$/.test(entry.name)) relayFiles.push(full);
+    }
+  };
+  walkRelay(relayDir);
+  check('there is a relay to check', relayFiles.length >= 4, `${relayFiles.length} files`);
+  for (const file of relayFiles) {
+    const text = fs.readFileSync(file, 'utf8');
+    const where = path.relative(root, file);
+    // An IMPORT, not a mention: these files explain in their own comments why
+    // they must not do this, and a grep for the path alone would flag the
+    // explanation.
+    check(
+      `${where} does not import Stacki's review events`,
+      !/(?:require\(\s*|from\s+)['"][^'"]*review\/events/.test(text),
+      'a relay that can parse a review event is a relay that could be asked to'
+    );
+    check(
+      `${where} does not reach into electron/`,
+      !/require\(\s*['"][^'"]*electron\//.test(text) && !/from\s+['"][^'"]*electron\//.test(text),
+      'the relay runs on machines that have never had Stacki installed'
+    );
+  }
+
+  // The shared file has to run in Node AND in a Worker, so it may require
+  // nothing at all.
+  const protocol = path.join(relayDir, 'protocol.js');
+  check('the shared envelope format exists', fs.existsSync(protocol));
+  if (fs.existsSync(protocol)) {
+    const text = fs.readFileSync(protocol, 'utf8');
+    check('the shared envelope format requires nothing', !/\brequire\(/.test(text), 'it runs unchanged in Node and in workerd');
+    check('and imports nothing', !/^\s*import\s/m.test(text));
+    check('and knows nothing about review events', !/thread|actorKind|lamport/.test(text));
+  }
+}
+
+// ── A plain deploy of the committed relay config is the safe one ────────────
+//
+// A relay with no limiter creates rooms for anybody who can reach it, forever.
+// So the shape `wrangler deploy` publishes by default must be the refusing
+// one, and the opt-out must live somewhere a default deploy does not reach.
+// Read from the file, because this is a claim about what is committed.
+
+const wranglerPath = path.join(root, 'relay', 'cloudflare', 'wrangler.jsonc');
+if (fs.existsSync(wranglerPath)) {
+  const raw = fs.readFileSync(wranglerPath, 'utf8');
+  // JSONC: whole-line comments only, which is all this file uses.
+  const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ''));
+  check('the deployed level binds no rate limiter', config.ratelimits === undefined, JSON.stringify(config.ratelimits));
+  check(
+    'and does not opt out of the abuse guard',
+    config.vars?.STACKI_ALLOW_UNLIMITED_RELAY === undefined,
+    JSON.stringify(config.vars)
+  );
+  check(
+    'so the opt-out exists only in an environment a default deploy does not publish',
+    config.env?.development?.vars?.STACKI_ALLOW_UNLIMITED_RELAY === '1',
+    JSON.stringify(config.env)
+  );
+  // And the flag that used to make protection opt-IN is gone entirely.
+  check('the old opt-in flag is not consulted any more', !/STACKI_OFFICIAL_RELAY/.test(fs.readFileSync(path.join(root, 'relay', 'cloudflare', 'src', 'worker.js'), 'utf8')));
+}
+
+// ── The bundle has to tell the operating system about the scheme ────────────
+//
+// A runtime `setAsDefaultProtocolClient` call cannot make an unlaunched bundle
+// reachable: Launch Services routes a URL scheme by what the BUNDLE declares.
+// Without this the packaged app received nothing at all, and clicking an
+// invitation did nothing and reported nothing. test/packaged-deeplink.js proves
+// the round trip against a built app; this is the fast check that the
+// configuration which makes it possible is still there.
+
+const protocols = Array.isArray(pkg.build?.protocols) ? pkg.build.protocols : pkg.build?.protocols ? [pkg.build.protocols] : [];
+check('the build declares a URL protocol', protocols.length > 0, JSON.stringify(pkg.build?.protocols));
+const joinProtocol = protocols.find((p) => (Array.isArray(p.schemes) ? p.schemes : []).includes('stacki'));
+check('and it is the stacki scheme', !!joinProtocol, JSON.stringify(protocols));
+check('with a name a person could recognise', typeof joinProtocol?.name === 'string' && joinProtocol.name.length > 3, joinProtocol?.name);
+// One scheme, because this app answers for exactly one thing.
+const declaredSchemes = protocols.flatMap((p) => (Array.isArray(p.schemes) ? p.schemes : []));
+check('and it is the only scheme claimed', declaredSchemes.length === 1, JSON.stringify(declaredSchemes));
+
+// ── The join link is a join link ────────────────────────────────────────────
+//
+// `stacki://join#…` is the one thing the custom protocol does, and the danger
+// with a URL handler is not that it is wrong today — it is that somebody adds
+// a second action to it later, and a link from a web page becomes a way to run
+// something. So the handler's body is read, and it may not mention any of the
+// verbs that would make it one.
+
+const mainText = fs.readFileSync(path.join(root, 'electron', 'main.js'), 'utf8');
+const handler = /function handleJoinUrl\(url\) \{[\s\S]*?\n\}/.exec(mainText);
+check('the join link handler is where the test expects it', !!handler, 'if this moved, this check needs to move with it');
+if (handler) {
+  const body = handler[0];
+  for (const [what, pattern] of [
+    ['spawn a process', /\bspawn\b|\bexec\b|execFile|child_process/],
+    ['open a file', /readFile|writeFile|createReadStream|shell\.openPath/],
+    ['open an external URL', /shell\.openExternal/],
+    ['run git', /\bgit\b/],
+    ['reach MCP', /\bmcp\b/i],
+    ['evaluate anything', /executeJavaScript|\beval\(|new Function/],
+    ['load a URL into the window', /loadURL|loadFile/],
+  ]) {
+    check(`the join link handler cannot ${what}`, !pattern.test(body), body.slice(0, 200));
+  }
+  check('and its only effect is to offer the invitation to a person', /reviews\.offerInvite\(/.test(body), body.slice(0, 200));
+}
+// Nothing else in the main process may claim the scheme for another purpose.
+const schemeUses = [...mainText.matchAll(/setAsDefaultProtocolClient\(([^)]*)\)/g)].map((m) => m[1]);
+check('the app claims exactly one custom scheme', schemeUses.length >= 1 && schemeUses.every((u) => u.includes('JOIN_SCHEME')), JSON.stringify(schemeUses));
+
 // ── The archive contains the app ────────────────────────────────────────────
 
 check('the main process is packaged', files.includes('electron/**/*'), JSON.stringify(files));

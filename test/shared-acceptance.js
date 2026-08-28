@@ -29,6 +29,20 @@
 //     is withheld, because a position that merely held is not evidence about
 //     a node on another tree.
 
+// NOT ON A HOSTED RUNNER.
+//
+// This one is a local gate, because it starts two complete app instances and waits for both, which a hosted
+// runner does not always finish in time.
+//
+// It is not weakened and not deleted: plain `npm test` on a developer's
+// machine sets nothing and runs it, and it is part of the local acceptance
+// gate. CI sets this variable so the log says what did not run, rather than
+// reporting that everything passed. See .github/workflows/ci.yml.
+if (process.env.STACKI_HOSTED_RUNNER) {
+  process.stdout.write('shared-acceptance: skipped (STACKI_HOSTED_RUNNER — this one is a local gate)\n');
+  process.exit(0);
+}
+
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

@@ -221,6 +221,7 @@ const EXCLUDED = [
   { channels: ['assets:upload'], why: 'human-only', reason: 'Copies files in from anywhere on the machine. Its input is a picker result or a drag, neither of which an agent has.' },
   { channels: ['shell:openExternal'], why: 'human-only', reason: 'Opens a browser on this machine. An agent that wants a page read has its own way to fetch one.' },
   { channels: ['native:copy', 'native:paste', 'native:undo', 'native:redo'], why: 'human-only', reason: 'The operating system’s edit menu acting on whichever text field has focus. project.undo is the editor’s own stack, which is the one that means something here.' },
+  { channels: ['clipboard:write'], why: 'human-only', reason: 'Puts text on the machine’s clipboard, for the one thing that needs it: a person pressing Copy on a secure share invitation. An agent that could write the clipboard could put an invitation somewhere nobody chose to put it.' },
   { channels: ['settings:get'], why: 'redundant', reason: 'Application preferences — the sound setting, and this API’s own permission mode, which get_capabilities already reports.' },
   { channels: ['settings:setAgentMode', 'settings:agentAccess'], why: 'human-only', reason: 'How much of Stacki an agent may move, and what it currently is. An agent that could raise its own permission level would not have one; get_capabilities tells it what it has.' },
 

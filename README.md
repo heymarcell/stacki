@@ -293,31 +293,82 @@ makes no network request of any kind — not a check, not a ping. Review comment
 are candid by nature, and that guarantee is the whole privacy model.
 
 Sharing is **asynchronous, not live**. Stacki catches up when you open a shared
-project, when you press **Sync**, and — quietly, at most once a minute — when
-you come back to the window. There are no live cursors, no presence, no typing
-indicators and no socket. A comment is written in minutes and read in hours;
-streaming it would buy nothing and cost a permanent connection.
+project, when something changes, and when you come back to the window. There are
+no live cursors, no presence and no typing indicators. A comment is written in
+minutes and read in hours; streaming it would buy nothing and cost a permanent
+connection. A healthy share needs no Sync button — one that does is one that is
+not working, and it says so.
 
-### A workspace
+### Secure Share
 
-A **workspace** is the thing comments are shared through. It has a random id, a
-name, and the people who have been invited into it — and it is a thing you
-create, never something Stacki discovers. A matching git remote will say *"this
-repository may already have a workspace"*; it will never join one. A public
-clone must not be a key to somebody's private comments.
+Sharing is **end-to-end encrypted**. Each review event is encrypted on your
+machine before it leaves it, and the relay that carries it stores opaque
+ciphertext — it cannot read your comments, the source paths they point at, the
+branch you were on, or anybody's name.
 
-Stacki has **no cloud**. Run the reference service yourself:
+    Comments are private to this Mac.                          Share…
+
+Press **Share…**, then **Create secure share**, and copy the invite link. The
+person you send it to opens it, confirms which local project it belongs to, and
+joins. There is **no account**, no sign-up, no email and no dashboard.
+
+An invite link **works once and expires in seven days**. Anyone holding it can
+read and write that project's comments, so send it the way you would send a
+password. Everything sensitive in the link is after the `#`, which is the one
+part of a URL a browser never sends to a server.
+
+**Your comments are always yours.** Leaving a share, ending one, or losing
+access to the relay never removes a comment from your machine. Written with no
+network, they are saved locally and sent when you are connected again — Stacki
+notices that on its own, with no click. Leaving needs the relay to confirm it:
+offline, Stacki says so rather than telling you it revoked something it could
+not reach.
+
+**A share stays on the relay it was created on.** There is no migration —
+changing relay means ending the share and creating a new one, which is a new
+room and a new key. Manage always shows the relay that share actually uses.
+
+**Self-hosting is first class.** Run a relay of your own:
+
+```
+node relay/node/bin.js
+```
+
+and point Stacki at it under **Share… → Advanced**. Nothing about the protocol
+depends on Stacki's hosted relay, on Cloudflare, or on any account — a relay
+that is not on your own computer just has to use https, so your invitation and
+your comments are never sent in the clear.
+
+What Secure Share deliberately does **not** claim: that nothing is stored
+(encrypted envelopes are stored, which is how somebody reads on Friday what you
+wrote on Monday), that it is anonymous (a relay sees an address, like every
+server), or that ending a share takes back copies people already have.
+[`docs/secure-reviews-protocol.md`](docs/secure-reviews-protocol.md) is the full
+threat model and the protocol itself, written so somebody else could implement
+it.
+
+### The older plaintext service
+
+Shares created before Secure Share existed keep working exactly as they did,
+through the small service you run yourself:
 
 ```
 npm run reviews:serve
 ```
 
-It prints its address and a signup token. Paste both into **Comments → Share…**
-to start a workspace; everybody else joins with a one-use invitation you send
-them. The service stores review events and the minimum needed to know who may
-read them — never your source, never a screenshot, never a path on your disk.
-Credentials live in Stacki's own application-support directory and are never
-written into your project, your git config or your repository.
+It prints its address and a signup token, which go into the same dialog. That
+service stores review events in the clear, which is why new shares no longer
+use it. Nothing is migrated automatically and nothing is uploaded by surprise.
+
+In either case a **workspace is a thing you create, never something Stacki
+discovers**. A matching git remote will say *"this repository may already have a
+workspace"*; it will never join one. A public clone must not be a key to
+somebody's private comments. Credentials live in Stacki's own
+application-support directory and are never written into your project, your git
+config or your repository. They are encrypted with your operating system's own
+key store where there genuinely is one — macOS Keychain, Windows DPAPI, a Linux
+keyring — and where there is not, Stacki keeps them in a `0600` file and says
+so rather than describing them as encrypted.
 
 Turning sharing off keeps every comment. It only stops this computer talking to
 the workspace.
@@ -535,7 +586,7 @@ projects, and the endpoint does not.
 - Node.js 18+ and npm (the app shells out to `npm install` / `astro dev` for opened projects)
 - `git` for version control features
 - [GitHub CLI](https://cli.github.com) (`gh`), authenticated via `gh auth login`, for "Publish to GitHub"
-- Node.js 22.5+ to run the reference Shared Reviews service (`npm run reviews:serve`); it uses node's built-in SQLite and is not part of the desktop app
+- Node.js 22.5+ to run a relay of your own (`node relay/node/bin.js`) or the older plaintext service (`npm run reviews:serve`); both use node's built-in SQLite and neither is part of the desktop app
 
 ## How editing works
 

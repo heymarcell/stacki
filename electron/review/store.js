@@ -363,6 +363,12 @@ const EMPTY_SHARED = () => ({
   // Threads that existed before sharing was turned on and were deliberately
   // NOT published. Their events never leave this machine.
   excluded: [],
+  // The last share this ledger belonged to, and which threads it was keeping
+  // back from it. Kept when sharing is turned off so that turning it back ON
+  // FOR THE SAME SHARE restores the decision that was already made — see
+  // enableShared. Not a credential and not a secret: two ids and a list of
+  // thread ids that are already in this file.
+  lastShared: null,
 });
 
 /**
@@ -483,6 +489,15 @@ function loadFile(file, { human = null } = {}) {
         ? { kind: str(rawShared.problem.kind, 60) || 'unknown', detail: str(rawShared.problem.detail, 300) }
         : null,
     pending: (Array.isArray(rawShared.pending) ? rawShared.pending : []).map((v) => str(v, 100)).filter(Boolean),
+    lastShared:
+      rawShared.lastShared && typeof rawShared.lastShared === 'object' && str(rawShared.lastShared.workspaceId, 100)
+        ? {
+            workspaceId: str(rawShared.lastShared.workspaceId, 100),
+            excluded: (Array.isArray(rawShared.lastShared.excluded) ? rawShared.lastShared.excluded : [])
+              .map((v) => str(v, 100))
+              .filter(Boolean),
+          }
+        : null,
     excluded: (Array.isArray(rawShared.excluded) ? rawShared.excluded : []).map((v) => str(v, 100)).filter(Boolean),
   };
 
@@ -1279,10 +1294,27 @@ function createReviewStore({
     const wanted = str(workspaceId, 100);
     if (!wanted) return fail('no_workspace', 'A workspace id is required.');
     const existing = threads.map((t) => t.id);
+    // COMING BACK TO A SHARE THIS LEDGER WAS ALREADY IN.
+    //
+    // `excluded` means "comments that were here before sharing was turned on
+    // and were deliberately kept back". Rebuilding it from every thread that
+    // exists now is right the FIRST time and wrong on a rejoin: by then most
+    // of those threads arrived from the share itself, and marking them private
+    // would mean replies to them silently stopped being sent — the thread
+    // would still be on screen, still look shared, and quietly not be.
+    //
+    // So a return to the same share restores the decision that was already
+    // made, and only a genuinely new share asks the question again.
+    const returning = shared.lastShared && shared.lastShared.workspaceId === wanted;
+    const keptBack = returning
+      ? (shared.lastShared.excluded || []).filter((id) => existing.includes(id))
+      : publishExisting
+        ? []
+        : existing;
     shared = {
       ...EMPTY_SHARED(),
       workspaceId: wanted,
-      excluded: publishExisting ? [] : existing,
+      excluded: keptBack,
     };
     // Everything not excluded goes into the outbox, in ledger order, so a
     // publish is an ordinary sync rather than a special upload path.
@@ -1302,7 +1334,12 @@ function createReviewStore({
    */
   function disableShared() {
     if (!writable) return readOnly();
-    shared = EMPTY_SHARED();
+    // What this ledger was sharing with, and what it was keeping back, so that
+    // rejoining the same share does not re-ask a question already answered.
+    const lastShared = shared.workspaceId
+      ? { workspaceId: shared.workspaceId, excluded: [...shared.excluded] }
+      : shared.lastShared;
+    shared = { ...EMPTY_SHARED(), lastShared: lastShared || null };
     const saved = changed();
     if (!saved.ok) return saved;
     return { ok: true, shared: sharedState() };

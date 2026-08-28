@@ -1907,6 +1907,34 @@ contextBridge.exposeInMainWorld('avb', {
   reviewsSharedJoin: invoke('reviews:sharedJoin'),
   reviewsSharedDisable: invoke('reviews:sharedDisable'),
   reviewsSharedInvite: invoke('reviews:sharedInvite'),
+  // Secure Share. The same rule as above and it matters more: nothing here is
+  // reachable from MCP or the Agent API, because the thing behind these verbs
+  // is a decryption key rather than a workspace membership.
+  //
+  // WHAT COMES BACK ACROSS THIS BRIDGE, and it is worth being exact: whether
+  // sharing is on, which relay it points at, whether this machine may end it,
+  // how many people are in it, the names of the ones who have written
+  // something, and — once, at the moment somebody clicks Copy — an invitation
+  // they asked for. What never comes back: the room id, the room secret, the
+  // member token, or any signing key. There is a test that walks every object
+  // this returns looking for them.
+  writeClipboard: invoke('clipboard:write'),
+  reviewsSecureEnable: invoke('reviews:secureEnable'),
+  reviewsSecureInvite: invoke('reviews:secureInvite'),
+  reviewsSecureJoin: invoke('reviews:secureJoin'),
+  reviewsSecureCancelJoin: invoke('reviews:secureCancelJoin'),
+  reviewsSecureLeave: invoke('reviews:secureLeave'),
+  reviewsSecureEnd: invoke('reviews:secureEnd'),
+  reviewsSecureRelay: invoke('reviews:secureRelay'),
+  // An invitation arrived from the operating system and a person is being
+  // asked about it. The capability itself stays in the main process — what
+  // arrives here is what the dialog needs to draw.
+  onReviewInvite: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('reviews:invite', listener);
+    return () => ipcRenderer.removeListener('reviews:invite', listener);
+  },
+  reviewsVisibility: invoke('reviews:visibility'),
   reviewsIdentity: invoke('reviews:identity'),
   reviewsSetIdentity: invoke('reviews:setIdentity'),
   onReviewsChanged: (cb) => {

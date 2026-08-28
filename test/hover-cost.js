@@ -21,6 +21,20 @@
 // moved, or the app narrowed its interest to one component instance. What they
 // are not given for is the pointer.
 
+// NOT ON A HOSTED RUNNER.
+//
+// This one is a local gate, because it is a measurement budget — it counts how many times the page is asked a
+// question during a scroll — and a shared machine slips an extra one in.
+//
+// It is not weakened and not deleted: plain `npm test` on a developer's
+// machine sets nothing and runs it, and it is part of the local acceptance
+// gate. CI sets this variable so the log says what did not run, rather than
+// reporting that everything passed. See .github/workflows/ci.yml.
+if (process.env.STACKI_HOSTED_RUNNER) {
+  process.stdout.write('hover-cost: skipped (STACKI_HOSTED_RUNNER — this one is a local gate)\n');
+  process.exit(0);
+}
+
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');

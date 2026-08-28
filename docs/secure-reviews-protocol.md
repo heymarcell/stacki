@@ -1,0 +1,821 @@
+# Stacki Secure Share — protocol and threat model
+
+Version 2 of Stacki's shared review transport. This document is the
+specification: an independent implementation that follows it, and reproduces
+the test vectors at the end, will interoperate with Stacki and with both relays
+in this repository.
+
+Secure Share replaces nothing in Stacki's review model. The events, their
+ordering, their projection and their authorship rules are exactly what
+`electron/review/events.js` already defines and are documented in
+[shared-reviews.md](./shared-reviews.md). This document is only about how those
+events get from one laptop to another without the machine in the middle being
+able to read them.
+
+---
+
+## 1. The one paragraph version
+
+Stacki keeps review comments in a local append-only event ledger. Secure Share
+encrypts each event on the client, signs it, and hands the result to a small
+relay that stores opaque ciphertext. The relay assigns each envelope a sequence
+number and serves them back after a cursor. Clients decrypt, verify, and union
+the events into their own ledger, which stays authoritative. A WebSocket tells
+clients when there is something new; it is an optimisation and correctness does
+not depend on it.
+
+---
+
+## 2. Security goals
+
+Secure Share is designed to hold these properties against a relay operator who
+reads their own database, a network attacker, and a room member who is not
+supposed to be able to speak as somebody else.
+
+| # | Goal |
+|---|---|
+| G1 | The relay cannot read review content, source paths, provenance, or actor names. |
+| G2 | A database dump yields ciphertext, sizes and timings, and nothing else about a review. |
+| G3 | The relay never receives the room master secret in any form. |
+| G4 | A modified envelope fails closed on the recipient, not silently. |
+| G5 | An envelope cannot be moved between rooms. |
+| G6 | A member cannot submit a `human` event attributed to another person. |
+| G7 | A relay cannot correlate one person across two rooms through the identifiers it holds. |
+| G8 | An invitation works once and expires. |
+| G9 | No secret is written into the user's project, repository or working tree. |
+| G10 | Secure Share works completely against a self-hosted relay with no Stacki account. |
+
+## 3. Non-goals
+
+Stated plainly, because a security claim that is not bounded is not a claim.
+
+- **An authorised collaborator copying plaintext.** Anybody in the room can
+  read the room. That is what being in the room means. Screenshots, exports and
+  memory are all outside this design.
+- **Relay availability.** The relay can drop, delay or refuse. It cannot read,
+  and it cannot forge, but it can be unhelpful. Clients keep working offline.
+- **A compromised endpoint.** Malware on a member's laptop has the room secret,
+  because that member's Stacki has it.
+- **Cryptographic forgetting.** A member who has held the room secret cannot be
+  made to forget it. See [§13, Revocation](#13-revocation-and-what-leaving-actually-does).
+- **Anonymity.** The relay sees IP addresses, request timing and ciphertext
+  sizes, like any server. Secure Share is confidential, not anonymous.
+- **A malicious relay colluding with a malicious member.** Outside the V1 trust
+  model. The honest-relay properties above are what is claimed.
+- **A malicious browser extension on the share landing page.** The page is
+  minimal and third-party-free, but it runs in the recipient's browser.
+
+The user-facing claim that is true:
+
+> Stacki's relay cannot read your review content.
+
+Claims that are **not** made anywhere in the product: "Stacki knows nothing
+about you", "nothing is stored", "your reviews are anonymous".
+
+---
+
+## 4. What the relay sees, and what it does not
+
+### The relay may know
+
+- the room ID (random, 128 bits, client-chosen)
+- a room-scoped sender ID per member (an HMAC; see §7)
+- a room-specific Ed25519 public key per member
+- the number of members, invitations and envelopes
+- ciphertext bytes, nonce, signature, and the size of each
+- a sequence cursor and a received-at timestamp per envelope
+- connection IP and request timing, at the level any HTTP server does
+
+### The relay must never receive
+
+Review text · source paths · selection trails · anchors · anchor confidence ·
+provenance · branch names · commit SHAs · git remotes · project names ·
+repository names · actor display names · Stacki actor IDs · agent responses ·
+review status · review targets · **the room master secret** · **any member's
+private signing key**.
+
+Note what is absent from the "may know" list that the legacy plaintext service
+does know: the project name, the git remote, and every actor's real ID and
+display name. Secure Share removes all three from the wire.
+
+---
+
+## 5. Roles and lifecycle
+
+There is **one** privileged role and it exists because ending a shared review
+has to be possible: the **owner** is whoever created the room. Everything else
+is a member. There is no roles system, no permissions matrix, and no directory
+of people.
+
+```
+create room ──> invite ──> join ──> push/pull ──┬──> leave        (that member)
+                                                └──> end room     (owner only)
+```
+
+- **Room** — created by a client, exists until the owner ends it or it is swept
+  for inactivity. Ending deletes all relay state for it.
+- **Member** — joins by redeeming an invitation, holds a bearer token, is bound
+  to one sender ID and one public key for the life of the room.
+- **Invitation** — single use, expires (7 days by default), stored server-side
+  only as a hash.
+
+---
+
+## 6. Key derivation
+
+The room master secret is **32 cryptographically random bytes**, generated on
+the creating client. It is never sent to a relay.
+
+All keys come from HKDF-SHA-256:
+
+```
+salt = UTF8("stacki-secure-review/v2/hkdf")
+ikm  = room master secret (32 bytes)
+info = UTF8("stacki-secure-review/v2/" + purpose + "/" + roomId)
+L    = 32 bytes
+```
+
+Three purposes, and no key is ever used for two of them:
+
+| purpose | constant | used for |
+|---|---|---|
+| `content` | `K_CONTENT` | AES-256-GCM key for review events |
+| `sender-id` | `K_SENDER_ID` | HMAC key naming members in this room |
+| `envelope-id` | `K_ENVELOPE_ID` | HMAC key naming events in this room |
+
+Every derivation is bound to the protocol version and the room ID, so a key is
+useless outside the room and version it was made for.
+
+---
+
+## 7. Room-scoped sender identifier
+
+```
+senderId = base64url( HMAC-SHA-256( K_SENDER_ID, UTF8(actorId) ) )
+```
+
+`actorId` is the Stacki actor UUID of the **human** member. The relay never
+receives it.
+
+Properties: deterministic within a room, so a member's envelopes all carry one
+sender ID and peers can pin a signing key to it; unrelated across rooms, so a
+relay holding two rooms cannot tell they contain the same person; one-way, so
+the relay cannot recover the actor ID.
+
+---
+
+## 8. Opaque envelope identifier
+
+```
+envelopeId = base64url( HMAC-SHA-256( K_ENVELOPE_ID, UTF8(event.id) ) )
+```
+
+Stable for one event in one room, which gives idempotent retry — a push that
+succeeded and lost its answer lands on the same identifier and is deduplicated.
+Different across rooms, so the same comment shared twice does not announce
+itself as the same comment.
+
+The relay deduplicates on `envelopeId`, uniquely per room.
+
+---
+
+## 9. Encryption
+
+AES-256-GCM under `K_CONTENT`.
+
+- **Plaintext**: `UTF8(JSON.stringify(event))`, the ordinary Stacki review
+  event, after it has passed Stacki's own validator.
+- **Nonce**: 12 fresh cryptographically random bytes per encryption operation.
+  Never derived, never counted, never reused. Test vectors inject a fixed nonce;
+  production has no code path that does.
+- **Ciphertext on the wire**: GCM output with the 16-byte tag appended, so
+  there is one value and no second field anybody can forget to authenticate.
+- **Associated data**: binds the routing context, so a relay cannot re-file an
+  envelope under a different room, sender or identifier without decryption
+  failing.
+
+```
+AAD = LP( "stacki-secure-review/aad", "2", roomId, envelopeId, senderId )
+```
+
+`LP` is the canonical length-prefixed encoding of §11.
+
+---
+
+## 10. Signatures
+
+Every member holds a **room-specific** Ed25519 keypair, generated locally at
+create or join. Not one key per installation — a stable signing identity across
+rooms would hand a relay operator exactly the correlation the derived sender ID
+exists to prevent.
+
+The private key never leaves the machine. The public key is given to the relay
+and served to other members, who pin it (§12).
+
+```
+signed bytes = LP( "stacki-secure-review/envelope", "2",
+                   roomId, envelopeId, senderId, nonce, ciphertext )
+```
+
+`nonce` is its base64url text; `ciphertext` is the raw bytes.
+
+The relay verifies before storing. **The recipient verifies again**, and that
+second check is the one that matters — it does not require trusting the relay.
+
+---
+
+## 11. Canonical encoding
+
+One encoding, used for both the AAD and the signed bytes:
+
+```
+LP(parts) = for each part: uint32be(byteLength(part)) || part
+```
+
+Strings are UTF-8. There is no canonical-JSON subsystem, deliberately: length
+prefixing five known fields is unambiguous, and a JSON canonicaliser is a pile
+of edge cases none of this needs.
+
+All binary values crossing a JSON boundary are **base64url with no padding**,
+and decoding is strict — the text is decoded, re-encoded and compared, so one
+value has exactly one encoding.
+
+| field | bytes |
+|---|---|
+| room ID | 16 |
+| sender ID | 32 |
+| envelope ID | 32 |
+| nonce | 12 |
+| signature | 64 |
+| public key | 32 |
+| room master secret | 32 |
+| member token / invitation | 32 |
+
+---
+
+## 12. Verifying a received envelope
+
+In this order, and it fails closed at every step:
+
+1. **Shape** — exactly the six envelope fields, correct version, correct
+   lengths, ciphertext within bounds.
+2. **Pinned key** — the sender's public key, as first observed for this room.
+   A public key that differs from the pin for a known sender ID is **rejected**,
+   never silently accepted. This is the whole of the key-substitution defence,
+   and it is deliberately not a PKI.
+3. **Signature** — verified against the pinned key over the §10 bytes. Checked
+   before decryption, so an unsignable envelope cannot cost a decryption pass.
+4. **Decryption** — AES-256-GCM with the §9 AAD.
+5. **Validation** — the decrypted JSON goes through Stacki's *own* event
+   validator (`reviveEvent`), the same function the local ledger folds with.
+6. **Envelope binding** — `envelopeId` must equal `HMAC(K_ENVELOPE_ID, event.id)`
+   for the event that came out. An envelope claiming to be one event and
+   containing another is refused.
+7. **Human authorship** — if `event.actorKind === "human"`, then
+   `HMAC(K_SENDER_ID, event.actorId)` must equal the envelope's `senderId`.
+
+Only after all seven does the event reach the union/fold. A failure at any step
+discards that envelope; it is never partially projected.
+
+### Agent events
+
+Step 7 applies to human events only. A member may submit an event whose inner
+`actorKind` is `agent` under any agent actor ID — that is what lets Claude be
+Claude on both machines. The outer envelope is still authenticated by the human
+member who submitted it, so an agent event is always attributable to a person
+in the room. This is exactly the rule the legacy plaintext service enforces.
+
+---
+
+## 12a. Leaving, rejoining, and who owns a room
+
+**Leaving is something the relay has to confirm.** A transient failure —
+offline, timeout, a relay that answers 500 — establishes nothing, so Stacki
+changes nothing locally and says *"Connect to the relay to leave this secure
+share."* Anything else would be the failure this once had: the token stays
+valid, the only credential that could revoke it is destroyed, and the person is
+told they left. `401` counts as confirmed, because the relay is saying the
+membership already has no access.
+
+**A confirmed leave keeps the signing identity and nothing else.** A sender ID
+is derived from the room secret and the actor ID, so somebody invited back to
+the same room returns as the *same sender* — and a member's public key is fixed
+for the life of the room, at the relay and in every peer's pin map. A fresh
+keypair on rejoin would be refused by both, correctly, as key substitution. So
+a departed room keeps:
+
+| kept | given up |
+|---|---|
+| room ID | room master secret |
+| room-specific Ed25519 keypair | member bearer token |
+| sender ID, actor binding | the project link |
+| peers already pinned | — |
+
+That is enough to be recognised and not enough to read anything. The new
+invitation carries the room secret again.
+
+**Ownership survives.** A member row keeps `is_owner` when its token is
+replaced, so an owner who leaves and is invited back is still the owner and can
+still end the share. Both relays report `member.isOwner` on join so the client
+does not have to guess.
+
+**The privacy decision survives too.** Turning sharing off records which share
+it was and which threads were being kept back, so returning to the *same* share
+restores that decision rather than marking every thread private — which would
+have silently stopped replies to previously shared threads from ever being sent.
+
+## 12b. When Stacki syncs
+
+| moment | direction |
+|---|---|
+| a shared project is opened | push then pull |
+| a comment is written, edited, resolved (after ~1.2 s) | push then pull |
+| the window regains focus (at most once a minute) | push then pull |
+| **connectivity returns**, with no click at all | push then pull |
+| **every 30–60 s, jittered**, while an active secure share's window is visible | push then pull |
+| the person presses Retry on a paused share | push then pull |
+
+Posting never waits for the network. The last two rows are what make the
+product's own wording true: "your comments will send when you're connected"
+needs no click, and somebody who leaves Stacki focused all afternoon still
+learns that a colleague replied. Nothing polls for a local-only project, a
+legacy workspace, or a minimised window.
+
+## 12c. A room cannot move
+
+A room belongs to the relay it was created on. Its secret, its members and
+their access all live there, so there is no migration and no control that
+offers one — changing relay means **end this share and create a new one**, which
+is a new room, a new key and new invitations. Stacki keeps the two ideas under
+two names, `secure.relay` (this room's, immutable) and `newShareRelay` (where
+the next one would be created), so no screen can show one while meaning the
+other.
+
+## 12d. When the remote worked and the local did not
+
+A relay mutation that lands while local persistence fails is the one place this
+design can leave litter. There is no distributed transaction; there is explicit
+compensation, performed while the credential that can perform it is still in
+hand:
+
+| what happened | what Stacki does |
+|---|---|
+| room created, cannot be stored locally | owner-deletes the room |
+| invitation redeemed, cannot be stored locally | leaves the membership |
+| stored, but the project link fails | undoes both |
+| linked, but the ledger refuses | undoes both |
+| the undo itself cannot be delivered | says so: an empty room may remain, holding nothing readable, and the retention sweep removes it |
+
+The last row is the honest one. Stacki does not claim to have cleaned up
+something it could not reach.
+
+## 13. Revocation, and what leaving actually does
+
+**Leave** revokes that member's relay credential. They can no longer read or
+write through the relay.
+
+**Leave does not un-know the room secret.** A member who has held it has it.
+This is stated in the UI and it is not worked around, because it cannot be:
+there is no group rekey, no MLS, no Double Ratchet, and adding one would be a
+large state machine to make a smaller claim than it appears to.
+
+For a genuinely new cryptographic boundary: **End secure share**, then create a
+new one. New room, new secret, new invitations, and the old secret opens
+nothing that exists any more.
+
+Ending a room deletes the relay's copy of every envelope. It does not delete
+what collaborators already decrypted onto their own machines, and the product
+does not suggest otherwise.
+
+---
+
+## 14. HTTP API
+
+All bodies are JSON. All member operations authenticate with
+`Authorization: Bearer <token>`. Errors are `{ "error": "<code>", "message": "..." }`
+with the stable codes in §16. No stack traces, ever.
+
+**One answer for every way of not being in a room.** A wrong credential, a
+credential for a different room, a room that was never created, and a room that
+has ended all answer `401 unauthorized`. Anything that distinguished them would
+let somebody holding one valid token discover which other rooms exist. The
+Cloudflare relay gives the same answer for a structural reason too: a room is
+its own Durable Object and genuinely cannot tell a stranger's token from another
+room's.
+
+| method | path | auth | purpose |
+|---|---|---|---|
+| `GET` | `/health` | — | liveness |
+| `POST` | `/v2/rooms` | — | create a room |
+| `POST` | `/v2/join` | invitation | redeem an invitation |
+| `GET` | `/v2/rooms/:room` | member | room status, members, head |
+| `GET` | `/v2/rooms/:room/envelopes?after=&limit=` | member | pull after a cursor |
+| `POST` | `/v2/rooms/:room/envelopes` | member | push a batch |
+| `POST` | `/v2/rooms/:room/invites` | member | create an invitation |
+| `DELETE` | `/v2/rooms/:room/membership/me` | member | leave |
+| `DELETE` | `/v2/rooms/:room` | owner | end the room for everyone |
+| `GET` | `/v2/rooms/:room/watch` | member | WebSocket upgrade |
+
+### `POST /v2/rooms`
+
+```json
+{ "roomId": "<16 bytes b64url>", "senderId": "<32>", "publicKey": "<32>" }
+```
+
+→ `{ "room": { "id", "createdAt" }, "credential": { "token" } }`
+
+The creator becomes the owner. A room ID that already exists answers `409
+member_exists`. The relay never receives the room secret.
+
+### `POST /v2/join`
+
+```json
+{ "roomId": "...", "invite": "...", "senderId": "<32>", "publicKey": "<32>" }
+```
+
+→ `{ "room": {...}, "credential": { "token" }, "members": [ { "senderId", "publicKey" } ] }`
+
+Redemption is **atomic**: the invitation is consumed by a conditional update, so
+two simultaneous redeems produce exactly one member. Every bad invitation —
+wrong, used, expired — answers the same `401 bad_invite`, so guessing cannot
+distinguish them.
+
+### `GET /v2/rooms/:room`
+
+→ `{ "room": { "id", "createdAt", "endedAt", "envelopeCount", "storedBytes" },
+     "member": { "senderId", "isOwner" },
+     "members": [ { "senderId", "publicKey", "joinedAt", "leftAt" } ],
+     "head": <cursor> }`
+
+The `members` array is where a joining client gets pinning material.
+
+### `POST /v2/rooms/:room/envelopes`
+
+```json
+{ "envelopes": [ { "v":2, "envelopeId", "senderId", "nonce", "ciphertext", "signature" } ] }
+```
+
+→ `{ "accepted": ["<envelopeId>"], "rejected": [ { "envelopeId", "code" } ], "cursor": <head> }`
+
+The relay checks shape, that `senderId` is the authenticated member's own, and
+the signature against that member's pinned public key. A duplicate `envelopeId`
+is **accepted** and stored once — the client's intent is satisfied either way,
+and reporting it rejected would make it retry forever.
+
+### `GET /v2/rooms/:room/envelopes?after=&limit=`
+
+→ `{ "envelopes": [ { ..., "seq", "receivedAt" } ], "cursor": <last seq>, "hasMore": bool }`
+
+`seq` is the relay's arrival order and is **not** the events' own order. Stacki
+sorts by `(lamport, id)` after decryption regardless of delivery order; the
+cursor is only about what has been fetched.
+
+### `GET /v2/rooms/:room/watch`
+
+WebSocket. Because a browser-style `WebSocket` cannot set an `Authorization`
+header, the credential travels as the second subprotocol:
+
+```
+Sec-WebSocket-Protocol: stacki-secure-review.v2, <token>
+```
+
+The server accepts by echoing `stacki-secure-review.v2`. The only message the
+server sends is:
+
+```json
+{ "type": "head", "cursor": 184 }
+```
+
+A client that sees a higher cursor runs an ordinary HTTP sync. **No review data
+travels over the WebSocket.** There is one synchronisation protocol; this is a
+doorbell. If the socket never connects, everything still works.
+
+**Stacki's own desktop client does not use it yet.** Both relays implement it
+and both are conformance-tested on it, but Electron 33 bundles Node 20.18,
+which has no `WebSocket` — and closing that gap would mean either a new runtime
+dependency or a hand-written RFC 6455 client, for something this document
+already calls an optimisation. Upgrading Electron for an API convenience is
+explicitly not on the table. So the endpoint is part of the protocol and
+available to any client that can speak it; Stacki catches up when a project is
+opened, when something is written locally (debounced), and when the window
+regains focus. Nothing is lost by the socket's absence — only latency.
+
+### When Stacki syncs
+
+| moment | direction |
+|---|---|
+| a shared project is opened | push then pull |
+| a comment is written, edited, resolved (after ~1.2 s) | push then pull |
+| the window regains focus (at most once a minute) | push then pull |
+| the person presses Retry on a paused share | push then pull |
+
+Posting never waits for the network: an event is written to the local ledger
+and put in the outbox first, and the outbox drains whenever one of the above
+happens. This is why a healthy secure share has no Sync button — and why one
+that is not healthy grows a Retry.
+
+---
+
+## 15. Limits
+
+Encrypted does not mean unlimited. A relay that accepted arbitrary ciphertext
+would be an encrypted file host.
+
+| limit | value |
+|---|---|
+| request body | 8 MiB |
+| single ciphertext | 66 KiB (Stacki's 64 KiB event + GCM tag + slack) |
+| envelopes per push | 100 |
+| envelopes per pull page | 200 |
+| members per room | 50 |
+| open invitations per room | 20 |
+| envelopes per room | 200 000 |
+| stored ciphertext per room | 512 MiB |
+| invitation lifetime | 7 days (minimum 1 s) |
+
+`MAX_BODY_BYTES` is **derived** from the two above it — a maximum legal batch of
+maximum legal envelopes, base64url-expanded and JSON-framed, plus the wrapper.
+It was an independently chosen 8 MiB while that worst case encoded to about
+8.6 MiB, which meant the protocol forbade something it also permitted. A
+conformance check builds a real maximum batch and measures it.
+
+**Duplicates cost nothing.** A room's caps apply to envelopes actually added,
+not to everything in an incoming batch — otherwise a room near its limit would
+begin refusing the retries this protocol depends on, and a client would retry
+forever with no way to confirm delivery.
+
+## 16. Error codes
+
+`bad_request` `bad_json` `bad_envelope` `bad_signature` `bad_sender` `bad_room`
+`bad_key` `unauthorized` `bad_invite` `not_found` `room_ended` `member_exists`
+`too_large` `too_many` `room_full` `rate_limited` `internal_error`
+
+Mapped to `400 401 404 409 413 429 500` as in `relay/protocol.js`.
+
+---
+
+## 17. Retention
+
+Clients are the durable owners of review history. The relay is a mailbox and a
+catch-up cache.
+
+- **Ending a room** deletes its relay state immediately.
+- **An abandoned room** — no authenticated activity for **365 days** — is swept.
+
+The retention window is one constant, there is no settings UI for it, and
+self-hosted relays can change it. 90 days was the candidate and was rejected: a
+review left open across a quiet quarter is an ordinary thing, and coming back to
+a swept room costs a person an invitation they have to ask a colleague for.
+Nothing about the longer window costs anything — the data is ciphertext and the
+per-room byte cap is enforced separately.
+
+There is no ACK-based deletion, no per-recipient bookkeeping, and no bootstrap
+snapshot ownership. Those are the complications this design exists to avoid.
+
+## 18. Rate limiting
+
+Room creation, join attempts and invitation redemption are rate limited by
+source. Rate limiting is **not** authorisation and is never relied on as such —
+it is there so a public relay is not a free resource for anybody who finds it.
+No accounts, no Turnstile.
+
+## 19. Logging
+
+Logging is part of the security model. Never logged, on any relay: the
+`Authorization` header, member tokens, invitations, capabilities, room secrets,
+private keys, request bodies, plaintext, ciphertext, nonces, or full URLs.
+
+Coarse operational codes only: `room_created` `member_joined` `invite_redeemed`
+`envelope_accepted` `rate_limited` `bad_signature` `internal_error`.
+
+---
+
+## 20. The share capability
+
+```
+stacki2.<base64url(JSON)>
+```
+
+where the JSON is exactly four fields:
+
+```json
+{ "r": "<relay origin>", "id": "<roomId>", "i": "<invitation>",
+  "k": "<room secret>", "e": <expiresAt ms, or 0> }
+```
+
+Any extra field, any missing field, a non-canonical encoding, a room ID or
+secret of the wrong length, an `e` that is not a non-negative safe integer, or
+a relay origin that is not HTTPS-or-loopback is refused outright.
+
+`e` is the invitation's expiry, carried here rather than asked of the relay.
+The relay gives **one** answer for every unusable invitation — wrong, used,
+expired — so that guessing at them reveals nothing, and that costs the
+recipient a true sentence: Stacki could otherwise only ever say "this cannot be
+used". The expiry leaks nothing, because whoever holds the capability already
+holds the invitation, and it lets Stacki say "this invitation has expired"
+before contacting anybody at all.
+
+### As a link
+
+```
+https://<share origin>/#stacki2....
+```
+
+The capability is the **fragment**. A browser does not put a fragment in the
+request line, in a `Referer`, or anywhere a server can log it. The landing page
+reads `location.hash`, keeps it in memory, and calls `history.replaceState()` to
+take it out of the visible URL. `Open Stacki` happens only on an explicit click.
+
+### As a deep link
+
+```
+stacki://join#stacki2....
+```
+
+The packaged application **declares the scheme in its bundle** — `CFBundleURLTypes`
+on macOS, `x-scheme-handler/stacki` in the `.desktop` entry on Linux — because
+Launch Services routes a URL by what the bundle says, and a runtime
+`setAsDefaultProtocolClient` call cannot make an unlaunched app reachable.
+Windows keeps the runtime registration; electron-builder's NSIS target does not
+write scheme associations from `protocols`.
+
+`join` is the only action this protocol has. A deep link cannot execute a shell,
+open a file, modify a project, invoke MCP, run git, or edit source — there is no
+code path from the handler to any of those. Everything else about the URL is
+validated before the capability is even parsed.
+
+---
+
+## 21. Local secret storage
+
+Three secrets live on the client and none of them go in the project:
+
+- the room master secret
+- the member bearer token
+- the room-specific Ed25519 private key
+
+They are stored in Electron's `userData`, in a file that is `0600`, and
+encrypted with Electron `safeStorage` when the platform provides an OS-backed
+backend (macOS Keychain, Windows DPAPI, and on Linux whichever of
+kwallet/gnome-libsecret is present).
+
+**Linux honestly, and it is narrower than it looks.**
+`safeStorage.isEncryptionAvailable()` returns **true** on Linux even when
+Electron has fallen back to `basic_text` — read its own note on
+`setUsePlainTextEncryption`: the key is derived from an in-memory password
+because no OS password manager could be determined. That is a reversible
+encoding, not a secret store, and anybody who can read the file can read the
+room secrets in it.
+
+So Stacki asks a narrower question than "is encryption available":
+
+| backend | treated as |
+|---|---|
+| `keychain` (macOS), `dpapi` (Windows) | protected |
+| `gnome_libsecret`, `kwallet`, `kwallet5`, `kwallet6` | protected |
+| `basic_text` | **not protected** — stored unsealed in the `0600` file, reported as a weak backend |
+| `unknown`, none at all | not protected — same fallback |
+
+Nothing refuses to run, and nothing is described as encrypted at rest that is
+not. Diagnostics distinguish "Electron would encrypt but the key is nowhere"
+from "there is no keyring at all", because they are different situations and
+rounding them together loses the one worth knowing.
+
+Tests inject a deterministic in-memory protector and never touch a real
+keychain.
+
+---
+
+## 22. Legacy compatibility
+
+The plaintext v1 Shared Reviews service is unchanged and keeps working. The two
+transports sit behind the same interface:
+
+- `legacy-http` — the existing `service/`, plaintext, signup tokens, workspaces
+- `secure-relay-v2` — this document
+
+New shares default to Secure Share. Existing legacy workspaces keep syncing.
+There is **no automatic migration**, no silent conversion, and no surprise
+upload; moving a legacy workspace to a secure room is a separate feature that
+has not been designed.
+
+---
+
+## 23. Relay implementations
+
+Two, and the protocol is what they have in common — Cloudflare is an
+implementation, not the protocol.
+
+### Node (`relay/node/`)
+
+`node:http`, `node:sqlite`, `node:crypto`. No framework, no dependencies. One
+SQLite file. This is what a self-hoster runs, and it is a first-class target:
+every capability of Secure Share works against it with no Stacki account, no
+Cloudflare account, and no proprietary anything.
+
+### Cloudflare (`relay/cloudflare/`)
+
+A Worker that routes, and **one SQLite-backed Durable Object per room** which
+owns that room's authorisation state, members, invitations, envelope storage,
+sequence assignment and WebSocket wake-ups. No D1, no KV, no R2, no Queues, no
+Redis, no external SQL.
+
+Both implementations run the same conformance suite (`test/relay-conformance.js`).
+Neither imports `electron/review/events.js`; there is a test that greps for it.
+
+### Durable Object schema
+
+```
+room_meta ( created_at, last_activity, owner_sender, ended_at,
+            envelope_count, stored_bytes )
+members   ( sender_id PK, public_key, token_hash, joined_at, left_at, is_owner )
+invites   ( token_hash PK, created_by, created_at, expires_at, used_at )
+envelopes ( seq INTEGER PK AUTOINCREMENT, envelope_id UNIQUE, sender_id,
+            nonce, ciphertext, signature, received_at )
+```
+
+No plaintext review metadata appears in any column.
+
+---
+
+## 24. Test vectors
+
+Room secret is bytes `00..1f`. Room ID is bytes `00..0f`. Signing seed is 32
+bytes of `0x07`. Nonce is bytes `00..0b`. All base64url, unpadded.
+
+```
+room secret   AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+room ID       AAECAwQFBgcICQoLDA0ODw
+
+K_CONTENT     D8ekrjAkOjEQJigEgF1-VOkZGu6T7ac9-SZ0mrW2xkg
+K_SENDER_ID   -kmEGcfKH6Si7gHn7f--8XpMhVf4IsLkj1SWfIqQ6n4
+K_ENVELOPE_ID fDbgW0QW4mgUV4jyyIXVDegyvrkiS7uRksQax1XBYqE
+
+senderId("actor-alice")   DkyH8tlUVZFb8miOQJCIi_wL64ReSHQJ3O9NhJfCR-A
+envelopeId("event-1")     pCBuwcUVDBr_JqMxTtOKfS3Qer6GAGQNa4T7KnIj9fo
+
+signing seed  BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc
+public key    6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw
+nonce         AAECAwQFBgcICQoL
+```
+
+Event plaintext (exact JSON, key order as written):
+
+```json
+{"id":"event-1","threadId":"t","actorId":"actor-alice","actorKind":"human","actorName":"Alice","type":"message.created","lamport":1,"createdAt":0,"payload":{"body":"hello"}}
+```
+
+```
+ciphertext  xLg2N-A8UlKbQJrm0ffK23JrutxztNE2SBrhkoNbMKYfMKzGJzovFDYINr7701YRp5muq-BvSsEYc-7Q
+            naC6Zgz1K2oMhdrOP-A9GNPByFU3Kha_RkGe-qGv4R7vq3qgVj40mt7lFN-tFzxyo_XFstH43lfoar_n
+            NFObt-a2V80dI7tnSaTJKsoNPUk_0vWL8l-P3iT640srM6ocIRnUYF-0mIlDkzCGe_4xJodQ4XVuP44i
+            5uWxh42Sd7Zs
+signature   XBWBZOGPcjACwFjD2KMYqIcTmqf3UbEiW37pD2LDZmUhmapdSjafQlZbnwQHd7XPq2ETOgSeFgfrqHCg
+            sXFbBA
+```
+
+(The ciphertext and signature are one line each; wrapped here for reading.)
+
+These are asserted in `test/secure-crypto.js`.
+
+---
+
+## 24a. What counts as acceptance
+
+`npm test` carries the cheap Secure Share suites — crypto, relay, the two-client
+share — because they are fast and belong with every other change. It
+deliberately does **not** carry the expensive ones: a packaged build, a real
+browser, a workerd runtime, twenty-nine sabotages and five lifecycle runs are
+minutes each and would make the ordinary loop unusable.
+
+That split is only safe if there is one command nobody has to remember the
+parts of:
+
+```bash
+npm run test:secureacceptance
+```
+
+which runs, in order: crypto → Node relay → two-client share → Cloudflare
+workerd → share-page privacy → sabotage → lifecycle → packaging → legacy shared
+reviews → legacy acceptance → **an unsigned package build** → the packaged
+`stacki://` deep link against that build → the visual harness.
+
+The build sits in the middle on purpose: the packaged deep-link proof is about
+the artefact, so it has to run after something has produced one.
+
+## 25. Self-hosting
+
+```bash
+node relay/node/bin.js
+```
+
+Prints the address it is listening on. Then in Stacki: **Share… → Advanced →
+Use custom secure relay**, and paste that address. Nothing else is required —
+no account, no token to copy, no Cloudflare, no Stacki service. Room creation on
+a self-hosted relay is open by default and bounded by the same limits; bind it
+to loopback or put it behind whatever your team already runs.
+
+The Node relay also serves the share landing page at `/`, so a self-hoster's
+invitation links work without depending on Stacki's hosted service at all.
+
+For Cloudflare deployment instructions see `relay/cloudflare/README.md`.

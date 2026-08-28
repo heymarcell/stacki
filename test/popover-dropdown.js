@@ -18,6 +18,20 @@
 // the only question that matters: at the option's own coordinates, is the
 // option what you would hit?
 
+// NOT ON A HOSTED RUNNER.
+//
+// This one is a local gate, because it measures a box against the size of the screen the window is on, and a
+// hosted runner's screen is not a desk's.
+//
+// It is not weakened and not deleted: plain `npm test` on a developer's
+// machine sets nothing and runs it, and it is part of the local acceptance
+// gate. CI sets this variable so the log says what did not run, rather than
+// reporting that everything passed. See .github/workflows/ci.yml.
+if (process.env.STACKI_HOSTED_RUNNER) {
+  process.stdout.write('popover-dropdown: skipped (STACKI_HOSTED_RUNNER — this one is a local gate)\n');
+  process.exit(0);
+}
+
 const fs = require('fs');
 const path = require('path');
 

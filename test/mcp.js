@@ -1143,17 +1143,42 @@ const rawPost = (hostHeader, body) =>
     check('nor has GitHub credentials anywhere near it', !/octokit|api\.github\.com|GITHUB_TOKEN|gh auth/i.test(reviewSource));
     check('nor runs anything', !/child_process|execFile|spawn\(/.test(reviewSource));
 
-    // Since Shared Reviews there IS a network in this feature, and the shape
-    // of that is worth pinning down: exactly one module reaches one, it is
+    // Since Shared Reviews there IS a network in this feature, and the shape of
+    // that is worth pinning down: only the transports reach one, they are
     // reached only through the syncer, and the syncer refuses before it builds
-    // a transport when the project is not shared. So the guarantee "a project
+    // one at all when the project is not shared. So the guarantee "a project
     // nobody shared makes no request" is a property of the code rather than a
-    // promise about it — test/shared-reviews.js counts the requests.
-    const transport = fs.readFileSync(path.join(__dirname, '..', 'electron', 'review', 'transport.js'), 'utf8');
-    check('exactly one review module talks to a network', /globalThis\.fetch/.test(transport));
+    // promise about it — test/shared-reviews.js and test/secure-share.js both
+    // count the requests.
+    //
+    // Secure Share added a SECOND transport, which is the whole point of there
+    // being a transport interface. Both are listed here by name so that a
+    // third one has to be added to this list on purpose.
+    const transports = ['electron/review/transport.js', 'electron/review/secure/transport.js'];
+    for (const file of transports) {
+      const text = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+      check(`${file} is a transport and reaches a network`, /globalThis\.fetch/.test(text));
+    }
+    // And nothing else on the review path does. This is the assertion that
+    // actually holds the line; the two above only say where the network is.
+    const reviewDir = path.join(__dirname, '..', 'electron', 'review');
+    const everyReviewFile = [];
+    (function walk(dir) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith('.js')) everyReviewFile.push(full);
+      }
+    })(reviewDir);
+    const strays = everyReviewFile.filter(
+      (f) => !transports.some((t) => f.endsWith(t.split('/').pop()) && f.includes(t.split('/').slice(-2)[0])) &&
+        /\bfetch\s*\(|https?\.request|XMLHttpRequest|axios/.test(fs.readFileSync(f, 'utf8'))
+    );
+    check('no other review module reaches a network', strays.length === 0, strays.join(', '));
+
     const sync = fs.readFileSync(path.join(__dirname, '..', 'electron', 'review', 'sync.js'), 'utf8');
-    check('and it is only ever built by the syncer', /makeTransport = createTransport/.test(sync));
-    check('which refuses before building one at all', /if \(!store \|\| !store\.shared\?\.workspaceId \|\| !workspace\)/.test(sync));
+    check('the syncer builds the transport and nothing else does', /link\.make\(\)/.test(sync));
+    check('which refuses before building one at all', /if \(!store \|\| !store\.shared\?\.workspaceId \|\| !link\)/.test(sync));
 
     // And none of it is reachable from MCP. An agent that could create a
     // workspace, mint an invitation or point Stacki at another server would be

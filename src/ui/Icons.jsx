@@ -1031,6 +1031,16 @@ export const ReopenIcon = (p) => (
   </I>
 );
 
+// This is encrypted. A closed padlock and nothing cleverer — it sits beside
+// the words "Shared securely" and is decorative, because a state conveyed by
+// an icon alone is a state some people cannot read.
+export const LockIcon = (p) => (
+  <I {...p}>
+    <rect x="3.1" y="7" width="9.8" height="7" rx="1.6" />
+    <path d="M5.4 7V5.1a2.6 2.6 0 0 1 5.2 0V7" />
+  </I>
+);
+
 // Stacki can no longer find what this review was about. A broken link rather
 // than a warning triangle: nothing went wrong, the code simply moved on.
 export const OrphanIcon = (p) => (

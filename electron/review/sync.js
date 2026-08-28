@@ -31,8 +31,25 @@
 // DNS lookup. The first line of `sync` is the guard, and there is a test that
 // counts.
 
-const { createTransport } = require('./transport');
-const { MAX_BATCH, MAX_PULL } = require('./transport');
+const { createTransport, MAX_BATCH, MAX_PULL } = require('./transport');
+
+/**
+ * The link for a legacy plaintext workspace.
+ *
+ * Here rather than at the call site so that the app and the tests build the
+ * same thing — two hand-rolled copies of "how a legacy workspace becomes a
+ * transport" is two places for it to drift.
+ */
+const legacyLink = (workspace, makeTransport = createTransport) =>
+  workspace
+    ? {
+        kind: 'legacy',
+        id: workspace.id,
+        actorId: workspace.actorId,
+        make: () =>
+          makeTransport({ kind: 'http', baseUrl: workspace.server, token: workspace.token, workspaceId: workspace.id }),
+      }
+    : null;
 
 // The most pages one synchronisation will walk. A workspace with more history
 // than this catches up over several syncs rather than holding the app for one
@@ -55,22 +72,38 @@ const fail = (code, message) => ({ ok: false, code, message });
 const problemOf = (result) => ({
   kind: result.code || 'sync_failed',
   detail: result.message || null,
-  fatal: result.code === 'unauthorized' || result.code === 'not_found',
+  // The ones that will go on failing until a person does something. A
+  // credential that has been revoked stays revoked, a room that has ended
+  // stays ended, and a member whose signing key changed is a room this
+  // machine should stop talking to rather than keep retrying.
+  fatal:
+    result.code === 'unauthorized' ||
+    result.code === 'not_found' ||
+    result.code === 'room_ended' ||
+    result.code === 'key_changed',
 });
 
 /**
  * Run one synchronisation for one open project.
  *
- * `store` is the ledger; `workspace` is the credential from the registry, or
- * null for a project that is not shared. `makeTransport` is injected so the
- * whole of this can be driven against a service in the same process.
+ * `store` is the ledger. `link` is how this project is shared, or null for a
+ * project that is not — and it is deliberately the SAME shape for a legacy
+ * plaintext workspace and for a secure room:
+ *
+ *     { id, actorId, kind, make() }
+ *
+ * `make()` returns something with the five transport methods. That is the
+ * whole of what this file knows about either one: it never learns what a
+ * server address is, and it never learns that an envelope exists. Adding
+ * Secure Share changed the two lines that used to build an HTTP transport and
+ * nothing else here, which is what the transport interface was for.
  */
-async function syncOnce({ store, workspace, makeTransport = createTransport, now = Date.now, reason = 'manual' } = {}) {
+async function syncOnce({ store, link, now = Date.now, reason = 'manual' } = {}) {
   // The guard. A project that has not been shared never reaches a network.
-  if (!store || !store.shared?.workspaceId || !workspace) {
+  if (!store || !store.shared?.workspaceId || !link) {
     return { ok: true, skipped: 'not_shared', pushed: 0, pulled: 0 };
   }
-  if (workspace.id !== store.shared.workspaceId) {
+  if (link.id !== store.shared.workspaceId) {
     // The ledger and the registry disagree about which workspace this project
     // belongs to. Refusing is right: pushing this project's comments into a
     // workspace it was not shared with is the one mistake that cannot be
@@ -84,7 +117,7 @@ async function syncOnce({ store, workspace, makeTransport = createTransport, now
   // copied between machines — every push would come back rejected, be taken
   // out of the outbox to stop it blocking the queue, and quietly never be
   // shared. That failure is silent, which is what makes it worth a guard.
-  if (workspace.actorId && store.actor?.id && workspace.actorId !== store.actor.id) {
+  if (link.actorId && store.actor?.id && link.actorId !== store.actor.id) {
     const why = 'This computer’s identity is not the one that joined this workspace. Ask for a new invitation.';
     store.setSyncProblem('identity_mismatch', why);
     return fail('identity_mismatch', why);
@@ -92,7 +125,7 @@ async function syncOnce({ store, workspace, makeTransport = createTransport, now
 
   let transport;
   try {
-    transport = makeTransport({ kind: 'http', baseUrl: workspace.server, token: workspace.token, workspaceId: workspace.id });
+    transport = link.make();
   } catch (err) {
     store.setSyncProblem('bad_workspace', err.message);
     return fail('bad_workspace', err.message);
@@ -101,6 +134,7 @@ async function syncOnce({ store, workspace, makeTransport = createTransport, now
   let pushed = 0;
   let pulled = 0;
   let refused = 0;
+  let unverified = 0;
   try {
     // 1 — ours, first.
     for (let page = 0; page < MAX_PAGES; page++) {
@@ -147,8 +181,18 @@ async function syncOnce({ store, workspace, makeTransport = createTransport, now
         return { ok: false, code: taken.code || 'store_refused', message: taken.message, pushed, pulled };
       }
       pulled += taken.added || 0;
+      unverified += got.unverified || 0;
       cursor = Number.isInteger(got.cursor) ? got.cursor : cursor;
       if (!got.hasMore) break;
+    }
+
+    // Something in the room did not verify. It is not shown as a crypto error
+    // — see SecureShare.jsx for the sentence — but it is never silent: a sync
+    // that quietly dropped part of somebody's history while reporting success
+    // is the exact failure this whole model exists not to have.
+    if (unverified) {
+      store.setSyncProblem('unverified_events', `${unverified} ${unverified === 1 ? 'change' : 'changes'} could not be verified.`);
+      return { ok: true, pushed, pulled, refused, unverified, at: now(), reason };
     }
 
     if (refused) {
@@ -169,18 +213,18 @@ async function syncOnce({ store, workspace, makeTransport = createTransport, now
  * had already pushed and race each other's cursor. So a second request while
  * one is in flight joins the one in flight rather than starting another.
  */
-function createSyncer({ makeTransport = createTransport, now = Date.now } = {}) {
+function createSyncer({ now = Date.now } = {}) {
   let inFlight = null;
   let lastAt = 0;
 
-  async function sync({ store, workspace, reason = 'manual' } = {}) {
+  async function sync({ store, link, reason = 'manual' } = {}) {
     if (inFlight) return inFlight;
     // A focus is a hint, not an instruction. Coming back to the window a
     // moment after the last sync is not a reason to talk to a server again.
     if (reason === 'focus' && now() - lastAt < FOCUS_QUIET_MS) {
       return { ok: true, skipped: 'too_soon', pushed: 0, pulled: 0 };
     }
-    inFlight = syncOnce({ store, workspace, makeTransport, now, reason })
+    inFlight = syncOnce({ store, link, now, reason })
       .catch((err) => fail('sync_failed', err?.message || 'Synchronising did not work.'))
       .finally(() => {
         inFlight = null;
@@ -205,4 +249,69 @@ function createSyncer({ makeTransport = createTransport, now = Date.now } = {}) 
   };
 }
 
-module.exports = { syncOnce, createSyncer, FOCUS_QUIET_MS, MAX_PAGES };
+// How often an ACTIVE secure share looks for somebody else's comments while
+// the window is on screen.
+//
+// The window is jittered so that a room full of people does not turn into a
+// room full of clients asking at the same instant, and it is minutes rather
+// than seconds because a review is written in minutes and read in hours. This
+// is not presence and it is not streaming: it is the answer to a real gap,
+// which is that somebody who leaves Stacki focused all afternoon would
+// otherwise never learn a colleague had replied.
+const CATCH_UP_MIN_MS = 30_000;
+const CATCH_UP_MAX_MS = 60_000;
+
+/**
+ * A repeating, jittered catch-up.
+ *
+ * Deliberately a tiny state machine with injected time, because "it polls
+ * about every 45 seconds" is otherwise a property nothing can test without
+ * sitting there for 45 seconds. `armed` is the only state; `due` is the only
+ * effect.
+ */
+function createCatchUp({
+  onDue,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  random = Math.random,
+  minMs = CATCH_UP_MIN_MS,
+  maxMs = CATCH_UP_MAX_MS,
+} = {}) {
+  let timer = null;
+
+  const wait = () => minMs + Math.floor(random() * Math.max(0, maxMs - minMs));
+
+  function arm() {
+    if (timer) return;
+    timer = setTimer(() => {
+      timer = null;
+      // The effect first, then re-arm: a catch-up that threw would otherwise
+      // stop the loop for the rest of the session.
+      try {
+        onDue?.('catchup');
+      } finally {
+        arm();
+      }
+    }, wait());
+    timer?.unref?.();
+  }
+
+  function disarm() {
+    if (timer) clearTimer(timer);
+    timer = null;
+  }
+
+  return {
+    /** Run while a secure share is open AND the window is on screen. */
+    set(active) {
+      if (active) arm();
+      else disarm();
+    },
+    get armed() {
+      return timer !== null;
+    },
+    disarm,
+  };
+}
+
+module.exports = { syncOnce, createSyncer, createCatchUp, legacyLink, FOCUS_QUIET_MS, MAX_PAGES, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS };
