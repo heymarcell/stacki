@@ -69,9 +69,19 @@ has the rate limiter, the SQLite Durable Object, the same body limits and the
 same logging policy, and it deliberately does **not** carry the development
 opt-out. It is a real public service; treat it as one.
 
-**Production** will be `relay.stacki.app`, from an environment of its own with
-its own limiter namespace. It is **not deployed yet** — see the bottom of this
-file.
+**The hosted relay for this fork**, on a domain this fork controls:
+
+```bash
+npx wrangler deploy --env hosted
+```
+
+That publishes `stacki-relay.neongod.io` — the address the app defaults to.
+Same Worker, same protocol, same limits as staging; its own Durable Object
+namespace and its own limiter namespace so the two never share state or
+counters.
+
+Upstream Stacki intends `relay.stacki.app`. This repository is a fork and does
+not own that domain, so it does not deploy there and does not claim to be it.
 
 **A private or experimental relay, knowingly unlimited.** Say so out loud;
 there is no way to get here by forgetting something:
@@ -104,7 +114,16 @@ own example uses `"1001"`, which is therefore the most contended integer on any
 busy account — on the account this was first deployed to it was already taken
 by an unrelated waitlist form *and* an unrelated bug reporter. Sharing a
 counter with a stranger's contact form is not rate limiting. Staging uses
-`770001`; production must use a different one again.
+`770001` and the hosted relay uses `770002`, so neither can spend the other's
+budget.
+
+**Query strings are visible in `wrangler tail`.** Cloudflare has a
+`redact_query_string` setting, and wrangler 4.127.0 will not accept it in this
+file — both placements are refused with *"Unexpected fields found in
+observability field"*. So the protection is that the client never puts anything
+sensitive in a query string, which `test/packaging.js` asserts directly: the
+only parameters the transport builds are `after=` and `limit=`. Persisted
+invocation logs are off regardless.
 
 Then set the relay origin Stacki should offer as its default (see
 `electron/review/secure/relays.js`), or leave it and let people paste their own
@@ -124,8 +143,8 @@ Room creation is **refused unless something explicitly permits it**. In order:
 |---|---|---|---|
 | top level (`wrangler deploy`) | none | — | no — **refuses to create rooms** |
 | `--env staging` | 20 / 60s | `770001` | no |
+| `--env hosted` | 20 / 60s | `770002` | no |
 | `--env development` | none | — | yes, on purpose, locally |
-| production (not yet deployed) | planned | must differ from staging | no |
 
 The last row is the default, and it is the point. An earlier version had this
 the other way round — protection was opt-in behind a flag — which meant
@@ -174,9 +193,9 @@ production-equivalent relay to workers.dev whenever somebody runs it. Whether
 one is running right now is a property of the account, not of this file, so
 this file does not claim one is.
 
-**Hosted production deployment: NOT EXECUTED.** `relay.stacki.app` does not
-exist yet. The blocker is not code and not credentials: the `stacki.app` zone
-is not present in the authenticated Cloudflare account, so no custom domain can
-be attached to it from here. `DEFAULT_RELAY` still points at
-`relay.stacki.app` because that remains the intended endpoint — it is simply
-not answering yet.
+**This fork's hosted relay: `stacki-relay.neongod.io`,** deployed from
+`--env hosted` and the address `DEFAULT_RELAY` points at.
+
+**`relay.stacki.app`: not ours.** That zone is not in this Cloudflare account,
+so nothing here deploys to it or claims to be it. If upstream ever runs it,
+this fork's default is a one-line change.

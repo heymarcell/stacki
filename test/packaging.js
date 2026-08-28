@@ -382,7 +382,10 @@ if (fs.existsSync(relayDir)) {
     const text = fs.readFileSync(wrangler, 'utf8');
     check('the Cloudflare config carries no account id', !/account_id/.test(text), 'deployment credentials do not belong in the repository');
     check('nor an API token', !/api_token|CLOUDFLARE_API/.test(text));
-    check('nor a production route', !/"routes"|"route"/.test(text), 'routes are attached at deploy time, deliberately');
+    // A custom domain IS in the config now — the hosted environment needs one,
+    // and a hostname is not a credential. What must never appear is an account
+    // identifier or a token, which the two checks above cover.
+    check('the only route is the hosted custom domain', (text.match(/"pattern"/g) || []).length <= 1, 'no route sprawl');
   }
   // No relay database, ever, anywhere near the build.
   for (const stray of ['relay.db', 'relay.db-wal', 'relay.db-shm']) {
@@ -514,6 +517,78 @@ if (fs.existsSync(wranglerPath)) {
   check('and staging does not fork the migration history', staging?.migrations === undefined, JSON.stringify(staging?.migrations));
   check('invocation logging stays off for every environment', config.observability?.logs?.invocation_logs === false, JSON.stringify(config.observability));
   check('and staging does not override observability', staging?.observability === undefined, JSON.stringify(staging?.observability));
+
+  // ── The hosted relay for this fork ──────────────────────────────────────
+  //
+  // Upstream's endpoint is relay.stacki.app and this repository does not own
+  // that domain. Shipping it as the default meant Share… pointed at an address
+  // that does not answer, which is the one thing a default must never do. The
+  // hosted environment below is the fork's own, on a hostname it controls.
+  const hosted = config.env?.hosted;
+  check('there is a hosted environment', !!hosted, JSON.stringify(Object.keys(config.env || {})));
+
+  const routes = hosted?.routes || [];
+  check('  bound to exactly one custom domain', routes.length === 1 && routes[0]?.custom_domain === true, JSON.stringify(routes));
+  check('  which is the hostname the app defaults to', routes[0]?.pattern === 'stacki-relay.neongod.io', String(routes[0]?.pattern));
+  check('  and it is not a domain this fork does not own', !JSON.stringify(routes).includes('stacki.app'), JSON.stringify(routes));
+
+  const hostedBindings = hosted?.durable_objects?.bindings || [];
+  check('  hosted declares its own Durable Object binding', hostedBindings.length === 1 && hostedBindings[0]?.name === 'ROOM' && hostedBindings[0]?.class_name === 'Room', JSON.stringify(hosted?.durable_objects));
+
+  const hostedLimiters = hosted?.ratelimits || [];
+  const hostedLimiter = hostedLimiters[0] || {};
+  check('  hosted binds a rate limiter', hostedLimiters.length === 1 && hostedLimiter.name === 'ROOM_LIMITER', JSON.stringify(hostedLimiters));
+  check('  with a window Cloudflare accepts', [10, 60].includes(hostedLimiter.simple?.period), String(hostedLimiter.simple?.period));
+  check('  and a positive-integer namespace id', typeof hostedLimiter.namespace_id === 'string' && /^[1-9][0-9]*$/.test(hostedLimiter.namespace_id), String(hostedLimiter.namespace_id));
+  // Counters are shared by VALUE across the whole account. Hosted sharing
+  // staging's namespace would let a test run spend the real service's budget.
+  check('  that is NOT the staging namespace', hostedLimiter.namespace_id !== limiter.namespace_id, `${hostedLimiter.namespace_id} vs staging ${limiter.namespace_id}`);
+  check('  and NOT the example id other Workers already took', hostedLimiter.namespace_id !== '1001', String(hostedLimiter.namespace_id));
+
+  check('  hosted does NOT carry the unlimited-relay bypass', hosted?.vars?.STACKI_ALLOW_UNLIMITED_RELAY === undefined, JSON.stringify(hosted?.vars));
+  check('  nor does it fork the migration history', hosted?.migrations === undefined, JSON.stringify(hosted?.migrations));
+  check('  nor override observability', hosted?.observability === undefined, JSON.stringify(hosted?.observability));
+  check('  and it does not publish on workers.dev as well', hosted?.workers_dev !== true, String(hosted?.workers_dev));
+}
+
+// ── The default relay has to be a real service ──────────────────────────────
+//
+// A default that does not answer is worse than no default: Share… fails for
+// somebody who did nothing wrong and has no way to know why. This fork points
+// at a relay its maintainer runs, which is a different claim from being
+// Stacki's official infrastructure — hence the label, asserted here too.
+{
+  const { DEFAULT_RELAY, describeRelay } = require(path.join(root, 'electron', 'review', 'secure', 'relays.js'));
+  check('the default relay is https', /^https:\/\//.test(DEFAULT_RELAY), DEFAULT_RELAY);
+  check('and is the hostname this fork controls', DEFAULT_RELAY === 'https://stacki-relay.neongod.io', DEFAULT_RELAY);
+  check('not a domain this fork does not own', !DEFAULT_RELAY.includes('stacki.app'), DEFAULT_RELAY);
+
+  const described = describeRelay(DEFAULT_RELAY);
+  check('the app calls it a hosted relay', described?.label === 'Hosted relay', JSON.stringify(described));
+  check('and never claims it is Stacki\'s own', !/stacki hosted|official/i.test(String(described?.label)), String(described?.label));
+
+  // The config the Worker deploys under must agree with what the app dials.
+  const hostedRoute = (JSON.parse(fs.readFileSync(wranglerPath, 'utf8').replace(/^\s*\/\/.*$/gm, '')).env?.hosted?.routes || [])[0];
+  check('the deployed hostname and the app default are the same string', `https://${hostedRoute?.pattern}` === DEFAULT_RELAY, `${hostedRoute?.pattern} vs ${DEFAULT_RELAY}`);
+}
+
+// ── Nothing sensitive may travel in a query string ──────────────────────────
+//
+// Cloudflare's live tail shows query strings verbatim, and
+// `redact_query_string` is not expressible in wrangler 4.127.0's config — both
+// placements are refused with "Unexpected fields found in observability
+// field". So the protection is that the client never puts anything there, and
+// that is worth asserting rather than remembering: the only query parameters
+// the transport builds are two integers.
+{
+  const transport = fs.readFileSync(path.join(root, 'electron', 'review', 'secure', 'transport.js'), 'utf8');
+  const params = [...transport.matchAll(/[?&]([a-zA-Z_]+)=/g)].map((m) => m[1]);
+  const allowed = new Set(['after', 'limit']);
+  const strays = [...new Set(params)].filter((p) => !allowed.has(p));
+  check('the transport puts only after= and limit= in a query string', strays.length === 0, JSON.stringify(strays));
+  for (const secret of ['token', 'secret', 'invite', 'capability', 'key']) {
+    check(`  never ${secret}=`, !new RegExp(`[?&]${secret}=`).test(transport), secret);
+  }
 }
 
 // ── The bundle has to tell the operating system about the scheme ────────────

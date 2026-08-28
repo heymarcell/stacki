@@ -396,7 +396,7 @@ app.whenReady().then(async () => {
     await wait(300);
 
     win.webContents.send('reviews:invite', {
-      relay: { ok: true, hosted: true, origin: 'https://relay.stacki.app', label: 'Stacki hosted' },
+      relay: { ok: true, hosted: true, origin: 'https://stacki-relay.neongod.io', label: 'Hosted relay' },
       project: null,
       alreadyShared: false,
       expiresAt: null,
@@ -409,7 +409,7 @@ app.whenReady().then(async () => {
     await wait(300);
 
     win.webContents.send('reviews:invite', {
-      relay: { ok: true, hosted: true, origin: 'https://relay.stacki.app', label: 'Stacki hosted' },
+      relay: { ok: true, hosted: true, origin: 'https://stacki-relay.neongod.io', label: 'Hosted relay' },
       project: path.basename(root),
       alreadyShared: false,
       expiresAt: Date.now() - 86400000,
