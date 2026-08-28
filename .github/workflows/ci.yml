@@ -38,13 +38,19 @@ env:
   # No harness may open a dialog: one that does would wait for a click that is
   # never coming, and the job would burn its timeout instead of failing.
   STACKI_NO_DIALOGS: '1'
-  STACKI_CANVAS_OFFLINE: '1'
 
 jobs:
   core:
     name: core suite (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # The three canvas suites install Astro and drive a real dev server. They
+      # are run for real on macOS below, where the rendering this project is
+      # about actually happens; here they would double the job to re-prove the
+      # same thing on a platform Stacki does not ship to yet. Set explicitly and
+      # named, rather than left to a default, so the skip is a decision.
+      STACKI_CANVAS_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -81,6 +87,14 @@ jobs:
         run: |
           sudo chown root:root node_modules/electron/dist/chrome-sandbox
           sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+      # Stacki's "start a new site" flow makes the first commit for you, and
+      # `git commit` refuses without an identity. A developer's machine has
+      # one; a fresh runner does not, so test/starter.js failed on `git
+      # rev-list HEAD` with nothing to count.
+      - name: Give git an identity to commit as
+        run: |
+          git config --global user.name "Stacki CI"
+          git config --global user.email "ci@stacki.invalid"
       - name: npm test
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm test
 
@@ -88,6 +102,8 @@ jobs:
     name: secure protocol + cloudflare (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      STACKI_CANVAS_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -146,7 +162,14 @@ jobs:
   macos:
     name: packaged acceptance (macos)
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    env:
+      # THE CANVAS SUITES RUN FOR REAL HERE. They need Astro genuinely
+      # installed, which the fixture does once into this directory and then
+      # copies from. Cached between runs so only the first pays for it; if the
+      # cache is cold the fixture installs it and the suites still run, because
+      # STACKI_CANVAS_OFFLINE is deliberately NOT set on this job.
+      STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -160,7 +183,15 @@ jobs:
             ~/Library/Caches/electron-builder
           key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
           restore-keys: ${{ runner.os }}-electron-
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.astro-cache
+          key: ${{ runner.os }}-astro-fixture-v1
       - run: npm ci
+      - name: Give git an identity to commit as
+        run: |
+          git config --global user.name "Stacki CI"
+          git config --global user.email "ci@stacki.invalid"
 
       # What ships inside the bundle, and what the bundle tells the operating
       # system. Reads the config rather than the built app, so it is quick and
@@ -185,3 +216,16 @@ jobs:
       # asserts the DOM it is about to photograph.
       - name: the Secure Share states
         run: npm run test:secureshareui
+
+      # The Agent API against a page that genuinely rendered: computed styles
+      # from an engine, classes from a page that ran, captures that are
+      # photographs.
+      - name: the agent, against a real canvas
+        run: npm run test:agentcanvas
+
+      # THE SEAM. A person comments in Stacki, a real MCP client finds that
+      # comment, is handed the exact object it is anchored to, changes it,
+      # photographs the result and answers in the thread. Every other suite
+      # proves one layer; this proves they join up.
+      - name: a real MCP client, end to end
+        run: npm run test:mcpdogfood

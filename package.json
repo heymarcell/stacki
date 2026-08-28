@@ -149,6 +149,7 @@
     "test:reviewvisual": "node --check test/review-ux-visual.js && electron test/review-ux-visual.js",
     "test:externallinks": "node --check test/external-links.js && electron test/external-links.js",
     "test:agentcanvas": "node --check test/agent-canvas.js && electron test/agent-canvas.js",
+    "test:mcpdogfood": "node --check test/mcp-dogfood.js && electron test/mcp-dogfood.js",
     "test:tempownership": "node test/temp-ownership.js",
     "test:devidentity": "node test/dev-server-identity.js",
     "test:assertedstate": "node test/asserted-state.js",
