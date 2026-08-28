@@ -228,6 +228,12 @@ jobs:
       - name: a real MCP client, end to end
         run: npm run test:mcpdogfood
 
+      # THE WHOLE LINE. Bob writes on his machine, it is sealed and pushed to a
+      # relay that cannot read it, Alice decrypts it, an agent acts on it over
+      # MCP, and the answer travels back the same way to Bob.
+      - name: remote review to agent answer and back
+        run: npm run test:securemcploop
+
   # TEMPORARY. Runs every suite in the `npm test` chain independently and
   # reports which ones a hosted runner cannot support, in one pass instead of
   # one CI cycle per discovery. Removed once the set is known.
