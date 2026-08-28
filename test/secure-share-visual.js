@@ -76,8 +76,11 @@ if (!astroCached() && process.env.STACKI_CANVAS_OFFLINE) {
   process.exit(0);
 }
 
-const sweptRuns = sweepStaleRuns(['stacki-share-ux-user-', 'stacki-canvas-']);
-if (sweptRuns) say(`secure-share-visual: swept ${sweptRuns} stale run(s)`);
+// `sweepStaleRuns` answers with what it took and what it left, and saying
+// which is the point — a sweep that reports a count cannot be checked against
+// what somebody expected to still be there.
+const sweptRuns = sweepStaleRuns(['stacki-share-ux-user-', 'stacki-share-ux-relay-', 'stacki-canvas-']);
+for (const one of sweptRuns.swept) say(`secure-share-visual: swept ${one.name} (dead ${one.harness} pid ${one.pid})`);
 
 const root = makeCanvasProject({ harness: 'secure-share-visual', log: (m) => say(`secure-share-visual: ${m}`) });
 const userData = ownedTempDir('stacki-share-ux-user-', { harness: 'secure-share-visual' });
@@ -667,9 +670,17 @@ app.whenReady().then(async () => {
       check('a paused share offers Retry', await js(`/Retry/.test(document.querySelector('.share-row')?.textContent || '')`));
       check(
         'and still says how much has not left this machine',
-        await js(`/waiting/.test(document.querySelector('.share-row')?.textContent || '')`),
-        await js(`document.querySelector('.share-row')?.textContent`)
+        await js(`/waiting to send/.test(document.querySelector('.share-problem')?.textContent || '')`),
+        await js(`document.querySelector('.share-problem')?.textContent`)
       );
+      // The row itself has to stay readable: two actions and a state in 260px.
+      const rowFits = await js(`(() => {
+        const row = document.querySelector('.share-row');
+        const state = row?.querySelector('.share-state');
+        if (!state) return null;
+        return { clipped: state.scrollWidth > state.clientWidth + 1, text: state.textContent.trim() };
+      })()`);
+      check('and the row itself is not truncated', rowFits && rowFits.clipped === false, JSON.stringify(rowFits));
       await shot(
         'access-lost',
         `document.querySelector('.share-problem')?.textContent.includes('no longer has access')`

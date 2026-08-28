@@ -129,13 +129,7 @@ export function SecureShareRow({ shared, onShare, onManage, onRetry, busy = fals
   if (problem) {
     return (
       <div className="share-row has-problem">
-        {/* The count belongs here MOST of all. Suppressing it exactly when
-            something has gone wrong would hide the one number that says how
-            much has not left this machine. */}
-        <span className="share-state is-paused">
-          Sharing paused
-          {pending > 0 ? ` · ${plural(pending, 'comment', 'comments')} waiting` : ''}
-        </span>
+        <span className="share-state is-paused">Sharing paused</span>
         <button type="button" className="share-link" onClick={onRetry} disabled={busy}>
           {busy ? 'Retrying…' : 'Retry'}
         </button>
@@ -151,7 +145,15 @@ export function SecureShareRow({ shared, onShare, onManage, onRetry, busy = fals
             appears rather than only when somebody happens to be reading. */}
         <div className="share-problem" role="alert">
           <OrphanIcon size={12} />
-          <span>{text}</span>
+          {/* The count goes in the sentence rather than the row. It belongs
+              here MOST of all — hiding how much has not left this machine at
+              exactly the moment something is wrong would be the worst time to
+              hide it — but the row is 260px holding two actions as well, and
+              "Sharing paused · 6 commen…" says less than nothing. */}
+          <span>
+            {text}
+            {pending > 0 ? ` ${plural(pending, 'comment is', 'comments are')} waiting to send.` : ''}
+          </span>
         </div>
       </div>
     );
