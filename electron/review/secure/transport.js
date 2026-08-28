@@ -57,6 +57,60 @@ const MAX_RESPONSE_BYTES = MAX_BODY_BYTES;
 const fail = (code, message) => ({ ok: false, code, message });
 
 /**
+ * A relay's answer, bounded in BYTES, read a chunk at a time.
+ *
+ * `await response.text()` was the wrong shape for the same two reasons the
+ * Worker's ingress reader was: by the time `text.length` is compared, an
+ * untrusted relay has already made this process buffer everything it chose to
+ * send — and `length` counts UTF-16 code units, so a body of astral-plane
+ * characters is twice the bytes its length reports and could pass a check it
+ * should fail.
+ *
+ * A custom relay is somebody else's server. It is the one party in this design
+ * that is not trusted for anything, so what it says about its own size is a
+ * hint and what it actually sends is what gets counted.
+ */
+async function readBounded(response, cap) {
+  const declared = Number(response.headers?.get?.('content-length'));
+  // Refused before a byte is consumed, when it is honest enough to say.
+  if (Number.isFinite(declared) && declared > cap) return { ok: false, code: 'too_large' };
+
+  const body = response.body;
+  if (!body || typeof body.getReader !== 'function') {
+    // No stream to read — an empty body, or a runtime without one. `text()` is
+    // safe here only because there is nothing to buffer.
+    try {
+      const text = await response.text();
+      return Buffer.byteLength(text, 'utf8') > cap ? { ok: false, code: 'too_large' } : { ok: true, text };
+    } catch {
+      return { ok: false, code: 'bad_response' };
+    }
+  }
+
+  const reader = body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      size += value.byteLength;
+      if (size > cap) {
+        // Stop taking it. A relay that keeps sending is talking to nobody.
+        await reader.cancel().catch(() => {});
+        return { ok: false, code: 'too_large' };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    return { ok: false, code: 'bad_response' };
+  }
+  return { ok: true, text: Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString('utf8') };
+}
+
+/**
  * One HTTP call to a relay, with every failure given a name.
  *
  * The names are what the panel says out loud and what the sync loop backs off
@@ -72,7 +126,10 @@ async function request(base, path, { method = 'GET', token = null, body = null, 
   let response;
   try {
     const text = body == null ? null : JSON.stringify(body);
-    if (text && text.length > MAX_RESPONSE_BYTES) return fail('too_large', 'That is too much to send in one request.');
+    // Bytes, not characters — the same reason as `readBounded` below.
+    if (text && Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
+      return fail('too_large', 'That is too much to send in one request.');
+    }
     response = await doFetch(`${base}${path}`, {
       method,
       signal: controller.signal,
@@ -90,13 +147,13 @@ async function request(base, path, { method = 'GET', token = null, body = null, 
     clearTimeout(timer);
   }
 
-  let text;
-  try {
-    text = await response.text();
-  } catch {
-    return fail('bad_response', 'The secure relay sent something unreadable.');
+  const read = await readBounded(response, MAX_RESPONSE_BYTES);
+  if (!read.ok) {
+    return read.code === 'too_large'
+      ? fail('too_large', 'The secure relay sent more than Stacki will read.')
+      : fail('bad_response', 'The secure relay sent something unreadable.');
   }
-  if (text.length > MAX_RESPONSE_BYTES) return fail('too_large', 'The secure relay sent more than Stacki will read.');
+  const text = read.text;
   let parsed = null;
   if (text) {
     try {
@@ -400,6 +457,65 @@ function createSecureTransport({ rooms, roomId, fetchImpl = null, timeoutMs = TI
   };
 }
 
+/**
+ * Walk back a share whose remote half succeeded and whose local half did not.
+ *
+ * The invariant this exists to hold: after any local setup failure, EITHER the
+ * remote room/membership is confirmed gone and the credential may be
+ * discarded, OR the credential is retained so the deletion can be retried.
+ * Never neither. The version this replaces did `await abandonRoom(...)`,
+ * ignored the answer, and then forgot the room unconditionally — so a DELETE
+ * that failed left a room on the relay with nothing anywhere able to remove
+ * it, and the caller could not tell.
+ *
+ * `abandon` is injected so this can be driven both ways without a network.
+ */
+async function undoSetup({ rooms, room, owner = false, abandon = abandonRoom, fetchImpl = null } = {}) {
+  if (!rooms || !room?.roomId) return { cleaned: false, retained: false };
+  const undone = await abandon({
+    relay: room.relay,
+    roomId: room.roomId,
+    token: room.token,
+    owner,
+    fetchImpl,
+  });
+  if (undone?.ok) {
+    rooms.forget(room.roomId);
+    return { cleaned: true, retained: false };
+  }
+  // The relay still has it. Keep the one credential that can take it away —
+  // sealed, unlinked from any project, and unable to read anything — so a
+  // later run can finish the job.
+  const retained = rooms.rememberCleanup?.({
+    roomId: room.roomId,
+    relay: room.relay,
+    token: room.token,
+    owner,
+  }) === true;
+  rooms.forget(room.roomId);
+  return { cleaned: false, retained, code: undone?.code || 'offline' };
+}
+
+/**
+ * Try again to delete what a failed setup left behind.
+ *
+ * Best effort and silent: nobody asked for this, it holds nothing readable,
+ * and the relay's own retention sweep removes it eventually anyway. Called
+ * when a project opens, which is the next moment there is a network.
+ */
+async function retryCleanups({ rooms, abandon = abandonRoom, fetchImpl = null, limit = 4 } = {}) {
+  const owed = rooms?.pendingCleanups?.() || [];
+  let done = 0;
+  for (const one of owed.slice(0, limit)) {
+    const undone = await abandon({ relay: one.relay, roomId: one.roomId, token: one.token, owner: one.owner, fetchImpl });
+    if (undone?.ok || undone?.code === 'unauthorized' || undone?.code === 'not_found') {
+      rooms.forgetCleanup(one.roomId);
+      done += 1;
+    }
+  }
+  return { done, owed: owed.length };
+}
+
 // The refusals that mean "try again in a moment" rather than "this is over".
 const TRANSIENT = new Set(['offline', 'timeout', 'busy', 'server', 'bad_response', 'unsupported', 'closed']);
 
@@ -610,6 +726,9 @@ module.exports = {
   createRoom,
   joinRoom,
   abandonRoom,
+  readBounded,
+  undoSetup,
+  retryCleanups,
   leaveOutcome,
   request,
   TIMEOUT_MS,

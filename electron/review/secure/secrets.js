@@ -449,6 +449,49 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     return true;
   }
 
+  /**
+   * A room or membership that still owes the relay a deletion.
+   *
+   * When setting up a share fails locally AFTER the relay has already made the
+   * room, Stacki tries to undo it immediately. If that DELETE cannot be
+   * delivered — the relay answered a moment ago and does not answer now — the
+   * credential that could undo it must not be thrown away, or nothing can ever
+   * clean it up. So it is kept here, sealed exactly like a room's secrets are,
+   * with no project pointed at it and no way to read anything: it is a token
+   * and an address, held only so the deletion can be retried.
+   */
+  function rememberCleanup({ roomId, relay, token, owner = false }) {
+    if (!isRoomId(roomId) || !isCredential(token)) return false;
+    const origin = relayOrigin(relay);
+    if (!origin) return false;
+    const data = read();
+    const cleanups = data.cleanups && typeof data.cleanups === 'object' ? { ...data.cleanups } : {};
+    if (Object.keys(cleanups).length >= MAX_ROOMS && !cleanups[roomId]) return false;
+    cleanups[roomId] = seal({ roomId, relay: origin, token, owner: owner === true, since: now() });
+    write({ ...data, version: 2, cleanups });
+    return true;
+  }
+
+  /** Everything still owed. Credentials included — callers must not publish them. */
+  function pendingCleanups() {
+    const data = read();
+    const raw = data.cleanups && typeof data.cleanups === 'object' ? data.cleanups : {};
+    return Object.values(raw)
+      .map(opened)
+      .filter((c) => c && isRoomId(c.roomId) && isCredential(c.token) && relayOrigin(c.relay))
+      .map((c) => ({ roomId: c.roomId, relay: relayOrigin(c.relay), token: c.token, owner: c.owner === true, since: c.since || 0 }))
+      .slice(0, MAX_ROOMS);
+  }
+
+  function forgetCleanup(roomId) {
+    const data = read();
+    const cleanups = { ...(data.cleanups || {}) };
+    if (!cleanups[roomId]) return false;
+    delete cleanups[roomId];
+    write({ ...data, cleanups });
+    return true;
+  }
+
   /** The signing identity kept from a room this machine has left, if any. */
   function dormantFor(roomId) {
     if (!roomId) return null;
@@ -529,6 +572,9 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     update,
     retire,
     dormantFor,
+    rememberCleanup,
+    pendingCleanups,
+    forgetCleanup,
     pin,
     learnName,
     forget,

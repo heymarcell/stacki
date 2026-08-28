@@ -41,7 +41,15 @@ const check = (what, condition, detail) => {
 
 const { createSecureRelay } = require('../relay/node/server.js');
 const { createSecureRooms, isProtectedBackend } = require('../electron/review/secure/secrets.js');
-const { createSecureTransport, createRoom, joinRoom, leaveOutcome } = require('../electron/review/secure/transport.js');
+const {
+  createSecureTransport,
+  createRoom,
+  joinRoom,
+  leaveOutcome,
+  undoSetup,
+  retryCleanups,
+  request,
+} = require('../electron/review/secure/transport.js');
 const { deriveKeys, senderIdFor, envelopeIdFor, sealEvent, openEnvelope, newSigningKeys } = require('../electron/review/secure/crypto.js');
 const { unpackCapability, shareLink, deepLink, deepLinkCapability } = require('../electron/review/secure/capability.js');
 const { checkRelay, describeRelay, relayFor, DEFAULT_RELAY } = require('../electron/review/secure/relays.js');
@@ -49,7 +57,7 @@ const { createReviewStore, scopeKey, fileFor } = require('../electron/review/sto
 const { syncOnce, createSyncer, createCatchUp, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS } = require('../electron/review/sync.js');
 const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
-const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION } = require('../relay/protocol.js');
+const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION, MAX_BODY_BYTES } = require('../relay/protocol.js');
 
 const say = (t) => fs.writeSync(1, `${t}\n`);
 
@@ -662,6 +670,222 @@ async function main() {
   check('and says it holds nothing readable', /nothing readable/i.test(orphaned.message || ''), orphaned.message);
   check('and it really did remain', live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n === roomsBeforeOrphan + 1);
   check('holding nothing at all', live.store.db.prepare('SELECT COUNT(*) AS n FROM envelopes').get().n >= 0);
+
+  // --- a relay that answers with more than Stacki will read ------------------
+  //
+  // A custom relay is somebody else's server: the one party in this design
+  // trusted for nothing. What it claims about its own size is a hint; what it
+  // actually sends is what gets counted. The version this replaces buffered
+  // the whole answer and then measured it, in UTF-16 code units.
+  {
+    const http = require('node:http');
+    const cap = MAX_BODY_BYTES;
+    let sentBytes = 0;
+    let mode = 'exact';
+    const hostile = http.createServer((req, res) => {
+      const write = (buf) => {
+        sentBytes += buf.length;
+        return res.write(buf);
+      };
+      if (mode === 'exact') {
+        // Valid JSON of exactly the cap, so the boundary itself is legal.
+        const head = '{"ok":true,"pad":"';
+        const tail = '"}';
+        const body = Buffer.concat([Buffer.from(head), Buffer.alloc(cap - head.length - tail.length, 0x78), Buffer.from(tail)]);
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) });
+        write(body);
+        return res.end();
+      }
+      if (mode === 'over') {
+        const head = '{"ok":true,"pad":"';
+        const tail = '"}';
+        const body = Buffer.concat([Buffer.from(head), Buffer.alloc(cap - head.length - tail.length + 1, 0x78), Buffer.from(tail)]);
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) });
+        write(body);
+        return res.end();
+      }
+      if (mode === 'lying') {
+        // Says it is small, then keeps going.
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': '20' });
+        const chunk = Buffer.alloc(65536, 0x78);
+        for (let i = 0; i < Math.ceil((cap * 3) / 65536); i++) write(chunk);
+        return res.end();
+      }
+      if (mode === 'multibyte') {
+        // Four bytes per character: half the code units, all of the bytes.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        const lock = Buffer.from(String.fromCodePoint(0x1f512), 'utf8');
+        const chunk = Buffer.concat(Array.from({ length: 16384 }, () => lock));
+        for (let i = 0; i < Math.ceil(cap / chunk.length) + 2; i++) write(chunk);
+        return res.end();
+      }
+      // 'endless' — chunked, no declared length, far more than the cap, and it
+      // keeps writing until somebody stops listening.
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const chunk = Buffer.alloc(65536, 0x78);
+      let open = true;
+      res.on('close', () => {
+        open = false;
+      });
+      const pump = () => {
+        while (open && sentBytes < cap * 40) {
+          if (!write(chunk)) return res.once('drain', pump);
+        }
+        if (open) res.end();
+      };
+      pump();
+    });
+    const hostilePort = await freePort();
+    await new Promise((resolve, reject) => {
+      hostile.once('error', reject);
+      hostile.listen(hostilePort, '127.0.0.1', resolve);
+    });
+    const ask = () => request(`http://127.0.0.1:${hostilePort}`, '/health', { timeoutMs: 20000 });
+
+    mode = 'exact';
+    sentBytes = 0;
+    const atCap = await ask();
+    check('a response of exactly the maximum is read', atCap.ok === true, JSON.stringify(atCap).slice(0, 120));
+
+    mode = 'over';
+    sentBytes = 0;
+    const overCap = await ask();
+    check('one byte over the maximum is refused', overCap.ok === false && overCap.code === 'too_large', JSON.stringify(overCap).slice(0, 120));
+    check('and refused on the declared length, before it was consumed', sentBytes === 0 || sentBytes <= cap + 64, `${sentBytes} bytes sent`);
+
+    // Under-declaring is handled a layer down: HTTP framing is authoritative,
+    // so the runtime hands over only the declared bytes and the rest is never
+    // read. What matters is that it is refused and nothing over-buffered —
+    // not which of the two refusals it earns.
+    mode = 'lying';
+    sentBytes = 0;
+    const lied = await ask();
+    check('a relay that lies about its length is refused', lied.ok === false, JSON.stringify(lied).slice(0, 120));
+    check('with a named reason rather than a crash', ['too_large', 'bad_response'].includes(lied.code), lied.code);
+
+    mode = 'multibyte';
+    sentBytes = 0;
+    const wide = await ask();
+    check('multibyte characters are counted as the bytes they are', wide.ok === false && wide.code === 'too_large', JSON.stringify(wide).slice(0, 120));
+
+    // THE ONE THAT MATTERS. The sender is willing to keep going for forty
+    // times the cap; Stacki must stop long before it finishes.
+    mode = 'endless';
+    sentBytes = 0;
+    const endless = await ask();
+    check('an endless response is refused', endless.ok === false && endless.code === 'too_large', JSON.stringify(endless).slice(0, 120));
+    check(
+      'and Stacki stopped reading long before the sender stopped sending',
+      sentBytes < cap * 8,
+      `${sentBytes} bytes were sent for a ${cap}-byte cap`
+    );
+
+    await new Promise((resolve) => {
+      hostile.close(resolve);
+      hostile.closeAllConnections?.();
+    });
+  }
+
+  // --- setting up got as far as the relay and no further ---------------------
+  //
+  // The invariant: after ANY local failure that follows a remote success,
+  // either the remote thing is confirmed gone and the credential may go with
+  // it, or the credential is kept so the deletion can be retried. Never
+  // neither — which is what the previous version did, because it ignored the
+  // DELETE's answer and forgot the room regardless.
+  const undoHost = makePerson('undohost', ALICE);
+  const undoRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: undoHost.rooms });
+  check('a room to walk back exists', undoRoom.ok, undoRoom.code);
+
+  const cleaned = await undoSetup({
+    rooms: undoHost.rooms,
+    room: undoRoom.room,
+    owner: true,
+    abandon: async () => ({ ok: true }),
+  });
+  check('a confirmed cleanup reports itself cleaned', cleaned.cleaned === true, JSON.stringify(cleaned));
+  check('and nothing is retained', cleaned.retained === false);
+  check('the room is gone locally', undoHost.rooms.get(undoRoom.room.roomId) === null);
+  check('and nothing is owed', undoHost.rooms.pendingCleanups().length === 0);
+
+  const stuckHost = makePerson('stuckhost', ALICE);
+  const stuckRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: stuckHost.rooms });
+  const stuck = await undoSetup({
+    rooms: stuckHost.rooms,
+    room: stuckRoom.room,
+    owner: true,
+    abandon: async () => ({ ok: false, code: 'offline' }),
+  });
+  check('a cleanup that could not be delivered says so', stuck.cleaned === false, JSON.stringify(stuck));
+  check('and keeps what it needs to try again', stuck.retained === true);
+  check('the room is no longer usable', stuckHost.rooms.get(stuckRoom.room.roomId) === null);
+  const owed = stuckHost.rooms.pendingCleanups();
+  check('but the debt is recorded', owed.length === 1 && owed[0].roomId === stuckRoom.room.roomId, JSON.stringify(owed.map((o) => o.roomId)));
+  check('with the credential that can settle it', owed[0].token === stuckRoom.room.token);
+  check('and knowing it was the owner', owed[0].owner === true);
+  check('and where to settle it', owed[0].relay === liveBase);
+  // Sealed like everything else, and holding nothing readable.
+  const stuckDisk = fs.readFileSync(stuckHost.rooms.file, 'utf8');
+  check('the retained credential is not in the clear on disk', !stuckDisk.includes(stuckRoom.room.token), stuckDisk.slice(0, 120));
+  check('and no room secret was retained with it', !stuckDisk.includes(stuckRoom.room.secret));
+  check('nor a signing key', !stuckDisk.includes(stuckRoom.room.privateKey));
+
+  // And a later run finishes the job.
+  const settled = await retryCleanups({ rooms: stuckHost.rooms });
+  check('a retry settles the debt', settled.done === 1, JSON.stringify(settled));
+  check('and it is forgotten', stuckHost.rooms.pendingCleanups().length === 0);
+  check('the relay really did lose the room', !live.store.roomFor(stuckRoom.room.roomId));
+
+  // A retry that still cannot reach the relay keeps the debt rather than
+  // silently dropping it.
+  const patientHost = makePerson('patient', ALICE);
+  const patientRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: patientHost.rooms });
+  await undoSetup({ rooms: patientHost.rooms, room: patientRoom.room, owner: true, abandon: async () => ({ ok: false, code: 'offline' }) });
+  const stillOwed = await retryCleanups({ rooms: patientHost.rooms, abandon: async () => ({ ok: false, code: 'offline' }) });
+  check('a retry that fails settles nothing', stillOwed.done === 0, JSON.stringify(stillOwed));
+  check('and the debt survives for next time', patientHost.rooms.pendingCleanups().length === 1);
+  // A membership the relay no longer recognises is settled too — there is
+  // nothing left to delete.
+  const gone = await retryCleanups({ rooms: patientHost.rooms, abandon: async () => ({ ok: false, code: 'unauthorized' }) });
+  check('a membership the relay has already lost counts as settled', gone.done === 1 && patientHost.rooms.pendingCleanups().length === 0);
+
+  // A JOIN walked back gives the membership up rather than the room.
+  const jHost = makePerson('joinundo', ALICE);
+  const jRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: jHost.rooms });
+  const jInvite = await createSecureTransport({ rooms: jHost.rooms, roomId: jRoom.room.roomId }).createInvite({});
+  const jGuest = makePerson('joinguest', BOB);
+  const jJoined = await joinRoom({ capability: jInvite.capability, actor: BOB, rooms: jGuest.rooms });
+  check('a guest joined', jJoined.ok, jJoined.code);
+  const membersBeforeUndo = live.store.membersOf(jRoom.room.roomId).filter((m) => !m.leftAt).length;
+  const jUndone = await undoSetup({ rooms: jGuest.rooms, room: jJoined.room, owner: false });
+  check('walking a join back is confirmed', jUndone.cleaned === true, JSON.stringify(jUndone));
+  check('and the membership is given up', live.store.membersOf(jRoom.room.roomId).filter((m) => !m.leftAt).length === membersBeforeUndo - 1);
+  check('while the room itself survives', !!live.store.roomFor(jRoom.room.roomId));
+
+  // A LOCAL WRITE THAT THROWS must not skip the walk-back. `undoSetup` is
+  // reached by the caller's try/catch; what is checked here is that a
+  // registry which throws does not take the cleanup with it.
+  const throwingRooms = () => {
+    const real = createSecureRooms({ userDataPath: mkdir('throwing'), protector });
+    return {
+      ...real,
+      link: () => {
+        throw new Error('the disk said no');
+      },
+    };
+  };
+  const throwHost = makePerson('throwhost', ALICE);
+  const throwRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: throwHost.rooms });
+  let threw = false;
+  try {
+    throwingRooms().link('x', 'y');
+  } catch {
+    threw = true;
+  }
+  check('a registry can throw on write', threw);
+  const afterThrow = await undoSetup({ rooms: throwHost.rooms, room: throwRoom.room, owner: true });
+  check('and the walk-back still runs and confirms', afterThrow.cleaned === true, JSON.stringify(afterThrow));
+  check('leaving nothing owed', throwHost.rooms.pendingCleanups().length === 0);
 
   // --- what may cross IPC ---------------------------------------------------
   //

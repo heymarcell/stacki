@@ -59,6 +59,8 @@ const {
   createRoom: createSecureRoom,
   joinRoom: joinSecureRoom,
   abandonRoom,
+  undoSetup,
+  retryCleanups,
   leaveOutcome,
 } = require('./secure/transport');
 const { unpackCapability, packCapability, shareLink } = require('./secure/capability');
@@ -214,6 +216,9 @@ function openProject(next) {
   // immediately and grows the rest when it arrives.
   reviseCatchUp();
   if (workspace || room) void syncNow('open');
+  // Anything a failed setup could not take back. Silent and best effort: it
+  // holds nothing readable and the relay sweeps it eventually anyway.
+  if (secureRooms?.pendingCleanups?.().length) void retryCleanups({ rooms: secureRooms });
   return store;
 }
 
@@ -520,32 +525,57 @@ async function enableSecureShare({ relay = null, publishExisting = false } = {})
   const made = await createSecureRoom({ relay: origin.origin, actor, rooms: secureRooms });
   if (!made.ok) return made;
 
-  // From here the room exists on a relay, and every remaining step can fail.
-  // None of them may be allowed to leave a room nobody is in or a ledger
-  // pointed at a share this machine cannot reach — so each is checked and each
-  // failure walks the whole thing back, remotely and locally.
-  const undo = async (why) => {
-    await abandonRoom({ relay: made.room.relay, roomId: made.room.roomId, token: made.room.token, owner: true });
-    secureRooms.unlink(scopeKey(projectPath));
-    secureRooms.forget(made.room.roomId);
-    room = null;
+  // From here the room exists on a relay, and every remaining step can fail —
+  // including by THROWING, because linking and enabling both write files. A
+  // throw that escaped this function would skip the walk-back entirely and
+  // leave a room on the relay with nothing able to remove it, so the whole
+  // remainder runs inside one try and every exit goes through `undo`.
+  const undo = (why) => finishFailed({ room: made.room, owner: true, why });
+  try {
+    if (!secureRooms.link(scopeKey(projectPath), made.room.roomId)) {
+      return await undo('Stacki could not link this project to the new secure share, so it was not created.');
+    }
+    room = made.room;
+    workspace = null;
     reviseCatchUp();
-    return { ok: false, code: 'not_stored', message: why };
-  };
+    const turned = store.enableShared({ workspaceId: made.room.roomId, publishExisting });
+    if (!turned.ok) {
+      // The undo's answer is the answer. It is the one that knows whether the
+      // relay still has a room, which is the part somebody may have to act on.
+      return await undo(turned.message || 'Stacki could not turn on sharing for this project, so the share was not created.');
+    }
+    const synced = await syncNow('enable');
+    return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+  } catch (err) {
+    return await undo(`Stacki could not finish setting up this secure share (${err?.message || 'unknown error'}).`);
+  }
+}
 
-  if (!secureRooms.link(scopeKey(projectPath), made.room.roomId)) {
-    return undo('Stacki could not link this project to the new secure share, so it was not created.');
+/**
+ * A setup that got as far as the relay and no further.
+ *
+ * One place, so both create and join say the same true thing. The result
+ * distinguishes the two outcomes that matter to a person: it was undone, or it
+ * was not and Stacki has kept what it needs to try again.
+ */
+async function finishFailed({ room: made, owner, why }) {
+  const undone = await undoSetup({ rooms: secureRooms, room: made, owner });
+  try {
+    secureRooms.unlink(scopeKey(projectPath));
+  } catch {
+    /* the link is gone or was never made; either way nothing points at it */
   }
-  room = made.room;
-  workspace = null;
+  room = null;
   reviseCatchUp();
-  const turned = store.enableShared({ workspaceId: made.room.roomId, publishExisting });
-  if (!turned.ok) {
-    await undo(turned.message || 'Stacki could not turn on sharing for this project, so the share was not created.');
-    return turned;
-  }
-  const synced = await syncNow('enable');
-  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+  // The ledger must not be left pointed at a share this machine cannot reach.
+  if (store?.shared?.workspaceId === made.roomId) store.disableShared();
+  if (undone.cleaned) return { ok: false, code: 'not_stored', message: why };
+  return {
+    ok: false,
+    code: 'not_stored_needs_cleanup',
+    message: `${why} Stacki could not reach the relay to remove what it had already made, and will try again later. It holds nothing readable.`,
+    retained: undone.retained,
+  };
 }
 
 /**
@@ -614,29 +644,25 @@ async function joinSecureShare({ publishExisting = false } = {}) {
 
   // The invitation is spent. Anything that fails now has to give the
   // membership back rather than leave somebody holding a share they cannot
-  // reach and an invitation they cannot reuse.
-  const undo = async (why) => {
-    await abandonRoom({ relay: joined.room.relay, roomId: joined.room.roomId, token: joined.room.token, owner: false });
-    secureRooms.unlink(scopeKey(projectPath));
-    secureRooms.forget(joined.room.roomId);
-    room = null;
+  // reach and an invitation they cannot reuse — including a local write that
+  // throws, which is why the whole remainder is inside one try.
+  const undo = (why) => finishFailed({ room: joined.room, owner: false, why });
+  try {
+    if (!secureRooms.link(scopeKey(projectPath), joined.room.roomId)) {
+      return await undo('Stacki could not link this project to that secure share. Ask for a new invitation.');
+    }
+    room = joined.room;
+    workspace = null;
     reviseCatchUp();
-    return { ok: false, code: 'not_stored', message: why };
-  };
-
-  if (!secureRooms.link(scopeKey(projectPath), joined.room.roomId)) {
-    return undo('Stacki could not link this project to that secure share. Ask for a new invitation.');
+    const turned = store.enableShared({ workspaceId: joined.room.roomId, publishExisting });
+    if (!turned.ok) {
+      return await undo(turned.message || 'Stacki could not turn on sharing for this project. Ask for a new invitation.');
+    }
+    const synced = await syncNow('join');
+    return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
+  } catch (err) {
+    return await undo(`Stacki could not finish joining this secure share (${err?.message || 'unknown error'}).`);
   }
-  room = joined.room;
-  workspace = null;
-  reviseCatchUp();
-  const turned = store.enableShared({ workspaceId: joined.room.roomId, publishExisting });
-  if (!turned.ok) {
-    await undo(turned.message || 'Stacki could not turn on sharing for this project. Ask for a new invitation.');
-    return turned;
-  }
-  const synced = await syncNow('join');
-  return { ok: true, shared: sharedStatus(), published: turned.published, sync: synced };
 }
 
 /**
