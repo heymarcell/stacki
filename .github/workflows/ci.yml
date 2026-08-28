@@ -1,0 +1,157 @@
+# Run the tests on every change, rather than discovering at release time that
+# something broke weeks ago.
+#
+# `release.yml` only fires on a `v*` tag, so until this existed nothing on
+# GitHub ever ran the suite. Three jobs, split by what they actually need:
+#
+#   core     — the whole suite, on Linux, where 128 of 131 files run
+#   protocol — the encryption, both relays, and the workerd runtime
+#   macos    — the parts that are genuinely about macOS: the packaged bundle,
+#              the built app, and Launch Services
+#
+# WHAT THIS MUST NOT TOUCH: a real keychain, a real Cloudflare account, Apple
+# signing material, the user's projects, or a real userData directory. Every
+# harness makes its own temp fixtures and removes them; nothing here logs in
+# anywhere. The Cloudflare tests run against workerd locally and need no
+# account.
+#
+# Node 24 rather than the 22 in release.yml: `relay/node/store.js` uses
+# `node:sqlite`, which is only usable without a flag from 24 onwards.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push supersedes an older run on the same ref, except on main, where
+# every commit's result is worth keeping.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # No harness may open a dialog: one that does would wait for a click that is
+  # never coming, and the job would burn its timeout instead of failing.
+  STACKI_NO_DIALOGS: '1'
+  STACKI_CANVAS_OFFLINE: '1'
+
+jobs:
+  core:
+    name: core suite (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-
+      # Electron needs a handful of shared libraries that the runner image does
+      # not carry, and a display. Three of the 131 suites drive the real binary;
+      # the rest load electron/main.js with a stub and need neither.
+      - name: Libraries Electron links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
+            libdrm2 libxkbcommon0 libatk-bridge2.0-0 libatk1.0-0 libcups2
+      - run: npm ci
+      - name: npm test
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm test
+
+  protocol:
+    name: secure protocol + cloudflare (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-
+      - name: Libraries Electron links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
+            libdrm2 libxkbcommon0 libatk-bridge2.0-0 libatk1.0-0 libcups2
+      - run: npm ci
+      # The Worker's own dependencies, including the workerd runtime the
+      # conformance suite runs inside.
+      - run: npm ci --prefix relay/cloudflare
+
+      - name: fixed vectors and the cryptography
+        run: npm run test:securecrypto
+      # The shared conformance suite runs inside this one for the Node relay,
+      # and inside the Cloudflare job below for the Worker. If the two ever
+      # disagree about what the protocol means, one of them fails it.
+      - name: the Node relay
+        run: npm run test:securerelay
+      - name: two clients over a relay
+        run: npm run test:secureshare
+      - name: the Worker, in workerd, against a real Durable Object
+        run: npm run relay:cf:test
+      - name: the share page, in a real browser
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run test:sharepage
+      # Each guard removed in turn, in the real files, to check something
+      # notices. The suite restores every file and verifies it byte-identical.
+      - name: the sabotage campaign
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run test:securesabotage
+
+  macos:
+    name: packaged acceptance (macos)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-electron-
+      - run: npm ci
+
+      # What ships inside the bundle, and what the bundle tells the operating
+      # system. Reads the config rather than the built app, so it is quick and
+      # runs before the ten-minute build.
+      - name: what the package declares
+        run: npm run test:packaging
+
+      # Unsigned deliberately: no Apple credentials reach CI, and none are
+      # needed to prove the bundle is correct.
+      - name: build the unsigned app
+        run: npm run dist:mac:unsigned
+
+      # The real bundle, the real open(1), the real renderer. This is the only
+      # thing that proves a clicked invitation reaches an app that was not
+      # already running, because Launch Services consults the bundle and not a
+      # runtime call.
+      - name: a stacki:// link through Launch Services
+        run: npm run test:packageddeeplink
+
+      # Every Secure Share state, asserted before capture, at five window
+      # sizes. Kept here rather than trusted to a screenshot diff: the harness
+      # asserts the DOM it is about to photograph.
+      - name: the Secure Share states
+        run: npm run test:secureshareui
