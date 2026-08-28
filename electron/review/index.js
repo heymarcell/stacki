@@ -558,7 +558,15 @@ async function enableSecureShare({ relay = null, publishExisting = false } = {})
  * was not and Stacki has kept what it needs to try again.
  */
 async function finishFailed({ room: made, owner, why }) {
-  const undone = await undoSetup({ rooms: secureRooms, room: made, owner });
+  // The walk-back itself must not throw on the way out of a failure — a
+  // registry that has started refusing writes is exactly the situation this
+  // runs in, and an exception here would escape the `catch` that called it.
+  let undone;
+  try {
+    undone = await undoSetup({ rooms: secureRooms, room: made, owner });
+  } catch {
+    undone = { cleaned: false, retained: false, held: true };
+  }
   try {
     secureRooms.unlink(scopeKey(projectPath));
   } catch {
@@ -573,7 +581,10 @@ async function finishFailed({ room: made, owner, why }) {
     ok: false,
     code: 'not_stored_needs_cleanup',
     message: `${why} Stacki could not reach the relay to remove what it had already made, and will try again later. It holds nothing readable.`,
-    retained: undone.retained,
+    retained: undone.retained === true,
+    // Neither deleted nor written down as owed: the room record itself was
+    // kept as the last thing able to delete it. `retryCleanups` looks for it.
+    held: undone.held === true,
   };
 }
 

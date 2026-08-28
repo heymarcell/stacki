@@ -480,20 +480,103 @@ async function undoSetup({ rooms, room, owner = false, abandon = abandonRoom, fe
     fetchImpl,
   });
   if (undone?.ok) {
-    rooms.forget(room.roomId);
-    return { cleaned: true, retained: false };
+    forgetQuietly(rooms, room.roomId);
+    return { cleaned: true, retained: false, held: false };
   }
   // The relay still has it. Keep the one credential that can take it away —
   // sealed, unlinked from any project, and unable to read anything — so a
   // later run can finish the job.
-  const retained = rooms.rememberCleanup?.({
-    roomId: room.roomId,
+  let retained = false;
+  try {
+    retained = rooms.rememberCleanup?.({
+      roomId: room.roomId,
+      relay: room.relay,
+      token: room.token,
+      owner,
+    }) === true;
+  } catch {
+    retained = false; // a registry that throws is a registry that did not store it
+  }
+  if (retained) {
+    forgetQuietly(rooms, room.roomId);
+    return { cleaned: false, retained: true, held: false, code: undone?.code || 'offline' };
+  }
+
+  // NEITHER CONFIRMED NOR RECORDED — so the room record STAYS.
+  //
+  // This is the third corner the invariant has, and the version this replaces
+  // fell into it: it forgot the room whether or not the cleanup record had
+  // been written. Both of those failing together is not exotic — the disk that
+  // could not store the room is the same disk that cannot store a note about
+  // it — and the result was a room on a relay with no credential anywhere able
+  // to remove it.
+  //
+  // Leaving the record is the one recovery step that needs no write, which is
+  // exactly why it is the right one here. The caller unlinks the project and
+  // turns sharing off, so nothing points at it and nothing pretends it worked;
+  // `retryCleanups` finds it again through `orphanedRooms()`.
+  return { cleaned: false, retained: false, held: true, code: undone?.code || 'offline' };
+}
+
+/** Forgetting must never be the thing that throws on the way out of a walk-back. */
+function forgetQuietly(rooms, roomId) {
+  try {
+    rooms.forget(roomId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remember a room whose remote half already exists — or take the remote half
+ * back.
+ *
+ * Both setup paths reach a point where the relay has made something real and
+ * this machine has not yet written it down. What happens next is the whole of
+ * the "never neither" invariant, and it used to be written out twice, slightly
+ * differently, with the same two holes in each copy:
+ *
+ *   `rooms.remember()` can THROW as well as return false. `write()` is a
+ *   `writeFileSync` and a `renameSync` with nothing around them, so a full
+ *   disk, a read-only volume or an EACCES leaves by exception — and an
+ *   exception walked straight out of `createRoom`/`joinRoom` past every line
+ *   of compensation. A local write that failed loudly got LESS cleanup than
+ *   one that failed quietly.
+ *
+ *   A failed DELETE dropped the credential. The caller was told an empty room
+ *   might remain, which was true, and the only token able to remove it was
+ *   discarded in the same breath, which made that permanent.
+ *
+ * So both are one class here — REMOTE STATE EXISTS, LOCAL STATE DID NOT
+ * COMPLETE — and it ends in exactly one of: cleaned, or retained for retry.
+ */
+async function storeOrUndo({ rooms, room, owner = false, abandon = abandonRoom, fetchImpl = null, timeoutMs = TIMEOUT_MS } = {}) {
+  let stored = null;
+  try {
+    stored = rooms.remember(room);
+  } catch {
+    stored = null; // a throw and a refusal mean the same thing to the relay
+  }
+  if (stored) return { ok: true, room: stored };
+
+  const undone = await abandon({
     relay: room.relay,
+    roomId: room.roomId,
     token: room.token,
     owner,
-  }) === true;
-  rooms.forget(room.roomId);
-  return { cleaned: false, retained, code: undone?.code || 'offline' };
+    fetchImpl,
+    timeoutMs,
+  });
+  if (undone?.ok) return { ok: false, cleaned: true, retained: false };
+
+  let retained = false;
+  try {
+    retained = rooms.rememberCleanup?.({ roomId: room.roomId, relay: room.relay, token: room.token, owner }) === true;
+  } catch {
+    retained = false;
+  }
+  return { ok: false, cleaned: false, retained, code: undone?.code || 'offline' };
 }
 
 /**
@@ -504,16 +587,34 @@ async function undoSetup({ rooms, room, owner = false, abandon = abandonRoom, fe
  * when a project opens, which is the next moment there is a network.
  */
 async function retryCleanups({ rooms, abandon = abandonRoom, fetchImpl = null, limit = 4 } = {}) {
-  const owed = rooms?.pendingCleanups?.() || [];
+  // The relay agreeing it is gone, and the relay saying it never heard of it,
+  // are the same outcome: there is nothing left to delete.
+  const settled = (r) => r?.ok === true || r?.code === 'unauthorized' || r?.code === 'not_found';
   let done = 0;
+
+  const owed = rooms?.pendingCleanups?.() || [];
   for (const one of owed.slice(0, limit)) {
     const undone = await abandon({ relay: one.relay, roomId: one.roomId, token: one.token, owner: one.owner, fetchImpl });
-    if (undone?.ok || undone?.code === 'unauthorized' || undone?.code === 'not_found') {
+    if (settled(undone)) {
       rooms.forgetCleanup(one.roomId);
       done += 1;
     }
   }
-  return { done, owed: owed.length };
+
+  // And the rooms held back because even the note could not be written. They
+  // have no cleanup record — they ARE the record. See `orphanedRooms()`.
+  const orphans = rooms?.orphanedRooms?.() || [];
+  for (const one of orphans.slice(0, limit)) {
+    const undone = await abandon({ relay: one.relay, roomId: one.roomId, token: one.token, owner: one.owner, fetchImpl });
+    if (settled(undone)) {
+      forgetQuietly(rooms, one.roomId);
+      done += 1;
+    }
+    // If it still cannot be delivered, the room stays exactly where it is and
+    // is found again next time. Nothing is promoted, nothing is deleted.
+  }
+
+  return { done, owed: owed.length + orphans.length, held: orphans.length };
 }
 
 // The refusals that mean "try again in a moment" rather than "this is over".
@@ -597,32 +698,39 @@ async function createRoom({ relay, actor, rooms, fetchImpl = null, timeoutMs = T
   const token = answer.body?.credential?.token;
   if (!token) return fail('bad_response', 'The secure relay did not issue a credential.');
 
-  const stored = rooms.remember({
-    roomId,
-    relay: origin,
-    secret,
-    token,
-    privateKey,
-    publicKey,
-    senderId,
-    actorId: actor.id,
-    isOwner: true,
-    pins: { [senderId]: publicKey },
-    names: {},
+  // The room exists on the relay and this machine has not written it down yet.
+  // Everything from here is `storeOrUndo`: stored, or taken back, or kept so
+  // it can be taken back later. Never neither.
+  const kept = await storeOrUndo({
+    rooms,
+    owner: true,
+    fetchImpl,
+    timeoutMs,
+    room: {
+      roomId,
+      relay: origin,
+      secret,
+      token,
+      privateKey,
+      publicKey,
+      senderId,
+      actorId: actor.id,
+      isOwner: true,
+      pins: { [senderId]: publicKey },
+      names: {},
+    },
   });
-  if (!stored) {
-    // The room exists on the relay and this machine cannot remember it. Undo
-    // it now, with the credential still in hand — a moment later there is no
-    // way to reach it at all.
-    const undone = await abandonRoom({ relay: origin, roomId, token, owner: true, fetchImpl, timeoutMs });
-    return fail(
-      'not_stored',
-      undone.ok
-        ? 'Stacki could not store this secure share, so it was not created.'
-        : 'Stacki could not store this secure share. An empty room may remain on the relay; it holds nothing readable and is removed automatically.'
-    );
-  }
-  return { ok: true, room: stored };
+  if (kept.ok) return { ok: true, room: kept.room };
+  if (kept.cleaned) return fail('not_stored', 'Stacki could not store this secure share, so it was not created.');
+  return {
+    ...fail(
+      'not_stored_needs_cleanup',
+      kept.retained
+        ? 'Stacki could not store this secure share, and could not reach the relay to remove the empty room it had already made. It will try again later. The room holds nothing readable.'
+        : 'Stacki could not store this secure share, and could not reach the relay to remove the empty room it had already made. It holds nothing readable and the relay removes it automatically.'
+    ),
+    retained: kept.retained,
+  };
 }
 
 /**
@@ -699,26 +807,23 @@ async function joinRoom({ capability, actor, rooms, fetchImpl = null, timeoutMs 
     pins,
     names: {},
   };
-  const stored = rooms.remember(remembered);
-  if (!stored) {
-    // The invitation is spent and the membership exists. Give it back now,
-    // while the token that can is still in hand.
-    const undone = await abandonRoom({
-      relay: invitation.relay,
-      roomId: invitation.roomId,
-      token,
-      owner: false,
-      fetchImpl,
-      timeoutMs,
-    });
-    return fail(
-      'not_stored',
-      undone.ok
-        ? 'Stacki could not store this secure share, so it did not join. Ask for a new invitation.'
-        : 'Stacki could not store this secure share. Ask for a new invitation.'
-    );
+  // The invitation is spent and the membership exists. Same invariant as
+  // creating: give it back now while the token that can is still in hand, or
+  // keep that token so it can be given back later.
+  const outcome = await storeOrUndo({ rooms, room: remembered, owner: false, fetchImpl, timeoutMs });
+  if (outcome.ok) return { ok: true, room: outcome.room };
+  if (outcome.cleaned) {
+    return fail('not_stored', 'Stacki could not store this secure share, so it did not join. Ask for a new invitation.');
   }
-  return { ok: true, room: stored };
+  return {
+    ...fail(
+      'not_stored_needs_cleanup',
+      outcome.retained
+        ? 'Stacki could not store this secure share, and could not reach the relay to give the membership back. It will try again later. Ask for a new invitation.'
+        : 'Stacki could not store this secure share, and could not reach the relay to give the membership back. Ask for a new invitation.'
+    ),
+    retained: outcome.retained,
+  };
 }
 
 module.exports = {
@@ -728,6 +833,7 @@ module.exports = {
   abandonRoom,
   readBounded,
   undoSetup,
+  storeOrUndo,
   retryCleanups,
   leaveOutcome,
   request,

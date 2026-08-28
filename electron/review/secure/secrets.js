@@ -492,6 +492,37 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     return true;
   }
 
+  /**
+   * Live rooms that nothing points at any more.
+   *
+   * THE LAST-RESORT HALF OF "NEVER NEITHER". When setting up a share fails
+   * after the relay has already made the room, Stacki tries to delete it, and
+   * failing that writes a pending-cleanup record. Both of those can be
+   * unavailable at once — a full disk is exactly the thing that makes the
+   * local write fail in the first place, and the same full disk cannot store
+   * a cleanup record either. Discarding the room then would leave a room on a
+   * relay with nothing anywhere able to remove it.
+   *
+   * So in that case the room record is LEFT WHERE IT IS. That takes no write,
+   * which is the point: it is the only recovery step available on a
+   * filesystem that has stopped accepting them. The caller has already
+   * unlinked the project, so what remains is a room with a live credential
+   * and nothing referring to it — and that, exactly, is what this finds.
+   *
+   * No new stored state, no new flag to keep in step. An active room no
+   * project points at cannot arise any other way: linking follows remembering
+   * immediately, leaving goes through `retire` (which drops the token), and
+   * ending goes through `forget`.
+   */
+  function orphanedRooms() {
+    const data = read();
+    const projects = data.projects && typeof data.projects === 'object' ? data.projects : {};
+    const claimed = new Set(Object.values(projects).map((v) => v?.roomId).filter(Boolean));
+    return all()
+      .filter((room) => room && !room.dormant && isCredential(room.token) && !claimed.has(room.roomId))
+      .map((room) => ({ roomId: room.roomId, relay: room.relay, token: room.token, owner: room.isOwner === true }));
+  }
+
   /** The signing identity kept from a room this machine has left, if any. */
   function dormantFor(roomId) {
     if (!roomId) return null;
@@ -575,6 +606,7 @@ function createSecureRooms({ userDataPath, protector = null, now = Date.now } = 
     rememberCleanup,
     pendingCleanups,
     forgetCleanup,
+    orphanedRooms,
     pin,
     learnName,
     forget,

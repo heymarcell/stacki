@@ -637,42 +637,183 @@ async function main() {
     return { ...real, remember: () => null };
   };
 
-  const roomsBefore = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
-  const cannotStore = await createRoom({ relay: liveBase, actor: ALICE, rooms: brokenRooms('create') });
-  check('a create that cannot be stored locally fails', cannotStore.ok === false && cannotStore.code === 'not_stored', JSON.stringify(cannotStore));
-  check('and says so without blaming the network', /could not store/i.test(cannotStore.message || ''), cannotStore.message);
-  const roomsAfter = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
-  check('and the room it made was removed from the relay', roomsAfter === roomsBefore, `${roomsBefore} then ${roomsAfter}`);
-
-  const joinHost = makePerson('joinhost', ALICE);
-  const jhRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: joinHost.rooms });
-  const jhInvite = await createSecureTransport({ rooms: joinHost.rooms, roomId: jhRoom.room.roomId }).createInvite({});
-  const membersBefore = live.store.membersOf(jhRoom.room.roomId).filter((m) => !m.leftAt).length;
-  const cannotJoin = await joinRoom({ capability: jhInvite.capability, actor: BOB, rooms: brokenRooms('join') });
-  check('a join that cannot be stored locally fails', cannotJoin.ok === false && cannotJoin.code === 'not_stored', JSON.stringify(cannotJoin));
-  check('and tells the person to ask for a new invitation', /new invitation/i.test(cannotJoin.message || ''), cannotJoin.message);
-  const membersAfter = live.store.membersOf(jhRoom.room.roomId).filter((m) => !m.leftAt).length;
-  check('and the membership it took was given back', membersAfter === membersBefore, `${membersBefore} then ${membersAfter}`);
-  check('so nobody is left holding a share they cannot reach', membersAfter === 1);
-
-  // COMPENSATION THAT ITSELF FAILS. The room really is created, the local
-  // store really does refuse it, and the DELETE that would undo it really does
-  // not get through — a relay that answered a moment ago and does not answer
-  // now. Stacki must say what it left behind rather than imply it cleaned up.
+  // A LOCAL WRITE FAILS IN TWO SHAPES, AND THEY MUST BE THE SAME CLASS.
+  //
+  // `remember()` returns null for a refusal — quota, a value that will not
+  // validate. It THROWS for everything a disk does: `write()` is a bare
+  // `writeFileSync` and `renameSync` with nothing around them, so ENOSPC,
+  // EACCES, EROFS and EIO all leave by exception. The version this replaces
+  // compensated for the first and let the second walk straight out of
+  // `createRoom`/`joinRoom` past every line of cleanup — a local failure that
+  // was LOUDER got LESS cleanup, and left a room on the relay with nothing
+  // able to remove it.
+  const refusingRooms = (why, how) => {
+    const real = createSecureRooms({ userDataPath: mkdir(`refusing-${why}`), protector });
+    return {
+      ...real,
+      remember:
+        how === 'throw'
+          ? () => {
+              throw new Error('ENOSPC: no space left on device');
+            }
+          : () => null,
+    };
+  };
+  const countRooms = () => live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
+  const liveMembers = (roomId) => live.store.membersOf(roomId).filter((m) => !m.leftAt).length;
+  // A relay that answered a moment ago and will not answer this one request.
   const noDelete = async (url, init = {}) =>
     (init.method || 'GET') === 'DELETE' ? Promise.reject(new Error('gone')) : fetch(url, init);
-  const roomsBeforeOrphan = live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n;
-  const orphaned = await createRoom({
-    relay: liveBase,
-    actor: ALICE,
-    rooms: brokenRooms('orphan'),
-    fetchImpl: noDelete,
-  });
-  check('a create whose cleanup cannot get through fails', orphaned.ok === false && orphaned.code === 'not_stored', JSON.stringify(orphaned));
-  check('and is honest that something may remain', /may remain/i.test(orphaned.message || ''), orphaned.message);
-  check('and says it holds nothing readable', /nothing readable/i.test(orphaned.message || ''), orphaned.message);
-  check('and it really did remain', live.store.db.prepare('SELECT COUNT(*) AS n FROM rooms').get().n === roomsBeforeOrphan + 1);
-  check('holding nothing at all', live.store.db.prepare('SELECT COUNT(*) AS n FROM envelopes').get().n >= 0);
+
+  for (const how of ['false', 'throw']) {
+    const shape = how === 'throw' ? 'throws' : 'refuses';
+
+    // --- CASE 1 / CASE 3 — cleanup gets through -----------------------------
+    const before1 = countRooms();
+    const rooms1 = refusingRooms(`create-clean-${how}`, how);
+    const create1 = await createRoom({ relay: liveBase, actor: ALICE, rooms: rooms1 });
+    check(`a create whose local write ${shape} fails`, create1.ok === false, JSON.stringify(create1).slice(0, 140));
+    check(`  and the ${shape} did not escape the cleanup`, create1.code === 'not_stored', create1.code);
+    check('  and says so without blaming the network', /could not store/i.test(create1.message || ''), create1.message);
+    check('  and the room it made was removed from the relay', countRooms() === before1, `${before1} then ${countRooms()}`);
+    check('  leaving nothing owed', rooms1.pendingCleanups().length === 0, JSON.stringify(rooms1.pendingCleanups()));
+    check('  and no room behind', rooms1.all().length === 0 && rooms1.orphanedRooms().length === 0);
+
+    // --- CASE 2 / CASE 4 — cleanup cannot get through -----------------------
+    //
+    // The room is real, the local write failed, and the DELETE does not
+    // arrive. Stacki must keep the one token able to remove it.
+    const before2 = countRooms();
+    const rooms2 = refusingRooms(`create-owed-${how}`, how);
+    const create2 = await createRoom({ relay: liveBase, actor: ALICE, rooms: rooms2, fetchImpl: noDelete });
+    check(`a create whose local write ${shape} and whose cleanup cannot get through fails`, create2.ok === false, JSON.stringify(create2).slice(0, 140));
+    check('  and says a cleanup is still owed', create2.code === 'not_stored_needs_cleanup', create2.code);
+    check('  and does not imply it tidied up', !/so it was not created/i.test(create2.message || ''), create2.message);
+    check('  and says it holds nothing readable', /nothing readable/i.test(create2.message || ''), create2.message);
+    check('  and the room really did remain', countRooms() === before2 + 1, `${before2} then ${countRooms()}`);
+    const owed2 = rooms2.pendingCleanups();
+    check('  and the credential that can remove it was kept', owed2.length === 1 && create2.retained === true, JSON.stringify(owed2.map((o) => o.roomId)));
+    check('  sealed, pointing at the right relay', owed2[0]?.relay === liveBase, String(owed2[0]?.relay));
+    check('  and marked as this machine’s to end', owed2[0]?.owner === true);
+    check('  with no active room and nothing linked to a project', rooms2.all().length === 0);
+
+    // AND THE RECOVERY REALLY WORKS. Not "a record exists" — the room is gone
+    // from the relay afterwards.
+    const recovered = await retryCleanups({ rooms: rooms2 });
+    check('  a later run with a network deletes it', recovered.done === 1, JSON.stringify(recovered));
+    check('  the room is gone from the relay', countRooms() === before2, `${before2} then ${countRooms()}`);
+    check('  and nothing is owed any more', rooms2.pendingCleanups().length === 0);
+
+    // --- CASE 6 / CASE 7 — the same, joining --------------------------------
+    const host = makePerson(`joinhost-${how}`, ALICE);
+    const hostRoom = await createRoom({ relay: liveBase, actor: ALICE, rooms: host.rooms });
+    const hostT = createSecureTransport({ rooms: host.rooms, roomId: hostRoom.room.roomId });
+
+    // CASE 6 — the invitation is spent, the write fails, the membership is
+    // given back.
+    // A DISTINCT JOINER PER CASE. A member's signing key is pinned for the
+    // life of the room, so coming back as the same actor from a fresh
+    // registry presents a new key for a known sender and is refused — which
+    // is the relay behaving correctly, and would make this test measure that
+    // instead of what it is for.
+    const joiner = (tag) => ({ id: uuidv5(`joiner-${tag}-${how}`), kind: 'human', displayName: 'Bob' });
+
+    const inv6 = await hostT.createInvite({});
+    const members6 = liveMembers(hostRoom.room.roomId);
+    const rooms6 = refusingRooms(`join-clean-${how}`, how);
+    const join6 = await joinRoom({ capability: inv6.capability, actor: joiner('clean'), rooms: rooms6 });
+    check(`a join whose local write ${shape} fails`, join6.ok === false && join6.code === 'not_stored', JSON.stringify(join6).slice(0, 140));
+    check('  and tells the person to ask for a new invitation', /new invitation/i.test(join6.message || ''), join6.message);
+    check('  and the membership it took was given back', liveMembers(hostRoom.room.roomId) === members6, `${members6} then ${liveMembers(hostRoom.room.roomId)}`);
+    check('  so nobody is left holding a share they cannot reach', liveMembers(hostRoom.room.roomId) === 1);
+    check('  leaving nothing owed', rooms6.pendingCleanups().length === 0);
+
+    // CASE 7 — the invitation is spent, the write fails, and the membership
+    // cannot be given back right now.
+    const inv7 = await hostT.createInvite({});
+    const members7 = liveMembers(hostRoom.room.roomId);
+    const rooms7 = refusingRooms(`join-owed-${how}`, how);
+    const join7 = await joinRoom({ capability: inv7.capability, actor: joiner('owed'), rooms: rooms7, fetchImpl: noDelete });
+    check(`a join whose local write ${shape} and whose cleanup cannot get through fails`, join7.ok === false, JSON.stringify(join7).slice(0, 140));
+    check('  and says a cleanup is still owed', join7.code === 'not_stored_needs_cleanup', join7.code);
+    check('  and the membership really did remain', liveMembers(hostRoom.room.roomId) === members7 + 1, `${members7} then ${liveMembers(hostRoom.room.roomId)}`);
+    const owed7 = rooms7.pendingCleanups();
+    check('  and the member token was kept so it can be given back', owed7.length === 1 && join7.retained === true, JSON.stringify(owed7.map((o) => o.roomId)));
+    check('  not claiming ownership of somebody else’s room', owed7[0]?.owner === false, String(owed7[0]?.owner));
+    const recovered7 = await retryCleanups({ rooms: rooms7 });
+    check('  a later run gives the membership back', recovered7.done === 1, JSON.stringify(recovered7));
+    check('  and the room has its original members again', liveMembers(hostRoom.room.roomId) === members7, `${members7} then ${liveMembers(hostRoom.room.roomId)}`);
+    check('  and nothing is owed any more', rooms7.pendingCleanups().length === 0);
+  }
+
+  // --- CASE 5 — the walk-back fails AND the note cannot be written ----------
+  //
+  // The third corner. A full disk is exactly what makes the local write fail,
+  // and the same full disk cannot store a note about it either — so "write a
+  // pending-cleanup record" is not a fallback that always works. The version
+  // this replaces forgot the room whether or not the record had been written,
+  // which in this corner destroyed the last credential able to remove it.
+  //
+  // What must happen instead needs no write at all: the room record STAYS.
+  {
+    const heldHost = makePerson('held', ALICE);
+    const beforeHeld = countRooms();
+    const made = await createRoom({ relay: liveBase, actor: ALICE, rooms: heldHost.rooms });
+    check('a room was really made to hold', made.ok === true, JSON.stringify(made).slice(0, 120));
+
+    const cannotNote = { ...heldHost.rooms, rememberCleanup: () => false };
+    const heldOut = await undoSetup({
+      rooms: cannotNote,
+      room: made.room,
+      owner: true,
+      abandon: async () => ({ ok: false, code: 'offline' }),
+    });
+    check('with neither a confirmed cleanup nor a written note', heldOut.cleaned === false && heldOut.retained === false, JSON.stringify(heldOut));
+    check('  it says so plainly rather than claiming one of them', heldOut.held === true, JSON.stringify(heldOut));
+    check('  THE LAST CREDENTIAL IS NOT DESTROYED', heldHost.rooms.get(made.room.roomId) !== null);
+    check('  and it is still the token the relay will accept', heldHost.rooms.get(made.room.roomId)?.token === made.room.token);
+    check('  the room is still on the relay, as expected', countRooms() === beforeHeld + 1);
+    check('  nothing points at it', heldHost.rooms.forProject?.(scopeKey(heldHost.project)) == null);
+    const orphans = heldHost.rooms.orphanedRooms();
+    check('  and it is findable as owed cleanup', orphans.some((o) => o.roomId === made.room.roomId), JSON.stringify(orphans.map((o) => o.roomId)));
+    check('  carrying the credential and the address', orphans[0]?.token === made.room.token && orphans[0]?.relay === liveBase);
+
+    // A registry that throws rather than returning false is the same corner.
+    const throwsNote = { ...heldHost.rooms, rememberCleanup: () => {
+      throw new Error('ENOSPC: no space left on device');
+    } };
+    const heldThrow = await undoSetup({
+      rooms: throwsNote,
+      room: made.room,
+      owner: true,
+      abandon: async () => ({ ok: false, code: 'offline' }),
+    });
+    check('a note that throws is a note that was not written', heldThrow.held === true && heldThrow.retained === false, JSON.stringify(heldThrow));
+    check('  and it did not take the credential with it', heldHost.rooms.get(made.room.roomId) !== null);
+
+    // ONCE THE DISK WORKS AGAIN, IT FINISHES. This is the whole point of
+    // keeping it: not that a record exists, but that the room goes away.
+    const finished = await retryCleanups({ rooms: heldHost.rooms });
+    check('a later run finishes what was held', finished.done === 1, JSON.stringify(finished));
+    check('  the room is gone from the relay', countRooms() === beforeHeld, `${beforeHeld} then ${countRooms()}`);
+    check('  and gone from this machine', heldHost.rooms.get(made.room.roomId) === null);
+    check('  with nothing left owed', heldHost.rooms.orphanedRooms().length === 0 && heldHost.rooms.pendingCleanups().length === 0);
+  }
+
+  // An active share that IS linked to a project is not an orphan, however
+  // little else is going on. The sweep must never take a working share.
+  {
+    const safeHost = makePerson('notorphan', ALICE);
+    const safe = await createRoom({ relay: liveBase, actor: ALICE, rooms: safeHost.rooms });
+    safeHost.rooms.link(scopeKey(safeHost.project), safe.room.roomId);
+    check('a linked, working share is not mistaken for an orphan', safeHost.rooms.orphanedRooms().length === 0, JSON.stringify(safeHost.rooms.orphanedRooms()));
+    const swept = await retryCleanups({ rooms: safeHost.rooms });
+    check('so a cleanup sweep leaves it alone', swept.done === 0 && safeHost.rooms.get(safe.room.roomId) !== null, JSON.stringify(swept));
+    // A room this machine has LEFT is dormant and has no token; it is not an
+    // orphan either, and must not be re-deleted.
+    safeHost.rooms.retire(safe.room.roomId);
+    check('and a room this machine has left is not an orphan', safeHost.rooms.orphanedRooms().length === 0, JSON.stringify(safeHost.rooms.orphanedRooms()));
+  }
 
   // --- a relay that answers with more than Stacki will read ------------------
   //
