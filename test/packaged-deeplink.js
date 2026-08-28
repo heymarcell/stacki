@@ -69,6 +69,7 @@ if (!fs.existsSync(APP)) {
 
 const { packCapability } = require('../electron/review/secure/capability.js');
 const { toBase64Url } = require('../relay/protocol.js');
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 
 // A capability that exists nowhere else, so finding it anywhere is unambiguous.
 // The relay it names is never contacted: this test stops at the confirmation.
@@ -134,7 +135,7 @@ function evaluate(wsUrl, expression) {
   });
 }
 
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-pkgdeeplink-'));
+const userData = ownedTempDir('stacki-pkgdeeplink-', { harness: 'packaged-deeplink' });
 let child = null;
 
 async function stopApp() {
@@ -154,11 +155,7 @@ async function finish(code) {
     problems.push(`stopping the app: ${err.message}`);
   }
   // Anything the packaged app may still be holding under this userData.
-  try {
-    fs.rmSync(userData, { recursive: true, force: true });
-  } catch (err) {
-    problems.push(`removing userData: ${err.message}`);
-  }
+  if (!releaseTempDir(userData)) problems.push('the userData directory would not go');
   if (problems.length) {
     shout(`\npackaged-deeplink: could not clean up\n${problems.map((p) => `  ${p}`).join('\n')}\n`);
     code = code || 1;

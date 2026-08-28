@@ -32,6 +32,7 @@ const { app, BrowserWindow, session } = require('electron');
 const { packCapability } = require('../electron/review/secure/capability.js');
 const { toBase64Url } = require('../relay/protocol.js');
 const { createLanding, headersFor } = require('../relay/share/serve.js');
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 
 const failures = [];
 let checked = 0;
@@ -46,8 +47,8 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.on('window-all-closed', () => {});
 
-const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-sharepage-'));
-const relayData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-sharepage-relay-'));
+const userData = ownedTempDir('stacki-sharepage-', { harness: 'share-page-privacy' });
+const relayData = ownedTempDir('stacki-sharepage-relay-', { harness: 'share-page-privacy' });
 app.setPath('userData', userData);
 
 // The capability this run uses. The room secret is not random: it is a canary,
@@ -102,11 +103,7 @@ async function finish(code) {
     problems.push(`stopping the page server: ${err.message}`);
   }
   for (const dir of [userData, relayData]) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch (err) {
-      problems.push(`removing ${dir}: ${err.message}`);
-    }
+    if (!releaseTempDir(dir)) problems.push(`removing ${dir}`);
   }
   if (problems.length) {
     shout(`\nshare-page-privacy: could not clean up\n${problems.map((p) => `  ${p}`).join('\n')}\n`);

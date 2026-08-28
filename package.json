@@ -137,6 +137,7 @@
     "test:packageddeeplink": "node test/packaged-deeplink.js",
     "test:securesabotage": "node test/secure-sabotage.js",
     "test:securelifecycle": "node test/secure-lifecycle.js",
+    "test:secureacceptance": "npm run test:securecrypto && npm run test:securerelay && npm run test:secureshare && npm run relay:cf:test && npm run test:sharepage && npm run test:securesabotage && npm run test:securelifecycle && npm run test:packaging && npm run test:sharedreviews && npm run test:sharedacceptance && npm run dist:mac:unsigned && npm run test:packageddeeplink && npm run test:secureshareui",
     "relay:serve": "node --disable-warning=ExperimentalWarning relay/node/bin.js",
     "relay:cf:test": "npm --prefix relay/cloudflare test",
     "reviews:serve": "node --disable-warning=ExperimentalWarning service/bin.js",

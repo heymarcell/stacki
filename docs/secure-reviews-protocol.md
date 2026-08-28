@@ -780,6 +780,29 @@ These are asserted in `test/secure-crypto.js`.
 
 ---
 
+## 24a. What counts as acceptance
+
+`npm test` carries the cheap Secure Share suites — crypto, relay, the two-client
+share — because they are fast and belong with every other change. It
+deliberately does **not** carry the expensive ones: a packaged build, a real
+browser, a workerd runtime, twenty-nine sabotages and five lifecycle runs are
+minutes each and would make the ordinary loop unusable.
+
+That split is only safe if there is one command nobody has to remember the
+parts of:
+
+```bash
+npm run test:secureacceptance
+```
+
+which runs, in order: crypto → Node relay → two-client share → Cloudflare
+workerd → share-page privacy → sabotage → lifecycle → packaging → legacy shared
+reviews → legacy acceptance → **an unsigned package build** → the packaged
+`stacki://` deep link against that build → the visual harness.
+
+The build sits in the middle on purpose: the packaged deep-link proof is about
+the artefact, so it has to run after something has produced one.
+
 ## 25. Self-hosting
 
 ```bash

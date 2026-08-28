@@ -46,23 +46,52 @@ const FLOWS = [
   { name: 'the share page in a browser', script: 'test/share-page-privacy.js', node: false },
 ];
 
-/** Temporary directories this feature's tests make, and only those. */
-const FIXTURE_PREFIXES = [
-  'stacki-secure-',
-  'stacki-share-',
-  'stacki-sharepage-',
-  'stacki-share-ux-',
-];
+const { readOwner, pidAlive, MARKER } = require('./support/ownedTemp.js');
 
+/** The harnesses these flows run, as they stamp their own fixtures. */
+const OUR_HARNESSES = new Set(['secure-relay', 'secure-share', 'share-page-privacy', 'packaged-deeplink']);
+
+/**
+ * Fixtures left behind by a run of one of THESE flows that has finished.
+ *
+ * Ownership, not name matching. The version this replaces listed every
+ * directory in the temp folder whose name began with one of a few prefixes,
+ * which meant a second Stacki checkout — or a parallel session doing exactly
+ * this — could make this run report a leak it had nothing to do with. PR #8
+ * put a marker in every owned directory for precisely this reason; the answer
+ * is to read it.
+ *
+ * A directory counts as leaked only when all three are true:
+ *
+ *   it carries an ownership marker      — no marker is somebody else's business
+ *   the harness is one of ours          — another harness is not this suite
+ *   the owning process is gone          — a live one is a run still using it
+ *
+ * A concurrent run's fixture fails the third test while that run is alive, so
+ * it is never counted here and never touched.
+ */
 const fixtures = () => {
+  const out = [];
+  let names;
   try {
-    return fs
-      .readdirSync(os.tmpdir())
-      .filter((name) => FIXTURE_PREFIXES.some((prefix) => name.startsWith(prefix)))
-      .sort();
+    names = fs.readdirSync(os.tmpdir());
   } catch {
-    return [];
+    return out;
   }
+  for (const name of names) {
+    const full = path.join(os.tmpdir(), name);
+    let owner;
+    try {
+      if (!fs.existsSync(path.join(full, MARKER))) continue;
+      owner = readOwner(full);
+    } catch {
+      continue;
+    }
+    if (!owner || !OUR_HARNESSES.has(owner.harness)) continue;
+    if (pidAlive(owner.pid)) continue; // somebody is still using it
+    out.push(name);
+  }
+  return out.sort();
 };
 
 /**
@@ -112,9 +141,46 @@ function run(flow) {
   }
 }
 
+// --- the accounting is about THIS run ---------------------------------------
+//
+// Proved before anything else, because a leak report that cannot tell a
+// parallel session's work from its own is a leak report nobody can act on.
+{
+  const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
+
+  // Somebody else's run of the same harness, still going: this process is
+  // alive, so its fixture belongs to it.
+  const theirs = ownedTempDir('stacki-share-parallel-', { harness: 'secure-share' });
+  check('a fixture whose owner is still running is not counted as a leak', !fixtures().includes(path.basename(theirs)), path.basename(theirs));
+
+  // A directory with the same prefix and no marker at all — another checkout,
+  // an older Stacki, somebody's mkdtemp. Not ours to count and not ours to touch.
+  const unmarked = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-share-unmarked-'));
+  check('an unmarked directory of the same shape is somebody else’s business', !fixtures().includes(path.basename(unmarked)));
+
+  // A fixture from a harness that is not one of these flows.
+  const other = ownedTempDir('stacki-share-other-', { harness: 'review-ux-visual' });
+  check('another harness’s fixture is not counted either', !fixtures().includes(path.basename(other)));
+
+  // And one whose owner is gone: that IS a leak, and it must be seen.
+  const dead = ownedTempDir('stacki-share-dead-', { harness: 'secure-share' });
+  const marker = path.join(dead, MARKER);
+  const stamped = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  // A pid that cannot be running: 1 is init, and never one of these harnesses,
+  // so instead use a very high one this machine has not reached.
+  fs.writeFileSync(marker, JSON.stringify({ ...stamped, pid: 4194303 }), 'utf8');
+  check('a fixture whose owner has gone IS counted', fixtures().includes(path.basename(dead)), path.basename(dead));
+
+  releaseTempDir(theirs);
+  releaseTempDir(other);
+  releaseTempDir(dead);
+  fs.rmSync(unmarked, { recursive: true, force: true });
+  check('and the proof cleaned up after itself', fixtures().length === 0, JSON.stringify(fixtures()));
+}
+
 const baseline = snapshot();
 say(`secure-lifecycle: ${RUNS} consecutive runs of ${FLOWS.length} flows`);
-say(`  starting with ${baseline.fixtures.length} fixture dir(s) and ${baseline.processes.length} process(es) already here\n`);
+say(`  starting with ${baseline.fixtures.length} owned leftover(s) and ${baseline.processes.length} process(es) already here\n`);
 
 let clean = 0;
 for (let pass = 1; pass <= RUNS; pass++) {

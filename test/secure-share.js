@@ -58,6 +58,9 @@ const { syncOnce, createSyncer, createCatchUp, CATCH_UP_MIN_MS, CATCH_UP_MAX_MS 
 const { makeEvent, projectThreads, orderEvents } = require('../electron/review/events.js');
 const { uuidv5, agentActor } = require('../electron/review/actors.js');
 const { signingBytes, aadFor, toBase64Url, fromBase64Url, VERSION, MAX_BODY_BYTES } = require('../relay/protocol.js');
+// PR #8's discipline: fixtures this run OWNS, marked, so a concurrent harness
+// is never mistaken for this one's leak and never deleted by it.
+const { ownedTempDir, releaseTempDir, MARKER } = require('./support/ownedTemp.js');
 
 const say = (t) => fs.writeSync(1, `${t}\n`);
 
@@ -74,7 +77,7 @@ const freePort = () =>
 
 const temp = [];
 const mkdir = (tag) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-share-${tag}-`));
+  const dir = ownedTempDir(`stacki-share-${tag}-`, { harness: 'secure-share' });
   temp.push(dir);
   return dir;
 };
@@ -920,6 +923,12 @@ async function main() {
     const found = [];
     const walk = (dir) => {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        // The harness's own ownership marker, which exists so a parallel run
+        // is never mistaken for this one's leak. It holds a harness name, a
+        // run id and a pid — nothing this scan is looking for — and it is
+        // excluded by the exported constant so the exclusion cannot drift into
+        // covering something else.
+        if (entry.name === MARKER) continue;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(full);
         else found.push([full, fs.readFileSync(full, 'utf8')]);
@@ -1205,7 +1214,7 @@ async function main() {
 
 main()
   .then(() => {
-    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of temp) releaseTempDir(dir);
     if (failures.length) {
       console.error(`\nsecure-share: ${failures.length} failed, ${checked - failures.length} passed\n`);
       console.error(failures.join('\n') + '\n');
@@ -1214,7 +1223,7 @@ main()
     console.log(`secure-share: ${checked} checks passed`);
   })
   .catch((err) => {
-    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of temp) releaseTempDir(dir);
     console.error('secure-share: threw\n', err);
     process.exit(1);
   });

@@ -34,11 +34,14 @@ const { createSecureTransport, createRoom, joinRoom } = require('../electron/rev
 const { makeEvent } = require('../electron/review/events.js');
 const { uuidv5 } = require('../electron/review/actors.js');
 const { toBase64Url, MAX_MEMBERS, IDLE_ROOM_TTL_MS } = require('../relay/protocol.js');
+// PR #8's discipline: a fixture this run OWNS, marked, so a concurrent harness
+// is never mistaken for this one's leak and never deleted by it.
+const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const temp = [];
 const mkdir = (tag) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-secure-${tag}-`));
+  const dir = ownedTempDir(`stacki-secure-${tag}-`, { harness: 'secure-relay' });
   temp.push(dir);
   return dir;
 };
@@ -373,7 +376,7 @@ async function main() {
 
 main()
   .then(() => {
-    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of temp) releaseTempDir(dir);
     if (failures.length) {
       console.error(`\nsecure-relay: ${failures.length} failed, ${checked - failures.length} passed\n`);
       console.error(failures.join('\n') + '\n');
@@ -382,7 +385,7 @@ main()
     console.log(`secure-relay: ${checked} checks passed`);
   })
   .catch((err) => {
-    for (const dir of temp) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of temp) releaseTempDir(dir);
     console.error('secure-relay: threw\n', err);
     process.exit(1);
   });
