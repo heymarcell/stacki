@@ -19,6 +19,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { fullScenario, boundaryScenario } = require('./mcpOperationScenarios.js');
+const { withFakeGh } = require('./fakeGh.js');
 const { DOT_WIDTH, DOT_HEIGHT, ROBOTS_CANARY } = require('./mcpWireFixture.js');
 
 // Walk a target tree into a flat list; several scenarios need to find a node.
@@ -845,10 +846,47 @@ fullScenario({ domain: 'git', action: 'push', run: async ({ call, rig }) => {
 
 boundaryScenario({
   domain: 'git', action: 'publish',
-  why: 'Publishing creates a repository on GitHub under the user\'s own account and pushes to it. There is no local stand-in for that, so the schema, the permission gate, argument validation and the dispatcher all run and the external call is exactly where this stops.',
+  why: 'Publishing creates a repository on GitHub under the user\'s own account and pushes to it. Everything up to the external program runs — schema, permission gate, dispatcher, domain adapter and the real git:publish handler — and the `gh` binary itself is replaced by a test-owned fake, so GitHub is never reached.',
   run: async ({ call }) => {
-    const { envelope } = await call('git', 'publish', { repoName: 'stacki-wire-test-never-created', private: true });
-    return { good: !!envelope && typeof envelope.ok === 'boolean', detail: JSON.stringify(envelope).slice(0, 220) };
+    // THIS SCENARIO ONCE CREATED A REAL REPOSITORY.
+    //
+    // It was graded BOUNDARY on the assumption that publish would refuse
+    // before doing anything external. It did not: the real handler ran, `gh`
+    // resolved to the developer's authenticated binary, and GitHub made
+    // heymarcell/stacki-wire-test-never-created. The boundary was a hope
+    // rather than a mechanism.
+    //
+    // Now the boundary IS a mechanism: `gh` is shadowed on PATH by a fake this
+    // test owns, the shadow is verified before the call is allowed to happen,
+    // and if the fake never ran this fails rather than assuming it was fine.
+    return withFakeGh(async ({ calls }) => {
+      const { envelope } = await call('git', 'publish', { repoName: 'stacki-wire-boundary-fake', private: true });
+      const seen = calls();
+      const create = seen.find((argv) => argv[0] === 'repo' && argv[1] === 'create');
+
+      // FAIL CLOSED. No recorded invocation means the real gh may have been
+      // the one that answered, and that is the failure this file exists for.
+      if (!seen.length) {
+        return { good: false, detail: 'the fake gh was never invoked — the boundary cannot be proven, so this fails rather than assume GitHub was untouched' };
+      }
+
+      const flag = (name) => create && create.includes(name);
+      const held = [
+        ['the fake gh was asked for its version first', seen.some((argv) => argv[0] === '--version')],
+        ['and then asked to create a repository', !!create],
+        ['under the name the caller gave', !!create && create.includes('stacki-wire-boundary-fake')],
+        ['privately, as asked', flag('--private')],
+        ['from this project as the source', flag('--source')],
+        ['wiring it up as origin', flag('--remote')],
+        ['and pushing', flag('--push')],
+        ['while the envelope came back well-formed', !!envelope && typeof envelope.ok === 'boolean'],
+      ];
+      const failed = held.filter(([, ok]) => !ok).map(([label]) => label);
+      return {
+        good: failed.length === 0,
+        detail: failed.length ? `${failed.join('; ')} | argv seen: ${JSON.stringify(seen)}` : '',
+      };
+    });
   },
 });
 
