@@ -149,6 +149,7 @@
     "test:mcpwire": "node test/mcp-wire-coverage.js",
     "bench:mcp": "node scripts/bench-mcp.js",
     "test:mcpperms": "node test/mcp-permission-matrix.js",
+    "test:packagedmcp": "node test/packaged-mcp.js",
     "agent:coverage": "node scripts/agent-api-coverage.js",
     "test:agentapi": "node test/agent-api.js",
     "test:agentacceptance": "node test/agent-acceptance.js",
