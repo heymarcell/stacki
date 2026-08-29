@@ -76,102 +76,102 @@ fullScenario({ domain: 'target', action: 'exit', run: async ({ call, ref }) => {
   ] };
 } });
 
-fullScenario({ domain: 'target', action: 'set_text', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'set_text', run: async ({ call, ref, fixture }) => {
   const inside = await call('target', 'enter', { ref: await ref('Hero') });
   const h1 = flatten(inside.envelope?.target).find((n) => String(n.tag || '').toLowerCase() === 'h1');
   const { envelope } = await call('target', 'set_text', { ref: h1?.ref, text: 'Wire-driven heading', replaceBinding: true });
   return { envelope, checks: [
-    ['the text is in Hero.astro on disk', rig.harness.read('src/components/Hero.astro').includes('Wire-driven heading')],
-    ['and the old text is gone', !rig.harness.read('src/components/Hero.astro').includes('Welcome to Stacki')],
+    ['the text is in Hero.astro on disk', fixture.read('src/components/Hero.astro').includes('Wire-driven heading')],
+    ['and the old text is gone', !fixture.read('src/components/Hero.astro').includes('Welcome to Stacki')],
   ] };
 } });
 
-fullScenario({ domain: 'target', action: 'edit', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'edit', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'edit', { ref: await ref('div'), operations: [{ type: 'add_class', className: 'wire-batch' }] });
-  return { envelope, checks: [['the batched class reached the file', rig.harness.read('src/pages/index.astro').includes('wire-batch')]] };
+  return { envelope, checks: [['the batched class reached the file', fixture.read('src/pages/index.astro').includes('wire-batch')]] };
 } });
 
-fullScenario({ domain: 'target', action: 'set_prop', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'set_prop', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'set_prop', { ref: await ref('div'), name: 'data-wire', value: 'yes' });
-  return { envelope, checks: [['the prop is authored in the page', /data-wire=("|\{)?"?yes/.test(rig.harness.read('src/pages/index.astro'))]] };
+  return { envelope, checks: [['the prop is authored in the page', /data-wire=("|\{)?"?yes/.test(fixture.read('src/pages/index.astro'))]] };
 } });
 
-fullScenario({ domain: 'target', action: 'remove_prop', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'remove_prop', run: async ({ call, ref, fixture }) => {
   await call('target', 'set_prop', { ref: await ref('div'), name: 'data-doomed', value: 'x' });
-  const before = rig.harness.read('src/pages/index.astro').includes('data-doomed');
+  const before = fixture.read('src/pages/index.astro').includes('data-doomed');
   const { envelope } = await call('target', 'remove_prop', { ref: await ref('div'), name: 'data-doomed' });
   return { envelope, checks: [
     ['the prop was there first', before],
-    ['and is gone from the file', !rig.harness.read('src/pages/index.astro').includes('data-doomed')],
+    ['and is gone from the file', !fixture.read('src/pages/index.astro').includes('data-doomed')],
   ] };
 } });
 
-fullScenario({ domain: 'target', action: 'set_classes', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'set_classes', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'set_classes', { ref: await ref('div'), classes: ['wire-only'] });
-  const src = rig.harness.read('src/pages/index.astro');
+  const src = fixture.read('src/pages/index.astro');
   return { envelope, checks: [
     ['the new class list is authored', src.includes('wire-only')],
     ['and it replaced what was there', !src.includes('pricing-grid') || src.includes('wire-only')],
   ] };
 } });
 
-fullScenario({ domain: 'target', action: 'add_class', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'add_class', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'add_class', { ref: await ref('div'), className: 'wire-added' });
-  return { envelope, checks: [['the class is in the page source', rig.harness.read('src/pages/index.astro').includes('wire-added')]] };
+  return { envelope, checks: [['the class is in the page source', fixture.read('src/pages/index.astro').includes('wire-added')]] };
 } });
 
-fullScenario({ domain: 'target', action: 'remove_class', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'remove_class', run: async ({ call, ref, fixture }) => {
   await call('target', 'add_class', { ref: await ref('div'), className: 'wire-doomed' });
-  const before = rig.harness.read('src/pages/index.astro').includes('wire-doomed');
+  const before = fixture.read('src/pages/index.astro').includes('wire-doomed');
   const { envelope } = await call('target', 'remove_class', { ref: await ref('div'), className: 'wire-doomed' });
   return { envelope, checks: [
     ['the class was added first', before],
-    ['and removing it took it out of the file', !rig.harness.read('src/pages/index.astro').includes('wire-doomed')],
+    ['and removing it took it out of the file', !fixture.read('src/pages/index.astro').includes('wire-doomed')],
   ] };
 } });
 
-fullScenario({ domain: 'target', action: 'insert_before', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'insert_before', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'insert_before', { ref: await ref('div'), node: { kind: 'element', tag: 'p', text: 'inserted-before' } });
-  return { envelope, checks: [['the new node is authored in the page', rig.harness.read('src/pages/index.astro').includes('inserted-before')]] };
+  return { envelope, checks: [['the new node is authored in the page', fixture.read('src/pages/index.astro').includes('inserted-before')]] };
 } });
 
-fullScenario({ domain: 'target', action: 'insert_after', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'insert_after', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'insert_after', { ref: await ref('div'), node: { kind: 'element', tag: 'p', text: 'inserted-after' } });
-  return { envelope, checks: [['the new node is authored in the page', rig.harness.read('src/pages/index.astro').includes('inserted-after')]] };
+  return { envelope, checks: [['the new node is authored in the page', fixture.read('src/pages/index.astro').includes('inserted-after')]] };
 } });
 
-fullScenario({ domain: 'target', action: 'append_child', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'append_child', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('target', 'append_child', { ref: await ref('footer'), node: { kind: 'element', tag: 'span', text: 'appended-child' } });
-  return { envelope, checks: [['the child is authored inside the parent', rig.harness.read('src/pages/index.astro').includes('appended-child')]] };
+  return { envelope, checks: [['the child is authored inside the parent', fixture.read('src/pages/index.astro').includes('appended-child')]] };
 } });
 
-fullScenario({ domain: 'target', action: 'duplicate', run: async ({ call, ref, rig }) => {
-  const before = (rig.harness.read('src/pages/index.astro').match(/<Hero/g) || []).length;
+fullScenario({ domain: 'target', action: 'duplicate', run: async ({ call, ref, fixture }) => {
+  const before = (fixture.read('src/pages/index.astro').match(/<Hero/g) || []).length;
   const { envelope } = await call('target', 'duplicate', { ref: await ref('footer') });
-  const after = (rig.harness.read('src/pages/index.astro').match(/<Hero/g) || []).length;
+  const after = (fixture.read('src/pages/index.astro').match(/<Hero/g) || []).length;
   return { envelope, checks: [['the page has one more copy of that node than before', after === before + 1]] };
 } });
 
-fullScenario({ domain: 'target', action: 'move', run: async ({ call, ref, rig }) => {
-  const before = rig.harness.read('src/pages/index.astro');
+fullScenario({ domain: 'target', action: 'move', run: async ({ call, ref, fixture }) => {
+  const before = fixture.read('src/pages/index.astro');
   const { envelope } = await call('target', 'move', { ref: await ref('div'), to: { index: 0 } });
-  return { envelope, checks: [['the page source is not what it was', rig.harness.read('src/pages/index.astro') !== before]] };
+  return { envelope, checks: [['the page source is not what it was', fixture.read('src/pages/index.astro') !== before]] };
 } });
 
-fullScenario({ domain: 'target', action: 'set_tag', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'set_tag', run: async ({ call, ref, fixture }) => {
   await call('target', 'insert_after', { ref: await ref('div'), node: { kind: 'element', tag: 'p', text: 'retag-me' } });
   const { envelope } = await call('target', 'set_tag', { ref: (await ref('p')), tag: 'h4' });
-  return { envelope, checks: [['an h4 is now authored in the page', /<h4/.test(rig.harness.read('src/pages/index.astro'))]] };
+  return { envelope, checks: [['an h4 is now authored in the page', /<h4/.test(fixture.read('src/pages/index.astro'))]] };
 } });
 
-fullScenario({ domain: 'target', action: 'remove', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'target', action: 'remove', run: async ({ call, ref, fixture }) => {
   await call('target', 'insert_after', { ref: await ref('div'), node: { kind: 'element', tag: 'p', text: 'doomed-node' } });
-  const before = rig.harness.read('src/pages/index.astro').includes('doomed-node');
+  const before = fixture.read('src/pages/index.astro').includes('doomed-node');
   const target = flatten((await call('target', 'read')).envelope?.target).find((n) => String(n.text || '').includes('doomed-node'));
   const { envelope } = await call('target', 'remove', { ref: target?.ref });
   return { envelope, checks: [
     ['the node was there first', before],
-    ['and is gone from the file', !rig.harness.read('src/pages/index.astro').includes('doomed-node')],
+    ['and is gone from the file', !fixture.read('src/pages/index.astro').includes('doomed-node')],
   ] };
 } });
 
@@ -183,7 +183,7 @@ const firstCell = async (call) => {
   for (const file of envelope?.files || []) for (const g of file.groups || []) for (const b of g.blocks || []) for (const r of b.rows || []) for (const c of r.cells || []) if (c?.name) return c;
   return null;
 };
-const css = (rig) => rig.harness.read('src/styles/site.css');
+const css = (fixture) => fixture.read('src/styles/site.css');
 
 fullScenario({ domain: 'style', action: 'list_sources', run: async ({ call }) => {
   const { envelope } = await call('style', 'list_sources', {});
@@ -220,108 +220,108 @@ fullScenario({ domain: 'style', action: 'variables', run: async ({ call }) => {
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'write_source', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'write_source', run: async ({ call, fixture }) => {
   const read = await call('style', 'read_source', { path: 'src/styles/site.css' });
   const next = String(read.envelope?.css || '') + '\n.wire-written { color: red; }\n';
   const { envelope } = await call('style', 'write_source', { path: 'src/styles/site.css', css: next, expectedDigest: read.envelope?.digest });
-  return { envelope, checks: [['the rule is in the stylesheet on disk', css(rig).includes('.wire-written')]] };
+  return { envelope, checks: [['the rule is in the stylesheet on disk', css(fixture).includes('.wire-written')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'set_property', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'style', action: 'set_property', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('style', 'set_property', { ref: await ref('div'), selector: '.pricing-grid', source: 'file:src/styles/site.css', property: 'outline', value: '3px solid red' });
-  return { envelope, checks: [['the declaration is authored in a stylesheet', css(rig).includes('outline') && css(rig).includes('3px solid red')]] };
+  return { envelope, checks: [['the declaration is authored in a stylesheet', css(fixture).includes('outline') && css(fixture).includes('3px solid red')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'set_declarations', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'style', action: 'set_declarations', run: async ({ call, ref, fixture }) => {
   const { envelope } = await call('style', 'set_declarations', { ref: await ref('div'), selector: '.pricing-grid', source: 'file:src/styles/site.css', declarations: [{ property: 'opacity', value: '0.42' }] });
-  return { envelope, checks: [['the declaration reached the stylesheet', css(rig).includes('0.42')]] };
+  return { envelope, checks: [['the declaration reached the stylesheet', css(fixture).includes('0.42')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'remove_property', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'style', action: 'remove_property', run: async ({ call, ref, fixture }) => {
   await call('style', 'set_property', { ref: await ref('div'), selector: '.pricing-grid', source: 'file:src/styles/site.css', property: 'letter-spacing', value: '3px' });
-  const before = css(rig).includes('letter-spacing');
+  const before = css(fixture).includes('letter-spacing');
   const cascade = await call('style', 'read', { ref: await ref('div') });
   const decl = (cascade.envelope?.rules || []).flatMap((r) => r.declarations || []).find((d) => d?.identity && String(d.property) === 'letter-spacing');
   const { envelope } = await call('style', 'remove_property', { ref: await ref('div'), identity: decl?.identity });
   return { envelope, checks: [
     ['the declaration was written first', before],
-    ['and removing it took it out of the stylesheet', !css(rig).includes('letter-spacing')],
+    ['and removing it took it out of the stylesheet', !css(fixture).includes('letter-spacing')],
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'set_variable', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'set_variable', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   const { envelope } = await call('style', 'set_variable', { edit: { file: cell.file, valueStart: cell.valueStart, valueEnd: cell.valueEnd, value: '2.5rem', expect: cell.value } });
   return { envelope, checks: [
-    ['the new value is in the stylesheet', css(rig).includes('2.5rem')],
-    ['and the old one is gone', !css(rig).includes(`${cell.name}: ${cell.value}`)],
+    ['the new value is in the stylesheet', css(fixture).includes('2.5rem')],
+    ['and the old one is gone', !css(fixture).includes(`${cell.name}: ${cell.value}`)],
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'add_variables', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'add_variables', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   const { envelope } = await call('style', 'add_variables', { adds: [{ file: cell.file, selector: cell.selector, name: '--wire-added', value: '4px' }] });
-  return { envelope, checks: [['the variable is declared in the stylesheet', css(rig).includes('--wire-added')]] };
+  return { envelope, checks: [['the variable is declared in the stylesheet', css(fixture).includes('--wire-added')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'rename_variables', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'rename_variables', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_variables', { adds: [{ file: cell.file, selector: cell.selector, name: '--wire-old', value: '1px' }] });
-  const before = css(rig).includes('--wire-old');
+  const before = css(fixture).includes('--wire-old');
   const { envelope } = await call('style', 'rename_variables', { renames: [{ from: '--wire-old', to: '--wire-new' }] });
   return { envelope, checks: [
     ['the old name existed', before],
-    ['the new name is there', css(rig).includes('--wire-new')],
-    ['and the old one is not', !css(rig).includes('--wire-old')],
+    ['the new name is there', css(fixture).includes('--wire-new')],
+    ['and the old one is not', !css(fixture).includes('--wire-old')],
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'move_variables', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'move_variables', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_variables', { adds: [{ file: cell.file, selector: cell.selector, name: '--wire-mover', value: '9px' }] });
-  const before = css(rig);
+  const before = css(fixture);
   const { envelope } = await call('style', 'move_variables', { moves: [{ file: cell.file, selector: cell.selector, name: '--wire-mover', target: cell.selector, at: 0 }] });
-  const after = css(rig);
+  const after = css(fixture);
   return { envelope, checks: [
     ['the variable still exists', after.includes('--wire-mover')],
     ['and the stylesheet was rewritten', after !== before],
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'add_section', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'add_section', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   const { envelope } = await call('style', 'add_section', { edit: { file: cell.file, selector: cell.selector, title: 'Wire section', at: 0 } });
-  return { envelope, checks: [['the section heading is in the stylesheet', css(rig).includes('Wire section')]] };
+  return { envelope, checks: [['the section heading is in the stylesheet', css(fixture).includes('Wire section')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'set_section_title', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'set_section_title', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_section', { edit: { file: cell.file, selector: cell.selector, title: 'Before rename', at: 0 } });
-  const text = css(rig);
+  const text = css(fixture);
   const start = text.indexOf('Before rename');
   const { envelope } = await call('style', 'set_section_title', { edit: { file: cell.file, start, end: start + 'Before rename'.length, title: 'After rename', expect: 'Before rename' } });
   return { envelope, checks: [
-    ['the new title is in the stylesheet', css(rig).includes('After rename')],
-    ['and the old title is gone', !css(rig).includes('Before rename')],
+    ['the new title is in the stylesheet', css(fixture).includes('After rename')],
+    ['and the old title is gone', !css(fixture).includes('Before rename')],
   ] };
 } });
 
-fullScenario({ domain: 'style', action: 'remove_section', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'remove_section', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_section', { edit: { file: cell.file, selector: cell.selector, title: 'Doomed section', at: 0 } });
-  const text = css(rig);
+  const text = css(fixture);
   const start = text.indexOf('Doomed section');
   const { envelope } = await call('style', 'remove_section', { edit: { file: cell.file, start, end: start + 'Doomed section'.length, expect: 'Doomed section' } });
-  return { envelope, checks: [['the section heading is gone from the stylesheet', !css(rig).includes('Doomed section')]] };
+  return { envelope, checks: [['the section heading is gone from the stylesheet', !css(fixture).includes('Doomed section')]] };
 } });
 
-fullScenario({ domain: 'style', action: 'move_heading', run: async ({ call, rig }) => {
+fullScenario({ domain: 'style', action: 'move_heading', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_section', { edit: { file: cell.file, selector: cell.selector, title: 'Movable heading', at: 0 } });
-  const text = css(rig);
+  const text = css(fixture);
   const start = text.indexOf('Movable heading');
   const { envelope } = await call('style', 'move_heading', { edit: { file: cell.file, selector: cell.selector, start, end: start + 'Movable heading'.length, expect: 'Movable heading' } });
-  return { envelope, checks: [['the heading survives the move', css(rig).includes('Movable heading')]] };
+  return { envelope, checks: [['the heading survives the move', css(fixture).includes('Movable heading')]] };
 } });
 
 // ── source ─────────────────────────────────────────────────────────────────
@@ -347,16 +347,16 @@ fullScenario({ domain: 'source', action: 'read_symbol', run: async ({ call }) =>
   return { envelope, checks: [['it answers about a symbol in a file the fixture has', !!envelope && ('text' in envelope || 'path' in envelope || 'symbol' in envelope)]] };
 } });
 
-fullScenario({ domain: 'source', action: 'write', run: async ({ call, rig }) => {
+fullScenario({ domain: 'source', action: 'write', run: async ({ call, fixture }) => {
   const read = await call('source', 'read', { path: 'src/lib/format.js' });
   const { envelope } = await call('source', 'write', { path: 'src/lib/format.js', text: '// wire-wrote-this\n' + String(read.envelope?.text || ''), expectedDigest: read.envelope?.digest });
-  return { envelope, checks: [['the file on disk starts with what was written', rig.harness.read('src/lib/format.js').startsWith('// wire-wrote-this')]] };
+  return { envelope, checks: [['the file on disk starts with what was written', fixture.read('src/lib/format.js').startsWith('// wire-wrote-this')]] };
 } });
 
-fullScenario({ domain: 'source', action: 'replace_range', run: async ({ call, rig }) => {
+fullScenario({ domain: 'source', action: 'replace_range', run: async ({ call, fixture }) => {
   const read = await call('source', 'read', { path: 'src/lib/format.js' });
   const { envelope } = await call('source', 'replace_range', { path: 'src/lib/format.js', startLine: 1, endLine: 1, text: '// wire-replaced-line-one', expectedDigest: read.envelope?.digest });
-  return { envelope, checks: [['the first line is the replacement', rig.harness.read('src/lib/format.js').split('\n')[0] === '// wire-replaced-line-one']] };
+  return { envelope, checks: [['the first line is the replacement', fixture.read('src/lib/format.js').split('\n')[0] === '// wire-replaced-line-one']] };
 } });
 
 
@@ -381,53 +381,53 @@ fullScenario({ domain: 'page', action: 'read', run: async ({ call }) => {
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'create', run: async ({ call, rig }) => {
+fullScenario({ domain: 'page', action: 'create', run: async ({ call, fixture }) => {
   const { envelope } = await call('page', 'create', { name: 'wire-made', layout: 'Base' });
-  return { envelope, checks: [['the new page exists on disk', rig.harness.exists('src/pages/wire-made.astro')]] };
+  return { envelope, checks: [['the new page exists on disk', fixture.exists('src/pages/wire-made.astro')]] };
 } });
 
-fullScenario({ domain: 'page', action: 'move', run: async ({ call, rig }) => {
+fullScenario({ domain: 'page', action: 'move', run: async ({ call, fixture }) => {
   const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'moved/index.astro' });
   return { envelope, checks: [
-    ['the old path is gone', !rig.harness.exists('src/pages/wire-made.astro')],
-    ['and the new path exists', rig.harness.exists('src/pages/moved/index.astro')],
+    ['the old path is gone', !fixture.exists('src/pages/wire-made.astro')],
+    ['and the new path exists', fixture.exists('src/pages/moved/index.astro')],
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'delete', run: async ({ call, rig }) => {
-  const before = rig.harness.exists('src/pages/moved/index.astro');
+fullScenario({ domain: 'page', action: 'delete', run: async ({ call, fixture }) => {
+  const before = fixture.exists('src/pages/moved/index.astro');
   const { envelope } = await call('page', 'delete', { path: 'src/pages/moved/index.astro' });
   return { envelope, checks: [
     ['the page was there first', before],
-    ['and is gone from disk', !rig.harness.exists('src/pages/moved/index.astro')],
+    ['and is gone from disk', !fixture.exists('src/pages/moved/index.astro')],
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, rig }) => {
+fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixture }) => {
   const { envelope } = await call('page', 'folder_create', { dir: 'wire-docs' });
-  return { envelope, checks: [['the folder exists under pages', rig.harness.exists('src/pages/wire-docs')]] };
+  return { envelope, checks: [['the folder exists under pages', fixture.exists('src/pages/wire-docs')]] };
 } });
 
-fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, rig }) => {
+fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixture }) => {
   const { envelope } = await call('page', 'folder_rename', { from: 'wire-docs', to: 'wire-guide' });
   return { envelope, checks: [
-    ['the old folder is gone', !rig.harness.exists('src/pages/wire-docs')],
-    ['and the new one exists', rig.harness.exists('src/pages/wire-guide')],
+    ['the old folder is gone', !fixture.exists('src/pages/wire-docs')],
+    ['and the new one exists', fixture.exists('src/pages/wire-guide')],
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, rig }) => {
-  const before = rig.harness.exists('src/pages/wire-guide');
+fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixture }) => {
+  const before = fixture.exists('src/pages/wire-guide');
   const { envelope } = await call('page', 'folder_delete', { dir: 'wire-guide' });
   return { envelope, checks: [
     ['the folder was there first', before],
-    ['and is gone', !rig.harness.exists('src/pages/wire-guide')],
+    ['and is gone', !fixture.exists('src/pages/wire-guide')],
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, rig }) => {
+fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, fixture }) => {
   const { envelope } = await call('page', 'component_create', { name: 'WireBox', nodes: [{ kind: 'element', tag: 'div', text: 'wire' }] });
-  return { envelope, checks: [['the component file exists', rig.harness.exists('src/components/WireBox.astro')]] };
+  return { envelope, checks: [['the component file exists', fixture.exists('src/components/WireBox.astro')]] };
 } });
 
 fullScenario({ domain: 'page', action: 'component_usage', run: async ({ call }) => {
@@ -489,42 +489,42 @@ fullScenario({ domain: 'asset', action: 'dimensions', run: async ({ call }) => {
   return { envelope, checks: [['it reads the real pixel size of the fixture PNG', d.w === DOT_WIDTH && d.h === DOT_HEIGHT]] };
 } });
 
-fullScenario({ domain: 'asset', action: 'write_text', run: async ({ call, rig }) => {
+fullScenario({ domain: 'asset', action: 'write_text', run: async ({ call, fixture }) => {
   const read = await call('asset', 'read_text', { path: 'public/robots.txt' });
   const { envelope } = await call('asset', 'write_text', { path: 'public/robots.txt', text: 'User-agent: *\nDisallow: /wire\n', ref: read.envelope?.ref });
   return { envelope, checks: [
-    ['the new text is on disk', rig.harness.read('public/robots.txt').includes('/wire')],
-    ['and the old canary is gone', !rig.harness.read('public/robots.txt').includes(ROBOTS_CANARY)],
+    ['the new text is on disk', fixture.read('public/robots.txt').includes('/wire')],
+    ['and the old canary is gone', !fixture.read('public/robots.txt').includes(ROBOTS_CANARY)],
   ] };
 } });
 
-fullScenario({ domain: 'asset', action: 'mkdir', run: async ({ call, rig }) => {
+fullScenario({ domain: 'asset', action: 'mkdir', run: async ({ call, fixture }) => {
   const { envelope } = await call('asset', 'mkdir', { parent: 'public', name: 'wire-folder' });
-  return { envelope, checks: [['the folder exists', rig.harness.exists('public/wire-folder')]] };
+  return { envelope, checks: [['the folder exists', fixture.exists('public/wire-folder')]] };
 } });
 
-fullScenario({ domain: 'asset', action: 'move', run: async ({ call, rig }) => {
+fullScenario({ domain: 'asset', action: 'move', run: async ({ call, fixture }) => {
   const { envelope } = await call('asset', 'move', { path: 'public/spare.txt', toFolder: 'public/wire-folder' });
   return { envelope, checks: [
-    ['the old path is gone', !rig.harness.exists('public/spare.txt')],
-    ['and the file is in the new folder', rig.harness.exists('public/wire-folder/spare.txt')],
+    ['the old path is gone', !fixture.exists('public/spare.txt')],
+    ['and the file is in the new folder', fixture.exists('public/wire-folder/spare.txt')],
   ] };
 } });
 
-fullScenario({ domain: 'asset', action: 'rename', run: async ({ call, rig }) => {
+fullScenario({ domain: 'asset', action: 'rename', run: async ({ call, fixture }) => {
   const { envelope } = await call('asset', 'rename', { path: 'public/wire-folder/spare.txt', name: 'renamed.txt' });
   return { envelope, checks: [
-    ['the old name is gone', !rig.harness.exists('public/wire-folder/spare.txt')],
-    ['and the new name exists', rig.harness.exists('public/wire-folder/renamed.txt')],
+    ['the old name is gone', !fixture.exists('public/wire-folder/spare.txt')],
+    ['and the new name exists', fixture.exists('public/wire-folder/renamed.txt')],
   ] };
 } });
 
-fullScenario({ domain: 'asset', action: 'delete', run: async ({ call, rig }) => {
-  const before = rig.harness.exists('public/wire-folder/renamed.txt');
+fullScenario({ domain: 'asset', action: 'delete', run: async ({ call, fixture }) => {
+  const before = fixture.exists('public/wire-folder/renamed.txt');
   const { envelope } = await call('asset', 'delete', { path: 'public/wire-folder/renamed.txt' });
   return { envelope, checks: [
     ['the file was there first', before],
-    ['and is gone from disk', !rig.harness.exists('public/wire-folder/renamed.txt')],
+    ['and is gone from disk', !fixture.exists('public/wire-folder/renamed.txt')],
   ] };
 } });
 
@@ -548,15 +548,15 @@ fullScenario({ domain: 'content', action: 'cms_read', run: async ({ call }) => {
   return { envelope, checks: [['it parses the fixture data', !!envelope?.data && typeof envelope.data === 'object']] };
 } });
 
-fullScenario({ domain: 'content', action: 'cms_write', run: async ({ call, rig }) => {
+fullScenario({ domain: 'content', action: 'cms_write', run: async ({ call, fixture }) => {
   const read = await call('content', 'cms_read', { path: 'src/data/site.json' });
   const { envelope } = await call('content', 'cms_write', { path: 'src/data/site.json', data: { ...(read.envelope?.data || {}), wireWrote: true }, ref: read.envelope?.ref });
-  return { envelope, checks: [['the new key is in the file on disk', JSON.parse(rig.harness.read('src/data/site.json')).wireWrote === true]] };
+  return { envelope, checks: [['the new key is in the file on disk', JSON.parse(fixture.read('src/data/site.json')).wireWrote === true]] };
 } });
 
-fullScenario({ domain: 'content', action: 'cms_create', run: async ({ call, rig }) => {
+fullScenario({ domain: 'content', action: 'cms_create', run: async ({ call, fixture }) => {
   const { envelope } = await call('content', 'cms_create', { name: 'wireteam' });
-  return { envelope, checks: [['a new data file exists', rig.harness.exists('src/data/wireteam.json')]] };
+  return { envelope, checks: [['a new data file exists', fixture.exists('src/data/wireteam.json')]] };
 } });
 
 fullScenario({ domain: 'content', action: 'cms_usage', run: async ({ call }) => {
@@ -569,18 +569,21 @@ fullScenario({ domain: 'content', action: 'cms_meta', run: async ({ call }) => {
   return { envelope, checks: [['it answers with a meta map', !!envelope && typeof envelope.meta === 'object']] };
 } });
 
-fullScenario({ domain: 'content', action: 'cms_set_meta', run: async ({ call, call2 }) => {
+fullScenario({ domain: 'content', action: 'cms_set_meta', run: async ({ call, fixture }) => {
   const { envelope } = await call('content', 'cms_set_meta', { path: 'src/data/site.json', fields: { label: 'Wire' } });
+  // Read back through a different operation: the meta is not in a file this
+  // fixture can open, so the follow-up read IS the world evidence.
   const back = await call('content', 'cms_meta', {});
+  fixture.observedWorld('read the meta back through content.cms_meta');
   return { envelope, checks: [['the meta it set reads back', JSON.stringify(back.envelope?.meta || {}).includes('Wire')]] };
 } });
 
-fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, rig }) => {
-  const before = rig.harness.exists('src/data/wireteam.json');
+fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, fixture }) => {
+  const before = fixture.exists('src/data/wireteam.json');
   const { envelope } = await call('content', 'cms_delete', { path: 'src/data/wireteam.json' });
   return { envelope, checks: [
     ['the data file was there first', before],
-    ['and is gone', !rig.harness.exists('src/data/wireteam.json')],
+    ['and is gone', !fixture.exists('src/data/wireteam.json')],
   ] };
 } });
 
@@ -689,24 +692,24 @@ fullScenario({ domain: 'project', action: 'diagnose', run: async ({ call }) => {
   ] };
 } });
 
-fullScenario({ domain: 'project', action: 'undo', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'project', action: 'undo', run: async ({ call, ref, fixture }) => {
   await call('target', 'add_class', { ref: await ref('div'), className: 'undo-me' });
-  const applied = rig.harness.read('src/pages/index.astro').includes('undo-me');
+  const applied = fixture.read('src/pages/index.astro').includes('undo-me');
   const { envelope } = await call('project', 'undo', {});
   return { envelope, checks: [
     ['the edit landed first', applied],
-    ['and undo took it back out of the file', !rig.harness.read('src/pages/index.astro').includes('undo-me')],
+    ['and undo took it back out of the file', !fixture.read('src/pages/index.astro').includes('undo-me')],
   ] };
 } });
 
-fullScenario({ domain: 'project', action: 'redo', run: async ({ call, ref, rig }) => {
+fullScenario({ domain: 'project', action: 'redo', run: async ({ call, ref, fixture }) => {
   await call('target', 'add_class', { ref: await ref('div'), className: 'redo-me' });
   await call('project', 'undo', {});
-  const undone = !rig.harness.read('src/pages/index.astro').includes('redo-me');
+  const undone = !fixture.read('src/pages/index.astro').includes('redo-me');
   const { envelope } = await call('project', 'redo', {});
   return { envelope, checks: [
     ['undo removed it first', undone],
-    ['and redo put it back', rig.harness.read('src/pages/index.astro').includes('redo-me')],
+    ['and redo put it back', fixture.read('src/pages/index.astro').includes('redo-me')],
   ] };
 } });
 
@@ -728,11 +731,11 @@ fullScenario({ domain: 'project', action: 'install', run: (ctx) => devLifecycle.
 // that lands somewhere checkable and no remote anybody owns is touched.
 
 const { execFileSync } = require('node:child_process');
-const git = (rig, args) => execFileSync('git', args, { cwd: rig.root, encoding: 'utf8' }).trim();
+const git = (fixture, args) => execFileSync('git', args, { cwd: fixture.root, encoding: 'utf8' }).trim();
 
-fullScenario({ domain: 'git', action: 'init', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'init', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'init', {});
-  return { envelope, checks: [['the project is a git repository now', rig.harness.exists('.git')]] };
+  return { envelope, checks: [['the project is a git repository now', fixture.exists('.git')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'info', run: async ({ call }) => {
@@ -740,15 +743,15 @@ fullScenario({ domain: 'git', action: 'info', run: async ({ call }) => {
   return { envelope, checks: [['it reports the repository it just initialised', 'branch' in envelope || 'head' in envelope || 'repo' in envelope]] };
 } });
 
-fullScenario({ domain: 'git', action: 'status', run: async ({ call, rig }) => {
-  rig.harness.write('public/status-canary.txt', 'untracked\n');
+fullScenario({ domain: 'git', action: 'status', run: async ({ call, fixture }) => {
+  fixture.write('public/status-canary.txt', 'untracked\n');
   const { envelope } = await call('git', 'status', {});
   return { envelope, checks: [['it sees the file just written into the working tree', JSON.stringify(envelope).includes('status-canary')]] };
 } });
 
-fullScenario({ domain: 'git', action: 'commit', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'commit', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'commit', { message: 'The fixture, as the wire test found it' });
-  return { envelope, checks: [['git reports a commit with that message', git(rig, ['log', '-1', '--pretty=%s']) === 'The fixture, as the wire test found it']] };
+  return { envelope, checks: [['git reports a commit with that message', git(fixture, ['log', '-1', '--pretty=%s']) === 'The fixture, as the wire test found it']] };
 } });
 
 fullScenario({ domain: 'git', action: 'log', run: async ({ call }) => {
@@ -771,21 +774,21 @@ fullScenario({ domain: 'git', action: 'commit_files', run: async ({ call }) => {
   return { envelope, checks: [['it lists files that commit touched', (envelope?.files || []).length > 0]] };
 } });
 
-fullScenario({ domain: 'git', action: 'worktrees', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'worktrees', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'worktrees', {});
-  return { envelope, checks: [['it reports the fixture working tree', JSON.stringify(envelope).includes(path.basename(rig.root)) || (envelope?.worktrees || []).length > 0]] };
+  return { envelope, checks: [['it reports the fixture working tree', JSON.stringify(envelope).includes(path.basename(fixture.root)) || (envelope?.worktrees || []).length > 0]] };
 } });
 
-fullScenario({ domain: 'git', action: 'checkout', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'checkout', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'checkout', { branch: 'wire-branch', create: true });
-  return { envelope, checks: [['git reports the new branch as current', git(rig, ['branch', '--show-current']) === 'wire-branch']] };
+  return { envelope, checks: [['git reports the new branch as current', git(fixture, ['branch', '--show-current']) === 'wire-branch']] };
 } });
 
-fullScenario({ domain: 'git', action: 'merge', run: async ({ call, rig }) => {
-  const base = git(rig, ['rev-parse', 'HEAD']);
+fullScenario({ domain: 'git', action: 'merge', run: async ({ call, fixture }) => {
+  const base = git(fixture, ['rev-parse', 'HEAD']);
   await call('git', 'checkout', { branch: 'wire-branch' });
   const { envelope } = await call('git', 'merge', { branch: 'main' });
-  return { envelope, checks: [['the repository still has the base commit reachable', git(rig, ['cat-file', '-t', base]) === 'commit']] };
+  return { envelope, checks: [['the repository still has the base commit reachable', git(fixture, ['cat-file', '-t', base]) === 'commit']] };
 } });
 
 fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call }) => {
@@ -793,37 +796,37 @@ fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call }) => 
   return { envelope, checks: [['it answers about the merge state', !!envelope]] };
 } });
 
-fullScenario({ domain: 'git', action: 'park', run: async ({ call, rig }) => {
-  rig.harness.write('public/park-canary.txt', 'parked\n');
+fullScenario({ domain: 'git', action: 'park', run: async ({ call, fixture }) => {
+  fixture.write('public/park-canary.txt', 'parked\n');
   const { envelope } = await call('git', 'park', {});
-  return { envelope, checks: [['the working tree is clean of the parked change', !git(rig, ['status', '--porcelain']).includes('park-canary')]] };
+  return { envelope, checks: [['the working tree is clean of the parked change', !git(fixture, ['status', '--porcelain']).includes('park-canary')]] };
 } });
 
-fullScenario({ domain: 'git', action: 'unpark', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'unpark', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'unpark', {});
-  return { envelope, checks: [['the parked change is back in the working tree', rig.harness.exists('public/park-canary.txt')]] };
+  return { envelope, checks: [['the parked change is back in the working tree', fixture.exists('public/park-canary.txt')]] };
 } });
 
-fullScenario({ domain: 'git', action: 'restore_file', run: async ({ call, rig }) => {
-  const committed = git(rig, ['show', 'HEAD:src/pages/about.astro']);
-  rig.harness.write('src/pages/about.astro', '<p>vandalised</p>\n');
+fullScenario({ domain: 'git', action: 'restore_file', run: async ({ call, fixture }) => {
+  const committed = git(fixture, ['show', 'HEAD:src/pages/about.astro']);
+  fixture.write('src/pages/about.astro', '<p>vandalised</p>\n');
   const { envelope } = await call('git', 'restore_file', { ref: 'HEAD', path: 'src/pages/about.astro' });
-  return { envelope, checks: [['the file matches what HEAD holds', rig.harness.read('src/pages/about.astro').trim() === committed.trim()]] };
+  return { envelope, checks: [['the file matches what HEAD holds', fixture.read('src/pages/about.astro').trim() === committed.trim()]] };
 } });
 
-fullScenario({ domain: 'git', action: 'restore_project', run: async ({ call, rig }) => {
-  rig.harness.write('src/pages/about.astro', '<p>vandalised again</p>\n');
+fullScenario({ domain: 'git', action: 'restore_project', run: async ({ call, fixture }) => {
+  fixture.write('src/pages/about.astro', '<p>vandalised again</p>\n');
   const { envelope } = await call('git', 'restore_project', { ref: 'HEAD' });
-  return { envelope, checks: [['the vandalism is gone', !rig.harness.read('src/pages/about.astro').includes('vandalised again')]] };
+  return { envelope, checks: [['the vandalism is gone', !fixture.read('src/pages/about.astro').includes('vandalised again')]] };
 } });
 
-fullScenario({ domain: 'git', action: 'delete_branch', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'delete_branch', run: async ({ call, fixture }) => {
   await call('git', 'checkout', { branch: 'main' });
-  const before = git(rig, ['branch', '--list', 'wire-branch']).includes('wire-branch');
+  const before = git(fixture, ['branch', '--list', 'wire-branch']).includes('wire-branch');
   const { envelope } = await call('git', 'delete_branch', { branch: 'wire-branch', force: true });
   return { envelope, checks: [
     ['the branch existed first', before],
-    ['and git no longer lists it', !git(rig, ['branch', '--list', 'wire-branch']).includes('wire-branch')],
+    ['and git no longer lists it', !git(fixture, ['branch', '--list', 'wire-branch']).includes('wire-branch')],
   ] };
 } });
 
@@ -832,12 +835,12 @@ fullScenario({ domain: 'git', action: 'gh_status', run: async ({ call }) => {
   return { envelope, checks: [['it reports whether the gh CLI is installed', typeof envelope?.installed === 'boolean']] };
 } });
 
-fullScenario({ domain: 'git', action: 'push', run: async ({ call, rig }) => {
+fullScenario({ domain: 'git', action: 'push', run: async ({ call, fixture }) => {
   const os = require('node:os');
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-wire-origin-'));
   try {
     execFileSync('git', ['init', '--bare', '-b', 'main', bare], { stdio: 'ignore' });
-    execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: rig.root, stdio: 'ignore' });
+    execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: fixture.root, stdio: 'ignore' });
     const { envelope } = await call('git', 'push', { branch: 'main' });
     let landed = '';
     try {

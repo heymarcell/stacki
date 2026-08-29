@@ -26,9 +26,18 @@
 // A scenario that cannot supply a postcondition is not FULL. There is no
 // grade between them and there is deliberately no way to opt out.
 //
-// BOUNDARY is for one thing only: an operation whose last hop would be an
-// external side effect nobody should cause from a test. It runs everything up
-// to that hop, and it says on itself what it stopped short of.
+// BOUNDARY used to mean "the operation is expected not to complete". That is
+// no longer true and the old wording was hiding something better: git.publish
+// now runs its REAL production handler all the way to the external program and
+// returns a real successful result — only the `gh` binary at the very end is a
+// test-owned double, verified to be the thing that answered.
+//
+// So BOUNDARY means: the production implementation is executed through the last
+// controllable local seam, and the external side-effect provider is replaced by
+// a fail-closed double. It must prove the registered operation ran, that the
+// real path reached the seam, that the genuine external provider could not be
+// reached, and what intent arrived there. A mock buried inside Stacki is not a
+// boundary; the seam has to be the edge of the world.
 
 const GRADES = new Set(['full', 'boundary']);
 
@@ -83,6 +92,12 @@ const boundaryScenario = (spec) => register({ ...spec, grade: 'boundary' });
  * the contract lives in one place rather than in whoever wrote the loop.
  */
 function judgeFull(out, subject) {
+  // THE RECORDER IS NOT OPTIONAL. `if (subject)` made the core invariant
+  // something a caller could opt out of by forgetting an argument, which is
+  // the same permissiveness this file has already had to remove twice.
+  if (!subject || typeof subject !== 'object' || typeof subject.key !== 'string') {
+    return { good: false, detail: 'judgeFull was called without a subject record — a FULL verdict cannot be reached without knowing what the runner actually invoked' };
+  }
   if (!out || typeof out !== 'object') return { good: false, detail: 'the scenario returned nothing' };
   const { envelope, checks } = out;
 
@@ -94,13 +109,17 @@ function judgeFull(out, subject) {
   // is to stop relying on that. `subject` is what the runner RECORDED for the
   // registered domain.action, so a scenario that accidentally returns a
   // successful setup envelope while its own operation failed cannot pass.
-  if (subject) {
-    if (!subject.invoked) {
-      return { good: false, detail: `${subject.key} was never invoked — the scenario ran, but not the operation it is registered for` };
-    }
-    if (subject.envelope !== envelope) {
-      return { good: false, detail: `the judged envelope is not the one ${subject.key} returned — a setup or read answer was handed back instead` };
-    }
+  if (!subject.invoked) {
+    return { good: false, detail: `${subject.key} was never invoked — the scenario ran, but not the operation it is registered for` };
+  }
+  // EXACTLY ONE. Not "at least one": a scenario that calls its own subject
+  // twice can have the first fail and the second succeed, return the second,
+  // and look green. Setup and read-back belong to OTHER operations.
+  if (subject.count !== 1) {
+    return { good: false, detail: `${subject.key} was invoked ${subject.count} times; a FULL scenario makes exactly one subject call, so a failing first attempt cannot be papered over by a second. Use other operations for setup and read-back.` };
+  }
+  if (subject.envelope !== envelope) {
+    return { good: false, detail: `the judged envelope is not the one ${subject.key} returned — a setup or read answer was handed back instead` };
   }
 
   if (!envelope || typeof envelope !== 'object') {

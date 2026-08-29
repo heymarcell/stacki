@@ -62,8 +62,8 @@ const LOCAL_DEP = {
   'vendor/wire-dep/index.js': "module.exports = 'installed by the wire test';\n",
 };
 
-async function install({ call, rig }) {
-  const root = rig.root;
+async function install({ call, fixture }) {
+  const root = fixture.root;
   // Give the fixture a dependency it can install without a registry.
   for (const [rel, text] of Object.entries(LOCAL_DEP)) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -80,6 +80,7 @@ async function install({ call, rig }) {
   const lock = fs.existsSync(path.join(root, 'package-lock.json'));
   const deps = await call('project', 'dependencies', {});
 
+  fixture.observedWorld('looked for node_modules on disk after the package manager ran');
   return {
     envelope,
     checks: [
@@ -94,12 +95,12 @@ async function install({ call, rig }) {
 //
 // One real Astro project per lifecycle run, started and stopped through MCP.
 
-async function devStart({ call, rig }) {
+async function devStart({ call, fixture }) {
   const { envelope } = await call('project', 'dev_start', {});
   const url = envelope?.url || envelope?.href || null;
   const port = url ? Number(new URL(url).port) : null;
-  rig.__devUrl = url;
-  rig.__devPort = port;
+  fixture.scratch.devUrl = url;
+  fixture.scratch.devPort = port;
 
   const answered = url
     ? await until('the dev server to answer', async () => {
@@ -112,6 +113,7 @@ async function devStart({ call, rig }) {
       })
     : null;
 
+  fixture.observedWorld('connected to the port the dev server bound, and asked it for a page');
   return {
     envelope,
     checks: [
@@ -122,8 +124,8 @@ async function devStart({ call, rig }) {
   };
 }
 
-async function probe({ call, rig }) {
-  const { envelope } = await call('project', 'probe', { url: rig.__devUrl || undefined });
+async function probe({ call, fixture }) {
+  const { envelope } = await call('project', 'probe', { url: fixture.scratch.devUrl || undefined });
   return {
     envelope,
     checks: [['probing the running server reports it reachable', envelope?.ok === true && (envelope.status === undefined || envelope.status > 0)]],
@@ -141,12 +143,13 @@ async function devStatus({ call }) {
   };
 }
 
-async function devStop({ call, rig }) {
-  const port = rig.__devPort;
+async function devStop({ call, fixture }) {
+  const port = fixture.scratch.devPort;
   const { envelope } = await call('project', 'dev_stop', {});
   const freed = port
     ? await until('the port to be released', async () => !(await portBusy(port)), 30000, 300)
     : true;
+  fixture.observedWorld('checked the port this test bound is no longer accepting connections');
   return {
     envelope,
     checks: [

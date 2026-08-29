@@ -93,9 +93,16 @@ for (const domain of DOMAINS) {
 
 if (!failures.length) {
   console.log(`  ${registryKeys.length} operations across ${DOMAINS.length} domains  [read ${risk.read} · write ${risk.write} · high ${risk.high}]`);
-  console.log(`  FULL      ${full.length}`);
-  console.log(`  BOUNDARY  ${boundary.length}`);
-  console.log(`  UNCOVERED ${missing.length}`);
+  console.log(`  REGISTERED   full ${full.length} · boundary ${boundary.length} · unaccounted ${missing.length}`);
+  // REGISTERED IS NOT PASSING, and this file cannot tell the difference: it
+  // audits the ledger without executing anything, on purpose, so that a
+  // hundred-odd rigs do not have to boot to answer "is every operation
+  // accounted for". Whether those scenarios actually SUCCEED is what
+  // test/mcp-wire-coverage.js runs, and that is the number a coverage claim
+  // has to come from. Saying "110 FULL covered" on the strength of 110
+  // scenario objects existing would be the same overstatement this whole pass
+  // exists to correct.
+  console.log('  (registration only — run test:mcpwire for executed/passing counts)');
   for (const s of boundary) console.log(`    boundary — ${s.domain}.${s.action}: ${s.why.split('.')[0]}.`);
 }
 
@@ -103,4 +110,4 @@ if (failures.length) {
   console.error(`\nmcp-operation-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
   process.exit(1);
 }
-console.log(`mcp-operation-matrix: ${checked} passed  [coverage derived from executable scenarios, not a typed list]`);
+console.log(`mcp-operation-matrix: ${checked} passed  [every operation has an executable scenario; passing is measured elsewhere]`);

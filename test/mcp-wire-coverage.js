@@ -24,6 +24,7 @@
 require('./support/mcpScenarioSet.js');
 const { all: allScenarios, size: scenarioCount, judgeFull } = require('./support/mcpOperationScenarios.js');
 const { startWireRig } = require('./support/mcpWireRig.js');
+const { find } = require('../electron/mcp/agent/registry.js');
 
 const failures = [];
 let checked = 0;
@@ -80,6 +81,10 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         // binds to, so a scenario cannot pass by handing back a successful
         // setup or read answer while its own operation failed.
         const subject = { key: `${s.domain}.${s.action}`, invoked: false, envelope: null, count: 0 };
+        // Declared out here so the verdict below can read it: an operation that
+        // mutates must have looked at the world, and that is judged after the
+        // scenario has finished running.
+        let worldReads = 0;
         const watched = async (domain, action, args = {}) => {
           const out = await rig.call(domain, action, args);
           if (domain === s.domain && action === s.action) {
@@ -93,7 +98,46 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         let raw = null;
         let verdict = null;
         try {
-          raw = await s.run({ call: watched, tool: rig.tool, rig, ref });
+          // NO RAW RIG. A scenario used to receive the rig itself, which
+          // exposes rig.call — an unwatched path straight to its own subject,
+          // and therefore a way to earn FULL without the runner ever seeing
+          // the invocation. It gets a narrow surface instead: the watched
+          // call, a ref helper, and the fixture files it needs to prove a
+          // postcondition. The rig stays with the harness that owns it.
+          // Reads of the world are counted, because a WRITE that only proves
+          // itself by its own success flag proves nothing. `ok: true` and
+          // `changed: true` are the operation's opinion of the operation. If a
+          // mutation leaves a trace anywhere inspectable — a file, a repo, a
+          // port — the scenario has to go and look.
+          const fixture = {
+            get root() {
+              worldReads += 1;
+              return rig.root;
+            },
+            read: (rel) => {
+              worldReads += 1;
+              return rig.harness.read(rel);
+            },
+            exists: (rel) => {
+              worldReads += 1;
+              return rig.harness.exists(rel);
+            },
+            // Writing is setup, not evidence, so it does not count.
+            write: (rel, text) => rig.harness.write(rel, text),
+            // Not every trace is a file. A dev server is a port answering, a
+            // meta change is a follow-up read through another operation. A
+            // scenario says what it went and looked at, so the claim is on the
+            // record rather than inferred from which helper it happened to use.
+            observedWorld: (what) => {
+              if (typeof what !== 'string' || !what.trim()) throw new Error('observedWorld needs to say what was inspected');
+              worldReads += 1;
+              return what;
+            },
+            // Somewhere for a multi-step scenario to keep its own state (the
+            // dev lifecycle needs the URL it started between calls).
+            scratch: {},
+          };
+          raw = await s.run({ call: watched, tool: rig.tool, ref, fixture });
         } catch (err) {
           verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
         }
@@ -102,6 +146,19 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         // have succeeded, and a postcondition must hold. BOUNDARY keeps its own
         // shape, because not completing is the thing it asserts.
         if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw, subject) : raw;
+        // The world-evidence rule, applied where it means something: an
+        // operation the registry calls `write` or `high` changes something, and
+        // a scenario that never looked at anything outside the answer has not
+        // shown that it did.
+        if (verdict?.good && s.grade === 'full') {
+          const entry = find(s.domain, s.action);
+          if (entry && (entry.risk === 'write' || entry.risk === 'high') && worldReads === 0) {
+            verdict = {
+              good: false,
+              detail: `${s.domain}.${s.action} is a ${entry.risk} operation and the scenario never read the world — its only evidence is the operation's own success flag. Inspect the file, the repository, the port or a follow-up read.`,
+            };
+          }
+        }
         results.set(`${s.domain}.${s.action}`, verdict);
         check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
       }
