@@ -429,8 +429,39 @@ fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixt
   ] };
 } });
 
-fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, fixture }) => {
-  const { envelope } = await call('page', 'component_create', { name: 'WireBox', nodes: [{ kind: 'element', tag: 'div', text: 'wire' }] });
+fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, fixture, ref }) => {
+  // THIS FAILS, AND THE FAILURE IS THE POINT.
+  //
+  // page.component_create cannot succeed over MCP at all, whatever is passed.
+  // Its declared input is "the model nodes to move into it, AS target.read
+  // REPORTS THEM" — and what target.read reports is a summary:
+  //
+  //   index, kind, tag, label, text, childCount, keys, breadcrumbs,
+  //   kindOfThing, ref
+  //
+  // while componentFile() hands that straight to serializeNodes(), which walks
+  // parser model nodes and reads `children`. There is no `children` on a
+  // target.read node — only `childCount` — so it dies on
+  // "Cannot read properties of undefined (reading 'length')".
+  //
+  // Checked three ways: the real target.read node, that node without its ref,
+  // and a hand-made NodeSpec. All three produce the identical crash, so this is
+  // not a test-input mistake. An agent has no way to obtain the shape the
+  // implementation wants, which makes the operation unreachable from MCP —
+  // the same family as the project.diagnose defect: exposed, and impossible to
+  // use.
+  //
+  // Left failing deliberately rather than softened or reclassified. Making it
+  // pass means fixing the contract — most likely having the operation take
+  // refs and resolve them to model nodes the way every other target operation
+  // does — and that is a product decision, not something a test should paper
+  // over.
+  const node = await (async () => {
+    const read = await call('target', 'read');
+    const found = flatten(read.envelope?.target).find((n) => String(n.tag || '').toLowerCase() === 'div');
+    return found || null;
+  })();
+  const { envelope } = await call('page', 'component_create', { name: 'WireBox', nodes: node ? [node] : [] });
   return { envelope, checks: [['the component file exists', fixture.exists('src/components/WireBox.astro')]] };
 } });
 
