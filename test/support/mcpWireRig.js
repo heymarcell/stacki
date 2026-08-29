@@ -25,7 +25,10 @@
 // meaning is a rendered pixel are graded against the packaged Electron proof
 // instead, not here.
 
+const fs = require('node:fs');
+const path = require('node:path');
 const H = require('../agent-harness.js');
+const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
 const { createStackiMcpServer } = require('../../electron/mcp/server.js');
 const { connectMcp } = require('./mcpWire.js');
 
@@ -36,7 +39,10 @@ let nextPort = 44120;
  * of that, and an official client connected to the endpoint.
  */
 async function startWireRig({ era = 'modern', agentMode = 'full', extra = {} } = {}) {
-  const root = H.makeProject(extra);
+  // The shared fixture plus what the wire scenarios need to assert anything
+  // real: a dynamic route, a genuine image, a canary in robots.txt.
+  const root = H.makeProject({ ...EXTRA, ...extra });
+  writeBinary(fs, path, root);
   const harness = await H.start(root, { agentMode });
 
   const port = nextPort++;

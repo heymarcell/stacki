@@ -22,7 +22,7 @@
 // rather than incidental — a scenario that needs a ref reads it first.
 
 require('./support/mcpScenarioSet.js');
-const { all: allScenarios, size: scenarioCount, byGrade } = require('./support/mcpOperationScenarios.js');
+const { all: allScenarios, size: scenarioCount, judgeFull } = require('./support/mcpOperationScenarios.js');
 const { startWireRig } = require('./support/mcpWireRig.js');
 
 const failures = [];
@@ -52,6 +52,12 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
       // stale the moment the tree it described is edited — which most of the
       // scenarios below do on purpose.
       const ref = async (want = 'h1') => {
+        // Leave any component a previous scenario drilled into. Without this,
+        // `set_text` enters Hero and every later ref resolves inside Hero's
+        // tree instead of the page's — which made a dozen mutations look like
+        // they had silently stopped writing. Scenario order must not decide
+        // what a ref means.
+        await rig.call('target', 'exit', {}).catch(() => {});
         const { envelope } = await rig.call('target', 'read');
         const root = envelope?.target;
         if (!root) return null;
@@ -68,14 +74,20 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         return (hit || seen[1] || root)?.ref || null;
       };
       for (const s of mine) {
-        let out = null;
+        let raw = null;
+        let verdict = null;
         try {
-          out = await s.run({ call: rig.call, tool: rig.tool, rig, ref });
+          raw = await s.run({ call: rig.call, tool: rig.tool, rig, ref });
         } catch (err) {
-          out = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
+          verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
         }
-        results.set(`${s.domain}.${s.action}`, out);
-        check(`${s.domain}.${s.action} [${s.grade}] through the wire`, out?.good === true, out?.detail || '');
+        // FULL is judged by the framework, not by whatever the scenario felt
+        // like returning: the operation must have answered, the answer must
+        // have succeeded, and a postcondition must hold. BOUNDARY keeps its own
+        // shape, because not completing is the thing it asserts.
+        if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw) : raw;
+        results.set(`${s.domain}.${s.action}`, verdict);
+        check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
       }
     } finally {
       if (rig) await rig.stop();
