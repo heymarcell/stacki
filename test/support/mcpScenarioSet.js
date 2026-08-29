@@ -205,8 +205,15 @@ fullScenario({ domain: 'style', action: 'read_source', run: async ({ call }) => 
 } });
 
 fullScenario({ domain: 'style', action: 'variables', run: async ({ call }) => {
+  // One subject call, and it is the LAST one: `firstCell` also asks
+  // style.variables, so calling it after would leave the runner holding a
+  // different invocation than the one being judged. The framework caught
+  // exactly that, which is what it is for.
   const { envelope } = await call('style', 'variables', {});
-  const cell = await firstCell(call);
+  const cell = (() => {
+    for (const file of envelope?.files || []) for (const g of file.groups || []) for (const b of g.blocks || []) for (const r of b.rows || []) for (const c of r.cells || []) if (c?.name) return c;
+    return null;
+  })();
   return { envelope, checks: [
     ['it reports the fixture stylesheet', (envelope?.files || []).some((f) => String(f.path).includes('site.css'))],
     ['with a real variable and its span', !!cell && typeof cell.valueStart === 'number'],

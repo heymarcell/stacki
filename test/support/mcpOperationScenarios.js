@@ -82,9 +82,27 @@ const boundaryScenario = (spec) => register({ ...spec, grade: 'boundary' });
  * Judge one FULL result. Exported so the runner and the matrix agree, and so
  * the contract lives in one place rather than in whoever wrote the loop.
  */
-function judgeFull(out) {
+function judgeFull(out, subject) {
   if (!out || typeof out !== 'object') return { good: false, detail: 'the scenario returned nothing' };
   const { envelope, checks } = out;
+
+  // BOUND TO THE SUBJECT, not to whatever the scenario handed back.
+  //
+  // A scenario runs setup calls, the operation under test, and often a read to
+  // prove the postcondition. Trusting it to return the right one of those is
+  // trusting the author to have been careful — and the whole point of this file
+  // is to stop relying on that. `subject` is what the runner RECORDED for the
+  // registered domain.action, so a scenario that accidentally returns a
+  // successful setup envelope while its own operation failed cannot pass.
+  if (subject) {
+    if (!subject.invoked) {
+      return { good: false, detail: `${subject.key} was never invoked — the scenario ran, but not the operation it is registered for` };
+    }
+    if (subject.envelope !== envelope) {
+      return { good: false, detail: `the judged envelope is not the one ${subject.key} returned — a setup or read answer was handed back instead` };
+    }
+  }
+
   if (!envelope || typeof envelope !== 'object') {
     return { good: false, detail: 'the operation under test produced no structuredContent — it was never invoked, or it answered isError' };
   }
@@ -94,6 +112,24 @@ function judgeFull(out) {
   if (!Array.isArray(checks) || checks.length === 0) {
     return { good: false, detail: 'FULL needs at least one postcondition; an envelope on its own proves reachability, not behaviour' };
   }
+
+  // STRICT SHAPES. A Promise is truthy, and an unawaited postcondition that
+  // silently counts as "held" is a test that proves nothing while looking
+  // rigorous. So the label must be a real string and the result must be an
+  // actual boolean — not truthy, boolean.
+  for (const [i, entry] of checks.entries()) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      return { good: false, detail: `check ${i} is not a [label, boolean] pair` };
+    }
+    const [label, held] = entry;
+    if (typeof label !== 'string' || !label.trim()) {
+      return { good: false, detail: `check ${i} has no label` };
+    }
+    if (typeof held !== 'boolean') {
+      return { good: false, detail: `check "${label}" is ${held instanceof Promise ? 'a Promise — it was probably not awaited' : `a ${typeof held}`}, not a boolean` };
+    }
+  }
+
   const failed = checks.filter(([, held]) => !held).map(([label]) => label);
   if (failed.length) return { good: false, detail: `postcondition failed: ${failed.join('; ')}` };
   return { good: true, detail: '', evidence: checks.map(([label]) => label) };

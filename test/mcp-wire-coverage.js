@@ -74,10 +74,26 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         return (hit || seen[1] || root)?.ref || null;
       };
       for (const s of mine) {
+        // WATCH THE SUBJECT. Every call the scenario makes goes through here,
+        // and the one matching the registered domain.action is recorded. That
+        // recording — not the scenario's return value — is what judgeFull
+        // binds to, so a scenario cannot pass by handing back a successful
+        // setup or read answer while its own operation failed.
+        const subject = { key: `${s.domain}.${s.action}`, invoked: false, envelope: null, count: 0 };
+        const watched = async (domain, action, args = {}) => {
+          const out = await rig.call(domain, action, args);
+          if (domain === s.domain && action === s.action) {
+            subject.invoked = true;
+            subject.envelope = out.envelope;
+            subject.count += 1;
+          }
+          return out;
+        };
+
         let raw = null;
         let verdict = null;
         try {
-          raw = await s.run({ call: rig.call, tool: rig.tool, rig, ref });
+          raw = await s.run({ call: watched, tool: rig.tool, rig, ref });
         } catch (err) {
           verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
         }
@@ -85,7 +101,7 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         // like returning: the operation must have answered, the answer must
         // have succeeded, and a postcondition must hold. BOUNDARY keeps its own
         // shape, because not completing is the thing it asserts.
-        if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw) : raw;
+        if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw, subject) : raw;
         results.set(`${s.domain}.${s.action}`, verdict);
         check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
       }
