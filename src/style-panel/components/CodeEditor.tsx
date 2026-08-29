@@ -71,10 +71,15 @@ const codeEditorTheme = EditorView.theme({
     outline: '1px solid rgba(255, 214, 10, 0.9)',
     outlineOffset: '-1px',
   },
+  // Selected code keeps the app's selection pair: white on the selection blue.
+  // This object used to declare `color` TWICE — `--selection-text` first, then
+  // `--color-text-primary`, which silently won. Not cosmetic: #ffffff on
+  // #1668e3 is 5.09:1 and passes AA, #f0f0f0 on the same blue is 4.47:1 and
+  // does not. A duplicate key downgraded selected text below the contrast
+  // floor, and the only complaint was a build warning.
   '.cm-content ::selection': {
     color: 'var(--selection-text)',
     backgroundColor: 'var(--selection)',
-    color: 'var(--color-text-primary)',
   },
 }, { dark: true })
 

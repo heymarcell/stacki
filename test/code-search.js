@@ -214,6 +214,56 @@ check(
   'styles.css sets .cm-searchMatch — a base theme ties with it'
 );
 
+// ── One property, declared once ─────────────────────────────────────────────
+//
+// A CodeMirror theme is a plain object, so a property written twice is not an
+// error — the later one silently wins and the earlier one never existed. The
+// style panel's editor declared `color` twice under `.cm-content ::selection`:
+// `--selection-text` first, then `--color-text-primary`.
+//
+// That is measurable, not cosmetic. Against the selection blue #1668e3,
+// #ffffff is 5.09:1 and clears WCAG AA; #f0f0f0 is 4.47:1 and does not. The
+// duplicate pushed selected code under the contrast floor, and the only thing
+// that ever complained was a build warning.
+//
+// So: every theme object in both editors declares each property at most once.
+for (const [what, file] of [
+  ['the app editor', 'src/ui/CodeEditor.jsx'],
+  ['the style panel editor', 'src/style-panel/components/CodeEditor.tsx'],
+]) {
+  const src = read(file);
+  const dupes = [];
+  // Each `'selector': { … }` block in the theme, and the property names in it.
+  for (const block of src.matchAll(/'([^']+)':\s*\{([^{}]*)\}/g)) {
+    const seen = new Map();
+    // Property names only: the start of a line, before any value. Matching
+    // `word:` anywhere would also find the `https:` inside a url() string.
+    for (const decl of block[2].matchAll(/^\s*([A-Za-z][A-Za-z-]*)\s*:/gm)) {
+      const prop = decl[1];
+      seen.set(prop, (seen.get(prop) || 0) + 1);
+    }
+    for (const [prop, n] of seen) if (n > 1) dupes.push(`${block[1]} declares ${prop} ${n}x`);
+  }
+  check(`${what} declares each themed property once`, dupes.length === 0, dupes.join('; '));
+}
+
+// And the pairing itself, named: selected code is the app's selection colours,
+// not the panel's body text colour over a blue wash.
+check(
+  'selected code uses the selection pair in both editors',
+  [read('src/ui/CodeEditor.jsx'), read('src/style-panel/components/CodeEditor.tsx')].every((src) =>
+    /'\.cm-content ::selection':\s*\{[^{}]*color:\s*'var\(--selection-text\)'[^{}]*\}/.test(src)
+  ),
+  'the ::selection foreground must be --selection-text'
+);
+check(
+  'and neither reaches for a body-text colour there',
+  ![read('src/ui/CodeEditor.jsx'), read('src/style-panel/components/CodeEditor.tsx')].some((src) =>
+    /'\.cm-content ::selection':\s*\{[^{}]*--color-text-primary[^{}]*\}/.test(src)
+  ),
+  '#f0f0f0 on #1668e3 is 4.47:1 — under the AA floor'
+);
+
 if (failures.length) {
   console.error(`\ncode-search: ${failures.length} failed, ${checked - failures.length} passed\n`);
   console.error(failures.join('\n') + '\n');

@@ -112,14 +112,33 @@ const check = (what, condition, detail) => {
      app.on('window-all-closed', () => app.quit());
      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
      app.whenReady().then(async () => {
-       const win = new BrowserWindow({ show: false, width: 520, height: 1700 });
+       // Tall enough that nothing scrolls on a roomy display. CI clamps this to
+       // the runner's screen, which is how the gradient fields end up below the
+       // fold and scrolled to — the geometry the flake needed. Overridable so
+       // the reliability run can reproduce that geometry on purpose.
+       const HEIGHT = Number(process.env.FIELD_FOCUS_HEIGHT || 1700);
+       const win = new BrowserWindow({ show: false, width: 520, height: HEIGHT });
        await win.loadFile(path.join(__dirname, 'index.html'));
        await sleep(800);
+
+       const out = { fields: [], timedOut: [] };
+       const js = (code) => win.webContents.executeJavaScript(code, true);
+       const HAS_POPUP = "document.querySelector('.embed-editor_tsettings')";
+       // Poll for a state rather than sleeping towards one. Bounded, and a
+       // timeout is recorded rather than swallowed: a wait that never came true
+       // is a broken test, not a slow one.
+       const waitFor = async (expr, what, ms = 5000) => {
+         const deadline = Date.now() + ms;
+         for (;;) {
+           if (await js('!!(' + expr + ')')) return true;
+           if (Date.now() > deadline) { out.timedOut.push(what); return false; }
+           await sleep(20);
+         }
+       };
+
        // Open the transform settings popup.
        await win.webContents.executeJavaScript("document.querySelector('button[aria-label=\\"Transform settings\\"]').click(); null");
-       await sleep(400);
-
-       const out = { fields: [] };
+       await waitFor(HAS_POPUP, 'the settings popover to open');
        // Which fields to press, by the label their input carries. The popup is
        // portaled to <body>, so it comes AFTER the gradient in document order —
        // walking the DOM would press a gradient field first, and that press is an
@@ -135,7 +154,15 @@ const check = (what, condition, detail) => {
              if (!document.querySelector('.embed-editor_tsettings'))
                document.querySelector('button[aria-label="Transform settings"]').click();
              return null; })()\`);
-           await sleep(350);
+           await waitFor(HAS_POPUP, 'the popover to reopen for ' + label);
+         } else {
+           // A field out on the page is pressed with NOTHING over it. The
+           // popover is dismissed here deliberately rather than left for the
+           // press to dismiss: scrolling this field into view closes it anyway,
+           // and the press would then be racing that unmount. That race is the
+           // flake this test had.
+           await js("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); null");
+           await waitFor('!' + HAS_POPUP, 'the popover to close before ' + label);
          }
          const t = await win.webContents.executeJavaScript(\`(() => {
            const input = document.querySelector('input[aria-label=' + JSON.stringify(\${JSON.stringify(label)}) + ']');
@@ -150,10 +177,18 @@ const check = (what, condition, detail) => {
            // to the window).
            if (!\${JSON.stringify(POPUP_JS)}.includes(\${JSON.stringify(label)})) ed.scrollIntoView({ block: 'center' });
            const r = ed.getBoundingClientRect();
+           const top = document.elementFromPoint(Math.round(r.left + r.width/2), Math.round(r.top + r.height/2));
            return { label: \${JSON.stringify(label)},
                     inView: r.width > 0 && r.height > 0 && r.top >= 0 && r.bottom <= innerHeight,
                     x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2),
-                    inputHidden: getComputedStyle(input).opacity === '0' };
+                    inputHidden: getComputedStyle(input).opacity === '0',
+                    // What is REALLY at the point about to be pressed. The
+                    // rect says where the field is; it says nothing about what
+                    // is drawn over it. Pressing without checking is how a
+                    // popover over the field became "focus went to BODY".
+                    topIsTheField: !!(top && top.dataset && top.dataset.probe === 'target'),
+                    topAtPoint: top ? top.tagName + '.' + String(top.className).slice(0, 50) : null,
+                    popoverUp: !!document.querySelector('.embed-editor_tsettings') };
          })()\`);
          if (!t || t.noEditor || !t.inView) { out.fields.push({ label, skipped: true, why: t }); continue; }
          await win.webContents.executeJavaScript("document.activeElement && document.activeElement.blur(); null");
@@ -200,6 +235,20 @@ const check = (what, condition, detail) => {
     check('and the gradient centre too', tested.filter((f) => /^Position/.test(f.label)).length === 2, JSON.stringify(tested.map((f) => f.label)));
     // The premise: these fields really are a visible editor over a hidden input.
     check('the input behind them is invisible', tested.every((f) => f.inputHidden), JSON.stringify(tested.map((f) => [f.label, f.inputHidden])));
+    // Every wait resolved. A timeout here means the popover never reached the
+    // state the next press assumes, which would make the press meaningless.
+    check('every popover state settled before it was pressed into', (out.timedOut || []).length === 0, JSON.stringify(out.timedOut));
+    // THE PRECONDITION, checked rather than assumed. If the field is not the
+    // topmost thing at the point pressed, the press was never a press on the
+    // field — and the caret assertion below would fail for a reason that has
+    // nothing to do with focus. This names it instead.
+    for (const f of tested) {
+      check(
+        `nothing is covering "${f.label}" when it is pressed`,
+        f.topIsTheField,
+        `at (${f.x},${f.y}) the topmost element is ${f.topAtPoint} | transform-settings popover up: ${f.popoverUp}`
+      );
+    }
     for (const f of tested) {
       check(`pressing "${f.label}" leaves the caret in it`, f.caretInTheFieldPressed, `focus went to ${f.activeTag}${f.focusedAnInvisibleField ? ' — an invisible one' : ''} | at (${f.x},${f.y}) the top element is ${f.hitTag}.${f.hitCls} | popup open: ${f.popupOpen}`);
       check(`and not into a field that cannot be seen ("${f.label}")`, !f.focusedAnInvisibleField, `${f.activeTag} | hit=${f.hitTag}.${f.hitCls} popup=${f.popupOpen}`);
