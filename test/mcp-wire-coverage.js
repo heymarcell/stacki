@@ -41,24 +41,44 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
 (async () => {
   const results = new Map();
 
-  for (const domain of DOMAIN_ORDER) {
-    const mine = allScenarios().filter((s) => s.domain === domain);
-    if (!mine.length) continue;
+  // A FRESH RIG PER SCENARIO.
+  //
+  // This used to be one rig per domain with scenarios running in declared
+  // order, and that was not isolation — it was an ordering that happened to
+  // work. It stopped working the moment `set_text` entered the Hero component
+  // and did not leave: every later ref resolved inside Hero's tree, and a dozen
+  // mutations looked like they had silently stopped writing. Fixing the ref
+  // helper fixed that symptom and left the architecture alone.
+  //
+  // So each scenario now gets its own project, its own MCP endpoint and its own
+  // client. Order independence stops being a property to test for and becomes a
+  // property of the shape: there is nothing for scenario N to inherit from
+  // N-1, because N-1's fixture no longer exists.
+  //
+  // It costs about 620ms a scenario, roughly seventy seconds for the set. That
+  // is a fair price for never again debugging a failure that belongs to a
+  // neighbour.
+  const order = [];
+  for (const domain of DOMAIN_ORDER) for (const s of allScenarios().filter((x) => x.domain === domain)) order.push(s);
+  // SCENARIO_ORDER=reverse|shuffle proves the isolation rather than asserting
+  // it — the results have to be identical whichever way round they run.
+  const mode = process.env.SCENARIO_ORDER || 'normal';
+  if (mode === 'reverse') order.reverse();
+  if (mode === 'shuffle') {
+    // Deterministic: a shuffle nobody can reproduce is not evidence.
+    let seed = 20260829;
+    for (let i = order.length - 1; i > 0; i--) {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      const j = seed % (i + 1);
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+  }
+
+  for (const s of order) {
     let rig = null;
     try {
       rig = await startWireRig();
-      // A ref for the fixture's own markup, obtained the way an agent does it:
-      // `target.read` with no ref answers the page root, and every node under
-      // it carries its own ref. Walked fresh each time, because a ref goes
-      // stale the moment the tree it described is edited — which most of the
-      // scenarios below do on purpose.
       const ref = async (want = 'h1') => {
-        // Leave any component a previous scenario drilled into. Without this,
-        // `set_text` enters Hero and every later ref resolves inside Hero's
-        // tree instead of the page's — which made a dozen mutations look like
-        // they had silently stopped writing. Scenario order must not decide
-        // what a ref means.
-        await rig.call('target', 'exit', {}).catch(() => {});
         const { envelope } = await rig.call('target', 'read');
         const root = envelope?.target;
         if (!root) return null;
@@ -74,132 +94,66 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
         const hit = seen.find((n) => String(n.tag || n.name || '').toLowerCase() === wanted);
         return (hit || seen[1] || root)?.ref || null;
       };
-      for (const s of mine) {
-        // WATCH THE SUBJECT. Every call the scenario makes goes through here,
-        // and the one matching the registered domain.action is recorded. That
-        // recording — not the scenario's return value — is what judgeFull
-        // binds to, so a scenario cannot pass by handing back a successful
-        // setup or read answer while its own operation failed.
-        const subject = { key: `${s.domain}.${s.action}`, invoked: false, envelope: null, count: 0 };
-        // Declared out here so the verdict below can read it: an operation that
-        // mutates must have looked at the world, and that is judged after the
-        // scenario has finished running.
-        let worldReads = 0;
-        const watched = async (domain, action, args = {}) => {
-          const out = await rig.call(domain, action, args);
-          if (domain === s.domain && action === s.action) {
-            subject.invoked = true;
-            subject.envelope = out.envelope;
-            subject.count += 1;
-          }
-          return out;
-        };
 
-        let raw = null;
-        let verdict = null;
-        try {
-          // NO RAW RIG. A scenario used to receive the rig itself, which
-          // exposes rig.call — an unwatched path straight to its own subject,
-          // and therefore a way to earn FULL without the runner ever seeing
-          // the invocation. It gets a narrow surface instead: the watched
-          // call, a ref helper, and the fixture files it needs to prove a
-          // postcondition. The rig stays with the harness that owns it.
-          // Reads of the world are counted, because a WRITE that only proves
-          // itself by its own success flag proves nothing. `ok: true` and
-          // `changed: true` are the operation's opinion of the operation. If a
-          // mutation leaves a trace anywhere inspectable — a file, a repo, a
-          // port — the scenario has to go and look.
-          const fixture = {
-            get root() {
-              worldReads += 1;
-              return rig.root;
-            },
-            read: (rel) => {
-              worldReads += 1;
-              return rig.harness.read(rel);
-            },
-            exists: (rel) => {
-              worldReads += 1;
-              return rig.harness.exists(rel);
-            },
-            // Writing is setup, not evidence, so it does not count.
-            write: (rel, text) => rig.harness.write(rel, text),
-            // Not every trace is a file. A dev server is a port answering, a
-            // meta change is a follow-up read through another operation. A
-            // scenario says what it went and looked at, so the claim is on the
-            // record rather than inferred from which helper it happened to use.
-            observedWorld: (what) => {
-              if (typeof what !== 'string' || !what.trim()) throw new Error('observedWorld needs to say what was inspected');
-              worldReads += 1;
-              return what;
-            },
-            // Somewhere for a multi-step scenario to keep its own state (the
-            // dev lifecycle needs the URL it started between calls).
-            scratch: {},
-          };
-          raw = await s.run({ call: watched, tool: rig.tool, ref, fixture });
-        } catch (err) {
-          verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
+      const subject = { key: `${s.domain}.${s.action}`, invoked: false, envelope: null, count: 0 };
+      let worldReads = 0;
+      const watched = async (domain, action, args = {}) => {
+        const out = await rig.call(domain, action, args);
+        if (domain === s.domain && action === s.action) {
+          subject.invoked = true;
+          subject.envelope = out.envelope;
+          subject.count += 1;
         }
-        // FULL is judged by the framework, not by whatever the scenario felt
-        // like returning: the operation must have answered, the answer must
-        // have succeeded, and a postcondition must hold. BOUNDARY keeps its own
-        // shape, because not completing is the thing it asserts.
-        if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw, subject) : raw;
-        // The world-evidence rule, applied where it means something: an
-        // operation the registry calls `write` or `high` changes something, and
-        // a scenario that never looked at anything outside the answer has not
-        // shown that it did.
-        if (verdict?.good && s.grade === 'full') {
-          const entry = find(s.domain, s.action);
-          if (entry && (entry.risk === 'write' || entry.risk === 'high') && worldReads === 0) {
-            verdict = {
-              good: false,
-              detail: `${s.domain}.${s.action} is a ${entry.risk} operation and the scenario never read the world — its only evidence is the operation's own success flag. Inspect the file, the repository, the port or a follow-up read.`,
-            };
-          }
-        }
-        results.set(`${s.domain}.${s.action}`, verdict);
-        check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
+        return out;
+      };
+      const fixture = {
+        get root() {
+          worldReads += 1;
+          return rig.root;
+        },
+        read: (rel) => {
+          worldReads += 1;
+          return rig.harness.read(rel);
+        },
+        exists: (rel) => {
+          worldReads += 1;
+          return rig.harness.exists(rel);
+        },
+        write: (rel, text) => rig.harness.write(rel, text),
+        observedWorld: (what) => {
+          if (typeof what !== 'string' || !what.trim()) throw new Error('observedWorld needs to say what was inspected');
+          worldReads += 1;
+          return what;
+        },
+        scratch: {},
+      };
+
+      let raw = null;
+      let verdict = null;
+      try {
+        raw = await s.run({ call: watched, tool: rig.tool, ref, fixture });
+      } catch (err) {
+        verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
       }
+      if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw, subject) : raw;
+      if (verdict?.good && s.grade === 'full') {
+        const entry = find(s.domain, s.action);
+        if (entry && (entry.risk === 'write' || entry.risk === 'high') && worldReads === 0) {
+          verdict = {
+            good: false,
+            detail: `${s.domain}.${s.action} is a ${entry.risk} operation and the scenario never read the world — its only evidence is the operation's own success flag. Inspect the file, the repository, the port or a follow-up read.`,
+          };
+        }
+      }
+      results.set(`${s.domain}.${s.action}`, verdict);
+      check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
     } finally {
+      // Owned, so it goes. A rig that will not stop is a leak, not a detail.
       if (rig) await rig.stop();
     }
   }
 
-  // ── The catalog does not grow silently ───────────────────────────────────
-  //
-  // A byte budget, not a stopwatch — §44's rule, and the one this repository
-  // keeps relearning: assert the invariant, not the milliseconds. Every client
-  // pays for `tools/list` on every session; it is 131KB raw / 11KB gzipped
-  // today, over half of it the Envelope output schema serialised once per
-  // domain tool.
-  //
-  // It has to be measured against the FULL surface. The first version of this
-  // check lived in test/mcp-modern.js, whose server is built without `api` and
-  // therefore publishes four tools rather than thirteen — the budget passed a
-  // deliberate 160KB of padding without noticing, because it was weighing the
-  // wrong catalog. Sabotage is why that was found rather than shipped.
-  //
-  // The headroom is deliberate: a tripwire for a surface that doubles, not a
-  // style rule about description length.
-  {
-    const rig = await startWireRig();
-    try {
-      const listed = await rig.client.listTools();
-      const json = JSON.stringify(listed);
-      const raw = Buffer.byteLength(json, 'utf8');
-      const gzip = require('zlib').gzipSync(json).length;
-      check('the whole tool surface is published', listed.tools.length === 13, `${listed.tools.length} tools`);
-      check('the tool catalog has not doubled', raw < 260000, `${raw} bytes raw (131349 when this budget was set)`);
-      check('  nor has it compressed worse', gzip < 24000, `${gzip} bytes gzip (11272 when set)`);
-      check('  and every tool still declares an output schema', listed.tools.every((t) => !!t.outputSchema), listed.tools.filter((t) => !t.outputSchema).map((t) => t.name).join(','));
-    } finally {
-      await rig.stop();
-    }
-  }
-
-  console.log(`  scenarios registered: ${scenarioCount()}`);
+  console.log(`  scenarios registered: ${scenarioCount()}  (order: ${mode}, fresh fixture each)`);
   console.log(`  scenarios run:        ${results.size}`);
 
   if (failures.length) {

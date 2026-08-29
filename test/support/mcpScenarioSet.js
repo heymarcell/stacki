@@ -387,6 +387,7 @@ fullScenario({ domain: 'page', action: 'create', run: async ({ call, fixture }) 
 } });
 
 fullScenario({ domain: 'page', action: 'move', run: async ({ call, fixture }) => {
+  await call('page', 'create', { name: 'wire-made', layout: 'Base' });
   const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'moved/index.astro' });
   return { envelope, checks: [
     ['the old path is gone', !fixture.exists('src/pages/wire-made.astro')],
@@ -395,11 +396,12 @@ fullScenario({ domain: 'page', action: 'move', run: async ({ call, fixture }) =>
 } });
 
 fullScenario({ domain: 'page', action: 'delete', run: async ({ call, fixture }) => {
-  const before = fixture.exists('src/pages/moved/index.astro');
-  const { envelope } = await call('page', 'delete', { path: 'src/pages/moved/index.astro' });
+  await call('page', 'create', { name: 'wire-doomed', layout: 'Base' });
+  const before = fixture.exists('src/pages/wire-doomed.astro');
+  const { envelope } = await call('page', 'delete', { path: 'src/pages/wire-doomed.astro' });
   return { envelope, checks: [
     ['the page was there first', before],
-    ['and is gone from disk', !fixture.exists('src/pages/moved/index.astro')],
+    ['and is gone from disk', !fixture.exists('src/pages/wire-doomed.astro')],
   ] };
 } });
 
@@ -409,6 +411,7 @@ fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixt
 } });
 
 fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixture }) => {
+  await call('page', 'folder_create', { dir: 'wire-docs' });
   const { envelope } = await call('page', 'folder_rename', { from: 'wire-docs', to: 'wire-guide' });
   return { envelope, checks: [
     ['the old folder is gone', !fixture.exists('src/pages/wire-docs')],
@@ -417,6 +420,7 @@ fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixt
 } });
 
 fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixture }) => {
+  await call('page', 'folder_create', { dir: 'wire-guide' });
   const before = fixture.exists('src/pages/wire-guide');
   const { envelope } = await call('page', 'folder_delete', { dir: 'wire-guide' });
   return { envelope, checks: [
@@ -512,6 +516,8 @@ fullScenario({ domain: 'asset', action: 'move', run: async ({ call, fixture }) =
 } });
 
 fullScenario({ domain: 'asset', action: 'rename', run: async ({ call, fixture }) => {
+  await call('asset', 'mkdir', { parent: 'public', name: 'wire-folder' });
+  await call('asset', 'move', { path: 'public/spare.txt', toFolder: 'public/wire-folder' });
   const { envelope } = await call('asset', 'rename', { path: 'public/wire-folder/spare.txt', name: 'renamed.txt' });
   return { envelope, checks: [
     ['the old name is gone', !fixture.exists('public/wire-folder/spare.txt')],
@@ -520,11 +526,11 @@ fullScenario({ domain: 'asset', action: 'rename', run: async ({ call, fixture })
 } });
 
 fullScenario({ domain: 'asset', action: 'delete', run: async ({ call, fixture }) => {
-  const before = fixture.exists('public/wire-folder/renamed.txt');
-  const { envelope } = await call('asset', 'delete', { path: 'public/wire-folder/renamed.txt' });
+  const before = fixture.exists('public/spare.txt');
+  const { envelope } = await call('asset', 'delete', { path: 'public/spare.txt' });
   return { envelope, checks: [
     ['the file was there first', before],
-    ['and is gone from disk', !fixture.exists('public/wire-folder/renamed.txt')],
+    ['and is gone from disk', !fixture.exists('public/spare.txt')],
   ] };
 } });
 
@@ -579,6 +585,7 @@ fullScenario({ domain: 'content', action: 'cms_set_meta', run: async ({ call, fi
 } });
 
 fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, fixture }) => {
+  await call('content', 'cms_create', { name: 'wireteam' });
   const before = fixture.exists('src/data/wireteam.json');
   const { envelope } = await call('content', 'cms_delete', { path: 'src/data/wireteam.json' });
   return { envelope, checks: [
@@ -733,81 +740,128 @@ fullScenario({ domain: 'project', action: 'install', run: (ctx) => devLifecycle.
 const { execFileSync } = require('node:child_process');
 const git = (fixture, args) => execFileSync('git', args, { cwd: fixture.root, encoding: 'utf8' }).trim();
 
+// Each git scenario gets its own repository with a seed commit. Fixtures are
+// per-scenario now, so nothing inherits `init` from a neighbour — and a
+// scenario that silently depended on one was never testing what it claimed.
+const seedRepo = async (call) => {
+  await call('git', 'init', {});
+  await call('git', 'commit', { message: 'seed commit for this scenario' });
+};
+
 fullScenario({ domain: 'git', action: 'init', run: async ({ call, fixture }) => {
   const { envelope } = await call('git', 'init', {});
   return { envelope, checks: [['the project is a git repository now', fixture.exists('.git')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'info', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'info', {});
   return { envelope, checks: [['it reports the repository it just initialised', 'branch' in envelope || 'head' in envelope || 'repo' in envelope]] };
 } });
 
 fullScenario({ domain: 'git', action: 'status', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   fixture.write('public/status-canary.txt', 'untracked\n');
   const { envelope } = await call('git', 'status', {});
   return { envelope, checks: [['it sees the file just written into the working tree', JSON.stringify(envelope).includes('status-canary')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'commit', run: async ({ call, fixture }) => {
+  // Only the repository: committing is what this scenario is for, so seeding a
+  // commit here would make the subject its own setup.
+  await call('git', 'init', {});
   const { envelope } = await call('git', 'commit', { message: 'The fixture, as the wire test found it' });
   return { envelope, checks: [['git reports a commit with that message', git(fixture, ['log', '-1', '--pretty=%s']) === 'The fixture, as the wire test found it']] };
 } });
 
 fullScenario({ domain: 'git', action: 'log', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'log', { limit: 5 });
   return { envelope, checks: [['it lists the commit that was just made', (envelope?.commits || []).length > 0]] };
 } });
 
 fullScenario({ domain: 'git', action: 'all_files', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'all_files', {});
-  return { envelope, checks: [['it lists the tracked page', (envelope?.files || []).some((f) => String(f).includes('index.astro'))]] };
+  const tracked = git(fixture, ['ls-files']);
+  const listed = JSON.stringify(envelope?.files || []);
+  return { envelope, checks: [
+    ['git itself tracks the page', tracked.includes('index.astro')],
+    ['and Stacki lists the same file', listed.includes('index.astro')],
+  ] };
 } });
 
 fullScenario({ domain: 'git', action: 'file_at', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'file_at', { ref: 'HEAD', path: 'src/pages/index.astro' });
   return { envelope, checks: [['it returns the committed page text', String(envelope?.text || '').includes('<Hero')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'commit_files', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'commit_files', { ref: 'HEAD' });
   return { envelope, checks: [['it lists files that commit touched', (envelope?.files || []).length > 0]] };
 } });
 
 fullScenario({ domain: 'git', action: 'worktrees', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'worktrees', {});
   return { envelope, checks: [['it reports the fixture working tree', JSON.stringify(envelope).includes(path.basename(fixture.root)) || (envelope?.worktrees || []).length > 0]] };
 } });
 
 fullScenario({ domain: 'git', action: 'checkout', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'checkout', { branch: 'wire-branch', create: true });
   return { envelope, checks: [['git reports the new branch as current', git(fixture, ['branch', '--show-current']) === 'wire-branch']] };
 } });
 
 fullScenario({ domain: 'git', action: 'merge', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   const base = git(fixture, ['rev-parse', 'HEAD']);
-  await call('git', 'checkout', { branch: 'wire-branch' });
-  const { envelope } = await call('git', 'merge', { branch: 'main' });
-  return { envelope, checks: [['the repository still has the base commit reachable', git(fixture, ['cat-file', '-t', base]) === 'commit']] };
+  // A branch with a commit of its own, then merge it back: merging the branch
+  // you are standing on is refused, correctly.
+  await call('git', 'checkout', { branch: 'wire-branch', create: true });
+  fixture.write('public/merge-canary.txt', 'from the branch\n');
+  await call('git', 'commit', { message: 'branch commit' });
+  await call('git', 'checkout', { branch: 'main' });
+  const { envelope } = await call('git', 'merge', { branch: 'wire-branch' });
+  return { envelope, checks: [
+    ['the base commit is still reachable', git(fixture, ['cat-file', '-t', base]) === 'commit'],
+    ['and the branch\'s file is now on main', fixture.exists('public/merge-canary.txt')],
+  ] };
 } });
 
 fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'resolve_merge', { branch: 'main', choices: {} });
-  return { envelope, checks: [['it answers about the merge state', !!envelope]] };
+  const clean = git(fixture, ['status', '--porcelain']);
+  return { envelope, checks: [
+    ['it answers about the merge state', !!envelope],
+    ['and the working tree is not left mid-merge', !clean.includes('UU ')],
+  ] };
 } });
 
 fullScenario({ domain: 'git', action: 'park', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   fixture.write('public/park-canary.txt', 'parked\n');
   const { envelope } = await call('git', 'park', {});
   return { envelope, checks: [['the working tree is clean of the parked change', !git(fixture, ['status', '--porcelain']).includes('park-canary')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'unpark', run: async ({ call, fixture }) => {
+  await seedRepo(call);
+  fixture.write('public/park-canary.txt', 'parked\n');
+  await call('git', 'park', {});
+  const parkedAway = !fixture.exists('public/park-canary.txt');
   const { envelope } = await call('git', 'unpark', {});
-  return { envelope, checks: [['the parked change is back in the working tree', fixture.exists('public/park-canary.txt')]] };
+  return { envelope, checks: [
+    ['parking took the file away first', parkedAway],
+    ['and unparking brought it back', fixture.exists('public/park-canary.txt')],
+  ] };
 } });
 
 fullScenario({ domain: 'git', action: 'restore_file', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   const committed = git(fixture, ['show', 'HEAD:src/pages/about.astro']);
   fixture.write('src/pages/about.astro', '<p>vandalised</p>\n');
   const { envelope } = await call('git', 'restore_file', { ref: 'HEAD', path: 'src/pages/about.astro' });
@@ -815,12 +869,15 @@ fullScenario({ domain: 'git', action: 'restore_file', run: async ({ call, fixtur
 } });
 
 fullScenario({ domain: 'git', action: 'restore_project', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   fixture.write('src/pages/about.astro', '<p>vandalised again</p>\n');
   const { envelope } = await call('git', 'restore_project', { ref: 'HEAD' });
   return { envelope, checks: [['the vandalism is gone', !fixture.read('src/pages/about.astro').includes('vandalised again')]] };
 } });
 
 fullScenario({ domain: 'git', action: 'delete_branch', run: async ({ call, fixture }) => {
+  await seedRepo(call);
+  await call('git', 'checkout', { branch: 'wire-branch', create: true });
   await call('git', 'checkout', { branch: 'main' });
   const before = git(fixture, ['branch', '--list', 'wire-branch']).includes('wire-branch');
   const { envelope } = await call('git', 'delete_branch', { branch: 'wire-branch', force: true });
@@ -831,11 +888,13 @@ fullScenario({ domain: 'git', action: 'delete_branch', run: async ({ call, fixtu
 } });
 
 fullScenario({ domain: 'git', action: 'gh_status', run: async ({ call }) => {
+  await seedRepo(call);
   const { envelope } = await call('git', 'gh_status', {});
   return { envelope, checks: [['it reports whether the gh CLI is installed', typeof envelope?.installed === 'boolean']] };
 } });
 
 fullScenario({ domain: 'git', action: 'push', run: async ({ call, fixture }) => {
+  await seedRepo(call);
   const os = require('node:os');
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-wire-origin-'));
   try {
