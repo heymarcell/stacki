@@ -82,6 +82,38 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
     }
   }
 
+  // ── The catalog does not grow silently ───────────────────────────────────
+  //
+  // A byte budget, not a stopwatch — §44's rule, and the one this repository
+  // keeps relearning: assert the invariant, not the milliseconds. Every client
+  // pays for `tools/list` on every session; it is 131KB raw / 11KB gzipped
+  // today, over half of it the Envelope output schema serialised once per
+  // domain tool.
+  //
+  // It has to be measured against the FULL surface. The first version of this
+  // check lived in test/mcp-modern.js, whose server is built without `api` and
+  // therefore publishes four tools rather than thirteen — the budget passed a
+  // deliberate 160KB of padding without noticing, because it was weighing the
+  // wrong catalog. Sabotage is why that was found rather than shipped.
+  //
+  // The headroom is deliberate: a tripwire for a surface that doubles, not a
+  // style rule about description length.
+  {
+    const rig = await startWireRig();
+    try {
+      const listed = await rig.client.listTools();
+      const json = JSON.stringify(listed);
+      const raw = Buffer.byteLength(json, 'utf8');
+      const gzip = require('zlib').gzipSync(json).length;
+      check('the whole tool surface is published', listed.tools.length === 13, `${listed.tools.length} tools`);
+      check('the tool catalog has not doubled', raw < 260000, `${raw} bytes raw (131349 when this budget was set)`);
+      check('  nor has it compressed worse', gzip < 24000, `${gzip} bytes gzip (11272 when set)`);
+      check('  and every tool still declares an output schema', listed.tools.every((t) => !!t.outputSchema), listed.tools.filter((t) => !t.outputSchema).map((t) => t.name).join(','));
+    } finally {
+      await rig.stop();
+    }
+  }
+
   console.log(`  scenarios registered: ${scenarioCount()}`);
   console.log(`  scenarios run:        ${results.size}`);
 

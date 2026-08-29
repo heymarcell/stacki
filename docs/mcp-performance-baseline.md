@@ -101,3 +101,59 @@ Machine time only — no model thinking.
 
 5. **`get_context` cannot be judged here.** See the caveat above. Any conclusion about its default
    has to come from the packaged app.
+
+## Profiling `style.read` — and why nothing was optimized
+
+`style.read` was the only operation outside 3–5 ms, so it was profiled before anything was changed.
+
+**The MCP layer is not where the time goes:**
+
+| path | ms |
+| --- | --- |
+| `style.read` through the full MCP wire | 129.9 |
+| the same call straight to `api.run` | 124.2 |
+| **MCP overhead** | **5.7** |
+
+For comparison, `target.read` is 20.0 ms over the wire and 0.7 ms direct — so the wire costs a few
+milliseconds, and `style.read` brings 124 of its own.
+
+**The 124 ms is a fixed prefix.** It does not vary with the node, with repetition, or with how much
+is asked for:
+
+| variation | ms |
+| --- | --- |
+| four different nodes | 123.3 · 123.3 · 123.5 · 122.2 |
+| same node, three times | 123.2 · 123.9 · 123.1 |
+| `properties: null` / one / three | 123.8 · 124.2 · 123.2 |
+| `style.list_sources` (loads sources, no cascade) | **0.2–0.5** |
+
+Sub-1 ms variance across every dimension is a fixed setup cost, not computation that scales with the
+work. `readCascade` re-runs `scanPage()`, `loadEmbedDocs()` and `rebuildRules()` on every call — all
+document-scoped, all redone per node.
+
+### Why it was left alone
+
+1. **It is not an MCP cost.** The transport contributes 5.7 ms. Optimizing the MCP layer to chase
+   this would be optimizing the wrong thing.
+
+2. **This rig has no canvas**, and the cascade path is exactly where that matters. The number is
+   real in this environment; whether it reproduces in the packaged app with a live canvas is
+   **unmeasured**. Acting on it would mean tuning against an artifact.
+
+3. **A cache here needs proven invalidation** — selection, source edit, style edit, viewport, preview
+   reload, page change, project change. A stale answer about CSS is worse than 124 ms, and an
+   invalidation proof is not something to rush.
+
+Measuring the real cost needs the packaged app with a project open, which is currently blocked: a
+packaged Stacki has no non-interactive way to open one (see `test/packaged-mcp.js`).
+
+## Conclusion
+
+**Stacki's MCP server is not slow.** Nineteen of twenty-two operations are 3–5 ms, `server/discover`
+is 4 ms against a 50 ms target, and `tools/list` is 8 ms against 100 ms. The transport adds single-digit
+milliseconds to everything measured.
+
+No server optimization was made, because the measurements do not justify one. What the numbers point
+at instead is the shape of the work rather than its speed: a catalog that is half repeated schema,
+and workflows that spend their time in sequential calls. Those are Phase B and Phase C questions —
+progressive guidance and batched auditing — not micro-optimizations here.
