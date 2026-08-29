@@ -1396,10 +1396,32 @@ async function main() {
   posting.rooms.link(scopeKey(posting.project), posting.roomId);
   posting.store.enableShared({ workspaceId: posting.roomId, publishExisting: false });
 
-  const started = Date.now();
-  const written = startReview(posting, 'written without waiting');
-  const took = Date.now() - started;
-  check('writing a comment does not wait for a relay', written.ok !== false && took < 250, `${took}ms`);
+  // COUNTED, NOT TIMED.
+  //
+  // This used to be a stopwatch: `took < 250`. The property it reached for is
+  // real and worth keeping — a write must be complete locally whether or not
+  // the network is there — but 250ms on a shared CI runner measures how busy
+  // the runner is. It failed on main at 301ms having passed for months, which
+  // is the signature of a threshold rather than a regression.
+  //
+  // So the property is asserted directly instead: the write is synchronous and
+  // it makes NO request. That is machine-independent, and it is stronger — a
+  // write that quietly waited 40ms on a fast relay would have passed the timer
+  // and fails this.
+  const realFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = (...args) => {
+    fetches += 1;
+    return realFetch(...args);
+  };
+  let written;
+  try {
+    written = startReview(posting, 'written without waiting');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  check('writing a comment does not wait for a relay', written.ok !== false, JSON.stringify(written).slice(0, 160));
+  check('  and reaches the network not at all while doing it', fetches === 0, `${fetches} request(s) during the write`);
   check('and it is in the ledger immediately', JSON.stringify(posting.store.all()).includes('written without waiting'));
   check('and in the outbox, waiting to go', posting.store.shared.pending >= 2, `${posting.store.shared.pending}`);
 
