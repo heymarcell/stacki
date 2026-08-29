@@ -6750,7 +6750,12 @@ textarea::selection {
   color: var(--text-faint);
   cursor: pointer;
 }
-.review-tool:hover { color: var(--text); background: var(--bg-hover); }
+/* No background here, and that is not an omission. `button:hover` above sets
+   `--bg-active` for every button in the editor, and with `:where()` adding
+   nothing that selector is (0,2,1) — stronger than this rule's (0,2,0). A
+   `--bg-hover` written here never applied: measured, the hovered toolbar button
+   painted 9% white either way. Declaring it only claimed otherwise. */
+.review-tool:hover { color: var(--text); }
 .review-tool b, .review-tool i { font-family: var(--font); }
 /* A normal button, not a full-width bar. Sending a reply is an ordinary act. */
 .review-send { min-width: 0; padding: 4px 12px; }
