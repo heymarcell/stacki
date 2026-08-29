@@ -438,27 +438,38 @@ fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, f
   // Agent API used to expose only the middle of that — and could not even
   // reach it, because its declared input was a shape no client could obtain.
   //
-  // It takes a ref now, resolved against the live model, and runs the same
-  // code the person's command runs.
+  // It takes a ref now, resolved against the live model, and runs the same code
+  // the person's command runs. The assertions below are about the extracted
+  // SUBTREE surviving, not about formatting.
   const target = await ref('div');
   const before = fixture.read('src/pages/index.astro');
   const { envelope } = await call('page', 'component_create', { name: 'WireCard', ref: target, withProps: true });
   const after = fixture.read('src/pages/index.astro');
-  const component = fixture.exists('src/components/WireCard.astro') ? fixture.read('src/components/WireCard.astro') : '';
+  const made = fixture.exists('src/components/WireCard.astro') ? fixture.read('src/components/WireCard.astro') : '';
   return { envelope, checks: [
     ['the component file was written', fixture.exists('src/components/WireCard.astro')],
-    ['carrying the markup that was extracted', component.includes('Card') || component.trim().length > 0],
+    // The subtree, element by element — the loop, the component inside it and
+    // the props it passes. A component that arrived empty would satisfy a
+    // "not blank" check and none of these.
+    ['the extracted div came with it', made.includes('class="pricing-grid"')],
+    ['including the loop over plans', /plans\.map/.test(made)],
+    ['and the Card inside the loop', /<Card/.test(made)],
+    ['with the props that Card was given', made.includes('title={plan.title}') && made.includes('body={plan.body}')],
+    ['the Card import travelled into the component', /import\s+Card\s+from/.test(made)],
+    ['aimed correctly from src/components', /from\s+'\.\/Card\.astro'/.test(made)],
+    ['and the component reads plans from its props', /Astro\.props/.test(made) && made.includes('plans')],
     ['the page now imports it', /import\s+WireCard\s+from/.test(after)],
     ['and renders it as an instance', /<WireCard/.test(after)],
-    ['the markup it replaced is gone from the page', before.includes('pricing-grid') && !after.includes('class="pricing-grid"')],
+    ['the markup it replaced is gone from the page', before.includes('class="pricing-grid"') && !after.includes('class="pricing-grid"')],
+    ['the rest of the page is untouched', after.includes('<Hero') && after.includes('<footer')],
     ['the answer names the file it made', typeof envelope.path === 'string' && envelope.path.includes('WireCard')],
     // The extracted markup reads the page's `plans`, so the operation has to
-    // notice and carry it across as a prop. This is the half that makes it the
-    // real command rather than a file write: without it the component would be
-    // reading scope it no longer has.
+    // notice and carry it across. This is the half that makes it the real
+    // command rather than a file write.
     ['it derived the page value the markup needs', (envelope.props || []).includes('plans')],
     ['and the instance passes it back in', /<WireCard[^>]*plans=\{plans\}/.test(after)],
-    ['the answer says the markup was replaced', envelope.replaced === true],
+    // ok:true has to mean the whole operation happened, not half of it.
+    ['success means the markup really was replaced', envelope.replaced === true],
   ] };
 } });
 

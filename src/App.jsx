@@ -1301,6 +1301,34 @@ export default function App() {
         replaced = true;
         return m;
       }, true);
+      // SUCCESS MEANS ALL OF IT.
+      //
+      // The file is written before the model is touched, so a node that has
+      // gone between those two moments leaves a component nobody asked for and
+      // a page that never changed. Reporting that as ok:true would be saying
+      // "turned it into a component" about markup still sitting where it was.
+      //
+      // So the half-done case is a failure, and it says what is on disk. The
+      // file just created is removed — it is this operation's own, made
+      // seconds ago, and nothing else can be pointing at it yet.
+      if (!replaced) {
+        let leftBehind = created.rel;
+        try {
+          await window.avb.deletePage?.({ projectPath: projectRef.current?.path, path: created.path });
+          leftBehind = null;
+        } catch {
+          /* could not take it back; say so rather than pretend */
+        }
+        return {
+          ok: false,
+          code: 'no_node',
+          message: leftBehind
+            ? `The element was gone before it could be replaced, and ${leftBehind} was left behind.`
+            : 'The element was gone before it could be replaced. Nothing was changed.',
+          leftBehind,
+        };
+      }
+
       setSelectedId(id);
       await rescan(projectRef.current.path);
 

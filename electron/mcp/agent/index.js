@@ -986,13 +986,48 @@ function createAgentApi({
         // style do it above. The window resolves anchors against its own live
         // model; it has never been handed a raw `ref` string to make sense of,
         // so an operation that took one silently saw nothing at all.
+        //
+        // AND IT CARRIES WHAT THE REF SAYS. The first version of this took
+        // `parsed.data` and dropped the rest, which quietly made a renderer
+        // write weaker than the identical target write beside it: a ref minted
+        // read-only would have been honoured for target.edit and ignored here,
+        // and a ref that had gone stale would have created a component file
+        // against a document it never saw. A ref may only ever become MORE
+        // restrictive as it travels.
         let anchor = null;
+        let refWritable = true;
+        let seen = null;
         if (args.ref) {
           const parsed = readRef(args.ref, 'node');
           if (!parsed.ok) return parsed;
           anchor = parsed.data;
+          refWritable = parsed.writable;
+          seen = parsed;
         }
-        const answer = await command({ domain, action, ...args, anchor, ref: undefined }, NAVIGATING_TIMEOUT_MS);
+        // Refused HERE, before the window is asked to do anything, so a
+        // read-only ref cannot write a file and then be told off.
+        if (args.ref && !refWritable && op.risk !== 'read') {
+          return no(
+            'not_editable',
+            'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
+              'was not made for. Read the target again on this checkout, or have the person select it.'
+          );
+        }
+        const answer = await command(
+          {
+            domain,
+            action,
+            ...args,
+            anchor,
+            ref: undefined,
+            // The ref's own observation is the guard, exactly as it is for
+            // target.edit: it was baked in by the read that handed the ref over,
+            // and the caller does not have to repeat it.
+            expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
+            expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
+          },
+          NAVIGATING_TIMEOUT_MS
+        );
         return answer;
       }
       return await mainWithSync(domain, action, args, ctx, op);

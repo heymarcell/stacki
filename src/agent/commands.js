@@ -409,6 +409,20 @@ export function createAgentCommands(getApp) {
         return fail('not_editable', 'That node is not editable here, so it cannot be turned into a component.');
       }
 
+      // The document has to be the one the ref saw. Checked before anything is
+      // written, so a stale ref cannot leave a component file behind.
+      const doc = documentOf(a);
+      if (args.expectedRevision != null && args.expectedRevision !== doc.revision) {
+        return fail(
+          'stale_target',
+          `${doc.file} has changed since you read it (revision ${args.expectedRevision} → ${doc.revision}). Nothing was changed.`,
+          { document: doc }
+        );
+      }
+      if (args.expectedDigest != null && args.expectedDigest !== doc.digest) {
+        return fail('stale_target', `${doc.file} has changed since you read it. Nothing was changed.`, { document: doc });
+      }
+
       const node = findNodeById(a.model()?.nodes || [], at.id);
       if (!node) return fail('no_node', 'That element is no longer in the page.');
 
