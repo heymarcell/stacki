@@ -115,7 +115,15 @@ const Envelope = z.looseObject({
   operation: z.string().optional(),
   risk: z.enum(['read', 'write', 'high']).optional(),
   mode: z.string().optional(),
-  requires: z.string().optional(),
+  // NULLABLE, and it has to be: two different answers land on this one key.
+  // A permission refusal sends the mode an operation needs — always a string
+  // (see permissions.js `refusal`). `project.diagnose` sends what the project
+  // needs installed, which is `raw?.requires ?? null`: an explicit null when
+  // nothing is missing. Declared string-only, that null failed the server's own
+  // output validation, so a real client got `isError` and no result — every
+  // refusal worked and project.diagnose was simply unusable over MCP. Found by
+  // driving the action through a real client in test/mcp-wire-coverage.js.
+  requires: z.string().nullable().optional(),
   index: z.number().int().nullable().optional().describe('Which operation in a batch was refused. The batch as a whole was not applied.'),
 });
 
