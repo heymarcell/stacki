@@ -982,7 +982,17 @@ function createAgentApi({
       if (domain === 'style') return await style(action, args);
       if (domain === 'project' && action === 'info') return info();
       if (op.via === 'renderer') {
-        const answer = await command({ domain, action, ...args });
+        // A ref becomes an anchor before it crosses, the same way target and
+        // style do it above. The window resolves anchors against its own live
+        // model; it has never been handed a raw `ref` string to make sense of,
+        // so an operation that took one silently saw nothing at all.
+        let anchor = null;
+        if (args.ref) {
+          const parsed = readRef(args.ref, 'node');
+          if (!parsed.ok) return parsed;
+          anchor = parsed.data;
+        }
+        const answer = await command({ domain, action, ...args, anchor, ref: undefined }, NAVIGATING_TIMEOUT_MS);
         return answer;
       }
       return await mainWithSync(domain, action, args, ctx, op);

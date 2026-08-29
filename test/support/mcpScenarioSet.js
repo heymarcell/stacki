@@ -430,39 +430,36 @@ fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixt
 } });
 
 fullScenario({ domain: 'page', action: 'component_create', run: async ({ call, fixture, ref }) => {
-  // THIS FAILS, AND THE FAILURE IS THE POINT.
+  // The whole operation, not a file write.
   //
-  // page.component_create cannot succeed over MCP at all, whatever is passed.
-  // Its declared input is "the model nodes to move into it, AS target.read
-  // REPORTS THEM" — and what target.read reports is a summary:
+  // "Make a component out of that" means four things in Stacki, and the menu
+  // item does all four: the component file, the import, the props the markup
+  // needs from page scope, and the markup itself replaced by the instance. The
+  // Agent API used to expose only the middle of that — and could not even
+  // reach it, because its declared input was a shape no client could obtain.
   //
-  //   index, kind, tag, label, text, childCount, keys, breadcrumbs,
-  //   kindOfThing, ref
-  //
-  // while componentFile() hands that straight to serializeNodes(), which walks
-  // parser model nodes and reads `children`. There is no `children` on a
-  // target.read node — only `childCount` — so it dies on
-  // "Cannot read properties of undefined (reading 'length')".
-  //
-  // Checked three ways: the real target.read node, that node without its ref,
-  // and a hand-made NodeSpec. All three produce the identical crash, so this is
-  // not a test-input mistake. An agent has no way to obtain the shape the
-  // implementation wants, which makes the operation unreachable from MCP —
-  // the same family as the project.diagnose defect: exposed, and impossible to
-  // use.
-  //
-  // Left failing deliberately rather than softened or reclassified. Making it
-  // pass means fixing the contract — most likely having the operation take
-  // refs and resolve them to model nodes the way every other target operation
-  // does — and that is a product decision, not something a test should paper
-  // over.
-  const node = await (async () => {
-    const read = await call('target', 'read');
-    const found = flatten(read.envelope?.target).find((n) => String(n.tag || '').toLowerCase() === 'div');
-    return found || null;
-  })();
-  const { envelope } = await call('page', 'component_create', { name: 'WireBox', nodes: node ? [node] : [] });
-  return { envelope, checks: [['the component file exists', fixture.exists('src/components/WireBox.astro')]] };
+  // It takes a ref now, resolved against the live model, and runs the same
+  // code the person's command runs.
+  const target = await ref('div');
+  const before = fixture.read('src/pages/index.astro');
+  const { envelope } = await call('page', 'component_create', { name: 'WireCard', ref: target, withProps: true });
+  const after = fixture.read('src/pages/index.astro');
+  const component = fixture.exists('src/components/WireCard.astro') ? fixture.read('src/components/WireCard.astro') : '';
+  return { envelope, checks: [
+    ['the component file was written', fixture.exists('src/components/WireCard.astro')],
+    ['carrying the markup that was extracted', component.includes('Card') || component.trim().length > 0],
+    ['the page now imports it', /import\s+WireCard\s+from/.test(after)],
+    ['and renders it as an instance', /<WireCard/.test(after)],
+    ['the markup it replaced is gone from the page', before.includes('pricing-grid') && !after.includes('class="pricing-grid"')],
+    ['the answer names the file it made', typeof envelope.path === 'string' && envelope.path.includes('WireCard')],
+    // The extracted markup reads the page's `plans`, so the operation has to
+    // notice and carry it across as a prop. This is the half that makes it the
+    // real command rather than a file write: without it the component would be
+    // reading scope it no longer has.
+    ['it derived the page value the markup needs', (envelope.props || []).includes('plans')],
+    ['and the instance passes it back in', /<WireCard[^>]*plans=\{plans\}/.test(after)],
+    ['the answer says the markup was replaced', envelope.replaced === true],
+  ] };
 } });
 
 fullScenario({ domain: 'page', action: 'component_usage', run: async ({ call }) => {

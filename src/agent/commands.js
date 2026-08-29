@@ -386,13 +386,59 @@ export function createAgentCommands(getApp) {
     return fail('bad_action', `project has no renderer action "${action}".`);
   }
 
+  // The page operations that need the LIVE model rather than a file.
+  //
+  // component_create is the whole reason this domain reaches the renderer.
+  // Making a component out of something means four things — the file, the
+  // import, the props derived from real page scope, and the markup replaced by
+  // the instance — and only this side knows the model those come from. The
+  // main-process `component:create` stays what it always was: the primitive
+  // that writes the file.
+  async function page(action, args) {
+    const a = app();
+    if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
+
+    if (action === 'component_create') {
+      const anchor = args.anchor || null;
+      if (!anchor) return fail('bad_ref', 'component_create needs a ref to the node to turn into a component.');
+
+      const at = await locate(a, anchor, { navigate: true });
+      if (!at.ok) return at;
+      const writable = at.writable === undefined ? a.writableFor(anchor, at.confidence) : at.writable;
+      if (!writable) {
+        return fail('not_editable', 'That node is not editable here, so it cannot be turned into a component.');
+      }
+
+      const node = findNodeById(a.model()?.nodes || [], at.id);
+      if (!node) return fail('no_node', 'That element is no longer in the page.');
+
+      const done = await a.extractComponent(node, args.name, { withProps: args.withProps !== false });
+      if (!done?.ok) return fail(done?.code || 'failed', done?.message || 'The component could not be made.');
+
+      return {
+        ok: true,
+        name: done.name,
+        path: done.path,
+        props: done.props,
+        replaced: done.replaced,
+        // Reads page scope with no props to carry it: the markup moved but the
+        // values it needs did not. Worth saying, rather than leaving the agent
+        // to discover a broken component later.
+        stranded: done.stranded,
+        document: documentOf(a),
+      };
+    }
+    return fail('bad_action', `page has no renderer action "${action}".`);
+  }
+
   return async function run(params) {
     const { domain, action, ...args } = params || {};
     try {
       if (domain === 'target') return await target(action, args);
       if (domain === 'style') return await style(action, args);
       if (domain === 'project') return await project(action, args);
-      return fail('bad_domain', `Stacki's window answers for target, style and project — not "${domain}".`);
+      if (domain === 'page') return await page(action, args);
+      return fail('bad_domain', `Stacki's window answers for target, style, project and page — not \"${domain}\".`);
     } catch (err) {
       // A command that throws must not look like a command that timed out.
       return fail('command_failed', String(err?.message || err));

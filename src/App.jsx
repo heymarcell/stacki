@@ -1243,12 +1243,23 @@ export default function App() {
   // the page ends up with `<Card />` where the element was — so this is one
   // edit to two files, and the component file is written first: a page that
   // imports a file that isn't there yet is a broken page, however briefly.
-  const createComponentFromSelection = useCallback(
-    async (name, { withProps = true } = {}) => {
+  // Turning a node into a component, once, for both the person and the agent.
+  //
+  // These were never allowed to become two implementations. "Make a component
+  // out of that" means the file, the import, the derived props AND the markup
+  // replaced by the instance — an agent that got only the file would be doing
+  // something the menu item does not do.
+  //
+  // Takes the node explicitly rather than reading the selection, because an
+  // agent arrives holding a ref to a node that may not be selected. Returns
+  // what happened instead of announcing it; the caller decides whether that
+  // becomes a toast or an MCP envelope.
+  const extractComponent = useCallback(
+    async (node, name, { withProps = true } = {}) => {
       const page = pageStateRef.current.currentPage;
       const model = pageStateRef.current.pageState?.model;
-      const node = model && selectedIdRef.current ? findNodeById(model.nodes, selectedIdRef.current) : null;
-      if (!page || !model || !node) return;
+      if (!page || !model || !node) return { ok: false, code: 'no_target', message: 'There is nothing to make a component from.' };
+
       const props = withProps ? propsNeededFor(model, node) : [];
       let created;
       try {
@@ -1261,15 +1272,16 @@ export default function App() {
           props,
         });
       } catch (err) {
-        showToast(cleanError(err), 'error');
-        return;
+        return { ok: false, code: 'failed', message: cleanError(err) };
       }
+
       const paths = await window.avb.importPathFor({
         pagePath: page.path,
         targetPath: created.path,
         projectPath: projectRef.current?.path,
       });
       const id = newId();
+      let replaced = false;
       mutateModel((m) => {
         const found = findParentList(m, node.id);
         if (!found) return m;
@@ -1286,23 +1298,40 @@ export default function App() {
           props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
           children: null,
         };
+        replaced = true;
         return m;
       }, true);
       setSelectedId(id);
       await rescan(projectRef.current.path);
+
       // Anything left reading the page's scope can't be reconnected on its own
       // — an expression naming something that isn't a value the page holds, or
-      // props turned off. The person who just moved it knows what it needs.
+      // props turned off. Whoever moved it knows what it needs.
       const stranded = usesPageScope(node) && !props.length;
+      return { ok: true, name, path: created.rel, absolutePath: created.path, instanceId: id, props, replaced, stranded };
+    },
+    [mutateModel, propsNeededFor, rescan]
+  );
+
+  const createComponentFromSelection = useCallback(
+    async (name, { withProps = true } = {}) => {
+      const model = pageStateRef.current.pageState?.model;
+      const node = model && selectedIdRef.current ? findNodeById(model.nodes, selectedIdRef.current) : null;
+      if (!node) return;
+      const done = await extractComponent(node, name, { withProps });
+      if (!done.ok) {
+        showToast(done.message, 'error');
+        return;
+      }
       showToast(
-        stranded
-          ? `Created ${created.rel} — it reads page data, so it will need props.`
-          : props.length
-            ? `Created ${created.rel} with ${props.length} prop${props.length === 1 ? '' : 's'}.`
-            : `Created ${created.rel}`
+        done.stranded
+          ? `Created ${done.path} — it reads page data, so it will need props.`
+          : done.props.length
+            ? `Created ${done.path} with ${done.props.length} prop${done.props.length === 1 ? '' : 's'}.`
+            : `Created ${done.path}`
       );
     },
-    [mutateModel, propsNeededFor, rescan, showToast]
+    [extractComponent, showToast]
   );
 
   const moveNode = useCallback(
@@ -4412,6 +4441,10 @@ export default function App() {
     isHidden: (id) => stateIds.hidden.has(id),
     isInert: (id) => stateIds.inert.has(id),
     insertables: () => insertables,
+    // The same operation the menu item runs — file, import, derived props and
+    // the markup replaced by the instance. An agent arrives with a ref rather
+    // than a selection, so the node comes in explicitly.
+    extractComponent,
     preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
     historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
     undo,

@@ -330,23 +330,6 @@ const page = {
   folder_rename: { channel: 'pagefolder:rename', args: (input, ctx) => ({ projectPath: ctx.root, from: input.from, to: input.to }) },
   folder_delete: { channel: 'pagefolder:delete', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
 
-  component_create: {
-    channel: 'component:create',
-    args: (input, ctx) => {
-      if (!Array.isArray(input.nodes) || !input.nodes.length) {
-        return problem('bad_request', 'component_create needs the nodes to make the component from.');
-      }
-      return {
-        projectPath: ctx.root,
-        pagePath: input.fromPage ? path.resolve(ctx.root, input.fromPage) : null,
-        name: input.name,
-        nodes: input.nodes,
-        imports: input.imports || [],
-        props: input.props || [],
-      };
-    },
-    result: (raw) => ({ name: raw?.name ?? null, path: raw?.rel ?? null }),
-  },
 
   component_usage: {
     channel: 'component:usage',

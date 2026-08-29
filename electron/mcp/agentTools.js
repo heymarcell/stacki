@@ -395,11 +395,19 @@ const PageInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('folder_delete'), dir: z.string().max(300) }),
   z.object({
     action: z.literal('component_create'),
-    name: z.string().max(120),
-    nodes: z.array(z.record(z.string(), z.unknown())).min(1).max(500).describe('The model nodes to move into it, as target.read reports them.'),
-    fromPage: RelPath.optional(),
-    imports: z.array(z.record(z.string(), z.unknown())).max(100).optional(),
-    props: z.array(z.record(z.string(), z.unknown())).max(100).optional(),
+    name: z.string().max(120).describe('The component name — a word starting with a capital letter.'),
+    // A REF, not a tree. The old input asked for "the model nodes, as
+    // target.read reports them", and no client could supply that: target.read
+    // answers with bounded summaries carrying `childCount`, while the
+    // serializer walks internal parser nodes with `children`. The operation was
+    // unreachable from MCP whatever was passed. It takes the handle an agent
+    // actually holds now, and Stacki resolves it against its own live model —
+    // which is what a ref is for.
+    ref: Ref.describe('One writable node, as target.read or get_context reported it. Its whole subtree becomes the component.'),
+    withProps: z
+      .boolean()
+      .optional()
+      .describe('Carry the page values this markup reads across as props. Default true; false extracts the markup as it stands, which may leave it reading scope it no longer has.'),
   }),
   z.object({ action: z.literal('component_usage'), name: z.string().max(120), exclude: z.string().max(1024).optional() }),
   z.object({ action: z.literal('dynamic_paths'), path: RelPath }),
