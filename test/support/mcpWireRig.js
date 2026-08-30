@@ -156,16 +156,21 @@ function installDeps(root, log) {
 // each time. On the permission matrix, which builds a fixture per operation per
 // level, that was four hundred and forty-three redundant bundles and enough
 // added minutes to time the CI job out.
-let depsVerified = false;
-
 /** Read the config once, so a fixture that cannot is rejected by name. */
-async function verifyDeps(root) {
-  // MEMOISED ON THE CACHE, not on "it worked once". The thing being proved is
-  // that the shared install can bundle a config; every fixture is a clone of
-  // it, so proving it per fixture re-proves the same fact at the cost of a
-  // child process each time. But a clone that is not a faithful copy is a
-  // different failure, and installDeps checks every one of those.
-  if (depsVerified) return;
+async function verifyDeps(root, full) {
+  // VERIFIED FOR EVERY FIXTURE THAT WILL READ A CONFIG.
+  //
+  // Memoising this on "it worked once" was a mistake: the first fixture to ask
+  // for dependencies is page.dynamic_paths, which wants a dev server and never
+  // reads a collection, so it set the flag and every content fixture after it
+  // went unchecked. When those then answered "notes is not a collection in this
+  // project" there was nothing to say whether the fixture or the product was at
+  // fault — which is the exact confusion this function exists to prevent.
+  //
+  // The expensive part is a child process per fixture, and only the handful
+  // that declare `deps` pay it. Fixtures that only want a dev server are
+  // checked by installDeps' landmarks, which is what they need.
+  if (!full) return;
   const { readContentConfig } = require('../../electron/contentConfig.js');
   let config = null;
   try {
@@ -179,10 +184,7 @@ async function verifyDeps(root) {
     throw new Error(`the fixture's content config could not be read: ${err?.message || err}`);
   }
   const names = (config?.collections || []).map((c) => c.name);
-  if (names.includes('notes') && names.includes('links')) {
-    depsVerified = true;
-    return;
-  }
+  if (names.includes('notes') && names.includes('links')) return;
   {
     throw new Error(
       `the fixture's content config resolved to [${names.join(', ') || 'nothing'}] — ` +
@@ -199,7 +201,7 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
   writeBinary(fs, path, root);
   if (withDeps || realDevServer) {
     installDeps(root, log);
-    await verifyDeps(root);
+    await verifyDeps(root, withDeps);
   }
   const harness = await H.start(root, { agentMode, realDevServer });
 
