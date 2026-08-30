@@ -87,7 +87,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.astro-cache
-          key: ${{ runner.os }}-astro-fixture-v1
+          key: ${{ runner.os }}-astro-fixture-v2
       - run: npm ci
       # Stacki's "start a new site" flow makes the first commit for you, and
       # `git commit` refuses without an identity. A developer's machine has
@@ -202,7 +202,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.astro-cache
-          key: ${{ runner.os }}-astro-fixture-v1
+          key: ${{ runner.os }}-astro-fixture-v2
       - run: npm ci
       - name: Give git an identity to commit as
         run: |

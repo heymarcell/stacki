@@ -83,10 +83,38 @@ function installDeps(root, log) {
   } catch {
     fs.cpSync(from, to, { recursive: true, dereference: false });
   }
+  // A fixture that is not what it claims must say so HERE, with the reason.
+  //
+  // Without this a half-copied or stale node_modules produced "notes is not a
+  // collection in this project" from six different scenarios — which reads as
+  // six product failures and is one fixture failure. The check is the real
+  // thing: read the content config the way the operations read it, and refuse
+  // to hand back a fixture that cannot answer.
   if (!fs.existsSync(path.join(to, 'esbuild', 'package.json'))) {
     throw new Error('the fixture has no esbuild, so its content config cannot be read');
   }
+  const astroPkg = path.join(to, 'astro', 'package.json');
+  if (!fs.existsSync(astroPkg)) throw new Error('the fixture has no astro');
   return to;
+}
+
+/** Read the config once, so a fixture that cannot is rejected by name. */
+async function verifyDeps(root) {
+  const { readContentConfig } = require('../../electron/contentConfig.js');
+  let config = null;
+  try {
+    config = await readContentConfig(root, { force: true });
+  } catch (err) {
+    throw new Error(`the fixture's content config could not be read: ${err?.message || err}`);
+  }
+  const names = (config?.collections || []).map((c) => c.name);
+  if (!names.includes('notes') || !names.includes('links')) {
+    throw new Error(
+      `the fixture's content config resolved to [${names.join(', ') || 'nothing'}] — ` +
+        `astro ${require(path.join(root, 'node_modules', 'astro', 'package.json')).version} in ${root}` +
+        (config?.error ? `: ${config.error}` : '')
+    );
+  }
 }
 
 async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, withDeps = false, realDevServer = false, log = () => {} } = {}) {
@@ -94,7 +122,10 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
   // real: a dynamic route, a genuine image, a canary in robots.txt.
   const root = H.makeProject({ ...EXTRA, ...extra });
   writeBinary(fs, path, root);
-  if (withDeps || realDevServer) installDeps(root, log);
+  if (withDeps || realDevServer) {
+    installDeps(root, log);
+    await verifyDeps(root);
+  }
   const harness = await H.start(root, { agentMode, realDevServer });
 
   // Skips past anything already listening: a port a previous rig has only just
