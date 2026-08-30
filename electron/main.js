@@ -4518,11 +4518,31 @@ async function spawnDevServer(projectPath, localBin, force, bare) {
     if (devServer && devServer.proc === proc) {
       // Astro >= 7 daemonizes: the CLI exits 0 after forking the real server
       // into a background process. That's a success, not a failure.
+      //
+      // ASK THE LOCK, NOT THE PROSE. This recognised the fork by matching
+      // "Dev server running at …" in the log — and Astro is run with --json, so
+      // whether that line appears at all depends on the version and the
+      // formatting. When it did not match, Stacki threw away the only record it
+      // had of a server that was still running: dev_stop then answered "nothing
+      // was running" while the port stayed bound, and quitting left the daemon
+      // behind. It showed up as a CI-only failure because the log happened to
+      // match on one machine and not the other.
+      //
+      // .astro/dev.json is Astro's own account of what it forked, and it is
+      // what every stop path already reads. It also carries the address the
+      // server really bound, which is better than the one we asked for.
+      const lock = readAstroLock(projectPath);
       const running = recentDevLog().match(
         /Dev server running at (https?:\/\/[^\s"\\)]+)/i
       );
-      if (code === 0 && running) {
-        devServer = { proc: null, url, projectPath, daemon: true, bin: localBin };
+      if (code === 0 && (lock || running)) {
+        devServer = {
+          proc: null,
+          url: lock?.url || (running && running[1]) || url,
+          projectPath,
+          daemon: true,
+          bin: localBin,
+        };
       } else {
         devServer = null;
         send('dev:exit', { code, log: recentDevLog() });
