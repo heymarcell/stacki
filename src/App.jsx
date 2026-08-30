@@ -192,6 +192,10 @@ export default function App() {
   const [devUrl, setDevUrl] = useState(null);
   const [trailingSlash, setTrailingSlash] = useState('ignore');
   const [devStatus, setDevStatus] = useState('off'); // off | starting | on
+  // Read back by the agent surface right after it starts one: React state is
+  // not readable through the closure that set it.
+  const devStatusRef = useRef('off');
+  const devUrlRef = useRef(null);
   const [devLog, setDevLog] = useState('');
   const [devDiag, setDevDiag] = useState(null); // {kind, nodePath, nodeVersion, …}
   const [busy, setBusy] = useState(null); // string message
@@ -372,6 +376,8 @@ export default function App() {
     const offExit = window.avb.onDevExit(({ log }) => {
       setDevStatus('off');
       setDevUrl(null);
+      devStatusRef.current = 'off';
+      devUrlRef.current = null;
       if (log) {
         devLogRef.current = log;
         setDevLog(log);
@@ -451,11 +457,19 @@ export default function App() {
     async (projectPath) => {
       setDevStatus('starting');
       try {
-        const { url, external, trailingSlash: resolved } =
+        const { url, external, trailingSlash: resolved, error } =
           await window.avb.startDevServer(projectPath);
+        // A preview with no address is not a preview that is on. Starting
+        // answers with a url or it did not start, and reporting `on` for
+        // anything else puts a lie somewhere it gets believed — the status dot,
+        // and project.dev_status, which an agent reads to decide whether it can
+        // look at the page at all.
+        if (!url) throw new Error(error || 'the dev server did not report a URL');
         setDevUrl(url);
+        devUrlRef.current = url;
         if (resolved) setTrailingSlash(resolved);
         setDevStatus('on');
+        devStatusRef.current = 'on';
         setDevDiag(null);
         if (external) {
           showToast(
@@ -465,6 +479,8 @@ export default function App() {
         }
       } catch (err) {
         setDevStatus('off');
+        devStatusRef.current = 'off';
+        devUrlRef.current = null;
         setBusy(null);
         showToast(`Preview failed to start — see the log in the preview area.`, 'error');
         const msg = cleanError(err);
@@ -1297,48 +1313,54 @@ export default function App() {
         }
       };
 
+      // WORK THE WHOLE NEXT PAGE OUT BEFORE ASKING REACT FOR ANY OF IT.
+      //
+      // The path lookup and the model edit both happen here, on a draft this
+      // function owns, so whether the extraction can happen at all is settled
+      // now — by code whose exceptions land in the catch immediately below.
+      //
+      // This used to be decided inside the callback handed to mutateModel, and
+      // that callback is queued state work: React runs it later, during render.
+      // An exception in it never reached this function at all. It came back out
+      // of useState, took the renderer down with it, and left the component
+      // file on disk with nobody to answer for it — while `replaced`, set from
+      // inside that same callback, was read here as though it had already run.
+      // A queued updater is not a transaction oracle. This is.
       const id = newId();
-      let replaced = false;
-      let paths;
+      let nextModel = null;
       try {
-        paths = await window.avb.importPathFor({
+        const paths = await window.avb.importPathFor({
           pagePath: page.path,
           targetPath: created.path,
           projectPath: projectRef.current?.path,
         });
-        mutateModel((m) => {
-          const found = findParentList(m, node.id);
-          if (!found) return m;
-          if (!m.imports.some((i) => i.name === name)) {
-            m.imports.push({ name, path: chooseImportPath(m, paths) });
+        // Read again rather than closing over the model from before the await:
+        // the node can go while the path is being worked out, and that is the
+        // `no_node` case below rather than this one.
+        const live = pageStateRef.current.pageState;
+        if (live?.editable && live.model) {
+          const draft = structuredClone(live.model);
+          const found = findParentList(draft, node.id);
+          if (found) {
+            if (!draft.imports.some((i) => i.name === name)) {
+              draft.imports.push({ name, path: chooseImportPath(draft, paths) });
+            }
+            // The instance passes each value straight back in under its own
+            // name. That's what reconnects it: `title` meant the page's title
+            // where this markup used to sit, and it still does, one level out.
+            found.list[found.index] = {
+              id,
+              kind: 'component',
+              name,
+              props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
+              children: null,
+            };
+            nextModel = draft;
           }
-          // The instance passes each value straight back in under its own name.
-          // That's what reconnects it: `title` meant the page's title where this
-          // markup used to sit, and it still does, one level out.
-          found.list[found.index] = {
-            id,
-            kind: 'component',
-            name,
-            props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
-            children: null,
-          };
-          replaced = true;
-          return m;
-        }, true);
+        }
       } catch (err) {
-        // THE COMMIT BOUNDARY.
-        //
-        // `replaced` is the whole question. Until it is true the page has not
-        // taken the extraction on, so the component is still only this
-        // operation's own file and removing it is the right compensation —
-        // which is what an import path that could not be worked out, or a model
-        // write that failed, leaves behind today.
-        //
-        // Once it is true the page holds an import and an instance pointing at
-        // that file, and deleting it would answer a failed step by breaking a
-        // page that had otherwise been changed correctly. So past this point
-        // the failure is passed on untouched rather than compensated for.
-        if (replaced) throw err;
+        // Nothing has been committed — the draft is thrown away and the file
+        // this operation made goes with it.
         const leftBehind = await rollbackCreated();
         return {
           ok: false,
@@ -1349,6 +1371,7 @@ export default function App() {
           leftBehind,
         };
       }
+
       // SUCCESS MEANS ALL OF IT.
       //
       // The file is written before the model is touched, so a node that has
@@ -1359,7 +1382,7 @@ export default function App() {
       // So the half-done case is a failure, and it says what is on disk. The
       // file just created is removed — it is this operation's own, made
       // seconds ago, and nothing else can be pointing at it yet.
-      if (!replaced) {
+      if (!nextModel) {
         const leftBehind = await rollbackCreated();
         return {
           ok: false,
@@ -1371,14 +1394,36 @@ export default function App() {
         };
       }
 
+      // THE COMMIT POINT.
+      //
+      // Everything that could refuse has refused. What goes to React is a
+      // finished model and a function that does nothing but hand it over, so
+      // there is no work left in the updater to fail — and past this line the
+      // extraction has happened as far as the page is concerned.
+      mutateModel(() => nextModel, true);
+
+      // COMMITTED. The page holds the import and the instance, so the component
+      // file is no longer this operation's to withdraw, and nothing below may
+      // report the extraction itself as not having happened.
+      const notes = [];
       setSelectedId(id);
-      await rescan(projectRef.current.path);
+      try {
+        await rescan(projectRef.current.path);
+      } catch (err) {
+        // A rescan keeps Stacki's own lists current; it is not the extraction.
+        // Answering ok:false here would tell an agent to try a mutation that
+        // has already been made, and it would do it — so this is said out loud
+        // and the operation still reports what actually happened.
+        notes.push(
+          `${name} was made and the page uses it, but the project could not be rescanned afterwards (${cleanError(err)}). Stacki's own lists may be stale until the next scan; the page itself is correct.`
+        );
+      }
 
       // Anything left reading the page's scope can't be reconnected on its own
       // — an expression naming something that isn't a value the page holds, or
       // props turned off. Whoever moved it knows what it needs.
       const stranded = usesPageScope(node) && !props.length;
-      return { ok: true, name, path: created.rel, absolutePath: created.path, instanceId: id, props, replaced, stranded };
+      return { ok: true, name, path: created.rel, absolutePath: created.path, instanceId: id, props, replaced: true, stranded, notes };
     },
     [mutateModel, propsNeededFor, rescan]
   );
@@ -3592,6 +3637,7 @@ export default function App() {
     hidden: stateIds.hidden.has(selectedId),
     inert: stateIds.inert.has(selectedId),
     devStatus,
+    devUrl,
     canvas: canvasReport,
   });
   // Every render, deduped on what was last sent — the alternative is an IPC
@@ -4224,6 +4270,7 @@ export default function App() {
       hidden: stateIds.hidden.has(target.id),
       inert: stateIds.inert.has(target.id),
       devStatus,
+      devUrl,
       canvas: {
         ...(canvasReport || {}),
         rect: target.rect || null,
@@ -4516,6 +4563,25 @@ export default function App() {
     // than a selection, so the node comes in explicitly.
     extractComponent,
     preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
+    // THE SAME START AND STOP THE APP ITSELF USES.
+    //
+    // These used to go straight to main, round the app, and the app is where
+    // the preview's state lives — so an agent could start a server and then be
+    // told by dev_status, truthfully about the state it read, that nothing was
+    // running. Two implementations of one thing, and the read was pointed at
+    // the one the write never touched.
+    startPreview: async (projectPath) => {
+      await startPreview(projectPath || projectRef.current?.path);
+      return { status: devStatusRef.current, url: devUrlRef.current };
+    },
+    stopPreview: async () => {
+      await window.avb.stopDevServer();
+      setDevStatus('off');
+      setDevUrl(null);
+      devStatusRef.current = 'off';
+      devUrlRef.current = null;
+      return { status: 'off', url: null };
+    },
     historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
     undo,
     redo,

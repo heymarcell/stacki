@@ -527,13 +527,131 @@ const divRef = async (rig) => {
       check('  and holds an instance of it', /<CommittedCard/.test(page), brief(page, 300));
       check('  the extracted markup having moved out of the page', !page.includes('pricing-grid'), brief(page, 300));
       check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
-      // Reported here for what it is: the page was changed correctly and the
-      // operation still says it failed, because the step after the commit
-      // threw. That is a separate post-commit truthfulness question and is not
-      // what this pass changes — but nothing is left behind, and the assertion
-      // pins the behaviour so a later change to it has to be deliberate.
-      check('  the late failure still reported rather than swallowed', out.envelope?.ok === false, brief(out.envelope));
-      check('  and no leftover claimed, because there is none', !/left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+      // The mutation happened, so the mutation is reported as having happened.
+      // An agent handed ok:false here would reasonably run component_create
+      // again, against a page that already has the component in it.
+      check('  the operation reports the mutation it actually made', out.envelope?.ok === true, brief(out.envelope));
+      check('  and does not answer with a retry-inducing failure code', !out.envelope?.code, brief(out.envelope));
+      check('  while saying out loud that the refresh failed', (out.envelope?.notes || []).some((n) => /rescan/i.test(String(n))), brief(out.envelope?.notes));
+      check('  naming what is stale rather than what is broken', (out.envelope?.notes || []).some((n) => /stale|out of date/i.test(String(n))), brief(out.envelope?.notes));
+      check('  and no leftover claimed, because there is none', !/left behind/i.test(String(out.envelope?.message || '')), brief(out.envelope));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // G. the import path RESOLVES, with something the next step cannot use
+  //
+  // D injects a rejection, which any try/catch around an await will see. This
+  // one resolves — successfully — with null, and the failure happens further
+  // in, inside the callback handed to mutateModel, where chooseImportPath
+  // destructures it. That callback is queued state work, so a `try` wrapped
+  // around the setter call is not obviously the thing that catches it, and
+  // `replaced` set from inside it is not obviously readable after it. This is
+  // the case that finds out whether the transaction has an oracle or a habit.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      let fileExistedBeforeFailure = null;
+      const deleteCalls = [];
+
+      const restorePath = intercept(rig, 'page:importPathFor', (original, event, payload) => {
+        if (String(payload?.targetPath || '').endsWith('MalformedCard.astro')) {
+          fileExistedBeforeFailure = rig.harness.exists('src/components/MalformedCard.astro');
+          return null;
+        }
+        return original(event, payload);
+      });
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        deleteCalls.push(payload);
+        return original(event, payload);
+      });
+      restore = () => {
+        restorePath();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'MalformedCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('an unusable import path is a failure, not a success', out.envelope?.ok === false, brief(out.envelope));
+      check('  and the file really had been written first', fileExistedBeforeFailure === true, `saw ${fileExistedBeforeFailure}`);
+      check('  the operation compensated instead of unwinding', deleteCalls.length === 1, `saw ${brief(deleteCalls)}`);
+      check(
+        '  passing the created path as a string',
+        deleteCalls.every((c) => typeof c === 'string' && c.endsWith('MalformedCard.astro')),
+        brief(deleteCalls)
+      );
+      check('  so nothing is left on disk', !rig.harness.exists('src/components/MalformedCard.astro'));
+      check('  and it does not name a leftover it does not have', !/left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the abandoned extraction', !/import\s+MalformedCard\s+from/.test(page));
+      check('  and no instance', !/<MalformedCard/.test(page));
+      check('  the original subtree still in place', page.includes('pricing-grid'), brief(page, 300));
+      check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
+
+      // The page model has to be as untouched as the file on disk: a half-applied
+      // import with no instance would be a broken page that the source check
+      // above could still miss if the save had not landed yet.
+      const after = await rig.call('target', 'read');
+      const flat = [];
+      const walk = (n) => { if (!n) return; flat.push(n); (n.children || []).forEach(walk); };
+      walk(after.envelope?.target);
+      check('  and the live model holds no instance either', !flat.some((n) => n.name === 'MalformedCard'), brief(flat.map((n) => n.tag || n.name)));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // H. the same unusable import path, with the compensation refused
+  //
+  // G proves the failure is caught and answered. This proves the answer stays
+  // honest when the taking-back does not work either.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+
+      const restorePath = intercept(rig, 'page:importPathFor', (original, event, payload) => {
+        if (String(payload?.targetPath || '').endsWith('StuckCard.astro')) return null;
+        return original(event, payload);
+      });
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        if (typeof payload === 'string' && payload.endsWith('StuckCard.astro')) {
+          return { ok: false, message: 'test-owned refusal: nothing was removed' };
+        }
+        return original(event, payload);
+      });
+      restore = () => {
+        restorePath();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'StuckCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('an unusable import path with a refused cleanup is still a failure', out.envelope?.ok === false, brief(out.envelope));
+      check('  which does not claim a clean state', /left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  and names the component it could not remove', /StuckCard/.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  which really is still there', rig.harness.exists('src/components/StuckCard.astro'));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the abandoned extraction', !/import\s+StuckCard\s+from/.test(page));
+      check('  and no instance', !/<StuckCard/.test(page));
+      check('  the original subtree still in place', page.includes('pricing-grid'), brief(page, 300));
+      check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
+      check('  and no unrelated component removed', rig.harness.exists('src/components/Card.astro') && rig.harness.exists('src/components/Hero.astro'));
+
+      fs.rmSync(path.join(rig.root, 'src/components/StuckCard.astro'), { force: true });
+      check('  and the test removed the artifact it deliberately created', !rig.harness.exists('src/components/StuckCard.astro'));
     } finally {
       if (restore) restore();
       await rig.stop();

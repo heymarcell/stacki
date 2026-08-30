@@ -360,6 +360,28 @@ export function createAgentCommands(getApp) {
     if (action === 'dev_status') {
       return { ok: true, ...a.preview() };
     }
+    // Through the app's own preview, so what dev_status reads next is what this
+    // just did. Main still does the work; the difference is that the app is
+    // told about it rather than finding out from a process exit.
+    if (action === 'dev_start') {
+      try {
+        const started = await a.startPreview();
+        // startPreview reports its own failures to the person and returns; a
+        // preview with no address did not start, and saying ok:true here would
+        // send an agent off to look at a page that is not being served.
+        if (!started?.url) {
+          return fail('failed', 'The dev server did not start. Stacki has the log in the preview area.');
+        }
+        return { ok: true, ...started };
+      } catch (err) {
+        return fail('failed', String(err?.message || err));
+      }
+    }
+    if (action === 'dev_stop') {
+      // What stopping just made true, not what React has re-rendered since.
+      const stopped = await a.stopPreview();
+      return { ok: true, ...stopped };
+    }
     // Not an action any tool can name — there is nothing for it in the registry
     // or the schemas. The main process sends it after a write that changed the
     // file the editor has open, so the model, the disk and the canvas agree
@@ -439,6 +461,10 @@ export function createAgentCommands(getApp) {
         // values it needs did not. Worth saying, rather than leaving the agent
         // to discover a broken component later.
         stranded: done.stranded,
+        // The extraction committed; something after it did not. Said out loud
+        // rather than folded into ok:false, because an agent told a mutation
+        // failed will reasonably make it again — and this one already happened.
+        ...(done.notes?.length ? { notes: done.notes } : {}),
         document: documentOf(a),
       };
     }
