@@ -328,7 +328,11 @@ const StyleInput = z.discriminatedUnion('action', [
           selector: z.string().max(300),
           name: z.string().max(200).optional().describe('One variable. Give `names` instead to move a whole section.'),
           names: z.array(z.string().max(200)).max(200).optional(),
-          target: z.string().max(300).optional(),
+          target: z
+            .string()
+            .max(300)
+            .optional()
+            .describe('The VARIABLE to land in front of — a name like --gap, not a selector. Leave it out to move to the end of the rule.'),
           at: z.number().int().min(0).optional(),
         })
       )
@@ -433,7 +437,23 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('write_entry'),
     entry: z.record(z.string(), z.unknown()).describe('The entry object content.entries reported — it carries where the entry lives.'),
-    edits: z.record(z.string(), z.unknown()).optional().describe('Fields to change.'),
+    // A LIST, because that is what the implementation applies: contentEntries.js
+    // `writeEntry` calls `edits.map(...)` over `{ path, value }` locators. This
+    // was declared as an object of fields, which no client could make work —
+    // an object reached `.map` and threw, and so did leaving it out, because
+    // the mapper below turned the absence into `{}`. Every possible call to
+    // content.write_entry failed until this matched the code underneath it.
+    edits: z
+      .array(
+        z.object({
+          path: z.array(z.union([z.string().max(200), z.number().int()])).min(1).describe('Where in the entry data, e.g. ["title"].'),
+          value: z.unknown().optional().describe('The new value. Leave it out to clear the field.'),
+          rename: z.string().max(200).optional().describe('Rename this key instead of setting it.'),
+        })
+      )
+      .max(500)
+      .optional()
+      .describe('The fields to change, each addressed by a path into the entry data.'),
     body: z.string().max(1_000_000).optional().describe('The markdown body, when the entry has one.'),
   }),
   z.object({ action: z.literal('validate'), collection: z.string().max(200), data: z.unknown() }),

@@ -73,6 +73,7 @@ export function buildMcpPayload({
   hidden,
   inert,
   devStatus,
+  devUrl,
   canvas,
 }) {
   const payload = {
@@ -91,7 +92,15 @@ export function buildMcpPayload({
       viewportWidth: canvas?.viewportWidth ?? null,
       viewportHeight: canvas?.viewportHeight ?? null,
     },
-    preview: { status: devStatus || 'off' },
+    // THE ADDRESS, not just the state.
+    //
+    // This carried `status` alone, and the Agent API reads the preview URL from
+    // exactly here — `devUrl: payload?.preview?.url` in electron/mcp/agent.
+    // So it was null for every operation that needs to reach the running site:
+    // project.probe with no url of its own, content.sample_entry, which can
+    // only be answered by the dev server, page.dynamic_paths, and project.info,
+    // which reported the preview as "not running" while it was running.
+    preview: { status: devStatus || 'off', url: devUrl || null },
     selection: { present: false },
   };
 

@@ -37,6 +37,12 @@ const { digestOf } = require('./digest');
 // down through three components before it can answer.
 const COMMAND_TIMEOUT_MS = 15000;
 const NAVIGATING_TIMEOUT_MS = 20000;
+// Starting a dev server is not a round trip to the window; it is the window
+// waiting for Astro to boot, resolve a config and bind a port, and on a cold
+// project that is tens of seconds. Under the ordinary command deadline it came
+// back `not_ready` while the server was still coming up perfectly well — and
+// then really did come up, unowned, with the caller told it had failed.
+const DEV_START_TIMEOUT_MS = 180000;
 
 const no = (code, message, extra = {}) => ({ ok: false, code, message, ...extra });
 
@@ -54,6 +60,15 @@ function createAgentApi({
   ask = null,
   readPayload = () => null,
   resolveTrail = () => null,
+  // WHERE THE PREVIEW REALLY IS.
+  //
+  // The payload is published from a React effect, so it tells you where the
+  // dev server was as of the last render. An agent that starts one and asks
+  // about it in the same breath is quicker than that: dev_start answered with
+  // a URL and content.sample_entry, one call later, was told there was no
+  // preview. Main owns the process and knows the moment it binds, so it is
+  // asked first and the payload is the fallback.
+  getDevUrl = () => null,
   version = '0.0.0',
 } = {}) {
   const gate = permissions.createGate(getAgentMode);
@@ -66,7 +81,7 @@ function createAgentApi({
         if (typeof callMain !== 'function') throw new Error('Stacki is not ready.');
         return callMain(channel, args);
       },
-      devUrl: payload?.preview?.url || null,
+      devUrl: getDevUrl() || payload?.preview?.url || null,
       branch: payload?.project?.branch || null,
       payload,
       // The two things the domains need from the ref system: a ref to hand back
@@ -1026,7 +1041,7 @@ function createAgentApi({
             expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
             expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
           },
-          NAVIGATING_TIMEOUT_MS
+          action === 'dev_start' ? DEV_START_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
         );
         return answer;
       }
@@ -1049,4 +1064,4 @@ function createAgentApi({
   };
 }
 
-module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS };
+module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS };

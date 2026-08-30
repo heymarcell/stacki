@@ -183,8 +183,12 @@ const OPERATIONS = {
     diagnose: { risk: 'read', via: 'main', channel: 'dev:diagnose', summary: 'Why the dev server will or will not start.', reuses: 'electron/main.js dev:diagnose' },
     probe: { risk: 'read', via: 'main', channel: 'dev:probe', summary: 'Whether a preview URL answers.', reuses: 'electron/devProbe.js' },
     dev_status: { risk: 'read', via: 'renderer', summary: 'What the preview is doing right now.', reuses: 'App.jsx devStatus' },
-    dev_start: { risk: 'write', via: 'main', channel: 'dev:start', summary: "Start the project's dev server (Stacki normally does this itself).", reuses: 'electron/main.js dev:start' },
-    dev_stop: { risk: 'write', via: 'main', channel: 'dev:stop', summary: 'Stop the dev server.', reuses: 'electron/main.js dev:stop' },
+    // Through the RENDERER, because that is where the preview's state lives and
+    // dev_status reads it. Going straight to main started a real server the app
+    // was never told about, so the write and the read disagreed about the same
+    // thing. Main still starts it; the app now knows.
+    dev_start: { risk: 'write', via: 'renderer', summary: "Start the project's dev server (Stacki normally does this itself).", reuses: 'App.jsx startPreview' },
+    dev_stop: { risk: 'write', via: 'renderer', summary: 'Stop the dev server.', reuses: 'App.jsx stopPreview' },
     undo: { risk: 'write', via: 'renderer', undoable: true, summary: "Undo the last step on Stacki's own stack.", reuses: 'App.jsx undo' },
     redo: { risk: 'write', via: 'renderer', undoable: true, summary: 'Redo the last undone step.', reuses: 'App.jsx redo' },
   },
@@ -225,6 +229,12 @@ const EXCLUDED = [
     why: 'exposed elsewhere',
     reason:
       'The primitive that writes a component file, and only that. Making a component is four things — the file, the import, the props the markup needs from page scope, and the markup replaced by the instance — and only the window knows the model those come from. So page.component_create runs in the renderer against a ref and calls this on its way through. Exposing the primitive directly is what made the operation unusable before: it wanted internal parser nodes nothing could hand it.',
+  },
+  {
+    channels: ['dev:start', 'dev:stop'],
+    why: 'exposed elsewhere',
+    reason:
+      'The preview lives in the window: App.jsx owns whether one is running and at what address, and project.dev_status reads exactly that. Calling these directly started a real server the app was never told about, so the write and the read disagreed about the same thing — dev_start answered with a URL and dev_status, next call, said the preview was off. project.dev_start and project.dev_stop go through App.jsx startPreview instead, which still calls these, and leaves one account of what is running.',
   },
   // Native chrome and the operating system.
   { channels: ['project:openDialog', 'project:newDialog', 'project:parentDialog'], why: 'human-only', reason: 'Native folder and file pickers. An agent cannot see one, and which project is open is the person’s decision to make.' },

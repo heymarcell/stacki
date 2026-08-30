@@ -157,6 +157,7 @@ async function startMcp({
   getProjectRoot = () => null,
   getAgentMode = () => 'inspect',
   callMain = null,
+  getDevUrl = () => null,
 } = {}) {
   store = store || createContextStore({ resolveTrail: (keys) => resolveTrail(keys) });
   let projectRoot = null;
@@ -234,6 +235,7 @@ async function startMcp({
     ask,
     readPayload: () => lastPayload,
     resolveTrail: (keys) => resolveTrail(keys),
+    getDevUrl,
     version,
   });
 

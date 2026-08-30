@@ -39,6 +39,50 @@ const { slug } = Astro.params;
 `,
   'public/robots.txt': `User-agent: *\nDisallow: /admin\n# ${ROBOTS_CANARY}\n`,
   'public/spare.txt': 'a file that exists to be moved and renamed\n',
+
+  // A SECOND COLLECTION THAT POINTS AT THE FIRST.
+  //
+  // `content.rename_plan` exists to say what a rename would drag with it, and
+  // it finds that by looking for other collections whose schema declares a
+  // `reference()` to this one (see electron/contentRefs.js `planRename`). With
+  // only `notes` in the project every plan came back with `pointers: []`, so a
+  // scenario could assert a plan was produced and never find out whether the
+  // hard half of the operation worked at all.
+  'src/content.config.ts': `import { defineCollection, reference, z } from 'astro:content';
+import { glob } from 'astro/loaders';
+
+const notes = defineCollection({
+  loader: glob({ pattern: '**/*.md', base: './src/content/notes' }),
+  schema: z.object({
+    title: z.string(),
+    draft: z.boolean().default(false),
+  }),
+});
+
+const links = defineCollection({
+  loader: glob({ pattern: '**/*.md', base: './src/content/links' }),
+  schema: z.object({
+    label: z.string(),
+    note: reference('notes'),
+  }),
+});
+
+export const collections = { notes, links };
+`,
+  'src/content/links/pointer.md': `---
+label: Points at the first note
+note: first
+---
+
+A link entry whose \`note\` field is a reference to notes/first.
+`,
+  'src/content/links/other.md': `---
+label: Points at the second note
+note: second
+---
+
+A link entry that must not be touched when notes/first is renamed.
+`,
 };
 
 /** Written after the project exists, because it is binary. */

@@ -145,11 +145,26 @@ fullScenario({ domain: 'target', action: 'append_child', run: async ({ call, ref
   return { envelope, checks: [['the child is authored inside the parent', fixture.read('src/pages/index.astro').includes('appended-child')]] };
 } });
 
+// Counts the node it actually duplicates. This asked for a copy of <footer>
+// and then counted <Hero>, which of course never moved — the operation had
+// been working the whole time and the canary was pointed at the wrong bird.
 fullScenario({ domain: 'target', action: 'duplicate', run: async ({ call, ref, fixture }) => {
-  const before = (fixture.read('src/pages/index.astro').match(/<Hero/g) || []).length;
+  const count = (src, re) => (src.match(re) || []).length;
+  const src = () => fixture.read('src/pages/index.astro');
+  const FOOTER = /<footer[\s>]/g;
+  const before = src();
+  const footersBefore = count(before, FOOTER);
   const { envelope } = await call('target', 'duplicate', { ref: await ref('footer') });
-  const after = (fixture.read('src/pages/index.astro').match(/<Hero/g) || []).length;
-  return { envelope, checks: [['the page has one more copy of that node than before', after === before + 1]] };
+  const after = src();
+  return { envelope, checks: [
+    ['the node it was asked to copy was there to copy', footersBefore === 1],
+    ['and afterwards the page has exactly one more', count(after, FOOTER) === footersBefore + 1],
+    ['the copy carries the original\'s content', count(after, /Made carefully\./g) === 2],
+    ['the original is still there', after.includes('<footer>')],
+    ['nothing else was duplicated', count(after, /<Hero/g) === count(before, /<Hero/g) && count(after, /pricing-grid/g) === count(before, /pricing-grid/g)],
+    ['and it hands back a ref to work with', typeof envelope?.ref === 'string' && envelope.ref.startsWith('stacki:')],
+    ['naming the file it changed', JSON.stringify(envelope?.changedFiles || []).includes('src/pages/index.astro')],
+  ] };
 } });
 
 fullScenario({ domain: 'target', action: 'move', run: async ({ call, ref, fixture }) => {
@@ -276,15 +291,26 @@ fullScenario({ domain: 'style', action: 'rename_variables', run: async ({ call, 
   ] };
 } });
 
+// `target` is the variable to land in FRONT of, not a selector. This used to
+// pass the selector, so the move asked to land in front of a declaration named
+// `:root` — which no rule has — and the operation correctly refused. Moving a
+// variable to where it already is would not have proved anything either: the
+// destination here is a real one, and the order is what gets checked.
 fullScenario({ domain: 'style', action: 'move_variables', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
   await call('style', 'add_variables', { adds: [{ file: cell.file, selector: cell.selector, name: '--wire-mover', value: '9px' }] });
   const before = css(fixture);
-  const { envelope } = await call('style', 'move_variables', { moves: [{ file: cell.file, selector: cell.selector, name: '--wire-mover', target: cell.selector, at: 0 }] });
+  const order = (src) => (src.match(/--[a-z-]+(?=\s*:)/g) || []);
+  const orderBefore = order(before);
+  const { envelope } = await call('style', 'move_variables', { moves: [{ file: cell.file, selector: cell.selector, name: '--wire-mover', target: '--gap' }] });
   const after = css(fixture);
+  const orderAfter = order(after);
   return { envelope, checks: [
-    ['the variable still exists', after.includes('--wire-mover')],
-    ['and the stylesheet was rewritten', after !== before],
+    ['it started after the variable it is moved in front of', orderBefore.indexOf('--wire-mover') > orderBefore.indexOf('--gap')],
+    ['and ends up before it', orderAfter.indexOf('--wire-mover') < orderAfter.indexOf('--gap')],
+    ['carrying its value with it', /--wire-mover:\s*9px/.test(after)],
+    ['exactly once, not copied', orderAfter.filter((n) => n === '--wire-mover').length === 1],
+    ['and no other variable was lost', orderBefore.every((n) => orderAfter.includes(n)) && orderAfter.length === orderBefore.length],
   ] };
 } });
 
@@ -505,9 +531,24 @@ fullScenario({ domain: 'page', action: 'import_path', run: async ({ call }) => {
   return { envelope, checks: [['it computes the specifier the page would use', envelope?.relative === '../components/Card.astro']] };
 } });
 
+// Rebased to a page one directory deeper, so the answer has to CHANGE. The
+// old destination was src/pages/about.astro — the same depth as the page it
+// came from, where the correct answer is the specifier it was already given —
+// and the check only asked whether some key was present, under a name the
+// operation does not use. It answers `path`.
 fullScenario({ domain: 'page', action: 'rebase_import', run: async ({ call }) => {
-  const { envelope } = await call('page', 'rebase_import', { fromPage: 'src/pages/index.astro', toPage: 'src/pages/about.astro', spec: '../components/Card.astro' });
-  return { envelope, checks: [['it answers about the specifier for the new location', 'relative' in (envelope || {}) || 'spec' in (envelope || {})]] };
+  const spec = '../components/Card.astro';
+  // One call, because that is what a FULL scenario gets. The control is
+  // page.import_path — a different operation — asked what the deeper page
+  // would import the same component as if it were starting from scratch.
+  const fresh = await call('page', 'import_path', { fromFile: 'src/pages/notes/[slug].astro', targetFile: 'src/components/Card.astro' });
+  const { envelope } = await call('page', 'rebase_import', { fromPage: 'src/pages/index.astro', toPage: 'src/pages/notes/[slug].astro', spec });
+  return { envelope, checks: [
+    ['it answers with the specifier the deeper page needs', envelope?.path === '../../components/Card.astro'],
+    ['which is not the one it was given', envelope?.path !== spec],
+    ['and still resolves to the same component', path.normalize(path.join('src/pages/notes', envelope?.path || '')) === path.normalize('src/components/Card.astro')],
+    ['agreeing with what that page would import it as from scratch', envelope?.path === fresh.envelope?.relative],
+  ] };
 } });
 
 // ── asset ──────────────────────────────────────────────────────────────────
@@ -581,7 +622,18 @@ fullScenario({ domain: 'asset', action: 'delete', run: async ({ call, fixture })
 // collection-shaped operations answer with a named refusal, and the checks
 // below assert the exact truthful answer rather than shrugging at any envelope.
 
-const configNeedsDeps = (e) => /dependencies installed/i.test(String(e?.error || e?.message || ''));
+// WHAT `needs: 'deps'` IS FOR.
+//
+// Reading a content config means bundling it, and electron/contentConfig.js
+// bundles it with the PROJECT's own esbuild. A fixture with no node_modules
+// therefore cannot answer a single collection question — it can only say the
+// dependencies are missing — and these scenarios used to accept exactly that
+// as their proof. `configNeedsDeps` was the check: the content domain was
+// graded on its refusal message, which is how five of these could be red for
+// the right reason and the rest green for the wrong one.
+//
+// The scenarios below ask for a fixture with the dependencies really installed
+// and asssert against real collections, real entries and real files.
 
 fullScenario({ domain: 'content', action: 'cms_list', run: async ({ call }) => {
   const { envelope } = await call('content', 'cms_list', {});
@@ -633,63 +685,136 @@ fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, fixt
   ] };
 } });
 
-fullScenario({ domain: 'content', action: 'config', run: async ({ call }) => {
+fullScenario({ domain: 'content', action: 'config', needs: 'deps', run: async ({ call }) => {
   const { envelope } = await call('content', 'config', {});
+  const notes = (envelope?.collections || []).find((c) => c.name === 'notes');
   return { envelope, checks: [
     ['it names the content config the fixture authored', String(envelope?.configPath || '').includes('content.config')],
-    ['and says plainly that reading it needs the dependencies', configNeedsDeps(envelope)],
+    ['and reads the collection out of it', !!notes],
+    ['with the loader the config declares', notes?.loader?.kind === 'glob' && String(notes?.loader?.base).includes('notes')],
+    ['and the zod schema resolved to a real JSON Schema', !!notes?.schema?.properties?.title],
   ] };
 } });
 
-fullScenario({ domain: 'content', action: 'collections', run: async ({ call }) => {
+fullScenario({ domain: 'content', action: 'collections', needs: 'deps', run: async ({ call }) => {
   const { envelope } = await call('content', 'collections', {});
+  const byName = Object.fromEntries((envelope?.collections || []).map((c) => [c.name, c]));
   return { envelope, checks: [
-    ['it answers with a collections list', Array.isArray(envelope?.collections)],
-    ['and says why it is empty rather than pretending', configNeedsDeps(envelope) || envelope.collections.length > 0],
+    ['it finds both collections the config declares', !!byName.notes && !!byName.links],
+    ['counting the entries each really has', byName.notes?.count === 2 && byName.links?.count === 2],
+    ['and reports no error reading them', (envelope?.collections || []).every((c) => !c.error)],
   ] };
 } });
 
-const collectionAnswer = (envelope, key) => [
-  [`it answers about ${key}`, !!envelope],
-  ['truthfully, given the config cannot be read without dependencies',
-    configNeedsDeps(envelope) || /not a collection/i.test(String(envelope?.message || '')) || Array.isArray(envelope?.[key]) || envelope?.ok === true],
-];
-
-fullScenario({ domain: 'content', action: 'entries', run: async ({ call }) => {
+fullScenario({ domain: 'content', action: 'entries', needs: 'deps', run: async ({ call }) => {
   const { envelope } = await call('content', 'entries', { collection: 'notes' });
-  return { envelope, checks: [['it answers with an entries list', Array.isArray(envelope?.entries)]] };
+  const ids = (envelope?.entries || []).map((e) => e.id).sort();
+  const first = (envelope?.entries || []).find((e) => e.id === 'first');
+  return { envelope, checks: [
+    ['it lists the entries the fixture wrote', JSON.stringify(ids) === JSON.stringify(['first', 'second'])],
+    ['each pointing at the file it came from', first?.file === 'src/content/notes/first.md'],
+    ['with the frontmatter parsed into data', first?.data?.title === 'The first note' && first?.data?.draft === false],
+    ['and the markdown body carried alongside it', String(first?.body || '').includes('Something worth writing down')],
+  ] };
 } });
 
-fullScenario({ domain: 'content', action: 'sample_entry', run: async ({ call }) => {
-  const { envelope } = await call('content', 'sample_entry', { collection: 'notes' });
-  return { envelope, checks: collectionAnswer(envelope, 'entry') };
+// Answered by the dev server, because only it can run the project's loaders —
+// so this raises one, exactly as an agent working on a live site would have.
+fullScenario({ domain: 'content', action: 'sample_entry', needs: 'server', run: async ({ call, fixture }) => {
+  await call('project', 'dev_start', {});
+  try {
+    const { envelope } = await call('content', 'sample_entry', { collection: 'notes' });
+    fixture.observedWorld('asked the running dev server to run the collection loader');
+    return { envelope, checks: [
+      ['it answers with one entry of that collection', !!envelope?.entry],
+      ['identified the way the collection identifies it', envelope?.entry?.id === 'first' || envelope?.entry?.id === 'second'],
+      ['carrying the data the entry really holds', typeof envelope?.entry?.data?.title === 'string'],
+      ['and naming the file it came from', String(envelope?.entry?.filePath || '').includes('src/content/notes/')],
+    ] };
+  } finally {
+    await call('project', 'dev_stop', {});
+  }
 } });
 
-fullScenario({ domain: 'content', action: 'targets', run: async ({ call }) => {
+fullScenario({ domain: 'content', action: 'targets', needs: 'deps', run: async ({ call }) => {
   const { envelope } = await call('content', 'targets', { collection: 'notes' });
-  return { envelope, checks: collectionAnswer(envelope, 'targets') };
+  const ids = (envelope?.targets || []).map((t) => t.id).sort();
+  return { envelope, checks: [
+    ['it lists what a reference to this collection could point at', JSON.stringify(ids) === JSON.stringify(['first', 'second'])],
+    ['each with the title that identifies it to a person', (envelope?.targets || []).every((t) => typeof t.title === 'string' && t.title.length > 0)],
+  ] };
 } });
 
-fullScenario({ domain: 'content', action: 'validate', run: async ({ call }) => {
-  const { envelope } = await call('content', 'validate', { collection: 'notes', data: { title: 'Wire' } });
-  return { envelope, checks: collectionAnswer(envelope, 'issues') };
+// Asked about an entry that BREAKS the schema, because that is the answer that
+// can only come from really running it: `title` is required and missing, and
+// `draft` is a boolean given a string. An entry that validates cleanly looks
+// the same whether the schema was applied or never read at all.
+fullScenario({ domain: 'content', action: 'validate', needs: 'deps', run: async ({ call }) => {
+  const { envelope } = await call('content', 'validate', { collection: 'notes', data: { draft: 'not a boolean' } });
+  const said = JSON.stringify(envelope?.issues || []);
+  return { envelope, checks: [
+    ['it reaches a verdict rather than refusing to look', Array.isArray(envelope?.issues)],
+    ['and finds what is wrong with an entry that breaks the schema', (envelope?.issues || []).length > 0],
+    ['naming the required field that is missing', said.includes('title')],
+    ['and the one whose type is wrong', said.includes('draft')],
+  ] };
 } });
 
-fullScenario({ domain: 'content', action: 'write_entry', run: async ({ call }) => {
+fullScenario({ domain: 'content', action: 'write_entry', needs: 'deps', run: async ({ call, fixture }) => {
   const list = await call('content', 'entries', { collection: 'notes' });
-  const first = (list.envelope?.entries || [])[0] || { collection: 'notes', id: 'first' };
-  const { envelope } = await call('content', 'write_entry', { entry: first, body: 'Rewritten by the wire test.' });
-  return { envelope, checks: collectionAnswer(envelope, 'entry') };
+  const first = (list.envelope?.entries || []).find((e) => e.id === 'first');
+  const before = fixture.read('src/content/notes/second.md');
+  // `edits` is a LIST of { path, value }. It was declared as an object of
+  // fields, and this scenario passed neither — it sent a body alone, which the
+  // mapper turned into `edits: {}`, which reached `.map` and threw. Every call
+  // this operation could receive failed until the schema matched the code.
+  const { envelope } = await call('content', 'write_entry', {
+    entry: first,
+    edits: [{ path: ['title'], value: 'Retitled by the wire test' }],
+    body: 'Rewritten by the wire test.\n',
+  });
+  const after = fixture.read('src/content/notes/first.md');
+  const reread = await call('content', 'entries', { collection: 'notes' });
+  const now = (reread.envelope?.entries || []).find((e) => e.id === 'first');
+  return { envelope, checks: [
+    ['it reports having changed the file', envelope?.changed === true],
+    ['the frontmatter field really is rewritten on disk', /title:\s*Retitled by the wire test/.test(after)],
+    ['and the body with it', after.includes('Rewritten by the wire test.')],
+    ['the field it was not asked about is untouched', /draft:\s*false/.test(after)],
+    ['reading the collection back reports the new value', now?.data?.title === 'Retitled by the wire test'],
+    ['and the other entry is exactly as it was', fixture.read('src/content/notes/second.md') === before],
+  ] };
 } });
 
-fullScenario({ domain: 'content', action: 'rename_plan', run: async ({ call }) => {
-  const { envelope } = await call('content', 'rename_plan', { collection: 'notes', from: 'title', to: 'heading' });
-  return { envelope, checks: collectionAnswer(envelope, 'plan') };
+fullScenario({ domain: 'content', action: 'rename_plan', needs: 'deps', run: async ({ call, fixture }) => {
+  const before = fixture.read('src/content/notes/first.md');
+  const { envelope } = await call('content', 'rename_plan', { collection: 'notes', from: 'first', to: 'introduction' });
+  const pointers = envelope?.pointers || [];
+  return { envelope, checks: [
+    ['it plans the move the rename would make', envelope?.move?.from === 'src/content/notes/first.md' && envelope?.move?.to === 'src/content/notes/introduction.md'],
+    ['and finds the entry elsewhere that points at this one', pointers.some((p) => p.collection === 'links' && p.entryId === 'pointer')],
+    ['naming the field that holds the reference', pointers.some((p) => JSON.stringify(p.path || []).includes('note'))],
+    ['while leaving the entry that points somewhere else out of it', !pointers.some((p) => p.entryId === 'other')],
+    ['and it is a plan, so nothing has moved yet', fixture.exists('src/content/notes/first.md') && !fixture.exists('src/content/notes/introduction.md')],
+    ['nor has anything been rewritten', fixture.read('src/content/notes/first.md') === before],
+  ] };
 } });
 
-fullScenario({ domain: 'content', action: 'rename', run: async ({ call }) => {
-  const { envelope } = await call('content', 'rename', { collection: 'notes', from: 'title', to: 'heading' });
-  return { envelope, checks: collectionAnswer(envelope, 'changed') };
+fullScenario({ domain: 'content', action: 'rename', needs: 'deps', run: async ({ call, fixture }) => {
+  const body = fixture.read('src/content/notes/first.md');
+  const otherBefore = fixture.read('src/content/links/other.md');
+  const { envelope } = await call('content', 'rename', { collection: 'notes', from: 'first', to: 'introduction' });
+  const reread = await call('content', 'entries', { collection: 'notes' });
+  const ids = (reread.envelope?.entries || []).map((e) => e.id).sort();
+  return { envelope, checks: [
+    ['it reports the rename as done', envelope?.renamed === true],
+    ['the old identity is gone from disk', !fixture.exists('src/content/notes/first.md')],
+    ['the new one is there', fixture.exists('src/content/notes/introduction.md')],
+    ['carrying the entry\'s content with it', fixture.read('src/content/notes/introduction.md') === body],
+    ['the collection now answers under the new id', JSON.stringify(ids) === JSON.stringify(['introduction', 'second'])],
+    ['the entry that pointed at it was updated to follow', /note:\s*introduction/.test(fixture.read('src/content/links/pointer.md'))],
+    ['and the one that pointed elsewhere was left alone', fixture.read('src/content/links/other.md') === otherBefore],
+  ] };
 } });
 
 fullScenario({ domain: 'content', action: 'resolve_import', run: async ({ call }) => {
@@ -765,10 +890,13 @@ fullScenario({ domain: 'project', action: 'redo', run: async ({ call, ref, fixtu
 // one scenario per operation; each delegates to that harness.
 const devLifecycle = require('./mcpDevLifecycle.js');
 
-fullScenario({ domain: 'project', action: 'dev_status', run: (ctx) => devLifecycle.devStatus(ctx) });
-fullScenario({ domain: 'project', action: 'dev_start', run: (ctx) => devLifecycle.devStart(ctx) });
-fullScenario({ domain: 'project', action: 'probe', run: (ctx) => devLifecycle.probe(ctx) });
-fullScenario({ domain: 'project', action: 'dev_stop', run: (ctx) => devLifecycle.devStop(ctx) });
+// `needs: 'deps'` on the three that have to reach a REAL running site: the app
+// only starts its own preview when the project can run, and probe and
+// dev_status are about what is actually listening.
+fullScenario({ domain: 'project', action: 'dev_status', needs: 'server', run: (ctx) => devLifecycle.devStatus(ctx) });
+fullScenario({ domain: 'project', action: 'dev_start', needs: 'server', run: (ctx) => devLifecycle.devStart(ctx) });
+fullScenario({ domain: 'project', action: 'probe', needs: 'server', run: (ctx) => devLifecycle.probe(ctx) });
+fullScenario({ domain: 'project', action: 'dev_stop', needs: 'server', run: (ctx) => devLifecycle.devStop(ctx) });
 fullScenario({ domain: 'project', action: 'install', run: (ctx) => devLifecycle.install(ctx) });
 
 // ── git ────────────────────────────────────────────────────────────────────
@@ -819,14 +947,27 @@ fullScenario({ domain: 'git', action: 'log', run: async ({ call }) => {
   return { envelope, checks: [['it lists the commit that was just made', (envelope?.commits || []).length > 0]] };
 } });
 
-fullScenario({ domain: 'git', action: 'all_files', run: async ({ call }) => {
+// `fixture` was used here and never taken from the arguments — a bare
+// identifier that threw ReferenceError the moment the scenario ran, which is
+// all this had ever done. The contract is `ls-files --cached --others
+// --exclude-standard`: tracked and untracked, minus what .gitignore excludes.
+fullScenario({ domain: 'git', action: 'all_files', run: async ({ call, fixture }) => {
+  fixture.write('.gitignore', 'ignored-by-git/\n');
+  fixture.write('ignored-by-git/secret.txt', 'must not be listed\n');
   await seedRepo(call);
+  // Written after the seed commit, so this one is genuinely untracked.
+  fixture.write('public/nested/deep/untracked-canary.txt', 'not committed\n');
   const { envelope } = await call('git', 'all_files', {});
-  const tracked = git(fixture, ['ls-files']);
-  const listed = JSON.stringify(envelope?.files || []);
+  const paths = (envelope?.files || []).map((f) => f.path);
+  const tracked = git(fixture, ['ls-files']).split('\n').filter(Boolean);
   return { envelope, checks: [
-    ['git itself tracks the page', tracked.includes('index.astro')],
-    ['and Stacki lists the same file', listed.includes('index.astro')],
+    ['git itself tracks the page', tracked.includes('src/pages/index.astro')],
+    ['and Stacki lists every file git tracks', tracked.every((t) => paths.includes(t))],
+    ['including the untracked one, which the contract asks for', paths.includes('public/nested/deep/untracked-canary.txt')],
+    ['at its full path rather than its basename', !paths.includes('untracked-canary.txt')],
+    ['while what .gitignore excludes stays out', !paths.some((p) => p.startsWith('ignored-by-git/'))],
+    ['and git\'s own internals are never files of the project', !paths.some((p) => p === '.git' || p.startsWith('.git/'))],
+    ['each entry carrying the status fields the shape promises', (envelope?.files || []).every((f) => typeof f.path === 'string' && 'status' in f && 'staged' in f)],
   ] };
 } });
 
@@ -870,13 +1011,41 @@ fullScenario({ domain: 'git', action: 'merge', run: async ({ call, fixture }) =>
   ] };
 } });
 
-fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call }) => {
+// Same missing `fixture`, and it asked to merge `main` into `main`, which is
+// refused on principle — so this never reached a conflict, let alone resolved
+// one. A real disagreement is built here: one file, changed differently on two
+// branches, resolved by taking the incoming side deliberately.
+fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call, fixture }) => {
+  const FILE = 'public/conflict-canary.txt';
+  fixture.write(FILE, 'the common ancestor\n');
   await seedRepo(call);
-  const { envelope } = await call('git', 'resolve_merge', { branch: 'main', choices: {} });
-  const clean = git(fixture, ['status', '--porcelain']);
+  const base = git(fixture, ['rev-parse', 'HEAD']);
+
+  await call('git', 'checkout', { branch: 'wire-conflict', create: true });
+  fixture.write(FILE, 'the incoming side\n');
+  await call('git', 'commit', { message: 'branch edits the canary' });
+
+  await call('git', 'checkout', { branch: 'main' });
+  fixture.write(FILE, 'the side already here\n');
+  await call('git', 'commit', { message: 'main edits the same line' });
+
+  // Proves the disagreement is real before anything is asked to settle it:
+  // merge reports what it could not reconcile, then leaves the tree alone.
+  const attempt = await call('git', 'merge', { branch: 'wire-conflict' });
+  const clashed = JSON.stringify(attempt.envelope?.conflicts || attempt.envelope || {});
+
+  const { envelope } = await call('git', 'resolve_merge', { branch: 'wire-conflict', choices: { [FILE]: 'theirs' } });
+  const after = fixture.read(FILE);
+  const status = git(fixture, ['status', '--porcelain']);
   return { envelope, checks: [
-    ['it answers about the merge state', !!envelope],
-    ['and the working tree is not left mid-merge', !clean.includes('UU ')],
+    ['the two branches really disagree about that file', clashed.includes('conflict-canary')],
+    ['and the merge was the one thing that could not go through cleanly', attempt.envelope?.ok !== true || clashed.includes('conflict-canary')],
+    ['resolving takes the side that was asked for', after.trim() === 'the incoming side'],
+    ['leaving no conflict markers behind', !/^<{7}|^={7}|^>{7}/m.test(after)],
+    ['nothing is left unmerged', !/^(UU|AA|DD|AU|UA|DU|UD)/m.test(status)],
+    ['the merge is committed rather than left in progress', !fixture.exists('.git/MERGE_HEAD')],
+    ['both sides are still reachable in history', git(fixture, ['cat-file', '-t', base]) === 'commit'],
+    ['and no unrelated file was rewritten', fixture.read('src/pages/index.astro').includes('<Hero')],
   ] };
 } });
 

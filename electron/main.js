@@ -563,6 +563,10 @@ app.whenReady().then(() => {
     getAgentMode: () => agentAccess.modeFor(openProjectRoot),
     // One implementation of each operation, called by name. See mainOps.
     callMain: callMainOp,
+    // The address of the server this process is running, straight from the
+    // thing that started it rather than from the renderer's last published
+    // snapshot of it.
+    getDevUrl: () => devServer?.url || null,
   });
   // Visual Review's ledger. Also for the app rather than for a project — the
   // door is registered once, and which project's reviews are behind it moves

@@ -77,7 +77,7 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
   for (const s of order) {
     let rig = null;
     try {
-      rig = await startWireRig();
+      rig = await startWireRig({ withDeps: s.needs === 'deps', realDevServer: s.needs === 'server' });
       const ref = async (want = 'h1') => {
         const { envelope } = await rig.call('target', 'read');
         const root = envelope?.target;

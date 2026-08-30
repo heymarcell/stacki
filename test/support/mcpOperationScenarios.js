@@ -44,8 +44,15 @@ const GRADES = new Set(['full', 'boundary']);
 /** Every registered scenario, keyed `domain.action`. */
 const scenarios = new Map();
 
+// 'deps'   the project's node_modules, so its content config can be bundled
+// 'server' those, and a real dev server the app may start — kept separate
+//          because starting Astro in every fixture that merely needs to read a
+//          config costs a process and a port per scenario, and fourteen of them
+//          contending over ports is how a working lifecycle times out.
+const NEEDS = new Set(['deps', 'server']);
+
 function register(spec) {
-  const { domain, action, grade, why, run } = spec || {};
+  const { domain, action, grade, why, run, needs = null } = spec || {};
   const where = `${domain || '?'}.${action || '?'}`;
 
   if (typeof domain !== 'string' || !domain) throw new Error(`scenario(${where}): domain must be a non-empty string`);
@@ -55,10 +62,18 @@ function register(spec) {
   if (grade === 'boundary' && (typeof why !== 'string' || why.trim().length < 20)) {
     throw new Error(`scenario(${where}): a boundary scenario must explain in 'why' what external effect it stops short of`);
   }
+  // What the fixture has to BE for the scenario to mean anything. Only one
+  // kind so far — `deps`, a project with its node_modules really installed,
+  // without which no content question can be answered at all. Declared rather
+  // than assumed, so a runner that cannot supply it can say so instead of
+  // grading the operation on the refusal it gets back.
+  if (needs !== null && !NEEDS.has(needs)) {
+    throw new Error(`scenario(${where}): needs must be one of ${[...NEEDS].join(', ')}, got ${JSON.stringify(needs)}`);
+  }
   const key = `${domain}.${action}`;
   if (scenarios.has(key)) throw new Error(`scenario(${key}): registered twice`);
 
-  scenarios.set(key, { domain, action, grade, why: why || null, run });
+  scenarios.set(key, { domain, action, grade, why: why || null, run, needs });
   return scenarios.get(key);
 }
 

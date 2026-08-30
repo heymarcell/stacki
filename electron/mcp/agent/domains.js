@@ -531,7 +531,13 @@ const content = {
       if (!input.entry || typeof input.entry !== 'object') {
         return problem('bad_request', 'entry is required — pass the entry object content.entries reported.');
       }
-      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || {}, body: input.body };
+      if (input.edits !== undefined && !Array.isArray(input.edits)) {
+        return problem('bad_request', 'edits is a list of { path, value } — one per field to change.');
+      }
+      // `[]`, not `{}`. The implementation maps over this; an object arrived at
+      // `.map` and took the operation down for every caller, including the ones
+      // that sent no edits at all and only wanted to rewrite the body.
+      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || [], body: input.body };
     },
   },
   validate: {
@@ -780,8 +786,7 @@ const project = {
     }),
   },
   probe: { channel: 'dev:probe', args: (input, ctx) => input.url || ctx.devUrl || null },
-  dev_start: { channel: 'dev:start', args: (_i, ctx) => ctx.root },
-  dev_stop: { channel: 'dev:stop', args: () => undefined },
+
 };
 
 // --- git ---------------------------------------------------------------------

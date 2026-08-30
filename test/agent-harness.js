@@ -344,13 +344,16 @@ const settle = (ms = 60) => new Promise((done) => setTimeout(done, ms));
  * the human — select something, edit a file behind the agent's back, read what
  * is on disk.
  */
-async function start(root, { agentMode = 'full' } = {}) {
+async function start(root, { agentMode = 'full', realDevServer = false } = {}) {
   const { handlers, callMain } = loadMain();
   const dom = makeDom();
 
   // Everything the app publishes about itself, kept so the API can read it the
   // way the real main process does.
   let payload = null;
+  // Where main's dev server is, as of the last start or stop that went through
+  // this bridge — the harness's stand-in for reading `devServer` in main.
+  let devUrlNow = null;
   // The app's own answer to an mcp:ask, registered by its effect.
   let askHandler = null;
   const replies = new Map();
@@ -367,10 +370,40 @@ async function start(root, { agentMode = 'full' } = {}) {
       // The fixture has no node_modules and must not try to acquire any: a
       // test that runs `npm install` is a test that fails on an aeroplane.
       hasNodeModules: async () => ({ has: true }),
-      startDevServer: async () => ({ error: 'the fixture has no dev server' }),
-      stopDevServer: async () => ({ ok: true }),
-      diagnoseDev: async () => ({ kind: 'no-deps' }),
-      probeDevPage: async () => null,
+      // A REAL SERVER WHEN THERE IS ONE TO START.
+      //
+      // A fixture built with its dependencies installed can run the project's
+      // own Astro, so these go to main's real handlers rather than round them —
+      // which is the only way project.dev_start, dev_status and probe can be
+      // about anything. Without dependencies they REFUSE BY THROWING, because
+      // that is what production does: doDevStart either answers with a url or
+      // throws, and the resolved `{ error }` this used to hand back walked
+      // straight past startPreview's catch and left the app reporting a preview
+      // that was on with no address.
+      startDevServer: realDevServer
+        ? (projectPath) =>
+            Promise.resolve()
+              .then(() => handlers.get('dev:start')(null, projectPath || root))
+              .then((r) => {
+                devUrlNow = r?.url || null;
+                return r;
+              })
+        : async () => {
+            throw new Error('the fixture has no dev server');
+          },
+      stopDevServer: realDevServer
+        ? () =>
+            Promise.resolve()
+              .then(() => handlers.get('dev:stop')(null))
+              .then((r) => {
+                devUrlNow = null;
+                return r;
+              })
+        : async () => ({ ok: true }),
+      diagnoseDev: async () => ({ kind: realDevServer ? 'ready' : 'no-deps' }),
+      probeDevPage: realDevServer
+        ? (url) => Promise.resolve().then(() => handlers.get('dev:probe')(null, url))
+        : async () => null,
       refreshThumb: async () => null,
       watchProject: async () => ({ ok: true }),
       mcpPublish: async (next) => {
@@ -469,6 +502,9 @@ async function start(root, { agentMode = 'full' } = {}) {
     callMain,
     ask,
     readPayload: () => payload,
+    // The same authority the app gives it: main's own dev server, asked
+    // through the handler rather than read out of a closure.
+    getDevUrl: () => devUrlNow,
     resolveTrail: (keys) => selectionTrail({ projectPath: root, keys }, locateSelection),
     version: '0.0.0-test',
   });
@@ -492,7 +528,14 @@ async function start(root, { agentMode = 'full' } = {}) {
     },
     settle,
     read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'),
-    write: (rel, text) => fs.writeFileSync(path.join(root, rel), text, 'utf8'),
+    write: (rel, text) => {
+      // Makes the directories on the way. A fixture that can only write beside
+      // files that already exist cannot set up a nested case, and every caller
+      // that wanted one had to reach past this helper to do it.
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, text, 'utf8');
+    },
     exists: (rel) => fs.existsSync(path.join(root, rel)),
     stop: () => {
       try {

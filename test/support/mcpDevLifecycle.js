@@ -102,45 +102,98 @@ async function devStart({ call, fixture }) {
   fixture.scratch.devUrl = url;
   fixture.scratch.devPort = port;
 
-  const answered = url
-    ? await until('the dev server to answer', async () => {
-        try {
-          const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
-          return res.status > 0;
-        } catch {
-          return false;
-        }
-      })
-    : null;
+  try {
+    const answered = url
+      ? await until('the dev server to answer', async () => {
+          try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+            return res.status > 0;
+          } catch {
+            return false;
+          }
+        })
+      : null;
 
-  fixture.observedWorld('connected to the port the dev server bound, and asked it for a page');
-  return {
-    envelope,
-    checks: [
-      ['starting answers with the URL it bound', typeof url === 'string' && url.startsWith('http')],
-      ['a port really is listening', port ? await portBusy(port) : false],
-      ['and the server answers an HTTP request', answered === true],
-    ],
-  };
+    fixture.observedWorld('connected to the port the dev server bound, and asked it for a page');
+    return {
+      envelope,
+      checks: [
+        ['starting answers with the URL it bound', typeof url === 'string' && url.startsWith('http')],
+        ['a port really is listening', port ? await portBusy(port) : false],
+        ['and the server answers an HTTP request', answered === true],
+        ['and the app agrees a preview is running', envelope?.status === 'on'],
+      ],
+    };
+  } finally {
+    // What this scenario started, this scenario stops. It used to leave the
+    // server up, and the fixture underneath it was then deleted — so a later
+    // scenario asked a live process about a directory that no longer existed.
+    await call('project', 'dev_stop', {});
+    if (port) await until('the port to be released', async () => !(await portBusy(port)), 30000, 300);
+  }
 }
 
-async function probe({ call, fixture }) {
-  const { envelope } = await call('project', 'probe', { url: fixture.scratch.devUrl || undefined });
-  return {
-    envelope,
-    checks: [['probing the running server reports it reachable', envelope?.ok === true && (envelope.status === undefined || envelope.status > 0)]],
-  };
+/**
+ * A server of this scenario's own, started and stopped inside it.
+ *
+ * Every scenario gets a fresh fixture, so there is no server left running by a
+ * neighbour to ask about — `probe` and `dev_status` used to read a
+ * `fixture.scratch` that only `dev_start` ever filled in, in a different rig,
+ * and so asked their questions of a project with nothing running. Each one
+ * raises its own now, and puts it down again whatever happens.
+ */
+async function withServer({ call, fixture }, body) {
+  const started = await call('project', 'dev_start', {});
+  const url = started.envelope?.url || null;
+  const port = url ? Number(new URL(url).port) : null;
+  try {
+    return await body({ url, port, started });
+  } finally {
+    await call('project', 'dev_stop', {});
+    if (port) await until('the port to be released', async () => !(await portBusy(port)), 30000, 300);
+  }
 }
 
-async function devStatus({ call }) {
-  const { envelope } = await call('project', 'dev_status', {});
-  return {
-    envelope,
-    checks: [
-      ['it reports what the preview is doing', typeof envelope?.status === 'string'],
-      ['and names a URL while a server is running', typeof envelope?.url === 'string' || envelope.status !== 'on'],
-    ],
-  };
+async function probe(ctx) {
+  const { call, fixture } = ctx;
+  return withServer(ctx, async ({ url, port }) => {
+    // ONE subject call, with no url of its own: the operation has to find the
+    // running preview from the context, which is both the harder case and what
+    // an agent that never called dev_start does. The URL it must have found is
+    // checked against the one the server really bound, and against what that
+    // address answers when this test asks it directly.
+    const { envelope } = await call('project', 'probe', {});
+    const direct = await fetch(url, { signal: AbortSignal.timeout(5000) }).then((r) => r.status).catch(() => 0);
+    fixture.observedWorld('asked the running dev server for a page over HTTP itself');
+    return {
+      envelope,
+      checks: [
+        ['probing with no URL finds the preview that is running', envelope?.ok === true],
+        ['and reports the status it really answered with', envelope?.status === direct && direct >= 200],
+        ['which is the server this scenario started', typeof url === 'string' && url.includes(String(port))],
+      ],
+    };
+  });
+}
+
+async function devStatus(ctx) {
+  const { call, fixture } = ctx;
+  return withServer(ctx, async ({ url }) => {
+    const { envelope } = await call('project', 'dev_status', {});
+    const answered = await fetch(String(envelope?.url || ''), { signal: AbortSignal.timeout(5000) })
+      .then((r) => r.status)
+      .catch(() => 0);
+    fixture.observedWorld('compared what the app says about the preview against the server actually answering');
+    return {
+      envelope,
+      checks: [
+        ['it reports what the preview is doing', typeof envelope?.status === 'string'],
+        ['with a server running it says so', envelope?.status === 'on'],
+        ['and names the address that server bound', envelope?.url === url && typeof url === 'string'],
+        ['which really answers HTTP', answered >= 200],
+      ],
+    };
+  });
 }
 
 async function devStop({ call, fixture }) {
