@@ -119,8 +119,9 @@ function relaunchApp() {
   }
   // app.exit skips before-quit, so take the Astro dev server down by hand —
   // otherwise it keeps the port and the next process adopts a server still
-  // running the previously generated config.
-  stopDevServer();
+  // running the previously generated config. Synchronously, for the same reason
+  // the quit path is: app.exit does not wait for a promise either.
+  stopDevServerSync();
   app.exit(RELAUNCH_CODE);
 }
 
@@ -692,9 +693,12 @@ app.whenReady().then(() => {
 // it, and the dev server outlives everything.
 handle('project:close', async (_e, next) => {
   pendingProject = typeof next === 'string' && next ? next : null;
-  stopDevServer();
+  // Awaited: this process is not going anywhere, and the window is about to be
+  // reloaded onto another project. A server still holding the port when the
+  // next one starts is the case the comment above is about.
+  await stopDevServer();
   stopAllServices();
-  stopAllPreviews();
+  await stopAllPreviews();
   cleanupTerminals();
   if (watcher) {
     watcher.close();
@@ -723,20 +727,23 @@ app.on('window-all-closed', () => {
   // it as one killed the dev server (and, off macOS, quit) in the middle of
   // taking a picture.
   if (mainWindow && !mainWindow.isDestroyed()) return;
-  stopDevServer();
+  // Off macOS this is followed by app.quit() a few lines down, so the same
+  // reasoning applies: finish before the process does.
+  stopDevServerSync();
+  stopAllPreviewsSync();
   // The pty ids are keyed to the window that opened them, so a surviving shell
   // could never be reached again — and on macOS the app stays running.
   cleanupTerminals();
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => stopDevServer());
+app.on('before-quit', () => stopDevServerSync());
 // Reading a project's content config leaves a process behind holding its
 // schemas; they go when the app does.
 app.on('before-quit', () => stopAllServices());
 // The preview checkouts live inside the user's projects, so leaving one behind
 // leaves a stray folder in a place they will notice.
-app.on('before-quit', () => stopAllPreviews());
+app.on('before-quit', () => stopAllPreviewsSync());
 // A pty outlives the window that opened it unless it is killed.
 app.on('before-quit', () => cleanupTerminals());
 // A listening socket outlives it too, and the next launch wants the port back.
@@ -3408,7 +3415,7 @@ function stopDevServer() {
 
   // Daemonized servers (Astro >= 7 forks a background process) stop via the CLI.
   if (daemon && bin) {
-    return stopAstroDaemon(projectPath, bin).then(() => waitForPortFree(url));
+    return stopAstroDaemon(projectPath, bin).then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
   }
 
   // External servers (started by the user, e.g. in a terminal) are never killed.
@@ -3420,7 +3427,7 @@ function stopDevServer() {
   // gone while the real server carries on serving. Astro writes down where its
   // daemon is — .astro/dev.json, pid and all — so that is asked instead of
   // guessed at.
-  if (!proc) return stopAstroDaemon(projectPath, bin).then(() => waitForPortFree(url));
+  if (!proc) return stopAstroDaemon(projectPath, bin).then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
 
   const exited = new Promise((done) => {
     let settled = false;
@@ -3467,7 +3474,68 @@ function stopDevServer() {
   }
   return exited
     .then(() => stopAstroDaemon(projectPath, bin))
-    .then(() => waitForPortFree(url));
+    .then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
+}
+
+/** Folds "what we were able to ask" into the answer about the port. */
+function withHow(result, asked) {
+  if (result.ok) return result;
+  const how =
+    asked?.asked === 'nothing'
+      ? 'and Stacki has no record of how to reach it — the project has no .astro/dev.json'
+      : 'after it was asked to stop';
+  return { ...result, reason: `something is still listening on port ${result.port} ${how}` };
+}
+
+/**
+ * The same stop, done synchronously, for the paths that will not be here to
+ * finish an asynchronous one.
+ *
+ * `before-quit` is synchronous: a listener can only stop the quit by calling
+ * `event.preventDefault()`, and everything else it starts is racing the
+ * process's own exit. The promise stopDevServer returns was therefore dropped
+ * on quit, and what it still owed was the part that matters — the SIGTERM to
+ * the pid Astro wrote down lives inside a `.then`, so it only ever ran if the
+ * app was still alive to run it. In practice `astro dev stop` is a separate
+ * process and usually outlives us, which is why the daemon has been getting
+ * cleaned up; a daemon that does not answer the CLI was being left behind on
+ * a coin toss.
+ *
+ * So the quit path signals the recorded pid FIRST, which is instant and exact,
+ * and only then spends a bounded moment asking the CLI to tidy the lock. No
+ * preventDefault, no second quit to schedule, and nothing that can make the app
+ * unquittable — the whole thing is capped at a few seconds.
+ */
+function stopDevServerSync() {
+  const server = devServer;
+  if (!server) return;
+  devServer = null;
+  // A server somebody else started is not ours to stop, here either.
+  if (server.external) return;
+
+  const lock = readAstroLock(server.projectPath);
+  if (lock?.pid) {
+    try {
+      process.kill(lock.pid, 'SIGTERM');
+    } catch {
+      /* already gone */
+    }
+  }
+  if (server.proc) {
+    try {
+      server.proc.kill('SIGTERM');
+    } catch {
+      /* already gone */
+    }
+  }
+  if (lock && server.bin) {
+    try {
+      const [cmd, argv] = nodeCliCommand(server.bin, ['dev', 'stop']);
+      execFileSync(cmd, argv, { cwd: server.projectPath, timeout: 3000, stdio: 'ignore' });
+    } catch {
+      /* the signal above is what this path relies on */
+    }
+  }
 }
 
 /**
@@ -3481,23 +3549,43 @@ function stopDevServer() {
  */
 function stopAstroDaemon(projectPath, bin) {
   const lock = readAstroLock(projectPath);
-  if (!lock) return Promise.resolve();
+  // NOTHING TO ADDRESS is a different answer from ASKED AND REFUSED, and the
+  // caller needs to be able to tell them apart: without the lock there is no
+  // way to reach this server at all, and reporting "it was asked to stop and
+  // did not" would be false in its second half.
+  if (!lock) return Promise.resolve({ asked: 'nothing', lock: null });
   const viaCli = new Promise((done) => {
-    if (!bin) return done();
+    if (!bin) return done(false);
     try {
       const [cmd, argv] = nodeCliCommand(bin, ['dev', 'stop']);
-      execFile(cmd, argv, { cwd: projectPath, timeout: 10000 }, () => done());
+      execFile(cmd, argv, { cwd: projectPath, timeout: 10000 }, (err) => done(!err));
     } catch {
-      done(); /* best effort */
+      done(false); /* best effort */
     }
   });
-  return viaCli.then(async () => {
-    if (!lock.pid || !(await portAnswers(Number(lock.port) || 0, '127.0.0.1'))) return;
+  return viaCli.then(async (cliWorked) => {
+    if (!lock.pid || !(await portAnswers(Number(lock.port) || 0, '127.0.0.1'))) {
+      return { asked: cliWorked ? 'cli' : 'nothing', lock };
+    }
     try {
       process.kill(lock.pid, 'SIGTERM');
     } catch {
-      /* already gone */
+      return { asked: 'signal', lock, error: 'the recorded process could not be signalled' };
     }
+    // The pid is the one the project itself wrote down, so being certain about
+    // it is safe. A server that has not gone a few seconds after being asked is
+    // holding a port somebody else is about to want.
+    for (let i = 0; i < 20 && (await portAnswers(Number(lock.port) || 0, '127.0.0.1')); i += 1) {
+      await new Promise((r) => setTimeout(r, 250).unref?.());
+    }
+    if (await portAnswers(Number(lock.port) || 0, '127.0.0.1')) {
+      try {
+        process.kill(lock.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+    return { asked: 'signal', lock };
   });
 }
 
@@ -3526,7 +3614,10 @@ function waitForPortFree(url, timeoutMs = 15000) {
       };
       socket.once('connect', () => settle(true));
       socket.once('error', () => settle(false));
-      setTimeout(() => settle(false), 500).unref?.();
+      // A loopback connect either succeeds or is refused promptly. One that does
+      // neither is not evidence the port was released, and a cleanup answer
+      // should err towards "still there" rather than towards "all clear".
+      setTimeout(() => settle(true), 500).unref?.();
     });
   const tick = async () => {
     if (!(await listening())) return { ok: true, port, url, reason: null };
@@ -5110,26 +5201,69 @@ async function currentBranch(projectPath) {
 // Kept in its own registry rather than generalising `devServer`, whose daemon
 // detection, external-server adoption and log plumbing are all keyed to there
 // being exactly one.
-const previewServers = new Map(); // projectPath -> {proc, url, ref, port}
+const previewServers = new Map(); // projectPath -> {proc, url, ref, port, dir, bin, daemon}
 
 async function stopPreview(projectPath) {
   const cur = previewServers.get(projectPath);
-  if (!cur) return;
+  if (!cur) return { ok: true, reason: 'nothing was running' };
   previewServers.delete(projectPath);
   try {
     cur.proc?.kill();
   } catch {
     /* already gone */
   }
+  // The same daemon Astro forks for the dev server, in the worktree instead of
+  // the project. Killing the CLI never reached it.
+  let stopped = { ok: true };
+  if (cur.dir) {
+    try {
+      await stopAstroDaemon(cur.dir, cur.bin);
+      stopped = await waitForPortFree(cur.url);
+    } catch {
+      stopped = { ok: false, port: cur.port, url: cur.url, reason: 'the preview server could not be stopped' };
+    }
+  }
+  // The checkout comes out too, and a worktree that will NOT come out is worth
+  // saying: it sits inside the user's own project, where they will find it.
+  let worktree = null;
   try {
     await previewWorktree.removeWorktree(git, { projectPath });
-  } catch {
-    /* the checkout is disposable; nothing here is the user's work */
+  } catch (err) {
+    worktree = String(err?.message || err);
   }
+  return worktree ? { ...stopped, ok: false, reason: `the preview checkout was left behind: ${worktree}` } : stopped;
 }
 
 function stopAllPreviews() {
-  for (const [projectPath] of previewServers) stopPreview(projectPath);
+  return Promise.all([...previewServers.keys()].map((projectPath) => stopPreview(projectPath)));
+}
+
+/** For the quit paths, which cannot await: signal now, tidy if there is time. */
+function stopAllPreviewsSync() {
+  for (const [projectPath, cur] of [...previewServers]) {
+    previewServers.delete(projectPath);
+    try {
+      cur.proc?.kill();
+    } catch {
+      /* already gone */
+    }
+    const lock = cur.dir ? readAstroLock(cur.dir) : null;
+    if (lock?.pid) {
+      try {
+        process.kill(lock.pid, 'SIGTERM');
+      } catch {
+        /* already gone */
+      }
+    }
+    if (lock && cur.bin) {
+      try {
+        const [cmd, argv] = nodeCliCommand(cur.bin, ['dev', 'stop']);
+        execFileSync(cmd, argv, { cwd: cur.dir, timeout: 3000, stdio: 'ignore' });
+      } catch {
+        /* the signal above is what this path relies on */
+      }
+    }
+  }
 }
 
 handle('preview:atCommit', async (_e, { projectPath, ref }) => {
@@ -5169,9 +5303,20 @@ handle('preview:atCommit', async (_e, { projectPath, ref }) => {
   let log = '';
   proc.stdout.on('data', (d) => (log += d.toString()));
   proc.stderr.on('data', (d) => (log += d.toString()));
-  previewServers.set(projectPath, { proc, url, ref, port });
-  proc.on('exit', () => {
-    if (previewServers.get(projectPath)?.proc === proc) previewServers.delete(projectPath);
+  previewServers.set(projectPath, { proc, url, ref, port, dir, bin: localBin });
+  proc.on('exit', (code) => {
+    if (previewServers.get(projectPath)?.proc !== proc) return;
+    // ASTRO 7 DAEMONIZES: the CLI exits 0 having forked the real server into a
+    // background process. Deleting the record here — which is what this did —
+    // threw away the only handle to a server that was still running, so the
+    // quit hook then iterated an empty map and both the daemon and the checkout
+    // outlived Stacki. The dev server has had this branch for a while; this is
+    // the same one.
+    if (code === 0 && readAstroLock(dir)) {
+      previewServers.set(projectPath, { proc: null, url, ref, port, dir, bin: localBin, daemon: true });
+      return;
+    }
+    previewServers.delete(projectPath);
   });
 
   // Wait for it to answer rather than guessing at a delay. An old commit can

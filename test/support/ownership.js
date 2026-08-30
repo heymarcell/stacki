@@ -107,9 +107,21 @@ function createManifest(file) {
      * read is retried briefly, and a claim that still cannot be verified is
      * kept and marked rather than thrown away.
      */
-    process(what, pid) {
+    process(what, pid, { rename = false } = {}) {
       if (!pid) return;
-      if (state.processes.some((p) => p.pid === Number(pid))) return;
+      const already = state.processes.find((p) => p.pid === Number(pid));
+      if (already) {
+        // A later, more specific claim wins the label. The sweep that finds
+        // everything running out of the project usually gets there first — the
+        // lock file naming the dev server appears a moment after the process
+        // does — and "a process in the project" is true but useless when the
+        // report has to say what was left behind.
+        if (rename) {
+          already.what = what;
+          flush();
+        }
+        return;
+      }
       let command = commandOf(pid);
       for (let i = 0; i < 4 && !command; i += 1) {
         const until = Date.now() + 50;

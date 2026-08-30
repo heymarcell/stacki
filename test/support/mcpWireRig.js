@@ -201,10 +201,13 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
   };
 
   let stopped = false;
+  let stopProblems = [];
   const stop = async () => {
-    if (stopped) return;
+    if (stopped) return { problems: stopProblems };
     stopped = true;
-    await closeClient();
+    stopProblems = [];
+    const closed = await closeClient();
+    if (closed && closed.ok === false) stopProblems.push(`the MCP client would not close: ${closed.error}`);
     await server.stop?.();
     // NO DEV SERVER OUTLIVES THE FIXTURE IT SERVES.
     //
@@ -213,11 +216,20 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
     // next scenario starts — pointed at a directory this teardown is about to
     // delete. That is how five scenarios could each pass alone and two of them
     // fail in the suite. Asked of main's own handler, so it is the real stop.
+    // AND WHAT IT ANSWERED. dev:stop can now refuse — it returns
+    // `{ ok:false }` rather than throwing when the port is still bound — and
+    // this dropped the answer entirely, so a fixture was deleted out from under
+    // a server that was still serving and the suite called it a clean teardown.
+    // "There was nothing running" and "we owned one and could not stop it" are
+    // the two states this whole file exists to keep apart.
     try {
       const stopDev = harness.handlers.get('dev:stop');
-      if (stopDev) await stopDev(null);
-    } catch {
-      /* nothing was running */
+      if (stopDev) {
+        const said = await stopDev(null);
+        if (said && said.ok === false) stopProblems.push(said.message || 'the dev server would not stop');
+      }
+    } catch (err) {
+      stopProblems.push(`stopping the dev server threw: ${String(err?.message || err)}`);
     }
     try {
       harness.stop();
@@ -240,6 +252,7 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
       /* nothing was ever started */
     }
     H.removeProject(root);
+    return { problems: stopProblems };
   };
 
   return { root, harness, client, call, tool, stop, url, token, port, withDeps, realDevServer };

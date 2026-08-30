@@ -153,8 +153,15 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
       results.set(`${s.domain}.${s.action}`, verdict);
       check(`${s.domain}.${s.action} [${s.grade}] through the wire`, verdict?.good === true, verdict?.detail || '');
     } finally {
-      // Owned, so it goes. A rig that will not stop is a leak, not a detail.
-      if (rig) await rig.stop();
+      // Owned, so it goes. A rig that will not stop is a leak, not a detail —
+      // and now it says which part of itself it could not put down, rather than
+      // deleting the fixture out from under a server that is still serving.
+      if (rig) {
+        const { problems } = (await rig.stop()) || { problems: [] };
+        if (problems.length) {
+          check(`${s.domain}.${s.action} tore its fixture down cleanly`, false, problems.join('; '));
+        }
+      }
     }
   }
 

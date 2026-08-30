@@ -188,7 +188,7 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
   const claimDevServer = () => {
     try {
       const lock = JSON.parse(fs.readFileSync(path.join(opened, '.astro', 'dev.json'), 'utf8'));
-      if (lock?.pid) manifest.process('astro dev server', lock.pid);
+      if (lock?.pid) manifest.process('astro dev server', lock.pid, { rename: true });
       if (lock?.port) manifest.port('preview', lock.port);
       return lock;
     } catch {

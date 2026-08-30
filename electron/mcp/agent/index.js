@@ -42,7 +42,14 @@ const NAVIGATING_TIMEOUT_MS = 20000;
 // project that is tens of seconds. Under the ordinary command deadline it came
 // back `not_ready` while the server was still coming up perfectly well — and
 // then really did come up, unowned, with the caller told it had failed.
+//
+// Stopping one is the same shape for the same reason: asking Astro's CLI,
+// signalling the daemon it wrote down, escalating if it will not go, and then
+// waiting for the port to actually be released. Answering before that is over
+// is what made "stopped" untrue in the first place, so the deadline has to
+// allow the work rather than cut it short and call it a timeout.
 const DEV_START_TIMEOUT_MS = 180000;
+const DEV_STOP_TIMEOUT_MS = 90000;
 
 const no = (code, message, extra = {}) => ({ ok: false, code, message, ...extra });
 
@@ -1041,7 +1048,7 @@ function createAgentApi({
             expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
             expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
           },
-          action === 'dev_start' ? DEV_START_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
+          action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
         );
         return answer;
       }
@@ -1064,4 +1071,4 @@ function createAgentApi({
   };
 }
 
-module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS };
+module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };

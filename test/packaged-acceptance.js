@@ -276,8 +276,26 @@ const brief = (v, n = 220) => {
     }
     check('  and the stylesheet is what it was', !/outline:\s*6px solid/.test(String(css2?.text || '')), brief(css2?.text, 200));
   } finally {
-    const { problems, pid, port } = await app.stop();
-    check('the packaged app, its project and its port are all gone', problems.length === 0, `pid ${pid}, port ${port}: ${problems.join('; ')}`);
+    // QUIT WITH THE PREVIEW STILL RUNNING.
+    //
+    // Nothing above calls dev_stop: the Astro daemon is deliberately still
+    // serving when the app is asked to go. That is the case that matters,
+    // because the daemon is a detached background process — it is not the
+    // app's child and does not die with it — and because `before-quit` cannot
+    // await anything. So what is asserted here is the invariant rather than the
+    // mechanism: after the app is gone, so is everything it started.
+    const { problems, pid, port, manifest } = await app.stop();
+    const owned = manifest || { processes: [], ports: [], paths: [] };
+    check(
+      'the run recorded a preview it never stopped by hand',
+      owned.processes.some((p) => p.what === 'astro dev server') && owned.ports.some((p) => p.what === 'preview'),
+      brief({ processes: owned.processes.map((p) => p.what), ports: owned.ports.map((p) => p.what) })
+    );
+    check(
+      'and quitting the app took everything it started with it',
+      problems.length === 0,
+      `pid ${pid}, mcp port ${port}: ${problems.join('; ')}`
+    );
   }
 
   if (failures.length) {
