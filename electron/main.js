@@ -33,12 +33,33 @@ const { spawn, spawnSync, execFile, execFileSync } = require('child_process');
 // EPIPE on these two streams is a fact about the reader, not about Stacki, and
 // is dropped. Anything else is re-thrown, because a genuine stream failure
 // should still be loud.
+const NOBODY_READING = new Set(['EPIPE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END']);
+const isBrokenPipe = (err) => !!err && (NOBODY_READING.has(err.code) || /\bEPIPE\b/.test(String(err.message || '')));
+
 for (const stream of [process.stdout, process.stderr]) {
   stream?.on?.('error', (err) => {
-    if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
+    if (isBrokenPipe(err)) return;
     throw err;
   });
 }
+
+// The same fact, caught where it actually surfaces.
+//
+// A failed write to a closed pipe does not always arrive as an `error` event:
+// console.warn can raise it straight up the call stack, out of whatever was
+// logging — including Electron's own IPC error path. There is no listener there,
+// so it becomes an uncaught exception, and Electron answers an uncaught
+// exception in the main process with a modal dialog. Closing the terminal that
+// launched Stacki could therefore put "A JavaScript error occurred in the main
+// process" on screen, over a log line nobody was there to read.
+//
+// Only that one fact is swallowed. Anything else takes its listener off and is
+// re-thrown, so a real fault crashes exactly as loudly as it did before.
+process.on('uncaughtException', function stackiUncaught(err) {
+  if (isBrokenPipe(err)) return;
+  process.off('uncaughtException', stackiUncaught);
+  throw err;
+});
 
 const {
   parsePage,

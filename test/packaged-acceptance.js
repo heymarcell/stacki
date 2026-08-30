@@ -46,6 +46,24 @@ const brief = (v, n = 220) => {
 
   const app = await startPackagedApp({ access: 'edit' });
   try {
+    // ── the protocol, from the bundle, before anything else ──────────────
+    //
+    // packaged-mcp.js proves these against an app with nothing open. They are
+    // here too so that ONE file walks the whole line an agent walks: discover,
+    // the catalogue, what it may do, and then the project.
+    const discover = await app.client.request({ method: 'server/discover', params: {} });
+    check('server/discover answers from the packaged app', (discover?.supportedVersions || []).includes('2026-07-28'), brief(discover?.supportedVersions));
+
+    const listed = await app.client.listTools();
+    const toolNames = (listed.tools || []).map((t) => t.name);
+    check('tools/list carries the whole surface', toolNames.length === 13, `${toolNames.length}: ${toolNames.join(',')}`);
+    check('  including the review tools', toolNames.includes('get_comments') && toolNames.includes('comment'), brief(toolNames));
+    check('  and every operation domain', ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((d) => toolNames.includes(d)), brief(toolNames));
+
+    const caps = await app.call('get_capabilities', {});
+    check('get_capabilities answers from the bundle', caps?.ok === true, brief(caps, 160));
+    check('  and reports the access this run was granted', JSON.stringify(caps).includes('edit'), brief(caps, 200));
+
     // ── the project opens, through the one automation door ────────────────
     const info = await app.untilOpen();
     check('the packaged app opened the project it was pointed at', info?.ok === true && info?.project?.open === true, brief(info));
@@ -108,6 +126,23 @@ const brief = (v, n = 220) => {
     check('  and names the address it bound', typeof dev?.url === 'string' && dev.url.startsWith('http'), String(dev?.url));
     const served = await fetch(dev.url, { signal: AbortSignal.timeout(8000) }).then((r) => r.status).catch(() => 0);
     check('  which really answers HTTP', served >= 200 && served < 500, String(served));
+
+    // ── NOBODY READING IS NOT A CRASH ─────────────────────────────────────
+    //
+    // This harness holds the app's stdout and stderr. A terminal that closes,
+    // or a harness that stops reading, breaks those pipes — and a write to a
+    // broken pipe surfaced as an uncaught exception in the main process, which
+    // Electron answers with a modal dialog. It really did put one on somebody's
+    // screen during this work.
+    //
+    // So the pipes are destroyed here, deliberately, and everything after this
+    // line is the proof: if the app had died with them, every call below would
+    // fail and the exit code at the end would not be zero.
+    app.child.stdout?.destroy();
+    app.child.stderr?.destroy();
+    await new Promise((r) => setTimeout(r, 500));
+    const afterPipes = await app.run('project', 'info');
+    check('the app survives having nobody read its output', afterPipes?.ok === true, brief(afterPipes, 160));
 
     // ── a capture, by the hash of its own bytes ───────────────────────────
     const shot = async () => {
@@ -285,6 +320,7 @@ const brief = (v, n = 220) => {
     // await anything. So what is asserted here is the invariant rather than the
     // mechanism: after the app is gone, so is everything it started.
     const { problems, pid, port, manifest } = await app.stop();
+    check('  and it exited cleanly rather than crashing', app.child.exitCode === 0 || app.child.exitCode === null, `exit ${app.child.exitCode}`);
     const owned = manifest || { processes: [], ports: [], paths: [] };
     check(
       'the run recorded a preview it never stopped by hand',

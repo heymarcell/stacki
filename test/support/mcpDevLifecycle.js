@@ -196,19 +196,43 @@ async function devStatus(ctx) {
   });
 }
 
+/**
+ * A SERVER OF ITS OWN, like probe and dev_status.
+ *
+ * This read `fixture.scratch.devPort`, which only devStart ever writes — and
+ * the runner hands every scenario a fresh rig with `scratch: {}`. So `port` was
+ * always undefined and both port assertions short-circuited to the literal
+ * `true`, leaving `!!envelope` as the only surviving check: a dev_stop that
+ * returned `{ ok: true }` and left Astro running with the port still bound
+ * passed. The one operation whose whole job is a port going quiet never asked
+ * about a port.
+ *
+ * It cannot use `withServer` — that stops the server in its own `finally`, and
+ * a FULL scenario gets exactly one call to the operation it is registered for.
+ * So the server is raised here and dev_stop is the only stop; if it fails, the
+ * rig's teardown still asks main's own `dev:stop` directly, so nothing leaks.
+ */
 async function devStop({ call, fixture }) {
-  const port = fixture.scratch.devPort;
+  const started = await call('project', 'dev_start', {});
+  const url = started.envelope?.url || null;
+  const port = url ? Number(new URL(url).port) : null;
+  const listening = port ? await portBusy(port) : false;
+
   const { envelope } = await call('project', 'dev_stop', {});
-  const freed = port
-    ? await until('the port to be released', async () => !(await portBusy(port)), 30000, 300)
-    : true;
-  fixture.observedWorld('checked the port this test bound is no longer accepting connections');
+
+  const freed = port ? await until('the port to be released', async () => !(await portBusy(port)), 30000, 300) : null;
+  const stillAnswering = port ? await portBusy(port) : true;
+  const after = await call('project', 'dev_status', {});
+  fixture.observedWorld('connected to the port the preview bound, before the stop and after it');
   return {
     envelope,
     checks: [
-      ['stopping answers', !!envelope],
-      ['the port this test bound is free again', port ? freed !== null : true],
-      ['and nothing answers there any more', port ? !(await portBusy(port)) : true],
+      ['a server really was listening before the stop', listening === true],
+      ['stopping reports the preview off, with no address', envelope?.status === 'off' && envelope?.url === null],
+      ['the port that server bound is free again', freed !== null],
+      ['and nothing answers there any more', stillAnswering === false],
+      ['the app agrees no preview is running', after.envelope?.status === 'off'],
+      ['with no address left to give for one', after.envelope?.url === null],
     ],
   };
 }

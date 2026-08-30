@@ -242,13 +242,24 @@ const summarizeScan = (raw, ctx, limit = MAX_LIST) => ({
     name: p.name,
     route: p.route,
     path: relativeTo(ctx.root, p.path),
-    dynamic: !!p.dynamic,
+    // WORKED OUT FROM THE ROUTE, because project:scan has never sent a flag.
+    // This read `p.dynamic`, so src/pages/notes/[slug].astro — the one page in
+    // the fixture that stands for many URLs — was reported `dynamic: false`,
+    // along with every other page in every answer. The app decides the same
+    // question the same way (App.jsx: `route?.includes('[')`), which is what
+    // makes it the route's own property rather than a field somebody forgot.
+    dynamic: typeof p.dynamic === 'boolean' ? p.dynamic : String(p.route ?? '').includes('['),
   })),
   components: take(raw?.components, limit).map((c) => ({
     name: c.name,
     path: relativeTo(ctx.root, c.path),
     slots: c.slots || null,
-    props: take(c.props, 40).map((prop) => (typeof prop === 'string' ? prop : prop?.name)).filter(Boolean),
+    // `schema` is what project:scan calls it — electron/main.js safeSchema()
+    // spreads parsePropSchema's array in under that name. This read `c.props`,
+    // a key the handler has never sent, so every component in this API
+    // answered `props: []`: an agent asking what <Hero> takes was told
+    // nothing, from a scan that knew `heading`.
+    props: take(c.props || c.schema, 40).map((prop) => (typeof prop === 'string' ? prop : prop?.name)).filter(Boolean),
   })),
   layouts: take(raw?.layouts, limit).map((l) => ({ name: l.name, path: relativeTo(ctx.root, l.path) })),
   counts: {
@@ -508,8 +519,27 @@ const content = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
+    // BACK OUT OF THE CMS CONVENTION, like everything else here. cmsRefs.js
+    // names an importer relative to src/ ('pages/index.astro'), and this
+    // passed that straight through — so cms_list answered
+    // 'src/data/site.json' and cms_usage answered 'pages/index.astro', and the
+    // second is not a path any other operation in this API accepts. An agent
+    // asking which pages read a data file got an answer it could not open.
+    result: (raw) => ({ files: take(raw?.files || [], MAX_LIST).map((r) => cmsPublic(r)) }),
   },
-  cms_meta: { channel: 'cms:meta', args: (_i, ctx) => ctx.root },
+  cms_meta: {
+    channel: 'cms:meta',
+    args: (_i, ctx) => ctx.root,
+    // The same translation, on the keys. .stacki/cms.json is keyed by the
+    // src-relative rel the CMS panel looks fields up by, and that convention
+    // stays on disk — but a caller that reads a key here has to be able to
+    // hand it back to cms_set_meta or cms_read, and 'data/site.json' is
+    // refused by both ('not under src/'). A '#export' fragment survives the
+    // round trip: cmsRel splits it off before resolving.
+    result: (raw) => ({
+      meta: Object.fromEntries(Object.entries(raw?.meta || {}).map(([k, v]) => [cmsPublic(k), v])),
+    }),
+  },
   cms_set_meta: {
     channel: 'cms:setMeta',
     args: (input, ctx) => {
