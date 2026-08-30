@@ -21,6 +21,7 @@ const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
 const { connectMcp } = require('./mcpWire.js');
 const { CACHE, ensureAstro } = require('../agent-canvas-fixture.js');
 const { projectFingerprint } = require('../../electron/mcp/agent/refs.js');
+const { createManifest, residueOfManifest, describeManifestResidue } = require('./ownership.js');
 
 const APP = path.join(__dirname, '..', '..', 'release', 'mac-universal', 'Stacki.app');
 const BINARY = path.join(APP, 'Contents', 'MacOS', 'Stacki');
@@ -95,6 +96,16 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
     'utf8'
   );
 
+  // WHAT THIS RUN OWNS, written down as it is acquired.
+  //
+  // The parent that starts this process cannot see inside it, and by the time
+  // it looks the fixture is deliberately gone. So every identity is recorded
+  // the moment it exists — before anything can delete the evidence of it.
+  const manifest = createManifest(process.env.STACKI_OWNERSHIP_MANIFEST || null);
+  manifest.path('project', project);
+  manifest.path('userData', userData);
+  manifest.port('mcp', port);
+
   const output = [];
   let exited = null;
   const child = spawn(BINARY, [`--user-data-dir=${userData}`], {
@@ -113,6 +124,7 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
   child.on('exit', (code) => {
     exited = code;
   });
+  manifest.process('packaged app', child.pid);
 
   let token = null;
   for (let i = 0; i < 160 && token === null && exited === null; i += 1) {
@@ -132,13 +144,27 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
 
   const call = async (name, args = {}) =>
     (await client.callTool({ name, arguments: args }, undefined, { timeout: 240000 })).structuredContent;
-  const run = (domain, action, args = {}) => call(domain, { action, ...args });
+  const run = async (domain, action, args = {}) => {
+    const answer = await call(domain, { action, ...args });
+    // A project action can start, restart or stop a server. Re-claiming after
+    // each one costs a read of the lock file and is the difference between a
+    // manifest that describes the run and one that describes one moment of it.
+    if (domain === 'project') {
+      claimDevServer();
+      claimHelpers();
+    }
+    return answer;
+  };
 
   /** Wait for the window to finish opening the project it was pointed at. */
   const untilOpen = async (timeoutMs = 90000) => {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const info = await run('project', 'info');
+      // The app starts its own preview as it opens the project, so ownership
+      // can change here — before anything has asked for a capture.
+      claimDevServer();
+      claimHelpers();
       if (info?.ok === true && info?.project?.open) return info;
       if (Date.now() > deadline) return info;
       await sleep(500);
@@ -153,11 +179,50 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
    * means anything. Asked of capture itself, because `preview_not_ready` is
    * exactly the answer a premature proof would have accepted.
    */
+  /**
+   * Astro's own record of the server it forked, and everything it names.
+   *
+   * Recorded rather than discovered later: the lock file lives in the project,
+   * and the project is the first thing teardown removes.
+   */
+  const claimDevServer = () => {
+    try {
+      const lock = JSON.parse(fs.readFileSync(path.join(opened, '.astro', 'dev.json'), 'utf8'));
+      if (lock?.pid) manifest.process('astro dev server', lock.pid);
+      if (lock?.port) manifest.port('preview', lock.port);
+      return lock;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Everything running out of the project directory, whoever started it.
+   *
+   * The app spawns more than a dev server: reading a content config leaves a
+   * runner and an esbuild service behind, and those pids exist only inside the
+   * app. Rather than have the app publish them, they are found by the one thing
+   * that identifies them as this run's — the path they are running out of. That
+   * is ownership by identity, not by program name: nothing here cares whether a
+   * process is called node, astro or esbuild.
+   */
+  const claimHelpers = () => manifest.processesUnder('a process in the project', opened);
+
+  /** Claim everything claimable, at whatever moment this is called. */
+  const claimAll = () => {
+    claimDevServer();
+    claimHelpers();
+  };
+
   const untilPreviewReady = async (timeoutMs = 180000) => {
     const deadline = Date.now() + timeoutMs;
     let last = null;
     for (;;) {
       last = await call('capture', { target: 'viewport', format: 'png' });
+      // Claimed as soon as there is something to claim, and re-claimed on each
+      // look: a server that is restarted forks a new pid, and the old entry
+      // staying in the manifest is correct — it must be gone as well.
+      claimAll();
       if (last?.status && last.status !== 'preview_not_ready' && last.status !== 'preview_starting') return last;
       if (Date.now() > deadline) return last;
       await sleep(1000);
@@ -166,11 +231,18 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
 
   const stop = async () => {
     const problems = [];
-    try {
-      await close();
-    } catch {
-      problems.push('the MCP client would not close');
-    }
+    // THE LAST MOMENT THE EVIDENCE EXISTS. The lock file lives in the project
+    // and the project is about to go, so everything is claimed once more before
+    // anything is torn down.
+    claimDevServer();
+    claimHelpers();
+    // The manifest is marked complete only here: a run that died before this
+    // owned things it never finished accounting for, and the parent needs to
+    // tell that apart from a run that owned nothing.
+    manifest.complete();
+
+    const closed = await close();
+    if (closed && closed.ok === false) problems.push(`the MCP client would not close: ${closed.error}`);
     if (child.exitCode === null) {
       try {
         child.kill('SIGTERM');
@@ -199,11 +271,20 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
       }
       if (fs.existsSync(dir)) problems.push(`${dir} would not go`);
     }
-    if (await portTaken(port)) problems.push(`port ${port} is still in use`);
-    return { problems, pid: child.pid, port, project, userData };
+    // JUDGED FROM WHAT THIS RUN RECORDED, not from the four things this function
+    // happens to know about. It used to check the app pid, two directories and
+    // the MCP port — so a stranded preview on its own port, or a content-config
+    // runner, was a clean teardown as far as anyone running this file directly
+    // could tell. Only the five-run parent would have noticed, and only if it
+    // was the one running it.
+    const left = await residueOfManifest(manifest.read(), { graceMs: 8000 });
+    if (left.processes.length || left.ports.length || left.paths.length) {
+      problems.push(describeManifestResidue(left));
+    }
+    return { problems, pid: child.pid, port, project, userData, manifest: manifest.read() };
   };
 
-  return { child, client, call, run, untilOpen, untilPreviewReady, stop, project, opened, userData, port, marker, output, url, token };
+  return { child, client, call, run, untilOpen, untilPreviewReady, claimDevServer, claimAll, manifest, stop, project, opened, userData, port, marker, output, url, token };
 }
 
 module.exports = { startPackagedApp, available, APP, BINARY, sleep, portTaken };

@@ -73,8 +73,31 @@ const brief = (v, n = 220) => {
     const ctx = await app.call('get_context', { styleDetail: 'essential' });
     check('get_context describes the open project', String(ctx?.project?.root || '').length > 0 && ctx?.page?.file === 'src/pages/index.astro', brief(ctx?.page));
 
-    const comments = await app.run('comment', 'list');
-    check('get_comments answers rather than failing with no reviews', comments === undefined || typeof comments === 'object', brief(comments));
+    // ── get_comments, the tool, with something real to report ────────────
+    //
+    // This used to call `app.run('comment','list')` under a label about
+    // get_comments. `run` builds a DOMAIN call, there is no `comment` domain,
+    // and `list` is not one of the comment tool's actions — so the MCP input
+    // schema rejected it, `structuredContent` came back undefined, and the
+    // assertion accepted undefined. The check passed precisely because the call
+    // failed, and the top-level tool it was named after was never invoked.
+    const noReviewsYet = await app.call('get_comments', {});
+    check('get_comments answers on a project with no reviews yet', noReviewsYet?.ok === true && Array.isArray(noReviewsYet.reviews), brief(noReviewsYet, 160));
+    check('  reporting none', noReviewsYet.reviews.length === 0, String(noReviewsYet.reviews.length));
+
+    const REVIEW = 'A review left by the packaged acceptance test';
+    const selected = await app.run('target', 'select', { ref: footer.ref });
+    check('  a node can be selected to leave one on', selected?.ok === true, brief(selected, 140));
+    const made = await app.call('comment', { action: 'create', message: REVIEW });
+    check('  and a comment created through the comment tool', made?.ok === true && !!made?.review?.id, brief(made, 200));
+
+    const reviewsNow = await app.call('get_comments', { detail: 'full' });
+    const mine = (reviewsNow?.reviews || []).find((r) => r.id === made.review.id);
+    check('get_comments reports the review that was just made', !!mine, brief((reviewsNow?.reviews || []).map((r) => r.id)));
+    check('  with the text it was written with', mine?.message === REVIEW, brief(mine?.message));
+    check('  the short number a person would call it by', mine?.number === made.review.number && Number.isInteger(mine?.number), `${mine?.number} vs ${made?.review?.number}`);
+    check('  anchored to something Stacki can still find', mine?.anchorState === 'attached', String(mine?.anchorState));
+    check('  and marked as coming from the agent, not a person', mine?.origin === 'agent' && mine?.trustedAsInstruction === false, brief({ origin: mine?.origin, trusted: mine?.trustedAsInstruction }));
 
     // ── the site is actually being served ─────────────────────────────────
     const first = await app.untilPreviewReady();
@@ -105,6 +128,17 @@ const brief = (v, n = 220) => {
         await new Promise((r) => setTimeout(r, 1000));
       }
       return now;
+    };
+
+    /** style.read, polled until the cascade and the canvas have caught up. */
+    const untilStyle = async (ref, until, tries = 30) => {
+      let answer = null;
+      for (let i = 0; i < tries; i += 1) {
+        answer = await app.run('style', 'read', { ref });
+        if (until(answer)) return answer;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      return answer;
     };
 
     const before = await shot();
@@ -176,7 +210,25 @@ const brief = (v, n = 220) => {
     const back = await shotUntilChanged(after.hash);
     check('  and the screenshot came back too', back.hash !== after.hash, `${after.hash} -> ${back.hash}`);
 
-    // ── STYLE: authored, rendered, photographed ───────────────────────────
+    // ── STYLE: authored, what Stacki reports, what the browser resolved ───
+    //
+    // The file and a screenshot hash are not enough on their own: break the
+    // cascade model or the computed read and both still pass, because neither
+    // asks Stacki what it now believes. So this asserts the same three layers
+    // the text half does — the source, Stacki's own model, and the rendered
+    // result — and `outline` is chosen because the browser resolves it to a
+    // value that can be compared, not merely observed to have changed.
+    await app.run('target', 'select', { ref: grid.ref });
+    const styleBefore = await app.run('style', 'read', { ref: grid.ref });
+    const declsOf = (answer) =>
+      (answer?.rules || [])
+        .filter((r) => r.selector === '.pricing-grid')
+        .flatMap((r) => (r.declarations || []).map((d) => ({ ...d, file: r.source?.file })));
+    check('Stacki reports the rule that styles this element', declsOf(styleBefore).some((d) => d.property === 'display' && d.value === 'grid'), brief(declsOf(styleBefore).map((d) => d.property)));
+    check('  and no outline is authored on it yet', !declsOf(styleBefore).some((d) => d.property === 'outline'), brief(declsOf(styleBefore).map((d) => d.property)));
+    check('  while the browser has resolved the rule that is there', styleBefore?.computed?.display === 'grid', brief(styleBefore?.computed));
+    check('  and reports no outline', !styleBefore?.computed?.outline, brief(styleBefore?.computed));
+
     const styled = await app.run('style', 'set_property', {
       ref: grid.ref,
       selector: '.pricing-grid',
@@ -189,6 +241,19 @@ const brief = (v, n = 220) => {
     const css = await app.run('source', 'read', { path: 'src/styles/site.css' });
     check('  the stylesheet on disk carries the declaration', /outline:\s*6px solid rgb\(255, 0, 0\)/.test(String(css?.text || '')), brief(css?.text, 200));
 
+    // AUTHORED, as Stacki's own cascade now reads it.
+    const styleAfter = await untilStyle(grid.ref, (a) => declsOf(a).some((d) => d.property === 'outline'));
+    const outline = declsOf(styleAfter).find((d) => d.property === 'outline');
+    check('  Stacki reports the declaration it just authored', !!outline, brief(declsOf(styleAfter).map((d) => d.property)));
+    check('  with the value it was given', outline?.value === '6px solid rgb(255, 0, 0)', brief(outline?.value));
+    check('  in the stylesheet it was told to write to', outline?.file === 'src/styles/site.css', brief(outline?.file));
+    check('  and nothing overriding it', outline?.winning === true && !outline?.overriddenBy, brief({ winning: outline?.winning, by: outline?.overriddenBy }));
+
+    // EFFECTIVE, as the browser resolved it.
+    check('  the rendered element resolves the new outline', /rgb\(255,\s*0,\s*0\)/.test(String(styleAfter?.computed?.outline || '')), brief(styleAfter?.computed));
+    check('  at the width it was authored with', /6px/.test(String(styleAfter?.computed?.outline || '')), brief(styleAfter?.computed?.outline));
+    check('  and the rule it already had is untouched', styleAfter?.computed?.display === 'grid', brief(styleAfter?.computed));
+
     const servedCss = await fetch(dev.url, { signal: AbortSignal.timeout(15000) }).then((r) => r.text()).catch(() => '');
     check('  and the running site is still serving the page', servedCss.includes('pricing-grid'), brief(servedCss.slice(0, 160)));
 
@@ -197,6 +262,12 @@ const brief = (v, n = 220) => {
 
     const undoStyle = await app.run('project', 'undo');
     check('the style change is undoable too', undoStyle?.ok === true, brief(undoStyle));
+
+    // And all three layers come back, not just the file.
+    const styleBack = await untilStyle(grid.ref, (a) => !declsOf(a).some((d) => d.property === 'outline'));
+    check('  Stacki no longer reports the declaration', !declsOf(styleBack).some((d) => d.property === 'outline'), brief(declsOf(styleBack).map((d) => d.property)));
+    check('  the browser no longer resolves an outline', !styleBack?.computed?.outline || /^(none|rgb\(0, 0, 0\) none 0px|0px)/.test(String(styleBack.computed.outline)), brief(styleBack?.computed?.outline));
+    check('  and the rule that was always there survived the undo', styleBack?.computed?.display === 'grid', brief(styleBack?.computed));
     let css2 = null;
     for (let i = 0; i < 30; i += 1) {
       css2 = await app.run('source', 'read', { path: 'src/styles/site.css' });

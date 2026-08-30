@@ -4575,12 +4575,18 @@ export default function App() {
       return { status: devStatusRef.current, url: devUrlRef.current };
     },
     stopPreview: async () => {
-      await window.avb.stopDevServer();
+      const said = await window.avb.stopDevServer();
+      // A refused stop leaves the preview exactly where it was. Saying `off`
+      // here would put the lie in the app's own state as well as in the answer,
+      // and the status dot would then agree with it.
+      if (said && said.ok === false) {
+        return { ok: false, message: said.message || 'The dev server did not stop.', status: devStatusRef.current, url: devUrlRef.current };
+      }
       setDevStatus('off');
       setDevUrl(null);
       devStatusRef.current = 'off';
       devUrlRef.current = null;
-      return { status: 'off', url: null };
+      return { ok: true, status: 'off', url: null };
     },
     historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
     undo,

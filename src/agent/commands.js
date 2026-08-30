@@ -378,8 +378,10 @@ export function createAgentCommands(getApp) {
       }
     }
     if (action === 'dev_stop') {
-      // What stopping just made true, not what React has re-rendered since.
+      // What stopping just made true, not what React has re-rendered since —
+      // and if it did not stop, that is what this says.
       const stopped = await a.stopPreview();
+      if (stopped?.ok === false) return fail('failed', stopped.message || 'The dev server did not stop.', { status: stopped.status, url: stopped.url });
       return { ok: true, ...stopped };
     }
     // Not an action any tool can name — there is nothing for it in the registry

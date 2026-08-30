@@ -199,12 +199,16 @@ const source = {
       if (from.error) return from;
       return { projectPath: ctx.root, fromFile: from.abs, spec: input.spec, name: input.name };
     },
-    result: (raw, _input, ctx) => ({
-      file: raw?.path ? relativeTo(ctx.root, raw.path) : null,
-      name: raw?.name ?? null,
+    // src:readSymbol answers { ok, rel, text, line }. This read `raw.path`,
+    // `raw.name`, `raw.startLine` and `raw.endLine` — none of which it sends —
+    // so four of the five fields were null on every successful call and only
+    // the text came through. `name` is the caller's own, and the handler
+    // reports one line (where the declaration starts), not a range.
+    result: (raw, input) => ({
+      file: raw?.rel ? toPosix(raw.rel) : null,
+      name: input?.name ?? null,
       text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
-      startLine: raw?.startLine ?? null,
-      endLine: raw?.endLine ?? null,
+      line: Number.isInteger(raw?.line) ? raw.line : null,
     }),
   },
 
@@ -215,9 +219,18 @@ const source = {
       if (from.error) return from;
       return { projectPath: ctx.root, fromFile: from.abs, spec: input.spec };
     },
-    result: (raw, _input, ctx) => ({
-      path: raw?.path ? relativeTo(ctx.root, raw.path) : null,
-      outsideProject: !!(raw?.path && !relativeTo(ctx.root, raw.path)),
+    // `rel`, because that is the field the handler sends. It read `raw.path`,
+    // which src:resolvePath has never answered with, so this operation returned
+    // `{ path: null, outsideProject: false }` for every input it has ever been
+    // given — a resolver that resolves nothing. The scenario asked only whether
+    // a `path` key existed and whether `outsideProject` was false, and both were
+    // true of the null.
+    result: (raw) => ({
+      path: raw?.rel ? toPosix(raw.rel) : null,
+      // The handler refuses to leave the project at all (assertInProject
+      // throws), so anything it resolves is inside it. Said from the answer
+      // rather than asserted: a rel that climbs out would be reported.
+      outsideProject: typeof raw?.rel === 'string' && raw.rel.startsWith('..'),
     }),
   },
 };
@@ -352,7 +365,12 @@ const page = {
       if (at.error) return at;
       return { projectPath: ctx.root, pagePath: at.abs, devUrl: ctx.devUrl || null };
     },
-    result: (raw) => ({ paths: take(raw?.paths || raw, MAX_LIST), problem: raw?.problem || null }),
+    // page:dynamicPaths answers { entries, error }. This read `raw.paths` and
+    // `raw.problem`, so a successful enumeration of two routes arrived as
+    // `{ paths: [], problem: null }` — indistinguishable from a page with no
+    // dynamic routes, and from a dev server that had answered 500. The scenario
+    // accepted "no paths, or a problem", which this satisfied both ways.
+    result: (raw) => ({ paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null }),
   },
 
   injected_routes: {
@@ -624,7 +642,15 @@ const asset = {
       if (typeof input.text !== 'string') return problem('bad_request', 'text is required.');
       return { projectPath: ctx.root, rel: at.rel, text: input.text };
     },
-    result: (_raw, input) => ({ path: input.path, afterDigest: digestOf(input.text) }),
+    // The digest of what is ON DISK, not of what the caller asked for. This
+    // hashed `input.text`, so a write that did not land still reported the
+    // digest of the text it was supposed to contain — and a client using that
+    // for optimistic concurrency would then hold a digest no file has. The
+    // cms_write beside it has always read the file.
+    result: (_raw, input, ctx) => ({
+      path: input.path,
+      afterDigest: digestOfFile(path.resolve(ctx.root, input.path)),
+    }),
   },
   mkdir: {
     channel: 'assets:mkdir',
@@ -865,7 +891,16 @@ const git = {
   },
   restore_project: { channel: 'git:restoreProject', args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }) },
   park: { channel: 'git:park', args: (_i, ctx) => ({ projectPath: ctx.root }) },
-  unpark: { channel: 'git:unpark', args: (_i, ctx) => ({ projectPath: ctx.root }) },
+  unpark: {
+    channel: 'git:unpark',
+    args: (_i, ctx) => ({ projectPath: ctx.root }),
+    // `{ restored: false, error }` is a refusal, and it used to arrive as
+    // ok:true with an error string nobody was obliged to read.
+    result: (raw) =>
+      raw && raw.restored === false && raw.error
+        ? problem('failed', String(raw.error))
+        : { restored: raw?.restored !== false, ...(raw?.error ? { note: String(raw.error) } : {}) },
+  },
   push: { channel: 'git:push', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
   publish: {
     channel: 'git:publish',

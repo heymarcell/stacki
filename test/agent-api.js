@@ -309,6 +309,92 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
       .join(', ')
   );
 
+  // EVERY OPERATION'S RISK, WRITTEN DOWN HERE.
+  //
+  // The permission matrix drives all 111 operations at all four levels and
+  // checks each answer against the policy — but it asks the REGISTRY what an
+  // operation needs, and the gate reads that same field. So it proves the gate
+  // is consistent with the registry, never that the registry is right:
+  // reclassify asset.write_text from write to read and the matrix computes
+  // "needs inspect", the gate agrees, and 444 answers stay green while a write
+  // has quietly become reachable at a level that may only look.
+  //
+  // This is the expectation the gate cannot supply. It is a literal table, and
+  // it is checked both ways — every operation must be listed with the risk it
+  // has, and every listed operation must exist — so adding one without
+  // classifying it fails here, and changing one's class is a deliberate edit to
+  // this file rather than a side effect somewhere else.
+  //
+  // The three tables below it are kept: they say WHY particular ones are where
+  // they are, which a flat list cannot.
+const PINNED_RISK = {
+  read: [
+    'target.read', 'target.select', 'target.enter', 'target.exit', 'style.read',
+    'style.list_sources', 'style.read_source', 'style.variables', 'source.read',
+    'source.read_symbol', 'source.resolve_path', 'page.list', 'page.read',
+    'page.component_usage', 'page.dynamic_paths', 'page.injected_routes', 'page.import_path',
+    'page.rebase_import', 'content.cms_list', 'content.cms_read', 'content.cms_usage',
+    'content.cms_meta', 'content.config', 'content.collections', 'content.entries',
+    'content.validate', 'content.targets', 'content.rename_plan', 'content.sample_entry',
+    'content.resolve_import', 'asset.list', 'asset.dimensions', 'asset.read_text',
+    'project.info', 'project.scan', 'project.classes', 'project.dependencies',
+    'project.diagnose', 'project.probe', 'project.dev_status', 'git.info', 'git.status',
+    'git.log', 'git.commit_files', 'git.all_files', 'git.file_at', 'git.worktrees',
+    'git.gh_status',
+  ],
+  write: [
+    'target.edit', 'target.set_text', 'target.set_prop', 'target.remove_prop',
+    'target.set_classes', 'target.add_class', 'target.remove_class', 'target.insert_before',
+    'target.insert_after', 'target.append_child', 'target.remove', 'target.duplicate',
+    'target.move', 'target.set_tag', 'style.set_property', 'style.remove_property',
+    'style.set_declarations', 'style.write_source', 'style.set_variable', 'style.add_variables',
+    'style.rename_variables', 'style.move_variables', 'style.add_section',
+    'style.set_section_title', 'style.remove_section', 'style.move_heading',
+    'source.replace_range', 'source.write', 'page.create', 'page.move', 'page.folder_create',
+    'page.folder_rename', 'page.component_create', 'content.cms_write', 'content.cms_create',
+    'content.cms_set_meta', 'content.write_entry', 'content.rename', 'asset.write_text',
+    'asset.mkdir', 'asset.move', 'asset.rename', 'project.dev_start', 'project.dev_stop',
+    'project.undo', 'project.redo',
+  ],
+  high: [
+    'page.delete', 'page.folder_delete', 'content.cms_delete', 'asset.delete',
+    'project.install', 'git.init', 'git.commit', 'git.checkout', 'git.merge',
+    'git.resolve_merge', 'git.delete_branch', 'git.restore_file', 'git.restore_project',
+    'git.park', 'git.unpark', 'git.push', 'git.publish',
+  ],
+};
+
+  {
+    const actual = new Map(all.map((op) => [`${op.domain}.${op.action}`, op.risk]));
+    const pinned = new Map();
+    for (const [risk, names] of Object.entries(PINNED_RISK)) for (const name of names) pinned.set(name, risk);
+
+    const wrong = [...actual].filter(([name, risk]) => pinned.get(name) !== risk).map(([name, risk]) => `${name} is ${risk}, pinned ${pinned.get(name) || 'nowhere'}`);
+    const gone = [...pinned.keys()].filter((name) => !actual.has(name));
+
+    check('every operation carries the risk this file pins it at', wrong.length === 0, wrong.slice(0, 10).join('; '));
+    check('and every operation is classified here', pinned.size === actual.size, `${pinned.size} pinned, ${actual.size} registered`);
+    check('with nothing pinned that no longer exists', gone.length === 0, gone.join(', '));
+  }
+
+  // A SECOND OPINION, derived rather than typed: an operation whose mapper
+  // guards a write cannot be a read, whatever anybody typed above.
+  {
+    const domains = fs.readFileSync(path.join(__dirname, '..', 'electron', 'mcp', 'agent', 'domains.js'), 'utf8');
+    const guarded = [];
+    for (const op of all.filter((o) => o.risk === 'read')) {
+      const at = domains.indexOf(`  ${op.action}: {`);
+      if (at < 0) continue;
+      // The entry's OWN block: cut at its closing brace, or the read next door
+      // inherits the guard belonging to the write below it.
+      const rest = domains.slice(at);
+      const ends = rest.indexOf('\n  },');
+      const block = ends > 0 ? rest.slice(0, ends) : rest.slice(0, 900);
+      if (/guardWrite\(/.test(block)) guarded.push(`${op.domain}.${op.action}`);
+    }
+    check('no operation classified read guards a write in its mapper', guarded.length === 0, guarded.join(', '));
+  }
+
   // The classification that matters most: nothing that deletes, rewrites a
   // working tree or talks to a network may be reachable at the ordinary
   // editing level.

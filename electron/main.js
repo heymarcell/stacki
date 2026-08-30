@@ -19,6 +19,27 @@ const net = require('net');
 const crypto = require('crypto');
 const { spawn, spawnSync, execFile, execFileSync } = require('child_process');
 
+// NOBODY READING IS NOT A CRASH.
+//
+// Launched from a terminal, Stacki's stdout and stderr are that terminal's
+// pipes; launched by a test harness, they are the harness's. Either can close
+// first — the window closes, the harness exits, a `| head` stops reading — and
+// the next thing the main process logs then fails with EPIPE. An unhandled
+// error on those streams is an uncaught exception, and Electron answers an
+// uncaught exception in the main process with a modal dialog. So closing a
+// terminal could put "A JavaScript error occurred in the main process" on
+// somebody's screen, over a log line nobody was there to read.
+//
+// EPIPE on these two streams is a fact about the reader, not about Stacki, and
+// is dropped. Anything else is re-thrown, because a genuine stream failure
+// should still be loud.
+for (const stream of [process.stdout, process.stderr]) {
+  stream?.on?.('error', (err) => {
+    if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
+    throw err;
+  });
+}
+
 const {
   parsePage,
   locateSelection,
@@ -3358,12 +3379,32 @@ handle('selection:copy', async (_e, state) => {
  * looked — a test checking its port was free, a restart binding the same one —
  * was told the server was down while it was up.
  *
- * Callers that do not care can ignore the promise; `before-quit` is one.
+ * ANSWERS WHETHER IT WORKED. `{ ok, port, url, reason }` — `ok` is false when
+ * the bounded wait ran out with the port still bound, because a stop that
+ * cannot be completed is not a stop. It used to resolve the same way whether
+ * the port had been freed or the deadline had simply expired, and `dev:stop`
+ * turned both into `{ ok: true }`: the one answer an agent must be able to
+ * believe was the one that could be false.
+ *
+ * Callers that do not care can ignore the result; the quit path is one.
  */
 function stopDevServer() {
-  if (!devServer) return Promise.resolve();
-  const { proc, daemon, bin, projectPath, url } = devServer;
+  if (!devServer) return Promise.resolve({ ok: true, port: null, url: null, reason: 'nothing was running' });
+  const { proc, daemon, bin, projectPath, url, external } = devServer;
   devServer = null;
+
+  // A SERVER SOMEBODY ELSE STARTED IS NOT OURS TO STOP.
+  //
+  // Stacki adopts a dev server already running for this project rather than
+  // fighting it for the port, and that one belongs to whoever typed `astro dev`
+  // in a terminal. Letting go of it is the whole operation. This check was lost
+  // when the daemon fallback below was added: an adopted server has `proc:
+  // null`, which walked straight into it, and Stacki would read the project's
+  // lock file and kill the person's own process — the exact opposite of what
+  // the comment under it promises.
+  if (external) {
+    return Promise.resolve({ ok: true, port: null, url, reason: 'the server was started outside Stacki and is left alone' });
+  }
 
   // Daemonized servers (Astro >= 7 forks a background process) stop via the CLI.
   if (daemon && bin) {
@@ -3380,6 +3421,7 @@ function stopDevServer() {
   // daemon is — .astro/dev.json, pid and all — so that is asked instead of
   // guessed at.
   if (!proc) return stopAstroDaemon(projectPath, bin).then(() => waitForPortFree(url));
+
   const exited = new Promise((done) => {
     let settled = false;
     const finish = () => {
@@ -3395,7 +3437,15 @@ function stopDevServer() {
         if (isWin) spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { shell: true });
         else process.kill(-proc.pid, 'SIGKILL');
       } catch {
-        /* already gone */
+        // The child is not spawned detached, so it shares THIS process's group
+        // and `-pid` names a group that does not exist: the escalation threw
+        // ESRCH every time and was swallowed, leaving SIGKILL a no-op. The
+        // SIGTERM path above has always had this fallback; this one did not.
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
       }
       setTimeout(finish, 500).unref?.();
     }, 4000);
@@ -3451,15 +3501,21 @@ function stopAstroDaemon(projectPath, bin) {
   });
 }
 
-/** Waits, briefly and boundedly, for nothing to be listening there any more. */
+/**
+ * Waits, briefly and boundedly, for nothing to be listening there any more —
+ * and says which of those two things happened.
+ *
+ * The distinction is the whole point. Returning nothing made "the port is free"
+ * and "we gave up waiting" indistinguishable to every caller.
+ */
 function waitForPortFree(url, timeoutMs = 15000) {
   let port = null;
   try {
     port = Number(new URL(String(url)).port) || null;
   } catch {
-    return Promise.resolve();
+    return Promise.resolve({ ok: true, port: null, url, reason: 'no port to wait for' });
   }
-  if (!port) return Promise.resolve();
+  if (!port) return Promise.resolve({ ok: true, port: null, url, reason: 'no port to wait for' });
   const deadline = Date.now() + timeoutMs;
   const listening = () =>
     new Promise((done) => {
@@ -3473,8 +3529,15 @@ function waitForPortFree(url, timeoutMs = 15000) {
       setTimeout(() => settle(false), 500).unref?.();
     });
   const tick = async () => {
-    if (!(await listening())) return;
-    if (Date.now() > deadline) return;
+    if (!(await listening())) return { ok: true, port, url, reason: null };
+    if (Date.now() > deadline) {
+      return {
+        ok: false,
+        port,
+        url,
+        reason: `something is still listening on port ${port} ${Math.round(timeoutMs / 1000)}s after it was asked to stop`,
+      };
+    }
     await new Promise((r) => setTimeout(r, 150).unref?.());
     return tick();
   };
@@ -4710,8 +4773,20 @@ handle('src:writeText', async (_e, { projectPath, rel, text }) => {
 });
 
 handle('dev:stop', async () => {
-  // Awaited: answering before the port is free is what made "stopped" untrue.
-  await stopDevServer();
+  // Awaited, AND its answer is the answer. Reporting success while the server
+  // is still serving is the one lie this operation must never tell: an agent
+  // that believes it goes on to bind the port, or to conclude the preview it
+  // can still reach is somebody else's.
+  const stopped = await stopDevServer();
+  if (stopped?.ok === false) {
+    return {
+      ok: false,
+      code: 'failed',
+      message: `The dev server was asked to stop and did not: ${stopped.reason}.`,
+      port: stopped.port ?? null,
+      url: stopped.url ?? null,
+    };
+  }
   return { ok: true };
 });
 

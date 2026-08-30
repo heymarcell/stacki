@@ -68,13 +68,23 @@ async function connectMcp({
   await client.connect(transport, { timeout: timeoutMs });
 
   let closed = false;
+  /**
+   * Answers what happened rather than swallowing it.
+   *
+   * A second close is nothing to report — the first one did the work. A FIRST
+   * close that fails is a socket still open against the thing under test, and
+   * this used to report it as a clean teardown: the caller's own
+   * "the client would not close" branch was unreachable, because this could
+   * not reject.
+   */
   const close = async () => {
-    if (closed) return;
+    if (closed) return { ok: true };
     closed = true;
     try {
       await client.close();
-    } catch {
-      /* already gone; a test that got this far must not fail on teardown */
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err?.message || err) };
     }
   };
   return { client, transport, close, era, modernVersion: MODERN_VERSION };
