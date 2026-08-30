@@ -209,7 +209,16 @@ const services = new Map(); // projectPath -> service
 const IDLE_TIMEOUT = 5 * 60 * 1000;
 
 function stopService(projectPath) {
-  stopEsbuild(projectPath);
+  // NOT the esbuild. A service is stopped for two very different reasons: the
+  // app is going away, or the config changed and the service is about to be
+  // started again. esbuild's `stop()` ends the compiler for the whole module
+  // instance, and Node hands the same instance back to the next `require` — so
+  // stopping it on a RESTART left the new service asking a compiler that had
+  // been shut down. It answered with no collections and no error, which is
+  // indistinguishable from a project that declares none: on CI six content
+  // operations refused with the product's own sentence and nothing to say the
+  // fixture was fine. stopAllServices ends the compilers, because that is the
+  // path that means "we are finished with this project".
   const service = services.get(projectPath);
   if (!service) return;
   services.delete(projectPath);
@@ -413,8 +422,10 @@ async function validateEntry(projectPath, { collection, data }) {
 
 const stopAllServices = () => {
   for (const projectPath of [...services.keys()]) stopService(projectPath);
+  // And the compilers, here and only here: this is the path that means the
+  // project is done with, rather than that its config is about to be re-read.
   // A project whose config was bundled but whose answering process had already
-  // gone still has a compiler waiting on it.
+  // gone still has one waiting on it.
   for (const projectPath of [...esbuilds.keys()]) stopEsbuild(projectPath);
 };
 
