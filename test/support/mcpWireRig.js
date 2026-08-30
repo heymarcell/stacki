@@ -33,8 +33,26 @@ const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
 const { ensureAstro, astroCached, CACHE } = require('../agent-canvas-fixture.js');
 const { createStackiMcpServer } = require('../../electron/mcp/server.js');
 const { connectMcp } = require('./mcpWire.js');
+const net = require('node:net');
 
-let nextPort = 44120;
+/** Whether something is already listening there. */
+const portTaken = (port) =>
+  new Promise((done) => {
+    const socket = net.connect({ port, host: '127.0.0.1' });
+    const settle = (taken) => {
+      socket.destroy();
+      done(taken);
+    };
+    socket.once('connect', () => settle(true));
+    socket.once('error', () => settle(false));
+    setTimeout(() => settle(false), 300).unref?.();
+  });
+
+// A base that differs per process, so two suites running at once do not both
+// start at the same number and collide — which is not hypothetical: the
+// permission matrix and the regression suites, run together, took each other
+// out with "port 44120 is already in use".
+let nextPort = 44120 + ((process.pid % 400) * 30);
 
 /**
  * Boot a fixture project, a real Agent API over it, an MCP endpoint in front
@@ -79,7 +97,10 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
   if (withDeps || realDevServer) installDeps(root, log);
   const harness = await H.start(root, { agentMode, realDevServer });
 
-  const port = nextPort++;
+  // Skips past anything already listening: a port a previous rig has only just
+  // let go of is still busy for a moment, and so is one another process took.
+  let port = nextPort++;
+  for (let tries = 0; tries < 200 && (await portTaken(port)); tries += 1) port = nextPort++;
   const token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
   const url = `http://127.0.0.1:${port}/mcp`;
 
@@ -167,20 +188,25 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
     } catch {
       /* nothing was running */
     }
+    try {
+      harness.stop();
+    } catch {
+      /* a jsdom that will not close must not fail the suite */
+    }
     // The content config is answered by a CHILD PROCESS, held open on purpose
     // so the next question does not pay to start one — and deliberately not
     // unref'd, because the pipes are what carry the answers. Nothing else in
     // this rig ends it, so without this a fixture with dependencies leaves a
     // node behind per scenario and the suite never exits.
+    //
+    // AFTER the window comes down, not before. Unmounting runs the app's own
+    // effects one last time, and one of them asks about the content config —
+    // which starts a fresh service, moments after the old one was stopped. Done
+    // in this order, the last thing to want a config has already finished.
     try {
       require('../../electron/contentConfig.js').stopAllServices();
     } catch {
       /* nothing was ever started */
-    }
-    try {
-      harness.stop();
-    } catch {
-      /* a jsdom that will not close must not fail the suite */
     }
     H.removeProject(root);
   };

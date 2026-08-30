@@ -63,22 +63,53 @@ const atLeast = (a, b) => MODES.indexOf(a) >= MODES.indexOf(b);
   // So each operation is driven by the same executable scenario the coverage
   // matrix uses — real arguments, real refs — and every envelope it produces
   // is watched for a permission refusal.
+  // A FRESH FIXTURE PER OPERATION PER LEVEL.
+  //
+  // This used to build one rig per level and run all hundred and eleven
+  // scenarios through it in order, which meant they inherited each other's
+  // world: by the time target.remove ran, the node it wanted had been removed
+  // by a neighbour, so `ref` came back null, so the MCP input schema rejected
+  // the call before the Agent API's gate was ever consulted. A hundred and
+  // thirty-two subjects were never asked the question, and the file reported no
+  // open doors because nobody had knocked on them.
+  //
+  // Four hundred and forty-four fixtures is the honest cost of four hundred and
+  // forty-four independent answers. Most take about a second; only the handful
+  // that declare a fixture pay for dependencies or a dev server.
   const seen = [];
   for (const mode of MODES) {
-    let rig = null;
-    try {
-      rig = await startWireRig({ agentMode: mode });
-      for (const op of ops) {
-        const s = getScenario(op.domain, op.action);
+    for (const op of ops) {
+      const s = getScenario(op.domain, op.action);
+      let rig = null;
+      try {
+        rig = await startWireRig({
+          agentMode: 'full',
+          withDeps: s.needs === 'deps',
+          realDevServer: s.needs === 'server',
+        });
         const envelopes = [];
+        // THE LEVEL APPLIES TO THE OPERATION UNDER TEST, NOT TO ITS SETUP.
+        //
+        // Every scenario needs a ref, and a ref comes from target.read, which
+        // is itself gated. Preparing the fixture at the level under test meant
+        // the setup was refused first and the subject never ran. So the fixture
+        // is prepared at full access and the level is applied to exactly one
+        // call: the one the gate is about. Put back in a finally, so a refused
+        // subject cannot lock the rest of the scenario out.
         const watched = async (domain, action, args = {}) => {
-          const out = await rig.call(domain, action, args);
-          // Only the operation under test counts: a scenario that reads
-          // something first would otherwise report the READ's refusal.
-          if (domain === op.domain && action === op.action) envelopes.push(out.envelope);
-          return out;
+          const subject = domain === op.domain && action === op.action;
+          if (!subject) return rig.call(domain, action, args);
+          rig.harness.setMode(mode);
+          try {
+            const out = await rig.call(domain, action, args);
+            envelopes.push(out.envelope);
+            return out;
+          } finally {
+            rig.harness.setMode('full');
+          }
         };
         const ref = async (want = 'h1') => {
+          // Read at full access: this is setup, not the subject.
           const { envelope } = await rig.call('target', 'read');
           const root = envelope?.target;
           if (!root) return null;
@@ -87,29 +118,50 @@ const atLeast = (a, b) => MODES.indexOf(a) >= MODES.indexOf(b);
           const hit = flat.find((n) => String(n.tag || n.name || '').toLowerCase() === String(want).toLowerCase());
           return (hit || flat[1] || root)?.ref || null;
         };
+        const fixture = {
+          root: rig.root,
+          read: (rel) => rig.harness.read(rel),
+          exists: (rel) => rig.harness.exists(rel),
+          write: (rel, text) => rig.harness.write(rel, text),
+          observedWorld: (what) => what,
+          scratch: {},
+        };
         try {
-          await s.run({ call: watched, tool: rig.tool, rig, ref });
+          await s.run({ call: watched, tool: rig.tool, rig, ref, fixture });
         } catch {
           /* a scenario that cannot complete at this level is expected; the
              envelopes it produced before giving up are what matter */
         }
         const denied = envelopes.some((e) => e?.ok === false && e?.code === 'permission_denied');
         // An envelope is only evidence if it IS one. A call whose arguments the
-        // MCP input schema rejected returns no structuredContent at all —
-        // which happens constantly at a low level, because the ref this
-        // operation needed came from a read that was itself refused. Counting
-        // that absence as "reached and not refused" is how this file first
-        // reported the entire write surface as an open door at visual, which
-        // it demonstrably is not.
+        // MCP input schema rejected returns no structuredContent at all, and
+        // counting that absence as "reached and not refused" is how this file
+        // first reported the entire write surface as an open door at visual.
         const reached = envelopes.some((e) => e && typeof e.ok === 'boolean');
         seen.push({ ...op, mode, denied, reached });
+      } finally {
+        if (rig) await rig.stop();
       }
-    } finally {
-      if (rig) await rig.stop();
     }
   }
 
-  check('every operation was tried at every level', seen.length === ops.length * MODES.length, `${seen.length} of ${ops.length * MODES.length}`);
+  const expected = ops.length * MODES.length;
+  check('every operation was tried at every level', seen.length === expected, `${seen.length} of ${expected}`);
+
+  // REACHED, not merely attempted.
+  //
+  // An envelope is only evidence about the gate if the operation was actually
+  // invoked. A scenario whose setup was refused never makes its own call, and
+  // counting that silence as "not an open door" is how this file could report a
+  // clean matrix while a quarter of the surface was never asked the question.
+  // So the count is a gate of its own rather than a footnote.
+  const unreached = seen.filter((r) => !r.reached);
+  check(
+    'every operation reached its own permission gate',
+    unreached.length === 0,
+    `${unreached.length} of ${expected} never invoked: ` +
+      [...new Set(unreached.map((r) => `${r.domain}.${r.action}@${r.mode}`))].slice(0, 14).join(', ')
+  );
 
   const wrongDenials = [];
   const wrongAccepts = [];
@@ -135,6 +187,8 @@ const atLeast = (a, b) => MODES.indexOf(a) >= MODES.indexOf(b);
     const grid = {};
     for (const m of MODES) grid[m] = seen.filter((r) => r.mode === m && r.denied).length;
     console.log(`  ${ops.length} operations × ${MODES.length} levels = ${seen.length} answers`);
+    console.log(`  subjects expected: ${expected} · reached: ${seen.filter((r) => r.reached).length} · unreached: ${unreached.length}`);
+    console.log(`  unexpected accepts: ${wrongAccepts.length} · unexpected denials: ${wrongDenials.length}`);
     console.log('  refused per level: ' + MODES.map((m) => `${m} ${grid[m]}`).join(' · '));
     console.log('  required levels: ' + Object.entries(NEEDED).map(([r, n]) => `${r} needs ${n}`).join(' · '));
   }

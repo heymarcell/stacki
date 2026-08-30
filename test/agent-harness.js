@@ -26,6 +26,7 @@
 // Not a test itself; the files that use it are agent-api.js and
 // agent-acceptance.js.
 
+const { execFileSync } = require('node:child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -170,10 +171,26 @@ function makeProject(extra = {}) {
 }
 
 const removeProject = (root) => {
-  try {
-    fs.rmSync(root, { recursive: true, force: true });
-  } catch {
-    /* a temp folder that will not go is not a test failure */
+  // Retried, because a fixture with dependencies in it is being let go of by
+  // processes that have only just been asked to stop — an esbuild binary still
+  // mapped out of node_modules will refuse the first attempt and allow the
+  // second. The comment here used to say a folder that will not go is not a
+  // test failure; it is exactly that, and test/support/ownedResidue.js says so
+  // now, so the least this can do is try more than once.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (!fs.existsSync(root)) return;
+    } catch {
+      /* still held; wait and try again */
+    }
+    // A short pause, without spinning: a busy-wait here would hold the very
+    // event loop the operating system needs to finish letting the files go.
+    try {
+      execFileSync('sleep', ['0.15'], { stdio: 'ignore' });
+    } catch {
+      /* nothing to wait with; the next attempt is immediate */
+    }
   }
 };
 
@@ -194,6 +211,16 @@ function loadMain() {
   const handlers = new Map();
   const sent = [];
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agent-userdata-'));
+  // Taken back when this process ends. One per run is easy to overlook and adds
+  // up to gigabytes across a working day — there were three hundred and
+  // sixty-five of these on this machine before anybody counted.
+  process.on('exit', () => {
+    try {
+      fs.rmSync(userData, { recursive: true, force: true });
+    } catch {
+      /* going away with the process anyway */
+    }
+  });
 
   const electron = {
     app: {

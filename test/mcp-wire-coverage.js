@@ -24,6 +24,10 @@
 require('./support/mcpScenarioSet.js');
 const { all: allScenarios, size: scenarioCount, judgeFull } = require('./support/mcpOperationScenarios.js');
 const { startWireRig } = require('./support/mcpWireRig.js');
+const { residueOf, describeResidue } = require('./support/ownedResidue.js');
+
+/** Every fixture directory this run created, so teardown can be checked. */
+const ownedRoots = [];
 const { find } = require('../electron/mcp/agent/registry.js');
 
 const failures = [];
@@ -78,6 +82,7 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
     let rig = null;
     try {
       rig = await startWireRig({ withDeps: s.needs === 'deps', realDevServer: s.needs === 'server' });
+      ownedRoots.push(rig.root);
       const ref = async (want = 'h1') => {
         const { envelope } = await rig.call('target', 'read');
         const root = envelope?.target;
@@ -155,6 +160,20 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
 
   console.log(`  scenarios registered: ${scenarioCount()}  (order: ${mode}, fresh fixture each)`);
   console.log(`  scenarios run:        ${results.size}`);
+
+  // CLEANUP IS A RESULT, NOT A COURTESY.
+  //
+  // A hundred and eleven fixtures were made here, several of them running a
+  // real Astro server and a real esbuild. Whether they are gone is a fact about
+  // this machine, so it is asked rather than assumed — and it is asked about
+  // the exact directories this run created, never about a program's name.
+  const residue = await residueOf(ownedRoots);
+  check(
+    'every fixture this run made is gone, and nothing is still running in one',
+    residue.dirs.length === 0 && residue.processes.length === 0,
+    describeResidue(residue)
+  );
+  console.log(`  fixtures made: ${ownedRoots.length} · left on disk: ${residue.dirs.length} · processes still in one: ${residue.processes.length}`);
 
   if (failures.length) {
     console.error(`\nmcp-wire-coverage: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

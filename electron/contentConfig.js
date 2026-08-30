@@ -43,16 +43,39 @@ function configPathOf(projectPath) {
 // esbuild comes with Vite, which comes with Astro, so any project that can
 // build can do this. Resolving it from the project (rather than shipping our
 // own) keeps us on the version the project already runs.
+// EVERY esbuild HANDED OUT IS REMEMBERED, because every one of them starts a
+// process. esbuild's Node API runs the compiler as a long-lived child and keeps
+// it for the next build; `stop()` is what ends it. Nothing called that, so each
+// project whose content config was ever read left an esbuild service behind for
+// the life of the process — and a test that reads a hundred configs leaks a
+// hundred of them, still running against fixture directories long deleted.
+const esbuilds = new Map();
+
 function esbuildOf(projectPath) {
+  if (esbuilds.has(projectPath)) return esbuilds.get(projectPath);
   const req = createRequire(path.join(projectPath, 'package.json'));
   for (const spec of ['esbuild', 'vite/node_modules/esbuild']) {
     try {
-      return req(spec);
+      const mod = req(spec);
+      esbuilds.set(projectPath, mod);
+      return mod;
     } catch {
       /* try the next */
     }
   }
   return null;
+}
+
+/** Ends the compiler process esbuild keeps for a project, if it started one. */
+function stopEsbuild(projectPath) {
+  const mod = esbuilds.get(projectPath);
+  if (!mod) return;
+  esbuilds.delete(projectPath);
+  try {
+    mod.stop?.();
+  } catch {
+    /* already gone */
+  }
 }
 
 // The generated bundle lives in the project so that `astro/zod` — left
@@ -186,17 +209,36 @@ const services = new Map(); // projectPath -> service
 const IDLE_TIMEOUT = 5 * 60 * 1000;
 
 function stopService(projectPath) {
+  stopEsbuild(projectPath);
   const service = services.get(projectPath);
   if (!service) return;
   services.delete(projectPath);
   clearTimeout(service.idle);
   for (const pending of service.pending.values()) pending.reject(new Error('The content config was reloaded.'));
   service.pending.clear();
+  // SIGTERM asks; SIGKILL is for a child that does not answer. The runner sits
+  // reading its stdin, and a plain kill() was leaving one behind per project —
+  // still running, against a directory already deleted, until whatever started
+  // it exited. Closing the pipe first is what a well-behaved child notices.
   try {
-    service.child.kill();
+    service.child.stdin?.end();
+  } catch {
+    /* already closed */
+  }
+  try {
+    service.child.kill('SIGTERM');
   } catch {
     /* already gone */
   }
+  const hard = setTimeout(() => {
+    try {
+      service.child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }, 1500);
+  if (hard.unref) hard.unref();
+  service.child.once('exit', () => clearTimeout(hard));
 }
 
 function touch(service) {
@@ -289,6 +331,18 @@ async function startService(projectPath, configAbs) {
   return service;
 }
 
+// One start at a time, per project.
+//
+// `services` was only written at the END of startService, which is several
+// awaits after the child is spawned. Two questions arriving together — and they
+// do, because opening a project asks about collections and entries in the same
+// tick — both found no service, both started one, and the second overwrote the
+// first in the map. The first child was then unreachable: nothing held it, so
+// nothing could ever stop it, and it outlived the project directory it was
+// reading. Callers share the in-flight start now, the same way dev:start makes
+// concurrent callers share one server.
+const starting = new Map();
+
 // The service for a project, started or restarted as needed. Restarted when
 // anything the config imports has changed on disk since it was read.
 async function serviceFor(projectPath, { force = false } = {}) {
@@ -297,10 +351,18 @@ async function serviceFor(projectPath, { force = false } = {}) {
     touch(existing);
     return existing;
   }
+  if (!force) {
+    const pending = starting.get(projectPath);
+    if (pending) return pending;
+  }
   if (existing) stopService(projectPath);
   const found = configPathOf(projectPath);
   if (!found) return null;
-  return startService(projectPath, found.abs);
+  const attempt = startService(projectPath, found.abs).finally(() => {
+    if (starting.get(projectPath) === attempt) starting.delete(projectPath);
+  });
+  starting.set(projectPath, attempt);
+  return attempt;
 }
 
 /**
@@ -351,6 +413,9 @@ async function validateEntry(projectPath, { collection, data }) {
 
 const stopAllServices = () => {
   for (const projectPath of [...services.keys()]) stopService(projectPath);
+  // A project whose config was bundled but whose answering process had already
+  // gone still has a compiler waiting on it.
+  for (const projectPath of [...esbuilds.keys()]) stopEsbuild(projectPath);
 };
 
 module.exports = { readContentConfig, validateEntry, configPathOf, stopService, stopAllServices };

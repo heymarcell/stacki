@@ -3284,22 +3284,60 @@ handle('selection:copy', async (_e, state) => {
 // Dev server IPC
 // ---------------------------------------------------------------------------
 
+/**
+ * Stops the dev server, and does not answer until it has stopped.
+ *
+ * This used to be fire-and-forget: for a daemonized server it spawned
+ * `astro dev stop` with an empty callback and returned, so `dev:stop` answered
+ * ok in about twenty milliseconds while the port was still listening and went
+ * on listening for another half minute. Anything that stopped a server and then
+ * looked — a test checking its port was free, a restart binding the same one —
+ * was told the server was down while it was up.
+ *
+ * Callers that do not care can ignore the promise; `before-quit` is one.
+ */
 function stopDevServer() {
-  if (!devServer) return;
-  const { proc, daemon, bin, projectPath } = devServer;
+  if (!devServer) return Promise.resolve();
+  const { proc, daemon, bin, projectPath, url } = devServer;
   devServer = null;
+
   // Daemonized servers (Astro >= 7 forks a background process) stop via the CLI.
   if (daemon && bin) {
-    try {
-      const [cmd, argv] = nodeCliCommand(bin, ['dev', 'stop']);
-      execFile(cmd, argv, { cwd: projectPath, timeout: 10000 }, () => {});
-    } catch {
-      /* best effort */
-    }
-    return;
+    return stopAstroDaemon(projectPath, bin).then(() => waitForPortFree(url));
   }
+
   // External servers (started by the user, e.g. in a terminal) are never killed.
-  if (!proc) return;
+  //
+  // But a server WE started may have daemonized without this process noticing.
+  // The record only becomes the daemon one if a line of Astro's prose matches
+  // on exit, and Astro is run with --json, so it does not: the CLI exits, the
+  // record stays pointing at it, and stopping kills a process that has already
+  // gone while the real server carries on serving. Astro writes down where its
+  // daemon is — .astro/dev.json, pid and all — so that is asked instead of
+  // guessed at.
+  if (!proc) return stopAstroDaemon(projectPath, bin).then(() => waitForPortFree(url));
+  const exited = new Promise((done) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      done();
+    };
+    proc.once('exit', finish);
+    // SIGTERM asks. A server that will not go within a few seconds is made to,
+    // because leaving it holding the port is worse than killing it.
+    const hard = setTimeout(() => {
+      try {
+        if (isWin) spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { shell: true });
+        else process.kill(-proc.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      setTimeout(finish, 500).unref?.();
+    }, 4000);
+    hard.unref?.();
+    proc.once('exit', () => clearTimeout(hard));
+  });
   try {
     if (isWin) {
       spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { shell: true });
@@ -3313,6 +3351,70 @@ function stopDevServer() {
       /* already gone */
     }
   }
+  return exited
+    .then(() => stopAstroDaemon(projectPath, bin))
+    .then(() => waitForPortFree(url));
+}
+
+/**
+ * Stops the background server Astro recorded for this project, if there is one.
+ *
+ * The lock file is Astro's own account of what it forked, and `astro dev stop`
+ * is what it offers to end it. If that does not free the port — a CLI that
+ * cannot run, a lock left by a version that answers differently — the pid in
+ * the lock is ended directly. Only ever that pid: it is the one the project
+ * itself wrote down.
+ */
+function stopAstroDaemon(projectPath, bin) {
+  const lock = readAstroLock(projectPath);
+  if (!lock) return Promise.resolve();
+  const viaCli = new Promise((done) => {
+    if (!bin) return done();
+    try {
+      const [cmd, argv] = nodeCliCommand(bin, ['dev', 'stop']);
+      execFile(cmd, argv, { cwd: projectPath, timeout: 10000 }, () => done());
+    } catch {
+      done(); /* best effort */
+    }
+  });
+  return viaCli.then(async () => {
+    if (!lock.pid || !(await portAnswers(Number(lock.port) || 0, '127.0.0.1'))) return;
+    try {
+      process.kill(lock.pid, 'SIGTERM');
+    } catch {
+      /* already gone */
+    }
+  });
+}
+
+/** Waits, briefly and boundedly, for nothing to be listening there any more. */
+function waitForPortFree(url, timeoutMs = 15000) {
+  let port = null;
+  try {
+    port = Number(new URL(String(url)).port) || null;
+  } catch {
+    return Promise.resolve();
+  }
+  if (!port) return Promise.resolve();
+  const deadline = Date.now() + timeoutMs;
+  const listening = () =>
+    new Promise((done) => {
+      const socket = net.connect({ port, host: '127.0.0.1' });
+      const settle = (busy) => {
+        socket.destroy();
+        done(busy);
+      };
+      socket.once('connect', () => settle(true));
+      socket.once('error', () => settle(false));
+      setTimeout(() => settle(false), 500).unref?.();
+    });
+  const tick = async () => {
+    if (!(await listening())) return;
+    if (Date.now() > deadline) return;
+    await new Promise((r) => setTimeout(r, 150).unref?.());
+    return tick();
+  };
+  return tick();
 }
 
 let devLogBuffer = [];
@@ -4107,13 +4209,21 @@ function readAstroLock(projectPath) {
 
 // Serialize dev:start calls — concurrent spawns race Astro's daemon lock and
 // the loser dies with "exited before becoming ready".
-let devStartInFlight = null;
+//
+// PER PROJECT, though. This was one promise for the whole process and the
+// project asked about was ignored while it was pending, so a start for one
+// project handed back another project's server — whichever happened to be
+// coming up at the time, possibly in a directory already deleted. Two projects
+// in a row is not a thing the app does often and it is exactly what a test
+// harness does, which is where it showed up.
+const devStartInFlight = new Map();
 
 handle('dev:start', (_e, projectPath) => {
   // Whatever thumbnails were queued for the start screen, this takes priority.
   captureEra++;
-  if (devStartInFlight) return devStartInFlight;
-  devStartInFlight = doDevStart(projectPath)
+  const pending = devStartInFlight.get(projectPath);
+  if (pending) return pending;
+  const attempt = doDevStart(projectPath)
     // Now that a server has resolved the config, this is the authoritative
     // answer — the scan before it could only read the config's text.
     .then((r) => ({ ...r, trailingSlash: readTrailingSlash(projectPath) }))
@@ -4125,9 +4235,10 @@ handle('dev:start', (_e, projectPath) => {
       return r;
     })
     .finally(() => {
-      devStartInFlight = null;
+      if (devStartInFlight.get(projectPath) === attempt) devStartInFlight.delete(projectPath);
     });
-  return devStartInFlight;
+  devStartInFlight.set(projectPath, attempt);
+  return attempt;
 });
 
 async function doDevStart(projectPath) {
@@ -4535,7 +4646,8 @@ handle('src:writeText', async (_e, { projectPath, rel, text }) => {
 });
 
 handle('dev:stop', async () => {
-  stopDevServer();
+  // Awaited: answering before the port is free is what made "stopped" untrue.
+  await stopDevServer();
   return { ok: true };
 });
 
