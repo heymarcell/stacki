@@ -25,7 +25,7 @@
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { execFileSync } = require('node:child_process');
 
 const { startWireRig } = require('./support/mcpWireRig.js');
 
@@ -38,6 +38,35 @@ const check = (what, condition, detail) => {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Whoever is listening there — this fixture's own server, by the port it took. */
+function listenersOn(port) {
+  try {
+    return execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 4000,
+    })
+      .split('\n')
+      .map((n) => Number(n.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** End what this test started, by pid and by the port it is holding. */
+function endOwned(pid, port) {
+  for (const target of [pid, ...listenersOn(port)].filter(Boolean)) {
+    for (const signal of ['SIGTERM', 'SIGKILL']) {
+      try {
+        process.kill(target, signal);
+      } catch {
+        break;
+      }
+    }
+  }
+}
 const alive = (pid) => {
   try {
     process.kill(pid, 0);
@@ -77,65 +106,63 @@ const busy = (port) =>
   }
 
   // ── a stop that cannot finish answers that it could not ──────────────────
+  //
+  // HOW THE FAILURE IS FORCED, without a production hook and without depending
+  // on the machine. An earlier version rewrote Astro's lock file to point
+  // somewhere harmless and expected the server to survive; on a runner
+  // `astro dev stop` found and stopped it anyway, so the test was asserting
+  // something only true of this laptop.
+  //
+  // What is deterministic everywhere is the other half of the same rule: Stacki
+  // will not signal a process it cannot confirm is its own. So this test ends
+  // the real server itself, by the pid it recorded, and then takes the port
+  // with a listener of its own. Stacki is then asked to stop a server it still
+  // holds a record for, finds something listening on that port, cannot
+  // establish that it is the dev server, and correctly refuses to kill it. The
+  // port stays busy, and the answer has to say so rather than claim success.
   {
     const rig = await startWireRig({ realDevServer: true });
     let realPid = null;
     let port = null;
-    let decoy = null;
+    let squatter = null;
     try {
       const started = await rig.call('project', 'dev_start', {});
       port = Number(new URL(String(started.envelope?.url)).port);
       const lockPath = path.join(fs.realpathSync(rig.root), '.astro', 'dev.json');
-      const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-      realPid = lock.pid;
-      check('the server this test will strand is running', !!realPid && alive(realPid) && (await busy(port)), `pid ${realPid} port ${port}`);
+      realPid = JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid;
+      check('a real preview is running to begin with', !!realPid && alive(realPid) && (await busy(port)), `pid ${realPid} port ${port}`);
 
-      // Somewhere harmless for Stacki's fallback to aim at, owned by this test.
-      decoy = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-      await sleep(300);
-      check('  and the decoy this test will offer instead is alive', alive(decoy.pid), `pid ${decoy.pid}`);
+      // The test ends the server, so what follows is not Stacki's to stop.
+      // By the port as well as the pid: Astro's daemon forks, and the process
+      // named in the lock is not always the one holding the socket.
+      endOwned(realPid, port);
+      for (let i = 0; i < 60 && (await busy(port)); i += 1) {
+        await sleep(250);
+        endOwned(realPid, port);
+      }
+      check('  and the test has ended it', !(await busy(port)), `pid ${realPid} port ${port}`);
 
-      fs.writeFileSync(lockPath, JSON.stringify({ ...lock, pid: decoy.pid }), 'utf8');
+      // Somebody else's server, on the port Stacki still thinks is its own.
+      squatter = net.createServer(() => {});
+      await new Promise((done, fail) => {
+        squatter.once('error', fail);
+        squatter.listen(port, '127.0.0.1', done);
+      });
+      check('  and something else has taken the port', await busy(port), `port ${port}`);
 
       const stopped = await rig.call('project', 'dev_stop', {});
-      check('a stop that cannot reach the server does NOT report success', stopped.envelope?.ok === false, JSON.stringify(stopped.envelope).slice(0, 220));
+      check('a stop it cannot complete does NOT report success', stopped.envelope?.ok === false, JSON.stringify(stopped.envelope).slice(0, 220));
       check('  and says what is still there', /still listening|did not stop/i.test(String(stopped.envelope?.message)), JSON.stringify(stopped.envelope?.message));
       check('  naming the port', String(stopped.envelope?.message || '').includes(String(port)) || stopped.envelope?.port === port, JSON.stringify(stopped.envelope).slice(0, 200));
-      check('  because the server really is still listening', await busy(port), `port ${port}`);
-      check('  and the server itself is untouched', alive(realPid), `pid ${realPid}`);
-
-      // The app must not have lied to itself either.
-      const status = await rig.call('project', 'dev_status', {});
-      check('  the app does not claim the preview is off', status.envelope?.status !== 'off' || !(await busy(port)), JSON.stringify(status.envelope));
-
-      // Only ever what this test started: the decoy, and the daemon whose pid
-      // was written down before the lock was rewritten.
-      try {
-        process.kill(realPid, 'SIGTERM');
-      } catch {
-        /* already gone */
-      }
-      for (let i = 0; i < 40 && (await busy(port)); i += 1) await sleep(250);
-      check('the test ended the server it deliberately stranded', !alive(realPid) && !(await busy(port)), `pid ${realPid} port ${port}`);
+      check('  and the process it could not identify is untouched', !!squatter.listening, String(squatter.listening));
+      check('  which is the point: it will not kill what it cannot confirm is its own', await busy(port), `port ${port}`);
     } finally {
-      if (decoy && decoy.exitCode === null) {
-        try {
-          decoy.kill('SIGKILL');
-        } catch {
-          /* already gone */
-        }
-      }
-      if (realPid && alive(realPid)) {
-        try {
-          process.kill(realPid, 'SIGKILL');
-        } catch {
-          /* already gone */
-        }
-      }
+      if (squatter) await new Promise((done) => squatter.close(done));
+      endOwned(realPid, port);
       await rig.stop();
     }
-    await sleep(400);
-    check('and left neither of the processes it made behind', !alive(realPid) && !(decoy && alive(decoy.pid)));
+    await sleep(600);
+    check('and the test left nothing of its own behind', !(await busy(port)), `port ${port}`);
   }
 
   if (failures.length) {
