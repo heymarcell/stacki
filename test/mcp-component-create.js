@@ -297,7 +297,7 @@ const divRef = async (rig) => {
       restore = null;
 
       check('a failed rollback is still a failure', out.envelope?.ok === false, brief(out.envelope));
-      // The message is the truthful carrier here:  is not a
+      // The message is the truthful carrier here: `leftBehind` is not a
       // declared Envelope field, so it does not survive the wire.
       check('  it does not claim a clean state', /left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
       check('  and names what it could not take back', /OrphanCard/.test(String(out.envelope?.leftBehind) + String(out.envelope?.message)), brief(out.envelope));
@@ -360,6 +360,180 @@ const divRef = async (rig) => {
 
       fs.rmSync(path.join(rig.root, 'src/components/RefusedCard.astro'), { force: true });
       check('  and the test removed the artifact it deliberately created', !rig.harness.exists('src/components/RefusedCard.astro'));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // D. an exception between creating the file and replacing the node
+  //
+  // A, B and C all arrive at the rollback through the `!replaced` branch, which
+  // only runs if execution reaches it. The file is on disk one statement
+  // earlier than that, and page:importPathFor sits in between — an IPC call
+  // like any other, free to reject. If it does, the function unwinds past the
+  // rollback entirely and the component stays behind with nothing pointing at
+  // it and nobody saying so.
+  //
+  // The failure is injected at the real page:importPathFor handler, after the
+  // real component:create has already written the file, so the orphan in this
+  // test is a genuine one.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      let fileExistedBeforeFailure = null;
+      const deleteCalls = [];
+
+      const restorePath = intercept(rig, 'page:importPathFor', (original, event, payload) => {
+        if (String(payload?.targetPath || '').endsWith('StrandedCard.astro')) {
+          fileExistedBeforeFailure = rig.harness.exists('src/components/StrandedCard.astro');
+          throw new Error('test-owned failure: the import path could not be worked out');
+        }
+        return original(event, payload);
+      });
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        deleteCalls.push(payload);
+        return original(event, payload);
+      });
+      restore = () => {
+        restorePath();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'StrandedCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('a failure after the file is written is not a success', out.envelope?.ok === false, brief(out.envelope));
+      check('  and the file really had been written first', fileExistedBeforeFailure === true, `saw ${fileExistedBeforeFailure}`);
+      check('  the operation compensated instead of unwinding', deleteCalls.length === 1, `saw ${brief(deleteCalls)}`);
+      check(
+        '  passing the created path as a string',
+        deleteCalls.every((c) => typeof c === 'string' && c.endsWith('StrandedCard.astro')),
+        brief(deleteCalls)
+      );
+      check('  so nothing is left on disk', !rig.harness.exists('src/components/StrandedCard.astro'));
+      check('  and it says so rather than naming a leftover', !/left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+
+      // The replacement was never reached, so the page must be exactly as it
+      // was — including the node this operation was asked to move.
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the abandoned extraction', !/import\s+StrandedCard\s+from/.test(page));
+      check('  and no instance', !/<StrandedCard/.test(page));
+      check('  the original subtree still in place', page.includes('pricing-grid'), brief(page, 300));
+      check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // E. the same exception, with the compensation itself refused
+  //
+  // The pre-replacement seam has to be as honest as the `!replaced` one: if it
+  // cannot take the file back, it says which file it could not take back.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+
+      const restorePath = intercept(rig, 'page:importPathFor', (original, event, payload) => {
+        if (String(payload?.targetPath || '').endsWith('MaroonedCard.astro')) {
+          throw new Error('test-owned failure: the import path could not be worked out');
+        }
+        return original(event, payload);
+      });
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        if (typeof payload === 'string' && payload.endsWith('MaroonedCard.astro')) {
+          return { ok: false, message: 'test-owned refusal: nothing was removed' };
+        }
+        return original(event, payload);
+      });
+      restore = () => {
+        restorePath();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'MaroonedCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('a failed compensation is still a failure', out.envelope?.ok === false, brief(out.envelope));
+      check('  which does not claim a clean state', /left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  and names the component it could not remove', /MaroonedCard/.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  which really is still there', rig.harness.exists('src/components/MaroonedCard.astro'));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the abandoned extraction', !/import\s+MaroonedCard\s+from/.test(page));
+      check('  and no instance', !/<MaroonedCard/.test(page));
+      check('  the original subtree still in place', page.includes('pricing-grid'), brief(page, 300));
+      check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
+
+      fs.rmSync(path.join(rig.root, 'src/components/MaroonedCard.astro'), { force: true });
+      check('  and the test removed the artifact it deliberately created', !rig.harness.exists('src/components/MaroonedCard.astro'));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // F. the other side of the boundary
+  //
+  // D and E prove the file is taken back when the page never committed. This
+  // proves the opposite duty, which is the easier one to get wrong: once the
+  // page holds the import and the instance, the component file is no longer
+  // this operation's to withdraw. A step that fails afterwards — here the
+  // project rescan — must not be answered by deleting a file the page now
+  // points at, because that turns a page that was changed correctly into a
+  // page with a broken import.
+  //
+  // The failure is injected after component:create has run, so it lands past
+  // the replacement rather than before it.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      let past = false;
+
+      const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
+        const made = await original(event, payload);
+        past = true;
+        return made;
+      });
+      const restoreScan = intercept(rig, 'project:scan', (original, event, payload) => {
+        if (past) throw new Error('test-owned failure: the project could not be rescanned');
+        return original(event, payload);
+      });
+      restore = () => {
+        restoreCreate();
+        restoreScan();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'CommittedCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      // A pending save is on a timer; another honest wire call gives it the
+      // turn of the loop it needs before the file is read.
+      await rig.call('target', 'read');
+      const page = rig.harness.read('src/pages/index.astro');
+
+      check('the component survives a failure after the page committed', rig.harness.exists('src/components/CommittedCard.astro'));
+      check('  because the page now imports it', /import\s+CommittedCard\s+from/.test(page), brief(page, 300));
+      check('  and holds an instance of it', /<CommittedCard/.test(page), brief(page, 300));
+      check('  the extracted markup having moved out of the page', !page.includes('pricing-grid'), brief(page, 300));
+      check('  and the rest of the page untouched', page.includes('<Hero') && page.includes('<footer'), brief(page, 300));
+      // Reported here for what it is: the page was changed correctly and the
+      // operation still says it failed, because the step after the commit
+      // threw. That is a separate post-commit truthfulness question and is not
+      // what this pass changes — but nothing is left behind, and the assertion
+      // pins the behaviour so a later change to it has to be deliberate.
+      check('  the late failure still reported rather than swallowed', out.envelope?.ok === false, brief(out.envelope));
+      check('  and no leftover claimed, because there is none', !/left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
     } finally {
       if (restore) restore();
       await rig.stop();

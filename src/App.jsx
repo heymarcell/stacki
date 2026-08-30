@@ -1275,32 +1275,80 @@ export default function App() {
         return { ok: false, code: 'failed', message: cleanError(err) };
       }
 
-      const paths = await window.avb.importPathFor({
-        pagePath: page.path,
-        targetPath: created.path,
-        projectPath: projectRef.current?.path,
-      });
+      // THE FILE IS ON DISK FROM HERE.
+      //
+      // Every exit between this line and the page committing owes an answer
+      // about it. Best effort, and honest when the effort fails: the caller is
+      // told which file is still there rather than left to find out.
+      const rollbackCreated = async () => {
+        try {
+          // The bare path, because that is what page:delete takes, and what the
+          // menu caller below already passes. This once sent an object, which
+          // the handler could only throw on, so the rollback had never removed
+          // anything in its life. Not optional-chained, and the answer is read:
+          // a missing bridge or an unconfirmed delete has to report the file as
+          // left behind, because claiming a clean state over an orphan on disk
+          // is worse than saying plainly that one is there.
+          const cleanup = await window.avb.deletePage(created.path);
+          if (!cleanup?.ok) throw new Error(`page:delete did not confirm removing ${created.rel}`);
+          return null;
+        } catch {
+          return created.rel;
+        }
+      };
+
       const id = newId();
       let replaced = false;
-      mutateModel((m) => {
-        const found = findParentList(m, node.id);
-        if (!found) return m;
-        if (!m.imports.some((i) => i.name === name)) {
-          m.imports.push({ name, path: chooseImportPath(m, paths) });
-        }
-        // The instance passes each value straight back in under its own name.
-        // That's what reconnects it: `title` meant the page's title where this
-        // markup used to sit, and it still does, one level out.
-        found.list[found.index] = {
-          id,
-          kind: 'component',
-          name,
-          props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
-          children: null,
+      let paths;
+      try {
+        paths = await window.avb.importPathFor({
+          pagePath: page.path,
+          targetPath: created.path,
+          projectPath: projectRef.current?.path,
+        });
+        mutateModel((m) => {
+          const found = findParentList(m, node.id);
+          if (!found) return m;
+          if (!m.imports.some((i) => i.name === name)) {
+            m.imports.push({ name, path: chooseImportPath(m, paths) });
+          }
+          // The instance passes each value straight back in under its own name.
+          // That's what reconnects it: `title` meant the page's title where this
+          // markup used to sit, and it still does, one level out.
+          found.list[found.index] = {
+            id,
+            kind: 'component',
+            name,
+            props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
+            children: null,
+          };
+          replaced = true;
+          return m;
+        }, true);
+      } catch (err) {
+        // THE COMMIT BOUNDARY.
+        //
+        // `replaced` is the whole question. Until it is true the page has not
+        // taken the extraction on, so the component is still only this
+        // operation's own file and removing it is the right compensation —
+        // which is what an import path that could not be worked out, or a model
+        // write that failed, leaves behind today.
+        //
+        // Once it is true the page holds an import and an instance pointing at
+        // that file, and deleting it would answer a failed step by breaking a
+        // page that had otherwise been changed correctly. So past this point
+        // the failure is passed on untouched rather than compensated for.
+        if (replaced) throw err;
+        const leftBehind = await rollbackCreated();
+        return {
+          ok: false,
+          code: 'failed',
+          message: leftBehind
+            ? `${name} could not be made: ${cleanError(err)}. ${leftBehind} was left behind.`
+            : `${name} could not be made: ${cleanError(err)}. Nothing was changed.`,
+          leftBehind,
         };
-        replaced = true;
-        return m;
-      }, true);
+      }
       // SUCCESS MEANS ALL OF IT.
       //
       // The file is written before the model is touched, so a node that has
@@ -1312,21 +1360,7 @@ export default function App() {
       // file just created is removed — it is this operation's own, made
       // seconds ago, and nothing else can be pointing at it yet.
       if (!replaced) {
-        let leftBehind = created.rel;
-        try {
-          // The bare path, because that is what page:delete takes, and what the
-          // menu caller below already passes. This once sent an object, which
-          // the handler could only throw on, so the rollback had never removed
-          // anything in its life. Not optional-chained, and the answer is read:
-          // a missing bridge or an unconfirmed delete has to leave `leftBehind`
-          // set, because claiming a clean state over an orphan on disk is worse
-          // than saying plainly that one is there.
-          const cleanup = await window.avb.deletePage(created.path);
-          if (!cleanup?.ok) throw new Error(`page:delete did not confirm removing ${created.rel}`);
-          leftBehind = null;
-        } catch {
-          /* could not take it back; say so rather than pretend */
-        }
+        const leftBehind = await rollbackCreated();
         return {
           ok: false,
           code: 'no_node',
