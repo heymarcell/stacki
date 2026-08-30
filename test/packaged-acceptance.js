@@ -101,7 +101,7 @@ const brief = (v, n = 220) => {
     // failed, and the top-level tool it was named after was never invoked.
     const noReviewsYet = await app.call('get_comments', {});
     check('get_comments answers on a project with no reviews yet', noReviewsYet?.ok === true && Array.isArray(noReviewsYet.reviews), brief(noReviewsYet, 160));
-    check('  reporting none', noReviewsYet.reviews.length === 0, String(noReviewsYet.reviews.length));
+    check('  reporting none', (noReviewsYet?.reviews || []).length === 0, brief(noReviewsYet?.reviews));
 
     const REVIEW = 'A review left by the packaged acceptance test';
     const selected = await app.run('target', 'select', { ref: footer.ref });
