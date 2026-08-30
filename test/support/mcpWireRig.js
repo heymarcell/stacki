@@ -74,14 +74,64 @@ let nextPort = 44120 + ((process.pid % 400) * 30);
  * not do that, and is the same layout either way — a real node_modules, not a
  * symlink farm.
  */
+/** A few deep files that a complete install has and a half-copy does not. */
+const DEPS_LANDMARKS = [
+  path.join('astro', 'package.json'),
+  path.join('astro', 'dist'),
+  path.join('astro', 'bin'),
+  path.join('.bin', 'astro'),
+  path.join('esbuild', 'package.json'),
+  path.join('esbuild', 'lib', 'main.js'),
+];
+
+/** Whether an installed node_modules has the parts a content config needs. */
+const looksComplete = (dir) => DEPS_LANDMARKS.every((rel) => fs.existsSync(path.join(dir, rel)));
+
 function installDeps(root, log) {
   ensureAstro({ log });
   const from = path.join(CACHE, 'node_modules');
+  // THE CACHE ITSELF, checked before anything is cloned from it.
+  //
+  // ensureAstro only looks for astro/package.json, so a cache that was restored
+  // half-written — or saved by a run that was cancelled mid-install — passes
+  // that and produces a fixture that cannot read a content config. On CI that
+  // surfaced as six content operations refusing, which reads as six product
+  // failures and is one bad archive. A cache that is not whole is thrown away
+  // and built again rather than cloned four hundred times.
+  if (fs.existsSync(from) && !looksComplete(from)) {
+    if (log) log(`the astro cache at ${CACHE} is incomplete; installing it again`);
+    fs.rmSync(CACHE, { recursive: true, force: true });
+    ensureAstro({ log });
+  }
   const to = path.join(root, 'node_modules');
+  // `cp -Rc` asks APFS for copy-on-write and is the fast path. It only works
+  // within one volume, and on a CI runner the cache and the temp directory are
+  // not always on the same one — so the failure is expected, and the plain copy
+  // behind it is not a fallback for a broken machine but the ordinary path
+  // there. What is NOT tolerable is a copy that half worked: that produced
+  // fixtures whose node_modules had an astro/package.json and not much else,
+  // and the only symptom was "notes is not a collection in this project" from
+  // six scenarios, which reads as six product failures.
+  let how = 'clone';
   try {
     execFileSync('cp', ['-Rc', from, to], { stdio: 'pipe' });
   } catch {
+    how = 'copy';
+    fs.rmSync(to, { recursive: true, force: true });
     fs.cpSync(from, to, { recursive: true, dereference: false });
+  }
+  const missing = DEPS_LANDMARKS.filter((rel) => !fs.existsSync(path.join(to, rel)));
+  // And roughly as many packages as the cache has: a copy that stopped partway
+  // usually has the first few and not the rest, which no single landmark finds.
+  const cached = fs.readdirSync(from).length;
+  const copied = fs.existsSync(to) ? fs.readdirSync(to).length : 0;
+  if (missing.length || copied < cached) {
+    throw new Error(
+      `the fixture's dependencies were ${how === 'clone' ? 'cloned' : 'copied'} incompletely — ` +
+        `${copied} of ${cached} packages` +
+        (missing.length ? `, missing ${missing.join(', ')}` : '') +
+        ` (from ${from})`
+    );
   }
   // A fixture that is not what it claims must say so HERE, with the reason.
   //
