@@ -4531,14 +4531,23 @@ async function spawnDevServer(projectPath, localBin, force, bare) {
       // .astro/dev.json is Astro's own account of what it forked, and it is
       // what every stop path already reads. It also carries the address the
       // server really bound, which is better than the one we asked for.
-      const lock = readAstroLock(projectPath);
+      // AND DO NOT DECIDE AT THIS MOMENT. The lock is written by the forked
+      // daemon, not by the CLI, so at the instant the CLI exits it may not be
+      // there yet — and the log line depends on Astro's version and on --json.
+      // Asking either of them here is a race that this machine wins and a
+      // runner loses, and losing it meant discarding the only record of a
+      // server that was about to start serving.
+      //
+      // A clean exit means it forked. Whether it came up is answered by
+      // doDevStart, which does not return until the address answers; the stop
+      // paths resolve the real address from the lock when they need it.
       const running = recentDevLog().match(
         /Dev server running at (https?:\/\/[^\s"\\)]+)/i
       );
-      if (code === 0 && (lock || running)) {
+      if (code === 0) {
         devServer = {
           proc: null,
-          url: lock?.url || (running && running[1]) || url,
+          url: readAstroLock(projectPath)?.url || (running && running[1]) || url,
           projectPath,
           daemon: true,
           bin: localBin,
