@@ -241,6 +241,30 @@ jobs:
       - name: the Secure Share states
         run: npm run test:secureshareui
 
+      # THE PACKAGED MCP GATE.
+      #
+      # Everything else in the MCP suite runs the server in-process against
+      # test/agent-harness.js — real parser, real Agent API, jsdom instead of a
+      # browser. These three are the only ones that speak to the bundle people
+      # install, and they run HERE because that bundle only exists after the
+      # build step above.
+      #
+      # protocol      the packaged binary serves 2026-07-28 and the whole tool
+      #               surface, and refuses a write with no project open
+      # acceptance    a real MCP client opens a real Astro project through the
+      #               automation door, changes it, watches the change reach the
+      #               running site and a screenshot, and undoes it
+      # lifecycle     the same thing five times, each run leaving no process,
+      #               no fixture and no port behind
+      - name: the packaged bundle speaks MCP
+        run: npm run test:packagedmcp
+
+      - name: a real project, changed and undone in the packaged app
+        run: npm run test:packagedacceptance
+
+      - name: five consecutive packaged lifecycles, each clean
+        run: npm run test:packagedlifecycle
+
       # THE SEAM. A person comments in Stacki, a real MCP client finds that
       # comment, is handed the exact object it is anchored to, changes it,
       # photographs the result and answers in the thread. Every other suite
