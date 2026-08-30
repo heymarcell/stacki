@@ -169,7 +169,12 @@ async function verifyDeps(root) {
   const { readContentConfig } = require('../../electron/contentConfig.js');
   let config = null;
   try {
-    config = await readContentConfig(root, { force: true });
+    // NOT `force`. Forcing stops the config service and its esbuild and starts
+    // them again — on the very fixture the scenario is about to use, and back
+    // to back with it. On CI that left the next read answering cleanly with no
+    // collections at all: no error to report, nothing to blame but the product.
+    // A plain read proves the same thing and leaves the service it warmed.
+    config = await readContentConfig(root);
   } catch (err) {
     throw new Error(`the fixture's content config could not be read: ${err?.message || err}`);
   }
