@@ -151,6 +151,7 @@
     "test:mcpperms": "node test/mcp-permission-matrix.js",
     "test:mcpcomponent": "node test/mcp-component-create.js",
     "test:packagedmcp": "node test/packaged-mcp.js",
+    "test:bootstrap": "node test/automation-bootstrap.js",
     "agent:coverage": "node scripts/agent-api-coverage.js",
     "test:agentapi": "node test/agent-api.js",
     "test:agentacceptance": "node test/agent-acceptance.js",

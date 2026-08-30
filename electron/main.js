@@ -13,6 +13,7 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { pathToFileURL } = require('url');
 const net = require('net');
 const crypto = require('crypto');
@@ -395,10 +396,73 @@ function callMainOp(channel, payload) {
   return fn(null, payload);
 }
 
+// THE ONE NON-INTERACTIVE WAY TO OPEN A PROJECT, AND ITS FENCE.
+//
+// Opening a project is a human act by design: the reopen file is dev-only,
+// `pendingProject` is only ever set by the renderer's own project:close, and
+// the sole argv path is the stacki:// join scheme. That is right, and it left
+// the packaged app with no way to be driven by a test — so the packaged proof
+// could only ever cover the half that needs no project open.
+//
+// This closes that, as narrowly as it can be closed. It is not a way to open an
+// arbitrary path without a person: FOUR things must all be true, and the app
+// asks for every one of them itself rather than trusting what it was handed.
+//
+//   1. an explicit automation flag is set in this process's environment
+//   2. the path it names is absolute and lies inside the OS temp directory
+//   3. the project on disk carries a marker file
+//   4. that marker's contents equal the nonce in the environment
+//
+// A renderer cannot set any of it — the environment belongs to the process it
+// was launched with. Nor can MCP: this is not an operation, it is not in the
+// registry, and no tool names a channel. Nor can a deep link. Nothing is
+// written down, so it cannot become a preference or survive the run. With the
+// flag absent every check short-circuits and the app behaves exactly as it
+// ships.
+function automationProject() {
+  const asked = process.env.STACKI_AUTOMATION_PROJECT;
+  const marker = process.env.STACKI_AUTOMATION_MARKER;
+  if (!asked || !marker) return null;
+  if (!path.isAbsolute(asked)) return null;
+
+  // Resolved on both sides before comparing: on macOS the temp directory is
+  // reached through a symlink, so the string a harness passes and the string
+  // the OS reports are different names for the same place.
+  let root = null;
+  let tmp = null;
+  try {
+    root = fs.realpathSync(asked);
+    tmp = fs.realpathSync(os.tmpdir());
+  } catch {
+    return null;
+  }
+  // A separator boundary, so /tmp-elsewhere cannot pass for a child of /tmp.
+  if (root !== tmp && !root.startsWith(tmp.endsWith(path.sep) ? tmp : tmp + path.sep)) return null;
+  if (root === tmp) return null;
+
+  // It has to BE a project, not merely a directory somebody named.
+  if (!fs.existsSync(path.join(root, 'package.json'))) return null;
+  if (!fs.existsSync(path.join(root, 'src', 'pages'))) return null;
+
+  // And it has to be the one this run made. The nonce is written into the
+  // fixture by whoever built it and passed in the environment separately;
+  // matching them is what makes a stale directory unusable.
+  let written = null;
+  try {
+    written = fs.readFileSync(path.join(root, '.stacki-automation'), 'utf8').trim();
+  } catch {
+    return null;
+  }
+  if (!written || written !== String(marker).trim()) return null;
+  return root;
+}
+
 handle('project:pending', () => {
   const asked = pendingProject;
   pendingProject = null;
   if (asked && fs.existsSync(asked)) return asked;
+  const automated = automationProject();
+  if (automated) return automated;
   if (!isDev) return null;
   if (openProjectRoot && fs.existsSync(openProjectRoot)) return openProjectRoot;
   let p = null;
