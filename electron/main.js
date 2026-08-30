@@ -4544,17 +4544,37 @@ async function spawnDevServer(projectPath, localBin, force, bare) {
       const running = recentDevLog().match(
         /Dev server running at (https?:\/\/[^\s"\\)]+)/i
       );
-      if (code === 0) {
-        devServer = {
-          proc: null,
-          url: readAstroLock(projectPath)?.url || (running && running[1]) || url,
-          projectPath,
-          daemon: true,
-          bin: localBin,
-        };
-      } else {
-        devServer = null;
-        send('dev:exit', { code, log: recentDevLog() });
+      // KEEP THE RECORD, THEN FIND OUT. A non-zero exit does not mean no
+      // server: Astro's CLI gives the daemon it forked a fixed time to report
+      // back, and on a cold project — a fresh node_modules, a first Vite
+      // optimize — that wait can run out while the daemon is still starting.
+      // It then removes the lock and exits 1, and the daemon finishes coming up
+      // and binds the port regardless. Treating that as "nothing started" threw
+      // away the only handle to a server that was about to serve, so every
+      // later stop truthfully reported that nothing was running while the port
+      // stayed bound. It never happened on a warm machine, which is why it was
+      // only ever visible in CI.
+      const record = {
+        proc: null,
+        url: readAstroLock(projectPath)?.url || (running && running[1]) || url,
+        projectPath,
+        daemon: true,
+        bin: localBin,
+      };
+      devServer = record;
+      if (code !== 0) {
+        // Give it the benefit of the doubt for as long as it takes to answer,
+        // and no longer. If nothing is there, this really was a failure.
+        void (async () => {
+          for (let i = 0; i < 60; i += 1) {
+            if (devServer !== record) return;
+            if (await serverAlive(record.url)) return;
+            await new Promise((r) => setTimeout(r, 500).unref?.());
+          }
+          if (devServer !== record) return;
+          devServer = null;
+          send('dev:exit', { code, log: recentDevLog() });
+        })();
       }
     }
   });
