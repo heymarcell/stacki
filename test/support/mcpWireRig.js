@@ -98,8 +98,19 @@ function installDeps(root, log) {
   return to;
 }
 
+// VERIFIED ONCE PER PROCESS, not once per fixture.
+//
+// What this checks is a property of the shared Astro cache, and every fixture
+// is cloned from that same cache — so bundling a content config in all of them
+// re-proves the same fact and pays for a child process and an esbuild service
+// each time. On the permission matrix, which builds a fixture per operation per
+// level, that was four hundred and forty-three redundant bundles and enough
+// added minutes to time the CI job out.
+let depsVerified = false;
+
 /** Read the config once, so a fixture that cannot is rejected by name. */
 async function verifyDeps(root) {
+  if (depsVerified) return;
   const { readContentConfig } = require('../../electron/contentConfig.js');
   let config = null;
   try {
@@ -108,7 +119,11 @@ async function verifyDeps(root) {
     throw new Error(`the fixture's content config could not be read: ${err?.message || err}`);
   }
   const names = (config?.collections || []).map((c) => c.name);
-  if (!names.includes('notes') || !names.includes('links')) {
+  if (names.includes('notes') && names.includes('links')) {
+    depsVerified = true;
+    return;
+  }
+  {
     throw new Error(
       `the fixture's content config resolved to [${names.join(', ') || 'nothing'}] — ` +
         `astro ${require(path.join(root, 'node_modules', 'astro', 'package.json')).version} in ${root}` +

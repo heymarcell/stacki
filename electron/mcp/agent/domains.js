@@ -1003,7 +1003,13 @@ async function runMain(domain, action, input, ctx) {
   // band (`{ ok: false, reason }`) rather than by throwing, and without this
   // the only thing a mapper could do with that was spread it into an ok:true
   // envelope: a resolver reporting success at resolving nothing.
-  if (shaped?.error) return shaped.error;
+  //
+  // Only `problem()`'s own shape counts. Plenty of answers carry an `error`
+  // STRING as an ordinary field — content.config says why it cannot read a
+  // config, css:setVariable says why it would not write — and treating those as
+  // the refusal itself replaced the whole envelope with that string, which
+  // arrives at a client spread into numbered characters.
+  if (shaped?.error && typeof shaped.error === 'object' && shaped.error.ok === false) return shaped.error;
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 

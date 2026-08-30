@@ -82,10 +82,15 @@ const atLeast = (a, b) => MODES.indexOf(a) >= MODES.indexOf(b);
       const s = getScenario(op.domain, op.action);
       let rig = null;
       try {
+        // The fixture each operation actually needs, and no more. Every rig used
+        // to clone the whole Astro node_modules — 154MB, four hundred and
+        // forty-four times — for operations that never look at a content
+        // config. The gate is about authorisation; only the operations that
+        // cannot reach their own gate without dependencies pay for them.
         rig = await startWireRig({
           agentMode: 'full',
-          withDeps: s.needs === 'deps',
-          realDevServer: s.needs === 'server',
+          withDeps: s.needs === 'deps' || s.needs === 'server',
+          realDevServer: false,
         });
         const envelopes = [];
         // THE LEVEL APPLIES TO THE OPERATION UNDER TEST, NOT TO ITS SETUP.
