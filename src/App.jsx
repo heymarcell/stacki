@@ -1314,7 +1314,15 @@ export default function App() {
       if (!replaced) {
         let leftBehind = created.rel;
         try {
-          await window.avb.deletePage?.({ projectPath: projectRef.current?.path, path: created.path });
+          // The bare path, because that is what page:delete takes, and what the
+          // menu caller below already passes. This once sent an object, which
+          // the handler could only throw on, so the rollback had never removed
+          // anything in its life. Not optional-chained, and the answer is read:
+          // a missing bridge or an unconfirmed delete has to leave `leftBehind`
+          // set, because claiming a clean state over an orphan on disk is worse
+          // than saying plainly that one is there.
+          const cleanup = await window.avb.deletePage(created.path);
+          if (!cleanup?.ok) throw new Error(`page:delete did not confirm removing ${created.rel}`);
           leftBehind = null;
         } catch {
           /* could not take it back; say so rather than pretend */

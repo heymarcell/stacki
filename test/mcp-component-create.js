@@ -184,6 +184,188 @@ const divRef = async (rig) => {
     }
   }
 
+  // ── the half-completed operation, and what it owes ───────────────────────
+  //
+  // component_create writes the component file and THEN rewrites the page. A
+  // node that disappears between those two moments leaves a component nobody
+  // asked for and a page that never changed. Reporting that as success would be
+  // saying "turned it into a component" about markup still sitting where it was.
+  //
+  // The rollback branch for that existed and had never once run. It could not
+  // have worked: it called `deletePage({ projectPath, path })` while the
+  // shipping handler takes the path itself — `handle('page:delete', (_e,
+  // pagePath) => fs.rmSync(pagePath))` — and the human caller passes
+  // `page.path`. Source presence is not proof; these two tests force the seam.
+  //
+  // The condition is made by wrapping the REAL `component:create` handler in
+  // the harness's own map: the original runs and genuinely writes the file,
+  // then the target is removed through an honest Stacki edit, and the outer
+  // extraction resumes to find nothing to replace. Nothing is faked — the
+  // operation still travels the whole MCP → Agent → renderer path.
+
+  const intercept = (rig, channel, wrap) => {
+    const handlers = rig.harness.handlers;
+    const original = handlers.get(channel);
+    if (!original) throw new Error(`the harness has no ${channel} handler to wrap`);
+    handlers.set(channel, (...args) => wrap(original, ...args));
+    return () => handlers.set(channel, original);
+  };
+
+  // A. the target vanishes, and the rollback works
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      const deleteCalls = [];
+
+      // Watch what the rollback actually hands the delete handler. If somebody
+      // later goes back to passing an object, this names it.
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        deleteCalls.push(payload);
+        return original(event, payload);
+      });
+
+      let fileExistedBeforeRollback = false;
+      const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
+        const made = await original(event, payload);
+        fileExistedBeforeRollback = rig.harness.exists('src/components/WireCard.astro');
+        // The node goes away through a real edit, the way a concurrent change
+        // would take it — not by poking at React internals.
+        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        return made;
+      });
+      restore = () => {
+        restoreCreate();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'WireCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('a half-completed extraction is a failure', out.envelope?.ok === false, brief(out.envelope));
+      check('  named for the node that went away', out.envelope?.code === 'no_node', String(out.envelope?.code));
+      check('  the component file really was written first', fileExistedBeforeRollback);
+      check('  and the rollback removed it', !rig.harness.exists('src/components/WireCard.astro'));
+      check('  it reports nothing was left behind', !out.envelope?.leftBehind, brief(out.envelope?.leftBehind));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  the page has no import from the failed extraction', !/import\s+WireCard\s+from/.test(page));
+      check('  and no instance from it', !/<WireCard/.test(page));
+      check('  the concurrent removal that caused this is preserved', !page.includes('pricing-grid'), page.slice(0, 200));
+      check('  and the rest of the page survived', page.includes('<Hero') && page.includes('<footer'));
+
+      // THE CONTRACT. A string, because that is what page:delete takes.
+      const own = deleteCalls.filter((c) => typeof c === 'string' && c.endsWith('WireCard.astro'));
+      check('  cleanup called page:delete with the created path as a string', own.length === 1, `saw ${brief(deleteCalls)}`);
+      check('  and targeted only the file this operation made', deleteCalls.every((c) => typeof c === 'string' && c.endsWith('WireCard.astro')), brief(deleteCalls));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // B. the target vanishes and the rollback ITSELF fails
+  //
+  // The honest outcome is still a failure, and it has to say what it could not
+  // take back. A response claiming a clean state while an orphan sits on disk
+  // is worse than an explicit failure.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        if (typeof payload === 'string' && payload.endsWith('OrphanCard.astro')) {
+          throw new Error('test-owned failure: this deletion is not allowed');
+        }
+        return original(event, payload);
+      });
+      const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
+        const made = await original(event, payload);
+        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        return made;
+      });
+      restore = () => {
+        restoreCreate();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'OrphanCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('a failed rollback is still a failure', out.envelope?.ok === false, brief(out.envelope));
+      // The message is the truthful carrier here:  is not a
+      // declared Envelope field, so it does not survive the wire.
+      check('  it does not claim a clean state', /left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  and names what it could not take back', /OrphanCard/.test(String(out.envelope?.leftBehind) + String(out.envelope?.message)), brief(out.envelope));
+      check('  the orphan really is on disk', rig.harness.exists('src/components/OrphanCard.astro'));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the failed extraction', !/import\s+OrphanCard\s+from/.test(page));
+      check('  and no instance', !/<OrphanCard/.test(page));
+
+      // The test made this orphan; the test accounts for it rather than leaving
+      // it to the fixture teardown to sweep up.
+      fs.rmSync(path.join(rig.root, 'src/components/OrphanCard.astro'), { force: true });
+      check('  and the test removed the artifact it deliberately created', !rig.harness.exists('src/components/OrphanCard.astro'));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
+  // C. the rollback is REFUSED rather than throwing
+  //
+  // A separate case from B on purpose. When page:delete throws, any `catch`
+  // keeps `leftBehind` set and the operation looks careful whether or not it
+  // checked anything. A handler that answers `{ ok: false }` and removes
+  // nothing is the one that finds out whether the result is actually read —
+  // and without this, dropping the confirmation entirely changed no test.
+  {
+    const rig = await startWireRig();
+    let restore = null;
+    try {
+      const target = await divRef(rig);
+      const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
+        if (typeof payload === 'string' && payload.endsWith('RefusedCard.astro')) {
+          return { ok: false, message: 'test-owned refusal: nothing was removed' };
+        }
+        return original(event, payload);
+      });
+      const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
+        const made = await original(event, payload);
+        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        return made;
+      });
+      restore = () => {
+        restoreCreate();
+        restoreDelete();
+      };
+
+      const out = await rig.call('page', 'component_create', { name: 'RefusedCard', ref: target, withProps: true });
+      restore();
+      restore = null;
+
+      check('a refused rollback is a failure', out.envelope?.ok === false, brief(out.envelope));
+      check('  and is not reported as a clean state', /left behind/i.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  naming the component still on disk', /RefusedCard/.test(String(out.envelope?.message)), brief(out.envelope));
+      check('  which really is still there', rig.harness.exists('src/components/RefusedCard.astro'));
+
+      const page = rig.harness.read('src/pages/index.astro');
+      check('  with no import from the failed extraction', !/import\s+RefusedCard\s+from/.test(page));
+      check('  and no instance', !/<RefusedCard/.test(page));
+
+      fs.rmSync(path.join(rig.root, 'src/components/RefusedCard.astro'), { force: true });
+      check('  and the test removed the artifact it deliberately created', !rig.harness.exists('src/components/RefusedCard.astro'));
+    } finally {
+      if (restore) restore();
+      await rig.stop();
+    }
+  }
+
   if (failures.length) {
     console.error(`\nmcp-component-create: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
