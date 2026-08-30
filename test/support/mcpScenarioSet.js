@@ -1360,9 +1360,13 @@ fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, fixt
 fullScenario({ domain: 'content', action: 'config', needs: 'deps', run: async ({ call }) => {
   const { envelope } = await call('content', 'config', {});
   const notes = (envelope?.collections || []).find((c) => c.name === 'notes');
+  // The operation says WHY when it cannot read a config, and a scenario that
+  // drops that reason turns one bad fixture into six product failures with no
+  // way to tell them apart. Whatever it said travels into the check's detail.
+  const why = envelope?.error ? ` — ${envelope.error}` : '';
   return { envelope, checks: [
     ['it names the content config the fixture authored', String(envelope?.configPath || '').includes('content.config')],
-    ['and reads the collection out of it', !!notes],
+    [`and reads the collection out of it${why}`, !!notes],
     ['with the loader the config declares', notes?.loader?.kind === 'glob' && String(notes?.loader?.base).includes('notes')],
     ['and the zod schema resolved to a real JSON Schema', !!notes?.schema?.properties?.title],
   ] };

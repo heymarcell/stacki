@@ -160,6 +160,11 @@ let depsVerified = false;
 
 /** Read the config once, so a fixture that cannot is rejected by name. */
 async function verifyDeps(root) {
+  // MEMOISED ON THE CACHE, not on "it worked once". The thing being proved is
+  // that the shared install can bundle a config; every fixture is a clone of
+  // it, so proving it per fixture re-proves the same fact at the cost of a
+  // child process each time. But a clone that is not a faithful copy is a
+  // different failure, and installDeps checks every one of those.
   if (depsVerified) return;
   const { readContentConfig } = require('../../electron/contentConfig.js');
   let config = null;
