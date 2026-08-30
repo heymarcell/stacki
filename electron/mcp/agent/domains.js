@@ -204,12 +204,20 @@ const source = {
     // so four of the five fields were null on every successful call and only
     // the text came through. `name` is the caller's own, and the handler
     // reports one line (where the declaration starts), not a range.
-    result: (raw, input) => ({
-      file: raw?.rel ? toPosix(raw.rel) : null,
-      name: input?.name ?? null,
-      text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
-      line: Number.isInteger(raw?.line) ? raw.line : null,
-    }),
+    // AN IN-BAND REFUSAL IS STILL A REFUSAL. src:readSymbol signals failure by
+    // answering `{ ok: false, reason }` rather than throwing, and runMain only
+    // makes an error envelope when the mapper reports one or the call throws —
+    // so an unresolvable specifier, or a file too large to read, arrived as
+    // ok:true with every field null.
+    result: (raw, input) =>
+      raw?.ok === false
+        ? problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`)
+        : {
+            file: raw?.rel ? toPosix(raw.rel) : null,
+            name: input?.name ?? null,
+            text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
+            line: Number.isInteger(raw?.line) ? raw.line : null,
+          },
   },
 
   resolve_path: {
@@ -225,13 +233,19 @@ const source = {
     // given — a resolver that resolves nothing. The scenario asked only whether
     // a `path` key existed and whether `outsideProject` was false, and both were
     // true of the null.
-    result: (raw) => ({
-      path: raw?.rel ? toPosix(raw.rel) : null,
-      // The handler refuses to leave the project at all (assertInProject
-      // throws), so anything it resolves is inside it. Said from the answer
-      // rather than asserted: a rel that climbs out would be reported.
-      outsideProject: typeof raw?.rel === 'string' && raw.rel.startsWith('..'),
-    }),
+    // Same in-band refusal as read_symbol above: `{ ok: false }` for a
+    // specifier that points at nothing, which used to answer ok:true with a
+    // null path — a resolver reporting success at resolving nothing.
+    result: (raw, input) =>
+      raw?.ok === false
+        ? problem('not_found', `${input?.spec} does not resolve to a file in this project.`)
+        : {
+            path: raw?.rel ? toPosix(raw.rel) : null,
+            // The handler refuses to leave the project at all (assertInProject
+            // throws), so anything it resolves is inside it. Said from the
+            // answer rather than asserted: a rel that climbs out is reported.
+            outsideProject: typeof raw?.rel === 'string' && raw.rel.startsWith('..'),
+          },
   },
 };
 
@@ -360,9 +374,11 @@ const page = {
     args: (input, ctx) => ({ projectPath: ctx.root, name: input.name, exclude: input.exclude || null }),
     result: (raw, _input, ctx) => ({
       total: raw?.total ?? null,
+      // No `name` here: componentUsage answers { rel, path, kind, count } and
+      // never a name, so this field was null in every entry of every answer.
+      // The component's name is what the caller asked with.
       files: take(raw?.files, MAX_LIST).map((f) => ({
         path: f.path ? relativeTo(ctx.root, f.path) || f.rel || null : f.rel || null,
-        name: f.name ?? null,
         kind: f.kind ?? null,
         count: f.count ?? null,
       })),
@@ -558,6 +574,12 @@ const content = {
       const limit = Math.min(input.limit || 100, MAX_LIST);
       return {
         collection: input.collection,
+        // "I CANNOT READ THIS" IS NOT "THERE IS NOTHING HERE". A collection
+        // built by a custom loader answers `{ entries: [], readOnly: true,
+        // reason }`, and dropping those two made it byte-identical to an empty
+        // collection — so an agent was told a collection was empty when Stacki
+        // simply had no way to enumerate it.
+        ...(raw?.readOnly ? { readOnly: true, reason: raw.reason ?? null } : {}),
         returned: Math.min(list.length, limit),
         total: list.length,
         entries: take(list, limit).map((e) => ({
@@ -891,8 +913,13 @@ const git = {
       return { projectPath: ctx.root, ref: input.ref, path: at };
     },
     result: (raw) => {
+      // A FILE THAT WAS NOT THERE YET is not a file that was empty. The handler
+      // answers `null` on purpose, and `null ?? ''` turned "this page did not
+      // exist at that commit" into an empty document — which reads as a page
+      // somebody had emptied.
+      if (raw === null || raw === undefined) return { text: null, existed: false, truncated: false };
       const body = clip(raw?.text ?? raw ?? '', MAX_TEXT_BYTES);
-      return { text: body.text, truncated: body.truncated };
+      return { text: body.text, existed: true, truncated: body.truncated };
     },
   },
   worktrees: { channel: 'git:worktrees', args: (_i, ctx) => ({ projectPath: ctx.root }), result: (raw) => ({ worktrees: take(raw?.worktrees || raw, MAX_LIST) }) },
@@ -971,6 +998,12 @@ async function runMain(domain, action, input, ctx) {
     return { ok: false, code: 'failed', message };
   }
   const shaped = entry.result ? entry.result(raw, input, ctx) : raw;
+  // A RESULT MAPPER MAY REFUSE, the same way an args mapper may — `problem()`
+  // in either place means the same thing. Several handlers signal failure in
+  // band (`{ ok: false, reason }`) rather than by throwing, and without this
+  // the only thing a mapper could do with that was spread it into an ok:true
+  // envelope: a resolver reporting success at resolving nothing.
+  if (shaped?.error) return shaped.error;
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 

@@ -471,17 +471,43 @@ function automationProject() {
   // Resolved on both sides before comparing: on macOS the temp directory is
   // reached through a symlink, so the string a harness passes and the string
   // the OS reports are different names for the same place.
+  //
+  // AND NOT FROM os.tmpdir() ALONE. On POSIX that reads TMPDIR straight out of
+  // the environment — the same environment that carries the two flags this
+  // check is guarding. Whoever can set STACKI_AUTOMATION_PROJECT can set
+  // TMPDIR=/ beside it and make "inside the temp directory" mean "anywhere".
+  // So the platform's own temp roots are listed here, and the environment's
+  // idea of one is accepted only if it is under one of them.
+  // The platform's own temp locations, written down rather than asked for.
+  // os.tmpdir() is deliberately NOT among them: it is TMPDIR, and TMPDIR comes
+  // from the same environment as the flags. A door that lets the knocker choose
+  // where the doorway is is not a fence. If a platform's temp directory is not
+  // one of these, this door simply does not open there — which is the safe
+  // direction for something only a test is meant to use.
+  const candidates =
+    process.platform === 'win32'
+      ? [path.join(os.homedir(), 'AppData', 'Local', 'Temp'), process.env.SystemRoot && path.join(process.env.SystemRoot, 'Temp')]
+      : ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders'];
+  const trusted = [];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const real = fs.realpathSync(candidate);
+      if (real !== path.parse(real).root) trusted.push(real);
+    } catch {
+      /* not on this machine */
+    }
+  }
   let root = null;
-  let tmp = null;
   try {
     root = fs.realpathSync(asked);
-    tmp = fs.realpathSync(os.tmpdir());
   } catch {
     return null;
   }
-  // A separator boundary, so /tmp-elsewhere cannot pass for a child of /tmp.
-  if (root !== tmp && !root.startsWith(tmp.endsWith(path.sep) ? tmp : tmp + path.sep)) return null;
-  if (root === tmp) return null;
+  // A separator boundary, so /tmp-elsewhere cannot pass for a child of /tmp,
+  // and never the root itself.
+  const inside = (dir) => root !== dir && root.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
+  if (!trusted.some(inside)) return null;
 
   // It has to BE a project, not merely a directory somebody named.
   if (!fs.existsSync(path.join(root, 'package.json'))) return null;
@@ -714,12 +740,17 @@ app.whenReady().then(() => {
 // it, and the dev server outlives everything.
 handle('project:close', async (_e, next) => {
   pendingProject = typeof next === 'string' && next ? next : null;
-  // Awaited: this process is not going anywhere, and the window is about to be
-  // reloaded onto another project. A server still holding the port when the
-  // next one starts is the case the comment above is about.
-  await stopDevServer();
+  // Awaited, AND read: this process is not going anywhere, and the window is
+  // about to be reloaded onto another project. A server still holding the port
+  // when the next one starts is the case the comment above is about, and
+  // reporting a clean close over one is how it would go unnoticed.
+  const closeProblems = [];
+  const devStopped = await stopDevServer();
+  if (devStopped?.ok === false) closeProblems.push(devStopped.reason || 'the dev server would not stop');
   stopAllServices();
-  await stopAllPreviews();
+  for (const stopped of await stopAllPreviews()) {
+    if (stopped?.ok === false) closeProblems.push(stopped.reason || 'a preview would not stop');
+  }
   cleanupTerminals();
   if (watcher) {
     watcher.close();
@@ -739,7 +770,10 @@ handle('project:close', async (_e, next) => {
   // stack and forty pieces of state that belong to the project just closed, and
   // none of it should be in the window that opens the next one.
   mainWindow?.webContents.reload();
-  return { ok: true };
+  // The window reloads either way — leaving it on a project that is half closed
+  // would be worse — but what could not be put down is said rather than
+  // swallowed, so a port the next project is about to want has a name.
+  return closeProblems.length ? { ok: true, problems: closeProblems } : { ok: true };
 });
 
 app.on('window-all-closed', () => {
@@ -3418,8 +3452,33 @@ handle('selection:copy', async (_e, state) => {
  */
 function stopDevServer() {
   if (!devServer) return Promise.resolve({ ok: true, port: null, url: null, reason: 'nothing was running' });
-  const { proc, daemon, bin, projectPath, url, external } = devServer;
+  const record = devServer;
+  const { proc, daemon, bin, projectPath, url, external } = record;
+
+  // THE RECORD IS THE ONLY HANDLE, so it is not let go of until the stop has
+  // worked. This used to clear `devServer` first: after one honest `ok:false`
+  // the app owned nothing, and the very next stop took the "nothing was
+  // running" early return and answered ok:true with the port still bound. A
+  // refusal that makes the next answer a lie is worse than no refusal at all.
+  const done = (result) => {
+    if (result?.ok === false) devServer = record;
+    return result;
+  };
   devServer = null;
+
+  // THE ADDRESS THE SERVER BOUND, not the one it was asked for. findFreePort
+  // binds, closes and hands the number back, so between that and Astro's own
+  // bind — a spawn, a node start, a config load — the port can be taken by
+  // something else, and Astro moves on without being asked to stay. Its lock
+  // records where it actually is, so waiting on the requested port could prove
+  // the wrong one free.
+  const bound = (() => {
+    try {
+      return readAstroLock(projectPath)?.url || url;
+    } catch {
+      return url;
+    }
+  })();
 
   // A SERVER SOMEBODY ELSE STARTED IS NOT OURS TO STOP.
   //
@@ -3431,12 +3490,16 @@ function stopDevServer() {
   // lock file and kill the person's own process — the exact opposite of what
   // the comment under it promises.
   if (external) {
-    return Promise.resolve({ ok: true, port: null, url, reason: 'the server was started outside Stacki and is left alone' });
+    // Left alone, and the record kept: Stacki has not stopped owning the fact
+    // that this project is being served, and the next question about the
+    // preview must not be answered as though nothing is running.
+    devServer = record;
+    return Promise.resolve({ ok: true, external: true, port: null, url, reason: 'the server was started outside Stacki and is left alone' });
   }
 
   // Daemonized servers (Astro >= 7 forks a background process) stop via the CLI.
   if (daemon && bin) {
-    return stopAstroDaemon(projectPath, bin).then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
+    return stopAstroDaemon(projectPath, bin, bound).then((asked) => waitForPortFree(bound).then((r) => done(withHow(r, asked))));
   }
 
   // External servers (started by the user, e.g. in a terminal) are never killed.
@@ -3448,7 +3511,7 @@ function stopDevServer() {
   // gone while the real server carries on serving. Astro writes down where its
   // daemon is — .astro/dev.json, pid and all — so that is asked instead of
   // guessed at.
-  if (!proc) return stopAstroDaemon(projectPath, bin).then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
+  if (!proc) return stopAstroDaemon(projectPath, bin, bound).then((asked) => waitForPortFree(bound).then((r) => done(withHow(r, asked))));
 
   const exited = new Promise((done) => {
     let settled = false;
@@ -3494,8 +3557,8 @@ function stopDevServer() {
     }
   }
   return exited
-    .then(() => stopAstroDaemon(projectPath, bin))
-    .then((asked) => waitForPortFree(url).then((r) => withHow(r, asked)));
+    .then(() => stopAstroDaemon(projectPath, bin, bound))
+    .then((asked) => waitForPortFree(bound).then((r) => done(withHow(r, asked))));
 }
 
 /** Folds "what we were able to ask" into the answer about the port. */
@@ -3535,7 +3598,7 @@ function stopDevServerSync() {
   if (server.external) return;
 
   const lock = readAstroLock(server.projectPath);
-  if (lock?.pid) {
+  if (lock?.pid && isOurDevServer(lock.pid, server.projectPath)) {
     try {
       process.kill(lock.pid, 'SIGTERM');
     } catch {
@@ -3568,13 +3631,83 @@ function stopDevServerSync() {
  * the lock is ended directly. Only ever that pid: it is the one the project
  * itself wrote down.
  */
-function stopAstroDaemon(projectPath, bin) {
+/**
+ * Whether a pid is really the dev server this project recorded.
+ *
+ * Astro leaves .astro/dev.json behind whenever its daemon is killed rather than
+ * asked, so a stale lock can name a pid the operating system has since given to
+ * something else entirely — and the only gate before the signal used to be
+ * "does something answer on the recorded port", which says nothing about
+ * whether the recorded PID is that something. Astro's own CLI checks; Stacki
+ * was overriding it. A pid is only signalled if it is still running out of this
+ * project.
+ */
+function isOurDevServer(pid, projectPath) {
+  if (!pid) return false;
+  try {
+    const cmd = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    }).trim();
+    if (!cmd) return false;
+    let real = projectPath;
+    try {
+      real = fs.realpathSync(projectPath);
+    } catch {
+      /* the project may already be gone; the raw path is still worth matching */
+    }
+    return cmd.includes(projectPath) || cmd.includes(real);
+  } catch {
+    return false;
+  }
+}
+
+/** The pid listening on a port we bound, when the lock file is missing. */
+function listenerOn(port) {
+  if (!port) return null;
+  try {
+    const out = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 4000,
+    }).trim();
+    const pid = Number(out.split('\n')[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function stopAstroDaemon(projectPath, bin, url) {
   const lock = readAstroLock(projectPath);
   // NOTHING TO ADDRESS is a different answer from ASKED AND REFUSED, and the
   // caller needs to be able to tell them apart: without the lock there is no
   // way to reach this server at all, and reporting "it was asked to stop and
   // did not" would be false in its second half.
-  if (!lock) return Promise.resolve({ asked: 'nothing', lock: null });
+  if (!lock) {
+    // NO LOCK IS NOT NO SERVER. Astro deletes the lock when its own start times
+    // out, and the daemon it forked can finish coming up afterwards and bind the
+    // port anyway — the state in which nothing could reach it. The port is ours;
+    // whoever is listening on it can be found and, if it is running out of this
+    // project, asked to stop.
+    let port = null;
+    try {
+      port = Number(new URL(String(url)).port) || null;
+    } catch {
+      port = null;
+    }
+    const orphan = listenerOn(port);
+    if (orphan && isOurDevServer(orphan, projectPath)) {
+      try {
+        process.kill(orphan, 'SIGTERM');
+      } catch {
+        /* already gone */
+      }
+      return Promise.resolve({ asked: 'signal', lock: null, note: 'found by the port, with no lock file to name it' });
+    }
+    return Promise.resolve({ asked: 'nothing', lock: null });
+  }
   const viaCli = new Promise((done) => {
     if (!bin) return done(false);
     try {
@@ -3585,28 +3718,34 @@ function stopAstroDaemon(projectPath, bin) {
     }
   });
   return viaCli.then(async (cliWorked) => {
-    if (!lock.pid || !(await portAnswers(Number(lock.port) || 0, '127.0.0.1'))) {
+    // Re-read: `astro dev stop` deletes the lock precisely when it worked, so
+    // the pre-CLI copy is the wrong thing to reason about afterwards.
+    const now = readAstroLock(projectPath);
+    if (!now || !now.pid || !(await portAnswers(Number(now.port) || 0, '127.0.0.1'))) {
       return { asked: cliWorked ? 'cli' : 'nothing', lock };
     }
-    try {
-      process.kill(lock.pid, 'SIGTERM');
-    } catch {
-      return { asked: 'signal', lock, error: 'the recorded process could not be signalled' };
+    if (!isOurDevServer(now.pid, projectPath)) {
+      return { asked: 'nothing', lock: now, error: 'the recorded process is not this project’s dev server' };
     }
-    // The pid is the one the project itself wrote down, so being certain about
-    // it is safe. A server that has not gone a few seconds after being asked is
-    // holding a port somebody else is about to want.
-    for (let i = 0; i < 20 && (await portAnswers(Number(lock.port) || 0, '127.0.0.1')); i += 1) {
+    try {
+      process.kill(now.pid, 'SIGTERM');
+    } catch {
+      return { asked: 'signal', lock: now, error: 'the recorded process could not be signalled' };
+    }
+    // A server that has not gone a few seconds after being asked is holding a
+    // port somebody else is about to want — and it has just been confirmed to
+    // be this project's, so being certain about it is safe.
+    for (let i = 0; i < 20 && (await portAnswers(Number(now.port) || 0, '127.0.0.1')); i += 1) {
       await new Promise((r) => setTimeout(r, 250).unref?.());
     }
-    if (await portAnswers(Number(lock.port) || 0, '127.0.0.1')) {
+    if ((await portAnswers(Number(now.port) || 0, '127.0.0.1')) && isOurDevServer(now.pid, projectPath)) {
       try {
-        process.kill(lock.pid, 'SIGKILL');
+        process.kill(now.pid, 'SIGKILL');
       } catch {
         /* already gone */
       }
     }
-    return { asked: 'signal', lock };
+    return { asked: 'signal', lock: now };
   });
 }
 
@@ -4899,6 +5038,13 @@ handle('dev:stop', async () => {
       url: stopped.url ?? null,
     };
   }
+  // A server Stacki adopted rather than started is left running on purpose, and
+  // saying so is the difference between "the preview is off" and "the preview
+  // is somebody else's". A bare ok:true was making the app write `off` into its
+  // own state while the site went on being served.
+  if (stopped?.external) {
+    return { ok: true, external: true, url: stopped.url ?? null, note: stopped.reason };
+  }
   return { ok: true };
 });
 
@@ -5284,6 +5430,19 @@ function stopAllPreviewsSync() {
         /* the signal above is what this path relies on */
       }
     }
+    // AND THE CHECKOUT. removeWorktree lived only in the async stopPreview, so
+    // the quit path — the one this listener exists for — killed the server and
+    // left the worktree inside the user's own project, which is precisely the
+    // stray folder the comment above the hook promises not to leave.
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', cur.dir], {
+        cwd: projectPath,
+        timeout: 5000,
+        stdio: 'ignore',
+      });
+    } catch {
+      /* a checkout that will not come out is reported by the async path */
+    }
   }
 }
 
@@ -5361,7 +5520,14 @@ handle('preview:atCommit', async (_e, { projectPath, ref }) => {
 });
 
 handle('preview:stop', async (_e, { projectPath }) => {
-  await stopPreview(projectPath);
+  // What it said, not a fixed answer. stopPreview deliberately builds
+  // `{ ok:false, reason:'the preview checkout was left behind…' }` and this
+  // threw it away — a stray worktree in the user's own project, reported as a
+  // clean stop.
+  const stopped = await stopPreview(projectPath);
+  if (stopped?.ok === false) {
+    return { ok: false, code: 'failed', message: stopped.reason || 'The preview did not stop.' };
+  }
   return { ok: true };
 });
 

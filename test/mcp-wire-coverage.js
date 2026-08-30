@@ -25,6 +25,7 @@ require('./support/mcpScenarioSet.js');
 const { all: allScenarios, size: scenarioCount, judgeFull } = require('./support/mcpOperationScenarios.js');
 const { startWireRig } = require('./support/mcpWireRig.js');
 const { residueOf, describeResidue } = require('./support/ownedResidue.js');
+const { DOMAINS } = require('../electron/mcp/agent/registry.js');
 
 /** Every fixture directory this run created, so teardown can be checked. */
 const ownedRoots = [];
@@ -40,7 +41,15 @@ const check = (what, condition, detail) => {
 
 // ── the runner ─────────────────────────────────────────────────────────────
 
-const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', 'project', 'git'];
+// THE ORDER COMES FROM THE REGISTRY, not from a list typed here.
+//
+// This was a literal, and the counts below it were printed rather than checked
+// — so a scenario whose domain was not in the literal was registered (the
+// operation matrix, which only proves parity, stayed green), never executed,
+// and never counted as missing. Renaming a domain in the registry and the
+// scenario set, or adding one, would have stopped every scenario in it from
+// running while both suites went on saying passed.
+const DOMAIN_ORDER = [...DOMAINS];
 
 (async () => {
   const results = new Map();
@@ -97,8 +106,26 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
           for (const child of node.children || []) stack.push(child);
         }
         const hit = seen.find((n) => String(n.tag || n.name || '').toLowerCase() === wanted);
-        return (hit || seen[1] || root)?.ref || null;
+        // NO FALLBACK. This used to answer `hit || seen[1] || root`, so asking
+        // for a tag the tree does not have handed back a neighbour and every
+        // "did it act on the right element" assertion downstream was being made
+        // about the wrong one — silently, and only when the fixture changed
+        // shape. A scenario that cannot find what it asked for should stop,
+        // saying what was there instead.
+        if (!hit) {
+          throw new Error(
+            `${s.domain}.${s.action}: no <${want}> in the tree — it holds ${seen.map((n) => n.tag || n.name).filter(Boolean).join(', ')}`
+          );
+        }
+        return hit.ref || null;
       };
+
+      // Reads made to SET UP a scenario go through the rig directly and are not
+      // the subject; the recorder below counts only calls to the operation under
+      // test. target.read is the one operation that is both — it is what mints a
+      // ref — so its own scenario reads twice by construction: once here for a
+      // ref, once as the subject it is judged on.
+
 
       const subject = { key: `${s.domain}.${s.action}`, invoked: false, envelope: null, count: 0 };
       let worldReads = 0;
@@ -140,6 +167,15 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
       } catch (err) {
         verdict = { good: false, detail: `threw: ${String(err?.message || err).slice(0, 240)}` };
       }
+      // A BOUNDARY SCENARIO IS STILL A SCENARIO. Its own {good, detail} used to
+      // be the whole verdict, unexamined — no subject recorder, so nothing
+      // checked that the operation it names was the one that ran, or that it
+      // ran once. The boundary judgement layers on top of that rather than
+      // replacing it.
+      if (!verdict && s.grade !== 'full') {
+        if (!subject.invoked) verdict = { good: false, detail: `${s.domain}.${s.action} was never invoked, so nothing was proven about it` };
+        else if (subject.count !== 1) verdict = { good: false, detail: `${s.domain}.${s.action} was invoked ${subject.count} times; a scenario makes exactly one subject call` };
+      }
       if (!verdict) verdict = s.grade === 'full' ? judgeFull(raw, subject) : raw;
       if (verdict?.good && s.grade === 'full') {
         const entry = find(s.domain, s.action);
@@ -167,6 +203,18 @@ const DOMAIN_ORDER = ['target', 'style', 'source', 'page', 'asset', 'content', '
 
   console.log(`  scenarios registered: ${scenarioCount()}  (order: ${mode}, fresh fixture each)`);
   console.log(`  scenarios run:        ${results.size}`);
+
+  // AND EVERY ONE OF THEM RAN. The two numbers above were printed and never
+  // compared, which is what let a whole domain be skipped in silence.
+  const ranKeys = new Set([...results.keys()]);
+  const neverRan = allScenarios()
+    .map((x) => `${x.domain}.${x.action}`)
+    .filter((key) => !ranKeys.has(key));
+  check(
+    'every registered scenario was executed',
+    neverRan.length === 0 && results.size === scenarioCount(),
+    neverRan.length ? `never ran: ${neverRan.join(', ')}` : `${results.size} ran of ${scenarioCount()} registered`
+  );
 
   // CLEANUP IS A RESULT, NOT A COURTESY.
   //

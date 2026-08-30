@@ -242,8 +242,12 @@ const brief = (v, n = 220) => {
     }
     check('  the running site serves the original again', restored.includes('Made carefully.') && !restored.includes(CANARY));
 
+    // BACK TO WHAT IT WAS, not merely different again. "The pixels changed"
+    // is satisfied by a page that changed into some third thing, which is not
+    // what undo promises.
     const back = await shotUntilChanged(after.hash);
     check('  and the screenshot came back too', back.hash !== after.hash, `${after.hash} -> ${back.hash}`);
+    check('  to exactly the picture it started as', back.hash === before.hash, `${before.hash} vs ${back.hash}`);
 
     // ── STYLE: authored, what Stacki reports, what the browser resolved ───
     //
@@ -283,6 +287,17 @@ const brief = (v, n = 220) => {
     check('  with the value it was given', outline?.value === '6px solid rgb(255, 0, 0)', brief(outline?.value));
     check('  in the stylesheet it was told to write to', outline?.file === 'src/styles/site.css', brief(outline?.file));
     check('  and nothing overriding it', outline?.winning === true && !outline?.overriddenBy, brief({ winning: outline?.winning, by: outline?.overriddenBy }));
+    // The model's answer and the browser's, cross-checked against each other.
+    // `winning` on a property declared once is true whatever the cascade does,
+    // so on its own it proves nothing; agreeing with what the browser actually
+    // resolved is the part that could be wrong.
+    const resolved = String(styleAfter?.computed?.outline || '');
+    const authored = String(outline?.value || '');
+    check(
+      '  and what Stacki says wins is what the browser resolved',
+      authored.split(/\s+/).every((bit) => resolved.includes(bit.replace(/,$/, ''))),
+      brief({ authored, resolved })
+    );
 
     // EFFECTIVE, as the browser resolved it.
     check('  the rendered element resolves the new outline', /rgb\(255,\s*0,\s*0\)/.test(String(styleAfter?.computed?.outline || '')), brief(styleAfter?.computed));
@@ -303,6 +318,12 @@ const brief = (v, n = 220) => {
     check('  Stacki no longer reports the declaration', !declsOf(styleBack).some((d) => d.property === 'outline'), brief(declsOf(styleBack).map((d) => d.property)));
     check('  the browser no longer resolves an outline', !styleBack?.computed?.outline || /^(none|rgb\(0, 0, 0\) none 0px|0px)/.test(String(styleBack.computed.outline)), brief(styleBack?.computed?.outline));
     check('  and the rule that was always there survived the undo', styleBack?.computed?.display === 'grid', brief(styleBack?.computed));
+
+    // The style change was proved to reach the pixels; this is it proved to
+    // leave them. Without it the outline is only ever shown arriving.
+    const unpainted = await shotUntilChanged(painted.hash);
+    check('  and the outline is gone from the picture too', unpainted.hash !== painted.hash, `${painted.hash} -> ${unpainted.hash}`);
+    check('  which is the picture from before it was authored', unpainted.hash === back.hash, `${back.hash} vs ${unpainted.hash}`);
     let css2 = null;
     for (let i = 0; i < 30; i += 1) {
       css2 = await app.run('source', 'read', { path: 'src/styles/site.css' });

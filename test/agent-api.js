@@ -380,18 +380,26 @@ const PINNED_RISK = {
   // A SECOND OPINION, derived rather than typed: an operation whose mapper
   // guards a write cannot be a read, whatever anybody typed above.
   {
-    const domains = fs.readFileSync(path.join(__dirname, '..', 'electron', 'mcp', 'agent', 'domains.js'), 'utf8');
+    // THE ENTRY, not the first block in the file that shares its action name.
+    //
+    // This searched domains.js for `  <action>: {` and took the first match,
+    // discarding the domain — so asset.list was measured against page.list's
+    // mapper, and target.read, style.read and source.read all against whichever
+    // `read:` came first. Every answer it gave was about a different operation
+    // than the one it named. The module is loaded and asked directly instead.
+    const { DOMAINS: MAPPERS } = require('../electron/mcp/agent/domains.js');
     const guarded = [];
-    for (const op of all.filter((o) => o.risk === 'read')) {
-      const at = domains.indexOf(`  ${op.action}: {`);
-      if (at < 0) continue;
-      // The entry's OWN block: cut at its closing brace, or the read next door
-      // inherits the guard belonging to the write below it.
-      const rest = domains.slice(at);
-      const ends = rest.indexOf('\n  },');
-      const block = ends > 0 ? rest.slice(0, ends) : rest.slice(0, 900);
-      if (/guardWrite\(/.test(block)) guarded.push(`${op.domain}.${op.action}`);
+    const unmapped = [];
+    for (const op of all.filter((o) => o.risk === 'read' && o.via === 'main')) {
+      const entry = MAPPERS[op.domain]?.[op.action];
+      if (!entry) {
+        unmapped.push(`${op.domain}.${op.action}`);
+        continue;
+      }
+      const text = typeof entry === 'function' ? String(entry) : `${String(entry.args || '')}${String(entry.result || '')}`;
+      if (/guardWrite\(/.test(text)) guarded.push(`${op.domain}.${op.action}`);
     }
+    check('every main-process read operation has a mapper to check', unmapped.length === 0, unmapped.join(', '));
     check('no operation classified read guards a write in its mapper', guarded.length === 0, guarded.join(', '));
   }
 

@@ -141,10 +141,17 @@ fullScenario({ domain: 'target', action: 'exit', run: async ({ call }) => {
 fullScenario({ domain: 'target', action: 'set_text', run: async ({ call, ref, fixture }) => {
   const inside = await call('target', 'enter', { ref: await ref('Hero') });
   const h1 = flatten(inside.envelope?.target).find((n) => String(n.tag || '').toLowerCase() === 'h1');
+  const before = fixture.read('src/components/Hero.astro');
   const { envelope } = await call('target', 'set_text', { ref: h1?.ref, text: 'Wire-driven heading', replaceBinding: true });
+  const after = fixture.read('src/components/Hero.astro');
   return { envelope, checks: [
-    ['the text is in Hero.astro on disk', fixture.read('src/components/Hero.astro').includes('Wire-driven heading')],
-    ['and the old text is gone', !fixture.read('src/components/Hero.astro').includes('Welcome to Stacki')],
+    ['the text is in Hero.astro on disk', after.includes('Wire-driven heading')],
+    ['and the old text is gone', !after.includes('Welcome to Stacki')],
+    // Present and absent are both true of a handler that rewrote the component
+    // as a single line. What must survive is everything around the heading.
+    ['the rest of the component is still there', after.includes('Astro.props') && after.includes('<section') && after.includes('{heading}') === before.includes('{heading}')],
+    ['the element it was written into is still an h1', /<h1[^>]*>[^<]*Wire-driven heading/.test(after)],
+    ['and the file is what it was with that one text replaced', after.replace('Wire-driven heading', 'Welcome to Stacki') === before],
   ] };
 } });
 
@@ -499,9 +506,17 @@ fullScenario({ domain: 'style', action: 'write_source', run: async ({ call, fixt
 // The destination is the point. Two independent substring tests are satisfied
 // by 'outline' landing in .card while '3px solid red' lands anywhere else at
 // all — so this asks about the braces the requested selector opens.
+// The ref does not choose the file here — `selector` and `source` are given
+// explicitly, and that is the operation's contract, not an oversight. What the
+// ref is for is the element the declaration has to end up styling, so that is
+// what is checked: the rule is read back through the SAME ref, with style.read,
+// and the new declaration has to be in that element's own cascade.
 fullScenario({ domain: 'style', action: 'set_property', run: async ({ call, ref, fixture }) => {
   const before = css(fixture);
-  const { envelope } = await call('style', 'set_property', { ref: await ref('div'), selector: '.pricing-grid', source: 'file:src/styles/site.css', property: 'outline', value: '3px solid red' });
+  const target = await ref('div');
+  const { envelope } = await call('style', 'set_property', { ref: target, selector: '.pricing-grid', source: 'file:src/styles/site.css', property: 'outline', value: '3px solid red' });
+  const seen = await call('style', 'read', { ref: target });
+  const reaching = (seen.envelope?.rules || []).flatMap((r) => r.declarations || []);
   const after = css(fixture);
   const grid = ruleBlock(after, '.pricing-grid');
   return { envelope, checks: [
@@ -510,6 +525,7 @@ fullScenario({ domain: 'style', action: 'set_property', run: async ({ call, ref,
     ['and the declaration is inside it', /outline:\s*3px solid red\s*;/.test(grid[0] || '')],
     ['what that rule already declared is still declared', /display:\s*grid\s*;/.test(grid[0] || '') && /gap:\s*var\(--gap\)\s*;/.test(grid[0] || '')],
     ['the other rules were not written into', after.includes(ROOT_RULE) && after.includes(CARD_RULE)],
+    ['reading that same element back, the declaration is in its cascade', reaching.some((d) => d.property === 'outline' && d.value === '3px solid red')],
     ['and the answer names the stylesheet it authored it in', envelope?.source?.key === 'file:src/styles/site.css'],
     ['nothing else in the file moved', after === before.replace(GRID_RULE, GRID_RULE.replace('\n}', '\n  outline: 3px solid red;\n}'))],
   ] };
@@ -521,18 +537,22 @@ fullScenario({ domain: 'style', action: 'set_property', run: async ({ call, ref,
 // of them cannot show they stayed together.
 fullScenario({ domain: 'style', action: 'set_declarations', run: async ({ call, ref, fixture }) => {
   const before = css(fixture);
+  const target = await ref('div');
   const { envelope } = await call('style', 'set_declarations', {
-    ref: await ref('div'),
+    ref: target,
     selector: '.pricing-grid',
     source: 'file:src/styles/site.css',
     declarations: [{ property: 'opacity', value: '0.42' }, { property: 'z-index', value: '7' }],
   });
+  const seen = await call('style', 'read', { ref: target });
+  const reaching = (seen.envelope?.rules || []).flatMap((r) => r.declarations || []);
   const after = css(fixture);
   const grid = ruleBlock(after, '.pricing-grid');
   return { envelope, checks: [
     ['the fixture stylesheet is the one these assertions are written against', before === SHEET],
     ['both declarations landed on the one rule they were aimed at', grid.length === 1 && /opacity:\s*0\.42\s*;/.test(grid[0]) && /z-index:\s*7\s*;/.test(grid[0])],
     ['and it says it set both', envelope?.applied === 2],
+    ['both reach the element the ref named', reaching.some((d) => d.property === 'opacity' && d.value === '0.42') && reaching.some((d) => d.property === 'z-index' && d.value === '7')],
     ['the rule was added to, not rewritten — what it declared survives', /display:\s*grid\s*;/.test(grid[0]) && /gap:\s*var\(--gap\)\s*;/.test(grid[0])],
     ['neither of them scattered into another rule', !ruleBlock(after, '.card').some((b) => /opacity|z-index/.test(b)) && after.includes(ROOT_RULE) && after.includes(CARD_RULE)],
     ['nothing else in the file moved', after === before.replace(GRID_RULE, GRID_RULE.replace('\n}', '\n  opacity: 0.42;\n  z-index: 7;\n}'))],
@@ -566,10 +586,20 @@ fullScenario({ domain: 'style', action: 'remove_property', run: async ({ call, r
 
 fullScenario({ domain: 'style', action: 'set_variable', run: async ({ call, fixture }) => {
   const cell = await firstCell(call);
+  const before = css(fixture);
   const { envelope } = await call('style', 'set_variable', { edit: { file: cell.file, valueStart: cell.valueStart, valueEnd: cell.valueEnd, value: '2.5rem', expect: cell.value } });
+  const after = css(fixture);
+  // AIMED, not merely present. The fixture writes `1rem` twice — as --gap's
+  // value and as .card's padding — so an edit that ignored the span it was
+  // handed and replaced the text everywhere satisfied "the new value is there"
+  // and "the old declaration is gone", while rewriting a rule nobody asked
+  // about. The span is the whole operation, so the file is checked byte for
+  // byte against exactly the one substitution it was told to make.
   return { envelope, checks: [
-    ['the new value is in the stylesheet', css(fixture).includes('2.5rem')],
-    ['and the old one is gone', !css(fixture).includes(`${cell.name}: ${cell.value}`)],
+    ['the variable holds its new value', /--gap:\s*2\.5rem/.test(after)],
+    ['and its old one is gone', !new RegExp(`${cell.name}:\\s*${cell.value.replace('.', '\\.')}`).test(after)],
+    ['the other declaration that reads the same way is untouched', /padding:\s*1rem/.test(after)],
+    ['and nothing else in the file moved', after === before.slice(0, cell.valueStart) + '2.5rem' + before.slice(cell.valueEnd)],
   ] };
 } });
 
@@ -669,9 +699,14 @@ fullScenario({ domain: 'style', action: 'set_section_title', run: async ({ call,
   const text = css(fixture);
   const start = text.indexOf('Before rename');
   const { envelope } = await call('style', 'set_section_title', { edit: { file: cell.file, start, end: start + 'Before rename'.length, title: 'After rename', expect: 'Before rename' } });
+  const after = css(fixture);
   return { envelope, checks: [
-    ['the new title is in the stylesheet', css(fixture).includes('After rename')],
-    ['and the old title is gone', !css(fixture).includes('Before rename')],
+    ['the new title is in the stylesheet', after.includes('After rename')],
+    ['and the old title is gone', !after.includes('Before rename')],
+    // A handler that wrote the whole stylesheet away, leaving only the new
+    // comment, passed both of the checks above.
+    ['the rules the file already had are all still in it', after.includes(':root') && /--gap:/.test(after) && /--brand:/.test(after) && after.includes('.pricing-grid') && after.includes('.card')],
+    ['and only the title changed', after === text.replace('Before rename', 'After rename')],
   ] };
 } });
 
@@ -872,6 +907,9 @@ fullScenario({ domain: 'page', action: 'delete', run: async ({ call, fixture }) 
   return { envelope, checks: [
     ['the page was there first', before],
     ['and is gone from disk', !fixture.exists('src/pages/wire-doomed.astro')],
+    ['the pages beside it are untouched', fixture.exists(INDEX) && fixture.exists('src/pages/about.astro')],
+    ['including the one in a folder of its own', fixture.exists('src/pages/notes/[slug].astro')],
+    ['and src/pages itself is still there', fixture.exists('src/pages')],
   ] };
 } });
 
@@ -1152,11 +1190,17 @@ fullScenario({ domain: 'asset', action: 'rename', run: async ({ call, fixture })
 } });
 
 fullScenario({ domain: 'asset', action: 'delete', run: async ({ call, fixture }) => {
+  // WHAT MUST SURVIVE, named. "It was there, now it is not" is equally true of
+  // a delete that took the folder with it — and this fixture's public/ holds
+  // the robots canary and an image other scenarios assert against.
   const before = fixture.exists('public/spare.txt');
   const { envelope } = await call('asset', 'delete', { path: 'public/spare.txt' });
   return { envelope, checks: [
     ['the file was there first', before],
     ['and is gone from disk', !fixture.exists('public/spare.txt')],
+    ['its neighbour in the same folder is untouched', fixture.exists('public/robots.txt') && fixture.read('public/robots.txt').includes(ROBOTS_CANARY)],
+    ['the image beside it is still there', fixture.exists('public/images/dot.png')],
+    ['and public/ itself was not what was removed', fixture.exists('public')],
   ] };
 } });
 
@@ -1215,8 +1259,17 @@ fullScenario({ domain: 'content', action: 'cms_read', run: async ({ call }) => {
 
 fullScenario({ domain: 'content', action: 'cms_write', run: async ({ call, fixture }) => {
   const read = await call('content', 'cms_read', { path: 'src/data/site.json' });
-  const { envelope } = await call('content', 'cms_write', { path: 'src/data/site.json', data: { ...(read.envelope?.data || {}), wireWrote: true }, ref: read.envelope?.ref });
-  return { envelope, checks: [['the new key is in the file on disk', JSON.parse(fixture.read('src/data/site.json')).wireWrote === true]] };
+  const was = read.envelope?.data || {};
+  const { envelope } = await call('content', 'cms_write', { path: 'src/data/site.json', data: { ...was, wireWrote: true }, ref: read.envelope?.ref });
+  const onDisk = JSON.parse(fixture.read('src/data/site.json'));
+  return { envelope, checks: [
+    ['the new key is in the file on disk', onDisk.wireWrote === true],
+    // A write that persisted only the changed field left the page reading a
+    // `site.tagline` that no longer existed, and the single check above held.
+    ['the keys it was not asked about are still there', Object.keys(was).every((k) => k in onDisk)],
+    ['with the values they had', Object.keys(was).every((k) => JSON.stringify(onDisk[k]) === JSON.stringify(was[k]))],
+    ['including the one the page reads', typeof onDisk.tagline === 'string' && onDisk.tagline.length > 0],
+  ] };
 } });
 
 // A file existing is not the operation. `cms:create` seeds an empty collection
@@ -1292,10 +1345,15 @@ fullScenario({ domain: 'content', action: 'cms_set_meta', run: async ({ call, fi
 fullScenario({ domain: 'content', action: 'cms_delete', run: async ({ call, fixture }) => {
   await call('content', 'cms_create', { name: 'wireteam' });
   const before = fixture.exists('src/data/wireteam.json');
+  const siteBefore = fixture.read('src/data/site.json');
   const { envelope } = await call('content', 'cms_delete', { path: 'src/data/wireteam.json' });
   return { envelope, checks: [
     ['the data file was there first', before],
     ['and is gone', !fixture.exists('src/data/wireteam.json')],
+    // site.json is what <Hero heading={site.tagline}/> reads. A delete that
+    // cleared the folder would satisfy the two checks above and break the page.
+    ['the data file the page reads is untouched', fixture.read('src/data/site.json') === siteBefore],
+    ['and src/data itself is still there', fixture.exists('src/data')],
   ] };
 } });
 
@@ -1828,8 +1886,19 @@ fullScenario({ domain: 'git', action: 'worktrees', run: async ({ call, fixture }
 
 fullScenario({ domain: 'git', action: 'checkout', run: async ({ call, fixture }) => {
   await seedRepo(call);
+  const was = git(fixture, ['branch', '--show-current']);
+  // An uncommitted canary. A checkout implemented with `reset --hard` and
+  // `clean -fdx` puts the branch name right and destroys the user's work doing
+  // it, which is exactly what the one-check version could not see.
+  fixture.write('public/uncommitted-canary.txt', 'work in progress\n');
   const { envelope } = await call('git', 'checkout', { branch: 'wire-branch', create: true });
-  return { envelope, checks: [['git reports the new branch as current', git(fixture, ['branch', '--show-current']) === 'wire-branch']] };
+  return { envelope, checks: [
+    ['git reports the new branch as current', git(fixture, ['branch', '--show-current']) === 'wire-branch'],
+    ['which is not the branch it was on', was !== 'wire-branch'],
+    ['the uncommitted work came across untouched', fixture.exists('public/uncommitted-canary.txt') && fixture.read('public/uncommitted-canary.txt').includes('work in progress')],
+    ['the committed files are still here', fixture.read('src/pages/index.astro').includes('<Hero')],
+    ['and the branch it left still exists', git(fixture, ['branch', '--list', was]).includes(was)],
+  ] };
 } });
 
 fullScenario({ domain: 'git', action: 'merge', run: async ({ call, fixture }) => {
@@ -1952,8 +2021,16 @@ fullScenario({ domain: 'git', action: 'restore_file', run: async ({ call, fixtur
   await seedRepo(call);
   const committed = git(fixture, ['show', 'HEAD:src/pages/about.astro']);
   fixture.write('src/pages/about.astro', '<p>vandalised</p>\n');
+  // A SECOND DIRTY FILE, which must stay dirty. `restore_file` restoring the
+  // whole working tree — `git checkout <ref> -- .` — satisfies "this file
+  // matches HEAD" while throwing away everything else uncommitted.
+  fixture.write('public/keep-my-edit.txt', 'not committed, and not yours to revert\n');
   const { envelope } = await call('git', 'restore_file', { ref: 'HEAD', path: 'src/pages/about.astro' });
-  return { envelope, checks: [['the file matches what HEAD holds', fixture.read('src/pages/about.astro').trim() === committed.trim()]] };
+  return { envelope, checks: [
+    ['the file matches what HEAD holds', fixture.read('src/pages/about.astro').trim() === committed.trim()],
+    ['the other uncommitted change is still there', fixture.exists('public/keep-my-edit.txt') && fixture.read('public/keep-my-edit.txt').includes('not yours to revert')],
+    ['and git still reports it as unstaged work', git(fixture, ['status', '--porcelain']).includes('keep-my-edit.txt')],
+  ] };
 } });
 
 // THE WHOLE TREE, AND THE FILE THAT SHOULD NOT SURVIVE IT.
@@ -1998,13 +2075,20 @@ fullScenario({ domain: 'git', action: 'restore_project', run: async ({ call, fix
 
 fullScenario({ domain: 'git', action: 'delete_branch', run: async ({ call, fixture }) => {
   await seedRepo(call);
+  // TWO branches to choose between. With only one, "the named branch is gone"
+  // and "every branch is gone" describe the same world, so the scenario could
+  // not tell a delete from a purge.
   await call('git', 'checkout', { branch: 'wire-branch', create: true });
+  await call('git', 'checkout', { branch: 'wire-keeper', create: true });
   await call('git', 'checkout', { branch: 'main' });
   const before = git(fixture, ['branch', '--list', 'wire-branch']).includes('wire-branch');
   const { envelope } = await call('git', 'delete_branch', { branch: 'wire-branch', force: true });
+  const branches = git(fixture, ['branch', '--format=%(refname:short)']).split('\n').map((b) => b.trim()).filter(Boolean);
   return { envelope, checks: [
     ['the branch existed first', before],
-    ['and git no longer lists it', !git(fixture, ['branch', '--list', 'wire-branch']).includes('wire-branch')],
+    ['and git no longer lists it', !branches.includes('wire-branch')],
+    ['the branch it was not asked about survived', branches.includes('wire-keeper')],
+    ['and so did the one it is standing on', branches.includes('main')],
   ] };
 } });
 

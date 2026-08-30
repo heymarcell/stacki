@@ -31,7 +31,17 @@ function loadAutomationProject(env) {
   const end = src.indexOf("handle('project:pending'");
   if (start < 0 || end < 0 || end < start) throw new Error('automationProject is no longer where this test reads it from');
   const body = src.slice(start, end);
-  return new Function('fs', 'os', 'path', 'process', `${body}; return automationProject;`)(fs, os, path, { env });
+  // `os` is injected as well as `process`, and its tmpdir() answers from the
+  // INJECTED environment. Node's real os.tmpdir() reads the real process.env,
+  // so a test that only swapped `process` could not reproduce the thing it is
+  // checking: a launcher setting TMPDIR beside the automation flags. Without
+  // this, removing the platform-root list entirely left every check green.
+  const fakeOs = {
+    ...os,
+    tmpdir: () => env.TMPDIR || env.TMP || env.TEMP || os.tmpdir(),
+    homedir: () => os.homedir(),
+  };
+  return new Function('fs', 'os', 'path', 'process', `${body}; return automationProject;`)(fs, fakeOs, path, { env, platform: process.platform });
 }
 
 const MARKER = 'nonce-3f9c2a-owned-by-this-test';
@@ -135,6 +145,35 @@ try {
     'an unmarked project in the right place is refused',
     loadAutomationProject({ STACKI_AUTOMATION_PROJECT: unmarked, STACKI_AUTOMATION_MARKER: MARKER })() === null
   );
+
+  // ── the environment cannot move the fence ──────────────────────────────
+  //
+  // os.tmpdir() reads TMPDIR out of the environment, and the environment is set
+  // by whoever launches the app — the same actor that sets the two flags. So a
+  // launcher could once point TMPDIR at `/` and make "inside the temp
+  // directory" mean anywhere at all. The project below is real, marked, and
+  // correctly nonced; only the temp-root rule can refuse it.
+  {
+    const elsewhere = fs.mkdtempSync(path.join(__dirname, '..', '.stacki-bootstrap-tmpmoved-'));
+    owned.push(elsewhere);
+    fs.mkdirSync(path.join(elsewhere, 'src', 'pages'), { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'package.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(elsewhere, 'src', 'pages', 'index.astro'), '<h1>moved</h1>\n', 'utf8');
+    fs.writeFileSync(path.join(elsewhere, '.stacki-automation'), MARKER, 'utf8');
+    check(
+      'pointing TMPDIR at the parent does not make a project inside it openable',
+      loadAutomationProject({
+        TMPDIR: path.join(__dirname, '..'),
+        STACKI_AUTOMATION_PROJECT: elsewhere,
+        STACKI_AUTOMATION_MARKER: MARKER,
+      })() === null,
+      elsewhere
+    );
+    check(
+      'nor does pointing it at the filesystem root',
+      loadAutomationProject({ TMPDIR: '/', STACKI_AUTOMATION_PROJECT: elsewhere, STACKI_AUTOMATION_MARKER: MARKER })() === null
+    );
+  }
 
   // ── nothing is written down ────────────────────────────────────────────
   //

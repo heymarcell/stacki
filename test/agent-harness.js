@@ -177,7 +177,11 @@ const removeProject = (root) => {
   // second. The comment here used to say a folder that will not go is not a
   // test failure; it is exactly that, and test/support/ownedResidue.js says so
   // now, so the least this can do is try more than once.
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  // Long enough to outlast an esbuild binary still being unmapped out of the
+  // fixture's node_modules — the case that used to leave a 52K fragment behind.
+  // The residue check no longer removes anything itself, so this is the only
+  // thing that does, and it has to be patient enough to be the whole answer.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       fs.rmSync(root, { recursive: true, force: true });
       if (!fs.existsSync(root)) return;

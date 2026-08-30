@@ -53,17 +53,13 @@ async function residueOf(roots, { graceMs = 10000, everyMs = 400 } = {}) {
   const deadline = Date.now() + graceMs;
   let seen = snapshot(owned);
   while ((seen.dirs.length || seen.processes.length) && Date.now() < deadline) {
-    // Ask again for what would not go. A fixture with node_modules in it is
-    // often most of the way gone, with a fragment the operating system is still
-    // unmapping an esbuild binary out of — removable a moment later. Trying
-    // once and reporting a leak would be as wrong as never checking.
-    for (const dir of seen.dirs) {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* still held; the next round asks again */
-      }
-    }
+    // WAITING, NOT TIDYING. This used to rm every directory it found still
+    // there and then report on what was left — so the "nothing is on disk" half
+    // was self-fulfilling: had the harness's own removal stopped working
+    // entirely, this would have quietly done it instead and called the run
+    // clean. A judge that clears the evidence is not a judge. Removal belongs to
+    // whoever made the thing (test/agent-harness.js removeProject); this gives
+    // it time and then says what it sees.
     await new Promise((r) => setTimeout(r, everyMs));
     seen = snapshot(owned);
   }

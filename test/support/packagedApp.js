@@ -206,7 +206,15 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
    * is ownership by identity, not by program name: nothing here cares whether a
    * process is called node, astro or esbuild.
    */
-  const claimHelpers = () => manifest.processesUnder('a process in the project', opened);
+  const claimHelpers = () => {
+    manifest.processesUnder('a process in the project', opened);
+    // AND UNDER userData. Electron's own children — the renderer, the GPU
+    // process, the utility processes — carry `--user-data-dir=<userData>` in
+    // their argv and nothing else this run owns. They were invisible to a
+    // manifest that only looked at the project path, so an app that had to be
+    // SIGKILLed could leave its helpers behind and still be a clean run.
+    manifest.processesUnder('a helper of the app', userData);
+  };
 
   /** Claim everything claimable, at whatever moment this is called. */
   const claimAll = () => {
