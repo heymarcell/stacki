@@ -193,10 +193,12 @@ const FIXTURE_IDENTIFIERS = [
       check(`[${mode}] the guide carries no project data`, !/src\/pages\/index\.astro|--brand|pricing-grid/.test(guideText));
 
       // --- prompts/get returns real messages
-      const got = await client.getPrompt({ name: 'stacki_audit_and_fix', arguments: { route: '/' } });
+      const got = await client.getPrompt({ name: 'stacki_audit_and_fix', arguments: { route: '/audit-me' } });
       const promptText = (got.messages || []).map((m) => m.content?.text || '').join('\n');
       check(`[${mode}] prompts/get returns a user message`, (got.messages || []).length > 0 && got.messages[0].role === 'user');
-      check(`[${mode}] the audit prompt names the route it was given`, promptText.includes('/'));
+      // NOT `includes('/')` -- the guide URI in the body satisfies that, so
+      // dropping the route argument entirely would have kept it green.
+      check(`[${mode}] the audit prompt names the route it was given`, /the route \/audit-me\b/.test(promptText), short(promptText));
       check(`[${mode}] the audit prompt refuses the compliance claim`, /does not mean accessible/.test(promptText));
       // A prompt is an entry point, not a manual. If one starts inlining the
       // guides, the context cost comes back and the resources stop being pulled.
@@ -301,6 +303,31 @@ const FIXTURE_IDENTIFIERS = [
         // Whatever else it says, the profile never claims a project string is
         // something Stacki itself is asserting.
         check(`[${mode}] the profile never presents project text as Stacki's own guidance`, !/you must|you should now|instruction from the project/i.test(profileText), short(profileText.slice(0, 120)));
+      }
+
+      // --- IS IT LIVE, OR IS IT A SNAPSHOT?
+      //
+      // Every other check here reads the profile exactly once per server, so a
+      // version that computed it at startup and cached it for ever would pass all
+      // of them -- and would then describe a project that had since changed. The
+      // profile is assembled from api.run() calls on every read, and this is what
+      // says so: change the project on disk, read again, see the change.
+      if (mode === 'full') {
+        const fs = require('fs');
+        const path = require('path');
+        const added = path.join(rig.root, 'src/components/LivenessProbe.astro');
+        fs.writeFileSync(added, '<div class="liveness-probe">added after the first read</div>\n', 'utf8');
+        try {
+          const again = await client.readResource({ uri: PROFILE_URI });
+          const laterText = textOf(again);
+          check(
+            '[full] the profile is recomputed on every read, not cached',
+            laterText.includes('LivenessProbe') && !profileText.includes('LivenessProbe'),
+            `before had it: ${profileText.includes('LivenessProbe')}, after: ${laterText.includes('LivenessProbe')}`
+          );
+        } finally {
+          fs.rmSync(added, { force: true });
+        }
       }
 
       // --- THE HOST THAT IGNORES ALL OF THIS.

@@ -51,6 +51,9 @@ const SETTLE_MS = 250;
 // the truth about it in the result.
 const MAX_FINDINGS = 60;
 const MAX_CAPTURES = 3;
+// axe can return hundreds of nodes for one rule on a big page. Twelve is enough
+// to act on and the number is reported rather than assumed.
+const AXE_NODES_PER_RULE = 12;
 
 // ONE in-memory partition, shared by every audit, and deliberately not
 // `persist:` anything. It keeps the audit's storage out of the app's own session
@@ -167,7 +170,7 @@ function axeScript({ rules }) {
     const pack = (list, bucket) => list.map((rule) => ({
       id: rule.id, impact: rule.impact, help: rule.help, helpUrl: rule.helpUrl, tags: rule.tags,
       bucket,
-      nodes: rule.nodes.slice(0, 12).map((n) => ({
+      nodes: rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
         target: n.target,
         html: String(n.html || '').slice(0, 240),
         failureSummary: String(n.failureSummary || '').replace(/\\s+/g, ' ').slice(0, 240),
@@ -247,6 +250,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
 
     const findings = [];
     const captures = [];
+    let capturesWanted = 0;
     const perViewport = [];
     let axeVersion = null;
     let engineError = null;
@@ -282,7 +286,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
           const geo = await withTimeout(win.webContents.executeJavaScript(OVERFLOW, true), PROBE_TIMEOUT_MS, 'measuring overflow');
           if (geo.overflows) {
             for (const culprit of geo.culprits) {
-              findings.push(overflowFinding({ viewport, culprit, documentOverflowBy: geo.overflowBy }));
+              findings.push(
+                overflowFinding({
+                  viewport,
+                  culprit,
+                  documentOverflowBy: geo.overflowBy,
+                  measured: { viewportWidth: geo.viewportWidth, documentScrollWidth: geo.documentScrollWidth },
+                })
+              );
             }
             // THE DOCUMENT SCROLLS AND NOTHING WAS BLAMED.
             //
@@ -320,6 +331,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
           // Taken AFTER the measurements, from the same window, in the same
           // state, with nothing in between that could move the layout. The
           // caption and the picture are of one moment by construction.
+          if (capture && encodeImage) capturesWanted += 1;
           if (capture && captures.length < MAX_CAPTURES && encodeImage) {
             const image = await win.webContents.capturePage();
             if (!image.isEmpty()) {
@@ -391,6 +403,16 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
       engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError },
       viewports: perViewport,
       findings: kept,
+      // EVERY PLACE SOMETHING WAS DROPPED, SAID OUT LOUD. The claim is that
+      // nothing is silently discarded, and three things can be: elements past
+      // the culprit cap, axe nodes past twelve per rule, and captures past three.
+      // A caller that never hears about them cannot know to ask differently.
+      dropped: {
+        culpritsTruncatedAtViewports: perViewport.filter((v) => v.culpritsTruncated).map((v) => v.viewport.key),
+        axeNodesPerRuleCap: AXE_NODES_PER_RULE,
+        captureCap: MAX_CAPTURES,
+        capturesRequestedButNotTaken: capturesWanted > captures.length ? capturesWanted - captures.length : 0,
+      },
       // Never a silent truncation. If there were more, the count is the true one
       // and the flag says the list is not.
       findingCount: sorted.length,

@@ -109,6 +109,14 @@ const AuditOutput = z.object({
     incomplete: z.number().int(),
   }).optional(),
   captures: z.array(Capture).optional(),
+  dropped: z
+    .object({
+      culpritsTruncatedAtViewports: z.array(z.string()),
+      axeNodesPerRuleCap: z.number().int(),
+      captureCap: z.number().int(),
+      capturesRequestedButNotTaken: z.number().int(),
+    })
+    .optional(),
   limits: z.string().optional(),
 });
 

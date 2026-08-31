@@ -85,7 +85,7 @@ function targetOf({ selector, refPath, tag }) {
 }
 
 /** One mechanical overflow finding. */
-function overflowFinding({ viewport, culprit, documentOverflowBy }) {
+function overflowFinding({ viewport, culprit, documentOverflowBy, measured = null }) {
   const target = targetOf({ selector: culprit.selector, refPath: culprit.ref, tag: culprit.tag });
   const where = target.modelPath && target.exact ? target.modelPath : culprit.selector;
   // At 320 this is a named success criterion; anywhere else it is a measurement.
@@ -104,8 +104,16 @@ function overflowFinding({ viewport, culprit, documentOverflowBy }) {
       `clips, so the overflow reaches the document.`,
     target,
     evidence: {
-      viewportWidth: viewport.width,
-      documentScrollWidth: viewport.width + documentOverflowBy,
+      // MEASURED, not requested. The window was ASKED for viewport.width; what
+      // the document actually reported is clientWidth, and the two differ once a
+      // scrollbar or a zoom level is involved. documentScrollWidth used to be
+      // reconstructed as width + overflow, which is arithmetic on a number that
+      // was already arithmetic. Both come straight off the page now, with the
+      // requested width kept beside them so a mismatch is visible rather than
+      // hidden.
+      viewportWidth: measured?.viewportWidth ?? viewport.width,
+      requestedViewportWidth: viewport.width,
+      documentScrollWidth: measured?.documentScrollWidth ?? viewport.width + documentOverflowBy,
       documentOverflowBy,
       elementOverflowBy: culprit.overflowBy,
       edge: culprit.edge,
