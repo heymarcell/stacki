@@ -44,7 +44,7 @@ process.env.STACKI_NO_DIALOGS = '1';
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
-const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, MANY_COUNT } = require('./support/auditFixture.js');
+const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, MANY_COUNT, WIDE_COUNT } = require('./support/auditFixture.js');
 const { liveWindowCount } = require('../electron/mcp/audit');
 
 app.on('window-all-closed', () => {});
@@ -416,6 +416,28 @@ let stopPreview = null;
       check('  and it says the omission happened BEFORE scoring', (many.truncation?.omittedBeforeScoring?.axeNodes || 0) >= MANY_COUNT - 12, short(many.truncation?.omittedBeforeScoring));
       check('  the truncation block is self-consistent', many.truncation?.detected === many.findingCount && many.truncation?.returned === many.returnedFindingCount, short(many.truncation));
       check('  and the findings that DID come back are actionable', alts.length > 0 && alts.every((f) => f.target?.selector), short(alts.slice(0, 2).map((f) => f.target?.selector)));
+    }
+  }
+
+  // --- THE GEOMETRY CAP HAS ITS OWN PRE-CAP ACCOUNTING, AND IT WAS WRONG TWICE
+  //
+  // /wide has 50 unconstrained 520px blocks. The in-page walk may hand back at
+  // most 40, so the difference between "there were 40" and "there were 50 and you
+  // got 40" is the whole contract -- and the counter that was supposed to carry it
+  // sat AFTER the cap's skip, so it stopped counting at exactly the moment it
+  // started mattering. The axe path had /many; this path had nothing, which is
+  // why the bug survived a rewrite that was specifically about it.
+  {
+    const wide = await call('audit', { route: '/wide', viewports: ['phone'] });
+    check('the over-cap geometry route audits', wide.ok === true, short(wide));
+    if (wide.ok) {
+      const vp = (wide.viewports || [])[0];
+      check('the page really does overflow there', vp && vp.overflows === true, short(vp));
+      check('  and the walk counted every offender, not just the ones it kept', vp && vp.culpritsTruncated === true, short(vp));
+      check('  findingCount exceeds what the geometry cap returned', wide.findingCount > (wide.findings || []).filter((f) => f.ruleId === 'horizontal-overflow').length, short({ detected: wide.findingCount, returned: wide.returnedFindingCount }));
+      check('  and it is at least the number actually seeded', wide.findingCount >= WIDE_COUNT, `${wide.findingCount} vs ${WIDE_COUNT} seeded`);
+      check('  truncated says so', wide.truncated === true);
+      check('  and the omission is attributed to the in-page cap', (wide.truncation?.omittedBeforeScoring?.geometryCulprits || 0) > 0, short(wide.truncation?.omittedBeforeScoring));
     }
   }
 

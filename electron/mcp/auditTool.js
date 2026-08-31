@@ -198,7 +198,9 @@ function registerAuditTool(server, { audit, api }) {
           .describe(
             `Up to ${MAX_VIEWPORTS} viewports, by name (${VIEWPORT_NAMES.join(', ')}) or as {width,height}. ` +
               'Defaults to phone, tablet and desktop. Each one is a real page load. `reflow` is 320px, the width ' +
-              'WCAG 2.2 SC 1.4.10 names — overflow there is reported as a standards failure rather than a measurement.'
+              'WCAG 2.2 SC 1.4.10 names — overflow found there names that criterion in `relatedStandard`, but stays a ' +
+              'MEASUREMENT: the criterion exempts content needing a two-dimensional layout, and geometry cannot tell an ' +
+              'exempt data table from a layout that failed to reflow.'
           ),
         rules: z
           .array(z.string())

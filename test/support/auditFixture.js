@@ -230,6 +230,23 @@ import Base from '../layouts/AuditBase.astro';
 </Base>
 `;
 
+// MORE OVERFLOWING ELEMENTS THAN THE GEOMETRY CAP (40).
+//
+// The axe path had /many; the geometry path had nothing, and that is exactly why
+// its pre-cap accounting could be broken twice without a test noticing. Fifty
+// unconstrained 520px blocks overflow a 375px phone, so the in-page walk finds
+// fifty and may hand back at most forty.
+const WIDE_COUNT = 50;
+const WIDE_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>Many wide</h1>
+${Array.from({ length: WIDE_COUNT }, (_, i) => `  <div class="banner-overflow" data-n="${i + 1}">Wide ${i + 1}</div>`).join('\n')}
+  <div id="end"></div>
+</Base>
+`;
+
 const MANY_COUNT = 17;
 const MANY_PAGE = `---
 import Base from '../layouts/AuditBase.astro';
@@ -300,6 +317,7 @@ function auditFixture({ broken }) {
     'src/pages/clean.astro': CONTROL_PAGE,
     'src/pages/many.astro': MANY_PAGE,
     'src/pages/table.astro': TABLE_PAGE,
+    'src/pages/wide.astro': WIDE_PAGE,
     'src/pages/setstate.astro': SET_STATE_PAGE,
     'src/pages/seestate.astro': SEE_STATE_PAGE,
   };
@@ -326,4 +344,4 @@ const SEEDED_INCOMPLETE = [{ ruleId: 'duplicate-id-aria', kind: 'incomplete' }];
 // list exists.
 const MUST_NOT_FIRE_ON_CLEAN = ['horizontal-overflow', 'color-contrast', 'label', 'button-name', 'image-alt'];
 
-module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS, MANY_COUNT, AUDIT_STATE_VALUE };
+module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS, MANY_COUNT, WIDE_COUNT, AUDIT_STATE_VALUE };

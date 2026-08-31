@@ -177,6 +177,12 @@ const OVERFLOW = `(() => {
       }
       if (contained) continue;
 
+      // COUNT FIRST, THEN CAP. This increment used to sit at the END of the
+      // loop body, after the cap skipped the rest -- so once the cap was reached
+      // the counter stopped too, culpritTotal always equalled culprits.length,
+      // and truncated was permanently false. The rewrite meant to fix the
+      // pre-cap accounting reproduced the same bug one line further down.
+      culpritTotal += 1;
       const sel = selectorOf(el);
       if (culprits.length >= ${MAX_ELEMENTS}) continue;
       culprits.push({
@@ -201,7 +207,6 @@ const OVERFLOW = `(() => {
       // place the real number existed -- so a page with two hundred offenders
       // reported forty and had no way to say so. The walk now runs to the end
       // and the cap applies only to what is kept.
-      culpritTotal += 1;
     }
     // Widest offender first, then by position, so two runs of the same page
     // produce the same order and therefore the same finding ids.
