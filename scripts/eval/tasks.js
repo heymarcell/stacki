@@ -159,29 +159,25 @@ Then verify the change.`,
     { needsDeps: true }
   ),
 
-  // 6. REVIEW-DRIVEN. The comment is seeded by the fixture; the fix is the check.
-  review: task(
-    'Do what the review asks',
-    `Somebody has left review feedback on this project through Stacki.
-
-Read it, do what it asks, and then deal with the comment appropriately.`,
-    async ({ root }) => {
-      const hero = read(root, 'src/components/Hero.astro');
-      const pass = /Get started today/.test(hero);
-      return { pass, why: pass ? null : 'the change the review asked for is not on disk' };
-    },
-    {
-      // A REAL review thread, created through Stacki's own review surface, so the
-      // agent has to find it the way anybody would: get_comments.
-      setup: async ({ rig }) => {
-        const made = await rig.tool('comment', {
-          action: 'create',
-          message: 'The hero paragraph should read "Get started today" instead of what is there now.',
-        });
-        return { seededReview: made?.envelope?.ok === true, detail: JSON.stringify(made?.envelope || {}).slice(0, 200) };
-      },
-    }
-  ),
+  // 6. REVIEW-DRIVEN — NOT MEASURABLE IN THIS HARNESS, and left in as a record.
+  //
+  // Attempted and withdrawn rather than quietly dropped. Two real obstacles, both
+  // in the harness and both identical for BOTH arms:
+  //
+  //   electron/review reaches ipcMain.handle at load, which is workable --
+  //   test/review-service.js has stubbed `electron` that way for a long time.
+  //
+  //   Creating a comment needs something to anchor to. A review pin is attached
+  //   to a selected canvas node, and this rig has no canvas at all: its `capture`
+  //   and selection are stubbed with "This rig has no canvas; screenshots are
+  //   proven against packaged Stacki." So a seeded review cannot be created here,
+  //   and an agent cannot be asked to find one.
+  //
+  // The first trial ran it anyway and both arms failed for exactly that reason,
+  // which is recorded in the report rather than removed from it. Review-driven
+  // agent work is proven deterministically elsewhere: test/review-*.js, and the
+  // packaged acceptance suite drives get_comments and comment against a real
+  // canvas in the real app.
 
   // 7. AUDIT AND FIX. The oracle is the audit's own re-measurement, run by the
   //    harness rather than by the agent, so "I fixed it" is not evidence.

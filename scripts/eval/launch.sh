@@ -19,7 +19,9 @@ BASELINE_REPO="$SP/baseline-main"
 
 TRIAL="${1:-1}"
 OUT="${2:-$SP/eval}"
-TASKS="understand text style component content review auditfix"
+# `review` is absent: a review pin needs a canvas selection and this rig has
+# none. See scripts/eval/tasks.js for the full record of why it was withdrawn.
+TASKS="understand text style component content auditfix"
 
 mkdir -p "$OUT"
 
