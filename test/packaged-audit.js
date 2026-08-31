@@ -22,6 +22,9 @@
 //   Astro project this test made — its routes, its components, its Astro
 //   version — and not a canned object that happens to have the right shape.
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 const { startPackagedApp, available, APP } = require('./support/packagedApp.js');
 const { auditFixture, MUST_NOT_FIRE_ON_CLEAN } = require('./support/auditFixture.js');
 const { TOPIC_NAMES, uriFor } = require('../electron/mcp/guide.js');
@@ -143,13 +146,38 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       check('  the clean control claims no failure', claimed.length === 0, brief(claimed.map((f) => `${f.ruleId}@${f.viewport.key}`)));
 
       // ── remediation, through the packaged app ──────────────────────────
+      //
+      // PACKAGED FIX -> REAL FILE -> REAL PAGE -> REAL AUDIT -> REAL PIXELS.
+      //
+      // Four independent viewpoints, because a write that only proves itself is
+      // not proof: the MCP read, the actual bytes on the harness's own disk, the
+      // re-audit, and the picture.
       const overflow = ids('horizontal-overflow')[0];
+      const cssPath = path.join(app.project, 'src/styles/audit.css');
+      const beforeOnDisk = fs.readFileSync(cssPath, 'utf8');
+      check('  the stylesheet on disk starts with the defect', /width:\s*520px/.test(beforeOnDisk), brief(beforeOnDisk.slice(0, 80)));
+      const shotBefore = await app.call('audit', { route: '/audit', viewports: ['phone'], capture: true });
+      const capBefore = (shotBefore?.captures || [])[0] || null;
+      check('  a capture of the broken state comes back', !!capBefore, brief(shotBefore?.captures?.length));
+
       const css = await app.run('style', 'read_source', { path: 'src/styles/audit.css' });
       check('  the stylesheet reads through the bundle', css?.ok === true && typeof css.css === 'string', brief(css, 160));
       if (css?.ok && overflow) {
         const fixed = css.css.replace('  width: 520px;', '  width: 100%;\n  max-width: 520px;');
         const wrote = await app.run('style', 'write_source', { path: 'src/styles/audit.css', css: fixed, expectedDigest: css.digest });
         check('  the fix writes through the bundle', wrote?.ok === true, brief(wrote, 160));
+
+        // VIEWPOINT 1: the harness's own read of the real file on disk. Not the
+        // envelope, not an MCP answer -- the bytes.
+        const afterOnDisk = fs.readFileSync(cssPath, 'utf8');
+        check('  the actual file on disk carries the change', /max-width:\s*520px/.test(afterOnDisk), brief(afterOnDisk.slice(0, 120)));
+        check('  and no longer carries the defect', !/\n\s*width:\s*520px;/.test(afterOnDisk));
+        check('  and the file really changed', afterOnDisk !== beforeOnDisk);
+
+        // VIEWPOINT 2: the same file, read back through MCP.
+        const reread = await app.run('style', 'read_source', { path: 'src/styles/audit.css' });
+        check('  MCP reads the changed stylesheet back', reread?.ok === true && /max-width:\s*520px/.test(String(reread.css)), brief(reread?.css?.slice(0, 120)));
+        check('  and the two viewpoints agree', reread?.css === afterOnDisk);
 
         let gone = null;
         for (let i = 0; i < 20 && !gone; i += 1) {
@@ -162,6 +190,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         // cannot pass for a fix that worked.
         if (gone) {
           check('  while the defects nobody fixed are still reported', (gone.findings || []).some((f) => f.ruleId === 'color-contrast'), brief((gone.findings || []).map((f) => f.ruleId)));
+
+          // VIEWPOINT 4: the pixels. The banner is 520px wide before and
+          // full-width after, so two captures of the same route at the same width
+          // cannot legitimately be the same bytes.
+          const shotAfter = await app.call('audit', { route: '/audit', viewports: ['phone'], capture: true });
+          const capAfter = (shotAfter?.captures || [])[0] || null;
+          check('  a capture of the corrected state comes back', !!capAfter, brief(shotAfter?.captures?.length));
+          if (capBefore && capAfter) {
+            check('  and it is not the picture of the broken state', capAfter.data !== capBefore.data, `${capBefore.bytes} -> ${capAfter.bytes} bytes`);
+            check('  at the viewport the fix was measured at', capAfter.viewport.width === 375, brief(capAfter.viewport));
+          }
+          // VIEWPOINT 3 restated: the running page no longer overflows at all.
+          const vp = (gone.viewports || [])[0];
+          check('  and the running page no longer scrolls sideways', vp && vp.overflows === false, brief(vp));
         }
       }
     }

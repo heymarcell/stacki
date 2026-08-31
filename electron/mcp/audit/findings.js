@@ -100,6 +100,30 @@ function targetOf({ selector, refPath, tag, crossBoundary = false, match = null 
   };
 }
 
+// WHY 320px OVERFLOW IS NOT AUTOMATICALLY A WCAG FAILURE.
+//
+// `standard` means, in this file's own words, "a named rule that HAS BEEN
+// BROKEN". Horizontal overflow at the 320px reflow width was being promoted
+// straight to that, purely because the requested width happened to be 320 --
+// which asserts a conclusion the detector cannot reach.
+//
+// WCAG 2.2 SC 1.4.10 exempts content that requires a two-dimensional layout for
+// usage or meaning: data tables, maps, diagrams, video, games, presentations,
+// some complex interfaces. A geometry probe measures boxes. It does not know
+// whether the thing sticking out is a pricing table that should have wrapped or
+// a train timetable that legitimately cannot.
+//
+// So the measurement stays `mechanical`, the criterion is named as RELATED
+// rather than as broken, and the exception is stated in the finding itself. If a
+// vetted standards engine ever returns a real 1.4.10 violation, that is a
+// different evidence source and may carry `kind: 'standard'` on its own account.
+const REFLOW_CRITERION = 'WCAG 2.2 SC 1.4.10 Reflow';
+const REFLOW_NOTE =
+  'This is a measurement, not a verdict. Content that requires a two-dimensional layout for its usage or ' +
+  'meaning — a data table, a map, a diagram, a video, a game — is exempt from SC 1.4.10, and this check cannot ' +
+  'tell those apart from a layout that simply failed to reflow. Decide which this is before treating it as a ' +
+  'failure.';
+
 /** One mechanical overflow finding. */
 function overflowFinding({ viewport, culprit, documentOverflowBy, measured = null }) {
   const target = targetOf({ selector: culprit.selector, refPath: culprit.ref, tag: culprit.tag, match: culprit.match });
@@ -110,20 +134,24 @@ function overflowFinding({ viewport, culprit, documentOverflowBy, measured = nul
     target.modelPath && target.exact
       ? target.modelPath
       : `${culprit.selector}[${culprit.match?.index ?? 0}]`;
-  // At 320 this is a named success criterion; anywhere else it is a measurement.
+  // AT 320 THIS IS STILL A MEASUREMENT. See reflowNote() below.
   const isReflow = viewport.standard != null;
   return {
     id: findingId({ ruleId: 'horizontal-overflow', viewport: viewport.key, where }),
     ruleId: 'horizontal-overflow',
     category: 'responsive',
-    kind: isReflow ? 'standard' : 'mechanical',
+    kind: 'mechanical',
     severity: 'serious',
-    standard: isReflow ? viewport.standard : null,
+    // Named as RELATED, never as broken. `standard` stays null because nothing
+    // here establishes a violation.
+    standard: null,
+    relatedStandard: isReflow ? REFLOW_CRITERION : null,
     viewport: { key: viewport.key, width: viewport.width, height: viewport.height, device: viewport.device },
     message:
       `The page scrolls ${documentOverflowBy}px sideways at ${viewport.width}px wide, and this element extends ` +
       `${culprit.overflowBy}px past the ${culprit.edge} edge. Nothing between it and the page root scrolls or ` +
-      `clips, so the overflow reaches the document.`,
+      `clips, so the overflow reaches the document.` +
+      (isReflow ? ` ${REFLOW_NOTE}` : ''),
     target,
     evidence: {
       // MEASURED, not requested. The window was ASKED for viewport.width; what
@@ -167,15 +195,16 @@ function unattributedOverflowFinding({ viewport, documentOverflowBy }) {
     id: findingId({ ruleId: 'horizontal-overflow', viewport: viewport.key, where: 'document' }),
     ruleId: 'horizontal-overflow',
     category: 'responsive',
-    kind: isReflow ? 'standard' : 'mechanical',
+    kind: 'mechanical',
     severity: 'serious',
-    standard: isReflow ? viewport.standard : null,
+    standard: null,
+    relatedStandard: isReflow ? REFLOW_CRITERION : null,
     viewport: { key: viewport.key, width: viewport.width, height: viewport.height, device: viewport.device },
     message:
       `The page scrolls ${documentOverflowBy}px sideways at ${viewport.width}px wide, and no single element ` +
       'could be held responsible for it: everything that extends past the edge is inside something that ' +
       'contains it, is fixed to the viewport, or has no box of its own. The overflow is real; the cause needs ' +
-      'a person.',
+      'a person.' + (isReflow ? ` ${REFLOW_NOTE}` : ''),
     target: {
       selector: null,
       tag: null,
@@ -245,6 +274,8 @@ function sortFindings(list) {
 
 module.exports = {
   KINDS,
+  REFLOW_CRITERION,
+  REFLOW_NOTE,
   SEVERITIES,
   findingId,
   targetOf,

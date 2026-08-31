@@ -119,6 +119,7 @@ const OVERFLOW = `(() => {
   const overflows = docOverflow >= 2;
 
   const culprits = [];
+  let culpritTotal = 0;
   if (overflows) {
     const all = document.querySelectorAll('body *');
     for (const el of all) {
@@ -177,6 +178,7 @@ const OVERFLOW = `(() => {
       if (contained) continue;
 
       const sel = selectorOf(el);
+      if (culprits.length >= ${MAX_ELEMENTS}) continue;
       culprits.push({
         selector: sel,
         match: matchIndexOf(el, sel),
@@ -193,7 +195,13 @@ const OVERFLOW = `(() => {
         ref: refPathOf(el),
         text: clip(el.textContent),
       });
-      if (culprits.length >= ${MAX_ELEMENTS}) break;
+      // COUNT EVERYTHING, KEEP THE FIRST N.
+      //
+      // This used to break out, which capped the list AND destroyed the only
+      // place the real number existed -- so a page with two hundred offenders
+      // reported forty and had no way to say so. The walk now runs to the end
+      // and the cap applies only to what is kept.
+      culpritTotal += 1;
     }
     // Widest offender first, then by position, so two runs of the same page
     // produce the same order and therefore the same finding ids.
@@ -210,7 +218,9 @@ const OVERFLOW = `(() => {
     overflowBy: docOverflow,
     overflows,
     culprits,
-    truncated: culprits.length >= ${MAX_ELEMENTS},
+    // The true number that qualified, whether or not it fitted.
+    culpritTotal,
+    truncated: culpritTotal > culprits.length,
   };
 })()`;
 

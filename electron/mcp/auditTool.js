@@ -67,7 +67,12 @@ const Finding = z.object({
   category: z.string(),
   kind: z.enum(['mechanical', 'standard', 'advisory', 'incomplete']),
   severity: z.enum(['critical', 'serious', 'moderate', 'minor', 'info']),
+  // A named rule that HAS BEEN BROKEN. Null for measurements.
   standard: z.string().nullable(),
+  // A criterion this measurement RELATES to without establishing a violation of
+  // it -- horizontal overflow at 320px and WCAG 2.2 SC 1.4.10, whose
+  // two-dimensional-layout exception a geometry probe cannot evaluate.
+  relatedStandard: z.string().nullable().optional(),
   viewport: Viewport,
   message: z.string(),
   target: Target,
@@ -100,11 +105,33 @@ const AuditOutput = z.object({
   runId: z.string().optional(),
   route: z.string().optional(),
   url: z.string().optional(),
-  engine: z.object({ accessibility: z.string().nullable(), error: z.string().nullable() }).optional(),
+  engine: z
+    .object({
+      accessibility: z.string().nullable(),
+      error: z.string().nullable(),
+      // Whether this run actually began from a wiped audit session.
+      sessionIsolated: z.boolean().optional(),
+    })
+    .optional(),
   viewports: z.array(z.unknown()).optional(),
   findings: z.array(Finding).optional(),
+  // findingCount is the TRUE number detected, before any cap. returnedFindingCount
+  // is what `findings` holds. See electron/mcp/audit/index.js.
   findingCount: z.number().int().optional(),
+  returnedFindingCount: z.number().int().optional(),
+  omittedFindingCount: z.number().int().optional(),
   truncated: z.boolean().optional(),
+  truncation: z
+    .object({
+      detected: z.number().int(),
+      returned: z.number().int(),
+      omitted: z.number().int(),
+      omittedBeforeScoring: z.object({ geometryCulprits: z.number().int(), axeNodes: z.number().int() }),
+      omittedByResponseBudget: z.number().int(),
+      responseCap: z.number().int(),
+      incompleteReserved: z.number().int(),
+    })
+    .optional(),
   counts: z.object({
     mechanical: z.number().int(),
     standard: z.number().int(),
@@ -131,7 +158,9 @@ const DESCRIPTION = [
   'rule that has been broken, `advisory` is a heuristic, and `incomplete` is one the engine could not decide and',
   'a person has to look at. No violations does NOT mean accessible or WCAG compliant, and nothing here produces',
   'a design or quality score. The audit never writes to the project, never clicks or submits anything, and runs',
-  'in a window of its own — it does not touch what the person is looking at. Needs `inspect`.',
+  'in a window of its own — it does not touch what the person is looking at, and it starts from a wiped browser',
+  'session so one audit never inherits another\'s cookies or storage. `findingCount` is the TRUE number detected;',
+  '`returnedFindingCount` is how many came back, and `truncation` says where the rest went. Needs `inspect`.',
 ].join(' ');
 
 /**

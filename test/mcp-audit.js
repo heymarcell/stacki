@@ -27,6 +27,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { app, BrowserWindow, dialog } = require('electron');
 
 const failures = [];
@@ -43,7 +44,7 @@ process.env.STACKI_NO_DIALOGS = '1';
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
-const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN } = require('./support/auditFixture.js');
+const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, MANY_COUNT } = require('./support/auditFixture.js');
 const { liveWindowCount } = require('../electron/mcp/audit');
 
 app.on('window-all-closed', () => {});
@@ -115,7 +116,19 @@ async function until(what, fn, { timeout = 60000, every = 250 } = {}) {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-/** Every file in the project that a person would notice changing. */
+/**
+ * Every file in the project that a person would notice changing, BY CONTENT.
+ *
+ * This used to store fs.statSync(full).size, and the check built on it was named
+ * "the audit wrote nothing to the project". A same-length rewrite -- one
+ * character swapped for another -- passed it. That is the exact shape of a
+ * false-green oracle: a name that promises content and an implementation that
+ * compares length.
+ *
+ * SHA-256 of the bytes, keyed by relative path, so a change, an addition and a
+ * removal are all visible and none of them depends on size. Hashes rather than
+ * contents so a failure prints a path and a digest instead of a file.
+ */
 function projectBytes(dir) {
   const skip = new Set(['node_modules', '.git', 'dist', '.astro', '.stacki']);
   const out = new Map();
@@ -127,7 +140,7 @@ function projectBytes(dir) {
       if (e.isDirectory()) walk(full, depth + 1);
       else {
         try {
-          out.set(path.relative(dir, full), fs.statSync(full).size);
+          out.set(path.relative(dir, full), crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex').slice(0, 16));
         } catch {
           /* a file that vanished mid-walk is reported by the comparison */
         }
@@ -142,7 +155,7 @@ const diffBytes = (a, b) => {
   for (const [k, v] of b) if (!a.has(k)) changed.push(`added ${k}`);
   for (const [k, v] of a) {
     if (!b.has(k)) changed.push(`removed ${k}`);
-    else if (b.get(k) !== v) changed.push(`changed ${k} (${v} -> ${b.get(k)})`);
+    else if (b.get(k) !== v) changed.push(`changed ${k} (sha ${v} -> ${b.get(k)})`);
   }
   return changed;
 };
@@ -351,13 +364,91 @@ let stopPreview = null;
     check('  and the route reported is the real one', hashed.ok === true && hashed.route === '/audit', short(hashed.route));
   }
 
-  // --- 320 is a standards failure, other widths are a measurement
+  // --- ONE AUDIT MUST NOT INHERIT ANOTHER'S BROWSER STATE
+  //
+  // /setstate writes a cookie and a localStorage value as it loads. /seestate
+  // looks for them and turns the answer into a finding: leaked state gives an
+  // image with no alternative, a clean session gives the same image with one.
+  //
+  // This is the shape of a real defect. Measured on the shared partition this
+  // engine used to use: a window that wrote those values, destroyed, then a fresh
+  // window on the same partition read them straight back. Not persisted to disk
+  // and not shared between runs are different properties, and only the first was
+  // ever true.
+  {
+    const seed = await call('audit', { route: '/setstate', viewports: ['phone'] });
+    check('the state-writing route audits', seed.ok === true, short(seed));
+    check('  and the audit says it isolated its session', seed.engine?.sessionIsolated === true, short(seed.engine));
+
+    const after = await call('audit', { route: '/seestate', viewports: ['phone'] });
+    check('the state-reading route audits', after.ok === true, short(after));
+    const leaked = (after.findings || []).filter((f) => f.ruleId === 'image-alt');
+    check(
+      'a later audit sees NOTHING the earlier one wrote',
+      leaked.length === 0,
+      leaked.length ? `leaked: ${short(leaked.map((f) => f.target?.selector))}` : ''
+    );
+
+    // And again, so it is a property of every boundary rather than of the first.
+    await call('audit', { route: '/setstate', viewports: ['phone'] });
+    const third = await call('audit', { route: '/seestate', viewports: ['phone'] });
+    check('and the boundary holds on the next cycle too', (third.findings || []).every((f) => f.ruleId !== 'image-alt'), short((third.findings || []).map((f) => f.ruleId)));
+    check('no audit window survived the isolation checks', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
+  }
+
+  // --- WHAT THE CAPS HID, COUNTED
+  //
+  // /many carries 17 images with no alternative. The audit takes at most 12 axe
+  // nodes per rule OUT OF THE PAGE, before Stacki has seen anything -- so the
+  // count that used to be called "the true one" was the number that survived a
+  // cap it could not see past. A caller reading 12 could not tell "there were 12"
+  // from "there were 17 and you got 12".
+  {
+    const many = await call('audit', { route: '/many', viewports: ['phone'] });
+    check('the over-cap route audits', many.ok === true, short(many));
+    if (many.ok) {
+      const alts = (many.findings || []).filter((f) => f.ruleId === 'image-alt');
+      check(`findingCount reports the TRUE total, not the capped one`, many.findingCount >= MANY_COUNT, `findingCount=${many.findingCount}, seeded=${MANY_COUNT}`);
+      check('  and returnedFindingCount matches what actually came back', many.returnedFindingCount === (many.findings || []).length, `${many.returnedFindingCount} vs ${(many.findings || []).length}`);
+      check('  and the returned list obeys the per-rule cap', alts.length <= 12, `${alts.length} image-alt findings returned`);
+      check('  so truncated is true', many.truncated === true, short({ truncated: many.truncated }));
+      check('  and omitted is the difference', many.omittedFindingCount === many.findingCount - many.returnedFindingCount, short({ omitted: many.omittedFindingCount, detected: many.findingCount, returned: many.returnedFindingCount }));
+      check('  and it says the omission happened BEFORE scoring', (many.truncation?.omittedBeforeScoring?.axeNodes || 0) >= MANY_COUNT - 12, short(many.truncation?.omittedBeforeScoring));
+      check('  the truncation block is self-consistent', many.truncation?.detected === many.findingCount && many.truncation?.returned === many.returnedFindingCount, short(many.truncation));
+      check('  and the findings that DID come back are actionable', alts.length > 0 && alts.every((f) => f.target?.selector), short(alts.slice(0, 2).map((f) => f.target?.selector)));
+    }
+  }
+
+  // --- 320 IS A MEASUREMENT THAT RELATES TO A CRITERION, NOT A VERDICT ON IT
+  //
+  // This block used to assert the opposite: that overflow at 320 came back as
+  // `kind: 'standard'`. That was an overclaim. WCAG 2.2 SC 1.4.10 exempts content
+  // needing a two-dimensional layout -- data tables, maps, diagrams, video -- and
+  // a geometry probe cannot tell an exempt table from a layout that failed to
+  // reflow. The measurement is real; the verdict is not Stacki's to give.
   {
     const reflow = await call('audit', { route: '/audit', viewports: ['reflow'] });
     check('the reflow viewport audits', reflow.ok === true, short(reflow));
     const o = (reflow.findings || []).filter((f) => f.ruleId === 'horizontal-overflow');
-    check('overflow at 320 is reported as a standard', o.length > 0 && o.every((f) => f.kind === 'standard'), short(o.map((f) => f.kind)));
-    check('and it names the success criterion', o.length > 0 && /1\.4\.10/.test(String(o[0].standard)), short(o[0]?.standard));
+    check('overflow at 320 is still detected', o.length > 0, short((reflow.findings || []).map((f) => f.ruleId)));
+    check('  and it is a MEASUREMENT, not a standards verdict', o.every((f) => f.kind === 'mechanical'), short(o.map((f) => f.kind)));
+    check('  and it claims no broken rule', o.every((f) => f.standard === null), short(o.map((f) => f.standard)));
+    check('  while still naming the criterion it relates to', o.length > 0 && /1\.4\.10/.test(String(o[0].relatedStandard)), short(o[0]?.relatedStandard));
+    check('  and saying the exception exists', o.length > 0 && /two-dimensional layout/.test(String(o[0].message)), short(o[0]?.message));
+    check('  and never asserting compliance either way', o.every((f) => !/violates|non-compliant|fails WCAG/i.test(String(f.message))));
+
+    // THE EXCEPTION IN THE FLESH, on a route of its own.
+    //
+    // A timetable overflows at 320 and may be entirely legitimate in doing so.
+    // The audit may report the geometry; it may not call it a failure. If this
+    // ever comes back as `standard`, Stacki is telling somebody their timetable
+    // breaks WCAG on the strength of its width.
+    const tableRun = await call('audit', { route: '/table', viewports: ['reflow'] });
+    check('the exception route audits at 320', tableRun.ok === true, short(tableRun));
+    const table = (tableRun.findings || []).filter((f) => f.ruleId === 'horizontal-overflow');
+    check('  a wide data table at 320 is still measured', table.length > 0, short((tableRun.findings || []).map((f) => f.ruleId)));
+    check('  but reported as measurement only', table.every((f) => f.kind === 'mechanical' && f.standard === null), short(table.map((f) => `${f.kind}/${f.standard}`)));
+    check('  with the criterion named as related, not broken', table.every((f) => /1\.4\.10/.test(String(f.relatedStandard))), short(table.map((f) => f.relatedStandard)));
   }
 
   // --- evidence, in the state it was measured in
@@ -572,10 +663,20 @@ let stopPreview = null;
   });
 
 async function finish() {
+  // A DEV SERVER THAT WILL NOT STOP IS OWNED RESIDUE.
+  //
+  // This said "reported by the residue check below", and there was no such check
+  // for the dev server -- so a preview that refused to stop was swallowed twice
+  // over. It is a named failure now.
   try {
-    if (stopPreview) await stopPreview();
-  } catch {
-    /* reported by the residue check below */
+    const said = stopPreview ? await stopPreview() : null;
+    if (said && said.ok === false) {
+      failures.push(`  the dev server would not stop: ${said.message || said.code || 'refused'}`);
+      checked++;
+    }
+  } catch (err) {
+    failures.push(`  stopping the dev server threw: ${err?.message || err}`);
+    checked++;
   }
   // CLEANUP FAILURE IS TEST FAILURE.
   check('no audit window outlived the run', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
@@ -583,11 +684,27 @@ async function finish() {
     removeCanvasProject(root);
   } catch (err) {
     failures.push(`  the fixture would not come down: ${err?.message || err}`);
+    checked++;
   }
+  if (fs.existsSync(root)) {
+    failures.push(`  the owned fixture is still on disk: ${root}`);
+    checked++;
+  }
+  // CLEANUP FAILURE IS TEST FAILURE.
+  //
+  // This was `catch { /* best effort */ }`, which is the one thing the standard
+  // this repository runs on forbids: a userData directory that cannot be removed
+  // is owned residue, and swallowing the error printed green over it.
   try {
     releaseTempDir(userData);
-  } catch {
-    /* best effort */
+  } catch (err) {
+    failures.push(`  the owned userData directory would not come down: ${err?.message || err}`);
+    checked++;
+  }
+  // And prove it actually went, rather than trusting a call that did not throw.
+  if (fs.existsSync(userData)) {
+    failures.push(`  the owned userData directory is still on disk: ${userData}`);
+    checked++;
   }
   if (failures.length) {
     console.error(`\nmcp-audit: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

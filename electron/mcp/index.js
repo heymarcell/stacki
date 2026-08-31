@@ -14,7 +14,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const { app, ipcMain, BrowserWindow } = require('electron');
+const { app, ipcMain, BrowserWindow, session } = require('electron');
 
 const { locateSelection } = require('../astroParser');
 const { selectionTrail } = require('../selectionTrail');
@@ -305,6 +305,9 @@ async function startMcp({
     BrowserWindow,
     getPreviewUrl: () => getDevUrl(),
     encodeImage,
+    // The audit session is wiped at every run boundary, so one audit cannot read
+    // what the last one left behind. See electron/mcp/audit/index.js.
+    session,
   });
 
   const port = resolvePort(settings);

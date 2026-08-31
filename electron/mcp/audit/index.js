@@ -55,12 +55,39 @@ const MAX_CAPTURES = 3;
 // to act on and the number is reported rather than assumed.
 const AXE_NODES_PER_RULE = 12;
 
-// ONE in-memory partition, shared by every audit, and deliberately not
-// `persist:` anything. It keeps the audit's storage out of the app's own session
-// -- an audit must not inherit a login or leave one behind -- while a partition
-// PER RUN would mint a fresh Session object every time somebody audits a page,
-// for the lifetime of the process, to isolate reads from reads.
+// ONE in-memory partition, and it is CLEARED AT EVERY AUDIT BOUNDARY.
+//
+// The partition alone was not isolation, and the comment that used to sit here
+// said it was. Measured, on this Electron, with two windows on one origin: a
+// window that set a cookie and a localStorage value, destroyed, then a FRESH
+// window on the same partition -- which read back `probe=FROM_A` and `FROM_A`.
+// The session survives its last window, so audit N+1 inherited audit N. Not
+// persisted to disk is a different property from not shared between runs, and
+// only the first was ever true.
+//
+// A partition per run would isolate, and would mint a Session object per audit
+// for the life of the process. So: one bounded session, wiped at the boundary.
+// clearStorageData covers cookies, DOM storage, IndexedDB, service workers and
+// cache storage; clearCache and clearAuthCache take the two that sit outside it.
+// Verified to bring a following window back to `cookie: ""`, `localStorage:
+// null`, across two consecutive cycles.
 const AUDIT_PARTITION = 'stacki-audit';
+
+/**
+ * Wipe the audit session.
+ *
+ * `session` arrives through the factory rather than being required here, so this
+ * module still loads in a plain node process and a test can hand it a fake.
+ */
+async function resetAuditSession(session) {
+  if (!session || typeof session.fromPartition !== 'function') return { ok: false, reason: 'no session api' };
+  const ses = session.fromPartition(AUDIT_PARTITION);
+  await ses.clearStorageData();
+  await ses.clearCache();
+  // Present since Electron 2; guarded because a fake in a test need not have it.
+  if (typeof ses.clearAuthCache === 'function') await ses.clearAuthCache();
+  return { ok: true };
+}
 
 // axe.min.js rather than the package's own `source` property: that one is the
 // UNMINIFIED build at 1.3 MB, and this string is injected into a page on every
@@ -178,9 +205,14 @@ function axeScript({ rules }) {
       return { refPath, tag: el.tagName.toLowerCase(),
                rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) } };
     };
+    // nodeTotal is the number axe ACTUALLY found for this rule, carried out
+    // alongside the capped list. Without it the slice below is the only number
+    // that ever reaches Stacki, and a rule with fifty offenders is
+    // indistinguishable from one with twelve.
     const pack = (list, bucket) => list.map((rule) => ({
       id: rule.id, impact: rule.impact, help: rule.help, helpUrl: rule.helpUrl, tags: rule.tags,
       bucket,
+      nodeTotal: rule.nodes.length,
       nodes: rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
         target: n.target,
         html: String(n.html || '').slice(0, 240),
@@ -204,7 +236,15 @@ function axeScript({ rules }) {
  * Everything Electron arrives as an argument, so the orchestration can be tested
  * without an app and the module can be required in a plain node process.
  */
-function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
+function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session = null }) {
+  // ONE AUDIT AT A TIME.
+  //
+  // The session is shared and wiped at the boundary, so two overlapping runs
+  // would clear each other's state halfway through and report on a page whose
+  // cookies vanished underneath it. Runs queue instead. This is a real
+  // constraint of the design, not an oversight: the alternative is a session per
+  // run, which is the unbounded thing being avoided.
+  let queue = Promise.resolve();
   /**
    * @param {object} opts
    * @param {string=} opts.route          route to audit; defaults to the site root
@@ -212,7 +252,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
    * @param {Array=}  opts.rules          specific accessibility rule ids; defaults to WCAG A/AA
    * @param {boolean=} opts.capture       return a screenshot per viewport
    */
-  async function run({ route = '/', viewports: wanted, rules = null, capture = false } = {}) {
+  async function run(opts = {}) {
+    // Chain rather than reject: a second audit waits its turn.
+    const mine = queue.then(() => runExclusive(opts));
+    queue = mine.catch(() => {});
+    return mine;
+  }
+
+  async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}) {
     const chosen = resolveViewports(wanted);
     if (!chosen.ok) return chosen;
 
@@ -265,8 +312,19 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
     const perViewport = [];
     let axeVersion = null;
     let engineError = null;
+    let sessionReset = null;
+    // THE TRUE NUMBER DETECTED, counted before any cap discards anything.
+    //
+    // findingCount used to be `sorted.length`, described in a comment as "the
+    // true one". It was the number that SURVIVED two earlier caps: twelve axe
+    // nodes per rule inside the page, and forty geometry culprits. A rule with
+    // fifty violations reported twelve and called it the total.
+    let detectedTotal = 0;
+    const omittedBefore = { geometryCulprits: 0, axeNodes: 0 };
 
     try {
+      // BEFORE: nothing this audit sees was put there by the last one.
+      sessionReset = await resetAuditSession(session);
       for (const viewport of chosen.viewports) {
         const started = Date.now();
         let win = null;
@@ -296,6 +354,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
           // --- geometry
           const geo = await withTimeout(win.webContents.executeJavaScript(OVERFLOW, true), PROBE_TIMEOUT_MS, 'measuring overflow');
           if (geo.overflows) {
+            // Every qualifying culprit counts, including the ones the in-page cap
+            // did not hand back.
+            detectedTotal += geo.culpritTotal || geo.culprits.length;
+            omittedBefore.geometryCulprits += Math.max(0, (geo.culpritTotal || 0) - geo.culprits.length);
             for (const culprit of geo.culprits) {
               findings.push(
                 overflowFinding({
@@ -316,6 +378,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
             // So the measurement itself is the finding, with no element on it.
             if (geo.culprits.length === 0) {
               findings.push(unattributedOverflowFinding({ viewport, documentOverflowBy: geo.overflowBy }));
+              detectedTotal += 1;
             }
           }
 
@@ -325,11 +388,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
             await win.webContents.executeJavaScript(axeSource(), true);
             axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine');
             axeVersion = axeResult.version;
-            for (const rule of axeResult.violations) {
-              for (const node of rule.nodes) findings.push(axeFinding({ viewport, rule, node, bucket: 'violation' }));
-            }
-            for (const rule of axeResult.incomplete) {
-              for (const node of rule.nodes) findings.push(axeFinding({ viewport, rule, node, bucket: 'incomplete' }));
+            for (const bucket of ['violation', 'incomplete']) {
+              const rules = bucket === 'violation' ? axeResult.violations : axeResult.incomplete;
+              for (const rule of rules) {
+                const total = typeof rule.nodeTotal === 'number' ? rule.nodeTotal : rule.nodes.length;
+                detectedTotal += total;
+                omittedBefore.axeNodes += Math.max(0, total - rule.nodes.length);
+                for (const node of rule.nodes) findings.push(axeFinding({ viewport, rule, node, bucket }));
+              }
             }
           } catch (err) {
             // A page that breaks the engine must not silently become a clean
@@ -389,6 +455,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
       }
     } catch (err) {
       return { ok: false, code: 'audit_failed', message: String(err?.message || err).slice(0, 300), runId };
+    } finally {
+      // AFTER, on every path out including the ones that threw: nothing this
+      // audit created outlives it for the next one to read.
+      await resetAuditSession(session).catch(() => {});
     }
 
     const sorted = sortFindings(findings);
@@ -411,13 +481,41 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
       runId,
       route: safeRoute,
       url,
-      engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError },
+      engine: {
+        accessibility: axeVersion ? `axe-core ${axeVersion}` : null,
+        error: engineError,
+        // Whether the audit actually started from a wiped session, rather than
+        // whether the code meant to.
+        sessionIsolated: sessionReset?.ok === true,
+      },
       viewports: perViewport,
       findings: kept,
+      // THE TRUE TOTAL, counted before any cap discarded anything.
+      //
+      // `findingCount` is what the engine DETECTED. `returnedFindingCount` is
+      // what is in `findings`. `truncated` is true if anything was dropped at
+      // ANY layer -- the in-page geometry cap, the per-rule axe node cap, or the
+      // response cap below. A caller reading 12 no longer has to wonder whether
+      // that means "there were 12" or "there may have been 500".
+      findingCount: detectedTotal,
+      returnedFindingCount: kept.length,
+      omittedFindingCount: Math.max(0, detectedTotal - kept.length),
       // EVERY PLACE SOMETHING WAS DROPPED, SAID OUT LOUD. The claim is that
       // nothing is silently discarded, and three things can be: elements past
       // the culprit cap, axe nodes past twelve per rule, and captures past three.
       // A caller that never hears about them cannot know to ask differently.
+      // WHERE it was dropped, layer by layer, so the number above is checkable.
+      truncation: {
+        detected: detectedTotal,
+        returned: kept.length,
+        omitted: Math.max(0, detectedTotal - kept.length),
+        // Discarded inside the page, before Stacki ever saw them.
+        omittedBeforeScoring: omittedBefore,
+        // Discarded by the response budget, after scoring.
+        omittedByResponseBudget: Math.max(0, sorted.length - kept.length),
+        responseCap: MAX_FINDINGS,
+        incompleteReserved: INCOMPLETE_SHARE,
+      },
       dropped: {
         culpritsTruncatedAtViewports: perViewport.filter((v) => v.culpritsTruncated).map((v) => v.viewport.key),
         axeNodesPerRuleCap: AXE_NODES_PER_RULE,
@@ -426,8 +524,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
       },
       // Never a silent truncation. If there were more, the count is the true one
       // and the flag says the list is not.
-      findingCount: sorted.length,
-      truncated: sorted.length > kept.length,
+      truncated: detectedTotal > kept.length,
       counts: {
         mechanical: sorted.filter((f) => f.kind === 'mechanical').length,
         standard: sorted.filter((f) => f.kind === 'standard').length,
@@ -449,6 +546,8 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
 
 module.exports = {
   createAudit,
+  resetAuditSession,
+  AUDIT_PARTITION,
   liveWindowCount,
   liveWindows,
   axeSource,

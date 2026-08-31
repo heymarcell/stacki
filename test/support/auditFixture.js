@@ -70,6 +70,12 @@ button { color: var(--ink); background: #f0f0f0; border: 1px solid #767676; }
    overflow detector that blames them is worse than useless -- they sort to the
    top, so the two most prominent findings on a well-built page are its
    accessibility features. Present in BOTH variants, never reported in either. */
+/* A data table that genuinely needs its width. At 320 it overflows, and WCAG 2.2
+   SC 1.4.10 exempts content requiring a two-dimensional layout -- so the audit
+   may report the GEOMETRY and must not call it a failure. */
+.wide-table { border-collapse: collapse; }
+.wide-table th, .wide-table td { border: 1px solid #767676; padding: 4px 10px; white-space: nowrap; }
+
 .sr-only { position: absolute; left: -9999px; width: 1px; height: 1px; }
 .skip-link { position: absolute; left: -10000px; top: 0; }
 `;
@@ -169,6 +175,7 @@ import Base from '../layouts/AuditBase.astro';
        rather than as a violation, which is the point of seeding it: the third
        bucket has to be real, and it has to survive to the caller as its own kind. -->
   ${broken ? '<label for="dup">First</label><input id="dup" /><input id="dup" />' : '<label for="dup">First</label><input id="dup" />'}
+
   <div id="end"></div>
 </Base>
 `;
@@ -193,6 +200,97 @@ import Base from '../layouts/AuditBase.astro';
 </Base>
 `;
 
+// MORE INSTANCES OF ONE RULE THAN THE PER-RULE CAP.
+//
+// The audit takes at most AXE_NODES_PER_RULE (12) nodes per rule out of the page.
+// Seventeen is enough to prove the difference between "there were 12" and "there
+// were 17 and you were shown 12" -- which is the whole truncation contract.
+// Each image is distinguishable so a reader can see which ones came back.
+// THE SC 1.4.10 EXCEPTION, on a route of its own.
+//
+// A timetable is wide because a timetable IS wide. WCAG 2.2 exempts content that
+// needs a two-dimensional layout for its meaning, and a geometry probe cannot
+// tell such a table from a layout that simply failed to reflow -- which is the
+// whole reason 320px overflow may not promote itself to a standards verdict.
+//
+// It lives here rather than on /audit because it overflows at 375 as well, and on
+// the shared page it displaced the seeded banner as the first culprit. A fixture
+// that perturbs the corpus it sits in is a fixture in the wrong place.
+const TABLE_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>Timetable</h1>
+  <table class="wide-table">
+    <caption>Services</caption>
+    <thead><tr><th>Service</th><th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th><th>Sun</th></tr></thead>
+    <tbody><tr><td>Early</td><td>06:00</td><td>06:00</td><td>06:00</td><td>06:00</td><td>06:00</td><td>07:30</td><td>08:30</td></tr></tbody>
+  </table>
+  <div id="end"></div>
+</Base>
+`;
+
+const MANY_COUNT = 17;
+const MANY_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>Many</h1>
+${Array.from({ length: MANY_COUNT }, (_, i) => `  <img src="${PIXEL}" width="24" height="24" data-n="${i + 1}" />`).join('\n')}
+  <div id="end"></div>
+</Base>
+`;
+
+// TWO ROUTES THAT PROVE AUDIT SESSIONS DO NOT BLEED.
+//
+// /setstate writes a cookie and a localStorage value as the page loads.
+// /seestate reports whatever it can see. Two audits, same origin, same project --
+// which is exactly what a person auditing a route twice does. If audit N+1 reads
+// what audit N wrote, the audit browser is not isolated.
+//
+// Measured before this was fixed: the second audit read back `probe=FROM_A` and
+// `FROM_A`. A partition that is not `persist:` is not written to disk; it is very
+// much shared between windows.
+const AUDIT_STATE_VALUE = 'STACKI_AUDIT_STATE_PROBE_V1';
+const SET_STATE_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>set</h1>
+  <script is:inline>
+    document.cookie = 'stacki_audit_probe=${AUDIT_STATE_VALUE}; path=/';
+    try { localStorage.setItem('stacki_audit_probe', '${AUDIT_STATE_VALUE}'); } catch (e) {}
+  </script>
+  <div id="end"></div>
+</Base>
+`;
+const SEE_STATE_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>see</h1>
+  <div id="seen"></div>
+  <script is:inline>
+    // THE OBSERVATION HAS TO BECOME A FINDING.
+    //
+    // An audit reports findings, not page text, so this page turns "I can see the
+    // previous audit's state" into something the accessibility engine detects: an
+    // image with no alternative. Leaked state -> image-alt fires. Clean session ->
+    // the same image with a proper alt, and nothing fires.
+    var leaked = false;
+    if (document.cookie.indexOf('stacki_audit_probe') >= 0) leaked = true;
+    try { if (localStorage.getItem('stacki_audit_probe')) leaked = true; } catch (e) {}
+    var img = document.createElement('img');
+    img.src = '${PIXEL}';
+    img.width = 40; img.height = 40;
+    img.setAttribute('data-leaked', leaked ? 'yes' : 'no');
+    if (!leaked) img.alt = 'Nothing carried over from the previous audit';
+    document.getElementById('seen').appendChild(img);
+  </script>
+  <div id="end"></div>
+</Base>
+`;
+
 /** The files, for a broken or a clean variant of the fixture. */
 function auditFixture({ broken }) {
   return {
@@ -200,6 +298,10 @@ function auditFixture({ broken }) {
     'src/layouts/AuditBase.astro': LAYOUT,
     'src/pages/audit.astro': page(broken),
     'src/pages/clean.astro': CONTROL_PAGE,
+    'src/pages/many.astro': MANY_PAGE,
+    'src/pages/table.astro': TABLE_PAGE,
+    'src/pages/setstate.astro': SET_STATE_PAGE,
+    'src/pages/seestate.astro': SEE_STATE_PAGE,
   };
 }
 
@@ -224,4 +326,4 @@ const SEEDED_INCOMPLETE = [{ ruleId: 'duplicate-id-aria', kind: 'incomplete' }];
 // list exists.
 const MUST_NOT_FIRE_ON_CLEAN = ['horizontal-overflow', 'color-contrast', 'label', 'button-name', 'image-alt'];
 
-module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS };
+module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS, MANY_COUNT, AUDIT_STATE_VALUE };
