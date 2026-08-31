@@ -52,10 +52,19 @@ const SETTLE_MS = 250;
 const MAX_FINDINGS = 60;
 const MAX_CAPTURES = 3;
 
-// axe.min.js rather than require('axe-core').source: the packaged property is
-// the UNMINIFIED build at 1.3 MB, and this string is injected into a page on
-// every viewport of every audit. The minified file is 580 KB and identical in
-// behaviour.
+// ONE in-memory partition, shared by every audit, and deliberately not
+// `persist:` anything. It keeps the audit's storage out of the app's own session
+// -- an audit must not inherit a login or leave one behind -- while a partition
+// PER RUN would mint a fresh Session object every time somebody audits a page,
+// for the lifetime of the process, to isolate reads from reads.
+const AUDIT_PARTITION = 'stacki-audit';
+
+// axe.min.js rather than the package's own `source` property: that one is the
+// UNMINIFIED build at 1.3 MB, and this string is injected into a page on every
+// viewport of every audit. The minified file is 580 KB and behaves identically.
+//
+// Resolved lazily, and cached, so the cost is paid by the first audit rather
+// than by starting the app.
 let axeSourceCache = null;
 function axeSource() {
   if (axeSourceCache) return axeSourceCache;
@@ -91,7 +100,7 @@ function withTimeout(promise, ms, what) {
  * an audit must not inherit a login or leave one behind.
  */
 function makeAuditWindow(BrowserWindow, { width, height, partition }) {
-  return new BrowserWindow({
+  const win = new BrowserWindow({
     show: false,
     width,
     height,
@@ -109,6 +118,18 @@ function makeAuditWindow(BrowserWindow, { width, height, partition }) {
       partition,
     },
   });
+  // THE AUDITED PAGE MAY NOT OPEN A WINDOW.
+  //
+  // window.open(), or a target=_blank link the page follows itself, would put a
+  // VISIBLE window on somebody's screen in the middle of an audit -- taking
+  // focus, outliving the run, and never appearing in the registry below, because
+  // only windows this file made are in it. The page is not trusted; it does not
+  // get to create UI.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // Nor may it navigate the audit somewhere else and have the result reported
+  // under the route that was asked for.
+  win.webContents.on('will-navigate', (event) => event.preventDefault());
+  return win;
 }
 
 /**
@@ -186,7 +207,6 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
     }
 
     const runId = `audit-${process.pid}-${++runSeq}`;
-    const partition = `stacki-audit-${runId}`;
     const safeRoute = String(route || '/').startsWith('/') ? route : `/${route}`;
     // NO `#avb-design`. See the note at the top of this file: that hash is what
     // makes the canvas a different document from the site.
@@ -210,7 +230,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
           // would then be laid out for the first width and stretched to the
           // rest. A visitor at 375 gets a page that loaded at 375, so that is
           // what gets measured.
-          win = makeAuditWindow(BrowserWindow, { width: viewport.width, height: viewport.height, partition });
+          win = makeAuditWindow(BrowserWindow, { width: viewport.width, height: viewport.height, partition: AUDIT_PARTITION });
           liveWindows.set(`${runId}:${viewport.key}`, win);
 
           const loaded = new Promise((resolve, reject) => {
@@ -288,11 +308,15 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
             ms: Date.now() - started,
           });
         } finally {
-          liveWindows.delete(`${runId}:${viewport.key}`);
+          // DELETE ONLY IF IT ACTUALLY WENT. Removing the entry first and then
+          // destroying meant a destroy that threw left a live window that the
+          // leak count could no longer see -- the oracle reporting zero because
+          // it had been told to stop looking.
           try {
             if (win && !win.isDestroyed()) win.destroy();
-          } catch {
-            /* a window that will not close must not take the audit with it */
+            liveWindows.delete(`${runId}:${viewport.key}`);
+          } catch (err) {
+            /* left in the registry on purpose: the count is the alarm */
           }
         }
       }

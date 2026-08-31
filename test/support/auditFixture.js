@@ -64,6 +64,14 @@ body {
    the CLEAN control genuinely defective. The control has to be clean because it
    is correct, never because the finding was filtered out afterwards. */
 button { color: var(--ink); background: #f0f0f0; border: 1px solid #767676; }
+
+/* The oldest trick in accessibility: put it off the left of the world so it is
+   read but not seen. A skip link and visually-hidden text are CORRECT, and an
+   overflow detector that blames them is worse than useless -- they sort to the
+   top, so the two most prominent findings on a well-built page are its
+   accessibility features. Present in BOTH variants, never reported in either. */
+.sr-only { position: absolute; left: -9999px; width: 1px; height: 1px; }
+.skip-link { position: absolute; left: -10000px; top: 0; }
 `;
 
 // The defects, as CSS. A fixed 520px banner fits at 768 and 1440 and only breaks
@@ -124,6 +132,8 @@ const page = (broken) => `---
 import Base from '../layouts/AuditBase.astro';
 ---
 <Base>
+  <a class="skip-link" href="#end">Skip to content</a>
+  <span class="sr-only">Visually hidden, and correct</span>
   <h1>Audit fixture</h1>
 
   <!-- SEED 1 / CONTROL 1: horizontal overflow, phone only.
@@ -159,6 +169,7 @@ import Base from '../layouts/AuditBase.astro';
        rather than as a violation, which is the point of seeding it: the third
        bucket has to be real, and it has to survive to the caller as its own kind. -->
   ${broken ? '<label for="dup">First</label><input id="dup" /><input id="dup" />' : '<label for="dup">First</label><input id="dup" />'}
+  <div id="end"></div>
 </Base>
 `;
 
@@ -169,6 +180,8 @@ const CONTROL_PAGE = `---
 import Base from '../layouts/AuditBase.astro';
 ---
 <Base>
+  <a class="skip-link" href="#end">Skip to content</a>
+  <span class="sr-only">Visually hidden, and correct</span>
   <h1>Control</h1>
   <div class="tile">Nothing here is wrong at any width.</div>
   <div class="carousel"><div class="carousel-row"></div></div>
@@ -176,6 +189,7 @@ import Base from '../layouts/AuditBase.astro';
   <label for="q">Search</label><input id="q" type="search" />
   <button aria-label="Go"><span aria-hidden="true">&#8594;</span></button>
   <img src="${PIXEL}" width="48" height="48" alt="A described marker" />
+  <div id="end"></div>
 </Base>
 `;
 

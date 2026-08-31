@@ -267,6 +267,16 @@ let stopPreview = null;
     // at every viewport, on purpose, inside overflow-x: auto.
     const carousel = findings.filter((f) => /carousel/.test(f.target?.selector || ''));
     check('the intentional scroll container is never reported', carousel.length === 0, short(carousel.map((f) => `${f.ruleId}@${f.viewport.key}`)));
+
+    // THE CONTROL THAT NEARLY WAS NOT THERE. A skip link and visually-hidden
+    // text sit at left:-9999px, which is correct and about as common as HTML
+    // gets. Before this was fixed they were reported as overflow AND sorted
+    // first, at 10000px and 9999px, ahead of the real 145px culprit -- so the
+    // two most prominent findings on a well-built page were its accessibility
+    // features.
+    const offLeft = findings.filter((f) => /sr-only|skip-link/.test(f.target?.selector || ''));
+    check('visually-hidden text off the left edge is never reported', offLeft.length === 0, short(offLeft.map((f) => `${f.ruleId}@${f.viewport.key}:${f.target?.selector}`)));
+    check('  and every overflow finding blames the right edge', overflow.every((f) => f.evidence.edge === 'right'), short(overflow.map((f) => f.evidence.edge)));
   }
 
   // --- the incomplete bucket is real and is kept apart

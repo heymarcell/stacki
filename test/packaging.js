@@ -56,7 +56,16 @@ const mainSide = walk(path.join(root, 'electron'));
 check('there is a main process to check', mainSide.length > 20, `${mainSide.length} files`);
 
 const RELATIVE = /require\(\s*'(\.[^']*)'\s*\)/g;
-const BARE = /require\(\s*'([^'.][^']*)'\s*\)/g;
+// `require('pkg')` and `require.resolve('pkg')` both make a package a RUNTIME
+// dependency. Only the first used to be matched, which meant a module that
+// resolved a file lazily -- the shape you want for a 580 KB blob you inject into
+// a page -- was invisible here, and the guard that says "this must not be a
+// devDependency" silently stopped guarding it.
+//
+// It was found the worst possible way: axe-core passed this check because a
+// COMMENT in electron/mcp/audit/index.js contained the characters
+// require('axe-core'). Reword the comment and the protection disappears.
+const BARE = /require(?:\.resolve)?\(\s*'([^'.][^']*)'\s*\)/g;
 
 /** Where a relative require resolves to, or null. */
 const resolveRelative = (from, spec) => {

@@ -111,10 +111,26 @@ const OVERFLOW = `(() => {
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
       const r = el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
-      // Does it actually stick out past the right edge (or off the left)?
+
+      // THE RIGHT EDGE ONLY, AND THAT IS NOT A SHORTCUT.
+      //
+      // The document-level test above is scrollWidth - clientWidth, which in a
+      // left-to-right document measures content past the RIGHT edge. Content
+      // placed off the LEFT does not contribute to it, so it cannot be the cause
+      // of the scroll and must not be blamed for it.
+      //
+      // This matters more than it sounds. "position:absolute; left:-9999px" is
+      // how a skip link and visually-hidden text have been written for twenty
+      // years. An earlier version of this reported both -- and sorted them
+      // FIRST, at 10000px and 9999px, ahead of the real 145px culprit. The two
+      // most prominent findings on a correctly built page were its accessibility
+      // features.
+      //
+      // The honest limit: in a right-to-left document the page scrolls the other
+      // way, and this looks in the wrong direction. Said in docs/audit.md rather
+      // than papered over with a heuristic.
       const overRight = r.right - clientW;
-      const overLeft = -r.left;
-      if (overRight < 2 && overLeft < 2) continue;
+      if (overRight < 2) continue;
 
       // An element that clips or scrolls its OWN overflow contains it.
       const ownX = cs.overflowX;
@@ -140,8 +156,8 @@ const OVERFLOW = `(() => {
         selector: selectorOf(el),
         tag: el.tagName.toLowerCase(),
         rect: rectOf(el),
-        overflowBy: Math.round(Math.max(overRight, overLeft)),
-        edge: overRight >= 2 ? 'right' : 'left',
+        overflowBy: Math.round(overRight),
+        edge: 'right',
         computed: {
           'overflow-x': ownX,
           width: cs.width,

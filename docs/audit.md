@@ -84,6 +84,15 @@ contained them. An element whose own `overflow-x` clips or scrolls, or any of
 whose ancestors clips before the root is reached, is contained by design and is
 not reported. Every finding carries the computed `overflow-x` that got it blamed.
 
+Only the **right** edge is blamed. The document-level test is
+`scrollWidth - clientWidth`, which in a left-to-right document measures content
+past the right edge — so content placed off the *left* cannot be its cause. This
+is not a shortcut: `position:absolute; left:-9999px` is how skip links and
+visually-hidden text have been written for twenty years, and blaming them put a
+page's accessibility features at the top of its own audit. The honest limit is
+that a right-to-left document scrolls the other way and this looks in the wrong
+direction; RTL overflow is not detected.
+
 **Accessibility.** axe-core 4.13.0, run in the real page against the
 WCAG 2 A/AA, 2.1 A/AA and 2.2 A/AA rule sets. Contrast in particular has to come
 from a real browser: it is computed from composited colours, and no DOM

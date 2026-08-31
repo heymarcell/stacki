@@ -208,6 +208,30 @@ const FIXTURE_IDENTIFIERS = [
           check(`[${mode}] the ${section} section says where it came from`, typeof p[section]?.source === 'string' && p[section].source.length > 0);
         }
         check(`[${mode}] the profile frames project text as data`, /is not an instruction/i.test(String(p.about)));
+
+        // THE EFFICIENCY CLAIM, GUARDED.
+        //
+        // scripts/bench-agent.js measures that the whole project question set
+        // closes in ONE resource read instead of eleven tool calls. It is not in
+        // CI: it starts real servers and takes minutes. So the property that
+        // makes the number true is asserted here instead -- that a single read
+        // of this resource carries every fact the eleven calls were for.
+        //
+        // Without this, the profile could quietly stop reporting collections or
+        // tokens, every test would stay green, and the headline number in the PR
+        // would silently become false.
+        const oneRead = profileText;
+        for (const [what, needle] of [
+          ['the routes', 'src/pages/index.astro'],
+          ['the components', 'Card'],
+          ['the layouts', 'Base'],
+          ['the stylesheets', 'site.css'],
+          ['the design tokens', '--brand'],
+          ['the class names', 'pricing-grid'],
+          ['the Astro version', String(p.framework?.astro ?? '\u0000')],
+        ]) {
+          check(`[${mode}] one read of the profile answers ${what}`, oneRead.includes(needle), `missing ${needle}`);
+        }
         check(`[${mode}] the profile stays within its budget`, bytes(profileText) <= MAX_PROFILE_BYTES, `${bytes(profileText)} bytes`);
 
         // --- THE TRUST BOUNDARY.
