@@ -117,13 +117,55 @@ let runSeq = 0;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** The origin of a URL, or null when it is not one. */
+/**
+ * The origin of a URL, or null when it does not have one.
+ *
+ * `data:`, `about:`, `file:` and `javascript:` are OPAQUE origins, and the URL
+ * standard spells those as the string "null". Returning that string put the word
+ * "null" into a refusal message as though it were a hostname and stopped the
+ * "unreadable origin" wording ever being reached. An opaque origin is not an
+ * origin, so it comes back as one.
+ */
 function originOf(u) {
   try {
-    return new URL(u).origin;
+    const origin = new URL(u).origin;
+    return origin === 'null' ? null : origin;
   } catch {
     return null;
   }
+}
+
+// THE SAME SERVER, SPELLED TWO WAYS.
+//
+// The preview URL Stacki builds itself is `http://127.0.0.1:PORT`, but a dev
+// server the user started and Stacki adopted is scraped from Astro's own output,
+// which prints `http://localhost:PORT`. Those are different origins to a string
+// compare, so a redirect between them -- which frameworks do -- would have been
+// refused as "outside the project" on a page that never left the machine. Same
+// scheme, same port and both names for the loopback interface is the same server.
+const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/** A test for "is this origin the project's", tolerant of loopback spelling only. */
+function projectOriginTest(projectOrigin) {
+  let base = null;
+  try {
+    base = new URL(projectOrigin);
+  } catch {
+    /* falls through to an exact compare, which will simply never match */
+  }
+  const loopback = !!base && LOOPBACK_NAMES.has(base.hostname);
+  return (origin) => {
+    if (!origin) return false;
+    if (origin === projectOrigin) return true;
+    if (!loopback) return false;
+    let other = null;
+    try {
+      other = new URL(origin);
+    } catch {
+      return false;
+    }
+    return other.protocol === base.protocol && other.port === base.port && LOOPBACK_NAMES.has(other.hostname);
+  };
 }
 
 /** The path+query of a URL, for reporting which document was actually measured. */
@@ -154,7 +196,7 @@ function withTimeout(promise, ms, what) {
  * hidden but painting. `partition` keeps its storage out of anything else's --
  * an audit must not inherit a login or leave one behind.
  */
-function makeAuditWindow(BrowserWindow, { width, height, partition, projectOrigin, onBlocked }) {
+function makeAuditWindow(BrowserWindow, { width, height, partition, isProjectOrigin, onBlocked, onSubframeBlocked }) {
   const win = new BrowserWindow({
     show: false,
     width,
@@ -194,20 +236,39 @@ function makeAuditWindow(BrowserWindow, { width, height, partition, projectOrigi
   // So both events, and the same rule for each: leaving the project's origin is
   // refused; staying on it is ordinary visitor behaviour and is allowed, with the
   // page that is finally measured reported truthfully.
-  const sameOrigin = (target) => {
-    try {
-      return new URL(target).origin === projectOrigin;
-    } catch {
-      return false;
-    }
+  //
+  // AND THE FRAMES UNDERNEATH IT. `will-navigate` is documented as the MAIN
+  // FRAME's event; `will-frame-navigate` is the one that sees the others. Without
+  // it an `<iframe src="http://somewhere.else/">` on a project page had that
+  // document fetched and rendered inside the audit window -- so "nothing outside
+  // this project is loaded" was true of the top document and false of the page.
+  // An off-origin frame is dropped and NAMED, and the audit continues: a page
+  // that embeds a video is an ordinary page, not a reason to refuse the run.
+  const allowed = (target) => isProjectOrigin(originOf(target));
+  const mainFrame = (details, positionalUrl) => {
+    const target = typeof details?.url === 'string' ? details.url : positionalUrl;
+    // `isMainFrame` is on the details object in this Electron; if some build ever
+    // omits it, treating the event as the main frame's keeps the strict path.
+    const isMain = typeof details?.isMainFrame === 'boolean' ? details.isMainFrame : true;
+    return { target, isMain };
   };
-  const guard = (kind) => (event, target) => {
-    if (sameOrigin(target)) return;
-    event.preventDefault();
+  const guard = (kind) => (details, positionalUrl) => {
+    const { target, isMain } = mainFrame(details, positionalUrl);
+    // A subframe is will-frame-navigate's business. Refusing the whole audit
+    // because an embedded widget redirected would be a false refusal.
+    if (!isMain) return;
+    if (allowed(target)) return;
+    details.preventDefault();
     onBlocked?.({ kind, target });
   };
   win.webContents.on('will-redirect', guard('redirect'));
   win.webContents.on('will-navigate', guard('navigate'));
+  win.webContents.on('will-frame-navigate', (details) => {
+    if (details?.isMainFrame) return;
+    if (allowed(details?.url)) return;
+    details.preventDefault();
+    onSubframeBlocked?.(originOf(details?.url));
+  });
   return win;
 }
 
@@ -357,6 +418,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // The one origin this audit is allowed to measure, decided once from the dev
     // server the app is running and never from anything a page says.
     const projectOrigin = new URL(baseHref).origin;
+    const isProjectOrigin = projectOriginTest(projectOrigin);
+    // Off-origin frames that were dropped so the page could still be measured.
+    // Named in the result: a page rendered without its embeds is not the page a
+    // visitor sees, and the caller is entitled to know which ones went.
+    const blockedSubframes = new Set();
     // Where the audit actually ENDED, when a same-origin redirect moved it. The
     // caller asked about one route and may have been shown another; both are
     // reported rather than only the one that was asked for.
@@ -430,13 +496,27 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // rest. A visitor at 375 gets a page that loaded at 375, so that is
           // what gets measured.
           let blocked = null;
+          // A CANCELLED NAVIGATION NEED NOT BE WAITED OUT.
+          //
+          // Blocking a redirect usually produces did-fail-load with ERR_ABORTED
+          // straight away, but "usually" is not a contract: if neither load event
+          // arrives, the refusal we have already decided on sat behind the full
+          // twenty-second load timeout. The block is its own signal.
+          let signalBlocked = () => {};
+          const blockedSignal = new Promise((resolve) => {
+            signalBlocked = resolve;
+          });
           win = makeAuditWindow(BrowserWindow, {
             width: viewport.width,
             height: viewport.height,
             partition: AUDIT_PARTITION,
-            projectOrigin,
+            isProjectOrigin,
             onBlocked: (info) => {
               if (!blocked) blocked = info;
+              signalBlocked();
+            },
+            onSubframeBlocked: (origin) => {
+              if (origin) blockedSubframes.add(origin);
             },
           });
           liveWindows.set(`${runId}:${viewport.key}`, win);
@@ -466,7 +546,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // about why. The block is checked before the load result is believed.
           let loadError = null;
           try {
-            await withTimeout(loaded, LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`);
+            await withTimeout(Promise.race([loaded, blockedSignal]), LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`);
           } catch (err) {
             loadError = err;
           }
@@ -493,7 +573,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // afterwards has already run axe on somebody else's page. Event
           // semantics are a thing to be wrong about; the final URL is a fact.
           const finalUrl = win.webContents.getURL();
-          if (originOf(finalUrl) !== projectOrigin) {
+          if (!isProjectOrigin(originOf(finalUrl))) {
             return {
               ok: false,
               code: 'route_outside_project',
@@ -602,6 +682,45 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
             }
           }
 
+          // WHAT THE PAGE DID WHILE IT WAS BEING MEASURED.
+          //
+          // `blocked` was read once, immediately after the load, and never again
+          // -- so a page that waited and THEN tried to leave (a delayed
+          // meta-refresh, a timer in a load handler) had its navigation cancelled
+          // correctly and reported as an ordinary successful audit. The refusal
+          // happened; nobody was told. The same read also fixes the other half:
+          // a same-origin move after the load changed which document was measured
+          // without changing `finalRoutes`.
+          if (blocked) {
+            return {
+              ok: false,
+              code: 'route_outside_project',
+              message:
+                `${safeRoute} tried to ${blocked.kind === 'redirect' ? 'redirect' : 'navigate'} to another origin ` +
+                'while it was being measured, which the audit refused. Nothing outside this project is measured, and ' +
+                'the findings from this run are discarded because the page did not stay still. Only the origin is ' +
+                'named here — a page Stacki declined to load is not quoted.',
+              blockedOrigin: originOf(blocked.target),
+              route: safeRoute,
+              runId,
+            };
+          }
+          const settledUrl = win.webContents.getURL();
+          if (!isProjectOrigin(originOf(settledUrl))) {
+            return {
+              ok: false,
+              code: 'route_outside_project',
+              message:
+                `${safeRoute} ended on ${originOf(settledUrl) || 'an unreadable origin'} while it was being ` +
+                'measured, which is not this project. The findings from this run are discarded.',
+              blockedOrigin: originOf(settledUrl),
+              route: safeRoute,
+              runId,
+            };
+          }
+          const settledRoute = routeOf(settledUrl);
+          if (settledRoute && settledRoute !== safeRoute) finalRoutes.add(settledRoute);
+
           perViewport.push({
             viewport: { key: viewport.key, width: viewport.width, height: viewport.height, device: viewport.device },
             documentScrollWidth: geo.documentScrollWidth,
@@ -643,29 +762,6 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       cleanupReset = await resetAuditSession(session);
     }
 
-    // AN AUDIT THAT COULD NOT CLEAN UP IS NOT AN ISOLATED AUDIT.
-    //
-    // The measurements are real and are still returned -- throwing them away
-    // would help nobody -- but the result says ok:false and says why, because the
-    // next audit may now see what this one left behind. A warning beside ok:true
-    // would be the swallow this replaced, wearing a different hat.
-    if (cleanupReset && cleanupReset.ok === false) {
-      const partial = sortFindings(findings);
-      return {
-        ok: false,
-        code: 'session_not_cleaned',
-        message:
-          `The audit measured ${safeRoute} but could not clear its browser session afterwards: ` +
-          `${cleanupReset.reason}. The findings below are real; what cannot be promised is that the NEXT audit ` +
-          'starts clean, so this run is not reported as isolated.',
-        route: safeRoute,
-        runId,
-        findings: partial.slice(0, MAX_FINDINGS),
-        findingCount: detectedTotal,
-        returnedFindingCount: Math.min(partial.length, MAX_FINDINGS),
-      };
-    }
-
     const sorted = sortFindings(findings);
     // WHEN THE CAP BITES, IT MUST NOT EAT ONE BUCKET WHOLE.
     //
@@ -681,7 +777,17 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     const keptDecided = decided.slice(0, MAX_FINDINGS - keptUndecided.length);
     const kept = sortFindings([...keptDecided, ...keptUndecided]);
 
-    return {
+    // ONE RESULT, BUILT ONCE.
+    //
+    // A cleanup failure used to return a hand-built object of its own, and every
+    // field the real one has that it did not was a silent loss on a path that
+    // still handed back findings: the reserved `incomplete` share, so a busy page
+    // lost that whole bucket; `engine.error`, so a page that broke axe came back
+    // as a clean page; the captures that had already been taken and paid for;
+    // `finalRoutes`, on a path whose own message then named the route that was
+    // ASKED for as the one measured. The failure changes the VERDICT, not the
+    // measurements, so it is applied to this object rather than replacing it.
+    const result = {
       ok: true,
       runId,
       route: safeRoute,
@@ -689,12 +795,16 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // findings describe THIS document, not `route`.
       ...(finalRoutes.size ? { finalRoutes: [...finalRoutes] } : {}),
       url,
+      // Off-origin documents this run refused to load INSIDE the page. Present
+      // only when there were some: the page was measured without them.
+      ...(blockedSubframes.size ? { blockedSubframeOrigins: [...blockedSubframes] } : {}),
       engine: {
         accessibility: axeVersion ? `axe-core ${axeVersion}` : null,
         error: engineError,
-        // Whether the audit actually started from a wiped session, rather than
-        // whether the code meant to.
-        sessionIsolated: sessionReset?.ok === true,
+        // Whether the audit actually started from a wiped session AND left one,
+        // rather than whether the code meant to. Both halves: a run that cannot
+        // clear up after itself has not isolated the next audit from this one.
+        sessionIsolated: sessionReset?.ok === true && cleanupReset?.ok === true,
       },
       viewports: perViewport,
       findings: kept,
@@ -747,6 +857,27 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         'mean accessible and does not mean WCAG compliant. `incomplete` findings are neither passes nor failures - ' +
         'a person has to look at them.',
     };
+
+    // AN AUDIT THAT COULD NOT CLEAN UP IS NOT AN ISOLATED AUDIT.
+    //
+    // The measurements are real and are all still here -- throwing them away
+    // would help nobody -- but the verdict is ok:false and says why, because the
+    // next audit may now see what this one left behind. A warning beside ok:true
+    // would be the swallow this replaced, wearing a different hat.
+    if (cleanupReset && cleanupReset.ok === false) {
+      const measured = finalRoutes.size ? [...finalRoutes].join(', ') : safeRoute;
+      return {
+        ...result,
+        ok: false,
+        code: 'session_not_cleaned',
+        message:
+          `The audit measured ${measured} but could not clear its browser session afterwards: ` +
+          `${cleanupReset.reason}. Everything below is the real measurement; what cannot be promised is that the ` +
+          'NEXT audit starts clean, so this run is not reported as isolated.',
+      };
+    }
+
+    return result;
   }
 
   return { run };
@@ -755,6 +886,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
 module.exports = {
   createAudit,
   resetAuditSession,
+  // Exported to be asserted directly: the loopback tolerance below is a
+  // RELAXATION of the origin check, and a relaxation nobody tests is a hole.
+  projectOriginTest,
+  originOf,
   AUDIT_PARTITION,
   liveWindowCount,
   liveWindows,

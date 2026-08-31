@@ -118,6 +118,10 @@ const AuditOutput = z.object({
   // Present only when a same-origin redirect landed somewhere other than the
   // route that was asked for. The findings describe these, not `route`.
   finalRoutes: z.array(z.string()).optional(),
+  // Off-origin documents the audit refused to load INSIDE the page — an iframe
+  // pointing somewhere else. The page was measured without them, which is worth
+  // knowing before trusting its geometry.
+  blockedSubframeOrigins: z.array(z.string()).optional(),
   url: z.string().optional(),
   engine: z
     .object({
@@ -244,10 +248,16 @@ function registerAuditTool(server, { audit, api }) {
       // by the content it is auditing. Before that guard existed this annotation
       // was a promise the code did not keep.
       //
-      // The honest limit: the guard is on top-level navigation. A project page
-      // that references a font, script or image on a CDN still causes the render
-      // to fetch it, exactly as the user's own browser preview would. The tool's
-      // domain is closed; the page's is the page's.
+      // That covers documents at every level, not just the top one: an
+      // `<iframe>` pointing off-origin is dropped through `will-frame-navigate`
+      // and named in `blockedSubframeOrigins`, because a third-party document
+      // rendered inside the audit window is outside the project whether or not
+      // it is the page in the address bar.
+      //
+      // The honest limit is SUBRESOURCES. A project page that references a font,
+      // script or image on a CDN still causes the render to fetch it, exactly as
+      // the user's own browser preview would. Documents are closed; the bytes a
+      // page pulls in to draw itself are the page's business.
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,

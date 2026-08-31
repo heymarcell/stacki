@@ -45,7 +45,12 @@ const portTaken = (port) =>
     };
     socket.once('connect', () => settle(true));
     socket.once('error', () => settle(false));
-    setTimeout(() => settle(false), 300).unref?.();
+    // A LOOPBACK CONNECT THAT DOES NEITHER IS NOT EVIDENCE OF A FREE PORT.
+    // On 127.0.0.1 a live listener connects and a dead one refuses, both at
+    // once. Silence means a loaded machine, a full accept backlog or a socket
+    // on its way down -- and this used to read that silence as "free", walk
+    // straight into it, and fail the suite with "already in use".
+    setTimeout(() => settle(true), 500).unref?.();
   });
 
 // A base that differs per process, so two suites running at once do not both
@@ -209,10 +214,10 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
   // let go of is still busy for a moment, and so is one another process took.
   let port = nextPort++;
   for (let tries = 0; tries < 200 && (await portTaken(port)); tries += 1) port = nextPort++;
-  const token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
-  const url = `http://127.0.0.1:${port}/mcp`;
+  let token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
+  let url = `http://127.0.0.1:${port}/mcp`;
 
-  const server = createStackiMcpServer({
+  const buildServer = (port, token) => createStackiMcpServer({
     port,
     token,
     version: '0.0.0-wire',
@@ -253,7 +258,32 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
     // benchmark came to measure a server that does not exist.
     audit,
 });
-  await server.start?.();
+
+  // ASKING WHETHER A PORT IS FREE AND BINDING IT ARE TWO SEPARATE MOMENTS.
+  //
+  // Whatever the probe above learns is already history by the time listen()
+  // runs: another suite's process, or one of ours on its way out, can take the
+  // port in between. On a CI runner that is not hypothetical -- it took out the
+  // permission matrix with "port 55555 is already in use, so the Stacki MCP
+  // server did not start", a message about somebody else's Stacki that here
+  // meant a lost race. Losing the race is now retried instead of thrown; every
+  // other start failure still throws, because those are real.
+  let server = buildServer(port, token);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await server.start?.();
+      break;
+    } catch (err) {
+      const inUse = /already in use|EADDRINUSE/i.test(String(err?.message || err));
+      if (!inUse || attempt >= 25) throw err;
+      await Promise.resolve(server.stop?.()).catch(() => {});
+      port = nextPort++;
+      for (let tries = 0; tries < 200 && (await portTaken(port)); tries += 1) port = nextPort++;
+      token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
+      url = `http://127.0.0.1:${port}/mcp`;
+      server = buildServer(port, token);
+    }
+  }
 
   const { client, close: closeClient } = await connectMcp({ url, token, era, name: 'Stacki Phase A Agent' });
 

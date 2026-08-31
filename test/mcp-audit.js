@@ -388,12 +388,21 @@ let stopPreview = null;
     await new Promise((r) => outside.listen(OUTSIDE_ORIGIN_PORT, '127.0.0.1', r));
     try {
       // B. server-side redirect to another origin
-      const out = await call('audit', { route: '/redirect-out', viewports: ['phone'] });
+      // `capture: true` on purpose: without it `captures` is empty on EVERY
+      // result and the assertion below passes whatever the guard does.
+      const out = await call('audit', { route: '/redirect-out', viewports: ['phone'], capture: true });
       check('a route that redirects off-origin is refused', out.ok === false && out.code === 'route_outside_project', short(out));
       check('  and the outside origin is never contacted', outsideHits === 0, `${outsideHits} requests reached it`);
-      check('  and it names the origin without quoting the page', String(out.blockedOrigin || '').includes(String(OUTSIDE_ORIGIN_PORT)) && !/OUTSIDE_ORIGIN/.test(JSON.stringify(out)), short(out.blockedOrigin));
+      // Nothing of the refused page: not its title, not the markup a finding
+      // would have carried, not the text axe would have quoted in a summary.
+      check(
+        '  and it names the origin without quoting the page',
+        String(out.blockedOrigin || '').includes(String(OUTSIDE_ORIGIN_PORT)) &&
+          !/OUTSIDE_ORIGIN|x\.gif|>outside</.test(JSON.stringify(out)),
+        short(out.blockedOrigin)
+      );
       check('  and reports no findings at all', !Array.isArray(out.findings) || out.findings.length === 0);
-      check('  and no capture', !Array.isArray(out.captures) || out.captures.length === 0);
+      check('  and no capture, though one was asked for', !Array.isArray(out.captures) || out.captures.length === 0, short(out.captures));
 
       // D. page-initiated navigation off-origin
       const nav = await call('audit', { route: '/navigate-out', viewports: ['phone'] });
@@ -406,6 +415,31 @@ let stopPreview = null;
       check('a same-origin redirect is followed', inRes.ok === true, short(inRes));
       check('  and the page actually measured is named', Array.isArray(inRes.finalRoutes) && inRes.finalRoutes.includes('/clean'), short(inRes.finalRoutes));
       check('  rather than pretending the requested route was the one measured', inRes.route === '/redirect-in');
+
+      // E. the page leaves AFTER the load, while it is being measured. The block
+      //    is real either way; being told about it is what was missing.
+      const late = await call('audit', { route: '/late-out', viewports: ['phone'] });
+      check('a page that leaves DURING measurement is refused too', late.ok === false && late.code === 'route_outside_project', short(late));
+      check('  and that origin is still never contacted', outsideHits === 0, `${outsideHits} requests reached it`);
+      check('  and the refusal names when it happened', /while it was being measured/.test(String(late.message)), short(late.message));
+
+      // F. the same timing, same origin: allowed, and the document actually
+      //    measured is named rather than the one that was asked for.
+      const lateIn = await call('audit', { route: '/late-in', viewports: ['phone'] });
+      check('a same-origin move during measurement is allowed', lateIn.ok === true, short(lateIn));
+      check('  and the document it ended on is named', Array.isArray(lateIn.finalRoutes) && lateIn.finalRoutes.includes('/clean'), short(lateIn.finalRoutes));
+
+      // G. an off-origin document INSIDE the page.
+      const framed = await call('audit', { route: '/frame-out', viewports: ['phone'] });
+      check('an off-origin iframe is never fetched', outsideHits === 0, `${outsideHits} requests reached it`);
+      check('  and the page is still measured', framed.ok === true, short(framed));
+      check(
+        '  and the frame that was dropped is named',
+        Array.isArray(framed.blockedSubframeOrigins) &&
+          framed.blockedSubframeOrigins.some((o) => o.includes(String(OUTSIDE_ORIGIN_PORT))),
+        short(framed.blockedSubframeOrigins)
+      );
+      check('  and nothing of that document is reported', !/OUTSIDE_ORIGIN|x\.gif/.test(JSON.stringify(framed)));
 
       check('no audit window survived any of it', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
     } finally {

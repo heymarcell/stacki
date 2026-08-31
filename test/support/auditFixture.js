@@ -339,6 +339,59 @@ import Base from '../layouts/AuditBase.astro';
 </Base>
 `;
 
+// THE DELAY IS SIZED AGAINST THE ENGINE, NOT PICKED.
+//
+// The audit's measurement window runs from did-finish-load through SETTLE_MS
+// (250ms) and the probes. A navigation has to START inside that window to be
+// what these pages are about, and for the same-origin one it has to COMMIT
+// inside it too, because what `finalRoutes` reports is the document that was
+// actually MEASURED -- one that commits after the last probe changed nothing and
+// must not be claimed. Measured at 300ms: the block was caught (it is instant)
+// and the same-origin landing was not (it still had a request to make). 100ms
+// leaves both comfortably inside.
+const LATE_MS = 100;
+
+// A PAGE THAT WAITS, THEN LEAVES. The refusal for a navigation that happens
+// DURING measurement is a different code path from one that happens during the
+// load: the block was read once, right after did-finish-load, and a page that
+// waited had its navigation cancelled and reported as an ordinary clean audit.
+const LATE_OUT_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>waiting</h1>
+  <script is:inline>
+    addEventListener('load', () => setTimeout(() => {
+      location.href = 'http://127.0.0.1:${OUTSIDE_ORIGIN_PORT}/late';
+    }, ${LATE_MS}));
+  </script>
+</Base>
+`;
+// The same timing, staying at home: the document that gets measured is /clean,
+// and saying so is the whole point of finalRoutes.
+const LATE_IN_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>moving along</h1>
+  <script is:inline>
+    addEventListener('load', () => setTimeout(() => { location.href = '/clean'; }, ${LATE_MS}));
+  </script>
+</Base>
+`;
+// AN OFF-ORIGIN DOCUMENT INSIDE THE PAGE. `will-navigate` is the main frame's
+// event, so an iframe was fetched and rendered in the audit window while the
+// guard reported nothing. The title is real so the embed itself does not seed a
+// frame-title violation and confuse what this page is for.
+const FRAME_OUT_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>embedded</h1>
+  <iframe src="http://127.0.0.1:${OUTSIDE_ORIGIN_PORT}/framed" width="240" height="160" title="an off-origin embed"></iframe>
+</Base>
+`;
+
 /** The files, for a broken or a clean variant of the fixture. */
 function auditFixture({ broken }) {
   return {
@@ -352,6 +405,9 @@ function auditFixture({ broken }) {
     'src/pages/redirect-out.js': REDIRECT_OUT_ENDPOINT,
     'src/pages/redirect-in.js': REDIRECT_IN_ENDPOINT,
     'src/pages/navigate-out.astro': NAVIGATE_OUT_PAGE,
+    'src/pages/late-out.astro': LATE_OUT_PAGE,
+    'src/pages/late-in.astro': LATE_IN_PAGE,
+    'src/pages/frame-out.astro': FRAME_OUT_PAGE,
     'src/pages/setstate.astro': SET_STATE_PAGE,
     'src/pages/seestate.astro': SEE_STATE_PAGE,
   };
