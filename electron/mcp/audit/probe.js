@@ -132,6 +132,15 @@ const OVERFLOW = `(() => {
       const overRight = r.right - clientW;
       if (overRight < 2) continue;
 
+      // A FIXED ELEMENT CANNOT CAUSE DOCUMENT SCROLL.
+      //
+      // position:fixed takes an element out of the flow entirely and pins it to
+      // the viewport; its box contributes nothing to scrollWidth. A wide fixed
+      // header therefore gets blamed for an overflow it provably did not cause,
+      // and -- being wide -- sorts above the element that did. Same class of
+      // mistake as blaming a skip link at left:-9999px.
+      if (cs.position === 'fixed') continue;
+
       // An element that clips or scrolls its OWN overflow contains it.
       const ownX = cs.overflowX;
       if (ownX === 'auto' || ownX === 'scroll' || ownX === 'hidden' || ownX === 'clip') continue;
@@ -175,6 +184,10 @@ const OVERFLOW = `(() => {
   }
 
   return {
+    // The MEASURED viewport, not the width that was asked for. A window told to
+    // be 375 wide can report a different clientWidth once a scrollbar or a zoom
+    // level is involved, and a finding that quotes the request rather than the
+    // measurement is describing an intention.
     viewportWidth: clientW,
     documentScrollWidth: de.scrollWidth,
     overflowBy: docOverflow,

@@ -110,6 +110,32 @@ function registerResources(server, { api = null } = {}) {
         }
         body = JSON.stringify(trimmed, null, 1);
       }
+      // AND CHECK AGAIN. The trim above drops the two lists most likely to be
+      // enormous, which is usually enough and is not guaranteed to be: a project
+      // with hundreds of components under the per-list caps could still exceed
+      // the budget, and the previous version announced a bound it then did not
+      // apply. If it is still over, say so and hand back the sections that are
+      // always small rather than a payload nobody asked for.
+      if (Buffer.byteLength(body, 'utf8') > MAX_PROFILE_BYTES) {
+        const p = result.profile || {};
+        body = JSON.stringify(
+          {
+            ok: true,
+            profile: {
+              about: p.about,
+              project: p.project,
+              framework: p.framework,
+              breakpoints: p.breakpoints,
+              oversize:
+                'This project is too large to profile in one response. Routes, components, layouts, styles, ' +
+                'tokens, classes and collections were dropped; call project.scan, style.variables, ' +
+                'project.classes and content.collections directly for them.',
+            },
+          },
+          null,
+          1
+        );
+      }
       return textContents(uri.href, body, 'application/json');
     }
   );

@@ -139,7 +139,13 @@ function registerAuditTool(server, { audit, api }) {
       title: 'Measure the running page',
       description: DESCRIPTION,
       inputSchema: z.object({
-        route: z.string().optional().describe('Route to audit, e.g. "/" or "/about". Defaults to the page Stacki has open.'),
+        route: z
+          .string()
+          .optional()
+          .describe(
+            'Route to audit, e.g. "/" or "/about". Defaults to the site root — NOT to the page Stacki has open; ' +
+              'call get_context first if you mean the page the person is looking at. Must resolve inside this project.'
+          ),
         viewports: z
           // z.string(), not z.enum(VIEWPORT_NAMES): an enum is refused by the SDK
           // with "viewports.0: Invalid input", which does not say what the valid

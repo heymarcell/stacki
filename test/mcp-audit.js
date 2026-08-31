@@ -339,6 +339,18 @@ let stopPreview = null;
     check('too many viewports is refused', many.ok === false, short(many));
   }
 
+  // --- the route is untrusted input
+  {
+    const off = await call('audit', { route: '//example.invalid/x' });
+    check('a route that resolves to another origin is refused', off.ok === false && off.code === 'route_outside_project', short(off));
+    check('  and the refusal names where it would have gone', /example\.invalid/.test(String(off.message)), short(off.message));
+    // The one hash that turns the project's own page into the canvas document --
+    // the exact document this engine exists not to measure.
+    const hashed = await call('audit', { route: '/audit#avb-design', viewports: ['phone'] });
+    check('a design-mode hash is dropped rather than honoured', hashed.ok === true && !/avb-design/.test(String(hashed.url)), short(hashed.url));
+    check('  and the route reported is the real one', hashed.ok === true && hashed.route === '/audit', short(hashed.route));
+  }
+
   // --- 320 is a standards failure, other widths are a measurement
   {
     const reflow = await call('audit', { route: '/audit', viewports: ['reflow'] });

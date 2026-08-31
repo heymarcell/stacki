@@ -35,7 +35,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { FREEZE, SETTLE, OVERFLOW } = require('./probe');
-const { overflowFinding, axeFinding, sortFindings } = require('./findings');
+const { overflowFinding, unattributedOverflowFinding, axeFinding, sortFindings } = require('./findings');
 const { resolveViewports } = require('../viewports');
 
 const LOAD_TIMEOUT_MS = 20000;
@@ -144,7 +144,12 @@ function axeScript({ rules }) {
     ? `{ type: 'rule', values: ${JSON.stringify(rules)} }`
     : `{ type: 'tag', values: ['wcag2a','wcag2aa','wcag21a','wcag21aa','wcag22a','wcag22aa'] }`;
   return `(async () => {
-    const res = await axe.run(document, { resultTypes: ['violations'], runOnly: ${runOnly} });
+    // BOTH buckets. resultTypes limits which result arrays keep their full node
+    // lists; anything omitted is truncated to ONE node per rule. Asking only for
+    // violations therefore quietly reduced every incomplete result to a single
+    // node -- while the payload went on presenting incomplete as a first-class
+    // bucket that a person has to look at.
+    const res = await axe.run(document, { resultTypes: ['violations', 'incomplete'], runOnly: ${runOnly} });
     const locate = (target) => {
       let el = null;
       try { el = document.querySelector(Array.isArray(target) ? target[target.length - 1] : target); } catch {}
@@ -207,10 +212,38 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
     }
 
     const runId = `audit-${process.pid}-${++runSeq}`;
-    const safeRoute = String(route || '/').startsWith('/') ? route : `/${route}`;
-    // NO `#avb-design`. See the note at the top of this file: that hash is what
-    // makes the canvas a different document from the site.
-    const url = new URL(safeRoute, base.endsWith('/') ? base : `${base}/`).href;
+    // THE ROUTE IS UNTRUSTED INPUT, AND A LEADING SLASH PROVES NOTHING.
+    //
+    // `//evil.example/x` starts with a slash and resolves, against any base, to
+    // a DIFFERENT ORIGIN -- so the audit would render a third-party site in a
+    // window Stacki opened, and report on it as though it were the project. And
+    // `/#avb-design` resolves to the project's own root wearing the one hash
+    // that turns the page into the canvas document, which is the exact thing
+    // this engine exists not to measure.
+    //
+    // So: resolve first, then check the result. Same origin as the dev server, no
+    // hash, or it is refused by name.
+    const baseHref = base.endsWith('/') ? base : `${base}/`;
+    let resolved;
+    try {
+      resolved = new URL(String(route || '/'), baseHref);
+    } catch {
+      return { ok: false, code: 'bad_route', message: `${route} is not a route this project can serve.` };
+    }
+    if (resolved.origin !== new URL(baseHref).origin) {
+      return {
+        ok: false,
+        code: 'route_outside_project',
+        message:
+          `${route} resolves to ${resolved.origin}, which is not the project Stacki is serving. ` +
+          'The audit only ever renders this project.',
+      };
+    }
+    // The hash is dropped rather than refused: it changes nothing a visitor sees
+    // except `#avb-design`, and silently keeping that one would be the bug.
+    resolved.hash = '';
+    const safeRoute = `${resolved.pathname}${resolved.search}`;
+    const url = resolved.href;
 
     const findings = [];
     const captures = [];
@@ -250,6 +283,17 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
           if (geo.overflows) {
             for (const culprit of geo.culprits) {
               findings.push(overflowFinding({ viewport, culprit, documentOverflowBy: geo.overflowBy }));
+            }
+            // THE DOCUMENT SCROLLS AND NOTHING WAS BLAMED.
+            //
+            // Every culprit rule above is a reason NOT to blame an element, and
+            // they can all be true at once: overflow from a text node with no box
+            // of its own, from a margin, from something the walk cannot reach.
+            // Reporting nothing then would be the worst possible answer -- the
+            // page demonstrably scrolls sideways and the audit says it is fine.
+            // So the measurement itself is the finding, with no element on it.
+            if (geo.culprits.length === 0) {
+              findings.push(unattributedOverflowFinding({ viewport, documentOverflowBy: geo.overflowBy }));
             }
           }
 
@@ -325,7 +369,19 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null }) {
     }
 
     const sorted = sortFindings(findings);
-    const kept = sorted.slice(0, MAX_FINDINGS);
+    // WHEN THE CAP BITES, IT MUST NOT EAT ONE BUCKET WHOLE.
+    //
+    // sortFindings ranks by severity, and every `incomplete` is severity `info`
+    // -- last. So a page with sixty violations would have had its entire
+    // incomplete bucket dropped, while `counts.incomplete` went on reporting the
+    // true number: the one channel whose whole purpose is honest uncertainty,
+    // silently emptied. A quarter of the budget is reserved for it.
+    const INCOMPLETE_SHARE = Math.floor(MAX_FINDINGS / 4);
+    const undecided = sorted.filter((f) => f.kind === 'incomplete');
+    const decided = sorted.filter((f) => f.kind !== 'incomplete');
+    const keptUndecided = undecided.slice(0, Math.min(INCOMPLETE_SHARE, undecided.length));
+    const keptDecided = decided.slice(0, MAX_FINDINGS - keptUndecided.length);
+    const kept = sortFindings([...keptDecided, ...keptUndecided]);
 
     return {
       ok: true,

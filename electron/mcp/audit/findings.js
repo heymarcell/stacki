@@ -119,6 +119,52 @@ function overflowFinding({ viewport, culprit, documentOverflowBy }) {
   };
 }
 
+/**
+ * The document scrolls sideways and no element could honestly be blamed.
+ *
+ * Every rule that excludes a culprit -- it clips its own overflow, an ancestor
+ * clips it, it is fixed, it is off the left -- is a reason not to point at that
+ * element. They can all be true at once: overflow from a text node with no box,
+ * from a margin, from something the walk cannot reach. Reporting nothing then
+ * would be the worst answer available, because the page demonstrably scrolls and
+ * the audit would be saying it is fine.
+ *
+ * So the measurement is the finding. It has no target, and it says so.
+ */
+function unattributedOverflowFinding({ viewport, documentOverflowBy }) {
+  const isReflow = viewport.standard != null;
+  return {
+    id: findingId({ ruleId: 'horizontal-overflow', viewport: viewport.key, where: 'document' }),
+    ruleId: 'horizontal-overflow',
+    category: 'responsive',
+    kind: isReflow ? 'standard' : 'mechanical',
+    severity: 'serious',
+    standard: isReflow ? viewport.standard : null,
+    viewport: { key: viewport.key, width: viewport.width, height: viewport.height, device: viewport.device },
+    message:
+      `The page scrolls ${documentOverflowBy}px sideways at ${viewport.width}px wide, and no single element ` +
+      'could be held responsible for it: everything that extends past the edge is inside something that ' +
+      'contains it, is fixed to the viewport, or has no box of its own. The overflow is real; the cause needs ' +
+      'a person.',
+    target: {
+      selector: null,
+      tag: null,
+      modelPath: null,
+      exact: false,
+      note: 'No element was attributable, so none is named. This is the document, not a node.',
+    },
+    evidence: {
+      viewportWidth: viewport.width,
+      documentOverflowBy,
+      attributableElements: 0,
+    },
+    help:
+      'Look for a text node or a margin that cannot be selected, or content the element walk cannot reach ' +
+      '(a shadow root, a cross-origin frame). Narrowing the viewport in a browser and using its layout tools ' +
+      'is the fastest way in.',
+  };
+}
+
 /** One accessibility finding, from the engine's own result. */
 function axeFinding({ viewport, rule, node, bucket }) {
   const refPath = node.refPath || null;
@@ -169,6 +215,7 @@ module.exports = {
   findingId,
   targetOf,
   overflowFinding,
+  unattributedOverflowFinding,
   axeFinding,
   sortFindings,
   IMPACT_TO_SEVERITY,
