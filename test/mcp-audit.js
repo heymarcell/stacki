@@ -498,10 +498,29 @@ let stopPreview = null;
     // reads of the SAME unchanged node produce different ref strings by design;
     // asserting on them would fail whether or not anything moved. What must not
     // move is which node is selected, which is its source range.
-    check('with the same thing selected', viewAfter.selection?.status === viewBefore.selection?.status, `${viewBefore.selection?.status} -> ${viewAfter.selection?.status}`);
-    check('  at the same place in the same file',
-      JSON.stringify(viewAfter.selection?.source ?? null) === JSON.stringify(viewBefore.selection?.source ?? null),
-      `${short(viewBefore.selection?.source)} -> ${short(viewAfter.selection?.source)}`);
+    // A COMPOSITE IDENTITY, not the ref.
+    //
+    // A ref embeds the revision and an expiry, so two reads of the same
+    // unchanged node produce different strings by design and comparing them
+    // would fail whether or not anything moved. But comparing the source range
+    // alone is too weak in the other direction: two different nodes can share a
+    // range, and an earlier sabotage moved the selection without this noticing.
+    // So: everything about the selection that says WHICH node it is.
+    const identity = (sel) =>
+      JSON.stringify({
+        status: sel?.status ?? null,
+        nodeKind: sel?.nodeKind ?? null,
+        tag: sel?.tag ?? null,
+        occurrence: sel?.occurrence ?? null,
+        source: sel?.source ?? null,
+        breadcrumbs: sel?.breadcrumbs ?? null,
+        componentChain: sel?.componentChain ?? null,
+      });
+    check(
+      'with the same thing selected',
+      identity(viewAfter.selection) === identity(viewBefore.selection),
+      `${short(identity(viewBefore.selection))} -> ${short(identity(viewAfter.selection))}`
+    );
     check('and the same viewport width', viewAfter.view?.viewportWidth === viewBefore.view?.viewportWidth, `${viewBefore.view?.viewportWidth} -> ${viewAfter.view?.viewportWidth}`);
 
     check('no audit window survived the run', liveWindowCount() === 0, `${liveWindowCount()} still registered`);

@@ -262,6 +262,13 @@ jobs:
       - name: a real project, changed and undone in the packaged app
         run: npm run test:packagedacceptance
 
+      # Phase B and Phase C, from the bundle rather than from source. This is
+      # the only job that can catch axe-core not being packaged: the engine is
+      # required lazily out of node_modules, so a packaging config that drops it
+      # passes every other suite and fails here.
+      - name: resources, prompts, the project profile and the audit, from the app
+        run: npm run test:packagedaudit
+
       - name: five consecutive packaged lifecycles, each clean
         run: npm run test:packagedlifecycle
 

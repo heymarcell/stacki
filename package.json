@@ -155,6 +155,7 @@
     "test:mcpcomponent": "node test/mcp-component-create.js",
     "test:packagedmcp": "node test/packaged-mcp.js",
     "test:packagedacceptance": "node test/packaged-acceptance.js",
+    "test:packagedaudit": "node test/packaged-audit.js",
     "test:packagedlifecycle": "node test/packaged-lifecycle.js",
     "test:bootstrap": "node test/automation-bootstrap.js",
     "test:devstop": "node test/dev-stop-truth.js",

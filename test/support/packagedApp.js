@@ -56,9 +56,12 @@ async function freePort(from) {
  * that cannot run Astro cannot render, and a packaged proof that never renders
  * is the in-process proof again with a longer startup.
  */
-function makeFixture({ nonce }) {
+function makeFixture({ nonce, extraFiles = null }) {
   ensureAstro();
-  const project = H.makeProject({ ...EXTRA });
+  // `extraFiles` is opt-in rather than always-on: a test that needs extra routes
+  // (the audit corpus) should not change the project every other packaged test
+  // is asserting page and component counts against.
+  const project = H.makeProject({ ...EXTRA, ...(extraFiles || {}) });
   writeBinary(fs, path, project);
   try {
     execFileSync('cp', ['-Rc', path.join(CACHE, 'node_modules'), path.join(project, 'node_modules')], { stdio: 'pipe' });
@@ -80,10 +83,10 @@ function makeFixture({ nonce }) {
  * comes from a live session or not at all), so `edit` is the ceiling here and
  * that is what a write needs.
  */
-async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 43990 } = {}) {
+async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 43990, extraFiles = null } = {}) {
   if (!available()) throw new Error(`no packaged app at ${APP}`);
   const marker = nonce || `stacki-automation-${process.pid}-${(process.hrtime.bigint() % 1000000n).toString()}`;
-  const project = makeFixture({ nonce: marker });
+  const project = makeFixture({ nonce: marker, extraFiles });
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-packaged-userdata-'));
   const port = await freePort(portFrom);
 
