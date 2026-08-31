@@ -199,13 +199,25 @@ const source = {
       if (from.error) return from;
       return { projectPath: ctx.root, fromFile: from.abs, spec: input.spec, name: input.name };
     },
-    result: (raw, _input, ctx) => ({
-      file: raw?.path ? relativeTo(ctx.root, raw.path) : null,
-      name: raw?.name ?? null,
-      text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
-      startLine: raw?.startLine ?? null,
-      endLine: raw?.endLine ?? null,
-    }),
+    // src:readSymbol answers { ok, rel, text, line }. This read `raw.path`,
+    // `raw.name`, `raw.startLine` and `raw.endLine` — none of which it sends —
+    // so four of the five fields were null on every successful call and only
+    // the text came through. `name` is the caller's own, and the handler
+    // reports one line (where the declaration starts), not a range.
+    // AN IN-BAND REFUSAL IS STILL A REFUSAL. src:readSymbol signals failure by
+    // answering `{ ok: false, reason }` rather than throwing, and runMain only
+    // makes an error envelope when the mapper reports one or the call throws —
+    // so an unresolvable specifier, or a file too large to read, arrived as
+    // ok:true with every field null.
+    result: (raw, input) =>
+      raw?.ok === false
+        ? problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`)
+        : {
+            file: raw?.rel ? toPosix(raw.rel) : null,
+            name: input?.name ?? null,
+            text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
+            line: Number.isInteger(raw?.line) ? raw.line : null,
+          },
   },
 
   resolve_path: {
@@ -215,10 +227,25 @@ const source = {
       if (from.error) return from;
       return { projectPath: ctx.root, fromFile: from.abs, spec: input.spec };
     },
-    result: (raw, _input, ctx) => ({
-      path: raw?.path ? relativeTo(ctx.root, raw.path) : null,
-      outsideProject: !!(raw?.path && !relativeTo(ctx.root, raw.path)),
-    }),
+    // `rel`, because that is the field the handler sends. It read `raw.path`,
+    // which src:resolvePath has never answered with, so this operation returned
+    // `{ path: null, outsideProject: false }` for every input it has ever been
+    // given — a resolver that resolves nothing. The scenario asked only whether
+    // a `path` key existed and whether `outsideProject` was false, and both were
+    // true of the null.
+    // Same in-band refusal as read_symbol above: `{ ok: false }` for a
+    // specifier that points at nothing, which used to answer ok:true with a
+    // null path — a resolver reporting success at resolving nothing.
+    result: (raw, input) =>
+      raw?.ok === false
+        ? problem('not_found', `${input?.spec} does not resolve to a file in this project.`)
+        : {
+            path: raw?.rel ? toPosix(raw.rel) : null,
+            // The handler refuses to leave the project at all (assertInProject
+            // throws), so anything it resolves is inside it. Said from the
+            // answer rather than asserted: a rel that climbs out is reported.
+            outsideProject: typeof raw?.rel === 'string' && raw.rel.startsWith('..'),
+          },
   },
 };
 
@@ -229,13 +256,24 @@ const summarizeScan = (raw, ctx, limit = MAX_LIST) => ({
     name: p.name,
     route: p.route,
     path: relativeTo(ctx.root, p.path),
-    dynamic: !!p.dynamic,
+    // WORKED OUT FROM THE ROUTE, because project:scan has never sent a flag.
+    // This read `p.dynamic`, so src/pages/notes/[slug].astro — the one page in
+    // the fixture that stands for many URLs — was reported `dynamic: false`,
+    // along with every other page in every answer. The app decides the same
+    // question the same way (App.jsx: `route?.includes('[')`), which is what
+    // makes it the route's own property rather than a field somebody forgot.
+    dynamic: typeof p.dynamic === 'boolean' ? p.dynamic : String(p.route ?? '').includes('['),
   })),
   components: take(raw?.components, limit).map((c) => ({
     name: c.name,
     path: relativeTo(ctx.root, c.path),
     slots: c.slots || null,
-    props: take(c.props, 40).map((prop) => (typeof prop === 'string' ? prop : prop?.name)).filter(Boolean),
+    // `schema` is what project:scan calls it — electron/main.js safeSchema()
+    // spreads parsePropSchema's array in under that name. This read `c.props`,
+    // a key the handler has never sent, so every component in this API
+    // answered `props: []`: an agent asking what <Hero> takes was told
+    // nothing, from a scan that knew `heading`.
+    props: take(c.props || c.schema, 40).map((prop) => (typeof prop === 'string' ? prop : prop?.name)).filter(Boolean),
   })),
   layouts: take(raw?.layouts, limit).map((l) => ({ name: l.name, path: relativeTo(ctx.root, l.path) })),
   counts: {
@@ -330,32 +368,17 @@ const page = {
   folder_rename: { channel: 'pagefolder:rename', args: (input, ctx) => ({ projectPath: ctx.root, from: input.from, to: input.to }) },
   folder_delete: { channel: 'pagefolder:delete', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
 
-  component_create: {
-    channel: 'component:create',
-    args: (input, ctx) => {
-      if (!Array.isArray(input.nodes) || !input.nodes.length) {
-        return problem('bad_request', 'component_create needs the nodes to make the component from.');
-      }
-      return {
-        projectPath: ctx.root,
-        pagePath: input.fromPage ? path.resolve(ctx.root, input.fromPage) : null,
-        name: input.name,
-        nodes: input.nodes,
-        imports: input.imports || [],
-        props: input.props || [],
-      };
-    },
-    result: (raw) => ({ name: raw?.name ?? null, path: raw?.rel ?? null }),
-  },
 
   component_usage: {
     channel: 'component:usage',
     args: (input, ctx) => ({ projectPath: ctx.root, name: input.name, exclude: input.exclude || null }),
     result: (raw, _input, ctx) => ({
       total: raw?.total ?? null,
+      // No `name` here: componentUsage answers { rel, path, kind, count } and
+      // never a name, so this field was null in every entry of every answer.
+      // The component's name is what the caller asked with.
       files: take(raw?.files, MAX_LIST).map((f) => ({
         path: f.path ? relativeTo(ctx.root, f.path) || f.rel || null : f.rel || null,
-        name: f.name ?? null,
         kind: f.kind ?? null,
         count: f.count ?? null,
       })),
@@ -369,7 +392,12 @@ const page = {
       if (at.error) return at;
       return { projectPath: ctx.root, pagePath: at.abs, devUrl: ctx.devUrl || null };
     },
-    result: (raw) => ({ paths: take(raw?.paths || raw, MAX_LIST), problem: raw?.problem || null }),
+    // page:dynamicPaths answers { entries, error }. This read `raw.paths` and
+    // `raw.problem`, so a successful enumeration of two routes arrived as
+    // `{ paths: [], problem: null }` — indistinguishable from a page with no
+    // dynamic routes, and from a dev server that had answered 500. The scenario
+    // accepted "no paths, or a problem", which this satisfied both ways.
+    result: (raw) => ({ paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null }),
   },
 
   injected_routes: {
@@ -507,8 +535,27 @@ const content = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
+    // BACK OUT OF THE CMS CONVENTION, like everything else here. cmsRefs.js
+    // names an importer relative to src/ ('pages/index.astro'), and this
+    // passed that straight through — so cms_list answered
+    // 'src/data/site.json' and cms_usage answered 'pages/index.astro', and the
+    // second is not a path any other operation in this API accepts. An agent
+    // asking which pages read a data file got an answer it could not open.
+    result: (raw) => ({ files: take(raw?.files || [], MAX_LIST).map((r) => cmsPublic(r)) }),
   },
-  cms_meta: { channel: 'cms:meta', args: (_i, ctx) => ctx.root },
+  cms_meta: {
+    channel: 'cms:meta',
+    args: (_i, ctx) => ctx.root,
+    // The same translation, on the keys. .stacki/cms.json is keyed by the
+    // src-relative rel the CMS panel looks fields up by, and that convention
+    // stays on disk — but a caller that reads a key here has to be able to
+    // hand it back to cms_set_meta or cms_read, and 'data/site.json' is
+    // refused by both ('not under src/'). A '#export' fragment survives the
+    // round trip: cmsRel splits it off before resolving.
+    result: (raw) => ({
+      meta: Object.fromEntries(Object.entries(raw?.meta || {}).map(([k, v]) => [cmsPublic(k), v])),
+    }),
+  },
   cms_set_meta: {
     channel: 'cms:setMeta',
     args: (input, ctx) => {
@@ -527,6 +574,12 @@ const content = {
       const limit = Math.min(input.limit || 100, MAX_LIST);
       return {
         collection: input.collection,
+        // "I CANNOT READ THIS" IS NOT "THERE IS NOTHING HERE". A collection
+        // built by a custom loader answers `{ entries: [], readOnly: true,
+        // reason }`, and dropping those two made it byte-identical to an empty
+        // collection — so an agent was told a collection was empty when Stacki
+        // simply had no way to enumerate it.
+        ...(raw?.readOnly ? { readOnly: true, reason: raw.reason ?? null } : {}),
         returned: Math.min(list.length, limit),
         total: list.length,
         entries: take(list, limit).map((e) => ({
@@ -548,7 +601,13 @@ const content = {
       if (!input.entry || typeof input.entry !== 'object') {
         return problem('bad_request', 'entry is required — pass the entry object content.entries reported.');
       }
-      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || {}, body: input.body };
+      if (input.edits !== undefined && !Array.isArray(input.edits)) {
+        return problem('bad_request', 'edits is a list of { path, value } — one per field to change.');
+      }
+      // `[]`, not `{}`. The implementation maps over this; an object arrived at
+      // `.map` and took the operation down for every caller, including the ones
+      // that sent no edits at all and only wanted to rewrite the body.
+      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || [], body: input.body };
     },
   },
   validate: {
@@ -635,7 +694,15 @@ const asset = {
       if (typeof input.text !== 'string') return problem('bad_request', 'text is required.');
       return { projectPath: ctx.root, rel: at.rel, text: input.text };
     },
-    result: (_raw, input) => ({ path: input.path, afterDigest: digestOf(input.text) }),
+    // The digest of what is ON DISK, not of what the caller asked for. This
+    // hashed `input.text`, so a write that did not land still reported the
+    // digest of the text it was supposed to contain — and a client using that
+    // for optimistic concurrency would then hold a digest no file has. The
+    // cms_write beside it has always read the file.
+    result: (_raw, input, ctx) => ({
+      path: input.path,
+      afterDigest: digestOfFile(path.resolve(ctx.root, input.path)),
+    }),
   },
   mkdir: {
     channel: 'assets:mkdir',
@@ -797,8 +864,7 @@ const project = {
     }),
   },
   probe: { channel: 'dev:probe', args: (input, ctx) => input.url || ctx.devUrl || null },
-  dev_start: { channel: 'dev:start', args: (_i, ctx) => ctx.root },
-  dev_stop: { channel: 'dev:stop', args: () => undefined },
+
 };
 
 // --- git ---------------------------------------------------------------------
@@ -847,8 +913,13 @@ const git = {
       return { projectPath: ctx.root, ref: input.ref, path: at };
     },
     result: (raw) => {
+      // A FILE THAT WAS NOT THERE YET is not a file that was empty. The handler
+      // answers `null` on purpose, and `null ?? ''` turned "this page did not
+      // exist at that commit" into an empty document — which reads as a page
+      // somebody had emptied.
+      if (raw === null || raw === undefined) return { text: null, existed: false, truncated: false };
       const body = clip(raw?.text ?? raw ?? '', MAX_TEXT_BYTES);
-      return { text: body.text, truncated: body.truncated };
+      return { text: body.text, existed: true, truncated: body.truncated };
     },
   },
   worktrees: { channel: 'git:worktrees', args: (_i, ctx) => ({ projectPath: ctx.root }), result: (raw) => ({ worktrees: take(raw?.worktrees || raw, MAX_LIST) }) },
@@ -877,7 +948,16 @@ const git = {
   },
   restore_project: { channel: 'git:restoreProject', args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }) },
   park: { channel: 'git:park', args: (_i, ctx) => ({ projectPath: ctx.root }) },
-  unpark: { channel: 'git:unpark', args: (_i, ctx) => ({ projectPath: ctx.root }) },
+  unpark: {
+    channel: 'git:unpark',
+    args: (_i, ctx) => ({ projectPath: ctx.root }),
+    // `{ restored: false, error }` is a refusal, and it used to arrive as
+    // ok:true with an error string nobody was obliged to read.
+    result: (raw) =>
+      raw && raw.restored === false && raw.error
+        ? problem('failed', String(raw.error))
+        : { restored: raw?.restored !== false, ...(raw?.error ? { note: String(raw.error) } : {}) },
+  },
   push: { channel: 'git:push', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
   publish: {
     channel: 'git:publish',
@@ -918,6 +998,18 @@ async function runMain(domain, action, input, ctx) {
     return { ok: false, code: 'failed', message };
   }
   const shaped = entry.result ? entry.result(raw, input, ctx) : raw;
+  // A RESULT MAPPER MAY REFUSE, the same way an args mapper may — `problem()`
+  // in either place means the same thing. Several handlers signal failure in
+  // band (`{ ok: false, reason }`) rather than by throwing, and without this
+  // the only thing a mapper could do with that was spread it into an ok:true
+  // envelope: a resolver reporting success at resolving nothing.
+  //
+  // Only `problem()`'s own shape counts. Plenty of answers carry an `error`
+  // STRING as an ordinary field — content.config says why it cannot read a
+  // config, css:setVariable says why it would not write — and treating those as
+  // the refusal itself replaced the whole envelope with that string, which
+  // arrives at a client spread into numbered characters.
+  if (shaped?.error && typeof shaped.error === 'object' && shaped.error.ok === false) return shaped.error;
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 

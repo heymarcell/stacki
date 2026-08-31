@@ -360,6 +360,30 @@ export function createAgentCommands(getApp) {
     if (action === 'dev_status') {
       return { ok: true, ...a.preview() };
     }
+    // Through the app's own preview, so what dev_status reads next is what this
+    // just did. Main still does the work; the difference is that the app is
+    // told about it rather than finding out from a process exit.
+    if (action === 'dev_start') {
+      try {
+        const started = await a.startPreview();
+        // startPreview reports its own failures to the person and returns; a
+        // preview with no address did not start, and saying ok:true here would
+        // send an agent off to look at a page that is not being served.
+        if (!started?.url) {
+          return fail('failed', 'The dev server did not start. Stacki has the log in the preview area.');
+        }
+        return { ok: true, ...started };
+      } catch (err) {
+        return fail('failed', String(err?.message || err));
+      }
+    }
+    if (action === 'dev_stop') {
+      // What stopping just made true, not what React has re-rendered since —
+      // and if it did not stop, that is what this says.
+      const stopped = await a.stopPreview();
+      if (stopped?.ok === false) return fail('failed', stopped.message || 'The dev server did not stop.', { status: stopped.status, url: stopped.url });
+      return { ok: true, ...stopped };
+    }
     // Not an action any tool can name — there is nothing for it in the registry
     // or the schemas. The main process sends it after a write that changed the
     // file the editor has open, so the model, the disk and the canvas agree
@@ -386,13 +410,77 @@ export function createAgentCommands(getApp) {
     return fail('bad_action', `project has no renderer action "${action}".`);
   }
 
+  // The page operations that need the LIVE model rather than a file.
+  //
+  // component_create is the whole reason this domain reaches the renderer.
+  // Making a component out of something means four things — the file, the
+  // import, the props derived from real page scope, and the markup replaced by
+  // the instance — and only this side knows the model those come from. The
+  // main-process `component:create` stays what it always was: the primitive
+  // that writes the file.
+  async function page(action, args) {
+    const a = app();
+    if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
+
+    if (action === 'component_create') {
+      const anchor = args.anchor || null;
+      if (!anchor) return fail('bad_ref', 'component_create needs a ref to the node to turn into a component.');
+
+      const at = await locate(a, anchor, { navigate: true });
+      if (!at.ok) return at;
+      const writable = at.writable === undefined ? a.writableFor(anchor, at.confidence) : at.writable;
+      if (!writable) {
+        return fail('not_editable', 'That node is not editable here, so it cannot be turned into a component.');
+      }
+
+      // The document has to be the one the ref saw. Checked before anything is
+      // written, so a stale ref cannot leave a component file behind.
+      const doc = documentOf(a);
+      if (args.expectedRevision != null && args.expectedRevision !== doc.revision) {
+        return fail(
+          'stale_target',
+          `${doc.file} has changed since you read it (revision ${args.expectedRevision} → ${doc.revision}). Nothing was changed.`,
+          { document: doc }
+        );
+      }
+      if (args.expectedDigest != null && args.expectedDigest !== doc.digest) {
+        return fail('stale_target', `${doc.file} has changed since you read it. Nothing was changed.`, { document: doc });
+      }
+
+      const node = findNodeById(a.model()?.nodes || [], at.id);
+      if (!node) return fail('no_node', 'That element is no longer in the page.');
+
+      const done = await a.extractComponent(node, args.name, { withProps: args.withProps !== false });
+      if (!done?.ok) return fail(done?.code || 'failed', done?.message || 'The component could not be made.');
+
+      return {
+        ok: true,
+        name: done.name,
+        path: done.path,
+        props: done.props,
+        replaced: done.replaced,
+        // Reads page scope with no props to carry it: the markup moved but the
+        // values it needs did not. Worth saying, rather than leaving the agent
+        // to discover a broken component later.
+        stranded: done.stranded,
+        // The extraction committed; something after it did not. Said out loud
+        // rather than folded into ok:false, because an agent told a mutation
+        // failed will reasonably make it again — and this one already happened.
+        ...(done.notes?.length ? { notes: done.notes } : {}),
+        document: documentOf(a),
+      };
+    }
+    return fail('bad_action', `page has no renderer action "${action}".`);
+  }
+
   return async function run(params) {
     const { domain, action, ...args } = params || {};
     try {
       if (domain === 'target') return await target(action, args);
       if (domain === 'style') return await style(action, args);
       if (domain === 'project') return await project(action, args);
-      return fail('bad_domain', `Stacki's window answers for target, style and project — not "${domain}".`);
+      if (domain === 'page') return await page(action, args);
+      return fail('bad_domain', `Stacki's window answers for target, style, project and page — not \"${domain}\".`);
     } catch (err) {
       // A command that throws must not look like a command that timed out.
       return fail('command_failed', String(err?.message || err));

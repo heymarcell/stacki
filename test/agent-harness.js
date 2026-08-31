@@ -26,6 +26,7 @@
 // Not a test itself; the files that use it are agent-api.js and
 // agent-acceptance.js.
 
+const { execFileSync } = require('node:child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -170,10 +171,30 @@ function makeProject(extra = {}) {
 }
 
 const removeProject = (root) => {
-  try {
-    fs.rmSync(root, { recursive: true, force: true });
-  } catch {
-    /* a temp folder that will not go is not a test failure */
+  // Retried, because a fixture with dependencies in it is being let go of by
+  // processes that have only just been asked to stop — an esbuild binary still
+  // mapped out of node_modules will refuse the first attempt and allow the
+  // second. The comment here used to say a folder that will not go is not a
+  // test failure; it is exactly that, and test/support/ownedResidue.js says so
+  // now, so the least this can do is try more than once.
+  // Long enough to outlast an esbuild binary still being unmapped out of the
+  // fixture's node_modules — the case that used to leave a 52K fragment behind.
+  // The residue check no longer removes anything itself, so this is the only
+  // thing that does, and it has to be patient enough to be the whole answer.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (!fs.existsSync(root)) return;
+    } catch {
+      /* still held; wait and try again */
+    }
+    // A short pause, without spinning: a busy-wait here would hold the very
+    // event loop the operating system needs to finish letting the files go.
+    try {
+      execFileSync('sleep', ['0.15'], { stdio: 'ignore' });
+    } catch {
+      /* nothing to wait with; the next attempt is immediate */
+    }
   }
 };
 
@@ -194,6 +215,16 @@ function loadMain() {
   const handlers = new Map();
   const sent = [];
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agent-userdata-'));
+  // Taken back when this process ends. One per run is easy to overlook and adds
+  // up to gigabytes across a working day — there were three hundred and
+  // sixty-five of these on this machine before anybody counted.
+  process.on('exit', () => {
+    try {
+      fs.rmSync(userData, { recursive: true, force: true });
+    } catch {
+      /* going away with the process anyway */
+    }
+  });
 
   const electron = {
     app: {
@@ -344,13 +375,16 @@ const settle = (ms = 60) => new Promise((done) => setTimeout(done, ms));
  * the human — select something, edit a file behind the agent's back, read what
  * is on disk.
  */
-async function start(root, { agentMode = 'full' } = {}) {
+async function start(root, { agentMode = 'full', realDevServer = false } = {}) {
   const { handlers, callMain } = loadMain();
   const dom = makeDom();
 
   // Everything the app publishes about itself, kept so the API can read it the
   // way the real main process does.
   let payload = null;
+  // Where main's dev server is, as of the last start or stop that went through
+  // this bridge — the harness's stand-in for reading `devServer` in main.
+  let devUrlNow = null;
   // The app's own answer to an mcp:ask, registered by its effect.
   let askHandler = null;
   const replies = new Map();
@@ -367,10 +401,40 @@ async function start(root, { agentMode = 'full' } = {}) {
       // The fixture has no node_modules and must not try to acquire any: a
       // test that runs `npm install` is a test that fails on an aeroplane.
       hasNodeModules: async () => ({ has: true }),
-      startDevServer: async () => ({ error: 'the fixture has no dev server' }),
-      stopDevServer: async () => ({ ok: true }),
-      diagnoseDev: async () => ({ kind: 'no-deps' }),
-      probeDevPage: async () => null,
+      // A REAL SERVER WHEN THERE IS ONE TO START.
+      //
+      // A fixture built with its dependencies installed can run the project's
+      // own Astro, so these go to main's real handlers rather than round them —
+      // which is the only way project.dev_start, dev_status and probe can be
+      // about anything. Without dependencies they REFUSE BY THROWING, because
+      // that is what production does: doDevStart either answers with a url or
+      // throws, and the resolved `{ error }` this used to hand back walked
+      // straight past startPreview's catch and left the app reporting a preview
+      // that was on with no address.
+      startDevServer: realDevServer
+        ? (projectPath) =>
+            Promise.resolve()
+              .then(() => handlers.get('dev:start')(null, projectPath || root))
+              .then((r) => {
+                devUrlNow = r?.url || null;
+                return r;
+              })
+        : async () => {
+            throw new Error('the fixture has no dev server');
+          },
+      stopDevServer: realDevServer
+        ? () =>
+            Promise.resolve()
+              .then(() => handlers.get('dev:stop')(null))
+              .then((r) => {
+                devUrlNow = null;
+                return r;
+              })
+        : async () => ({ ok: true }),
+      diagnoseDev: async () => ({ kind: realDevServer ? 'ready' : 'no-deps' }),
+      probeDevPage: realDevServer
+        ? (url) => Promise.resolve().then(() => handlers.get('dev:probe')(null, url))
+        : async () => null,
       refreshThumb: async () => null,
       watchProject: async () => ({ ok: true }),
       mcpPublish: async (next) => {
@@ -469,6 +533,9 @@ async function start(root, { agentMode = 'full' } = {}) {
     callMain,
     ask,
     readPayload: () => payload,
+    // The same authority the app gives it: main's own dev server, asked
+    // through the handler rather than read out of a closure.
+    getDevUrl: () => devUrlNow,
     resolveTrail: (keys) => selectionTrail({ projectPath: root, keys }, locateSelection),
     version: '0.0.0-test',
   });
@@ -492,7 +559,14 @@ async function start(root, { agentMode = 'full' } = {}) {
     },
     settle,
     read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'),
-    write: (rel, text) => fs.writeFileSync(path.join(root, rel), text, 'utf8'),
+    write: (rel, text) => {
+      // Makes the directories on the way. A fixture that can only write beside
+      // files that already exist cannot set up a nested case, and every caller
+      // that wanted one had to reach past this helper to do it.
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, text, 'utf8');
+    },
     exists: (rel) => fs.existsSync(path.join(root, rel)),
     stop: () => {
       try {

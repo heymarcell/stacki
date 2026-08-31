@@ -78,7 +78,7 @@ says so.
 | `folder_create` | Edit project | main | — | electron/main.js pagefolder:create | Create a page folder. |
 | `folder_rename` | Edit project | main | — | electron/main.js pagefolder:rename | Rename a page folder and rebase what it holds. |
 | `folder_delete` | Full control | main | — | electron/main.js pagefolder:delete | Delete a page folder and the pages in it. |
-| `component_create` | Edit project | main | — | electron/componentFile.js | Create a component file. |
+| `component_create` | Edit project | renderer | — | src/App.jsx extractComponent — the same operation the menu item runs | Turn one node into a component: the file, the import, the props it needs, and the markup replaced by the instance. |
 | `component_usage` | Inspect | main | — | electron/componentUsage.js | Where a component is used. |
 | `dynamic_paths` | Inspect | main | — | electron/main.js page:dynamicPaths | The routes a dynamic page renders. |
 | `injected_routes` | Inspect | main | — | electron/injectedRoutes.js | Routes injected by integrations. |
@@ -133,8 +133,8 @@ says so.
 | `diagnose` | Inspect | main | — | electron/main.js dev:diagnose | Why the dev server will or will not start. |
 | `probe` | Inspect | main | — | electron/devProbe.js | Whether a preview URL answers. |
 | `dev_status` | Inspect | renderer | — | App.jsx devStatus | What the preview is doing right now. |
-| `dev_start` | Edit project | main | — | electron/main.js dev:start | Start the project's dev server (Stacki normally does this itself). |
-| `dev_stop` | Edit project | main | — | electron/main.js dev:stop | Stop the dev server. |
+| `dev_start` | Edit project | renderer | — | App.jsx startPreview | Start the project's dev server (Stacki normally does this itself). |
+| `dev_stop` | Edit project | renderer | — | App.jsx stopPreview | Stop the dev server. |
 | `undo` | Edit project | renderer | ⌘Z | App.jsx undo | Undo the last step on Stacki's own stack. |
 | `redo` | Edit project | renderer | ⌘Z | App.jsx redo | Redo the last undone step. |
 
@@ -167,6 +167,8 @@ says so.
 
 | Capability | Why | Reason |
 | --- | --- | --- |
+| `component:create` | exposed elsewhere | The primitive that writes a component file, and only that. Making a component is four things — the file, the import, the props the markup needs from page scope, and the markup replaced by the instance — and only the window knows the model those come from. So page.component_create runs in the renderer against a ref and calls this on its way through. Exposing the primitive directly is what made the operation unusable before: it wanted internal parser nodes nothing could hand it. |
+| `dev:start`<br>`dev:stop` | exposed elsewhere | The preview lives in the window: App.jsx owns whether one is running and at what address, and project.dev_status reads exactly that. Calling these directly started a real server the app was never told about, so the write and the read disagreed about the same thing — dev_start answered with a URL and dev_status, next call, said the preview was off. project.dev_start and project.dev_stop go through App.jsx startPreview instead, which still calls these, and leaves one account of what is running. |
 | `project:openDialog`<br>`project:newDialog`<br>`project:parentDialog` | human-only | Native folder and file pickers. An agent cannot see one, and which project is open is the person’s decision to make. |
 | `assets:pickUpload` | human-only | A native picker over the whole filesystem — the one door in Stacki that reaches outside the open project, and it opens only for a person. |
 | `assets:upload` | human-only | Copies files in from anywhere on the machine. Its input is a picker result or a drag, neither of which an agent has. |
@@ -198,4 +200,4 @@ says so.
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
 - 31 land on Stacki's own undo stack.
-- 52 capabilities deliberately kept out.
+- 55 capabilities deliberately kept out.

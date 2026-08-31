@@ -144,9 +144,9 @@ and by whether they are on the page you are looking at.
 
 Every comment gets a short number — **#3** — shown on its pin, on its row and in
 what an agent reads back, so "fix #3" means one thing to both of you. A pin with
-several comments under it shows the first number and how many more. Drag a
-comment's header to push it aside when it is covering the thing it is about; the
-pin stays where it is, and the panel goes back on its own next time.
+several comments under it shows the first number and how many more. Hovering a
+pin shows a passive peek; clicking one opens the Review Inspector beside the
+canvas rather than over the thing it is about.
 
 A comment is not a sticky note on a screenshot. It is anchored to the same
 source-backed node **⇧⌘C** copies and `get_context` reports — through every

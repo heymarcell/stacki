@@ -192,6 +192,10 @@ export default function App() {
   const [devUrl, setDevUrl] = useState(null);
   const [trailingSlash, setTrailingSlash] = useState('ignore');
   const [devStatus, setDevStatus] = useState('off'); // off | starting | on
+  // Read back by the agent surface right after it starts one: React state is
+  // not readable through the closure that set it.
+  const devStatusRef = useRef('off');
+  const devUrlRef = useRef(null);
   const [devLog, setDevLog] = useState('');
   const [devDiag, setDevDiag] = useState(null); // {kind, nodePath, nodeVersion, …}
   const [busy, setBusy] = useState(null); // string message
@@ -372,6 +376,8 @@ export default function App() {
     const offExit = window.avb.onDevExit(({ log }) => {
       setDevStatus('off');
       setDevUrl(null);
+      devStatusRef.current = 'off';
+      devUrlRef.current = null;
       if (log) {
         devLogRef.current = log;
         setDevLog(log);
@@ -451,11 +457,19 @@ export default function App() {
     async (projectPath) => {
       setDevStatus('starting');
       try {
-        const { url, external, trailingSlash: resolved } =
+        const { url, external, trailingSlash: resolved, error } =
           await window.avb.startDevServer(projectPath);
+        // A preview with no address is not a preview that is on. Starting
+        // answers with a url or it did not start, and reporting `on` for
+        // anything else puts a lie somewhere it gets believed — the status dot,
+        // and project.dev_status, which an agent reads to decide whether it can
+        // look at the page at all.
+        if (!url) throw new Error(error || 'the dev server did not report a URL');
         setDevUrl(url);
+        devUrlRef.current = url;
         if (resolved) setTrailingSlash(resolved);
         setDevStatus('on');
+        devStatusRef.current = 'on';
         setDevDiag(null);
         if (external) {
           showToast(
@@ -465,6 +479,8 @@ export default function App() {
         }
       } catch (err) {
         setDevStatus('off');
+        devStatusRef.current = 'off';
+        devUrlRef.current = null;
         setBusy(null);
         showToast(`Preview failed to start — see the log in the preview area.`, 'error');
         const msg = cleanError(err);
@@ -1243,12 +1259,23 @@ export default function App() {
   // the page ends up with `<Card />` where the element was — so this is one
   // edit to two files, and the component file is written first: a page that
   // imports a file that isn't there yet is a broken page, however briefly.
-  const createComponentFromSelection = useCallback(
-    async (name, { withProps = true } = {}) => {
+  // Turning a node into a component, once, for both the person and the agent.
+  //
+  // These were never allowed to become two implementations. "Make a component
+  // out of that" means the file, the import, the derived props AND the markup
+  // replaced by the instance — an agent that got only the file would be doing
+  // something the menu item does not do.
+  //
+  // Takes the node explicitly rather than reading the selection, because an
+  // agent arrives holding a ref to a node that may not be selected. Returns
+  // what happened instead of announcing it; the caller decides whether that
+  // becomes a toast or an MCP envelope.
+  const extractComponent = useCallback(
+    async (node, name, { withProps = true } = {}) => {
       const page = pageStateRef.current.currentPage;
       const model = pageStateRef.current.pageState?.model;
-      const node = model && selectedIdRef.current ? findNodeById(model.nodes, selectedIdRef.current) : null;
-      if (!page || !model || !node) return;
+      if (!page || !model || !node) return { ok: false, code: 'no_target', message: 'There is nothing to make a component from.' };
+
       const props = withProps ? propsNeededFor(model, node) : [];
       let created;
       try {
@@ -1261,48 +1288,165 @@ export default function App() {
           props,
         });
       } catch (err) {
-        showToast(cleanError(err), 'error');
-        return;
+        return { ok: false, code: 'failed', message: cleanError(err) };
       }
-      const paths = await window.avb.importPathFor({
-        pagePath: page.path,
-        targetPath: created.path,
-        projectPath: projectRef.current?.path,
-      });
-      const id = newId();
-      mutateModel((m) => {
-        const found = findParentList(m, node.id);
-        if (!found) return m;
-        if (!m.imports.some((i) => i.name === name)) {
-          m.imports.push({ name, path: chooseImportPath(m, paths) });
+
+      // THE FILE IS ON DISK FROM HERE.
+      //
+      // Every exit between this line and the page committing owes an answer
+      // about it. Best effort, and honest when the effort fails: the caller is
+      // told which file is still there rather than left to find out.
+      const rollbackCreated = async () => {
+        try {
+          // The bare path, because that is what page:delete takes, and what the
+          // menu caller below already passes. This once sent an object, which
+          // the handler could only throw on, so the rollback had never removed
+          // anything in its life. Not optional-chained, and the answer is read:
+          // a missing bridge or an unconfirmed delete has to report the file as
+          // left behind, because claiming a clean state over an orphan on disk
+          // is worse than saying plainly that one is there.
+          const cleanup = await window.avb.deletePage(created.path);
+          if (!cleanup?.ok) throw new Error(`page:delete did not confirm removing ${created.rel}`);
+          return null;
+        } catch {
+          return created.rel;
         }
-        // The instance passes each value straight back in under its own name.
-        // That's what reconnects it: `title` meant the page's title where this
-        // markup used to sit, and it still does, one level out.
-        found.list[found.index] = {
-          id,
-          kind: 'component',
-          name,
-          props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
-          children: null,
+      };
+
+      // WORK THE WHOLE NEXT PAGE OUT BEFORE ASKING REACT FOR ANY OF IT.
+      //
+      // The path lookup and the model edit both happen here, on a draft this
+      // function owns, so whether the extraction can happen at all is settled
+      // now — by code whose exceptions land in the catch immediately below.
+      //
+      // This used to be decided inside the callback handed to mutateModel, and
+      // that callback is queued state work: React runs it later, during render.
+      // An exception in it never reached this function at all. It came back out
+      // of useState, took the renderer down with it, and left the component
+      // file on disk with nobody to answer for it — while `replaced`, set from
+      // inside that same callback, was read here as though it had already run.
+      // A queued updater is not a transaction oracle. This is.
+      const id = newId();
+      let nextModel = null;
+      try {
+        const paths = await window.avb.importPathFor({
+          pagePath: page.path,
+          targetPath: created.path,
+          projectPath: projectRef.current?.path,
+        });
+        // Read again rather than closing over the model from before the await:
+        // the node can go while the path is being worked out, and that is the
+        // `no_node` case below rather than this one.
+        const live = pageStateRef.current.pageState;
+        if (live?.editable && live.model) {
+          const draft = structuredClone(live.model);
+          const found = findParentList(draft, node.id);
+          if (found) {
+            if (!draft.imports.some((i) => i.name === name)) {
+              draft.imports.push({ name, path: chooseImportPath(draft, paths) });
+            }
+            // The instance passes each value straight back in under its own
+            // name. That's what reconnects it: `title` meant the page's title
+            // where this markup used to sit, and it still does, one level out.
+            found.list[found.index] = {
+              id,
+              kind: 'component',
+              name,
+              props: Object.fromEntries(props.map((p) => [p, { type: 'expr', value: p }])),
+              children: null,
+            };
+            nextModel = draft;
+          }
+        }
+      } catch (err) {
+        // Nothing has been committed — the draft is thrown away and the file
+        // this operation made goes with it.
+        const leftBehind = await rollbackCreated();
+        return {
+          ok: false,
+          code: 'failed',
+          message: leftBehind
+            ? `${name} could not be made: ${cleanError(err)}. ${leftBehind} was left behind.`
+            : `${name} could not be made: ${cleanError(err)}. Nothing was changed.`,
+          leftBehind,
         };
-        return m;
-      }, true);
+      }
+
+      // SUCCESS MEANS ALL OF IT.
+      //
+      // The file is written before the model is touched, so a node that has
+      // gone between those two moments leaves a component nobody asked for and
+      // a page that never changed. Reporting that as ok:true would be saying
+      // "turned it into a component" about markup still sitting where it was.
+      //
+      // So the half-done case is a failure, and it says what is on disk. The
+      // file just created is removed — it is this operation's own, made
+      // seconds ago, and nothing else can be pointing at it yet.
+      if (!nextModel) {
+        const leftBehind = await rollbackCreated();
+        return {
+          ok: false,
+          code: 'no_node',
+          message: leftBehind
+            ? `The element was gone before it could be replaced, and ${leftBehind} was left behind.`
+            : 'The element was gone before it could be replaced. Nothing was changed.',
+          leftBehind,
+        };
+      }
+
+      // THE COMMIT POINT.
+      //
+      // Everything that could refuse has refused. What goes to React is a
+      // finished model and a function that does nothing but hand it over, so
+      // there is no work left in the updater to fail — and past this line the
+      // extraction has happened as far as the page is concerned.
+      mutateModel(() => nextModel, true);
+
+      // COMMITTED. The page holds the import and the instance, so the component
+      // file is no longer this operation's to withdraw, and nothing below may
+      // report the extraction itself as not having happened.
+      const notes = [];
       setSelectedId(id);
-      await rescan(projectRef.current.path);
+      try {
+        await rescan(projectRef.current.path);
+      } catch (err) {
+        // A rescan keeps Stacki's own lists current; it is not the extraction.
+        // Answering ok:false here would tell an agent to try a mutation that
+        // has already been made, and it would do it — so this is said out loud
+        // and the operation still reports what actually happened.
+        notes.push(
+          `${name} was made and the page uses it, but the project could not be rescanned afterwards (${cleanError(err)}). Stacki's own lists may be stale until the next scan; the page itself is correct.`
+        );
+      }
+
       // Anything left reading the page's scope can't be reconnected on its own
       // — an expression naming something that isn't a value the page holds, or
-      // props turned off. The person who just moved it knows what it needs.
+      // props turned off. Whoever moved it knows what it needs.
       const stranded = usesPageScope(node) && !props.length;
+      return { ok: true, name, path: created.rel, absolutePath: created.path, instanceId: id, props, replaced: true, stranded, notes };
+    },
+    [mutateModel, propsNeededFor, rescan]
+  );
+
+  const createComponentFromSelection = useCallback(
+    async (name, { withProps = true } = {}) => {
+      const model = pageStateRef.current.pageState?.model;
+      const node = model && selectedIdRef.current ? findNodeById(model.nodes, selectedIdRef.current) : null;
+      if (!node) return;
+      const done = await extractComponent(node, name, { withProps });
+      if (!done.ok) {
+        showToast(done.message, 'error');
+        return;
+      }
       showToast(
-        stranded
-          ? `Created ${created.rel} — it reads page data, so it will need props.`
-          : props.length
-            ? `Created ${created.rel} with ${props.length} prop${props.length === 1 ? '' : 's'}.`
-            : `Created ${created.rel}`
+        done.stranded
+          ? `Created ${done.path} — it reads page data, so it will need props.`
+          : done.props.length
+            ? `Created ${done.path} with ${done.props.length} prop${done.props.length === 1 ? '' : 's'}.`
+            : `Created ${done.path}`
       );
     },
-    [mutateModel, propsNeededFor, rescan, showToast]
+    [extractComponent, showToast]
   );
 
   const moveNode = useCallback(
@@ -3493,6 +3637,7 @@ export default function App() {
     hidden: stateIds.hidden.has(selectedId),
     inert: stateIds.inert.has(selectedId),
     devStatus,
+    devUrl,
     canvas: canvasReport,
   });
   // Every render, deduped on what was last sent — the alternative is an IPC
@@ -4125,6 +4270,7 @@ export default function App() {
       hidden: stateIds.hidden.has(target.id),
       inert: stateIds.inert.has(target.id),
       devStatus,
+      devUrl,
       canvas: {
         ...(canvasReport || {}),
         rect: target.rect || null,
@@ -4412,7 +4558,36 @@ export default function App() {
     isHidden: (id) => stateIds.hidden.has(id),
     isInert: (id) => stateIds.inert.has(id),
     insertables: () => insertables,
+    // The same operation the menu item runs — file, import, derived props and
+    // the markup replaced by the instance. An agent arrives with a ref rather
+    // than a selection, so the node comes in explicitly.
+    extractComponent,
     preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
+    // THE SAME START AND STOP THE APP ITSELF USES.
+    //
+    // These used to go straight to main, round the app, and the app is where
+    // the preview's state lives — so an agent could start a server and then be
+    // told by dev_status, truthfully about the state it read, that nothing was
+    // running. Two implementations of one thing, and the read was pointed at
+    // the one the write never touched.
+    startPreview: async (projectPath) => {
+      await startPreview(projectPath || projectRef.current?.path);
+      return { status: devStatusRef.current, url: devUrlRef.current };
+    },
+    stopPreview: async () => {
+      const said = await window.avb.stopDevServer();
+      // A refused stop leaves the preview exactly where it was. Saying `off`
+      // here would put the lie in the app's own state as well as in the answer,
+      // and the status dot would then agree with it.
+      if (said && said.ok === false) {
+        return { ok: false, message: said.message || 'The dev server did not stop.', status: devStatusRef.current, url: devUrlRef.current };
+      }
+      setDevStatus('off');
+      setDevUrl(null);
+      devStatusRef.current = 'off';
+      devUrlRef.current = null;
+      return { ok: true, status: 'off', url: null };
+    },
     historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
     undo,
     redo,

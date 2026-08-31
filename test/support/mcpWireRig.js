@@ -25,21 +25,190 @@
 // meaning is a rendered pixel are graded against the packaged Electron proof
 // instead, not here.
 
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const H = require('../agent-harness.js');
+const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
+const { ensureAstro, astroCached, CACHE } = require('../agent-canvas-fixture.js');
 const { createStackiMcpServer } = require('../../electron/mcp/server.js');
 const { connectMcp } = require('./mcpWire.js');
+const net = require('node:net');
 
-let nextPort = 44120;
+/** Whether something is already listening there. */
+const portTaken = (port) =>
+  new Promise((done) => {
+    const socket = net.connect({ port, host: '127.0.0.1' });
+    const settle = (taken) => {
+      socket.destroy();
+      done(taken);
+    };
+    socket.once('connect', () => settle(true));
+    socket.once('error', () => settle(false));
+    setTimeout(() => settle(false), 300).unref?.();
+  });
+
+// A base that differs per process, so two suites running at once do not both
+// start at the same number and collide — which is not hypothetical: the
+// permission matrix and the regression suites, run together, took each other
+// out with "port 44120 is already in use".
+let nextPort = 44120 + ((process.pid % 400) * 30);
 
 /**
  * Boot a fixture project, a real Agent API over it, an MCP endpoint in front
  * of that, and an official client connected to the endpoint.
  */
-async function startWireRig({ era = 'modern', agentMode = 'full', extra = {} } = {}) {
-  const root = H.makeProject(extra);
-  const harness = await H.start(root, { agentMode });
+/**
+ * The project's own dependencies, really installed.
+ *
+ * The content operations are not testable without them. Reading a content
+ * config means bundling it, which electron/contentConfig.js does with the
+ * project's OWN esbuild — `esbuildOf(projectPath)` — so without node_modules
+ * every collection question can only answer "that needs the dependencies
+ * installed". Scenarios were accepting that answer as proof, which meant the
+ * whole content domain was graded on its refusal message.
+ *
+ * Installed once into a shared cache by test/agent-canvas-fixture.js, then
+ * cloned per fixture. `cp -c` asks APFS for copy-on-write, which turns 154MB
+ * into a metadata operation; the plain copy is there for filesystems that will
+ * not do that, and is the same layout either way — a real node_modules, not a
+ * symlink farm.
+ */
+/** A few deep files that a complete install has and a half-copy does not. */
+const DEPS_LANDMARKS = [
+  path.join('astro', 'package.json'),
+  path.join('astro', 'dist'),
+  path.join('astro', 'bin'),
+  path.join('.bin', 'astro'),
+  path.join('esbuild', 'package.json'),
+  path.join('esbuild', 'lib', 'main.js'),
+];
 
-  const port = nextPort++;
+/** Whether an installed node_modules has the parts a content config needs. */
+const looksComplete = (dir) => DEPS_LANDMARKS.every((rel) => fs.existsSync(path.join(dir, rel)));
+
+function installDeps(root, log) {
+  ensureAstro({ log });
+  const from = path.join(CACHE, 'node_modules');
+  // THE CACHE ITSELF, checked before anything is cloned from it.
+  //
+  // ensureAstro only looks for astro/package.json, so a cache that was restored
+  // half-written — or saved by a run that was cancelled mid-install — passes
+  // that and produces a fixture that cannot read a content config. On CI that
+  // surfaced as six content operations refusing, which reads as six product
+  // failures and is one bad archive. A cache that is not whole is thrown away
+  // and built again rather than cloned four hundred times.
+  if (fs.existsSync(from) && !looksComplete(from)) {
+    if (log) log(`the astro cache at ${CACHE} is incomplete; installing it again`);
+    fs.rmSync(CACHE, { recursive: true, force: true });
+    ensureAstro({ log });
+  }
+  const to = path.join(root, 'node_modules');
+  // `cp -Rc` asks APFS for copy-on-write and is the fast path. It only works
+  // within one volume, and on a CI runner the cache and the temp directory are
+  // not always on the same one — so the failure is expected, and the plain copy
+  // behind it is not a fallback for a broken machine but the ordinary path
+  // there. What is NOT tolerable is a copy that half worked: that produced
+  // fixtures whose node_modules had an astro/package.json and not much else,
+  // and the only symptom was "notes is not a collection in this project" from
+  // six scenarios, which reads as six product failures.
+  let how = 'clone';
+  try {
+    execFileSync('cp', ['-Rc', from, to], { stdio: 'pipe' });
+  } catch {
+    how = 'copy';
+    fs.rmSync(to, { recursive: true, force: true });
+    fs.cpSync(from, to, { recursive: true, dereference: false });
+  }
+  const missing = DEPS_LANDMARKS.filter((rel) => !fs.existsSync(path.join(to, rel)));
+  // And roughly as many packages as the cache has: a copy that stopped partway
+  // usually has the first few and not the rest, which no single landmark finds.
+  const cached = fs.readdirSync(from).length;
+  const copied = fs.existsSync(to) ? fs.readdirSync(to).length : 0;
+  if (missing.length || copied < cached) {
+    throw new Error(
+      `the fixture's dependencies were ${how === 'clone' ? 'cloned' : 'copied'} incompletely — ` +
+        `${copied} of ${cached} packages` +
+        (missing.length ? `, missing ${missing.join(', ')}` : '') +
+        ` (from ${from})`
+    );
+  }
+  // A fixture that is not what it claims must say so HERE, with the reason.
+  //
+  // Without this a half-copied or stale node_modules produced "notes is not a
+  // collection in this project" from six different scenarios — which reads as
+  // six product failures and is one fixture failure. The check is the real
+  // thing: read the content config the way the operations read it, and refuse
+  // to hand back a fixture that cannot answer.
+  if (!fs.existsSync(path.join(to, 'esbuild', 'package.json'))) {
+    throw new Error('the fixture has no esbuild, so its content config cannot be read');
+  }
+  const astroPkg = path.join(to, 'astro', 'package.json');
+  if (!fs.existsSync(astroPkg)) throw new Error('the fixture has no astro');
+  return to;
+}
+
+// VERIFIED ONCE PER PROCESS, not once per fixture.
+//
+// What this checks is a property of the shared Astro cache, and every fixture
+// is cloned from that same cache — so bundling a content config in all of them
+// re-proves the same fact and pays for a child process and an esbuild service
+// each time. On the permission matrix, which builds a fixture per operation per
+// level, that was four hundred and forty-three redundant bundles and enough
+// added minutes to time the CI job out.
+/** Read the config once, so a fixture that cannot is rejected by name. */
+async function verifyDeps(root, full) {
+  // VERIFIED FOR EVERY FIXTURE THAT WILL READ A CONFIG.
+  //
+  // Memoising this on "it worked once" was a mistake: the first fixture to ask
+  // for dependencies is page.dynamic_paths, which wants a dev server and never
+  // reads a collection, so it set the flag and every content fixture after it
+  // went unchecked. When those then answered "notes is not a collection in this
+  // project" there was nothing to say whether the fixture or the product was at
+  // fault — which is the exact confusion this function exists to prevent.
+  //
+  // The expensive part is a child process per fixture, and only the handful
+  // that declare `deps` pay it. Fixtures that only want a dev server are
+  // checked by installDeps' landmarks, which is what they need.
+  if (!full) return;
+  const { readContentConfig } = require('../../electron/contentConfig.js');
+  let config = null;
+  try {
+    // NOT `force`. Forcing stops the config service and its esbuild and starts
+    // them again — on the very fixture the scenario is about to use, and back
+    // to back with it. On CI that left the next read answering cleanly with no
+    // collections at all: no error to report, nothing to blame but the product.
+    // A plain read proves the same thing and leaves the service it warmed.
+    config = await readContentConfig(root);
+  } catch (err) {
+    throw new Error(`the fixture's content config could not be read: ${err?.message || err}`);
+  }
+  const names = (config?.collections || []).map((c) => c.name);
+  if (names.includes('notes') && names.includes('links')) return;
+  {
+    throw new Error(
+      `the fixture's content config resolved to [${names.join(', ') || 'nothing'}] — ` +
+        `astro ${require(path.join(root, 'node_modules', 'astro', 'package.json')).version} in ${root}` +
+        (config?.error ? `: ${config.error}` : '')
+    );
+  }
+}
+
+async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, withDeps = false, realDevServer = false, log = () => {} } = {}) {
+  // The shared fixture plus what the wire scenarios need to assert anything
+  // real: a dynamic route, a genuine image, a canary in robots.txt.
+  const root = H.makeProject({ ...EXTRA, ...extra });
+  writeBinary(fs, path, root);
+  if (withDeps || realDevServer) {
+    installDeps(root, log);
+    await verifyDeps(root, withDeps);
+  }
+  const harness = await H.start(root, { agentMode, realDevServer });
+
+  // Skips past anything already listening: a port a previous rig has only just
+  // let go of is still busy for a moment, and so is one another process took.
+  let port = nextPort++;
+  for (let tries = 0; tries < 200 && (await portTaken(port)); tries += 1) port = nextPort++;
   const token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
   const url = `http://127.0.0.1:${port}/mcp`;
 
@@ -91,32 +260,79 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {} } =
    * output schema — so a schema drift throws here rather than being silently
    * accepted, which is the whole reason this path exists.
    */
+  // Starting a real Astro dev server is the slowest thing any operation does,
+  // and it is slower still the first time a fixture runs one. The client's
+  // default deadline is shorter than that, so a working lifecycle came back as
+  // "Request timed out" — a wire timeout dressed up as an operation failure.
+  const CALL_TIMEOUT_MS = 180000;
+
   const call = async (domain, action, args = {}) => {
-    const res = await client.callTool({ name: domain, arguments: { action, ...args } });
+    const res = await client.callTool({ name: domain, arguments: { action, ...args } }, undefined, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
   };
 
   /** get_capabilities, get_context and the rest of the non-domain surface. */
   const tool = async (name, args = {}) => {
-    const res = await client.callTool({ name, arguments: args });
+    const res = await client.callTool({ name, arguments: args }, undefined, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
   };
 
   let stopped = false;
+  let stopProblems = [];
   const stop = async () => {
-    if (stopped) return;
+    if (stopped) return { problems: stopProblems };
     stopped = true;
-    await closeClient();
+    stopProblems = [];
+    const closed = await closeClient();
+    if (closed && closed.ok === false) stopProblems.push(`the MCP client would not close: ${closed.error}`);
     await server.stop?.();
+    // NO DEV SERVER OUTLIVES THE FIXTURE IT SERVES.
+    //
+    // `devServer` is one module-level value in electron/main.js and the harness
+    // loads main once, so a server a scenario forgets is still running when the
+    // next scenario starts — pointed at a directory this teardown is about to
+    // delete. That is how five scenarios could each pass alone and two of them
+    // fail in the suite. Asked of main's own handler, so it is the real stop.
+    // AND WHAT IT ANSWERED. dev:stop can now refuse — it returns
+    // `{ ok:false }` rather than throwing when the port is still bound — and
+    // this dropped the answer entirely, so a fixture was deleted out from under
+    // a server that was still serving and the suite called it a clean teardown.
+    // "There was nothing running" and "we owned one and could not stop it" are
+    // the two states this whole file exists to keep apart.
+    try {
+      const stopDev = harness.handlers.get('dev:stop');
+      if (stopDev) {
+        const said = await stopDev(null);
+        if (said && said.ok === false) stopProblems.push(said.message || 'the dev server would not stop');
+      }
+    } catch (err) {
+      stopProblems.push(`stopping the dev server threw: ${String(err?.message || err)}`);
+    }
     try {
       harness.stop();
     } catch {
       /* a jsdom that will not close must not fail the suite */
     }
+    // The content config is answered by a CHILD PROCESS, held open on purpose
+    // so the next question does not pay to start one — and deliberately not
+    // unref'd, because the pipes are what carry the answers. Nothing else in
+    // this rig ends it, so without this a fixture with dependencies leaves a
+    // node behind per scenario and the suite never exits.
+    //
+    // AFTER the window comes down, not before. Unmounting runs the app's own
+    // effects one last time, and one of them asks about the content config —
+    // which starts a fresh service, moments after the old one was stopped. Done
+    // in this order, the last thing to want a config has already finished.
+    try {
+      require('../../electron/contentConfig.js').stopAllServices();
+    } catch {
+      /* nothing was ever started */
+    }
     H.removeProject(root);
+    return { problems: stopProblems };
   };
 
-  return { root, harness, client, call, tool, stop, url, token, port };
+  return { root, harness, client, call, tool, stop, url, token, port, withDeps, realDevServer };
 }
 
-module.exports = { startWireRig };
+module.exports = { startWireRig, astroCached };

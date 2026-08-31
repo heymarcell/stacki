@@ -37,6 +37,19 @@ const { digestOf } = require('./digest');
 // down through three components before it can answer.
 const COMMAND_TIMEOUT_MS = 15000;
 const NAVIGATING_TIMEOUT_MS = 20000;
+// Starting a dev server is not a round trip to the window; it is the window
+// waiting for Astro to boot, resolve a config and bind a port, and on a cold
+// project that is tens of seconds. Under the ordinary command deadline it came
+// back `not_ready` while the server was still coming up perfectly well — and
+// then really did come up, unowned, with the caller told it had failed.
+//
+// Stopping one is the same shape for the same reason: asking Astro's CLI,
+// signalling the daemon it wrote down, escalating if it will not go, and then
+// waiting for the port to actually be released. Answering before that is over
+// is what made "stopped" untrue in the first place, so the deadline has to
+// allow the work rather than cut it short and call it a timeout.
+const DEV_START_TIMEOUT_MS = 180000;
+const DEV_STOP_TIMEOUT_MS = 90000;
 
 const no = (code, message, extra = {}) => ({ ok: false, code, message, ...extra });
 
@@ -54,6 +67,15 @@ function createAgentApi({
   ask = null,
   readPayload = () => null,
   resolveTrail = () => null,
+  // WHERE THE PREVIEW REALLY IS.
+  //
+  // The payload is published from a React effect, so it tells you where the
+  // dev server was as of the last render. An agent that starts one and asks
+  // about it in the same breath is quicker than that: dev_start answered with
+  // a URL and content.sample_entry, one call later, was told there was no
+  // preview. Main owns the process and knows the moment it binds, so it is
+  // asked first and the payload is the fallback.
+  getDevUrl = () => null,
   version = '0.0.0',
 } = {}) {
   const gate = permissions.createGate(getAgentMode);
@@ -66,7 +88,7 @@ function createAgentApi({
         if (typeof callMain !== 'function') throw new Error('Stacki is not ready.');
         return callMain(channel, args);
       },
-      devUrl: payload?.preview?.url || null,
+      devUrl: getDevUrl() || payload?.preview?.url || null,
       branch: payload?.project?.branch || null,
       payload,
       // The two things the domains need from the ref system: a ref to hand back
@@ -982,7 +1004,52 @@ function createAgentApi({
       if (domain === 'style') return await style(action, args);
       if (domain === 'project' && action === 'info') return info();
       if (op.via === 'renderer') {
-        const answer = await command({ domain, action, ...args });
+        // A ref becomes an anchor before it crosses, the same way target and
+        // style do it above. The window resolves anchors against its own live
+        // model; it has never been handed a raw `ref` string to make sense of,
+        // so an operation that took one silently saw nothing at all.
+        //
+        // AND IT CARRIES WHAT THE REF SAYS. The first version of this took
+        // `parsed.data` and dropped the rest, which quietly made a renderer
+        // write weaker than the identical target write beside it: a ref minted
+        // read-only would have been honoured for target.edit and ignored here,
+        // and a ref that had gone stale would have created a component file
+        // against a document it never saw. A ref may only ever become MORE
+        // restrictive as it travels.
+        let anchor = null;
+        let refWritable = true;
+        let seen = null;
+        if (args.ref) {
+          const parsed = readRef(args.ref, 'node');
+          if (!parsed.ok) return parsed;
+          anchor = parsed.data;
+          refWritable = parsed.writable;
+          seen = parsed;
+        }
+        // Refused HERE, before the window is asked to do anything, so a
+        // read-only ref cannot write a file and then be told off.
+        if (args.ref && !refWritable && op.risk !== 'read') {
+          return no(
+            'not_editable',
+            'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
+              'was not made for. Read the target again on this checkout, or have the person select it.'
+          );
+        }
+        const answer = await command(
+          {
+            domain,
+            action,
+            ...args,
+            anchor,
+            ref: undefined,
+            // The ref's own observation is the guard, exactly as it is for
+            // target.edit: it was baked in by the read that handed the ref over,
+            // and the caller does not have to repeat it.
+            expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
+            expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
+          },
+          action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
+        );
         return answer;
       }
       return await mainWithSync(domain, action, args, ctx, op);
@@ -1004,4 +1071,4 @@ function createAgentApi({
   };
 }
 
-module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS };
+module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };
