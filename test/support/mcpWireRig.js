@@ -194,7 +194,7 @@ async function verifyDeps(root, full) {
   }
 }
 
-async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, withDeps = false, realDevServer = false, log = () => {} } = {}) {
+async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, withDeps = false, realDevServer = false, audit = null, log = () => {} } = {}) {
   // The shared fixture plus what the wire scenarios need to assert anything
   // real: a dynamic route, a genuine image, a canary in robots.txt.
   const root = H.makeProject({ ...EXTRA, ...extra });
@@ -248,7 +248,11 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
       total: 0, returned: 0, truncated: false, reviews: [], problem: null,
     }),
     comment: async () => ({ ok: false, code: 'no_project', message: 'This rig has no review ledger.' }),
-  });
+      // The product registers `audit` when the app hands one over. A rig that
+    // omits it serves a 13-tool surface nobody has, which is how the agent
+    // benchmark came to measure a server that does not exist.
+    audit,
+});
   await server.start?.();
 
   const { client, close: closeClient } = await connectMcp({ url, token, era, name: 'Stacki Phase A Agent' });

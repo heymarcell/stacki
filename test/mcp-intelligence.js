@@ -117,14 +117,26 @@ const FIXTURE_IDENTIFIERS = [
       shipped += p.config.title + p.config.description;
       shipped += p.build({ what: 'x', only: 'y', route: 'z' });
     }
-    // AND THE TOOL SURFACE, which the first version of this firewall did not
-    // look at -- 137 KB of descriptions and schemas, the largest single place a
-    // fixture identifier could hide while this reported green.
+    // AND THE TOOL SURFACE -- read off the WIRE, not out of the zod objects.
+    //
+    // Two earlier attempts at this were worthless. The first scanned only
+    // instructions, guides and prompts, and so ignored the 138 KB of tools/list
+    // that is most of what a session reads. The second scanned the registered zod
+    // schemas with JSON.stringify -- which does not carry .describe() text, so it
+    // walked the whole surface and found nothing.
+    //
+    // What a client actually receives is the only thing worth checking. It found
+    // two real contaminants immediately: a path example naming the fixture's own
+    // page, and a variable example naming one of its tokens -- both of which put
+    // two of the benchmark's eight questions into bytes every session reads
+    // before it asks anything.
     {
-      const { McpServer } = require('@modelcontextprotocol/server');
-      const { registerTools } = require('../electron/mcp/tools.js');
-      const probe = new McpServer({ name: 'firewall-probe', version: '0' }, {});
-      registerTools(probe, {
+      const { createStackiMcpServer } = require('../electron/mcp/server.js');
+      const { connectMcp } = require('./support/mcpWire.js');
+      const probe = createStackiMcpServer({
+        port: 44929,
+        token: 'f'.repeat(48),
+        version: '0.0.0-test',
         getContext: async () => ({}),
         capture: async () => ({}),
         getComments: async () => ({}),
@@ -132,9 +144,15 @@ const FIXTURE_IDENTIFIERS = [
         api: { run: async () => ({}), capabilities: () => ({}), checkAccess: () => null },
         audit: async () => ({}),
       });
-      for (const [name, tool] of Object.entries(probe._registeredTools || {})) {
-        shipped += name + (tool.title || '') + (tool.description || '');
-        shipped += JSON.stringify(tool.inputSchema || '') + JSON.stringify(tool.outputSchema || '');
+      await probe.start();
+      const { client, close } = await connectMcp({ url: probe.url, token: 'f'.repeat(48), era: 'modern' });
+      try {
+        shipped += JSON.stringify(await client.listTools());
+        shipped += JSON.stringify(await client.listResources());
+        shipped += JSON.stringify(await client.listPrompts());
+      } finally {
+        await close();
+        await probe.stop();
       }
     }
 

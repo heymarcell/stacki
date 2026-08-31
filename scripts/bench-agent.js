@@ -271,15 +271,30 @@ async function main() {
   const mode = process.env.BENCH_MODE || 'full';
   const label = process.env.BENCH_LABEL || 'baseline';
   const withDeps = process.env.BENCH_DEPS === '1';
-  const rig = await startWireRig({ era: 'modern', agentMode: mode, withDeps });
+  // An `audit` stub, so the benchmark measures the FOURTEEN-tool surface users
+  // get rather than a thirteen-tool one that exists only in this harness. The
+  // stub never runs -- no probe calls it -- but its schema is the real one, and
+  // the schema is what tools/list costs.
+  const rig = await startWireRig({ era: 'modern', agentMode: mode, withDeps, audit: async () => ({ ok: true }) });
   const out = { label, mode, withDeps, at: new Date().toISOString() };
   try {
     out.preamble = await preamble(rig);
     // The preamble bytes a model would actually be handed.
+    // EVERYTHING A SESSION READS BEFORE ITS FIRST USEFUL CALL, including the two
+    // lists Phase B added. An earlier version seeded only instructions and
+    // tools/list, which charged the candidate nothing for resources/list and
+    // prompts/list even though preamble() had already measured them -- flattering
+    // the candidate by about 3 KB in every bytes-to-answer number it produced.
     const seed = [
       String(rig.client.getInstructions?.() ?? ''),
       JSON.stringify(await rig.client.listTools()),
     ];
+    try {
+      seed.push(JSON.stringify(await rig.client.listResources()));
+    } catch { /* a server with no resources pays nothing, which is the point */ }
+    try {
+      seed.push(JSON.stringify(await rig.client.listPrompts()));
+    } catch { /* likewise */ }
     const rec = record(rig);
     out.closure = await closure(rec, rig.client, seed);
     out.discovery = rec.totals();

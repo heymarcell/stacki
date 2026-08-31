@@ -29,7 +29,7 @@ const RelPath = z
   .string()
   .min(1)
   .max(1024)
-  .describe('A path inside the open project, relative to its root (src/pages/index.astro). Never absolute.');
+  .describe('A path inside the open project, relative to its root (src/pages/contact.astro). Never absolute.');
 const Digest = z
   .string()
   .min(4)
@@ -334,7 +334,7 @@ const StyleInput = z.discriminatedUnion('action', [
             .string()
             .max(300)
             .optional()
-            .describe('The VARIABLE to land in front of — a name like --gap, not a selector. Leave it out to move to the end of the rule.'),
+            .describe('The VARIABLE to land in front of — a name like --spacing-lg, not a selector. Leave it out to move to the end of the rule.'),
           at: z.number().int().min(0).optional(),
         })
       )

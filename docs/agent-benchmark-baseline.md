@@ -79,6 +79,52 @@ the content-config service cannot read a config without a resolvable `astro:cont
 — and the set closes at 7 / 8. Both arms of any comparison must therefore run in
 the same condition; `BENCH_DEPS=1` is the condition of record.
 
+## The candidate, measured the same way
+
+Recorded after Phase B and Phase C, on the surface the product actually ships.
+
+Two corrections were made to the apparatus before these numbers were taken, both
+found by a fresh reviewer, and both had been flattering the candidate:
+
+1. **The rig served thirteen tools.** `startWireRig` never passed an `audit`
+   implementation, and `tools.js` registers that tool only when one is present —
+   so the benchmark measured a server nobody has. The rig now takes an `audit`
+   stub, and `tools/list` is the real 138,563 bytes.
+2. **The seed omitted the two new lists.** It counted instructions and
+   `tools/list` only, so the candidate was charged nothing for the
+   `resources/list` and `prompts/list` it had added, even though `preamble()`
+   had already measured them.
+
+| Preamble | Phase A | Phase B+C (shipped) |
+| --- | --- | --- |
+| server instructions | 1,527 | 1,740 |
+| tools/list | 131,761 (13) | 138,563 (14) |
+| resources/list | 0 | 2,175 (6) |
+| prompts/list | 0 | 1,077 (3) |
+| **total** | **133,318** | **143,555** |
+
+| Answering the whole eight-question set | Phase A | Phase B+C |
+| --- | --- | --- |
+| **calls** | **11** | **1** |
+| median calls | 6 | 1 |
+| **bytes** | **154,508** | **146,498** |
+| invalid calls | 0 | 0 |
+| redundant calls | 0 | 0 |
+| stale-ref retries | 0 | 0 |
+
+So: **ten fewer round trips, and about 8,000 fewer bytes** — a 91% cut in calls
+and a 5.2% cut in bytes. The byte saving is much smaller than the call saving
+because a session now pays 10,237 bytes more up front, 6,802 of which is the
+`audit` tool's own schema and has nothing to do with Phase B. A session that
+never asks a project question pays that and gets nothing back.
+
+The guide resources — 10,480 bytes across five topics — are not in any of these
+numbers, because nothing reads them unless it asks.
+
+Running the candidate over the baseline's exact probe sequence (`BENCH_PROBE=legacy`)
+reproduces Phase A's calls-to-answer question for question: 4, 4, 4, 6, 6, 8, 11,
+10. No tool answer moved.
+
 ## What this says about Phase A
 
 Nothing here is a defect. The surface is complete and correct: every question is
