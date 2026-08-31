@@ -412,6 +412,11 @@ let stopPreview = null;
     const contrastBefore = (before.findings || []).find((f) => f.ruleId === 'color-contrast');
     check('the overflow is there before the fix', !!overflowBefore, short((before.findings || []).map((f) => f.ruleId)));
 
+    // Taken before the stylesheet changes, at the width the change is visible at.
+    const shotBefore = await call('audit', { route: '/audit', viewports: ['phone'], capture: true });
+    const shotBeforeFix = (shotBefore.captures || [])[0] || null;
+    check('a capture before the fix comes back', !!shotBeforeFix, short(shotBefore.captures?.length));
+
     const css = await call('style', { action: 'read_source', path: 'src/styles/audit.css' });
     // The field is `css`, not `text`: style.read_source answers with the
     // stylesheet under the name the style panel uses for it.
@@ -442,6 +447,26 @@ let stopPreview = null;
           'and the defects that were NOT fixed are still reported',
           (after.findings || []).some((f) => f.id === contrastBefore.id),
           short((after.findings || []).map((f) => f.ruleId))
+        );
+      }
+    }
+
+    // --- 3. THE PICTURE MOVED TOO.
+    //
+    // A screenshot is evidence only of the state it was taken in. The strongest
+    // available proof of that is a before and an after of the SAME route at the
+    // SAME width across a change that alters what it looks like: the banner is
+    // 520px wide before the fix and full-width after it, so an encoder that
+    // cached, reused or pre-computed an image cannot produce two different ones.
+    if (shotBeforeFix) {
+      const shotAfterFix = await call('audit', { route: '/audit', viewports: ['phone'], capture: true });
+      const after = (shotAfterFix.captures || [])[0];
+      check('a capture after the fix comes back', !!after, short(shotAfterFix.captures?.length));
+      if (after) {
+        check(
+          'and it is not the picture taken before the fix',
+          after.data !== shotBeforeFix.data,
+          `${shotBeforeFix.bytes} -> ${after.bytes} bytes`
         );
       }
     }
