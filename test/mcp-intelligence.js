@@ -165,8 +165,20 @@ const FIXTURE_IDENTIFIERS = [
       check(`[${mode}] the audit prompt stays a pointer rather than a manual`, bytes(promptText) < 1400, `${bytes(promptText)} bytes`);
 
       // --- the project profile, gated
-      const profile = await client.readResource({ uri: PROFILE_URI });
-      const profileText = textOf(profile);
+      //
+      // Read defensively. A missing resource makes the client throw, and an
+      // uncaught throw here would abort the whole run with a stack trace instead
+      // of naming what is wrong -- which is exactly what happened the first time
+      // the profile registration was deliberately removed.
+      let profile = null;
+      let profileReadError = null;
+      try {
+        profile = await client.readResource({ uri: PROFILE_URI });
+      } catch (err) {
+        profileReadError = String(err?.message || err).slice(0, 160);
+      }
+      check(`[${mode}] the project profile can be read at all`, profileReadError === null, profileReadError || '');
+      const profileText = profile ? textOf(profile) : '';
       let parsed = null;
       try {
         parsed = JSON.parse(profileText);
@@ -224,6 +236,80 @@ const FIXTURE_IDENTIFIERS = [
       const { problems } = await rig.stop();
       check(`[${mode}] the rig left nothing behind`, (problems || []).length === 0, (problems || []).join('; '));
     }
+  }
+
+  // ---------------------------------------------------------------- audit, gated
+  //
+  // The audit engine needs a browser, so the real thing is proven in
+  // test/mcp-audit.js. What is proven HERE is the gate in front of it, at every
+  // level, through a real client -- because `audit` is a top-level tool rather
+  // than a registry operation, and so is the one read surface the 444-answer
+  // permission matrix does not cover for free.
+  {
+    const { createStackiMcpServer } = require('../electron/mcp/server.js');
+    const { connectMcp } = require('./support/mcpWire.js');
+    const permissions = require('../electron/mcp/agent/permissions.js');
+    const { AUDIT_OPERATION, AUDIT_RISK } = require('../electron/mcp/auditTool.js');
+
+    // A sentinel the audit would only return if it actually ran.
+    const RAN = { ok: true, runId: 'audit-x', route: '/', findings: [], findingCount: 0, truncated: false,
+                  counts: { mechanical: 0, standard: 0, advisory: 0, incomplete: 0 }, captures: [],
+                  viewports: [], engine: { accessibility: 'axe-core 4.13.0', error: null },
+                  limits: 'no violations does not mean accessible' };
+
+    // A port per level, well clear of the default, so four servers can be built
+    // one after another without waiting for a socket to come back.
+    const AUDIT_PORT_BASE = 44930;
+    let portOffset = 0;
+    for (const mode of ['visual', 'inspect', 'edit', 'full']) {
+      const gate = permissions.createGate(() => mode);
+      let ran = false;
+      const server = createStackiMcpServer({
+        port: AUDIT_PORT_BASE + portOffset++,
+        token: 'a'.repeat(48),
+        version: '0.0.0-test',
+        getContext: async () => ({ ok: true }),
+        capture: async () => ({ meta: {}, image: null }),
+        getComments: async () => ({ ok: true, threads: [] }),
+        comment: async () => ({ ok: true }),
+        api: {
+          run: async () => ({ ok: true }),
+          capabilities: () => ({ ok: true }),
+          checkAccess: (op, risk) => gate.check(op, risk),
+        },
+        audit: async () => {
+          ran = true;
+          return RAN;
+        },
+      });
+      await server.start();
+      const { client, close } = await connectMcp({ url: server.url, token: 'a'.repeat(48), era: 'modern' });
+      try {
+        const names = (await client.listTools()).tools.map((t) => t.name);
+        // Fourteen at every level. The catalogue does not shrink with permission.
+        check(`[audit/${mode}] the audit tool is on the surface`, names.includes('audit'), `${names.length}: ${names.join(',')}`);
+        check(`[audit/${mode}] the surface is fourteen tools`, names.length === 14, String(names.length));
+
+        const res = await client.callTool({ name: 'audit', arguments: { route: '/' } });
+        const out = res.structuredContent || {};
+        if (mode === 'visual') {
+          check('[audit/visual] the audit is refused', out.ok === false && out.code === 'permission_denied', JSON.stringify(out).slice(0, 160));
+          check('[audit/visual] and it names the level it needs', out.requires === 'inspect', String(out.requires));
+          // THE ONE THAT MATTERS. A refusal that still ran the engine would have
+          // rendered the project's page and measured it before saying no.
+          check('[audit/visual] and the engine never ran', ran === false);
+        } else {
+          check(`[audit/${mode}] the audit runs`, out.ok === true, JSON.stringify(out).slice(0, 160));
+          check(`[audit/${mode}] and the engine actually ran`, ran === true);
+        }
+      } finally {
+        await close();
+        await server.stop();
+      }
+    }
+    // And the subject it is gated on is a read, so `inspect` is what it needs --
+    // asserted against the permission module rather than against a comment.
+    check('the audit is gated as a project read', AUDIT_RISK === 'read' && permissions.NEEDED[AUDIT_RISK] === 'inspect', `${AUDIT_OPERATION}/${AUDIT_RISK} -> ${permissions.NEEDED[AUDIT_RISK]}`);
   }
 
   // The catalogue is identical at every level: a client cannot learn what it is

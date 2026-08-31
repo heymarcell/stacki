@@ -28,6 +28,7 @@ const z = require('zod');
 
 const { registerReviewTools } = require('./reviewTools');
 const { registerResources, registerPrompts } = require('./intelligence');
+const { registerAuditTool } = require('./auditTool');
 const { registerAgentTools } = require('./agentTools');
 
 const INSTRUCTIONS = [
@@ -167,7 +168,7 @@ const MAX_PADDING = 256;
  * the two review implementations are the app's own — passed in so this file
  * describes the surface and nothing else.
  */
-function registerTools(server, { getContext, capture, getComments, comment, api = null, clientName = null }) {
+function registerTools(server, { getContext, capture, getComments, comment, api = null, audit = null, clientName = null }) {
   server.registerTool(
     'get_context',
     {
@@ -247,6 +248,10 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
   // The editor half. Absent only in a test that builds the endpoint without an
   // app behind it.
   if (api) registerAgentTools(server, { api });
+  // The fourteenth tool. Absent when the app did not hand one over -- a server
+  // built without a browser behind it has nothing to render a page in. See
+  // auditTool.js for why this is a tool rather than a 112th operation.
+  if (api && audit) registerAuditTool(server, { audit, api });
   // The pull half: guidance and project facts, fetched only when a client asks.
   // Registered LAST so that a host which lists tools first sees an unchanged
   // tool surface -- nothing here alters what the thirteen tools do, and a client

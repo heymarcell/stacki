@@ -146,6 +146,7 @@
     "test:mcp": "node test/mcp.js",
     "test:mcpmodern": "node test/mcp-modern.js",
     "test:mcpintelligence": "node test/mcp-intelligence.js",
+    "test:mcpaudit": "node --check test/mcp-audit.js && electron test/mcp-audit.js",
     "test:mcpmatrix": "node test/mcp-operation-matrix.js",
     "test:mcpwire": "node test/mcp-wire-coverage.js",
     "bench:mcp": "node scripts/bench-mcp.js",

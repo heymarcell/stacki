@@ -1065,6 +1065,18 @@ function createAgentApi({
     nodeRef,
     sourceRef,
     readRef,
+    // THE SAME GATE, FOR THE ONE CALLER THAT IS NOT AN OPERATION.
+    //
+    // `audit` is a top-level tool rather than a registry operation, so that the
+    // 111 operations and the 444 permission answers stay exactly what Phase A
+    // proved them to be. That leaves it outside `run`, which is where the gate
+    // lives -- and a new surface that reads the project without asking the gate
+    // is precisely how a `visual` token ends up reading a repository.
+    //
+    // So it asks the SAME gate object, through this. Not a second check that
+    // resembles the first: the first one, called from one more place. It returns
+    // the refusal envelope, or null when the level allows it.
+    checkAccess: (operation, risk) => gate.check(operation, risk),
     get mode() {
       return gate.mode;
     },

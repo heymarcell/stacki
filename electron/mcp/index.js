@@ -14,13 +14,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const { app, ipcMain } = require('electron');
+const { app, ipcMain, BrowserWindow } = require('electron');
 
 const { locateSelection } = require('../astroParser');
 const { selectionTrail } = require('../selectionTrail');
 const { createContextStore } = require('./contextStore');
 const { propertiesFor, pickEssential, allStyles } = require('./essentialStyles');
-const { createCapture } = require('./capture');
+const { createCapture, encodeImage } = require('./capture');
+const { createAudit } = require('./audit');
 const { createStackiMcpServer, DEFAULT_PORT } = require('./server');
 const { createAgentApi } = require('./agent');
 const agentRefs = require('./agent/refs');
@@ -295,6 +296,17 @@ async function startMcp({
     return state;
   }
 
+  // The audit engine renders the page again, off screen, in a window of its own
+  // rather than through the canvas -- see electron/mcp/audit/index.js for why
+  // that is a correctness decision and not just a politeness one. It is given the
+  // dev server the app is already running, so an audit costs a page load and not
+  // a second server, and the same bounded image encoder `capture` uses.
+  const auditEngine = createAudit({
+    BrowserWindow,
+    getPreviewUrl: () => getDevUrl(),
+    encodeImage,
+  });
+
   const port = resolvePort(settings);
   const token = readOrCreateToken();
   const server = createStackiMcpServer({
@@ -306,6 +318,7 @@ async function startMcp({
     getComments,
     comment,
     api,
+    audit: (args) => auditEngine.run(args),
     onError: (err) => console.warn('[stacki] MCP:', err?.message || err),
   });
   try {

@@ -56,7 +56,12 @@ const brief = (v, n = 220) => {
 
     const listed = await app.client.listTools();
     const toolNames = (listed.tools || []).map((t) => t.name);
-    check('tools/list carries the whole surface', toolNames.length === 13, `${toolNames.length}: ${toolNames.join(',')}`);
+    // FOURTEEN, not thirteen: `audit` joined the surface. It is a tool rather
+    // than a 112th Agent operation deliberately -- see electron/mcp/auditTool.js
+    // -- so the registry's 111 operations and its 444 permission answers are
+    // exactly what they were.
+    check('tools/list carries the whole surface', toolNames.length === 14, `${toolNames.length}: ${toolNames.join(',')}`);
+    check('  including the audit', toolNames.includes('audit'), brief(toolNames));
     check('  including the review tools', toolNames.includes('get_comments') && toolNames.includes('comment'), brief(toolNames));
     check('  and every operation domain', ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((d) => toolNames.includes(d)), brief(toolNames));
 
