@@ -329,6 +329,13 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         const started = Date.now();
         let win = null;
         try {
+          // AND BETWEEN VIEWPORTS. The mechanism documented at the top of this
+          // file -- a destroyed window's cookies and storage surviving for the
+          // next window on the same partition -- is just as true inside one run
+          // as across two. Without this, a page that sets state on its first
+          // visit shows the phone a first visit and the tablet a return visit,
+          // and the two viewports are no longer measuring the same page.
+          await resetAuditSession(session);
           // A FRESH WINDOW PER VIEWPORT, and the size set before the load.
           //
           // Resizing one loaded window is cheaper and re-evaluates media queries
@@ -339,6 +346,17 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           win = makeAuditWindow(BrowserWindow, { width: viewport.width, height: viewport.height, partition: AUDIT_PARTITION });
           liveWindows.set(`${runId}:${viewport.key}`, win);
 
+          // THE STATUS, NOT JUST THE LOAD.
+          //
+          // did-fail-load fires for network-level failures only. A 404 or a 500
+          // returns a body, so it finishes loading like anything else -- and the
+          // audit would measure Astro's dev 404 page, find a contrast problem on
+          // it, and report that under the route the caller asked for. A typo in a
+          // route would come back as findings about the project.
+          let httpStatus = null;
+          win.webContents.on('did-navigate', (_e, _url, code) => {
+            if (typeof code === 'number' && httpStatus === null) httpStatus = code;
+          });
           const loaded = new Promise((resolve, reject) => {
             win.webContents.once('did-finish-load', resolve);
             win.webContents.once('did-fail-load', (_e, code, desc) => reject(new Error(`${desc || 'load failed'} (${code})`)));
@@ -346,6 +364,18 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           loaded.catch(() => {});
           await win.loadURL(url).catch(() => {});
           await withTimeout(loaded, LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`);
+          if (httpStatus !== null && httpStatus >= 400) {
+            return {
+              ok: false,
+              code: 'route_not_ok',
+              message:
+                `${safeRoute} answered HTTP ${httpStatus}. That page renders and could be measured, but the ` +
+                'findings would describe an error page rather than the route asked for, so nothing is reported.',
+              status: httpStatus,
+              route: safeRoute,
+              runId,
+            };
+          }
 
           await win.webContents.executeJavaScript(FREEZE, true).catch(() => {});
           await withTimeout(win.webContents.executeJavaScript(SETTLE, true), PROBE_TIMEOUT_MS, 'settling the page');

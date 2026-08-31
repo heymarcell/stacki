@@ -352,6 +352,21 @@ let stopPreview = null;
     check('too many viewports is refused', many.ok === false, short(many));
   }
 
+  // --- A ROUTE THAT ANSWERS 404 IS AN ERROR PAGE, NOT THE ROUTE
+  //
+  // did-fail-load fires for network failures only. Astro's dev 404 returns a
+  // body, so it finishes loading like anything else -- and the audit would
+  // measure THAT page, find a contrast problem on it, and report it under the
+  // route the caller asked for. A typo would come back as findings about the
+  // project.
+  {
+    const missing = await call('audit', { route: '/definitely-not-a-route-at-all', viewports: ['phone'] });
+    check('a route that answers with an error page is refused', missing.ok === false && missing.code === 'route_not_ok', short(missing));
+    check('  and the status is reported', typeof missing.status === 'number' && missing.status >= 400, short(missing.status));
+    check('  and no findings are attributed to the route that was asked for', !Array.isArray(missing.findings) || missing.findings.length === 0);
+    check('  and it left no window behind', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
+  }
+
   // --- the route is untrusted input
   {
     const off = await call('audit', { route: '//example.invalid/x' });
@@ -669,7 +684,9 @@ let stopPreview = null;
   // outcome that is actually true: the audit completes, and nothing leaked.
   {
     const missing = await call('audit', { route: '/definitely-not-a-route-here' });
-    check('auditing a route that does not exist answers rather than hangs', typeof missing.ok === 'boolean', short(missing));
+    // Not `typeof ok === 'boolean'`, which was true either way. A missing route
+    // is refused by name, and the refusal is what must not write anything.
+    check('auditing a route that does not exist is refused, not measured', missing.ok === false && missing.code === 'route_not_ok', short(missing));
     check('and leaks no window whichever way it went', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
     const settled = projectBytes(root);
     await call('audit', { route: '/definitely-not-a-route-here' });

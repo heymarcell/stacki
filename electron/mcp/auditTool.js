@@ -102,6 +102,10 @@ const AuditOutput = z.object({
   risk: z.string().optional(),
   mode: z.string().optional(),
   requires: z.string().optional(),
+  // The HTTP status, when the route answered with an error page. A 404 renders
+  // and could be measured; reporting it under the requested route would describe
+  // an error page as if it were the project.
+  status: z.number().int().optional(),
   runId: z.string().optional(),
   route: z.string().optional(),
   url: z.string().optional(),

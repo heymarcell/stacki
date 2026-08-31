@@ -41,6 +41,28 @@ if (!task) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// A KILL MUST NOT LEAK A DEV SERVER.
+//
+// This process owns a real Astro rig, its port and its temp fixture, and the only
+// cleanup was the happy path's `finally`. An external terminate -- which
+// launch.sh actively invites by writing a pid file -- skipped it entirely and left
+// twelve Astro servers behind. `rigRef` is set as soon as there is something to
+// stop, and both signals stop it before exiting.
+let rigRef = null;
+let stopping = false;
+const stopAndExit = async (signal) => {
+  if (stopping) return;
+  stopping = true;
+  try {
+    if (rigRef) await rigRef.stop();
+  } catch (err) {
+    console.error(`stopping the rig on ${signal} failed:`, err?.message || err);
+  }
+  process.exit(signal === 'SIGTERM' ? 143 : 130);
+};
+process.on('SIGTERM', () => void stopAndExit('SIGTERM'));
+process.on('SIGINT', () => void stopAndExit('SIGINT'));
+
 (async () => {
   // Loaded from whichever checkout this arm is: the baseline worktree has Phase-A
   // code, this one has the candidate.
@@ -61,6 +83,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     // test/mcp-audit.js and test/packaged-audit.js against a real browser.
   });
 
+  rigRef = rig;
   let result = { arm, task: taskId, trial, ok: false };
   try {
     fs.writeFileSync(

@@ -25,6 +25,24 @@ TASKS="understand text style component content auditfix"
 
 mkdir -p "$OUT"
 
+# THE BASELINE CHECKOUT, CREATED HERE AND REMOVED BY teardown.sh.
+#
+# It used to be made by hand, which left a worktree registered inside the user's
+# repository that nothing in the repository knew about or cleaned up. It is a
+# detached worktree at origin/main with its OWN node_modules -- an APFS clone, so
+# it costs seconds and almost no disk. Its own, not a symlink: the agent harness
+# caches a bundle of src/App.jsx under node_modules, and a shared one would have
+# the two arms comparing one Stacki against itself.
+if [ ! -d "$BASELINE_REPO/.git" ] && [ ! -f "$BASELINE_REPO/.git" ]; then
+  echo "creating the baseline worktree at origin/main..."
+  git -C "$REPO" worktree add --detach "$BASELINE_REPO" origin/main || exit 1
+fi
+if [ ! -d "$BASELINE_REPO/node_modules" ]; then
+  cp -Rc "$REPO/node_modules" "$BASELINE_REPO/node_modules" 2>/dev/null \
+    || cp -R "$REPO/node_modules" "$BASELINE_REPO/node_modules" || exit 1
+fi
+echo "baseline is $(git -C "$BASELINE_REPO" rev-parse HEAD)"
+
 # ONE RIG PER ARM FIRST. The harness caches a bundle of src/App.jsx under
 # node_modules; seven rigs starting together all find it missing, all write it,
 # and the loser reads a half-written file. Building it once serially removes the
