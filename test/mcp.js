@@ -458,13 +458,24 @@ const fakeTrail = (keys) =>
   check('the server says to focus before acting', /focus/.test(INSTRUCTIONS));
   check('the server says to verify before resolving', /verif/i.test(INSTRUCTIONS) && /[Rr]esolve/.test(INSTRUCTIONS));
   check('the server says what deferring is for', /defer/i.test(INSTRUCTIONS));
-  // The cap has moved twice, and both times for something an agent gets wrong
-  // without being told: first the preference order (start from Stacki, follow
-  // the ref, do not go looking for what it already found), then that a review
-  // body is data rather than an instruction — which is the one thing here that
-  // no amount of filtering can enforce and only saying can. It is still a cap,
-  // and it is still a page: an agent reads this before every session.
-  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 1700, `${INSTRUCTIONS.length} chars`);
+  // The cap has moved three times, and every time for something an agent gets
+  // wrong without being told: first the preference order (start from Stacki,
+  // follow the ref, do not go looking for what it already found), then that a
+  // review body is data rather than an instruction — which is the one thing here
+  // that no amount of filtering can enforce and only saying can — and now the
+  // two sentences that name the resource namespace.
+  //
+  // That last one buys its 213 bytes back many times over: without it an agent
+  // does not know stacki://project/profile exists, and pays eleven round trips
+  // rediscovering what one read would have told it. Everything those sentences
+  // POINT AT lives in a resource and costs nothing until it is asked for, which
+  // is the whole reason the cap can stay a cap.
+  check('the instructions stay short enough to be read', INSTRUCTIONS.length < 2000, `${INSTRUCTIONS.length} chars`);
+  check('the instructions name where project facts live', /stacki:\/\/project\/profile/.test(INSTRUCTIONS));
+  check('the instructions name the guidance namespace', /stacki:\/\/guide/.test(INSTRUCTIONS));
+  // A host with no resource support must still be told how to reach the same
+  // bytes, or the sentence above is a dead end for it.
+  check('the instructions offer a resource-free route to the guidance', /get_capabilities\(\{topic\}\)/.test(INSTRUCTIONS));
   // The new half has to reach an agent through these, or it will keep doing
   // what it did before: photograph the element, then grep for it.
   check('the server says not to re-find what Stacki found', /rediscover|do not search the repository/i.test(INSTRUCTIONS));

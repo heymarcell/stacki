@@ -136,17 +136,24 @@ async function preamble(rig) {
 // surface under test is the one way this benchmark could quietly become a lie.
 const has = (...needles) => (s) => needles.every((n) => s.includes(n));
 const QUESTIONS = [
-  { id: 'what-pages',       ask: 'which routes/pages does this project have',   answerable: has('index.astro', 'about.astro') },
+  // FULL PATHS, not bare filenames. `about.astro` and `index.astro` appear in
+  // stacki://guide/astro as the canonical example of how routing works, which is
+  // legitimate generic documentation -- but a host that read that guide would
+  // have satisfied a bare-filename needle without learning anything about THIS
+  // project. The full path is a fact only the project can supply.
+  { id: 'what-pages',       ask: 'which routes/pages does this project have',   answerable: has('src/pages/index.astro', 'src/pages/about.astro') },
   { id: 'what-components',  ask: 'which components exist',                      answerable: has('Card.astro', 'Hero.astro') },
   { id: 'what-layouts',     ask: 'which layouts exist',                         answerable: has('Base.astro') },
   { id: 'what-tokens',      ask: 'which design tokens exist',                   answerable: has('--brand', '--gap') },
   { id: 'what-styles',      ask: 'which stylesheets style this project',        answerable: has('site.css') },
-  { id: 'what-collections', ask: 'which content collections exist',             answerable: has('notes', 'first.md') },
+  // Both collection names, because 'notes' alone also appears in a tool schema
+  // and would score for free. 'links' appears nowhere Stacki ships.
+  { id: 'what-collections', ask: 'which content collections exist',             answerable: has('notes', 'links') },
   { id: 'what-classes',     ask: 'which class names does this project use',     answerable: has('pricing-grid') },
   { id: 'what-astro',       ask: 'which Astro version is this project on',      answerable: has('^5.0.0') },
 ];
 
-async function closure(rig, seenFromPreamble) {
+async function closure(rig, client, seenFromPreamble) {
   const seen = [...seenFromPreamble];
   const first = new Map();
   let spent = seenFromPreamble.reduce((n, t) => n + bytes(t), 0);
@@ -182,10 +189,42 @@ async function closure(rig, seenFromPreamble) {
     ['call', 'project', 'classes', {}],
   ];
   let collection = null;
+  let resourceBytes = null;
+  let resourceError = null;
+
+  // THE RESOURCE READ THE INSTRUCTIONS NOW POINT AT.
+  //
+  // Phase A cannot have this probe -- it advertises no resources -- so the two
+  // arms are compared on each one's own SHORTEST CORRECT ROUTE rather than on a
+  // sequence one of them has no way to run. Set BENCH_PROBE=legacy to make the
+  // candidate walk the baseline's exact sequence instead; that run answers a
+  // different question, which is whether the old road got slower.
+  if (process.env.BENCH_PROBE !== 'legacy') {
+    probes.unshift(['resource', 'stacki://project/profile', {}]);
+  }
   let i = 0;
   for (const p of probes) {
     i += 1;
     try {
+      if (p[0] === 'resource') {
+        let body = '';
+        try {
+          const r = await client.readResource({ uri: p[1] });
+          body = (r.contents || []).map((c) => c.text || '').join('');
+          resourceBytes = bytes(body);
+        } catch (err) {
+          // A server with no resources: costs the call, answers nothing. That is
+          // exactly what the baseline experiences, and it is RECORDED rather than
+          // silently scoring zero -- an earlier version swallowed a programming
+          // error here and reported it as "the resource answered nothing".
+          body = '';
+          resourceError = String(err?.message || err).slice(0, 120);
+        }
+        seen.push(body);
+        spent += bytes(body);
+        mark(i);
+        continue;
+      }
       let args = p[0] === 'tool' ? p[2] : p[3];
       if (args === 'DERIVE_COLLECTION') {
         if (!collection) { seen.push(''); mark(i); continue; }
@@ -223,6 +262,8 @@ async function closure(rig, seenFromPreamble) {
     // The whole set, which is what a session actually needs.
     callsToAnswerAll: hits.length === QUESTIONS.length ? Math.max(...hits.map((q) => first.get(q.id).calls)) : null,
     bytesToAnswerAll: hits.length === QUESTIONS.length ? Math.max(...hits.map((q) => first.get(q.id).bytes)) : null,
+    resourceBytes,
+    resourceError,
   };
 }
 
@@ -240,7 +281,7 @@ async function main() {
       JSON.stringify(await rig.client.listTools()),
     ];
     const rec = record(rig);
-    out.closure = await closure(rec, seed);
+    out.closure = await closure(rec, rig.client, seed);
     out.discovery = rec.totals();
   } finally {
     const { problems } = await rig.stop();
