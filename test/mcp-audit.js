@@ -67,6 +67,26 @@ for (const [rel, body] of Object.entries(auditFixture({ broken: true }))) {
   fs.writeFileSync(full, body, 'utf8');
 }
 
+// ONE DEFECT ON THE PAGE STACKI OPENS BY DEFAULT.
+//
+// The /audit route carries the corpus, but a semantic fix needs a ref, and a ref
+// comes from reading the page the editor has open. So the image with no
+// alternative is seeded on index.astro too -- that is the one fixed through
+// target.set_prop below, which is the path this whole product is supposed to
+// make ordinary.
+{
+  const index = path.join(root, 'src/pages/index.astro');
+  const body = fs.readFileSync(index, 'utf8');
+  fs.writeFileSync(
+    index,
+    body.replace(
+      '</Base>',
+      '  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="48" height="48" />\n</Base>'
+    ),
+    'utf8'
+  );
+}
+
 const userData = ownedTempDir('stacki-canvas-user-', { harness: 'mcp-audit' });
 app.setPath('userData', userData);
 fs.writeFileSync(
@@ -178,7 +198,6 @@ let stopPreview = null;
 
   // ------------------------------------------------------------------ the audit
 
-  const beforeBytes = projectBytes(root);
   const viewBefore = await call('get_context', { styleDetail: 'none' });
   const windowsBefore = BrowserWindow.getAllWindows().length;
 
@@ -336,11 +355,116 @@ let stopPreview = null;
     check('captures are off by default', (noShot.captures || []).length === 0);
   }
 
-  // ------------------------------------------------------- it changed nothing
+  // --------------------------------------------------------------- remediation
+  //
+  // The point of the whole exercise: findings an agent can act on with the
+  // operations Phase A already shipped, and then PROVE it acted, by the finding
+  // going away rather than by the array getting shorter.
+  //
+  // Two fixes, deliberately of different kinds. One semantic, through the model,
+  // on the page the editor has open. One at the source, on a stylesheet, because
+  // a rule that reaches an element on a route nobody has selected is exactly the
+  // case a semantic operation cannot express.
+
+  let fixedIds = [];
   {
+    // --- 1. SEMANTIC: an image with no alternative, on the open page.
+    const home = await call('audit', { route: '/', viewports: ['phone'] });
+    check('the open page audits', home.ok === true, short(home));
+    const altFinding = (home.findings || []).find((f) => f.ruleId === 'image-alt');
+    check('and the image with no alternative is found there', !!altFinding, short((home.findings || []).map((f) => f.ruleId)));
+
+    if (altFinding) {
+      fixedIds.push(altFinding.id);
+      const page = await call('target', { action: 'read' });
+      const img = (page.target?.children || []).find((c) => c.tag === 'img');
+      check('the page reads, with the image on it', !!img, short((page.target?.children || []).map((c) => c.tag)));
+      if (img) {
+        const set = await call('target', { action: 'set_prop', ref: img.ref, name: 'alt', value: 'A described marker' });
+        check('target.set_prop adds the alternative', set.ok === true, short(set));
+
+        // The world, not the envelope: the file on disk.
+        const onDisk = await until(
+          'the alt to reach the file',
+          async () => (/alt="A described marker"/.test(fs.readFileSync(path.join(root, 'src/pages/index.astro'), 'utf8')) ? true : null),
+          { timeout: 20000 }
+        ).catch(() => null);
+        check('and the source file on disk now carries it', onDisk === true);
+
+        // And the running page. Retried, because Astro has to rebuild before the
+        // audit's fresh load can see it.
+        const gone = await until(
+          'the finding to go away',
+          async () => {
+            const again = await call('audit', { route: '/', viewports: ['phone'] });
+            if (!again.ok) return null;
+            return (again.findings || []).some((f) => f.id === altFinding.id) ? null : again;
+          },
+          { timeout: 60000, every: 2000 }
+        ).catch(() => null);
+        check('and re-auditing no longer reports it, by id', !!gone, 'the finding survived the fix');
+      }
+    }
+
+    // --- 2. SOURCE: the CSS rule behind the mobile overflow.
+    const before = await call('audit', { route: '/audit', viewports: ['phone'] });
+    const overflowBefore = (before.findings || []).find((f) => f.ruleId === 'horizontal-overflow');
+    const contrastBefore = (before.findings || []).find((f) => f.ruleId === 'color-contrast');
+    check('the overflow is there before the fix', !!overflowBefore, short((before.findings || []).map((f) => f.ruleId)));
+
+    const css = await call('style', { action: 'read_source', path: 'src/styles/audit.css' });
+    // The field is `css`, not `text`: style.read_source answers with the
+    // stylesheet under the name the style panel uses for it.
+    check('the stylesheet reads', css.ok === true && typeof css.css === 'string', short(css));
+    if (css.ok && typeof css.css === 'string' && overflowBefore) {
+      fixedIds.push(overflowBefore.id);
+      const fixed = css.css.replace('  width: 520px;', '  width: 100%;\n  max-width: 520px;');
+      check('the fix actually changes the stylesheet text', fixed !== css.css);
+      const wrote = await call('style', { action: 'write_source', path: 'src/styles/audit.css', css: fixed, expectedDigest: css.digest });
+      check('style.write_source accepts it with the digest it read', wrote.ok === true, short(wrote));
+      check('and the file on disk changed', /max-width: 520px/.test(fs.readFileSync(path.join(root, 'src/styles/audit.css'), 'utf8')));
+
+      const after = await until(
+        'the overflow to go away',
+        async () => {
+          const again = await call('audit', { route: '/audit', viewports: ['phone'] });
+          if (!again.ok) return null;
+          return (again.findings || []).some((f) => f.id === overflowBefore.id) ? null : again;
+        },
+        { timeout: 60000, every: 2000 }
+      ).catch(() => null);
+      check('re-auditing no longer reports the overflow, by id', !!after, 'the overflow survived the fix');
+
+      // THE FIX WAS A FIX, NOT A SILENCING. The defects nobody touched are still
+      // reported, so "it went quiet" cannot pass for "it got better".
+      if (after && contrastBefore) {
+        check(
+          'and the defects that were NOT fixed are still reported',
+          (after.findings || []).some((f) => f.id === contrastBefore.id),
+          short((after.findings || []).map((f) => f.ruleId))
+        );
+      }
+    }
+
+    // The clean control is still clean after all of that.
+    const cleanAfter = await call('audit', { route: '/clean' });
+    const claimedAfter = (cleanAfter.findings || []).filter(
+      (f) => MUST_NOT_FIRE_ON_CLEAN.includes(f.ruleId) && (f.kind === 'standard' || f.kind === 'mechanical')
+    );
+    check('the clean control is still clean after the fixes', claimedAfter.length === 0, short(claimedAfter.map((f) => f.ruleId)));
+  }
+
+  // ------------------------------------------------------- it changed nothing
+  //
+  // Measured from AFTER the remediation, so that the two fixes above are not
+  // mistaken for the audit having written something.
+  {
+    const beforeBytes = projectBytes(root);
+    await call('audit', { route: '/audit' });
     const afterBytes = projectBytes(root);
     const changed = diffBytes(beforeBytes, afterBytes);
     check('the audit wrote nothing to the project', changed.length === 0, changed.slice(0, 6).join('; '));
+    check('and the fixes it was asked for did land', fixedIds.length === 2, `${fixedIds.length} fixed`);
 
     const viewAfter = await call('get_context', { styleDetail: 'none' });
     check('the person is still on the same page', viewAfter.page?.route === viewBefore.page?.route, `${viewBefore.page?.route} -> ${viewAfter.page?.route}`);
@@ -368,8 +492,9 @@ let stopPreview = null;
     const missing = await call('audit', { route: '/definitely-not-a-route-here' });
     check('auditing a route that does not exist answers rather than hangs', typeof missing.ok === 'boolean', short(missing));
     check('and leaks no window whichever way it went', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
-    const afterBytes = projectBytes(root);
-    check('and still wrote nothing', diffBytes(beforeBytes, afterBytes).length === 0);
+    const settled = projectBytes(root);
+    await call('audit', { route: '/definitely-not-a-route-here' });
+    check('and still wrote nothing', diffBytes(settled, projectBytes(root)).length === 0);
   }
 
   return finish();
