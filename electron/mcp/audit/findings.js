@@ -64,8 +64,24 @@ function findingId({ ruleId, viewport, where }) {
  * A finding with a selector, a rectangle and a screenshot and no source location
  * is more useful than one with a confident lie in it.
  */
-function targetOf({ selector, refPath, tag }) {
-  const base = { selector: selector || null, tag: tag || null };
+function targetOf({ selector, refPath, tag, crossBoundary = false, match = null }) {
+  const base = {
+    selector: selector || null,
+    tag: tag || null,
+    // Present only when the selector is ambiguous, so a reader knows which of
+    // several identical boxes this is.
+    ...(match && match.of > 1 ? { selectorMatch: { index: match.index, of: match.of } } : {}),
+  };
+  if (crossBoundary) {
+    return {
+      ...base,
+      modelPath: null,
+      exact: false,
+      note:
+        'This element is inside a shadow root or a frame. Stacki cannot address it from the top document, so no ' +
+        'source location is claimed for it.',
+    };
+  }
   if (!refPath || !refPath.path) {
     return {
       ...base,
@@ -86,8 +102,14 @@ function targetOf({ selector, refPath, tag }) {
 
 /** One mechanical overflow finding. */
 function overflowFinding({ viewport, culprit, documentOverflowBy, measured = null }) {
-  const target = targetOf({ selector: culprit.selector, refPath: culprit.ref, tag: culprit.tag });
-  const where = target.modelPath && target.exact ? target.modelPath : culprit.selector;
+  const target = targetOf({ selector: culprit.selector, refPath: culprit.ref, tag: culprit.tag, match: culprit.match });
+  // Four levels of tag.class matches every card in a row, so two real defects on
+  // two different cards used to hash to ONE id -- and fixing either made both
+  // look fixed. The match index disambiguates without making `selector` invalid.
+  const where =
+    target.modelPath && target.exact
+      ? target.modelPath
+      : `${culprit.selector}[${culprit.match?.index ?? 0}]`;
   // At 320 this is a named success criterion; anywhere else it is a measurement.
   const isReflow = viewport.standard != null;
   return {
@@ -176,8 +198,12 @@ function unattributedOverflowFinding({ viewport, documentOverflowBy }) {
 /** One accessibility finding, from the engine's own result. */
 function axeFinding({ viewport, rule, node, bucket }) {
   const refPath = node.refPath || null;
-  const selector = Array.isArray(node.target) ? node.target.join(' ') : String(node.target || '');
-  const target = targetOf({ selector, refPath, tag: node.tag });
+  // ' >>> ' between hops, not a space: a shadow or frame path joined by spaces
+  // reads as a descendant selector and is not one.
+  const selector = Array.isArray(node.target)
+    ? node.target.join(node.target.length > 1 ? ' >>> ' : ' ')
+    : String(node.target || '');
+  const target = targetOf({ selector, refPath, tag: node.tag, crossBoundary: !!node.crossBoundary });
   const where = target.modelPath && target.exact ? target.modelPath : selector;
   const wcag = (rule.tags || []).filter((t) => /^wcag\d/.test(t));
   return {

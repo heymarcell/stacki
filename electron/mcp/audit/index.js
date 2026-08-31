@@ -154,8 +154,19 @@ function axeScript({ rules }) {
     // bucket that a person has to look at.
     const res = await axe.run(document, { resultTypes: ['violations', 'incomplete'], runOnly: ${runOnly} });
     const locate = (target) => {
+      // A SHADOW OR FRAME PATH IS NOT A SELECTOR.
+      //
+      // axe answers with an ARRAY when the node is inside a shadow root or an
+      // iframe: each entry is a hop. Taking the last hop and running it against
+      // the top document finds some OTHER element that happens to match -- and
+      // then reads its data-avb-p and reports it as this finding's source, with
+      // exact:true. A confidently wrong file location is worse than none, so a
+      // multi-hop target resolves to nothing and says why.
+      if (Array.isArray(target) && target.length > 1) {
+        return { refPath: null, rect: null, tag: null, crossBoundary: true };
+      }
       let el = null;
-      try { el = document.querySelector(Array.isArray(target) ? target[target.length - 1] : target); } catch {}
+      try { el = document.querySelector(Array.isArray(target) ? target[0] : target); } catch {}
       if (!el) return { refPath: null, rect: null, tag: null };
       let n = el, refPath = null;
       while (n && n.nodeType === 1) {

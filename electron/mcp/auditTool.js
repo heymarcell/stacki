@@ -48,6 +48,9 @@ const Viewport = z.object({
 const Target = z.object({
   selector: z.string().nullable(),
   tag: z.string().nullable(),
+  // Only when the selector matches more than one element, so a reader can tell
+  // which of several identical boxes this is.
+  selectorMatch: z.object({ index: z.number().int(), of: z.number().int() }).optional(),
   // The Stacki model path, when the audited element actually carried a marker.
   // Null is a real answer and appears often: a runtime-generated node or a
   // third-party embed has no source Stacki can prove.

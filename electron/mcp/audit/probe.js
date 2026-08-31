@@ -72,6 +72,21 @@ const HELPERS = `
     }
     return parts.join(' > ');
   };
+  // Which of the selector's matches this is, and how many there are.
+  //
+  // Kept BESIDE the selector rather than spliced into it: a selector field that
+  // is not a valid selector is worse than an ambiguous one. Four levels of
+  // tag.class matches every card in a row, and the selector is what a finding's
+  // identity falls back to when the element carries no Stacki marker -- so two
+  // real defects on two different cards hashed to ONE id, and fixing either made
+  // both look fixed.
+  const matchIndexOf = (el, sel) => {
+    let matches = [];
+    try { matches = [...document.querySelectorAll(sel)]; } catch { return { index: 0, of: 1 }; }
+    if (matches.length <= 1) return { index: 0, of: matches.length || 1 };
+    const at = matches.indexOf(el);
+    return { index: at < 0 ? 0 : at, of: matches.length };
+  };
 `;
 
 // Make the page hold still. Animations and transitions mean two measurements of
@@ -161,8 +176,10 @@ const OVERFLOW = `(() => {
       }
       if (contained) continue;
 
+      const sel = selectorOf(el);
       culprits.push({
-        selector: selectorOf(el),
+        selector: sel,
+        match: matchIndexOf(el, sel),
         tag: el.tagName.toLowerCase(),
         rect: rectOf(el),
         overflowBy: Math.round(overRight),
