@@ -106,8 +106,18 @@ const AuditOutput = z.object({
   // and could be measured; reporting it under the requested route would describe
   // an error page as if it were the project.
   status: z.number().int().optional(),
+  // Named when a route left the project by redirect or navigation. Only the
+  // ORIGIN -- a page Stacki declined to load is never quoted.
+  blockedOrigin: z.string().nullable().optional(),
+  // `session_not_isolated` -- the audit refused to measure because it could not
+  // start from a clean browser session. `session_not_cleaned` -- it measured, and
+  // could not clear up afterwards, so the findings are real but the run is not
+  // reported as isolated.
   runId: z.string().optional(),
   route: z.string().optional(),
+  // Present only when a same-origin redirect landed somewhere other than the
+  // route that was asked for. The findings describe these, not `route`.
+  finalRoutes: z.array(z.string()).optional(),
   url: z.string().optional(),
   engine: z
     .object({
@@ -217,6 +227,27 @@ function registerAuditTool(server, { audit, api }) {
           .describe('Return a screenshot per viewport, taken in the same state the findings were measured in. Off by default: findings are the useful part and images are large.'),
       }),
       outputSchema: AuditOutput,
+      // ANNOTATIONS, MEASURED AGAINST WHAT THE SPEC ACTUALLY SAYS.
+      //
+      // `openWorldHint` is defined as: "If true, this tool may interact with an
+      // 'open world' of external entities. If false, the tool's domain of
+      // interaction is closed. For example, the world of a web search tool is
+      // open, whereas that of a memory tool is not." Default: true.
+      //
+      // `false` is a real claim, so it has to be enforced rather than asserted.
+      // Two things make it true here. The arguments cannot address anything
+      // outside: `route` is a path joined onto the project's own preview origin
+      // and `viewports` is an enum -- there is no argument that names a host.
+      // And the window refuses to leave that origin: a server-side redirect or a
+      // page-initiated navigation to another origin is cancelled and reported as
+      // `route_outside_project`, so the audit cannot be walked out of the project
+      // by the content it is auditing. Before that guard existed this annotation
+      // was a promise the code did not keep.
+      //
+      // The honest limit: the guard is on top-level navigation. A project page
+      // that references a font, script or image on a CDN still causes the render
+      // to fetch it, exactly as the user's own browser preview would. The tool's
+      // domain is closed; the page's is the page's.
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,

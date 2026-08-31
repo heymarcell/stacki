@@ -308,6 +308,37 @@ import Base from '../layouts/AuditBase.astro';
 </Base>
 `;
 
+// ROUTES THAT TRY TO LEAVE THE PROJECT.
+//
+// A server-side redirect is not a navigation the page initiated, so
+// `will-navigate` never fires for it. Measured against the engine before this was
+// guarded: a project route answering 302 to a second local origin had that origin
+// loaded, axe run on it, and three of ITS findings returned under the project's
+// own route and URL.
+//
+// The outside port is fixed so the test can listen on it and assert it was never
+// contacted -- refusing after fetching would still be a leak.
+const OUTSIDE_ORIGIN_PORT = 45999;
+const REDIRECT_OUT_ENDPOINT = `export function GET() {
+  return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:${OUTSIDE_ORIGIN_PORT}/landed' } });
+}
+`;
+const REDIRECT_IN_ENDPOINT = `export function GET() {
+  return new Response(null, { status: 302, headers: { location: '/clean' } });
+}
+`;
+// A page that sends ITSELF somewhere else, which is the other half of the
+// contract: same-origin is ordinary visitor behaviour, off-origin is refused.
+const NAVIGATE_OUT_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>going</h1>
+  <script is:inline>location.href = 'http://127.0.0.1:${OUTSIDE_ORIGIN_PORT}/landed';</script>
+  <div id="end"></div>
+</Base>
+`;
+
 /** The files, for a broken or a clean variant of the fixture. */
 function auditFixture({ broken }) {
   return {
@@ -318,6 +349,9 @@ function auditFixture({ broken }) {
     'src/pages/many.astro': MANY_PAGE,
     'src/pages/table.astro': TABLE_PAGE,
     'src/pages/wide.astro': WIDE_PAGE,
+    'src/pages/redirect-out.js': REDIRECT_OUT_ENDPOINT,
+    'src/pages/redirect-in.js': REDIRECT_IN_ENDPOINT,
+    'src/pages/navigate-out.astro': NAVIGATE_OUT_PAGE,
     'src/pages/setstate.astro': SET_STATE_PAGE,
     'src/pages/seestate.astro': SEE_STATE_PAGE,
   };
@@ -344,4 +378,4 @@ const SEEDED_INCOMPLETE = [{ ruleId: 'duplicate-id-aria', kind: 'incomplete' }];
 // list exists.
 const MUST_NOT_FIRE_ON_CLEAN = ['horizontal-overflow', 'color-contrast', 'label', 'button-name', 'image-alt'];
 
-module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS, MANY_COUNT, WIDE_COUNT, AUDIT_STATE_VALUE };
+module.exports = { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, BASE_CSS, MANY_COUNT, WIDE_COUNT, AUDIT_STATE_VALUE, OUTSIDE_ORIGIN_PORT };

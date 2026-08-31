@@ -28,6 +28,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
 const { app, BrowserWindow, dialog } = require('electron');
 
 const failures = [];
@@ -44,7 +45,7 @@ process.env.STACKI_NO_DIALOGS = '1';
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
-const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, MANY_COUNT, WIDE_COUNT } = require('./support/auditFixture.js');
+const { auditFixture, SEEDED, SEEDED_INCOMPLETE, MUST_NOT_FIRE_ON_CLEAN, MANY_COUNT, WIDE_COUNT, OUTSIDE_ORIGIN_PORT } = require('./support/auditFixture.js');
 const { liveWindowCount } = require('../electron/mcp/audit');
 
 app.on('window-all-closed', () => {});
@@ -365,6 +366,51 @@ let stopPreview = null;
     check('  and the status is reported', typeof missing.status === 'number' && missing.status >= 400, short(missing.status));
     check('  and no findings are attributed to the route that was asked for', !Array.isArray(missing.findings) || missing.findings.length === 0);
     check('  and it left no window behind', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
+  }
+
+  // --- LEAVING THE PROJECT, BY EVERY ROUTE OUT OF IT
+  //
+  // A server-side redirect is not a page-initiated navigation, so `will-navigate`
+  // never sees it. Measured against the engine before this was guarded: a project
+  // route answering 302 to a second local origin had that origin LOADED, axe run
+  // on it, and three of its findings returned under the project's own route and
+  // URL. A third-party document reported as the project.
+  //
+  // The outside origin is listened to here, so "refused" can mean "never
+  // contacted" rather than "fetched and then discarded".
+  {
+    let outsideHits = 0;
+    const outside = http.createServer((_req, res) => {
+      outsideHits += 1;
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<!doctype html><title>OUTSIDE_ORIGIN</title><img src="x.gif"><p>outside</p>');
+    });
+    await new Promise((r) => outside.listen(OUTSIDE_ORIGIN_PORT, '127.0.0.1', r));
+    try {
+      // B. server-side redirect to another origin
+      const out = await call('audit', { route: '/redirect-out', viewports: ['phone'] });
+      check('a route that redirects off-origin is refused', out.ok === false && out.code === 'route_outside_project', short(out));
+      check('  and the outside origin is never contacted', outsideHits === 0, `${outsideHits} requests reached it`);
+      check('  and it names the origin without quoting the page', String(out.blockedOrigin || '').includes(String(OUTSIDE_ORIGIN_PORT)) && !/OUTSIDE_ORIGIN/.test(JSON.stringify(out)), short(out.blockedOrigin));
+      check('  and reports no findings at all', !Array.isArray(out.findings) || out.findings.length === 0);
+      check('  and no capture', !Array.isArray(out.captures) || out.captures.length === 0);
+
+      // D. page-initiated navigation off-origin
+      const nav = await call('audit', { route: '/navigate-out', viewports: ['phone'] });
+      check('a page that navigates off-origin is refused', nav.ok === false && nav.code === 'route_outside_project', short(nav));
+      check('  and that origin is still never contacted', outsideHits === 0, `${outsideHits} requests reached it`);
+
+      // C. same-origin redirect is ordinary visitor behaviour -- followed, and
+      //    reported as the document that was actually measured.
+      const inRes = await call('audit', { route: '/redirect-in', viewports: ['phone'] });
+      check('a same-origin redirect is followed', inRes.ok === true, short(inRes));
+      check('  and the page actually measured is named', Array.isArray(inRes.finalRoutes) && inRes.finalRoutes.includes('/clean'), short(inRes.finalRoutes));
+      check('  rather than pretending the requested route was the one measured', inRes.route === '/redirect-in');
+
+      check('no audit window survived any of it', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
+    } finally {
+      await new Promise((r) => outside.close(r));
+    }
   }
 
   // --- the route is untrusted input
