@@ -617,6 +617,28 @@ const PINNED_RISK = {
     const caps = api.capabilities();
     check('and capabilities say which actions are open to it', caps.domains.find((d) => d.domain === 'git').actions.find((a) => a.action === 'push').allowed === false);
     check('and which are not', caps.domains.find((d) => d.domain === 'git').actions.find((a) => a.action === 'log').allowed === true);
+
+    // AND WHICH LEVEL WOULD ALLOW THE ONE THAT IS NOT.
+    //
+    // Every action row carries `risk` and `allowed`. Turning "this is a write
+    // and it is refused" into "you would need Edit project" needed a mapping
+    // that lived only inside `refusal()` -- which an agent sees only if it
+    // TRIES something. One that orients itself first, as the instructions tell
+    // it to, never sees a refusal at all.
+    //
+    // Measured: asked to edit at `visual`, a real Claude Code called
+    // get_capabilities once, correctly refused, correctly said only the person
+    // at the keyboard could change it, and named the level needed as "Editing".
+    // There is no level called Editing. It had nothing to read the name off.
+    check('capabilities name the level each risk needs', caps.access.needs?.write?.mode === 'edit' && caps.access.needs?.high?.mode === 'full' && caps.access.needs?.read?.mode === 'inspect', JSON.stringify(caps.access.needs));
+    check('  in the words the window uses', caps.access.needs?.write?.label === 'Edit project' && caps.access.needs?.high?.label === 'Full control', JSON.stringify(caps.access.needs));
+    check('  and every level there is, in order', JSON.stringify((caps.access.levels || []).map((l) => l.mode)) === JSON.stringify(['visual', 'inspect', 'edit', 'full']), JSON.stringify(caps.access.levels));
+    check('  named the same way', (caps.access.levels || []).map((l) => l.label).join('|') === 'Visual only|Inspect project|Edit project|Full control', JSON.stringify(caps.access.levels));
+    // The refusal an agent gets if it tries, and the answer it gets if it asks,
+    // must name the same level. Two sources that could disagree is worse than
+    // one that was silent.
+    const refused = await api.run('git', 'push', {});
+    check('  the same level the refusal names', refused.requires === caps.access.needs?.high?.mode, `${refused.requires} vs ${caps.access.needs?.high?.mode}`);
   }
 
   {

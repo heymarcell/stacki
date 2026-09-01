@@ -921,6 +921,29 @@ function createAgentApi({
         canRead: gate.allows('read'),
         canEdit: gate.allows('write'),
         canDoHighRisk: gate.allows('high'),
+        // WHICH LEVEL WOULD ALLOW THE THING THAT WAS JUST REFUSED, BY NAME.
+        //
+        // Every action below carries `risk` and `allowed`. Turning "this is a
+        // write and it is not allowed" into "you would need Edit project" took
+        // a mapping that lived only inside `permissions.refusal()`, and a
+        // refusal is a thing an agent only sees if it tries. One that orients
+        // itself first -- which is what the instructions tell it to do -- never
+        // sees one.
+        //
+        // Measured: asked to make an edit at `visual`, a real Claude Code
+        // called `get_capabilities` once, correctly reported that it could not,
+        // correctly said only the person at the keyboard could change it, and
+        // named the level needed as "Editing". There is no level called
+        // Editing. It had nothing to read the name off, so it made one up --
+        // and a person told to look for "Editing" in a window whose control
+        // says "Edit project" is a person given a slightly wrong instruction.
+        //
+        // `permissions.NEEDED` has held this mapping the whole time.
+        needs: Object.fromEntries(
+          Object.entries(permissions.NEEDED).map(([risk, mode]) => [risk, { mode, label: permissions.LABEL[mode] }])
+        ),
+        // And every level there is, in order, so "raise it" names something.
+        levels: permissions.MODES.map((mode) => ({ mode, label: permissions.LABEL[mode] })),
         // Levels are granted per project, and the one that is not remembered
         // says so — an agent that knows `full` is for this session will not
         // assume it still has it tomorrow.
