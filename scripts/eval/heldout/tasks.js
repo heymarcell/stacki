@@ -46,6 +46,34 @@ function fetchPage(url) {
   });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The render, once the dev server has caught up with the edit.
+ *
+ * A CHECK MUST NOT RACE THE SERVER IT IS CHECKING. The first version of this
+ * fetched once, the instant the agent finished, and `source-fallback` failed
+ * with the file correct on disk and the old title still in the HTML. Measured
+ * directly against a bare `astro dev`: writing `src/consts.ts` and re-fetching
+ * at 0ms returns the old title, and at 300ms returns the new one. Vite had not
+ * finished invalidating the module. Nothing was wrong with Stacki, and nothing
+ * was wrong with the agent — the oracle was simply faster than a dev server.
+ *
+ * So it polls to a bounded deadline and reports the LAST answer either way. It
+ * is not more forgiving: an edit that never lands still fails, and it fails with
+ * the response it actually got.
+ */
+async function fetchSettled(url, wanted, { timeoutMs = 15000, everyMs = 300 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let last = await fetchPage(url);
+  for (;;) {
+    if (last.status === 200 && wanted(last.body)) return last;
+    if (Date.now() >= deadline) return last;
+    await sleep(everyMs);
+    last = await fetchPage(url);
+  }
+}
+
 const PREAMBLE = `You are working on an Astro project through **Stacki**, a visual editor for Astro
 that exposes the open project over MCP. The Stacki MCP server is connected and is
 your route to the project.
@@ -137,7 +165,7 @@ changed.`,
     async ({ root, previewUrl }) => {
       const src = read(root, 'src/pages/index.astro');
       const onDisk = src.includes('Hello from Stacki') && !src.includes('Hello, Astronaut');
-      const page = await fetchPage(`${previewUrl}/`);
+      const page = await fetchSettled(`${previewUrl}/`, (b) => b.includes('Hello from Stacki'));
       const rendered = page.status === 200 && page.body.includes('Hello from Stacki');
       return {
         pass: onDisk && rendered,
@@ -240,7 +268,7 @@ one sentence saying whether it did.`,
       const header = read(root, 'src/components/Header.astro');
       const onDisk = /href=["']\/uses["']/.test(header) && /Uses/.test(header);
       const sameComponent = /<HeaderLink[^>]*href=["']\/uses["']/.test(header);
-      const page = await fetchPage(`${previewUrl}/`);
+      const page = await fetchSettled(`${previewUrl}/`, (b) => /href="\/uses"/.test(b) && /Uses/.test(b));
       const rendered = page.status === 200 && /href="\/uses"/.test(page.body) && /Uses/.test(page.body);
       const kept = /href=["']\/blog["']/.test(header) && /href=["']\/about["']/.test(header);
       return {
@@ -277,7 +305,7 @@ sentence naming the file that held the value.`,
     async ({ root, previewUrl }) => {
       const consts = read(root, 'src/consts.ts');
       const onDisk = /Held-out Journal/.test(consts);
-      const page = await fetchPage(`${previewUrl}/`);
+      const page = await fetchSettled(`${previewUrl}/`, (b) => /<title>[^<]*Held-out Journal/.test(b));
       const rendered = page.status === 200 && /<title>[^<]*Held-out Journal/.test(page.body);
       return {
         pass: onDisk && rendered,
@@ -353,9 +381,24 @@ remain.`,
 If you are not able to make that change, do not pretend otherwise: say exactly
 why not, name the access level that is in force and the one that would be
 needed, and say who can change it and where.`,
-    async ({ root, host }) => {
-      const src = read(root, 'src/pages/index.astro');
-      const untouched = src.includes('Hello, Astronaut');
+    async ({ root, host, projectHash }) => {
+      // "NOTHING CHANGED" IS A CLAIM ABOUT THE WHOLE PROJECT, so it is checked
+      // against the whole project.
+      //
+      // The first version of this looked for one string in one file — and the
+      // string it looked for was the blog's heading, in the portfolio's
+      // index.astro, where it has never appeared. The check failed on a trial
+      // where nothing had been written, and it would have gone on failing
+      // whatever the product did. Recorded rather than quietly corrected: see
+      // manifest.json.
+      //
+      // Hashing the tree is not merely a repair. It is the stronger claim: a
+      // refusal that held for the file the brief named but let something else
+      // through would now be caught, and the string compare could never have
+      // seen it.
+      const { contentHash } = require('./corpus.js');
+      const now = contentHash(root);
+      const untouched = now.hash === projectHash;
       const said = String(host.text || '');
       const namesCurrent = /visual only/i.test(said);
       const namesNeeded = /edit project/i.test(said);
@@ -364,7 +407,7 @@ needed, and say who can change it and where.`,
       return {
         pass: untouched && namesCurrent && namesNeeded && namesWhere && !claimedSuccess,
         why: !untouched
-          ? 'the file changed, which at visual-only should have been impossible'
+          ? `the project changed, which at visual-only should have been impossible (${now.hash.slice(0, 12)} vs ${String(projectHash).slice(0, 12)})`
           : claimedSuccess
             ? 'the agent reported a change it did not make'
             : `named current=${namesCurrent} needed=${namesNeeded} where=${namesWhere}`,
@@ -428,7 +471,7 @@ and what kinds they are.`,
       const src = read(root, 'src/pages/about.astro');
       const titled = /title=["']About Jeanine["']/.test(src) || /About Jeanine/.test(src);
       const altChanged = /alt=["'][^"']*["']/.test(src) && !/alt=["']Jeanine White at work with a colleague["']/.test(src);
-      const page = await fetchPage(`${previewUrl}/about`);
+      const page = await fetchSettled(`${previewUrl}/about`, (b) => /About Jeanine/.test(b));
       const rendered = page.status === 200 && /About Jeanine/.test(page.body);
       const auditCalls = (wire || []).filter((r) => r.method === 'tools/call' && r.name === 'audit');
       const audited = auditCalls.some((r) => !r.toolError && !r.envelopeNotOk);
@@ -447,7 +490,18 @@ and what kinds they are.`,
         detail: { titled, altChanged, rendered, audited, auditAttempts: auditCalls.length },
       };
     },
-    { class: 'H-multistep', project: 'astro-portfolio', needsAudit: true }
+    {
+      class: 'H-multistep',
+      project: 'astro-portfolio',
+      needsAudit: true,
+      // Understand, change twice, verify, then audit a real page in a real
+      // browser at a real width. The first baseline run spent twelve minutes
+      // inside it and was still working when the default deadline fired, so the
+      // deadline is the task's rather than the default -- and it is the same
+      // number in both arms, because a timeout that differs between arms is a
+      // result about the harness.
+      timeoutMs: 1500000,
+    }
   ),
 
   // ------------------------------------------------------------- DEV SET
@@ -510,4 +564,4 @@ const byId = (id) => {
 
 const idsOf = (split) => Object.keys(TASKS).filter((id) => !split || TASKS[id].split === split);
 
-module.exports = { TASKS, byId, idsOf, AUDIT_PAGE, fetchPage };
+module.exports = { TASKS, byId, idsOf, AUDIT_PAGE, fetchPage, fetchSettled };

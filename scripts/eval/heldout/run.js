@@ -181,6 +181,9 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
       host,
       wire: wireRows,
       structured: host.structured,
+      // What the project hashed to before the trial started, so a check can
+      // assert that nothing at all changed rather than that one string survived.
+      projectHash: result.projectHash,
     });
     result.ok = result.oracle?.pass === true;
   } catch (err) {

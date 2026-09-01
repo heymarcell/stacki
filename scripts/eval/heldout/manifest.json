@@ -76,6 +76,22 @@
     { "id": "dev-targeted-heading", "class": "A-targeted", "project": "astro-starlog", "split": "dev", "access": "edit", "mode": "mcp-only", "oracle": "the heading changed on disk" },
     { "id": "dev-understand", "class": "B-discovery", "project": "astro-starlog", "split": "dev", "access": "edit", "mode": "mcp-only", "oracle": "three structured answers, all correct" }
   ],
+  "corrections": [
+    {
+      "task": "diagnostic-permission",
+      "found": "The baseline run failed it with 'the file changed, which at visual-only should have been impossible'.",
+      "defect": "The oracle looked for the blog's heading text ('Hello, Astronaut') inside the portfolio's src/pages/index.astro, where it has never appeared. The check could not pass whatever the product did, and it was measuring the fixture author rather than Stacki.",
+      "replacement": "The whole project tree is hashed before the trial and again after it, and 'nothing changed' means the two hashes agree.",
+      "whyThisIsNotTuning": "The replacement is strictly stronger than the original: it would catch a refusal that held for the file the brief named and let a write through somewhere else, which the string compare could never see. It was made before any Phase-D product change was measured against this task, and the failing baseline result is reported alongside the corrected one."
+    },
+    {
+      "task": "source-fallback (and every other check that reads the render)",
+      "found": "The baseline run failed it with 'the rendered <title> does not carry it (200)' while the file on disk was correct and the agent had done the work properly.",
+      "defect": "The check fetched the page once, the instant the agent finished. Measured directly against a bare `astro dev`: writing src/consts.ts and re-fetching at 0ms returns the old title and at 300ms returns the new one. The oracle was racing Vite's module invalidation, not measuring Stacki.",
+      "replacement": "fetchSettled polls to a bounded 15s deadline and reports the last response either way.",
+      "whyThisIsNotTuning": "It does not weaken the check: an edit that never reaches the render still fails, and it fails with the response actually received. It removes a race that had nothing to do with the product, and it was found by a baseline failure rather than by a candidate one."
+    }
+  ],
   "notCovered": [
     {
       "class": "E-review",
