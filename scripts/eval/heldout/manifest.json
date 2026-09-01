@@ -43,13 +43,13 @@
     "agent": "Claude Code CLI, driven with --strict-mcp-config and a per-trial temporary MCP config. No user registration is created or read.",
     "isolation": "--setting-sources '' so no user, project or local settings file loads; --no-session-persistence; a fresh process per trial.",
     "surfaces": {
-      "mcp-only": "--tools '' — the model has ZERO built-in tools. Every action is an MCP call to Stacki, and the transcript proves it (builtinToolCalls must be 0).",
+      "mcp-only": "--tools ListMcpResourcesTool,ReadMcpResourceTool \u2014 no Bash, no Read, no Write, no Glob, no Grep, no web. Those two are MCP access, not filesystem access, and Claude Code reaches MCP resources ONLY through them: a run with --tools '' has a healthy resources/list and cannot open a single resource. Every other action is an MCP call to Stacki, and the transcript proves it (builtinToolCalls must be 0).",
       "integrated": "The ordinary toolset plus the project directory. Its MCP counts are not comparable with mcp-only and are never averaged with them."
     },
-    "server": "The real packaged Stacki.app — 14 tools including audit, a real dev server, a real browser. Not the in-process wire rig, which serves 13 tools and no audit."
+    "server": "The real packaged Stacki.app \u2014 14 tools including audit, a real dev server, a real browser. Not the in-process wire rig, which serves 13 tools and no audit."
   },
   "metrics": {
-    "primary": "semanticSuccess — the task's own check, reading the world",
+    "primary": "semanticSuccess \u2014 the task's own check, reading the world",
     "efficiency": [
       "preambleBytes (server/discover + tools/list + resources/list + prompts/list)",
       "toolCalls",
@@ -60,21 +60,115 @@
       "elapsedMs",
       "host tokens in/out"
     ],
-    "safety": ["refusals", "refusalCodes", "permissionDenials", "cleanupProblems", "isolationHeld"],
+    "safety": [
+      "refusals",
+      "refusalCodes",
+      "permissionDenials",
+      "cleanupProblems",
+      "isolationHeld"
+    ],
     "note": "Reported per task class. A verification call is not waste; a targeted call that prevents a wrong edit is a win. Nothing here is aggregated into one number."
   },
   "tasks": [
-    { "id": "targeted-heading", "class": "A-targeted", "project": "astro-blog", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "src/pages/index.astro carries the new heading AND the dev server renders it" },
-    { "id": "targeted-token", "class": "A-targeted", "project": "astro-portfolio", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "--link-color is #0b7285 AND two named neighbouring tokens are unchanged" },
-    { "id": "understand", "class": "B-discovery", "project": "astro-portfolio", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "five structured answers, all correct: routes, the layout of one named page, the link-colour token, the size of a collection, the Astro major" },
-    { "id": "semantic-nav", "class": "C-semantic", "project": "astro-blog", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "the header carries a new /uses link, the existing links survive, and the home page renders it" },
-    { "id": "source-fallback", "class": "D-source", "project": "astro-blog", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "src/consts.ts carries the new title AND the rendered <title> shows it" },
-    { "id": "auditfix", "class": "F-auditfix", "project": "astro-tailwind", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "a re-run audit reports zero horizontal-overflow, image-alt and label findings, and both seeded controls survive" },
-    { "id": "diagnostic-permission", "class": "G-diagnostic", "project": "astro-portfolio", "split": "holdout", "access": "visual", "mode": "mcp-only", "oracle": "nothing changed on disk, and the answer names the level in force, the level needed and where a person changes it, without claiming success" },
-    { "id": "diagnostic-preview", "class": "G-diagnostic", "project": "astro-blog", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "the dev server was deliberately stopped first; the audit must actually succeed and the server must be back on" },
-    { "id": "multistep", "class": "H-multistep", "project": "astro-portfolio", "split": "holdout", "access": "edit", "mode": "mcp-only", "oracle": "both edits on disk, the About page renders the new title, and the audit ran" },
-    { "id": "dev-targeted-heading", "class": "A-targeted", "project": "astro-starlog", "split": "dev", "access": "edit", "mode": "mcp-only", "oracle": "the heading changed on disk" },
-    { "id": "dev-understand", "class": "B-discovery", "project": "astro-starlog", "split": "dev", "access": "edit", "mode": "mcp-only", "oracle": "three structured answers, all correct" }
+    {
+      "id": "targeted-heading",
+      "class": "A-targeted",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "src/pages/index.astro carries the new heading AND the dev server renders it"
+    },
+    {
+      "id": "targeted-token",
+      "class": "A-targeted",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "--link-color is #0b7285 AND two named neighbouring tokens are unchanged"
+    },
+    {
+      "id": "understand",
+      "class": "B-discovery",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "five structured answers, all correct: routes, the layout of one named page, the link-colour token, the size of a collection, the Astro major"
+    },
+    {
+      "id": "semantic-nav",
+      "class": "C-semantic",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the header carries a new /uses link, the existing links survive, and the home page renders it"
+    },
+    {
+      "id": "source-fallback",
+      "class": "D-source",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "src/consts.ts carries the new title AND the rendered <title> shows it"
+    },
+    {
+      "id": "auditfix",
+      "class": "F-auditfix",
+      "project": "astro-tailwind",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "a re-run audit reports zero horizontal-overflow, image-alt and label findings, and both seeded controls survive"
+    },
+    {
+      "id": "diagnostic-permission",
+      "class": "G-diagnostic",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "visual",
+      "mode": "mcp-only",
+      "oracle": "nothing changed on disk, and the answer names the level in force, the level needed and where a person changes it, without claiming success"
+    },
+    {
+      "id": "diagnostic-preview",
+      "class": "G-diagnostic",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the dev server was deliberately stopped first; the audit must actually succeed and the server must be back on"
+    },
+    {
+      "id": "multistep",
+      "class": "H-multistep",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "both edits on disk, the About page renders the new title, and the audit ran"
+    },
+    {
+      "id": "dev-targeted-heading",
+      "class": "A-targeted",
+      "project": "astro-starlog",
+      "split": "dev",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the heading changed on disk"
+    },
+    {
+      "id": "dev-understand",
+      "class": "B-discovery",
+      "project": "astro-starlog",
+      "split": "dev",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "three structured answers, all correct"
+    }
   ],
   "corrections": [
     {
@@ -90,6 +184,13 @@
       "defect": "The check fetched the page once, the instant the agent finished. Measured directly against a bare `astro dev`: writing src/consts.ts and re-fetching at 0ms returns the old title and at 300ms returns the new one. The oracle was racing Vite's module invalidation, not measuring Stacki.",
       "replacement": "fetchSettled polls to a bounded 15s deadline and reports the last response either way.",
       "whyThisIsNotTuning": "It does not weaken the check: an edit that never reaches the render still fails, and it fails with the response actually received. It removes a race that had nothing to do with the product, and it was found by a baseline failure rather than by a candidate one."
+    },
+    {
+      "task": "source-fallback",
+      "found": "Failed in BOTH arms with 'the rendered <title> does not carry it (200)', with the file correct on disk and the agent's work correct.",
+      "defect": "The check required a bare `<title>`. The dev server Stacki runs marks every authored element, so the tag arrives as `<title data-avb-p=\"src/components/BaseHead.astro|12 1.0.0\">` and the pattern could never match. Verified directly against a real packaged Stacki: a source.write reaches the served HTML in under 500ms, and the served title reads exactly what was written.",
+      "replacement": "`<title[^>]*>` \u2014 the same claim, tolerant of the attributes Stacki's own preview adds.",
+      "whyThisIsNotTuning": "It failed identically in both arms, so it biased nothing; the correction admits an attribute rather than relaxing what must be true. The task was re-run in both arms after the fix and both results are reported."
     }
   ],
   "notCovered": [

@@ -305,8 +305,17 @@ sentence naming the file that held the value.`,
     async ({ root, previewUrl }) => {
       const consts = read(root, 'src/consts.ts');
       const onDisk = /Held-out Journal/.test(consts);
-      const page = await fetchSettled(`${previewUrl}/`, (b) => /<title>[^<]*Held-out Journal/.test(b));
-      const rendered = page.status === 200 && /<title>[^<]*Held-out Journal/.test(page.body);
+      // `<title[^>]*>` and not `<title>`. THE PAGE STACKI SERVES IS NOT A PLAIN
+      // DOCUMENT: the dev server it runs marks every authored element with
+      // `data-avb-p`, so the tag arrives as
+      // `<title data-avb-p="src/components/BaseHead.astro|12 1.0.0">`. The
+      // first version of this check required a bare `<title>` and could never
+      // match, which failed the task in both arms with the file correct on disk
+      // and the render correct in the browser. Verified directly: a
+      // `source.write` through Stacki reaches the served HTML in under 500ms.
+      const titled = (b) => /<title[^>]*>[^<]*Held-out Journal/.test(b);
+      const page = await fetchSettled(`${previewUrl}/`, titled);
+      const rendered = page.status === 200 && titled(page.body);
       return {
         pass: onDisk && rendered,
         why: onDisk ? (rendered ? null : `the rendered <title> does not carry it (${page.status})`) : 'src/consts.ts does not carry the new title',
