@@ -786,11 +786,30 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // incomplete bucket dropped, while `counts.incomplete` went on reporting the
     // true number: the one channel whose whole purpose is honest uncertainty,
     // silently emptied. A quarter of the budget is reserved for it.
+    //
+    // THE RESERVE IS A FLOOR. IT USED TO BE A CEILING, AND ON REAL PAGES THAT IS
+    // THE ONLY WAY IT EVER BIT.
+    //
+    // `keptUndecided` was `undecided.slice(0, min(15, undecided.length))` --
+    // never more than fifteen incomplete, whatever the rest of the budget was
+    // doing. That is invisible against the audit's own fixture, which is seeded
+    // with violations, and it is the normal case on a project somebody actually
+    // wrote: surveying four upstream Astro examples, 105 of 129 findings came
+    // back `incomplete` (axe cannot resolve a background it cannot see), and the
+    // portfolio's home page detected 96, scored 36, and returned 15 -- with
+    // forty-five slots of a sixty-slot budget unused and twenty-one findings
+    // dropped for no reason at all. `truncated` said so, honestly, about a
+    // truncation that did not need to happen.
+    //
+    // Decided findings still get first refusal on everything above the floor, so
+    // a page with sixty violations is unchanged: fifteen incomplete survive and
+    // forty-five violations fill the rest, exactly as before.
     const INCOMPLETE_SHARE = Math.floor(MAX_FINDINGS / 4);
     const undecided = sorted.filter((f) => f.kind === 'incomplete');
     const decided = sorted.filter((f) => f.kind !== 'incomplete');
-    const keptUndecided = undecided.slice(0, Math.min(INCOMPLETE_SHARE, undecided.length));
-    const keptDecided = decided.slice(0, MAX_FINDINGS - keptUndecided.length);
+    const floorUndecided = Math.min(INCOMPLETE_SHARE, undecided.length);
+    const keptDecided = decided.slice(0, MAX_FINDINGS - floorUndecided);
+    const keptUndecided = undecided.slice(0, MAX_FINDINGS - keptDecided.length);
     const kept = sortFindings([...keptDecided, ...keptUndecided]);
 
     // ONE RESULT, BUILT ONCE.
