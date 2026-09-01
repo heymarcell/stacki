@@ -28,6 +28,8 @@
 //   filed uses its own GitHub tooling and hands the URL back as text.
 
 const z = require('zod');
+// One refusal shape for every tool on this endpoint. See auditTool.js.
+const { answer } = require('./agentTools');
 
 const nullableString = z.string().nullable();
 const nullableInt = z.number().int().nullable();
@@ -441,10 +443,11 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
         detail: args.detail || 'summary',
         limit: args.limit == null ? 50 : args.limit,
       });
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        structuredContent: result,
-      };
+      // `get_comments` refuses like everything else — no project, no ledger, a
+      // scope that names nothing — and it was the one tool whose refusal
+      // reached the wire without `isError`. See auditTool.js for why that
+      // matters to a host.
+      return answer(result);
     }
   );
 
@@ -536,15 +539,11 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
             }
           : {}),
       };
-      return {
-        content: [{ type: 'text', text: JSON.stringify(body, null, 2) }],
-        structuredContent: body,
-        // A refusal is an error the client should see as one — an agent that
-        // reads `ok: false` out of a successful tool call and carries on is a
-        // real failure mode, and this is the wire's own word for "that did not
-        // happen".
-        ...(body.ok ? {} : { isError: true }),
-      };
+      // A refusal is an error the client should see as one — an agent that
+      // reads `ok: false` out of a successful tool call and carries on is a
+      // real failure mode, and this is the wire's own word for "that did not
+      // happen".
+      return answer(body);
     }
   );
 }

@@ -170,7 +170,15 @@ const MoveTarget = z
 // One operation inside a batch. The same vocabulary as the single-operation
 // actions, so learning one teaches the other.
 const Operation = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('set_text'), value: z.string().max(20000), replaceBinding: z.boolean().optional() }),
+  // `value` is this form's name and stays the declared one; `text` is accepted
+  // because the single-action form calls it that. See the note on
+  // `action: "set_text"` below.
+  z.object({
+    type: z.literal('set_text'),
+    value: z.string().max(20000).optional(),
+    text: z.string().max(20000).optional(),
+    replaceBinding: z.boolean().optional(),
+  }),
   z.object({ type: z.literal('set_prop'), name: z.string().max(120), value: z.string().max(4000), valueType: z.enum(['string', 'expr']).optional() }),
   z.object({ type: z.literal('remove_prop'), name: z.string().max(120) }),
   z.object({ type: z.literal('set_classes'), classes: z.array(z.string().max(120)).max(80) }),
@@ -221,7 +229,28 @@ const TargetInput = z.discriminatedUnion('action', [
     action: z.literal('set_text'),
     ...withTarget({
       ...guard,
-      text: z.string().max(20000),
+      // ONE OPERATION, TWO NAMES FOR ITS ARGUMENT, AND AN AGENT CAUGHT BETWEEN
+      // THEM.
+      //
+      // `action: "set_text"` takes `text`. The SAME operation inside `edit`'s
+      // batch takes `value` (see `Operation` above), and every other pair in
+      // this file is consistent — `set_prop` is `{name, value}` in both forms.
+      // `set_text` is the one that is not.
+      //
+      // Measured, on the simplest task in the held-out corpus: change one
+      // heading. A real Claude Code read the schemas, called
+      // `{action:"set_text", value:"…"}` and got
+      // "Invalid input: expected string, received undefined"; tried the batch
+      // shape without `action` and got another validation error; and only then
+      // found `{action:"edit", operations:[…]}`. Twelve tool calls and 718 KB
+      // for a one-word change, and two of the calls were this.
+      //
+      // So both names are accepted, here and in the batch form, and the
+      // dispatch normalises. Declaring `text` optional is what makes that
+      // possible; a call with neither is refused by the tool with a sentence
+      // naming both, which is a better answer than a Zod error either way.
+      text: z.string().max(20000).optional().describe('The new text. `value` is accepted as well, because the batch form of this operation calls it that.'),
+      value: z.string().max(20000).optional().describe('The same thing as `text`. Accepted so the single and batch forms of set_text agree.'),
       replaceBinding: z
         .boolean()
         .optional()
@@ -619,7 +648,20 @@ function registerAgentTools(server, { api }) {
       },
       async (args) => {
         const { action, ...rest } = args || {};
-        return answer(await api.run(name, action, rest));
+        const shaped = normalise(name, action, rest);
+        // Declaring `text` optional is what lets `value` be accepted; the cost
+        // is that a call with NEITHER now reaches here instead of being refused
+        // by the schema. Refused with a sentence that names both, which is what
+        // the Zod error should have said in the first place.
+        if (name === 'target' && action === 'set_text' && typeof shaped.text !== 'string') {
+          return answer({
+            ok: false,
+            code: 'bad_arguments',
+            operation: 'target.set_text',
+            message: 'set_text needs the new text. Send it as `text` — `value` is accepted too, because that is what the same operation is called inside `edit`.',
+          });
+        }
+        return answer(await api.run(name, action, shaped));
       }
     );
 
@@ -634,6 +676,35 @@ function registerAgentTools(server, { api }) {
 }
 
 /**
+ * The one argument this surface calls two things, given one name before it
+ * reaches the Agent API.
+ *
+ * The API below has ONE spelling and does not learn about this: the alias is a
+ * property of the wire, where an agent chooses argument names from two schemas
+ * that disagreed, and it stops there. `text` wins when both are sent, because
+ * `text` is what the action's own schema names first.
+ */
+function normalise(domain, action, args) {
+  if (domain !== 'target') return args;
+  if (action === 'set_text') {
+    const text = typeof args.text === 'string' ? args.text : args.value;
+    const { value, ...rest } = args;
+    return { ...rest, ...(typeof text === 'string' ? { text } : {}) };
+  }
+  if (action === 'edit' && Array.isArray(args.operations)) {
+    return {
+      ...args,
+      operations: args.operations.map((op) =>
+        op && op.type === 'set_text' && typeof op.value !== 'string' && typeof op.text === 'string'
+          ? { ...op, value: op.text }
+          : op
+      ),
+    };
+  }
+  return args;
+}
+
+/**
  * One shape out.
  *
  * A refusal is `ok: false` with a code and a sentence, in content and in
@@ -641,10 +712,15 @@ function registerAgentTools(server, { api }) {
  * so a client that reads only that still knows, but the sentence is the part
  * an agent can act on.
  */
-function answer(result) {
+function answer(result, { spaces = 2 } = {}) {
   const body = result && typeof result === 'object' ? result : { ok: false, code: 'failed', message: 'Stacki gave no answer.' };
   return {
-    content: [{ type: 'text', text: JSON.stringify(body, null, 2) }],
+    // `spaces` exists for one caller and one reason: the text block is a second
+    // copy of the same payload, and an audit's payload is findings. Indenting it
+    // costs a third again in bytes on the largest answer this endpoint sends, on
+    // a wire where the catalogue already costs 140 KB a session. The envelope
+    // answers stay indented, because they are small and a person reads them.
+    content: [{ type: 'text', text: JSON.stringify(body, null, spaces) }],
     structuredContent: body,
     ...(body.ok === false ? { isError: true } : {}),
   };
@@ -652,6 +728,9 @@ function answer(result) {
 
 module.exports = {
   registerAgentTools,
+  // Exported so the two tools that live outside this file can refuse in exactly
+  // the same shape rather than in one that resembles it. See auditTool.js.
+  answer,
   DESCRIPTIONS,
   Envelope,
   TargetInput,

@@ -139,6 +139,14 @@ const ContextOutput = z.object({
   project: z.object({ root: nullableString }),
   page: z.object({ route: nullableString, file: nullableString }),
   view: View,
+  // Whether the project is actually being served, in the one read that works at
+  // every permission level. `starting` is a real state and is the reason this is
+  // three-valued: an agent that cannot tell "coming up" from "not running" will
+  // either give up on a healthy project or start a second dev server.
+  preview: z.object({
+    status: z.enum(['off', 'starting', 'on']).describe('Whether Stacki is serving this project right now.'),
+    url: nullableString.describe('Where it is being served, when it is.'),
+  }),
   selection: Selection,
 });
 
