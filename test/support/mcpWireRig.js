@@ -199,14 +199,42 @@ async function verifyDeps(root, full) {
   }
 }
 
-async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, withDeps = false, realDevServer = false, audit = null, log = () => {} } = {}) {
+async function startWireRig({
+  era = 'modern',
+  agentMode = 'full',
+  extra = {},
+  withDeps = false,
+  realDevServer = false,
+  audit = null,
+  // A PROJECT THIS RIG DID NOT BUILD.
+  //
+  // Everything above `project` describes the shared fixture — the one every
+  // coverage scenario is written against, and the one Phase B was designed
+  // against. `extra` can only ADD files to it; it cannot remove `Hero.astro`,
+  // `--brand` or the two collections, so no overlay makes that fixture
+  // unfamiliar. A held-out evaluation needs a project the surface under test
+  // has never seen, so it hands one over whole and this rig opens it through
+  // the app's own `loadProject` exactly as it opens the fixture.
+  //
+  // Its dependencies are the caller's business: `installDeps` writes the
+  // fixture's own package.json, which would be wrong here, and `verifyDeps`
+  // looks for the fixture's two collections, which a real project has no
+  // reason to have. Both are skipped, and `realDevServer` therefore requires
+  // that the caller has already installed them.
+  project = null,
+  log = () => {},
+} = {}) {
   // The shared fixture plus what the wire scenarios need to assert anything
   // real: a dynamic route, a genuine image, a canary in robots.txt.
-  const root = H.makeProject({ ...EXTRA, ...extra });
-  writeBinary(fs, path, root);
-  if (withDeps || realDevServer) {
-    installDeps(root, log);
-    await verifyDeps(root, withDeps);
+  const root = project || H.makeProject({ ...EXTRA, ...extra });
+  if (!project) {
+    writeBinary(fs, path, root);
+    if (withDeps || realDevServer) {
+      installDeps(root, log);
+      await verifyDeps(root, withDeps);
+    }
+  } else if (realDevServer && !fs.existsSync(path.join(root, 'node_modules', 'astro'))) {
+    throw new Error(`no astro is installed in ${root}; a held-out project must arrive with its dependencies`);
   }
   const harness = await H.start(root, { agentMode, realDevServer });
 
@@ -362,7 +390,11 @@ async function startWireRig({ era = 'modern', agentMode = 'full', extra = {}, wi
     } catch {
       /* nothing was ever started */
     }
-    H.removeProject(root);
+    // A PROJECT THIS RIG DID NOT BUILD IS NOT THIS RIG'S TO DELETE. The
+    // held-out corpus is materialised, hashed and owned by its caller, and one
+    // teardown that forgot the difference would remove the evidence the next
+    // trial is measured against.
+    if (!project) H.removeProject(root);
     return { problems: stopProblems };
   };
 

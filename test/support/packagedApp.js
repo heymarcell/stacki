@@ -26,9 +26,19 @@ const { createManifest, residueOfManifest, describeManifestResidue } = require('
 const APP = path.join(__dirname, '..', '..', 'release', 'mac-universal', 'Stacki.app');
 const BINARY = path.join(APP, 'Contents', 'MacOS', 'Stacki');
 
+/**
+ * The bundle to launch.
+ *
+ * Defaulted rather than fixed because a held-out A/B needs two of them at once
+ * — one built from the baseline commit, one from the candidate — and the whole
+ * comparison is void if both arms launch the same app. Every test in the suite
+ * passes nothing and gets this checkout's own build, exactly as before.
+ */
+const binaryOf = (app) => path.join(app || APP, 'Contents', 'MacOS', 'Stacki');
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const available = () => fs.existsSync(BINARY);
+const available = (app) => fs.existsSync(binaryOf(app));
 
 const portTaken = (port) =>
   new Promise((done) => {
@@ -83,10 +93,35 @@ function makeFixture({ nonce, extraFiles = null }) {
  * comes from a live session or not at all), so `edit` is the ceiling here and
  * that is what a write needs.
  */
-async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 43990, extraFiles = null } = {}) {
-  if (!available()) throw new Error(`no packaged app at ${APP}`);
+async function startPackagedApp({
+  access = 'edit',
+  nonce = null,
+  portFrom = 43990,
+  extraFiles = null,
+  // A PROJECT THIS MODULE DID NOT BUILD.
+  //
+  // `makeFixture` writes the shared fixture, which is the right thing for every
+  // packaged test: they assert page and component counts against it. A held-out
+  // evaluation needs the opposite — a project nothing here has seen — so it
+  // hands one over whole, with its own dependencies already installed.
+  //
+  // It must be a DISPOSABLE COPY. `stop()` removes whatever it opened, because
+  // a trial that leaves its project behind leaves the next trial starting from
+  // the last one's edits. Pass a checkout, never the reference corpus.
+  project: given = null,
+  // Which bundle to launch. See `binaryOf`.
+  app = APP,
+} = {}) {
+  if (!available(app)) throw new Error(`no packaged app at ${app}`);
+  const binary = binaryOf(app);
   const marker = nonce || `stacki-automation-${process.pid}-${(process.hrtime.bigint() % 1000000n).toString()}`;
-  const project = makeFixture({ nonce: marker, extraFiles });
+  const project = given || makeFixture({ nonce: marker, extraFiles });
+  if (given) {
+    if (!fs.existsSync(path.join(given, 'node_modules', 'astro'))) {
+      throw new Error(`no astro is installed in ${given}; a held-out project must arrive with its dependencies`);
+    }
+    fs.writeFileSync(path.join(given, '.stacki-automation'), marker, 'utf8');
+  }
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-packaged-userdata-'));
   const port = await freePort(portFrom);
 
@@ -111,7 +146,7 @@ async function startPackagedApp({ access = 'edit', nonce = null, portFrom = 4399
 
   const output = [];
   let exited = null;
-  const child = spawn(BINARY, [`--user-data-dir=${userData}`], {
+  const child = spawn(binary, [`--user-data-dir=${userData}`], {
     env: {
       ...process.env,
       STACKI_NO_DIALOGS: '1',
