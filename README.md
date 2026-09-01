@@ -598,6 +598,26 @@ claude mcp add --transport http --scope user stacki \
   --header "Authorization: Bearer <token>"
 ```
 
+Claude Code, as a file — for a project-scoped `.mcp.json`, or for a headless run
+driven with `--mcp-config`. Note `"type": "http"`, which the Cursor shape below
+does not have:
+
+```json
+{
+  "mcpServers": {
+    "stacki": {
+      "type": "http",
+      "url": "http://127.0.0.1:43821/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Claude Code expands `${VAR}` inside `headers`, so if that file is going to be
+committed, put the token in your environment and write
+`"Bearer ${STACKI_MCP_TOKEN}"` instead of the value.
+
 Cursor — `~/.cursor/mcp.json`:
 
 ```json
@@ -611,8 +631,16 @@ Cursor — `~/.cursor/mcp.json`:
 }
 ```
 
-Both are shown at user/global scope on purpose: Stacki switches between
+All three are shown at user/global scope on purpose: Stacki switches between
 projects, and the endpoint does not.
+
+### What this server promises
+
+[`docs/mcp-v1.md`](docs/mcp-v1.md) is the contract — the protocol revisions
+served, the permission model, what a finding may claim, refs and staleness, the
+trust boundary, what the connection costs, and what is explicitly **not**
+promised. [`docs/mcp-compatibility.md`](docs/mcp-compatibility.md) says which
+hosts have actually been driven against it and which have only been assumed.
 
 ## Requirements
 

@@ -1661,6 +1661,36 @@ const rawPost = (hostHeader, body) =>
     check('the panel does not print the token until it is asked to', !up.includes(TOK), 'the token is on screen by default');
     check('the panel masks the token instead', up.includes('••••••••'));
     check('the panel names Cursor too', up.includes('Cursor'));
+    check('the panel offers the JSON a headless run and a .mcp.json both need', up.includes('Claude Code (JSON)'));
+
+    // EVERY RECIPE, HELD TO WHAT MAKES ONE USABLE.
+    //
+    // The copy button hands the whole snippet over, so a JSON recipe that does
+    // not parse is a recipe that cannot be pasted where it is for. And the token
+    // is masked with one string replace, so a recipe carrying it twice would put
+    // it on screen.
+    const { CLIENTS } = require(bundlePath);
+    check('there are recipes for three clients', CLIENTS.length === 3, `${CLIENTS.length}`);
+    for (const recipe of CLIENTS) {
+      const snippet = recipe.text({ url: 'http://127.0.0.1:43821/mcp', token: TOK });
+      const occurrences = snippet.split(TOK).length - 1;
+      check(`  ${recipe.key} carries the token exactly once`, occurrences === 1, `${occurrences} occurrences`);
+      check(`  ${recipe.key} is masked by the panel's own replace`, !snippet.replace(TOK, '••••••••').includes(TOK));
+      if (snippet.trim().startsWith('{')) {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(snippet);
+        } catch (err) {
+          parsed = null;
+        }
+        check(`  ${recipe.key} is a document that parses`, !!parsed, snippet.slice(0, 120));
+        check(`  ${recipe.key} points at the running endpoint`, JSON.stringify(parsed).includes('http://127.0.0.1:43821/mcp'));
+      }
+    }
+    // The one key the Cursor shape does not have, and the reason the CLI command
+    // could not simply be copied into a file.
+    const claudeJson = JSON.parse(CLIENTS.find((c) => c.key === 'claude-json').text({ url: 'http://127.0.0.1:43821/mcp', token: TOK }));
+    check('the JSON recipe declares the transport Claude Code needs', claudeJson.mcpServers?.stacki?.type === 'http', JSON.stringify(claudeJson));
     check('the panel says the token is not for the project', /never in\s+your project/.test(up.replace(/\s+/g, ' ')) || /never in your project/.test(up.replace(/\s+/g, ' ')));
 
     const down = render({ running: false, url: null, port: 43821, token: null, error: 'port 43821 is already in use, so the Stacki MCP server did not start.' });

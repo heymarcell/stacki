@@ -17,13 +17,47 @@ import React from 'react';
 // even for somebody who has been running this server for months, because an
 // update must never quietly hand out a permission nobody was asked for.
 
-const CLIENTS = [
+// Exported so a test can hold every recipe to the two things that make one
+// usable: a JSON recipe has to PARSE — the copy button hands the whole snippet
+// over, and a version of this file briefly offered two documents and a comment
+// line in one box — and any recipe carrying the token has to contain it exactly
+// once, because the panel masks it with a single string replace.
+export const CLIENTS = [
   {
     key: 'claude',
     label: 'Claude Code',
     hint: 'Run this in a terminal. --scope user registers it for every project, which is what you want: Stacki can switch projects, the endpoint does not.',
     text: ({ url, token }) =>
       `claude mcp add --transport http --scope user stacki ${url} --header "Authorization: Bearer ${token}"`,
+  },
+  {
+    // THE SHAPE `claude mcp add` WRITES, WRITTEN OUT.
+    //
+    // The command above is the right answer for a person at a terminal and the
+    // wrong answer for three real cases: a project-scoped `.mcp.json` that gets
+    // committed, a headless run driven with `--mcp-config`, and anyone who wants
+    // to see what the command is about to do before they run it. All three need
+    // the JSON, and the JSON has a key the Cursor recipe below does not —
+    // `"type": "http"` — so it cannot be copied from there.
+    //
+    // Found by needing it: connecting a real Claude Code to a real Stacki for
+    // the Phase-D evaluation meant writing this file by hand, from the spec,
+    // because the app that owns the endpoint does not offer it.
+    //
+    // The `${...}` form is Claude Code's own expansion, and it is offered
+    // because the app tells people not to commit the token and then hands them
+    // only a form with the token in it.
+    key: 'claude-json',
+    label: 'Claude Code (JSON)',
+    hint:
+      'For .mcp.json in a project, or for --mcp-config in a headless run. Claude Code expands ${STACKI_MCP_TOKEN} in headers, so ' +
+      'if you are going to commit this file, put the token in your environment and write that instead of the value above.',
+    text: ({ url, token }) =>
+      JSON.stringify(
+        { mcpServers: { stacki: { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } },
+        null,
+        2
+      ),
   },
   {
     key: 'cursor',
