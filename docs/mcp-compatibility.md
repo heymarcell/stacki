@@ -22,7 +22,7 @@ only the first while sounding like the second.
 | --- | --- | --- |
 | **Claude Code** | 2.1.251 | A real subprocess per trial: `--strict-mcp-config` with a per-trial temporary config, `--setting-sources ''`, no session persistence, and a recording proxy between it and the app. Eleven sessions against a real packaged Stacki over four upstream Astro projects. No user MCP registration was created or read. |
 | **`@modelcontextprotocol/client`** | 2.0.0 | The official client, at the modern revision, at `auto`, and at the legacy handshake. This is what every wire test in the suite uses. |
-| **Codex CLI** | 0.144.1 | A tools-only host, driven with an inline `-c mcp_servers.…` config so no file in `~/.codex` is touched. See §"A tools-only host" below. |
+| **Codex CLI** | 0.144.1 | **Attempted and not established.** See §"A tools-only host" below. |
 | Cursor, VS Code + Copilot, Gemini CLI, Claude Desktop | installed on the development machine | **Not driven.** Configuration for Cursor is shipped in the app; nothing here proves it. |
 
 ## Capabilities
@@ -87,20 +87,40 @@ nothing here does: every prompt is a shortcut into a workflow that is fully
 achievable without it. **v1 keeps the prompts and states plainly that a headless
 host cannot reach them.**
 
-## A tools-only host
+## A tools-only host — attempted, and not established
 
-Codex CLI is a tools-only MCP client: it consumes `tools/list` and `tools/call`
-and does not surface resources or prompts. That makes it the honest test of the
-claim that a tools-only client loses nothing, which until now was argued from the
+Codex CLI is a tools-only MCP client, which makes it the honest test of the claim
+that a tools-only client loses nothing. That claim is still argued from the
 architecture rather than observed.
 
-It is driven with an inline configuration (`-c mcp_servers.stacki=…`) so that
-nothing in `~/.codex` is created, read for credentials, or modified.
+It was driven with an inline configuration (`-c mcp_servers.stacki.url=…`,
+`bearer_token_env_var`) so that nothing in `~/.codex` was created, read for
+credentials, or modified. `codex mcp list` with the same flags shows the server
+registered, enabled, and with bearer auth recognised. But across three attempts —
+including with `experimental_use_rmcp_client` — **not one byte reached the
+recording proxy**, and the session reported that Stacki's tools were not
+available to it.
+
+Claude Code connects to the same endpoint, through the same proxy, with the same
+token, every time. So this is a Codex-side limitation in `exec` mode rather than
+anything Stacki does, and the honest row is that the host was **attempted and not
+established**. It is written down rather than dropped, because the next person to
+try will otherwise start from zero.
+
+**The claim that a tools-only client keeps 100% of the behaviour therefore
+remains architectural.** It rests on: every guide is also
+`get_capabilities({topic})`, serving the same bytes (asserted in
+`test/mcp-intelligence.js`); no tool requires a resource or a prompt to have been
+fetched first; and the four core tools plus the Agent API are the whole
+functional surface. What is *measured* is the adjacent fact — a Claude Code run
+whose resource tools were switched off completed the discovery task correctly
+using tools alone, and paid more calls to do it.
 
 ## What this document does not claim
 
 Cursor, VS Code with Copilot, Gemini CLI and Claude Desktop are installed on the
-development machine and **none of them has been driven against Stacki**. The app
+development machine and **none of them has been driven against Stacki**. Codex
+CLI was driven and did not connect (above). The app
 ships a Cursor configuration snippet; that is a convenience, not evidence. Until
 one of them appears in the table above with a session behind it, the honest
 statement is that they are expected to work because they implement the same
