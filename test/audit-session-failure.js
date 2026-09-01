@@ -115,8 +115,10 @@ function countingWindows({ axe = null, axeThrows = false, capturable = false } =
 
   // --- WHICH ORIGINS COUNT AS THE PROJECT'S.
   //
-  // The audit's whole closed-world claim rests on this predicate, and it
-  // deliberately accepts more than one string: Stacki builds its own preview URL
+  // Every DOCUMENT the audit will load is decided by this predicate -- which is
+  // the fence, not a closed world: the page itself still fetches whatever
+  // subresources it names, which is why the tool is annotated openWorldHint:true.
+  // It deliberately accepts more than one string: Stacki builds its own preview URL
   // as 127.0.0.1 but adopts a user-started dev server by reading Astro's output,
   // which prints localhost. Same scheme, same port, either name for the loopback
   // interface is the same server. Everything else is somebody else's.

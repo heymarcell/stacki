@@ -177,6 +177,21 @@ let stopPreview = null;
   window_.webContents.send('menu:openProject');
 
   let rpc = 1;
+  /** Any JSON-RPC method, for the ones that are not tools/call. */
+  const rpc_ = async (method, params) => {
+    const res = await fetch(status.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: `Bearer ${status.token}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: rpc++, method, params }),
+    });
+    const text = await res.text();
+    const line = text.split('\n').find((l) => l.startsWith('data:')) || text;
+    return JSON.parse(line.replace(/^data:\s*/, '')).result || null;
+  };
   const call = async (name, args) => {
     const res = await fetch(status.url, {
       method: 'POST',
@@ -441,10 +456,55 @@ let stopPreview = null;
       );
       check('  and nothing of that document is reported', !/OUTSIDE_ORIGIN|x\.gif/.test(JSON.stringify(framed)));
 
+      // H. A FRAME WHOSE FIRST HOP IS INNOCENT AND WHOSE SERVER IS NOT.
+      //
+      // The iframe src is same-origin, so the frame's first navigation is
+      // allowed; the 302 that answers it arrives as `will-redirect` for a
+      // SUBFRAME. A redirect guard that only looks at the main frame never sees
+      // it, and the second origin gets the document.
+      const frameRedirect = await call('audit', { route: '/frame-redirect-page', viewports: ['phone'] });
+      check('a same-origin frame redirected off-origin never reaches it', outsideHits === 0, `${outsideHits} requests reached it`);
+      check('  and the project page is still audited', frameRedirect.ok === true, short(frameRedirect));
+      check(
+        '  and the origin the frame was sent to is named',
+        Array.isArray(frameRedirect.blockedSubframeOrigins) &&
+          frameRedirect.blockedSubframeOrigins.some((o) => o.includes(String(OUTSIDE_ORIGIN_PORT))),
+        short(frameRedirect.blockedSubframeOrigins)
+      );
+      check('  and none of that document is reported', !/OUTSIDE_ORIGIN|x\.gif|>outside</.test(JSON.stringify(frameRedirect)));
+      check('  and no capture of it either', !Array.isArray(frameRedirect.captures) || frameRedirect.captures.length === 0);
+
+      // I. THE CONTROL, same shape, redirect staying inside the project. Blocking
+      //    this one would not be a fix, it would be a broken browser.
+      const frameHome = await call('audit', { route: '/frame-redirect-in-page', viewports: ['phone'] });
+      check('a frame that redirects WITHIN the project is left alone', frameHome.ok === true, short(frameHome));
+      check(
+        '  and nothing is reported as blocked',
+        frameHome.blockedSubframeOrigins === undefined,
+        short(frameHome.blockedSubframeOrigins)
+      );
+      check('  and the outside origin is still untouched', outsideHits === 0, `${outsideHits} requests reached it`);
+
       check('no audit window survived any of it', liveWindowCount() === 0, `${liveWindowCount()} still registered`);
     } finally {
       await new Promise((r) => outside.close(r));
     }
+  }
+
+  // --- WHAT THE TOOL DECLARES ABOUT ITSELF.
+  //
+  // `openWorldHint` is the one that had to change. The document fence is real and
+  // is proven above; it is not the same claim as a closed world, because the page
+  // this tool renders decides for itself what scripts, fonts and images it pulls
+  // and from where. The spec's own words are "may interact with an open world of
+  // external entities", and a real browser rendering a real project page does.
+  {
+    const listed = await rpc_('tools/list', {});
+    const audit_ = (listed?.tools || []).find((t) => t.name === 'audit');
+    const a = audit_?.annotations || {};
+    check('the audit tool is on the surface with annotations', !!audit_ && !!audit_.annotations, JSON.stringify(Object.keys(a)));
+    check('  it is read-only and not destructive', a.readOnlyHint === true && a.destructiveHint === false, JSON.stringify(a));
+    check('  and it does NOT claim a closed world, because the page it renders is not one', a.openWorldHint === true, JSON.stringify(a));
   }
 
   // --- the route is untrusted input

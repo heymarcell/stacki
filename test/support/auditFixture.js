@@ -392,6 +392,41 @@ import Base from '../layouts/AuditBase.astro';
 </Base>
 `;
 
+// A FRAME WHOSE FIRST HOP IS INNOCENT.
+//
+// The iframe's src is SAME ORIGIN, so the frame's first navigation is allowed --
+// and then its own server answers 302 to somewhere else. That redirect arrives as
+// `will-redirect` for a subframe, which a main-frame-only redirect guard ignored:
+// measured against that code the second origin served two requests, the document
+// and an image inside it, with ok:true and nothing named as blocked.
+const FRAME_REDIRECT_ENDPOINT = `export function GET() {
+  return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:${OUTSIDE_ORIGIN_PORT}/frame-redirect-landed' } });
+}
+`;
+const FRAME_REDIRECT_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>host page</h1>
+  <iframe src="/frame-redirect" width="240" height="160" title="a same-origin embed"></iframe>
+</Base>
+`;
+// THE CONTROL. Identical shape, and the redirect stays at home. A guard that
+// refuses this one has not fixed the leak, it has broken ordinary pages: a frame
+// that 302s within the project is normal browser behaviour.
+const FRAME_REDIRECT_IN_ENDPOINT = `export function GET() {
+  return new Response(null, { status: 302, headers: { location: '/clean' } });
+}
+`;
+const FRAME_REDIRECT_IN_PAGE = `---
+import Base from '../layouts/AuditBase.astro';
+---
+<Base>
+  <h1>host page, staying home</h1>
+  <iframe src="/frame-redirect-in" width="240" height="160" title="a same-origin embed"></iframe>
+</Base>
+`;
+
 /** The files, for a broken or a clean variant of the fixture. */
 function auditFixture({ broken }) {
   return {
@@ -408,6 +443,10 @@ function auditFixture({ broken }) {
     'src/pages/late-out.astro': LATE_OUT_PAGE,
     'src/pages/late-in.astro': LATE_IN_PAGE,
     'src/pages/frame-out.astro': FRAME_OUT_PAGE,
+    'src/pages/frame-redirect.js': FRAME_REDIRECT_ENDPOINT,
+    'src/pages/frame-redirect-page.astro': FRAME_REDIRECT_PAGE,
+    'src/pages/frame-redirect-in.js': FRAME_REDIRECT_IN_ENDPOINT,
+    'src/pages/frame-redirect-in-page.astro': FRAME_REDIRECT_IN_PAGE,
     'src/pages/setstate.astro': SET_STATE_PAGE,
     'src/pages/seestate.astro': SEE_STATE_PAGE,
   };

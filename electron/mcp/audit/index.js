@@ -237,15 +237,35 @@ function makeAuditWindow(BrowserWindow, { width, height, partition, isProjectOri
   // refused; staying on it is ordinary visitor behaviour and is allowed, with the
   // page that is finally measured reported truthfully.
   //
-  // AND THE FRAMES UNDERNEATH IT. `will-navigate` is documented as the MAIN
-  // FRAME's event; `will-frame-navigate` is the one that sees the others. Without
-  // it an `<iframe src="http://somewhere.else/">` on a project page had that
-  // document fetched and rendered inside the audit window -- so "nothing outside
-  // this project is loaded" was true of the top document and false of the page.
-  // An off-origin frame is dropped and NAMED, and the audit continues: a page
-  // that embeds a video is an ordinary page, not a reason to refuse the run.
+  // AND THE FRAMES UNDERNEATH IT, INCLUDING THE ONES THAT LEAVE LATER.
+  //
+  // THE INVARIANT: no off-origin document loads in ANY frame of this window.
+  //
+  // Three events are needed for that, and each of them can be about the main
+  // frame or about one underneath it. `will-navigate` is documented as the main
+  // frame's; `will-frame-navigate` sees a frame's FIRST navigation; and a frame's
+  // SERVER can still answer that first navigation with a redirect, which arrives
+  // as `will-redirect` for that same frame.
+  //
+  // That last case is what escaped. The redirect guard asked `isMainFrame` and
+  // returned early when it was false, on the reasoning that subframes were
+  // will-frame-navigate's business -- but will-frame-navigate had already seen
+  // and allowed the frame's SAME-ORIGIN first hop. Measured against that code:
+  //
+  //   page -> <iframe src="/frame-redirect">      same origin, allowed
+  //   /frame-redirect -> 302 to a second origin   will-redirect, isMainFrame:false
+  //   ... ignored, and the second origin served two requests: the document and
+  //       an image inside it, rendered in the audit window, with ok:true and
+  //       nothing named in blockedSubframeOrigins.
+  //
+  // So no event asks WHICH event it is any more. Every one of them asks the same
+  // two questions in the same order: is the target this project's, and if not, is
+  // this the main frame or one underneath it. What differs is only the REPORT --
+  // the main document leaving fails the audit, a frame leaving drops that frame
+  // and is named, because a page that embeds a video is an ordinary page and not
+  // a reason to refuse the run.
   const allowed = (target) => isProjectOrigin(originOf(target));
-  const mainFrame = (details, positionalUrl) => {
+  const frameOf = (details, positionalUrl) => {
     const target = typeof details?.url === 'string' ? details.url : positionalUrl;
     // `isMainFrame` is on the details object in this Electron; if some build ever
     // omits it, treating the event as the main frame's keeps the strict path.
@@ -253,22 +273,18 @@ function makeAuditWindow(BrowserWindow, { width, height, partition, isProjectOri
     return { target, isMain };
   };
   const guard = (kind) => (details, positionalUrl) => {
-    const { target, isMain } = mainFrame(details, positionalUrl);
-    // A subframe is will-frame-navigate's business. Refusing the whole audit
-    // because an embedded widget redirected would be a false refusal.
-    if (!isMain) return;
+    const { target, isMain } = frameOf(details, positionalUrl);
     if (allowed(target)) return;
     details.preventDefault();
-    onBlocked?.({ kind, target });
+    if (isMain) onBlocked?.({ kind, target });
+    else onSubframeBlocked?.(originOf(target));
   };
   win.webContents.on('will-redirect', guard('redirect'));
   win.webContents.on('will-navigate', guard('navigate'));
-  win.webContents.on('will-frame-navigate', (details) => {
-    if (details?.isMainFrame) return;
-    if (allowed(details?.url)) return;
-    details.preventDefault();
-    onSubframeBlocked?.(originOf(details?.url));
-  });
+  // Fires for the main frame too, which is harmless: an off-origin main-frame
+  // navigation is refused by whichever of the two sees it first, and `blocked`
+  // keeps the first report.
+  win.webContents.on('will-frame-navigate', guard('navigate'));
   return win;
 }
 

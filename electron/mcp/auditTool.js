@@ -236,33 +236,37 @@ function registerAuditTool(server, { audit, api }) {
       // `openWorldHint` is defined as: "If true, this tool may interact with an
       // 'open world' of external entities. If false, the tool's domain of
       // interaction is closed. For example, the world of a web search tool is
-      // open, whereas that of a memory tool is not." Default: true.
+      // open, whereas that of a memory tool is not." Default: true. Annotations
+      // are HINTS, and the spec tells clients to treat them as untrusted; this
+      // one describes the shape of the interaction, it does not enforce anything.
       //
-      // `false` is a real claim, so it has to be enforced rather than asserted.
-      // Two things make it true here. The arguments cannot address anything
-      // outside: `route` is a path joined onto the project's own preview origin
-      // and `viewports` is an enum -- there is no argument that names a host.
-      // And the window refuses to leave that origin: a server-side redirect or a
-      // page-initiated navigation to another origin is cancelled and reported as
-      // `route_outside_project`, so the audit cannot be walked out of the project
-      // by the content it is auditing. Before that guard existed this annotation
-      // was a promise the code did not keep.
+      // TRUE, and this used to say false.
       //
-      // That covers documents at every level, not just the top one: an
-      // `<iframe>` pointing off-origin is dropped through `will-frame-navigate`
-      // and named in `blockedSubframeOrigins`, because a third-party document
-      // rendered inside the audit window is outside the project whether or not
-      // it is the page in the address bar.
+      // The false was defended by the document fence: no argument can name a host
+      // (`route` is a path joined onto the project's own preview origin and
+      // `viewports` is an enum), and no document from another origin loads in any
+      // frame of the audit window -- an off-origin redirect or navigation of the
+      // main frame fails the run as `route_outside_project`, and one of a
+      // subframe drops that frame and is named in `blockedSubframeOrigins`. All
+      // of that is true and all of it is still enforced.
       //
-      // The honest limit is SUBRESOURCES. A project page that references a font,
-      // script or image on a CDN still causes the render to fetch it, exactly as
-      // the user's own browser preview would. Documents are closed; the bytes a
-      // page pulls in to draw itself are the page's business.
+      // It is just not the same claim as a closed world. This tool RENDERS A REAL
+      // PROJECT PAGE in a real browser, and that page decides for itself what it
+      // fetches: scripts, images, fonts, stylesheets, and whatever its own
+      // JavaScript asks the network for. Those go wherever the project points
+      // them, which can be anywhere. Saying `false` described the fence and
+      // invited a reader to conclude something broader about the tool.
+      //
+      // The alternative -- blocking every external subresource to keep the word
+      // "closed" -- would change what the page IS, and an audit of a page that
+      // could not load its own fonts would measure a layout nobody has. The fence
+      // is on documents, deliberately, and the hint now says the true thing about
+      // the rest.
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false,
+        openWorldHint: true,
       },
     },
     async (args = {}) => {
