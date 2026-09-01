@@ -37,7 +37,8 @@ were.
 ```
 MCP client
    ↓  loopback · Host · Origin · bearer token          electron/mcp/server.js
-tools.js ─── reviewTools.js ─── agentTools.js          the 13 tools
+tools.js ─── reviewTools.js ─── agentTools.js          13 of the 14 tools
+                                                     (auditTool.js is the 14th)
    ↓
 electron/mcp/agent/index.js                            the one dispatcher
    ├── permissions.js   may this level run it           ← checked before dispatch
@@ -417,7 +418,7 @@ into a read tool and a write tool would double the surface to soften a hint that
 is telling the truth, and the permission gate is the thing actually enforcing
 the boundary. Left as it is, and reported rather than hidden.
 
-The real client connects, lists all thirteen tools, and accepts every schema —
+The real client connects, lists all fourteen tools, and accepts every schema —
 no rejections, 6.9 KB of descriptions in total.
 
 ## The security boundary

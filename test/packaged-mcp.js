@@ -120,7 +120,10 @@ const PORT = 43970 + Math.floor(Math.random() * 20);
       check('server/discover answers from the packaged app', (discover?.supportedVersions || []).includes(MODERN_VERSION), JSON.stringify(discover?.supportedVersions));
 
       const listed = await client.listTools();
-      check('tools/list carries the whole surface', listed.tools.length === 13, `${listed.tools.length}: ${listed.tools.map((t) => t.name).join(',')}`);
+      // Fourteen since Phase C: `audit` is a top-level tool, not a 112th Agent
+      // operation. See electron/mcp/auditTool.js for why.
+      check('tools/list carries the whole surface', listed.tools.length === 14, `${listed.tools.length}: ${listed.tools.map((t) => t.name).join(',')}`);
+      check('  including the audit', listed.tools.some((t) => t.name === 'audit'), listed.tools.map((t) => t.name).join(','));
 
       const call = async (name, args = {}) => (await client.callTool({ name, arguments: args })).structuredContent;
       const run = (domain, action, args = {}) => call(domain, { action, ...args });

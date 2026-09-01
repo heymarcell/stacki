@@ -18,6 +18,8 @@
 
 const z = require('zod');
 
+const { TOPICS, TOPIC_NAMES: GUIDE_TOPICS, uriFor: guideUri } = require('./guide');
+
 const { DOMAINS, actionsOf, find } = require('./agent/registry');
 
 // --- shapes ------------------------------------------------------------------
@@ -27,7 +29,7 @@ const RelPath = z
   .string()
   .min(1)
   .max(1024)
-  .describe('A path inside the open project, relative to its root (src/pages/index.astro). Never absolute.');
+  .describe('A path inside the open project, relative to its root (src/pages/contact.astro). Never absolute.');
 const Digest = z
   .string()
   .min(4)
@@ -332,7 +334,7 @@ const StyleInput = z.discriminatedUnion('action', [
             .string()
             .max(300)
             .optional()
-            .describe('The VARIABLE to land in front of — a name like --gap, not a selector. Leave it out to move to the end of the rule.'),
+            .describe('The VARIABLE to land in front of — a name like --spacing-lg, not a selector. Leave it out to move to the end of the rule.'),
           at: z.number().int().min(0).optional(),
         })
       )
@@ -573,12 +575,36 @@ function registerAgentTools(server, { api }) {
       description:
         'A fast answer to "what is Stacki able to do right now": its version, the open project and branch, the ' +
         'agent-access level the person has granted, every domain and action with whether this level may run it, ' +
-        'and the current limitations. Call it once at the start rather than discovering a refusal.',
-      inputSchema: z.object({}),
+        'and the current limitations. Call it once at the start rather than discovering a refusal. Pass a `topic` ' +
+        'to get one of Stacki\'s guides as text — the same bytes as the stacki://guide/ resources, for a client ' +
+        'that does not do resources. It lists the topics it has.',
+      inputSchema: z.object({
+        topic: z
+          .enum(GUIDE_TOPICS)
+          .optional()
+          .describe('One of Stacki\'s guides. Omit for capabilities.'),
+      }),
       outputSchema: Envelope,
       annotations: READ_ONLY,
     },
-    async () => answer(api.capabilities())
+    // THE RESOURCE-FREE ROAD TO THE SAME PLACE.
+    //
+    // A host that ignores resources entirely is a first-class client, and the
+    // instructions promise it this. It is the same string the resource serves,
+    // read from the same module, so the two cannot drift into disagreeing.
+    async ({ topic } = {}) => {
+      if (!topic) return answer({ ...api.capabilities(), guideTopics: GUIDE_TOPICS });
+      const t = TOPICS[topic];
+      if (!t) {
+        return answer({
+          ok: false,
+          code: 'bad_topic',
+          message: `Stacki has no guide called ${topic}.`,
+          guideTopics: GUIDE_TOPICS,
+        });
+      }
+      return answer({ ok: true, topic, title: t.title, uri: guideUri(topic), text: t.body });
+    }
   );
 
   const domain = (name, inputSchema, annotations) =>
