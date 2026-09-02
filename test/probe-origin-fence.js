@@ -128,11 +128,18 @@ const redirectTo = (location, status = 302) => (_req, res) => {
     //
     // Each of these must refuse BEFORE the request, which is why the hit count
     // is asserted beside every one of them rather than once at the end.
-    const refuses = async (what, url) => {
+    //
+    // `codes` is a set rather than one string because two refusals are honest
+    // here and which one applies is a property of the URL, not of the fence: an
+    // address that parses and points elsewhere is `route_outside_project`, and
+    // one that does not parse at all is `bad_route`. Both refuse before the
+    // request, which is the thing being asserted. What is NOT accepted is a
+    // refusal with no code, or a success.
+    const refuses = async (what, url, codes = ['route_outside_project']) => {
       const before = outsideHits();
       const res = await run('project', 'probe', { url });
       check(`${what} is refused`, res.ok === false, short(res));
-      check(`  ${what}: with a code that names the reason`, res.code === 'route_outside_project', short({ code: res.code, message: res.message }));
+      check(`  ${what}: with a code that names the reason`, codes.includes(res.code), short({ code: res.code, wanted: codes, message: res.message }));
       check(`  ${what}: and the outside origin got nothing`, outsideHits() === before, short({ reached: outside.hits.slice(before) }));
       return res;
     };
@@ -144,7 +151,7 @@ const redirectTo = (location, status = 302) => (_req, res) => {
     await refuses('a redirect chain that ends outside', `${project.origin}/chain-1`);
     await refuses('a protocol-relative redirect outside', `${project.origin}/protocol-relative`);
     await refuses('another port on this machine', `http://127.0.0.1:${outside.port}/landed`);
-    await refuses('a host that merely starts with the project origin', `${project.origin}.evil.example/landed`);
+    await refuses('a host that merely starts with the project origin', `${project.origin}.evil.example/landed`, ['route_outside_project', 'bad_route']);
     await refuses('a URL with the project origin in its userinfo', `http://127.0.0.1:${project.port}@127.0.0.1:${outside.port}/landed`);
     await refuses('a different protocol on the project host', `https://127.0.0.1:${project.port}/landed`);
 

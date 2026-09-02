@@ -23,6 +23,7 @@ const fs = require('node:fs');
 
 const { resolveInProject, relativeTo, toPosix } = require('./paths');
 const { digestOf, digestOfFile, checkDigest } = require('./digest');
+const { originOf, projectOriginTest } = require('../../projectOrigin.js');
 
 const problem = (code, message, extra = {}) => ({ error: { ok: false, code, message, ...extra } });
 
@@ -863,7 +864,48 @@ const project = {
       requires: raw?.requires ?? null,
     }),
   },
-  probe: { channel: 'dev:probe', args: (input, ctx) => input.url || ctx.devUrl || null },
+  // PROBE THE PROJECT'S PREVIEW, not an arbitrary address.
+  //
+  // `input.url` used to win outright over the trusted `ctx.devUrl`, which made
+  // this a general-purpose fetch wearing a project operation's name. It is
+  // resolved against the preview origin instead, so the ordinary thing an agent
+  // wants -- "is /pricing answering?" -- is a route, an absolute URL on the
+  // project still works, and anything else is refused HERE, before the main
+  // process is asked for anything.
+  //
+  // The fence in electron/devProbe.js is the one that matters, because it also
+  // sees the redirects. This one exists so the refusal names the reason at the
+  // boundary the agent is actually standing at.
+  probe: {
+    channel: 'dev:probe',
+    args: (input, ctx) => {
+      const preview = ctx.devUrl || null;
+      if (!input.url) return { url: preview, projectOrigin: preview };
+      if (!preview) {
+        return problem(
+          'no_preview',
+          'There is no preview running, so there is no project origin to probe. Start the dev server first.'
+        );
+      }
+      let resolved = null;
+      try {
+        resolved = new URL(String(input.url), preview);
+      } catch {
+        return problem('bad_route', `${input.url} is not a route this project can serve.`);
+      }
+      if (!projectOriginTest(originOf(preview))(originOf(resolved.href))) {
+        return problem(
+          'route_outside_project',
+          `${input.url} resolves to ${originOf(resolved.href) || 'an origin Stacki cannot read'}, which is not ` +
+            `${preview}, the project Stacki is serving. project.probe only ever reaches this project.`
+        );
+      }
+      // The origin travels with the route. Main prefers its own record of the
+      // dev server and only falls back to this, and this is `ctx.devUrl` --
+      // main's own `getDevUrl` -- never anything read out of `input.url`.
+      return { url: resolved.href, projectOrigin: preview };
+    },
+  },
 
 };
 

@@ -154,56 +154,11 @@ let runSeq = 0;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * The origin of a URL, or null when it does not have one.
- *
- * `data:`, `about:`, `file:` and `javascript:` are OPAQUE origins, and the URL
- * standard spells those as the string "null". Returning that string put the word
- * "null" into a refusal message as though it were a hostname and stopped the
- * "unreadable origin" wording ever being reached. An opaque origin is not an
- * origin, so it comes back as one.
- */
-function originOf(u) {
-  try {
-    const origin = new URL(u).origin;
-    return origin === 'null' ? null : origin;
-  } catch {
-    return null;
-  }
-}
-
-// THE SAME SERVER, SPELLED TWO WAYS.
-//
-// The preview URL Stacki builds itself is `http://127.0.0.1:PORT`, but a dev
-// server the user started and Stacki adopted is scraped from Astro's own output,
-// which prints `http://localhost:PORT`. Those are different origins to a string
-// compare, so a redirect between them -- which frameworks do -- would have been
-// refused as "outside the project" on a page that never left the machine. Same
-// scheme, same port and both names for the loopback interface is the same server.
-const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
-
-/** A test for "is this origin the project's", tolerant of loopback spelling only. */
-function projectOriginTest(projectOrigin) {
-  let base = null;
-  try {
-    base = new URL(projectOrigin);
-  } catch {
-    /* falls through to an exact compare, which will simply never match */
-  }
-  const loopback = !!base && LOOPBACK_NAMES.has(base.hostname);
-  return (origin) => {
-    if (!origin) return false;
-    if (origin === projectOrigin) return true;
-    if (!loopback) return false;
-    let other = null;
-    try {
-      other = new URL(origin);
-    } catch {
-      return false;
-    }
-    return other.protocol === base.protocol && other.port === base.port && LOOPBACK_NAMES.has(other.hostname);
-  };
-}
+// The project-origin test, and the loopback relaxation inside it, live in
+// electron/projectOrigin.js so that `project.probe` asks the same question this
+// engine asks rather than a second one that resembles it. Re-exported at the
+// foot of this file, because the audit's own tests assert it here.
+const { originOf, projectOriginTest } = require('../../projectOrigin.js');
 
 /** The path+query of a URL, for reporting which document was actually measured. */
 function routeOf(u) {

@@ -5143,7 +5143,32 @@ function nodeVersionOf(bin) {
   }
 }
 
-handle('dev:probe', (_e, url) => probeUrl(url));
+// FENCED AT THE DOOR, so every caller is fenced.
+//
+// Both the app's preview watcher and the agent's `project.probe` arrive here.
+// The origin the probe is confined to is `devServer.url` — Stacki's own state,
+// and never anything derived from the address being probed. `project.probe`
+// also sends the origin it resolved the caller's route against, which is this
+// same value read through `getDevUrl`; it is used only when main is not holding
+// a record of its own, and it can never be a URL a caller supplied, because the
+// agent layer takes it from `ctx.devUrl` rather than from `input.url`.
+//
+// With no origin at all there is nothing that counts as "the project", so the
+// probe refuses. Failing closed here is the whole point: the alternative is one
+// operation that will fetch anything as long as no preview is running.
+handle('dev:probe', (_e, arg) => {
+  const url = typeof arg === 'string' ? arg : arg?.url || null;
+  const projectOrigin = devServer?.url || (typeof arg === 'object' && arg ? arg.projectOrigin : null) || null;
+  if (!projectOrigin) {
+    return {
+      ok: false,
+      status: 0,
+      code: 'no_preview',
+      message: 'No preview is running, so there is no project origin to probe. Nothing was requested.',
+    };
+  }
+  return probeUrl(url, fetch, { projectOrigin });
+});
 
 handle('dev:diagnose', async (_e, projectPath) => {
   const nodePath = resolveNodeBin();
