@@ -105,9 +105,21 @@ function runHost({
   schema = null,
   addDir = null,
   timeoutMs = 900000,
+  // A CONFIG THE CALLER WROTE, rather than the one this file writes.
+  //
+  // Every trial wants the ordinary literal-token config, so that stays the
+  // default. What this exists for is proving that a config Stacki GENERATES
+  // actually connects — and the only honest way to test that is to hand over
+  // the exact bytes the product produced and change nothing else about the
+  // invocation. A smoke test that rebuilds the command by hand is testing the
+  // command.
+  configPath = null,
+  // Extra environment for the child only. The whole point of the committable
+  // recipe is that the token lives here instead of in the file.
+  env = {},
   log = () => {},
 }) {
-  const config = writeConfig(workspace, { url, token });
+  const config = configPath || writeConfig(workspace, { url, token });
   const tools = TOOLSET[mode];
   if (tools === undefined) throw new Error(`unknown host mode ${mode}`);
 
@@ -145,7 +157,7 @@ function runHost({
     const child = spawn('claude', args, {
       cwd: workspace,
       // A trial must not inherit an interactive terminal's idea of anything.
-      env: { ...process.env, CI: '1' },
+      env: { ...process.env, CI: '1', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

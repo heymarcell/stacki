@@ -17,14 +17,35 @@ import React from 'react';
 // even for somebody who has been running this server for months, because an
 // update must never quietly hand out a permission nobody was asked for.
 
-// Exported so a test can hold every recipe to the two things that make one
-// usable: a JSON recipe has to PARSE — the copy button hands the whole snippet
-// over, and a version of this file briefly offered two documents and a comment
-// line in one box — and any recipe carrying the token has to contain it exactly
-// once, because the panel masks it with a single string replace.
+// WHICH FILE A RECIPE IS FOR, DECLARED, BECAUSE IT DECIDES WHETHER THE TOKEN
+// MAY BE IN IT.
+//
+// The token is this endpoint's whole security boundary. Stacki keeps it out of
+// the project and out of git — and then this panel handed people a `.mcp.json`
+// with it in, for a file whose own documentation says "Check `.mcp.json` into
+// version control so everyone on your team gets the same MCP tools". The hint
+// underneath told them to go and make it safe by hand. A product that generates
+// the unsafe form and explains the safe one has chosen the wrong default.
+//
+//   scope: 'user'     a file only this person has — `claude mcp add --scope
+//                     user` writes ~/.claude.json. The real token belongs here.
+//   scope: 'project'  a file that goes in the repository. ZERO bytes of the
+//                     token, ever. Both hosts resolve an environment variable
+//                     in `headers`, so the recipe names one instead.
+//
+// The syntaxes are the hosts' own and differ, which is exactly why they are
+// written out per recipe rather than shared:
+//   Claude Code  ${VAR}        — code.claude.com/docs/en/mcp
+//   Cursor       ${env:VAR}    — cursor.com/docs/context/mcp
+//
+// `test/mcp.js` reads `scope` and holds every recipe to it, so a fourth recipe
+// added with the wrong one fails rather than ships.
+export const TOKEN_ENV_VAR = 'STACKI_MCP_TOKEN';
+
 export const CLIENTS = [
   {
     key: 'claude',
+    scope: 'user',
     label: 'Claude Code',
     hint: 'Run this in a terminal. --scope user registers it for every project, which is what you want: Stacki can switch projects, the endpoint does not.',
     text: ({ url, token }) =>
@@ -44,28 +65,40 @@ export const CLIENTS = [
     // the Phase-D evaluation meant writing this file by hand, from the spec,
     // because the app that owns the endpoint does not offer it.
     //
-    // The `${...}` form is Claude Code's own expansion, and it is offered
-    // because the app tells people not to commit the token and then hands them
-    // only a form with the token in it.
+    // It names the environment variable rather than carrying the token, because
+    // this is the recipe for a file the host's own documentation tells people to
+    // commit. `${VAR}` is Claude Code's expansion and it works in `headers`.
     key: 'claude-json',
+    scope: 'project',
     label: 'Claude Code (JSON)',
     hint:
-      'For .mcp.json in a project, or for --mcp-config in a headless run. Claude Code expands ${STACKI_MCP_TOKEN} in headers, so ' +
-      'if you are going to commit this file, put the token in your environment and write that instead of the value above.',
-    text: ({ url, token }) =>
+      `Safe to commit: it names ${TOKEN_ENV_VAR} rather than carrying the token. Put it in .mcp.json at the project root, or pass it to ` +
+      `--mcp-config for a headless run. Export ${TOKEN_ENV_VAR} in the shell that starts Claude Code — "Copy token" above puts the value on your clipboard.`,
+    text: ({ url }) =>
       JSON.stringify(
-        { mcpServers: { stacki: { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } },
+        {
+          mcpServers: {
+            stacki: { type: 'http', url, headers: { Authorization: `Bearer \${${TOKEN_ENV_VAR}}` } },
+          },
+        },
         null,
         2
       ),
   },
   {
+    // Cursor's config is shareable in both places it lives -- the global one
+    // ends up in plenty of dotfile repositories -- and Cursor resolves
+    // `${env:VAR}` in `headers` for either. So there is one recipe and it is
+    // safe wherever it is put, rather than two that differ by a secret.
     key: 'cursor',
+    scope: 'project',
     label: 'Cursor',
-    hint: 'Put this in ~/.cursor/mcp.json (global) — or .cursor/mcp.json in one project, if you would rather it were not everywhere.',
-    text: ({ url, token }) =>
+    hint:
+      `Safe to commit: it names ${TOKEN_ENV_VAR} rather than carrying the token. Put it in ~/.cursor/mcp.json for every project, or ` +
+      `.cursor/mcp.json for one. Export ${TOKEN_ENV_VAR} in the environment Cursor starts from — "Copy token" above puts the value on your clipboard.`,
+    text: ({ url }) =>
       JSON.stringify(
-        { mcpServers: { stacki: { url, headers: { Authorization: `Bearer ${token}` } } } },
+        { mcpServers: { stacki: { url, headers: { Authorization: `Bearer \${env:${TOKEN_ENV_VAR}}` } } } },
         null,
         2
       ),
@@ -294,14 +327,31 @@ export default function McpDialog({ status, onClose }) {
                   Copy {chosen.label} config
                 </button>
                 <button onClick={() => copy('token', token)}>Copy token</button>
-                <button className="ghost" onClick={() => setRevealed((v) => !v)}>
-                  {revealed ? 'Hide token' : 'Show token'}
-                </button>
+                {/* Only a recipe that CARRIES the token has one to reveal. On a
+                    project recipe the snippet is the same either way, and a
+                    "Show token" button that does nothing invites the reading
+                    that the token is in there somewhere. */}
+                {chosen.scope === 'user' && (
+                  <button className="ghost" onClick={() => setRevealed((v) => !v)}>
+                    {revealed ? 'Hide token' : 'Show token'}
+                  </button>
+                )}
               </div>
 
               <p className="mcp-hint">
-                The token is this machine's — it lives in Stacki's own data folder and never in
-                your project. Keep it out of anything you commit.
+                {chosen.scope === 'project' ? (
+                  <>
+                    This one is safe to commit — it names <code>{TOKEN_ENV_VAR}</code> and never
+                    contains the token. The token itself is this machine's: it lives in Stacki's
+                    own data folder, never in your project.
+                  </>
+                ) : (
+                  <>
+                    This one contains the token, and the file it writes is yours alone. The token
+                    is this machine's — it lives in Stacki's own data folder and never in your
+                    project. Keep it out of anything you commit.
+                  </>
+                )}
               </p>
             </>
           )}

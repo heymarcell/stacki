@@ -1663,34 +1663,78 @@ const rawPost = (hostHeader, body) =>
     check('the panel names Cursor too', up.includes('Cursor'));
     check('the panel offers the JSON a headless run and a .mcp.json both need', up.includes('Claude Code (JSON)'));
 
-    // EVERY RECIPE, HELD TO WHAT MAKES ONE USABLE.
+    // EVERY RECIPE, HELD TO THE FILE IT IS FOR.
     //
-    // The copy button hands the whole snippet over, so a JSON recipe that does
-    // not parse is a recipe that cannot be pasted where it is for. And the token
-    // is masked with one string replace, so a recipe carrying it twice would put
-    // it on screen.
-    const { CLIENTS } = require(bundlePath);
+    // The invariant here used to be "every recipe carries the token exactly
+    // once", which was the wrong invariant and passed happily while the panel
+    // generated a `.mcp.json` with a live bearer token in it -- for a file whose
+    // own documentation says to check it into version control.
+    //
+    // A recipe now declares the file it is for, and that decides everything:
+    //
+    //   scope 'user'     ~/.claude.json, written by `claude mcp add --scope
+    //                    user`. Private to one person. The token belongs in it,
+    //                    exactly once, so the panel's single-replace mask works.
+    //   scope 'project'  .mcp.json / .cursor/mcp.json. Goes in the repository.
+    //                    ZERO bytes of the token, and an environment variable in
+    //                    the host's own syntax instead.
+    //
+    // Asserted off `scope` rather than off the three keys that exist today, so a
+    // fourth recipe added with the wrong one fails here instead of shipping.
+    const { CLIENTS, TOKEN_ENV_VAR } = require(bundlePath);
+    const ENDPOINT = 'http://127.0.0.1:43821/mcp';
     check('there are recipes for three clients', CLIENTS.length === 3, `${CLIENTS.length}`);
+    check('and the environment variable has one name', TOKEN_ENV_VAR === 'STACKI_MCP_TOKEN', String(TOKEN_ENV_VAR));
+
+    // The host syntaxes, verified against each host's current documentation:
+    //   Claude Code  ${VAR}      code.claude.com/docs/en/mcp
+    //   Cursor       ${env:VAR}  cursor.com/docs/context/mcp
+    const PLACEHOLDER = { 'claude-json': '${STACKI_MCP_TOKEN}', cursor: '${env:STACKI_MCP_TOKEN}' };
+
     for (const recipe of CLIENTS) {
-      const snippet = recipe.text({ url: 'http://127.0.0.1:43821/mcp', token: TOK });
+      const snippet = recipe.text({ url: ENDPOINT, token: TOK });
       const occurrences = snippet.split(TOK).length - 1;
-      check(`  ${recipe.key} carries the token exactly once`, occurrences === 1, `${occurrences} occurrences`);
-      check(`  ${recipe.key} is masked by the panel's own replace`, !snippet.replace(TOK, '••••••••').includes(TOK));
+      check(`  ${recipe.key} declares which file it is for`, recipe.scope === 'user' || recipe.scope === 'project', String(recipe.scope));
+
+      if (recipe.scope === 'project') {
+        // THE ONE THAT MATTERS. Not "few" occurrences, not "masked" — none.
+        check(`  ${recipe.key} is committable and carries NO token`, occurrences === 0, `${occurrences} occurrence(s) of the live token`);
+        check(`  ${recipe.key} names the environment variable instead`, snippet.includes(PLACEHOLDER[recipe.key]), snippet.slice(0, 200));
+        // Copying the config must not put the secret on the clipboard: the
+        // button copies this exact string.
+        check(`  ${recipe.key} puts nothing secret on the clipboard`, !snippet.includes(TOK));
+        check(`  ${recipe.key} says it is safe to commit`, /safe to commit/i.test(String(recipe.hint)), String(recipe.hint).slice(0, 120));
+      } else {
+        check(`  ${recipe.key} is private and carries the token once`, occurrences === 1, `${occurrences} occurrence(s)`);
+        check(`  ${recipe.key} is masked by the panel's own replace`, !snippet.replace(TOK, '••••••••').includes(TOK));
+        check(`  ${recipe.key} is for a file only this person has`, /--scope user/.test(snippet), snippet.slice(0, 120));
+      }
+
       if (snippet.trim().startsWith('{')) {
         let parsed = null;
         try {
           parsed = JSON.parse(snippet);
-        } catch (err) {
+        } catch {
           parsed = null;
         }
         check(`  ${recipe.key} is a document that parses`, !!parsed, snippet.slice(0, 120));
-        check(`  ${recipe.key} points at the running endpoint`, JSON.stringify(parsed).includes('http://127.0.0.1:43821/mcp'));
+        check(`  ${recipe.key} points at the running endpoint`, JSON.stringify(parsed).includes(ENDPOINT));
+        check(
+          `  ${recipe.key} puts the header where the host reads it`,
+          typeof parsed?.mcpServers?.stacki?.headers?.Authorization === 'string' &&
+            parsed.mcpServers.stacki.headers.Authorization.startsWith('Bearer '),
+          JSON.stringify(parsed?.mcpServers?.stacki?.headers)
+        );
       }
     }
     // The one key the Cursor shape does not have, and the reason the CLI command
     // could not simply be copied into a file.
-    const claudeJson = JSON.parse(CLIENTS.find((c) => c.key === 'claude-json').text({ url: 'http://127.0.0.1:43821/mcp', token: TOK }));
+    const claudeJson = JSON.parse(CLIENTS.find((c) => c.key === 'claude-json').text({ url: ENDPOINT, token: TOK }));
     check('the JSON recipe declares the transport Claude Code needs', claudeJson.mcpServers?.stacki?.type === 'http', JSON.stringify(claudeJson));
+
+    // And the panel itself: the reveal control belongs only to the recipe that
+    // has something to reveal.
+    check('a project recipe is not offered a Show token button', (CLIENTS.filter((c) => c.scope === 'project').length === 2), 'two project recipes expected');
     check('the panel says the token is not for the project', /never in\s+your project/.test(up.replace(/\s+/g, ' ')) || /never in your project/.test(up.replace(/\s+/g, ' ')));
 
     const down = render({ running: false, url: null, port: 43821, token: null, error: 'port 43821 is already in use, so the Stacki MCP server did not start.' });
