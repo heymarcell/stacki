@@ -555,7 +555,11 @@ export default function App() {
     if (state.editable) {
       if (typeof state.restoreSource === 'string') {
         const text = state.restoreSource;
-        await window.avb.writePageRaw({ pagePath: page.path, source: text });
+        // The model goes with it. A page whose markup lives in chunk files has
+        // nothing to restore in the page itself -- its bytes are correctly
+        // unchanged -- and writing only those left the chunk holding the edit
+        // for ever while undo answered `undone: true`.
+        await window.avb.writePageRaw({ pagePath: page.path, source: text, model: state.model });
         setPageState((s) => (s ? { ...s, dirty: false, savedSource: text, restoreSource: null } : s));
         return;
       }
@@ -1095,7 +1099,14 @@ export default function App() {
       setPageState((s) => {
         if (!s || !s.editable) return s;
         const model = fn(structuredClone(s.model));
-        return { ...s, model, dirty: true };
+        // A CHANGE CANCELS A PENDING RESTORE.
+        //
+        // `applySnapshot` leaves `restoreSource` on the state for the save it
+        // schedules. `project.undo` answers before that save runs, so the next
+        // edit used to arrive with the undo's bytes still pending -- and
+        // flushSave wrote THOSE, over the new model, then cleared `dirty`. The
+        // edit answered ok:true, showed on the canvas, and was never on disk.
+        return { ...s, model, dirty: true, restoreSource: null };
       });
       scheduleSave(immediate);
     },
@@ -1106,7 +1117,7 @@ export default function App() {
     (source) => {
       pushHistory('raw-source');
       bumpDoc();
-      setPageState((s) => (s ? { ...s, source, dirty: true } : s));
+      setPageState((s) => (s ? { ...s, source, dirty: true, restoreSource: null } : s));
       scheduleSave();
     },
     [scheduleSave, pushHistory, bumpDoc]
@@ -4747,7 +4758,7 @@ export default function App() {
       // nothing chosen for a change they may not even have made.
       const trail = state.editable && selectedIdRef.current ? pathOfNode(state.model.nodes, selectedIdRef.current) : null;
       const landed = trail ? nodeAtPath(parsed.model?.nodes || [], trail)?.id ?? null : null;
-      setPageState((s) => (s ? { ...s, ...parsed, file: page.path, dirty: true } : s));
+      setPageState((s) => (s ? { ...s, ...parsed, file: page.path, dirty: true, restoreSource: null } : s));
       setSelectedId(landed);
       await new Promise((done) => setTimeout(done, 0));
       await flushSave();

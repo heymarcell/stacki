@@ -65,6 +65,7 @@ const plans = [
         title="Wide"
         body='across lines on purpose'
     />
+    <label>Name: <input type='text' name='n' /></label>
     <!-- The footer is deliberately last -->
     <footer>
         <p class='fine-print'>Made carefully.</p>
@@ -260,10 +261,88 @@ const linesChanged = (before, after) => {
       );
     }
 
+    // --- A COMPONENT INSIDE A `.map()`, which is where half the components on
+    //     a real page live.
+    //
+    // The write reads its result back and requires it to say what was asked
+    // for. Comparing SERIALIZED TEXT could not do that -- the serializer keeps
+    // a file's own layout where it can, so the same meaning has many spellings
+    // and this splice was thrown away, falling back to rewriting the whole
+    // document: 582 bytes out, 580 in, the frontmatter comments torn off their
+    // imports. Found by review. The check compares meaning now.
+    {
+      const beforeMap = app.read(PAGE);
+      const p5 = await run('target', 'read');
+      const grid = p5.target?.children?.find((c) => c.tag === 'div');
+      const inGrid = grid?.ref ? await run('target', 'read', { ref: grid.ref }) : null;
+      const findCard = (list) => {
+        for (const c of list || []) {
+          if (c.tag === 'Card') return c;
+          if (Array.isArray(c.children)) {
+            const deeper = findCard(c.children);
+            if (deeper) return deeper;
+          }
+        }
+        return null;
+      };
+      let card = findCard(inGrid?.target?.children);
+      if (!card) {
+        const branch = inGrid?.target?.children?.[0];
+        const inBranch = branch?.ref ? await run('target', 'read', { ref: branch.ref }) : null;
+        card = findCard(inBranch?.target?.children);
+      }
+      if (card?.ref) {
+        const set5 = await run('target', 'set_prop', { ref: card.ref, name: 'data-in-map', value: 'yes' });
+        await H.settle(250);
+        const afterMap = app.read(PAGE);
+        check('a prop on a component inside a .map() lands', set5.ok === true && /data-in-map="yes"/.test(afterMap), short(set5));
+        check(
+          '  and does not rewrite the document to do it',
+          afterMap.replace(/ data-in-map="yes"/, '') === beforeMap,
+          short({ span: changedSpan(beforeMap, afterMap) })
+        );
+        check('  with the frontmatter comments still on their imports', /\/\/ Component imports\nimport Hero/.test(afterMap), short(frontmatterOf(afterMap)));
+      } else {
+        check('the grid reports the Card inside its map', false, short(inGrid?.target?.children?.map((c) => c.tag || c.kindOfThing)));
+      }
+    }
+
+    // --- TEXT NEXT TO A SIBLING THE INLINE RUN DOES NOT RECOGNISE.
+    //
+    // A text node's source range starts where the PREVIOUS node ended, so it
+    // carries the line break and indent between them -- and the serializer
+    // strips a text run's boundary spaces, because normally those line breaks
+    // ARE that whitespace. Splicing the narrow text into the wide span deleted
+    // a space the page renders: `<label>Name: <input /></label>` came back as
+    // `<label>Name:<input />`. Found by review; the write now refuses to
+    // replace a span that is not exactly the node's own text.
+    {
+      const p4 = await run('target', 'read');
+      const label = p4.target?.children?.find((c) => c.tag === 'label');
+      check('the page reports its label', !!label?.ref, short(p4.target?.children?.map((c) => c.tag)));
+      const kids = label?.ref ? await run('target', 'read', { ref: label.ref }) : null;
+      const text = kids?.target?.children?.find((c) => !c.tag || c.tag === '#text' || c.kindOfThing === 'text');
+      if (text?.ref) {
+        const set4 = await run('target', 'set_text', { ref: text.ref, text: 'Full name: ' });
+        await H.settle(250);
+        const afterText = app.read(PAGE);
+        check('a text edit lands', set4.ok === true && afterText.includes('Full name:'), short(set4));
+        check(
+          '  and the space the page renders before the input survives',
+          /Full name:(\s|&nbsp;)/.test(afterText.slice(afterText.indexOf('Full name:'))) &&
+            !/Full name:<input/.test(afterText),
+          short(afterText.slice(afterText.indexOf('<label'), afterText.indexOf('<label') + 180))
+        );
+        check('  and the input is still there', /<input[^>]*name=/.test(afterText), 'the input went missing');
+      } else {
+        check('the label reports a text child to edit', false, short(kids?.target?.children));
+      }
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);
   }
+  check('the fixture is gone', !require('node:fs').existsSync(root), root);
 
   if (failures.length) {
     console.error(`source-fidelity: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

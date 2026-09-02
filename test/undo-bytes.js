@@ -212,10 +212,39 @@ const plans = [
         short({ original: `${originalSha.slice(0, 12)} (${Buffer.byteLength(original)}b)`, afterUndo: tag(back) })
       );
     }
+    // --- AND THE EDIT AFTER AN UNDO IS NOT SWALLOWED BY IT.
+    //
+    // An undo schedules a save that writes exact bytes. `project.undo` answers
+    // before that save runs, so the next edit arrived with those bytes still
+    // pending -- and the save wrote THEM, over the new model, then cleared the
+    // dirty flag so nothing would ever write it again. The edit answered
+    // ok:true, appeared on the canvas, and was never on disk. Found by review,
+    // measured against the previous commit, and pinned here.
+    {
+      const ref1 = await refFor('Hero');
+      await run('target', 'set_prop', { ref: ref1, name: 'id', value: 'before-undo' });
+      await H.settle(250);
+      const undone = await run('project', 'undo');
+      await H.settle(300);
+      check('the undo lands', undone.ok === true && sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+
+      const ref2 = await refFor('Hero');
+      const after = await run('target', 'set_prop', { ref: ref2, name: 'id', value: 'after-undo' });
+      await H.settle(400);
+      const onDisk = app.read(PAGE);
+      check('an edit made straight after an undo is written', after.ok === true && onDisk.includes('id="after-undo"'), short({ said: after.ok, has: onDisk.includes('id="after-undo"') }));
+      check('  and the undo\'s bytes did not overwrite it', sha(onDisk) !== originalSha, tag(onDisk));
+
+      const back = await run('project', 'undo');
+      await H.settle(300);
+      check('  and it is itself undoable, back to the original', back.ok === true && sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);
   }
+  // Cleanup is a check, not a log line.
+  check('the fixture is gone', !require('node:fs').existsSync(root), root);
 
   if (failures.length) {
     console.error(`undo-bytes: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

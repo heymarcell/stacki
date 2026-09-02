@@ -24,7 +24,7 @@
 // it, because Stacki does not control the host's tokenizer and must not tune
 // itself to one version of one client.
 
-const { createAudit, MAX_RESPONSE_BYTES } = require('../electron/mcp/audit');
+const { createAudit, MAX_RESPONSE_BYTES, liveWindowCount } = require('../electron/mcp/audit');
 const { answer } = require('../electron/mcp/agentTools.js');
 
 const failures = [];
@@ -41,9 +41,14 @@ const short = (v, n = 260) => JSON.stringify(v ?? null).slice(0, n);
 const SMALLEST_REFUSED_BY_HOST = 52640;
 // What Stacki promises, whatever the host of the day happens to allow.
 const HARD_CEILING = 32000;
+// AND THE PRODUCT'S OWN NUMBER HAS TO EARN ITS PLACE. Asserting only "under the
+// ceiling" leaves the suite green if the budget is raised to just below it, so
+// the declared budget is required to keep a real margin under the smallest
+// result this host was measured to refuse.
+const REQUIRED_MARGIN = 0.6;
 
 /** A window that answers the probes with whatever axe result it was given. */
-function windowsServing(axe) {
+function windowsServing(axe, { blank = true } = {}) {
   return class FakeWindow {
     constructor() {
       this.webContents = {
@@ -60,7 +65,7 @@ function windowsServing(axe) {
           return { title: 'fake', readyState: 'complete' };
         },
         getURL: () => 'http://127.0.0.1:4321/',
-        capturePage: async () => ({ isEmpty: () => true }),
+        capturePage: async () => ({ isEmpty: () => blank }),
       };
     }
     async loadURL() {}
@@ -220,7 +225,12 @@ const envelopeOf = (res) => {
       short(size)
     );
     check(
-      '  against the budget the product declares',
+      'the declared budget keeps a real margin under what the host refused',
+      MAX_RESPONSE_BYTES <= SMALLEST_REFUSED_BY_HOST * REQUIRED_MARGIN,
+      short({ declared: MAX_RESPONSE_BYTES, refusedAt: SMALLEST_REFUSED_BY_HOST, mustBeAtMost: SMALLEST_REFUSED_BY_HOST * REQUIRED_MARGIN })
+    );
+    check(
+      '  and the answer is inside it',
       typeof MAX_RESPONSE_BYTES === 'number' && size.structuredBytes <= MAX_RESPONSE_BYTES,
       short({ structuredBytes: size.structuredBytes, declared: MAX_RESPONSE_BYTES })
     );
@@ -230,7 +240,20 @@ const envelopeOf = (res) => {
     // A budget that answers with nothing is trivially under any ceiling. The
     // point is a usable answer that fits.
     check('  while still returning findings to act on', res.returnedFindingCount >= 8, short({ returned: res.returnedFindingCount }));
-    check('  each of which is a whole finding', (res.findings || []).every((f) => f.id && f.ruleId && f.kind && f.severity && f.target), short((res.findings || [])[0]));
+    // NAMING THE FIELDS THAT MAKE A FINDING USEFUL, not only the ones that make
+    // it well-formed. Review patched `clipFinding` to drop `evidence` and all
+    // 28 checks stayed green -- and the returned count went UP, because losing
+    // the evidence bought room under the cap.
+    check(
+      '  each of which is a whole finding',
+      (res.findings || []).every((f) => f.id && f.ruleId && f.kind && f.severity && f.target && f.message && f.evidence && f.help),
+      short((res.findings || [])[0])
+    );
+    check(
+      '  carrying the evidence it was found by',
+      (res.findings || []).every((f) => typeof f.evidence?.failureSummary === 'string' && typeof f.evidence?.html === 'string'),
+      short((res.findings || [])[0]?.evidence)
+    );
 
     // --- AND IT IS STILL HONEST.
     check('the true detected total is unchanged by the budget', res.findingCount === 360 * 3, short({ findingCount: res.findingCount }));
@@ -306,6 +329,8 @@ const envelopeOf = (res) => {
     check('  reports nothing dropped', res.truncated === false && res.truncation.omittedByByteBudget === 0, short(res.truncation));
     check('  and is comfortably inside the budget', size.textBytes < HARD_CEILING, short(size));
     check('  with its evidence intact rather than clipped', (res.findings || []).every((f) => !f.truncatedFields), short((res.findings || [])[0]?.truncatedFields));
+    check('  and none of it missing', (res.findings || []).every((f) => f.message && f.evidence && f.help), short((res.findings || [])[0]));
+    check('  and the answer says no field was shortened', res.truncation.findingsWithShortenedFields === 0, short(res.truncation));
   }
 
   // --- ONE ENORMOUS FIELD CANNOT SMUGGLE THE PAYLOAD PAST THE BUDGET.
@@ -329,10 +354,34 @@ const envelopeOf = (res) => {
   }
 
   // --- CAPTURE OFF CANNOT RETURN CAPTURE DATA.
+  //
+  // BOTH HALVES, because one is not a control. Without an `encodeImage` the
+  // capture block never runs whatever the flag says, so `captures.length === 0`
+  // was true by construction: review patched the engine to ignore the flag
+  // entirely and this section stayed green. So this audit can really take a
+  // picture, and is asked twice.
   {
-    const res = await audit(page({ violations: 24, incomplete: 12 }), { capture: false });
-    check('capture:false returns no captures at all', Array.isArray(res.captures) && res.captures.length === 0, short({ captures: res.captures?.length }));
-    check('  and no base64 rides along in the payload', !/[A-Za-z0-9+/]{2000,}/.test(JSON.stringify(res)), 'something very long and base64-shaped is in the answer');
+    const shooting = (axe, args) =>
+      createAudit({
+        BrowserWindow: windowsServing(axe, { blank: false }),
+        getPreviewUrl: () => 'http://127.0.0.1:4321',
+        session: cleanSession,
+        encodeImage: () => ({ buffer: Buffer.alloc(2048, 7), size: { width: 375, height: 800 } }),
+      }).run({ route: '/dense', ...args });
+
+    const on = await shooting(page({ violations: 24, incomplete: 12 }), { capture: true, viewports: ['phone'] });
+    check('capture:true really produces a capture', Array.isArray(on.captures) && on.captures.length > 0, short({ captures: on.captures?.length }));
+    check('  with image data in it', typeof on.captures?.[0]?.data === 'string' && on.captures[0].data.length > 100, short({ len: on.captures?.[0]?.data?.length }));
+
+    const off = await shooting(page({ violations: 24, incomplete: 12 }), { capture: false, viewports: ['phone'] });
+    check('capture:false returns no captures at all', Array.isArray(off.captures) && off.captures.length === 0, short({ captures: off.captures?.length }));
+    check('  and no base64 rides along in the payload', !/[A-Za-z0-9+/]{2000,}/.test(JSON.stringify(off)), 'something very long and base64-shaped is in the answer');
+    check('  while the findings are unaffected by asking for one', off.returnedFindingCount === on.returnedFindingCount, short({ off: off.returnedFindingCount, on: on.returnedFindingCount }));
+  }
+
+  // --- AND NO AUDIT WINDOW SURVIVED ANY OF IT.
+  {
+    check('every audit window this suite opened was destroyed', liveWindowCount() === 0, short({ live: liveWindowCount() }));
   }
 
   if (failures.length) {

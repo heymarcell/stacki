@@ -166,8 +166,12 @@ const AuditOutput = z.object({
       // field, because "there were more" and "they would not have fitted" are
       // different facts and lead a caller to do different things.
       omittedByByteBudget: z.number().int(),
+      // Findings returned whole but with one of their own fields shortened.
+      // `truncated` is about the list; this is the other kind of loss.
+      findingsWithShortenedFields: z.number().int(),
       responseCap: z.number().int(),
       responseByteCap: z.number().int(),
+      fieldCaps: z.record(z.string(), z.number().int()),
       incompleteReserved: z.number().int(),
     })
     .optional(),

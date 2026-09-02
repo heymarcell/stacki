@@ -96,7 +96,8 @@ const { componentUsage, instancesIn } = require('./componentUsage');
 const { listEntries, writeEntry, countEntries, coveredPaths } = require('./contentEntries');
 const { planRename, applyRename } = require('./contentRefs');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
-const { probeUrl } = require('./devProbe');
+const { probeUrl } = require('./devProbe')
+const { trustedPreviewUrl } = require('./projectOrigin.js');
 const { selectionTrail, formatTrail } = require('./selectionTrail');
 const gitHistory = require('./gitHistory');
 const gitSnapshot = require('./gitSnapshot');
@@ -3215,8 +3216,13 @@ handle('page:write', async (_e, { pagePath, model }) => {
   return { ok: true, text };
 });
 
-handle('page:writeRaw', async (_e, { pagePath, source }) => {
+handle('page:writeRaw', async (_e, { pagePath, source, model = null }) => {
   writePageText(pagePath, source);
+  // Chunk-backed markup lives in its own files, and a raw write of the page
+  // says nothing about them. Undo restores a page whose bytes may be correctly
+  // unchanged while the chunk still holds the edit, so when a model comes with
+  // the text, the chunks are written from it too.
+  if (model) writeChunks(model);
   return { ok: true };
 });
 
@@ -3335,6 +3341,27 @@ handle('project:injectedRoutes', async (_e, { projectPath }) => ({
   routes: readInjectedRoutes(projectPath),
 }));
 
+// THE PREVIEW'S OWN ENDPOINTS, AND ONLY THOSE.
+//
+// Two handlers ask the dev server to answer a question only it can: which URLs
+// a dynamic page stands for, and what one collection entry looks like. Both
+// build their URL from `devUrl`, and both followed redirects, so a project
+// route answering 302 sent them somewhere else -- with a collection name the
+// caller chose sitting in the query string. Review measured forty bytes of an
+// agent's choosing delivered to an off-project origin from `inspect`, through
+// the same door `project.probe` had just been fenced at.
+//
+// The address is checked before the request, and a redirect is an answer rather
+// than a hop: `__avb` endpoints reply directly, so a 3xx from one means the
+// preview is not what is on the other end.
+async function fetchFromPreview(devUrl, pathAndQuery) {
+  const origin = trustedPreviewUrl(devUrl);
+  if (!origin) throw new Error("the preview address is not this project's");
+  const res = await fetch(`${origin}${pathAndQuery}`, { redirect: 'manual' });
+  if (res.status >= 300 && res.status < 400) throw new Error(`the preview redirected ${pathAndQuery} instead of answering it`);
+  return res;
+}
+
 // The concrete URLs a dynamic page stands for, by asking the dev server to run
 // its getStaticPaths. Returns [] for a static page, and for any failure — a
 // page that can't answer is previewed at its own pattern, exactly as before.
@@ -3343,7 +3370,7 @@ handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
   if (!pattern.includes('[') || !devUrl) return { entries: [] };
   const rel = toPosix(path.relative(projectPath, pagePath));
   try {
-    const res = await fetch(`${devUrl}/__avb/paths?p=${encodeURIComponent(rel)}`);
+    const res = await fetchFromPreview(devUrl, `/__avb/paths?p=${encodeURIComponent(rel)}`);
     if (!res.ok) return { entries: [], error: `Dev server returned ${res.status}` };
     const data = await res.json();
     const entries = (data.entries || []).map((e) => {
@@ -3371,7 +3398,7 @@ handle('content:sampleEntry', async (_e, { devUrl, name, id }) => {
   if (!devUrl || !name) return { entry: null };
   try {
     const q = `c=${encodeURIComponent(name)}${id ? `&id=${encodeURIComponent(id)}` : ''}`;
-    const res = await fetch(`${devUrl}/__avb/data?${q}`);
+    const res = await fetchFromPreview(devUrl, `/__avb/data?${q}`);
     if (!res.ok) return { entry: null, error: `Dev server returned ${res.status}` };
     return await res.json();
   } catch (err) {
@@ -4576,7 +4603,7 @@ async function spawnDevServer(projectPath, localBin, force, bare) {
       // only ever visible in CI.
       const record = {
         proc: null,
-        url: readAstroLock(projectPath)?.url || (running && running[1]) || url,
+        url: trustedPreviewUrl(readAstroLock(projectPath)?.url) || trustedPreviewUrl(running && running[1]) || url,
         projectPath,
         daemon: true,
         bin: localBin,
@@ -4739,10 +4766,16 @@ async function doDevStart(projectPath) {
       const existing = parseExistingServer(recentDevLog());
       if (existing) {
         const alive = await serverAlive(existing);
-        if (alive) {
+        // ADOPTED, BUT NOT ON THE ADDRESS IT NAMED IF THAT ADDRESS IS NOT LOCAL.
+        //
+        // `existing` is scraped out of the dev server's own stdout, and it
+        // becomes the origin every fenced door compares against. A dev server
+        // is a local process; anything else is not this project's preview.
+        const adopted = trustedPreviewUrl(existing);
+        if (alive && adopted) {
           // Adopt the user's own server instead of fighting it.
-          devServer = { proc: null, url: existing, projectPath, external: true };
-          return { url: existing, external: true };
+          devServer = { proc: null, url: adopted, projectPath, external: true };
+          return { url: adopted, external: true };
         }
       }
       devLogBuffer = [];
@@ -5178,7 +5211,12 @@ function nodeVersionOf(bin) {
 // operation that will fetch anything as long as no preview is running.
 handle('dev:probe', (_e, arg) => {
   const url = typeof arg === 'string' ? arg : arg?.url || null;
-  const projectOrigin = devServer?.url || (typeof arg === 'object' && arg ? arg.projectOrigin : null) || null;
+  // ONLY STACKI'S OWN RECORD. An earlier version accepted an origin from the
+  // caller when main held none, which review measured as a way for any renderer
+  // caller to nominate the fence's own boundary. The MCP path never could -- it
+  // passes `ctx.devUrl`, which IS this value -- so the branch bought nothing
+  // and cost the fail-closed property.
+  const projectOrigin = devServer?.url || null;
   if (!projectOrigin) {
     return {
       ok: false,

@@ -85,6 +85,16 @@ const MAX_RESPONSE_BYTES = 30000;
 // list spends the whole budget on violations and empties the one bucket whose
 // entire purpose is honest uncertainty. A floor, not a ceiling.
 const INCOMPLETE_BYTE_SHARE = 0.25;
+// What the skeleton cannot include because it is not known until the selection
+// is made: the counts, the truncation block, `dropped`, and the array
+// punctuation around the findings. Measured at ~140 bytes on the widest shape
+// (six viewports, every one named in `dropped`); the allowance is generous
+// because being wrong the other way is a promise broken by fifty bytes.
+const OVERHEAD_SLACK = 1024;
+// A page names at most a handful of places it ended up or refused to load, and
+// each of those is a string the PAGE chose the length of.
+const MAX_NAMED_ROUTES = 8;
+const MAX_NAMED_LENGTH = 300;
 // PER-FIELD CAPS, because the count cap is not a bound while one field is
 // unbounded. `evidence.html` and `evidence.failureSummary` are already clipped
 // to 240 where they are collected; these are the five that were not. Three
@@ -96,6 +106,17 @@ const FIELD_CAPS = {
   help: 200,
   selector: 300,
   modelPath: 300,
+  // `target.tag` is `el.tagName.toLowerCase()` straight off the page, and a
+  // custom element's name is an arbitrary-length identifier by spec. Review
+  // measured one 40,000-character tag on the top-sorting finding emptying the
+  // whole answer -- `returnedFindingCount: 0`, blamed on the byte budget, in a
+  // 1.8 KB reply with 28 KB of the budget unspent.
+  tag: 80,
+  // `evidence` is a free record. `html`, `failureSummary` and `text` are
+  // clipped where they are collected, but a computed style is whatever the
+  // CSSOM resolved -- a long `calc()` round-trips verbatim -- and nothing here
+  // should depend on remembering to clip the next field somebody adds.
+  evidence: 300,
 };
 const MAX_CAPTURES = 3;
 // axe can return hundreds of nodes for one rule on a big page. Twelve is enough
@@ -213,14 +234,34 @@ function clipFinding(finding) {
         ...target,
         selector: clip(target.selector, FIELD_CAPS.selector, 'target.selector'),
         modelPath: clip(target.modelPath, FIELD_CAPS.modelPath, 'target.modelPath'),
+        tag: clip(target.tag, FIELD_CAPS.tag, 'target.tag'),
       }
     : target;
+  // Every string the page could have chosen the length of, whatever it is
+  // called. Nested one level, which is as deep as `evidence` goes.
+  const clippedEvidence = (() => {
+    const ev = finding.evidence;
+    if (!ev || typeof ev !== 'object') return ev;
+    const shorter = {};
+    for (const [k, v] of Object.entries(ev)) {
+      if (typeof v === 'string') shorter[k] = clip(v, FIELD_CAPS.evidence, `evidence.${k}`);
+      else if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const inner = {};
+        for (const [ik, iv] of Object.entries(v)) {
+          inner[ik] = typeof iv === 'string' ? clip(iv, FIELD_CAPS.evidence, `evidence.${k}.${ik}`) : iv;
+        }
+        shorter[k] = inner;
+      } else shorter[k] = v;
+    }
+    return shorter;
+  })();
   const out = {
     ...finding,
     message: clip(finding.message, FIELD_CAPS.message, 'message'),
     standard: clip(finding.standard, FIELD_CAPS.standard, 'standard'),
     help: clip(finding.help, FIELD_CAPS.help, 'help'),
     ...(clippedTarget ? { target: clippedTarget } : {}),
+    ...(finding.evidence !== undefined ? { evidence: clippedEvidence } : {}),
   };
   // Absent rather than empty, so an untouched finding is the shape it always
   // was and a reader can test the field's presence.
@@ -913,18 +954,26 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // the selection, so a small allowance stands in for them; being generous
     // there costs a finding, and being wrong the other way costs the promise.
     const clipped = byCount.map(clipFinding);
+    // BOUNDED, BECAUSE THE PAGE CHOOSES THEM. `finalRoutes` is a path and query
+    // read off the document, and `blockedSubframeOrigins` had no count cap at
+    // all -- one entry per distinct off-origin frame. Review measured a page
+    // redirecting to a long same-origin URL pushing the answer to 53,836 bytes
+    // with zero findings returned: over the smallest result the host refused,
+    // and the budget spent on a string the page wrote.
+    const routes = [...finalRoutes].slice(0, MAX_NAMED_ROUTES).map((r) => String(r).slice(0, MAX_NAMED_LENGTH));
+    const subframes = [...blockedSubframes].slice(0, MAX_NAMED_ROUTES).map((o) => String(o).slice(0, MAX_NAMED_LENGTH));
     const overhead =
       jsonBytes({
         ok: true,
         runId,
         route: safeRoute,
-        ...(finalRoutes.size ? { finalRoutes: [...finalRoutes] } : {}),
+        ...(routes.length ? { finalRoutes: routes } : {}),
         url,
-        ...(blockedSubframes.size ? { blockedSubframeOrigins: [...blockedSubframes] } : {}),
+        ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
         engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true },
         viewports: perViewport,
         limits: LIMITS_SENTENCE,
-      }) + 512;
+      }) + OVERHEAD_SLACK;
     const kept = fitToBytes(clipped, overhead);
     const omittedByBytes = clipped.length - kept.length;
 
@@ -944,11 +993,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       route: safeRoute,
       // Present only when a same-origin redirect landed somewhere else. The
       // findings describe THIS document, not `route`.
-      ...(finalRoutes.size ? { finalRoutes: [...finalRoutes] } : {}),
+      ...(routes.length ? { finalRoutes: routes } : {}),
       url,
       // Off-origin documents this run refused to load INSIDE the page. Present
       // only when there were some: the page was measured without them.
-      ...(blockedSubframes.size ? { blockedSubframeOrigins: [...blockedSubframes] } : {}),
+      ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
       engine: {
         accessibility: axeVersion ? `axe-core ${axeVersion}` : null,
         error: engineError,
@@ -990,8 +1039,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         // this one knows to narrow the route or the viewports rather than to
         // assume the page has sixty problems.
         omittedByByteBudget: omittedByBytes,
+        // Findings that came back whole, but with a field of their own
+        // shortened. `truncated` is about the LIST being short and stays
+        // about that; this is the other kind of loss, and a reader who is not
+        // told cannot know that the selector they were handed will not match.
+        findingsWithShortenedFields: kept.filter((f) => Array.isArray(f.truncatedFields) && f.truncatedFields.length).length,
         responseCap: MAX_FINDINGS,
         responseByteCap: MAX_RESPONSE_BYTES,
+        fieldCaps: FIELD_CAPS,
         incompleteReserved: INCOMPLETE_SHARE,
       },
       dropped: {
@@ -1022,7 +1077,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // next audit may now see what this one left behind. A warning beside ok:true
     // would be the swallow this replaced, wearing a different hat.
     if (cleanupReset && cleanupReset.ok === false) {
-      const measured = finalRoutes.size ? [...finalRoutes].join(', ') : safeRoute;
+      // Bounded like everything else in the answer: this is a page-chosen
+      // string, and it is added AFTER the budget has been spent. Review
+      // measured a 72,573-byte message on this path.
+      const measured = (routes.length ? routes.join(', ') : String(safeRoute)).slice(0, MAX_NAMED_LENGTH * 2);
       return {
         ...result,
         ok: false,

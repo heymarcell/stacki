@@ -1208,8 +1208,13 @@ function patchAttrs(text, baseProps, nextProps) {
       out += space + spread;
       continue;
     }
+    // A name that appears twice is written once. `<div class="a" class="b">` is
+    // one attribute to every HTML parser, and rewriting both occurrences
+    // produced `class="c" class="c"` -- text the check accepts, because the
+    // reparse dedupes it back to the same model.
+    if (seen.has(name)) continue;
     seen.add(name);
-    if (!(name in next)) continue; // removed: its whitespace goes with it
+    if (!Object.prototype.hasOwnProperty.call(next, name)) continue; // removed
     const before = attrText(name, base[name]);
     const after = attrText(name, next[name]);
     // Unchanged in meaning: the file's own bytes, quotes and all.
@@ -1236,9 +1241,8 @@ function frontmatterText(model) {
   return lines.join('\n');
 }
 
-const nodeTextFlat = (node) => (node ? nodeText(node, '') : '');
-/** The node's own text with its subtree removed, to ask whether IT changed or something inside it did. */
-const headText = (node) => nodeTextFlat({ ...node, children: Array.isArray(node.children) ? [] : node.children });
+/** The node itself, without its subtree, to ask whether IT changed or something inside it did. */
+const headOf = (node) => ({ ...node, children: Array.isArray(node.children) ? [] : node.children });
 
 /**
  * The single node two trees disagree about, or null when it is not one node.
@@ -1250,9 +1254,14 @@ const headText = (node) => nodeTextFlat({ ...node, children: Array.isArray(node.
 function locateChange(baseNodes, nextNodes) {
   if (!Array.isArray(baseNodes) || !Array.isArray(nextNodes)) return null;
   if (baseNodes.length !== nextNodes.length) return null;
+  // COMPARED BY MEANING, NOT BY SERIALIZED TEXT. A `.map()` body carries its
+  // own as-written source, which goes stale the moment a child inside it is
+  // mutated -- so the two sides' TEXT differed at the map while their meaning
+  // differed only at the component inside it, and the splice replaced the whole
+  // expression and reformatted it.
   let at = -1;
   for (let i = 0; i < baseNodes.length; i += 1) {
-    if (nodeTextFlat(baseNodes[i]) !== nodeTextFlat(nextNodes[i])) {
+    if (!sameMeaning(baseNodes[i], nextNodes[i])) {
       if (at !== -1) return null;
       at = i;
     }
@@ -1263,7 +1272,7 @@ function locateChange(baseNodes, nextNodes) {
   const hasKids = Array.isArray(base.children) && Array.isArray(next.children);
   // Only the subtree differs: go further in, so the span replaced is as small
   // as the change actually is.
-  if (hasKids && headText(base) === headText(next)) {
+  if (hasKids && sameMeaning(headOf(base), headOf(next))) {
     const deeper = locateChange(base.children, next.children);
     if (deeper && !deeper.unchanged) return deeper;
     return { base, next };
@@ -1274,12 +1283,53 @@ function locateChange(baseNodes, nextNodes) {
   const sameKids =
     hasKids &&
     base.children.length === next.children.length &&
-    base.children.every((c, i) => nodeTextFlat(c) === nodeTextFlat(next.children[i]));
+    base.children.every((c, i) => sameMeaning(c, next.children[i]));
   // A self-closing tag IS its opening tag: there is no subtree to preserve, but
   // there is a multi-line attribute block, and reprinting the node flattens it.
   const selfClosing = base.children === null && next.children === null;
   if (sameKids || selfClosing) return { base, next, headOnly: true };
   return { base, next };
+}
+
+// The fields that describe how a node was WRITTEN rather than what it says: a
+// parse-local id, source offsets, and the four verbatim caches the serializer
+// consults to keep a file's own layout. Everything not named here is compared,
+// so a field this list has never heard of makes two nodes differ and the write
+// falls back -- which is the safe direction.
+const AS_WRITTEN = new Set(['id', 'start', 'end', 'source', 'attrSource', 'headSource', 'closeSource']);
+
+/**
+ * Do these two models say the same thing?
+ *
+ * Comparing serialized text cannot answer this. `serializePage` is not
+ * canonicalizing -- `attrsAsWritten` and its three siblings deliberately keep a
+ * file's own layout -- so the same meaning has many spellings, and a correct
+ * splice was rejected whenever the spliced file kept a layout the model's stale
+ * caches had already lost. Measured: a `set_prop` on a component inside a
+ * `.map()`, and a multi-line attribute block written with double quotes, both
+ * fell back to rewriting the whole document.
+ */
+function sameMeaning(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return a === b;
+  if (typeof a !== 'object' || typeof b !== 'object') return a === b;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => sameMeaning(v, b[i]));
+  }
+  // ONLY A NODE HAS AS-WRITTEN FIELDS. Applying the skip list at every depth
+  // skipped `props.id` as well -- a prop legitimately called `id` -- and a
+  // `set_prop` that added one then read back as no change at all.
+  const isNode = typeof a.kind === 'string' || typeof b.kind === 'string';
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)].filter((k) => !(isNode && AS_WRITTEN.has(k))));
+  for (const k of keys) {
+    // `undefined` and absent are the same thing here: one side came from a
+    // parse and the other from a model the editor has been mutating.
+    if (a[k] === undefined && b[k] === undefined) continue;
+    if (!sameMeaning(a[k], b[k])) return false;
+  }
+  return true;
 }
 
 /**
@@ -1320,6 +1370,20 @@ function anchoredSerialize(source, model) {
     const { start, end } = spot.base;
     if (typeof start !== 'number' || typeof end !== 'number') return canonical;
     if (!(start >= 0 && end > start && end <= source.length)) return canonical;
+    // THE SPAN MUST BE THE NODE, AND NOTHING AROUND IT.
+    //
+    // A text node's range starts where the PREVIOUS node ended, so it carries
+    // the line break and indent that sit between them -- and `serializeNode`
+    // strips a text run's boundary spaces, on the assumption that the newlines
+    // either side already are that whitespace. Replacing the wide span with the
+    // narrow text therefore deleted a space the page renders:
+    // `<label>Name: <input /></label>` came back as `<label>Name:<input />`.
+    // The check could not see it, because the same stripping happens on both
+    // sides of the comparison. So a span that begins or ends in whitespace is
+    // not this node's text, and is not spliced.
+    const held = source.slice(start, end);
+    if (/^\s|\s$/.test(held)) return canonical;
+
     spliced = null;
     if (spot.headOnly) {
       // The opening tag, exactly as the parser found it, so the span replaced
@@ -1340,6 +1404,14 @@ function anchoredSerialize(source, model) {
     }
   }
 
+  // READ IT BACK AND CHECK IT SAYS WHAT WAS ASKED FOR.
+  //
+  // Not by comparing serialized text: `serializePage` keeps a file's own layout
+  // where it can, so the same meaning has many spellings and a correct splice
+  // was thrown away whenever the spliced file kept a layout the model's stale
+  // caches had lost. `sameMeaning` compares the two trees on everything except
+  // the as-written caches, and treats any field it does not know about as
+  // meaning -- so the unknown case falls back rather than being waved through.
   let check = null;
   try {
     check = parsePage(spliced);
@@ -1347,7 +1419,8 @@ function anchoredSerialize(source, model) {
     return canonical;
   }
   if (!check?.editable || !check.model) return canonical;
-  if (serializePage(check.model) !== canonical) return canonical;
+  if (!sameMeaning(check.model.nodes, model.nodes)) return canonical;
+  if (frontmatterText(check.model) !== frontmatterText(model)) return canonical;
   return spliced;
 }
 

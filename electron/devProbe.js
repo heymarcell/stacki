@@ -68,12 +68,40 @@ async function probeUrl(url, fetchImpl = fetch, { projectOrigin = null, maxHops 
     }
   }
 
-  const isProjectOrigin = projectOriginTest(originOf(projectOrigin));
+  const base = originOf(projectOrigin);
+  const isProjectOrigin = projectOriginTest(base);
   let next = url;
   for (let hop = 0; hop <= maxHops; hop += 1) {
     // Asked of every hop, including the first, so an absolute URL somewhere
     // else and a redirect somewhere else are refused by the same line.
     if (!isProjectOrigin(originOf(next))) return outsideProject(next, projectOrigin);
+
+    // THE SPELLING IS TOLERATED; THE SOCKET IS NOT NEGOTIABLE.
+    //
+    // `127.0.0.1`, `localhost` and `[::1]` are accepted as names for the same
+    // server -- an adopted Astro prints one and Stacki builds another, and a
+    // redirect between them has not left the machine. They are not the same
+    // SOCKET: Stacki spawns Astro with `--host 127.0.0.1`, so the project binds
+    // v4 only, and review measured an unrelated process holding the same port
+    // on the v6 loopback answering inside the fence. So the request is always
+    // sent to the address the project is actually on, whatever it was called.
+    // The scheme is checked here too: `blob:` is not an opaque origin -- it
+    // borrows the one in its path -- so the origin test alone waves it through.
+    let target = next;
+    try {
+      const asked = new URL(next);
+      if (asked.protocol !== 'http:' && asked.protocol !== 'https:') return outsideProject(next, projectOrigin);
+      const home = new URL(base);
+      asked.protocol = home.protocol;
+      asked.hostname = home.hostname;
+      asked.port = home.port;
+      asked.username = '';
+      asked.password = '';
+      target = asked.href;
+    } catch {
+      return outsideProject(next, projectOrigin);
+    }
+    next = target;
 
     let res;
     try {

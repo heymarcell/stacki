@@ -66,4 +66,36 @@ function projectOriginTest(projectOrigin) {
   };
 }
 
-module.exports = { originOf, projectOriginTest, LOOPBACK_NAMES };
+/**
+ * A preview address Stacki is willing to treat as the project's, or null.
+ *
+ * THE FENCE IS ONLY AS GOOD AS WHAT IT IS FENCED TO. `devServer.url` reads as
+ * Stacki's own state, and two of the three ways it is set are not: Astro's
+ * `.astro/dev.json` is an ordinary file inside the project, and the adopted
+ * address is scraped out of the dev server's stdout. A repository that ships a
+ * lock file naming another host therefore chose the origin every one of these
+ * doors compares against -- probe, the audit, `page:dynamicPaths`,
+ * `content:sampleEntry` -- and an adversarial review measured four real
+ * requests reaching a non-project origin through exactly that, answered
+ * `ok:true`, while the project's real preview was refused as foreign.
+ *
+ * A dev server is a local process on a loopback interface. Anything else is not
+ * this project's preview, whatever a file in the project says.
+ */
+function trustedPreviewUrl(candidate) {
+  let u = null;
+  try {
+    u = new URL(String(candidate));
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (!LOOPBACK_NAMES.has(u.hostname)) return null;
+  if (!u.port) return null;
+  // Origin only: a path, a query or userinfo on a preview address is not
+  // something Stacki has any use for, and dropping them here means no caller
+  // has to remember to.
+  return `${u.protocol}//${u.hostname}:${u.port}`;
+}
+
+module.exports = { originOf, projectOriginTest, trustedPreviewUrl, LOOPBACK_NAMES };
