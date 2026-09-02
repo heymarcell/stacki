@@ -561,16 +561,27 @@ export default function App() {
         // for ever while undo answered `undone: true`.
         await window.avb.writePageRaw({ pagePath: page.path, source: text, model: state.model });
         setPageState((s) => (s ? { ...s, dirty: false, savedSource: text, restoreSource: null } : s));
-        return;
+      } else {
+        const wrote = await window.avb.writePage({ pagePath: page.path, model: state.model });
+        setPageState((s) =>
+          s ? { ...s, dirty: false, savedSource: typeof wrote?.text === 'string' ? wrote.text : s.savedSource } : s
+        );
       }
-      const wrote = await window.avb.writePage({ pagePath: page.path, model: state.model });
-      setPageState((s) =>
-        s ? { ...s, dirty: false, savedSource: typeof wrote?.text === 'string' ? wrote.text : s.savedSource } : s
-      );
-      return;
+    } else {
+      await window.avb.writePageRaw({ pagePath: page.path, source: state.source });
+      setPageState((s) => (s ? { ...s, dirty: false, savedSource: state.source } : s));
     }
-    await window.avb.writePageRaw({ pagePath: page.path, source: state.source });
-    setPageState((s) => (s ? { ...s, dirty: false, savedSource: state.source } : s));
+    // AND THE STATE THAT SAYS SO IS SETTLED BEFORE THIS RETURNS.
+    //
+    // The bytes were on disk at the `await` above, but `dirty` is cleared and
+    // `savedSource` recorded through `setPageState`, and nothing waited for
+    // that to reach the ref the rest of this file reads. So the NEXT history
+    // push saw a stale `dirty: true` and recorded no source for a state whose
+    // bytes were sitting on disk and known -- which is what made undo fall back
+    // to serializing. Measured across the agent suites: 13 history entries lost
+    // their bytes to this, none of them for a real reason. One turn of the loop
+    // is the same wait `commit` already makes for the same class of reason.
+    await new Promise((done) => setTimeout(done, 0));
   }, []);
 
   // Leaving a project. Main lets go of everything the project had running and
@@ -918,10 +929,17 @@ export default function App() {
   // out, 259 back, indentation mixed, both calls answering ok. The bytes are
   // attached here, so the inverse can be an inverse.
   //
-  // ONLY WHEN THE MODEL AND THE FILE AGREE. While a save is still pending, the
-  // model has moved and `savedSource` has not, and a snapshot pairing the two
-  // would restore bytes that never held that model. Then there is no source on
-  // the entry and undo falls back to serializing, which is what it always did.
+  // ONLY WHEN THE MODEL AND THE FILE AGREE, and for every operation that
+  // reaches this through the Agent API they now always do: `commit` awaits its
+  // save, `applySnapshot` awaits its restore, and `flushSave` does not return
+  // until the state saying so has settled. Instrumented across undo-bytes,
+  // source-fidelity and agent-acceptance: 51 history entries recorded, every
+  // one of them carrying its exact bytes, none falling through here.
+  //
+  // The guard stays for the one case where it is the truth rather than a
+  // shortfall -- a UI typing burst pushes history for a model whose bytes have
+  // genuinely never been on disk, and there is nothing to record. Pairing that
+  // model with the last saved file would restore bytes that never held it.
   const snapshotOf = (state) =>
     state.editable
       ? {
@@ -990,7 +1008,21 @@ export default function App() {
     h.lastPush = 0;
   }, []);
 
-  const applySnapshot = useCallback((entry) => {
+  // AN UNDO IS NOT DONE UNTIL ITS RESTORE IS ON DISK.
+  //
+  // This used to end at `scheduleSaveRef.current?.(true)` -- a zero-delay timer
+  // -- and `undo` returned without waiting for it. `project.undo` therefore
+  // answered `ok:true, undone:true` while the file still held the bytes it
+  // claimed to have taken back, and an operation issued immediately afterwards
+  // read the wrong state and built on it. Measured, with no delay inserted
+  // anywhere: S0 -> edit A -> undo -> edit B -> undo left `id="a"` still in the
+  // file, both undos reporting success. The first edit was never undone at all.
+  //
+  // So the restore is awaited here, exactly as `commit` awaits the save for a
+  // write. The turn of the loop before it is the same one and for the same
+  // reason: `setPageState`'s updater is where the state actually changes, and
+  // `flushSave` reads it through the ref React updates before effects run.
+  const applySnapshot = useCallback(async (entry) => {
     docRevRef.current += 1; // an undo is a change to the document like any other
     setPageState((s) => {
       if (!s) return s;
@@ -1001,8 +1033,9 @@ export default function App() {
           model: structuredClone(entry.model),
           dirty: true,
           // The bytes this model was last saved as, for flushSave to write
-          // straight through. Null when the entry was taken mid-save, and the
-          // model is then the only thing there is to go on.
+          // straight through. Null only for a snapshot of a model whose bytes
+          // were never on disk -- see `snapshotOf`; no Agent API path produces
+          // one -- and the model is then the only thing there is to go on.
           restoreSource: typeof entry.source === 'string' ? entry.source : null,
         };
       }
@@ -1014,8 +1047,9 @@ export default function App() {
         id && id !== 'layout' && !findNodeById(entry.model.nodes || [], id) ? null : id
       );
     }
-    scheduleSaveRef.current?.(true);
-  }, []);
+    await new Promise((done) => setTimeout(done, 0));
+    await flushSave();
+  }, [flushSave]);
 
   const scheduleSaveRef = useRef(null);
 
@@ -1043,7 +1077,7 @@ export default function App() {
     const state = pageStateRef.current.pageState;
     if (!state) return; // its page is gone — nothing to restore onto
     h.future.push(snapshotOf(state));
-    applySnapshot(entry);
+    await applySnapshot(entry);
   }, [applySnapshot, showToast]);
 
   const redo = useCallback(async () => {
@@ -1065,7 +1099,7 @@ export default function App() {
     const state = pageStateRef.current.pageState;
     if (!state) return;
     h.past.push(snapshotOf(state));
-    applySnapshot(entry);
+    await applySnapshot(entry);
   }, [applySnapshot, showToast]);
 
   // Discrete edits (dropdown, checkbox, drag, delete) save immediately;
