@@ -82,13 +82,20 @@ const plans = [
   const run = (domain, action, args = {}) => app.api.run(domain, action, args);
   await H.settle(400);
 
+  // The page's own ref, taken once while the selection is still the freshly
+  // opened page. An undo clears the selection when the restored model no longer
+  // holds the selected node, so a later bare `target.read` is not reliably the
+  // page root.
+  let pageRef = null;
+  const pageRead = async () => (pageRef ? run('target', 'read', { ref: pageRef }) : run('target', 'read'));
   const refFor = async (tagName) => {
-    const page = await run('target', 'read');
+    const page = await pageRead();
     return page.target?.children?.find((c) => c.tag === tagName)?.ref ?? null;
   };
 
   try {
     // --- THE BASELINE IS THE FILE AS AUTHORED.
+    pageRef = (await run('target', 'read')).target?.ref ?? null;
     const original = app.read(PAGE);
     check('the project opens without rewriting the page', original === SOURCE, short({
       onDisk: tag(original),
@@ -212,45 +219,140 @@ const plans = [
         short({ original: `${originalSha.slice(0, 12)} (${Buffer.byteLength(original)}b)`, afterUndo: tag(back) })
       );
     }
-    // --- AND THE EDIT AFTER AN UNDO IS NOT SWALLOWED BY IT.
+    // --- THE TRANSACTION BOUNDARY: NO SETTLE ANYWHERE.
     //
-    // An undo schedules a save that writes exact bytes. `project.undo` answers
-    // before that save runs, so the next edit arrived with those bytes still
-    // pending -- and the save wrote THEM, over the new model, then cleared the
-    // dirty flag so nothing would ever write it again. The edit answered
-    // ok:true, appeared on the canvas, and was never on disk. Found by review,
-    // measured against the previous commit, and pinned here.
+    // `project.undo` used to answer while its restore was still a pending
+    // timer, so an operation issued immediately afterwards read the file the
+    // undo claimed to have taken back and built on it. Measured against
+    // bc9c0195 with no delay inserted anywhere:
+    //
+    //   S0                    3c5398a9e885
+    //   edit A                fc3d804c5810
+    //   undo   -> ok, undone  fc3d804c5810   <- still edit A's bytes
+    //   edit B -> ok          f9f197bf5a27   <- built on the wrong state
+    //   undo   -> ok, undone  fc3d804c5810   <- id="a" STILL IN THE FILE
+    //
+    // Both undos reported success and the first edit was never undone at all.
+    // That is not a byte-fidelity nicety; it is a lost undo.
+    //
+    // NOT ONE `settle` IN THIS BLOCK. The waiting is what hid it: every delay
+    // between an undo and the next operation lets the restore land and the
+    // defect disappear. If a settle is ever added here to make this pass, the
+    // property it is testing has gone.
     {
-      const ref1 = await refFor('Hero');
-      await run('target', 'set_prop', { ref: ref1, name: 'id', value: 'before-undo' });
-      await H.settle(250);
-      const undone = await run('project', 'undo');
-      check('the undo is answered', undone.ok === true && undone.undone === true, short(undone));
+      const s0 = app.read(PAGE);
+      check('the boundary case starts from the original bytes', sha(s0) === originalSha, tag(s0));
 
-      // NO SETTLE BETWEEN THE UNDO AND THE EDIT. That is the whole case: the
-      // undo SCHEDULES a save and answers before it runs, so the edit has to
-      // arrive while those bytes are still pending. Waiting here would let the
-      // restore flush first and the defect would never appear -- which is
-      // exactly why the shipped settles hid it.
-      const ref2 = await refFor('Hero');
-      const after = await run('target', 'set_prop', { ref: ref2, name: 'id', value: 'after-undo' });
-      await H.settle(600);
-      const onDisk = app.read(PAGE);
-      check('an edit made straight after an undo is written', after.ok === true && onDisk.includes('id="after-undo"'), short({ said: after.ok, has: onDisk.includes('id="after-undo"') }));
-      check('  and the undo\'s bytes did not overwrite it', sha(onDisk) !== originalSha, tag(onDisk));
+      const refA = await refFor('Hero');
+      const editA = await run('target', 'set_prop', { ref: refA, name: 'id', value: 'edit-a' });
+      const s1 = app.read(PAGE);
+      check('edit A lands with no settle', editA.ok === true && s1.includes('id="edit-a"'), tag(s1));
 
-      // AND IT UNWINDS, though not byte-exactly, and that is honest rather than
-      // a defect. A snapshot taken while a save is still pending has no bytes
-      // to carry -- the model has moved and the file has not, and pairing them
-      // would restore bytes that never held that model -- so an undo across
-      // this race degrades to serializing, which is what it always did. What
-      // must not happen is the edit surviving or the page changing meaning.
-      await run('project', 'undo');
-      await H.settle(300);
-      const unwound = app.read(PAGE);
-      check('  and the stack unwinds, taking the edit back off', !unwound.includes('id="after-undo"'), unwound.slice(0, 160));
-      check('  leaving the page saying what it said before', unwound.includes('heading={site.tagline}') && unwound.includes("class='lead'".replace(/'/g, "'")) === unwound.includes("class='lead'"), tag(unwound));
+      const undo1 = await run('project', 'undo');
+      const afterUndo1 = app.read(PAGE);
+      check('the first undo reports it undid something', undo1.ok === true && undo1.undone === true, short(undo1));
+      // THE STATE IT REPORTS IS OBSERVABLE THE MOMENT IT ANSWERS. This is the
+      // assertion the whole block exists for.
+      check(
+        '  and the state it reports is on disk before the next call starts',
+        sha(afterUndo1) === originalSha,
+        short({ expected: originalSha.slice(0, 12), found: tag(afterUndo1) })
+      );
+
+      const refB = await refFor('Hero');
+      const editB = await run('target', 'set_prop', { ref: refB, name: 'id', value: 'edit-b' });
+      const s2 = app.read(PAGE);
+      check('an edit made straight after an undo is written', editB.ok === true && s2.includes('id="edit-b"'), short({ said: editB.ok, has: s2.includes('id="edit-b"') }));
+      check('  and is not built on the state undo took back', !s2.includes('id="edit-a"'), s2.slice(0, 200));
+
+      const undo2 = await run('project', 'undo');
+      const afterUndo2 = app.read(PAGE);
+      check('the second undo reports it undid something', undo2.ok === true && undo2.undone === true, short(undo2));
+      check(
+        '  and the file is byte-for-byte the original, with no settle anywhere',
+        sha(afterUndo2) === originalSha,
+        short({ expected: originalSha.slice(0, 12), found: tag(afterUndo2) })
+      );
+      check('  with neither edit left in it', !afterUndo2.includes('id="edit-a"') && !afterUndo2.includes('id="edit-b"'), afterUndo2.slice(0, 200));
     }
+
+    // --- A STRUCTURAL CHANGE ACROSS THE BOUNDARY, which is the case that needs
+    //     the bytes rather than a patch.
+    //
+    // A local edit can be put back by splicing the node's text into the file,
+    // so an entry that lost its bytes is usually rescued by the write path and
+    // the loss is invisible. A structural change cannot: the tree has a
+    // different shape, the write falls back to serializing the whole document,
+    // and only the recorded file returns the original.
+    //
+    // The entry this undo restores is pushed by the structural commit, reading
+    // the state the PREVIOUS save left behind -- so it is exactly the entry
+    // that carried no bytes while `flushSave` returned before the state saying
+    // it had saved caught up. Measured with that settle removed: this undo
+    // lands on a re-serialization instead of S1, while every other check in
+    // this file stays green.
+    {
+      const before = app.read(PAGE);
+      check('the structural boundary case starts from the original', sha(before) === originalSha, tag(before));
+
+      await run('target', 'set_prop', { ref: await refFor('Hero'), name: 'id', value: 'boundary' });
+      const s1 = app.read(PAGE);
+      check('the attribute edit lands', s1.includes('id="boundary"'), tag(s1));
+
+      // NO SETTLE. The next commit's history push must read the state the save
+      // above actually left.
+      // Back out to whatever contains the current selection first: the edit
+      // above may have left it inside the component it touched.
+      const page = await pageRead();
+      const footer = page.target?.children?.find((c) => c.tag === 'footer');
+      check('  the page still reports its footer', !!footer?.ref, short(page.target?.children?.map((c) => c.tag)));
+      const removed = await run('target', 'remove', { ref: footer.ref });
+      const s2 = app.read(PAGE);
+      check('  and a structural change on top of it lands too', removed.ok === true && !s2.includes('<footer>'), short(removed));
+
+      const u1 = await run('project', 'undo');
+      const backToS1 = app.read(PAGE);
+      check('undoing the structural change reports success', u1.ok === true && u1.undone === true, short(u1));
+      check(
+        '  and restores the exact bytes it was made on, not a re-serialization',
+        sha(backToS1) === sha(s1),
+        short({ s1: tag(s1), got: tag(backToS1) })
+      );
+
+      const u2 = await run('project', 'undo');
+      check('  and unwinding the rest returns the original exactly', u2.ok === true && sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+    }
+
+    // --- REDO ACROSS THE SAME BOUNDARY, also with no settle.
+    {
+      const refA = await refFor('Hero');
+      await run('target', 'set_prop', { ref: refA, name: 'id', value: 'redo-me' });
+      const s1 = app.read(PAGE);
+      await run('project', 'undo');
+      check('undo across the boundary is exact', sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+      const r = await run('project', 'redo');
+      const back = app.read(PAGE);
+      check('redo reports success with no settle', r.ok === true && r.redone === true, short(r));
+      check('  and puts back exactly the state it undid', sha(back) === sha(s1), short({ s1: tag(s1), got: tag(back) }));
+      await run('project', 'undo');
+      check('  and one more undo returns to the original', sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+    }
+
+    // --- A TWO-EDIT STACK UNWOUND WITH NO SETTLE, each step observable.
+    {
+      const refA = await refFor('Hero');
+      await run('target', 'set_prop', { ref: refA, name: 'id', value: 'stack-a' });
+      const s1 = app.read(PAGE);
+      const refB = await refFor('div');
+      await run('target', 'set_prop', { ref: refB, name: 'data-stack', value: 'b' });
+      const s2 = app.read(PAGE);
+      check('two edits with no settle both land', s2.includes('id="stack-a"') && s2.includes('data-stack="b"'), tag(s2));
+      await run('project', 'undo');
+      check('the first undo lands exactly on S1, immediately', sha(app.read(PAGE)) === sha(s1), short({ s1: tag(s1), got: tag(app.read(PAGE)) }));
+      await run('project', 'undo');
+      check('  and the second lands exactly on the original', sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
+    }
+
   } finally {
     await app.stop?.();
     H.removeProject(root);

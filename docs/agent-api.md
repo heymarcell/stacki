@@ -222,9 +222,16 @@ was a model clone, restoring it re-ran the serializer, and parse-then-serialize
 is not the identity function on a page somebody actually wrote, so a 250-line
 page came back at 259 lines with its indentation mixed. The entry now carries the
 file's own bytes and they are written straight through, so the inverse is an
-inverse. It carries them only when the model and the file agree — while a save is
-still in flight there is nothing honest to record, and undo falls back to
-serializing, as it always did.
+inverse.
+
+**And the state an undo reports is on disk before the next call starts.**
+`project.undo` used to answer while its restore was still a pending timer, so an
+operation issued straight afterwards read the file the undo claimed to have
+taken back and built on it — measured with no delay anywhere, two undos both
+reporting success and the first edit still in the file. An undo now waits for
+its own restore, and a save does not return until the state saying so has
+settled, so no caller needs to sleep between operations to see what it was
+told.
 
 The forward direction matters for the same reason. A semantic edit patches the
 node it changed into the file rather than reprinting the document: one
