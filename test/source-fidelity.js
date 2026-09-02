@@ -61,6 +61,10 @@ const plans = [
             <Card title={plan.title} body={plan.body} />
         ))}
     </div>
+    <Card
+        title="Wide"
+        body='across lines on purpose'
+    />
     <!-- The footer is deliberately last -->
     <footer>
         <p class='fine-print'>Made carefully.</p>
@@ -229,6 +233,33 @@ const linesChanged = (before, after) => {
         short(afterTwo.slice(afterTwo.indexOf('<div'), afterTwo.indexOf('<div') + 140))
       );
     }
+    // --- A TAG WHOSE ATTRIBUTES ARE WRITTEN ACROSS LINES.
+    //
+    // Reprinting the node flattens the block onto one line, which is a diff on
+    // every line of a tag for an edit that added one attribute. The block is
+    // the author's, and the new attribute joins it rather than replacing it.
+    {
+      const beforeMulti = app.read(PAGE);
+      const p3 = await run('target', 'read');
+      const card = p3.target?.children?.find((c) => c.tag === 'Card');
+      check('the page reports its multi-line Card', !!card?.ref, short(p3.target?.children?.map((c) => c.tag)));
+      const set3 = await run('target', 'set_prop', { ref: card.ref, name: 'id', value: 'wide' });
+      await H.settle(250);
+      const afterMulti = app.read(PAGE);
+      check('a prop on a multi-line tag lands', set3.ok === true && /id="wide"/.test(afterMulti), short(set3));
+      check(
+        '  and the attribute block keeps its lines',
+        /<Card\n        title="Wide"\n        body='across lines on purpose'/.test(afterMulti),
+        short(afterMulti.slice(afterMulti.indexOf('<Card'), afterMulti.indexOf('<Card') + 160))
+      );
+      check('  and the other attributes keep their quotes', afterMulti.includes("body='across lines on purpose'"), short(afterMulti.slice(afterMulti.indexOf('<Card'), afterMulti.indexOf('<Card') + 160)));
+      check(
+        '  and removing the new one gives the file back',
+        afterMulti.replace(/ id="wide"/, '') === beforeMulti,
+        short({ span: changedSpan(beforeMulti, afterMulti) })
+      );
+    }
+
   } finally {
     await app.stop?.();
     H.removeProject(root);

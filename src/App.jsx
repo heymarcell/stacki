@@ -541,16 +541,32 @@ export default function App() {
   // Page loading & saving
   // ----------------------------------------------------------------
 
+  // THE BYTES ON DISK ARE TRACKED, not inferred.
+  //
+  // `savedSource` is what this page's file actually holds, updated with what
+  // main reports it wrote. Undo needs it: restoring a model and serializing it
+  // again cannot reproduce a file the serializer would not have written in the
+  // first place, and on a real page it never would have. `restoreSource` is an
+  // undo or redo saying "these exact bytes", and it is written straight through.
   const flushSave = useCallback(async () => {
     clearTimeout(saveTimer.current);
     const { currentPage: page, pageState: state } = pageStateRef.current;
     if (!page || !state || !state.dirty) return;
     if (state.editable) {
-      await window.avb.writePage({ pagePath: page.path, model: state.model });
-    } else {
-      await window.avb.writePageRaw({ pagePath: page.path, source: state.source });
+      if (typeof state.restoreSource === 'string') {
+        const text = state.restoreSource;
+        await window.avb.writePageRaw({ pagePath: page.path, source: text });
+        setPageState((s) => (s ? { ...s, dirty: false, savedSource: text, restoreSource: null } : s));
+        return;
+      }
+      const wrote = await window.avb.writePage({ pagePath: page.path, model: state.model });
+      setPageState((s) =>
+        s ? { ...s, dirty: false, savedSource: typeof wrote?.text === 'string' ? wrote.text : s.savedSource } : s
+      );
+      return;
     }
-    setPageState((s) => (s ? { ...s, dirty: false } : s));
+    await window.avb.writePageRaw({ pagePath: page.path, source: state.source });
+    setPageState((s) => (s ? { ...s, dirty: false, savedSource: state.source } : s));
   }, []);
 
   // Leaving a project. Main lets go of everything the project had running and
@@ -890,9 +906,25 @@ export default function App() {
     docRevRef.current += 1;
   }, []);
 
+  // AN UNDO ENTRY CARRIES THE FILE, not only the model.
+  //
+  // A model clone was the whole entry, and undo restored it and ran the
+  // serializer over it again -- so the file came back as this process would
+  // have written it rather than as it was. Measured on a real page: 250 lines
+  // out, 259 back, indentation mixed, both calls answering ok. The bytes are
+  // attached here, so the inverse can be an inverse.
+  //
+  // ONLY WHEN THE MODEL AND THE FILE AGREE. While a save is still pending, the
+  // model has moved and `savedSource` has not, and a snapshot pairing the two
+  // would restore bytes that never held that model. Then there is no source on
+  // the entry and undo falls back to serializing, which is what it always did.
   const snapshotOf = (state) =>
     state.editable
-      ? { kind: 'model', model: structuredClone(state.model) }
+      ? {
+          kind: 'model',
+          model: structuredClone(state.model),
+          source: state.dirty ? null : state.savedSource ?? state.source ?? null,
+        }
       : { kind: 'source', source: state.source };
 
   // Records the state *before* a mutation. Consecutive edits with the same
@@ -959,7 +991,16 @@ export default function App() {
     setPageState((s) => {
       if (!s) return s;
       if (entry.kind === 'model') {
-        return { ...s, editable: true, model: structuredClone(entry.model), dirty: true };
+        return {
+          ...s,
+          editable: true,
+          model: structuredClone(entry.model),
+          dirty: true,
+          // The bytes this model was last saved as, for flushSave to write
+          // straight through. Null when the entry was taken mid-save, and the
+          // model is then the only thing there is to go on.
+          restoreSource: typeof entry.source === 'string' ? entry.source : null,
+        };
       }
       return { ...s, source: entry.source, dirty: true };
     });

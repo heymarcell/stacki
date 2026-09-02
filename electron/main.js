@@ -65,6 +65,7 @@ const {
   parsePage,
   locateSelection,
   serializePage,
+  anchoredSerialize,
   parseTemplate,
   serializeNodes,
   resolveChunks,
@@ -3187,12 +3188,31 @@ handle('page:parseSource', async (_e, { pagePath, source }) => {
 
 handle('page:write', async (_e, { pagePath, model }) => {
   if (isMarkdownPage(pagePath)) {
-    writePageText(pagePath, serializeMarkdownPage(model));
-    return { ok: true };
+    const text = serializeMarkdownPage(model);
+    writePageText(pagePath, text);
+    return { ok: true, text };
   }
-  writePageText(pagePath, serializePage(model));
+  // THE FILE IS EDITED, NOT REPRINTED.
+  //
+  // `serializePage(model)` rebuilds the whole document, and parse-then-serialize
+  // is not the identity function on real pages -- so one prop change used to
+  // reformat everything it touched. `anchoredSerialize` puts the changed node's
+  // new text where its old text was and leaves the rest of the file alone,
+  // falling back to a full serialization when the change cannot be placed. See
+  // electron/astroParser.js.
+  let before = null;
+  try {
+    before = fs.readFileSync(pagePath, 'utf8');
+  } catch {
+    /* a page being created has nothing to preserve */
+  }
+  const text = anchoredSerialize(before, model);
+  writePageText(pagePath, text);
   writeChunks(model);
-  return { ok: true };
+  // The bytes that are now on disk, so the renderer's copy of the source stays
+  // the file rather than drifting from it -- which is what makes an undo able
+  // to put the file back exactly. See src/App.jsx `flushSave`.
+  return { ok: true, text };
 });
 
 handle('page:writeRaw', async (_e, { pagePath, source }) => {
