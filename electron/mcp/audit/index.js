@@ -69,6 +69,16 @@ const MAX_FINDINGS = 60;
 // The envelope sends this payload TWICE -- `structuredContent` and a JSON copy
 // in a text block (agentTools.js `answer`) -- so the wire cost is about twice
 // this. The host counts the text block, which is what this bounds.
+//
+// WHAT IT BOUNDS IS THE FINDINGS PAYLOAD. `captures` is deliberately outside
+// it, and is not counted in the overhead either, so asking for a picture does
+// not quietly cost findings. That is not the same as saying a capture is small:
+// one is up to MAX_BYTES from capture.js before base64, and three of them would
+// exceed any host's limit on their own. Captures are off by default, they were
+// off for every oversize result the dogfood measured, and bounding them here
+// would mean returning none at all -- which is a decision about whether an
+// image belongs in an MCP response, not about audit budgeting. Recorded as a
+// separate question rather than answered by the side effect of this one.
 const MAX_RESPONSE_BYTES = 30000;
 // A quarter of the byte budget is held for `incomplete`, for exactly the reason
 // a quarter of the count budget is: they sort last, so a straight walk down the
@@ -913,7 +923,6 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         ...(blockedSubframes.size ? { blockedSubframeOrigins: [...blockedSubframes] } : {}),
         engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true },
         viewports: perViewport,
-        captures,
         limits: LIMITS_SENTENCE,
       }) + 512;
     const kept = fitToBytes(clipped, overhead);

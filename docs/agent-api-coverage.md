@@ -131,7 +131,7 @@ says so.
 | `dependencies` | Inspect | main | — | electron/main.js project:hasNodeModules | Whether dependencies are installed. |
 | `install` | Full control | main | — | electron/main.js project:install | Install dependencies — runs package tooling and reaches the network. |
 | `diagnose` | Inspect | main | — | electron/main.js dev:diagnose | Why the dev server will or will not start. |
-| `probe` | Inspect | main | — | electron/devProbe.js | Whether a route on the project's preview answers. **Only ever the project's own origin** — a route is resolved against the preview URL, an absolute URL elsewhere is refused before the request, and a redirect off the project origin is stopped rather than followed. |
+| `probe` | Inspect | main | — | electron/devProbe.js | Whether a route on this project's preview answers. Give a route; only the project's own origin is reached, and a redirect off it is refused rather than followed. |
 | `dev_status` | Inspect | renderer | — | App.jsx devStatus | What the preview is doing right now. |
 | `dev_start` | Edit project | renderer | — | App.jsx startPreview | Start the project's dev server (Stacki normally does this itself). |
 | `dev_stop` | Edit project | renderer | — | App.jsx stopPreview | Stop the dev server. |

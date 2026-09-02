@@ -181,7 +181,15 @@ const OPERATIONS = {
     dependencies: { risk: 'read', via: 'main', channel: 'project:hasNodeModules', summary: 'Whether dependencies are installed.', reuses: 'electron/main.js project:hasNodeModules' },
     install: { risk: 'high', via: 'main', channel: 'project:install', summary: 'Install dependencies — runs package tooling and reaches the network.', reuses: 'electron/main.js project:install' },
     diagnose: { risk: 'read', via: 'main', channel: 'dev:diagnose', summary: 'Why the dev server will or will not start.', reuses: 'electron/main.js dev:diagnose' },
-    probe: { risk: 'read', via: 'main', channel: 'dev:probe', summary: 'Whether a preview URL answers.', reuses: 'electron/devProbe.js' },
+    probe: {
+      risk: 'read',
+      via: 'main',
+      channel: 'dev:probe',
+      summary:
+        "Whether a route on this project's preview answers. Give a route; only the project's own origin is reached, " +
+        'and a redirect off it is refused rather than followed.',
+      reuses: 'electron/devProbe.js',
+    },
     dev_status: { risk: 'read', via: 'renderer', summary: 'What the preview is doing right now.', reuses: 'App.jsx devStatus' },
     // Through the RENDERER, because that is where the preview's state lives and
     // dev_status reads it. Going straight to main started a real server the app
