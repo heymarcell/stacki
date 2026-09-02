@@ -74,6 +74,28 @@ async function fetchSettled(url, wanted, { timeoutMs = 15000, everyMs = 300 } = 
   }
 }
 
+/**
+ * What `Header.astro` says about the link the brief asked for.
+ *
+ * Pulled out of the check so it can be PROVEN rather than trusted: it is pure,
+ * it takes a string, and `test/heldout-oracles.js` feeds it a correct control
+ * and a broken one and requires them to come out different. An oracle nobody
+ * can fail on purpose is an oracle nobody has tested.
+ *
+ *   onDisk         a `/uses` link exists, reading "Uses"
+ *   sameComponent  it is a `<HeaderLink>`, like the three beside it — the brief
+ *                  asks for this explicitly, "so it is styled like them"
+ *   kept           the links that were already there survived
+ */
+function judgeNavHeader(header) {
+  const text = String(header || '');
+  return {
+    onDisk: /href=["']\/uses["']/.test(text) && /Uses/.test(text),
+    sameComponent: /<HeaderLink[^>]*href=["']\/uses["']/.test(text),
+    kept: /href=["']\/blog["']/.test(text) && /href=["']\/about["']/.test(text),
+  };
+}
+
 const PREAMBLE = `You are working on an Astro project through **Stacki**, a visual editor for Astro
 that exposes the open project over MCP. The Stacki MCP server is connected and is
 your route to the project.
@@ -265,22 +287,33 @@ It must use the same kind of link component the other three use, so it is styled
 like them. Then check that it really renders on the home page, and reply with
 one sentence saying whether it did.`,
     async ({ root, previewUrl }) => {
-      const header = read(root, 'src/components/Header.astro');
-      const onDisk = /href=["']\/uses["']/.test(header) && /Uses/.test(header);
-      const sameComponent = /<HeaderLink[^>]*href=["']\/uses["']/.test(header);
+      const source = judgeNavHeader(read(root, 'src/components/Header.astro'));
       const page = await fetchSettled(`${previewUrl}/`, (b) => /href="\/uses"/.test(b) && /Uses/.test(b));
       const rendered = page.status === 200 && /href="\/uses"/.test(page.body) && /Uses/.test(page.body);
-      const kept = /href=["']\/blog["']/.test(header) && /href=["']\/about["']/.test(header);
       return {
-        pass: onDisk && rendered && kept,
-        why: !onDisk
+        // `sameComponent` WAS COMPUTED AND THEN IGNORED.
+        //
+        // The brief asks for a link that uses "the same kind of link component
+        // the other three use, so it is styled like them", and the check worked
+        // out whether it did — and then left it out of the verdict. A raw
+        // `<a href="/uses">Uses</a>` satisfied every clause that was actually
+        // being read: it is on disk, it renders, the other links survive. It
+        // would also have been unstyled, which is the one thing the sentence
+        // was there to prevent.
+        //
+        // A field a checker calculates and does not use is worse than one it
+        // never calculated: it reads, in the result file, exactly like evidence.
+        pass: source.onDisk && source.sameComponent && rendered && source.kept,
+        why: !source.onDisk
           ? 'Header.astro has no /uses link'
-          : !kept
+          : !source.kept
             ? 'the existing links were lost'
-            : rendered
-              ? null
-              : `the home page did not render it (${page.status})`,
-        detail: { onDisk, sameComponent, rendered, kept },
+            : !source.sameComponent
+              ? 'the /uses link exists but does not use HeaderLink'
+              : rendered
+                ? null
+                : `the home page did not render it (${page.status})`,
+        detail: { ...source, rendered },
       };
     },
     { class: 'C-semantic', project: 'astro-blog' }
@@ -573,4 +606,4 @@ const byId = (id) => {
 
 const idsOf = (split) => Object.keys(TASKS).filter((id) => !split || TASKS[id].split === split);
 
-module.exports = { TASKS, byId, idsOf, AUDIT_PAGE, fetchPage, fetchSettled };
+module.exports = { TASKS, byId, idsOf, AUDIT_PAGE, fetchPage, fetchSettled, judgeNavHeader };

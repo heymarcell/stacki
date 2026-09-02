@@ -191,6 +191,13 @@
       "defect": "The check required a bare `<title>`. The dev server Stacki runs marks every authored element, so the tag arrives as `<title data-avb-p=\"src/components/BaseHead.astro|12 1.0.0\">` and the pattern could never match. Verified directly against a real packaged Stacki: a source.write reaches the served HTML in under 500ms, and the served title reads exactly what was written.",
       "replacement": "`<title[^>]*>` \u2014 the same claim, tolerant of the attributes Stacki's own preview adds.",
       "whyThisIsNotTuning": "It failed identically in both arms, so it biased nothing; the correction admits an attribute rather than relaxing what must be true. The task was re-run in both arms after the fix and both results are reported."
+    },
+    {
+      "task": "semantic-nav",
+      "found": "Raised by independent audit of PR #27, not by a failing trial \u2014 which is what makes it the worst of the four.",
+      "defect": "The check computed `sameComponent` (is the new /uses link a <HeaderLink>, like the three beside it?) and left it out of the verdict. The brief asks for it explicitly \u2014 'the same kind of link component the other three use, so it is styled like them' \u2014 so a raw <a href=\"/uses\">Uses</a> satisfied every clause that was actually read: on disk, renders, neighbours intact. The trial passed in both arms and the result file carried a field that read exactly like evidence and was load-bearing on nothing.",
+      "replacement": "pass = onDisk && sameComponent && rendered && kept, with a failure message that names the defect ('the /uses link exists but does not use HeaderLink'). The source half of the judgement is now a pure exported function, judgeNavHeader, and test/heldout-oracles.js feeds it a correct control and a raw-anchor control and requires them to come out different.",
+      "whyThisIsNotTuning": "It is strictly STRICTER, and it matches the brief that was registered before any product change \u2014 the task was never loosened, the check was simply not reading all of it. It cannot advantage the candidate: it applies identically to both arms, and both were re-run after the correction with the product untouched. The proof needs no agent."
     }
   ],
   "notCovered": [
