@@ -32,6 +32,17 @@
 const z = require('zod');
 
 const { NAMES: VIEWPORT_NAMES, MAX_VIEWPORTS } = require('./viewports');
+// ONE ENVELOPE FOR EVERY REFUSAL ON THE WIRE.
+//
+// This tool used to build its own two-line return, and the difference was
+// `isError`. The permission refusal that reaches a client from `target.set_text`
+// carries it; the byte-identical refusal from `audit` did not, and neither did
+// `get_comments`. The spec says a tool that fails for an application reason
+// SHOULD set it so the model can self-correct, and a host keying off it -- Claude
+// Code does -- recorded a refused audit as a call that worked. At the default
+// permission level `audit` is ALWAYS refused, so this was the common case rather
+// than the edge one.
+const { answer } = require('./agentTools');
 
 // The permission subject. Named like a registry operation so that a reader
 // grepping for what needs `inspect` finds it in the same shape as the rest.
@@ -272,17 +283,10 @@ function registerAuditTool(server, { audit, api }) {
     async (args = {}) => {
       // THE SAME DOOR. See the note at the top of this file.
       const denied = api.checkAccess(AUDIT_OPERATION, AUDIT_RISK);
-      if (denied) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify(denied) }],
-          structuredContent: denied,
-        };
-      }
-      const result = await audit(args);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result) }],
-        structuredContent: result,
-      };
+      // Compact, exactly as this tool has always answered: the text block is a
+      // second copy of the findings and indenting it is bytes for nothing.
+      if (denied) return answer(denied, { spaces: 0 });
+      return answer(await audit(args), { spaces: 0 });
     }
   );
   return true;

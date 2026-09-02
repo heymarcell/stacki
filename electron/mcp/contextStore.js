@@ -133,6 +133,27 @@ function normalize(payload, resolveTrail) {
       viewportWidth: int(p.view?.viewportWidth),
       viewportHeight: int(p.view?.viewportHeight),
     },
+    // THE ONE ANSWER TO "IS THE PREVIEW UP" THAT EVERY LEVEL CAN HEAR.
+    //
+    // The renderer publishes `preview: {status, url}` on every snapshot, and
+    // this file read `p.preview?.status` once to decide whether the selection
+    // was measurable and then dropped it. So the tool an agent is told to call
+    // first, the only project-shaped read that works at `visual`, was handed a
+    // three-valued dev-server status and threw it away.
+    //
+    // What was left cost a permission the question does not need: at `visual`
+    // the only alternative is `get_capabilities().project.preview`, which is two
+    // valued and cannot say `starting` — so "wait, it is coming up" and "it is
+    // not running, start it" were the same answer. `project.dev_status` says it
+    // properly and needs `inspect`.
+    //
+    // It is a field on a declared output schema, so a strict client validates
+    // it: see test/mcp-modern.js, which checks every result against the schema
+    // that arrived over the wire.
+    preview: {
+      status: ['off', 'starting', 'on'].includes(p.preview?.status) ? p.preview.status : 'off',
+      url: str(p.preview?.url, 512),
+    },
     selection: emptySelection(),
   };
 
@@ -215,6 +236,10 @@ function emptySnapshot() {
     project: { root: null },
     page: { route: null, file: null },
     view: { device: null, viewportWidth: null, viewportHeight: null },
+    // Nothing is open, so nothing is being served. Said rather than omitted:
+    // a field that is present on one path and missing on another is a field a
+    // client has to write a branch for.
+    preview: { status: 'off', url: null },
     selection: { ...emptySelection(), status: 'no_project' },
   };
 }

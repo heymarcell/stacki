@@ -1,0 +1,209 @@
+{
+  "registeredOn": "2026-09-01",
+  "phase": "D",
+  "baselineCommit": "d6a8d4992805b89b7344c4227315e7f82c40784e",
+  "why": "Registered BEFORE any Phase-D product change, so the tasks cannot be chosen to suit the result. A task found to be objectively invalid may be replaced, and the defect and the replacement are recorded here rather than edited away.",
+  "corpus": {
+    "source": "withastro/astro",
+    "sourceCommit": "916b738b0447728f1c274e32677c9bac09be78f6",
+    "license": "MIT (upstream repository; UPSTREAM-LICENSE is kept beside the materialised copy)",
+    "readOnly": "Fetched as one immutable tarball over HTTPS. Never cloned, forked, pushed to, or issued against. Every trial works in a disposable copy.",
+    "projects": [
+      {
+        "id": "astro-portfolio",
+        "upstreamPath": "examples/portfolio",
+        "contentHash": "03aca3cf549cb133665ca75b8d19f1f65b6bed9c0d774e2a32cc260022ec3456",
+        "fileCount": 60,
+        "shape": "Five routes including a dynamic one and a 404, fourteen components, a real design system in plain CSS custom properties, a content collection with a nested entry, a theme toggle."
+      },
+      {
+        "id": "astro-blog",
+        "upstreamPath": "examples/blog",
+        "contentHash": "d833107759390fbe8486f489ed3acf5d0869153f935baaad2d3a61ed278bbe19",
+        "fileCount": 37,
+        "shape": "Content collections, a dynamic route, layouts, MDX, an RSS endpoint, and shared constants in a TypeScript module Stacki does not model as a tree."
+      },
+      {
+        "id": "astro-tailwind",
+        "upstreamPath": "examples/with-tailwindcss",
+        "contentHash": "7256267a75691d574dcf0609d302996424e2ba810da2a4d82bb5074e6dfea53b",
+        "fileCount": 13,
+        "shape": "Tailwind 4 through the Vite plugin, utility-class styling with no authored stylesheet of its own, a client-side island, MDX."
+      },
+      {
+        "id": "astro-starlog",
+        "upstreamPath": "examples/starlog",
+        "contentHash": "f70b2d1c248d56bf5d77afe4f014c3027bd4bc134d12ad535d8d89e0c0674f0c",
+        "fileCount": 30,
+        "shape": "A SCSS design system split across four stylesheets, a content collection, a dynamic route. Development set only."
+      }
+    ]
+  },
+  "host": {
+    "agent": "Claude Code CLI, driven with --strict-mcp-config and a per-trial temporary MCP config. No user registration is created or read.",
+    "isolation": "--setting-sources '' so no user, project or local settings file loads; --no-session-persistence; a fresh process per trial.",
+    "surfaces": {
+      "mcp-only": "--tools ListMcpResourcesTool,ReadMcpResourceTool \u2014 no Bash, no Read, no Write, no Glob, no Grep, no web. Those two are MCP access, not filesystem access, and Claude Code reaches MCP resources ONLY through them: a run with --tools '' has a healthy resources/list and cannot open a single resource. Every other action is an MCP call to Stacki, and the transcript proves it (builtinToolCalls must be 0).",
+      "integrated": "The ordinary toolset plus the project directory. Its MCP counts are not comparable with mcp-only and are never averaged with them."
+    },
+    "server": "The real packaged Stacki.app \u2014 14 tools including audit, a real dev server, a real browser. Not the in-process wire rig, which serves 13 tools and no audit."
+  },
+  "metrics": {
+    "primary": "semanticSuccess \u2014 the task's own check, reading the world",
+    "efficiency": [
+      "preambleBytes (server/discover + tools/list + resources/list + prompts/list)",
+      "toolCalls",
+      "projectProfileReads",
+      "projectProfileBytes",
+      "guideReads",
+      "responseBytes",
+      "elapsedMs",
+      "host tokens in/out"
+    ],
+    "safety": [
+      "refusals",
+      "refusalCodes",
+      "permissionDenials",
+      "cleanupProblems",
+      "isolationHeld"
+    ],
+    "note": "Reported per task class. A verification call is not waste; a targeted call that prevents a wrong edit is a win. Nothing here is aggregated into one number."
+  },
+  "tasks": [
+    {
+      "id": "targeted-heading",
+      "class": "A-targeted",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "src/pages/index.astro carries the new heading AND the dev server renders it"
+    },
+    {
+      "id": "targeted-token",
+      "class": "A-targeted",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "--link-color is #0b7285 AND two named neighbouring tokens are unchanged"
+    },
+    {
+      "id": "understand",
+      "class": "B-discovery",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "five structured answers, all correct: routes, the layout of one named page, the link-colour token, the size of a collection, the Astro major"
+    },
+    {
+      "id": "semantic-nav",
+      "class": "C-semantic",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the header carries a new /uses link, the existing links survive, and the home page renders it"
+    },
+    {
+      "id": "source-fallback",
+      "class": "D-source",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "src/consts.ts carries the new title AND the rendered <title> shows it"
+    },
+    {
+      "id": "auditfix",
+      "class": "F-auditfix",
+      "project": "astro-tailwind",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "a re-run audit reports zero horizontal-overflow, image-alt and label findings, and both seeded controls survive"
+    },
+    {
+      "id": "diagnostic-permission",
+      "class": "G-diagnostic",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "visual",
+      "mode": "mcp-only",
+      "oracle": "nothing changed on disk, and the answer names the level in force, the level needed and where a person changes it, without claiming success"
+    },
+    {
+      "id": "diagnostic-preview",
+      "class": "G-diagnostic",
+      "project": "astro-blog",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the dev server was deliberately stopped first; the audit must actually succeed and the server must be back on"
+    },
+    {
+      "id": "multistep",
+      "class": "H-multistep",
+      "project": "astro-portfolio",
+      "split": "holdout",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "both edits on disk, the About page renders the new title, and the audit ran"
+    },
+    {
+      "id": "dev-targeted-heading",
+      "class": "A-targeted",
+      "project": "astro-starlog",
+      "split": "dev",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "the heading changed on disk"
+    },
+    {
+      "id": "dev-understand",
+      "class": "B-discovery",
+      "project": "astro-starlog",
+      "split": "dev",
+      "access": "edit",
+      "mode": "mcp-only",
+      "oracle": "three structured answers, all correct"
+    }
+  ],
+  "corrections": [
+    {
+      "task": "diagnostic-permission",
+      "found": "The baseline run failed it with 'the file changed, which at visual-only should have been impossible'.",
+      "defect": "The oracle looked for the blog's heading text ('Hello, Astronaut') inside the portfolio's src/pages/index.astro, where it has never appeared. The check could not pass whatever the product did, and it was measuring the fixture author rather than Stacki.",
+      "replacement": "The whole project tree is hashed before the trial and again after it, and 'nothing changed' means the two hashes agree.",
+      "whyThisIsNotTuning": "The replacement is strictly stronger than the original: it would catch a refusal that held for the file the brief named and let a write through somewhere else, which the string compare could never see. It was made before any Phase-D product change was measured against this task, and the failing baseline result is reported alongside the corrected one."
+    },
+    {
+      "task": "source-fallback (and every other check that reads the render)",
+      "found": "The baseline run failed it with 'the rendered <title> does not carry it (200)' while the file on disk was correct and the agent had done the work properly.",
+      "defect": "The check fetched the page once, the instant the agent finished. Measured directly against a bare `astro dev`: writing src/consts.ts and re-fetching at 0ms returns the old title and at 300ms returns the new one. The oracle was racing Vite's module invalidation, not measuring Stacki.",
+      "replacement": "fetchSettled polls to a bounded 15s deadline and reports the last response either way.",
+      "whyThisIsNotTuning": "It does not weaken the check: an edit that never reaches the render still fails, and it fails with the response actually received. It removes a race that had nothing to do with the product, and it was found by a baseline failure rather than by a candidate one."
+    },
+    {
+      "task": "source-fallback",
+      "found": "Failed in BOTH arms with 'the rendered <title> does not carry it (200)', with the file correct on disk and the agent's work correct.",
+      "defect": "The check required a bare `<title>`. The dev server Stacki runs marks every authored element, so the tag arrives as `<title data-avb-p=\"src/components/BaseHead.astro|12 1.0.0\">` and the pattern could never match. Verified directly against a real packaged Stacki: a source.write reaches the served HTML in under 500ms, and the served title reads exactly what was written.",
+      "replacement": "`<title[^>]*>` \u2014 the same claim, tolerant of the attributes Stacki's own preview adds.",
+      "whyThisIsNotTuning": "It failed identically in both arms, so it biased nothing; the correction admits an attribute rather than relaxing what must be true. The task was re-run in both arms after the fix and both results are reported."
+    },
+    {
+      "task": "semantic-nav",
+      "found": "Raised by independent audit of PR #27, not by a failing trial \u2014 which is what makes it the worst of the four.",
+      "defect": "The check computed `sameComponent` (is the new /uses link a <HeaderLink>, like the three beside it?) and left it out of the verdict. The brief asks for it explicitly \u2014 'the same kind of link component the other three use, so it is styled like them' \u2014 so a raw <a href=\"/uses\">Uses</a> satisfied every clause that was actually read: on disk, renders, neighbours intact. The trial passed in both arms and the result file carried a field that read exactly like evidence and was load-bearing on nothing.",
+      "replacement": "pass = onDisk && sameComponent && rendered && kept, with a failure message that names the defect ('the /uses link exists but does not use HeaderLink'). The source half of the judgement is now a pure exported function, judgeNavHeader, and test/heldout-oracles.js feeds it a correct control and a raw-anchor control and requires them to come out different.",
+      "whyThisIsNotTuning": "It is strictly STRICTER, and it matches the brief that was registered before any product change \u2014 the task was never loosened, the check was simply not reading all of it. It cannot advantage the candidate: it applies identically to both arms, and both were re-run after the correction with the product untouched. The proof needs no agent."
+    }
+  ],
+  "notCovered": [
+    {
+      "class": "E-review",
+      "why": "A review thread needs the app's review ledger and a canvas selection to anchor a pin. The packaged automation door opens a project and serves MCP; it does not seed a human's review. Phase B withdrew its own review task for the same reason rather than fake one. The review surface is proven instead by test/mcp-intelligence.js and test/packaged-audit.js, and is reported as PROTOCOL-SUPPORTED-NOT-HOST-TESTED in the compatibility matrix."
+    }
+  ]
+}

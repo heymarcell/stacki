@@ -587,10 +587,15 @@ operation and everything deliberately left off.
 ### Connecting
 
 **File ▸ AI Connection (MCP)…** shows whether the server is running, the
-endpoint, and a ready-made config for Claude Code or Cursor with the token
-filled in. Copy it from there rather than typing it — and don't commit it.
+endpoint, and a ready-made config for Claude Code or Cursor. Copy it from there
+rather than typing it.
 
-Claude Code:
+Two of the three recipes are **safe to commit**: they name an environment
+variable rather than carrying the token. The one that carries it writes a file
+only you have.
+
+**Claude Code, at user scope** — writes `~/.claude.json`, which is yours alone,
+so the token goes straight in:
 
 ```bash
 claude mcp add --transport http --scope user stacki \
@@ -598,21 +603,55 @@ claude mcp add --transport http --scope user stacki \
   --header "Authorization: Bearer <token>"
 ```
 
-Cursor — `~/.cursor/mcp.json`:
+**Claude Code, as a file** — for `.mcp.json` at the project root, which Claude
+Code's own documentation tells you to check into version control, or for
+`--mcp-config` in a headless run. It names `STACKI_MCP_TOKEN`; Claude Code
+expands `${VAR}` inside `headers`. Note `"type": "http"`, which the Cursor shape
+below does not have:
+
+```json
+{
+  "mcpServers": {
+    "stacki": {
+      "type": "http",
+      "url": "http://127.0.0.1:43821/mcp",
+      "headers": { "Authorization": "Bearer ${STACKI_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+**Cursor** — `~/.cursor/mcp.json` for every project, or `.cursor/mcp.json` for
+one. Cursor's interpolation is spelled `${env:VAR}`:
 
 ```json
 {
   "mcpServers": {
     "stacki": {
       "url": "http://127.0.0.1:43821/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
+      "headers": { "Authorization": "Bearer ${env:STACKI_MCP_TOKEN}" }
     }
   }
 }
 ```
 
-Both are shown at user/global scope on purpose: Stacki switches between
-projects, and the endpoint does not.
+For either of those, export the variable in the shell the host starts from:
+
+```bash
+export STACKI_MCP_TOKEN="<token>"   # "Copy token" in the panel puts it on your clipboard
+```
+
+The token is this machine's. It lives in Stacki's own application-support
+directory, never in your project and never in git — and now, never in a config
+file Stacki hands you for a repository either.
+
+### What this server promises
+
+[`docs/mcp-v1.md`](docs/mcp-v1.md) is the contract — the protocol revisions
+served, the permission model, what a finding may claim, refs and staleness, the
+trust boundary, what the connection costs, and what is explicitly **not**
+promised. [`docs/mcp-compatibility.md`](docs/mcp-compatibility.md) says which
+hosts have actually been driven against it and which have only been assumed.
 
 ## Requirements
 
