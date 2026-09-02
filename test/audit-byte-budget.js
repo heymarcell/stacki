@@ -338,18 +338,41 @@ const envelopeOf = (res) => {
   // A handful of findings is under the count cap and always will be, so if a
   // single evidence field is unbounded then the count cap is not a bound at all.
   {
+    // EVERY FIELD THE PAGE CHOOSES THE LENGTH OF, not only the ones that were
+    // easy to think of. `target.tag` is a tag name off the document and a
+    // custom element's is arbitrary; `evidence` is a free record and a computed
+    // `calc()` round-trips verbatim. Both were unbounded, and neither was in
+    // this fixture, so removing their caps left all 36 checks green.
     const monstrous = plainPage({ violations: 3 });
     for (const r of monstrous.violations) {
       r.help = 'H'.repeat(20000);
       for (const n of r.nodes) {
         n.target = ['S'.repeat(20000)];
         n.refPath = { path: 'P'.repeat(20000), exact: true };
+        n.tag = `x-${'T'.repeat(20000)}`;
+        // `evidence` is a free record. In production `failureSummary` is
+        // clipped where it is collected in the page; the cap here is what
+        // stands between the answer and the next evidence field somebody adds
+        // without remembering to.
+        n.failureSummary = 'F'.repeat(20000);
       }
     }
     const res = await audit(monstrous);
     const size = envelopeOf(res);
     check('three findings with enormous fields are still a small answer', size.textBytes <= HARD_CEILING, short({ ...size, returned: res.returnedFindingCount }));
     check('  and the answer says the fields were shortened', (res.findings || []).some((f) => Array.isArray(f.truncatedFields) && f.truncatedFields.length > 0), short((res.findings || [])[0]?.truncatedFields));
+    check('  naming each one that was cut', (res.findings || []).every((f) => (f.truncatedFields || []).every((n) => typeof n === 'string' && n.length)), short((res.findings || [])[0]?.truncatedFields));
+    check('  including the tag and the evidence, not only the obvious ones',
+      (res.findings || []).some((f) => (f.truncatedFields || []).includes('target.tag')) &&
+        (res.findings || []).some((f) => (f.truncatedFields || []).some((n) => n.startsWith('evidence.'))),
+      short((res.findings || [])[0]?.truncatedFields));
+    check('  and counts them, rather than leaving it to `truncated`',
+      res.truncation.findingsWithShortenedFields === (res.findings || []).filter((f) => f.truncatedFields?.length).length &&
+        res.truncation.findingsWithShortenedFields > 0,
+      short({ counted: res.truncation.findingsWithShortenedFields }));
+    check('  and every string in the answer is under its cap',
+      !/[A-Za-z]{2000,}/.test(JSON.stringify(res)),
+      'a very long unbroken run of characters survived into the answer');
     check('  rather than dropping the findings to hide it', res.returnedFindingCount === res.findingCount, short({ returned: res.returnedFindingCount, detected: res.findingCount }));
   }
 
