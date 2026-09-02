@@ -179,6 +179,39 @@ const plans = [
       await H.settle(300);
       check('and one more undo returns to the original', u3.ok === true && sha(app.read(PAGE)) === originalSha, tag(app.read(PAGE)));
     }
+    // --- A CHANGE THAT IS NOT ONE NODE'S TEXT.
+    //
+    // The write path patches the changed node's span into the file, and for an
+    // attribute edit that is enough on its own to put the bytes back. A
+    // STRUCTURAL change has no such span -- the tree has a different shape, so
+    // the write falls back to serializing the whole document, and the only
+    // thing that can return the original file is the file itself, recorded on
+    // the undo entry. This is the case that proves the snapshot is load-bearing
+    // rather than a second belt over the first one's braces.
+    {
+      const s0 = app.read(PAGE);
+      check('the structural case starts from the original bytes', sha(s0) === originalSha, tag(s0));
+
+      const page = await run('target', 'read');
+      const footer = page.target?.children?.find((c) => c.tag === 'footer');
+      check('the page reports its footer', !!footer?.ref, short(page.target?.children?.map((c) => c.tag)));
+
+      const removed = await run('target', 'remove', { ref: footer.ref });
+      await H.settle(250);
+      const gone = app.read(PAGE);
+      check('the footer can be removed', removed.ok === true && !gone.includes('<footer>'), short(removed));
+      check('  and the file really changed', sha(gone) !== originalSha, tag(gone));
+
+      const undone = await run('project', 'undo');
+      await H.settle(300);
+      const back = app.read(PAGE);
+      check('undo puts the footer back', undone.ok === true && undone.undone === true && back.includes('<footer>'), short(undone));
+      check(
+        '  and the file is byte-for-byte the original again',
+        sha(back) === originalSha,
+        short({ original: `${originalSha.slice(0, 12)} (${Buffer.byteLength(original)}b)`, afterUndo: tag(back) })
+      );
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);

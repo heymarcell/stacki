@@ -111,6 +111,15 @@ const redirectTo = (location, status = 302) => (_req, res) => {
       check('  and still nothing outside', outsideHits() === baseline, short({ hits: outside.hits.slice(baseline) }));
     }
     {
+      // A ROUTE, NOT A HOST -- which is the contract the tool description now
+      // states, and the only thing the agent-boundary layer can answer on its
+      // own: a bare '/landed' has no origin at all, so it is the resolution
+      // against the preview URL that makes this work.
+      const res = await run('project', 'probe', { url: '/landed' });
+      check('a bare project route is resolved against the preview', res.ok === true && res.status === 200, short(res));
+      check('  and reaches nothing outside', outsideHits() === baseline, short({ hits: outside.hits.slice(baseline) }));
+    }
+    {
       const res = await run('project', 'probe', { url: `${project.origin}/redirect-in` });
       check('a SAME-ORIGIN redirect is followed, as it always was', res.ok === true && res.status === 200, short(res));
       check('  and reaches nothing outside', outsideHits() === baseline, short({ hits: outside.hits.slice(baseline) }));
