@@ -215,6 +215,25 @@ page delete, a git commit, a dependency install. This does not invent history
 the app does not have, and the result says `undoable` so an agent is not left
 guessing.
 
+**`undoable: true` means the bytes come back.** Not that the page renders the
+same, not that the model is equivalent — that `SHA256(file)` after the undo is
+the hash it had before the edit. That promise used to be broken: an undo entry
+was a model clone, restoring it re-ran the serializer, and parse-then-serialize
+is not the identity function on a page somebody actually wrote, so a 250-line
+page came back at 259 lines with its indentation mixed. The entry now carries the
+file's own bytes and they are written straight through, so the inverse is an
+inverse. It carries them only when the model and the file agree — while a save is
+still in flight there is nothing honest to record, and undo falls back to
+serializing, as it always did.
+
+The forward direction matters for the same reason. A semantic edit patches the
+node it changed into the file rather than reprinting the document: one
+`set_prop` changes one attribute's bytes, and the comment above an import, the
+author's indentation, the quotes on the other attributes and the markup nowhere
+near the edit are all still exactly what they were. A change that cannot be
+placed — a different tree shape, a frontmatter edit — falls back to a full
+serialization, and says nothing to the contrary.
+
 ### A raw write to the file the editor has open
 
 There is no second write path. `source.write` and `source.replace_range` go

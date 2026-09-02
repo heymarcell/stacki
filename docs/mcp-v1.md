@@ -125,6 +125,13 @@ notification, and re-list after anything that could have changed the surface.
 - **`git.publish` is the boundary.** It is the one operation that reaches outside
   the machine, it is fail-closed, and no automated test performs a real
   authenticated external mutation through it.
+- **`project.probe` reaches the project's own preview and nothing else.** A route
+  is resolved against the preview origin; an absolute URL somewhere else is
+  refused before the request; a redirect off the project origin is stopped rather
+  than followed, so the outside origin receives nothing rather than receiving a
+  request Stacki then disapproves of. It asks the same origin question the audit
+  asks, out of the same module, with the same tolerance for loopback having more
+  than one spelling. (`test/probe-origin-fence.js`.)
 
 ### Refs and staleness
 
@@ -192,6 +199,13 @@ A finding claims exactly one of four things:
   floor reserved for `incomplete` so a busy page cannot empty that bucket — a
   floor, not a ceiling: a page whose findings are all undecided gets all of them,
   up to the budget. (`test/audit-budget.js`.)
+- **And the answer is bounded in bytes, which is the cap that binds.** Sixty
+  findings off a dense page are about 80 KB, and a host that will not deliver
+  that hands the agent an error instead of an audit. Individual fields are capped
+  too — a finding that was shortened names the fields in `truncatedFields` — and
+  `truncation.omittedByByteBudget` is counted apart from the count layer, so
+  "there were more" and "they would not have fitted" stay different facts.
+  (`test/audit-byte-budget.js`.)
 - **Running an audit changes nothing.** No project file, no click, no focus, no
   scroll, no navigation, no move of the person's viewport. Every window it opens
   is registered and destroyed in a `finally`, and the count is asserted.
