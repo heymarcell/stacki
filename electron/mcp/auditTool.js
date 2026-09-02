@@ -89,6 +89,11 @@ const Finding = z.object({
   target: Target,
   evidence: z.record(z.string(), z.unknown()),
   help: z.string().nullable(),
+  // Named when a field on THIS finding was shortened to keep the answer inside
+  // the response budget. Present only when something was: a clipped selector
+  // still looks like a selector, and a reader who is not told cannot know the
+  // one they were handed will not match.
+  truncatedFields: z.array(z.string()).optional(),
 });
 
 const Capture = z.object({
@@ -157,7 +162,12 @@ const AuditOutput = z.object({
       omitted: z.number().int(),
       omittedBeforeScoring: z.object({ geometryCulprits: z.number().int(), axeNodes: z.number().int() }),
       omittedByResponseBudget: z.number().int(),
+      // Findings the answer could not carry: see MAX_RESPONSE_BYTES. Its own
+      // field, because "there were more" and "they would not have fitted" are
+      // different facts and lead a caller to do different things.
+      omittedByByteBudget: z.number().int(),
       responseCap: z.number().int(),
+      responseByteCap: z.number().int(),
       incompleteReserved: z.number().int(),
     })
     .optional(),
@@ -189,7 +199,9 @@ const DESCRIPTION = [
   'a design or quality score. The audit never writes to the project, never clicks or submits anything, and runs',
   'in a window of its own — it does not touch what the person is looking at, and it starts from a wiped browser',
   'session so one audit never inherits another\'s cookies or storage. `findingCount` is the TRUE number detected;',
-  '`returnedFindingCount` is how many came back, and `truncation` says where the rest went. Needs `inspect`.',
+  '`returnedFindingCount` is how many came back, and `truncation` says where the rest went — including',
+  '`omittedByByteBudget`, findings dropped because the answer would not have fitted through the host. A finding',
+  'whose own fields were shortened to fit names them in `truncatedFields`. Needs `inspect`.',
 ].join(' ');
 
 /**
