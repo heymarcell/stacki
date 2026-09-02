@@ -50,6 +50,74 @@ const SETTLE_MS = 250;
 // bomb, and one that silently returns the first twenty is a lie. So: a cap, and
 // the truth about it in the result.
 const MAX_FINDINGS = 60;
+// AND THE BUDGET THAT ACTUALLY BINDS: bytes.
+//
+// A cap on the NUMBER of findings says nothing about how big they are. Sixty
+// findings off a dense page serialize to about 80 KB, and a native Claude Code
+// dogfood had 19 of 72 audit calls (26%) refused by the host --
+// `result (N characters) exceeds maximum allowed tokens` -- between 52,640 and
+// 428,948 characters, in the default configuration, on the plainest possible
+// call. The count cap was green through every one of them.
+//
+// WHY BYTES AND NOT TOKENS. Stacki does not know the host's tokenizer, its
+// version, or its limit, and a budget tuned to one client is a budget that
+// breaks on the next. Bytes are the thing the server can actually count, and
+// they are counted on the serialized payload rather than estimated from the
+// finding list. The number is chosen well under the smallest result this host
+// was measured to refuse, so the margin absorbs whatever the tokenizer does.
+//
+// The envelope sends this payload TWICE -- `structuredContent` and a JSON copy
+// in a text block (agentTools.js `answer`) -- so the wire cost is about twice
+// this. The host counts the text block, which is what this bounds.
+//
+// WHAT IT BOUNDS IS THE FINDINGS PAYLOAD. `captures` is deliberately outside
+// it, and is not counted in the overhead either, so asking for a picture does
+// not quietly cost findings. That is not the same as saying a capture is small:
+// one is up to MAX_BYTES from capture.js before base64, and three of them would
+// exceed any host's limit on their own. Captures are off by default, they were
+// off for every oversize result the dogfood measured, and bounding them here
+// would mean returning none at all -- which is a decision about whether an
+// image belongs in an MCP response, not about audit budgeting. Recorded as a
+// separate question rather than answered by the side effect of this one.
+const MAX_RESPONSE_BYTES = 30000;
+// A quarter of the byte budget is held for `incomplete`, for exactly the reason
+// a quarter of the count budget is: they sort last, so a straight walk down the
+// list spends the whole budget on violations and empties the one bucket whose
+// entire purpose is honest uncertainty. A floor, not a ceiling.
+const INCOMPLETE_BYTE_SHARE = 0.25;
+// What the skeleton cannot include because it is not known until the selection
+// is made: the counts, the truncation block, `dropped`, and the array
+// punctuation around the findings. Measured at ~140 bytes on the widest shape
+// (six viewports, every one named in `dropped`); the allowance is generous
+// because being wrong the other way is a promise broken by fifty bytes.
+const OVERHEAD_SLACK = 1024;
+// A page names at most a handful of places it ended up or refused to load, and
+// each of those is a string the PAGE chose the length of.
+const MAX_NAMED_ROUTES = 8;
+const MAX_NAMED_LENGTH = 300;
+// PER-FIELD CAPS, because the count cap is not a bound while one field is
+// unbounded. `evidence.html` and `evidence.failureSummary` are already clipped
+// to 240 where they are collected; these are the five that were not. Three
+// findings with a 20 KB selector serialize to half a megabyte and never come
+// near the sixty-finding cap.
+const FIELD_CAPS = {
+  message: 400,
+  standard: 120,
+  help: 200,
+  selector: 300,
+  modelPath: 300,
+  // `target.tag` is `el.tagName.toLowerCase()` straight off the page, and a
+  // custom element's name is an arbitrary-length identifier by spec. Review
+  // measured one 40,000-character tag on the top-sorting finding emptying the
+  // whole answer -- `returnedFindingCount: 0`, blamed on the byte budget, in a
+  // 1.8 KB reply with 28 KB of the budget unspent.
+  tag: 80,
+  // `evidence` is a free record. `html`, `failureSummary` and `text` are
+  // clipped where they are collected, but a computed style is whatever the
+  // CSSOM resolved -- a long `calc()` round-trips verbatim -- and nothing here
+  // should depend on remembering to clip the next field somebody adds.
+  evidence: 300,
+};
 const MAX_CAPTURES = 3;
 // axe can return hundreds of nodes for one rule on a big page. Twelve is enough
 // to act on and the number is reported rather than assumed.
@@ -117,56 +185,11 @@ let runSeq = 0;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * The origin of a URL, or null when it does not have one.
- *
- * `data:`, `about:`, `file:` and `javascript:` are OPAQUE origins, and the URL
- * standard spells those as the string "null". Returning that string put the word
- * "null" into a refusal message as though it were a hostname and stopped the
- * "unreadable origin" wording ever being reached. An opaque origin is not an
- * origin, so it comes back as one.
- */
-function originOf(u) {
-  try {
-    const origin = new URL(u).origin;
-    return origin === 'null' ? null : origin;
-  } catch {
-    return null;
-  }
-}
-
-// THE SAME SERVER, SPELLED TWO WAYS.
-//
-// The preview URL Stacki builds itself is `http://127.0.0.1:PORT`, but a dev
-// server the user started and Stacki adopted is scraped from Astro's own output,
-// which prints `http://localhost:PORT`. Those are different origins to a string
-// compare, so a redirect between them -- which frameworks do -- would have been
-// refused as "outside the project" on a page that never left the machine. Same
-// scheme, same port and both names for the loopback interface is the same server.
-const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
-
-/** A test for "is this origin the project's", tolerant of loopback spelling only. */
-function projectOriginTest(projectOrigin) {
-  let base = null;
-  try {
-    base = new URL(projectOrigin);
-  } catch {
-    /* falls through to an exact compare, which will simply never match */
-  }
-  const loopback = !!base && LOOPBACK_NAMES.has(base.hostname);
-  return (origin) => {
-    if (!origin) return false;
-    if (origin === projectOrigin) return true;
-    if (!loopback) return false;
-    let other = null;
-    try {
-      other = new URL(origin);
-    } catch {
-      return false;
-    }
-    return other.protocol === base.protocol && other.port === base.port && LOOPBACK_NAMES.has(other.hostname);
-  };
-}
+// The project-origin test, and the loopback relaxation inside it, live in
+// electron/projectOrigin.js so that `project.probe` asks the same question this
+// engine asks rather than a second one that resembles it. Re-exported at the
+// foot of this file, because the audit's own tests assert it here.
+const { originOf, projectOriginTest } = require('../../projectOrigin.js');
 
 /** The path+query of a URL, for reporting which document was actually measured. */
 function routeOf(u) {
@@ -176,6 +199,111 @@ function routeOf(u) {
   } catch {
     return null;
   }
+}
+
+// The sentence that goes on every answer. Named because the response budget has
+// to measure the result's non-finding overhead before the result exists, and two
+// copies of this paragraph would drift.
+const LIMITS_SENTENCE =
+  'Automated rules find roughly half of the accessibility problems a real audit finds. No violations does not ' +
+  'mean accessible and does not mean WCAG compliant. `incomplete` findings are neither passes nor failures - ' +
+  'a person has to look at them.';
+
+/** The serialized size of a value, in the bytes a host counts. */
+const jsonBytes = (v) => Buffer.byteLength(JSON.stringify(v ?? null), 'utf8');
+
+/**
+ * A finding with its unbounded fields brought inside a cap, saying which.
+ *
+ * The shortening is NAMED in the finding, because a clipped selector still
+ * looks like a selector and a reader who is not told cannot know that the one
+ * they were handed will not match. Nothing here decides whether a finding is
+ * worth keeping -- that is the budget's job below -- and nothing is dropped:
+ * every field survives, shorter.
+ */
+function clipFinding(finding) {
+  const truncatedFields = [];
+  const clip = (value, cap, name) => {
+    if (typeof value !== 'string' || value.length <= cap) return value;
+    truncatedFields.push(name);
+    return `${value.slice(0, cap)}…`;
+  };
+  const target = finding.target || null;
+  const clippedTarget = target
+    ? {
+        ...target,
+        selector: clip(target.selector, FIELD_CAPS.selector, 'target.selector'),
+        modelPath: clip(target.modelPath, FIELD_CAPS.modelPath, 'target.modelPath'),
+        tag: clip(target.tag, FIELD_CAPS.tag, 'target.tag'),
+      }
+    : target;
+  // Every string the page could have chosen the length of, whatever it is
+  // called. Nested one level, which is as deep as `evidence` goes.
+  const clippedEvidence = (() => {
+    const ev = finding.evidence;
+    if (!ev || typeof ev !== 'object') return ev;
+    const shorter = {};
+    for (const [k, v] of Object.entries(ev)) {
+      if (typeof v === 'string') shorter[k] = clip(v, FIELD_CAPS.evidence, `evidence.${k}`);
+      else if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const inner = {};
+        for (const [ik, iv] of Object.entries(v)) {
+          inner[ik] = typeof iv === 'string' ? clip(iv, FIELD_CAPS.evidence, `evidence.${k}.${ik}`) : iv;
+        }
+        shorter[k] = inner;
+      } else shorter[k] = v;
+    }
+    return shorter;
+  })();
+  const out = {
+    ...finding,
+    message: clip(finding.message, FIELD_CAPS.message, 'message'),
+    standard: clip(finding.standard, FIELD_CAPS.standard, 'standard'),
+    help: clip(finding.help, FIELD_CAPS.help, 'help'),
+    ...(clippedTarget ? { target: clippedTarget } : {}),
+    ...(finding.evidence !== undefined ? { evidence: clippedEvidence } : {}),
+  };
+  // Absent rather than empty, so an untouched finding is the shape it always
+  // was and a reader can test the field's presence.
+  if (truncatedFields.length) out.truncatedFields = truncatedFields;
+  return out;
+}
+
+/**
+ * As many findings as fit, most important first, undecided keeping their floor.
+ *
+ * Mirrors the count cap deliberately: the two buckets are filled separately so
+ * that a page whose violations would swallow the whole budget still returns
+ * some of what the engine could not decide. `overhead` is the measured size of
+ * everything in the result that is not a finding, so the budget is spent on the
+ * answer rather than on an estimate of it.
+ */
+function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES) {
+  const room = Math.max(0, budget - overhead);
+  const sized = sorted.map((f) => ({ finding: f, bytes: jsonBytes(f) + 1 }));
+  const undecided = sized.filter((s) => s.finding.kind === 'incomplete');
+  const decided = sized.filter((s) => s.finding.kind !== 'incomplete');
+
+  const fill = (list, allowance) => {
+    const out = [];
+    let used = 0;
+    for (const item of list) {
+      if (used + item.bytes > allowance) break;
+      out.push(item.finding);
+      used += item.bytes;
+    }
+    return { out, used };
+  };
+
+  // What the undecided bucket would actually use, capped at its share. Taking
+  // the smaller of the two is what makes this a floor: a page with two
+  // incomplete findings does not reserve a quarter of the budget for them.
+  const wanted = undecided.reduce((n, s) => n + s.bytes, 0);
+  const reserve = Math.min(wanted, Math.floor(room * INCOMPLETE_BYTE_SHARE));
+
+  const first = fill(decided, room - reserve);
+  const second = fill(undecided, room - first.used);
+  return [...first.out, ...second.out];
 }
 
 /** Reject rather than hang for ever on a page that never loads. */
@@ -810,7 +938,44 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     const floorUndecided = Math.min(INCOMPLETE_SHARE, undecided.length);
     const keptDecided = decided.slice(0, MAX_FINDINGS - floorUndecided);
     const keptUndecided = undecided.slice(0, MAX_FINDINGS - keptDecided.length);
-    const kept = sortFindings([...keptDecided, ...keptUndecided]);
+    const byCount = sortFindings([...keptDecided, ...keptUndecided]);
+
+    // AND THEN THE SECOND CAP, WHICH IS THE ONE THAT WAS MISSING.
+    //
+    // The count cap above has now chosen sixty. This asks the only question the
+    // host will ask: how big is that? The fields are brought inside their caps
+    // first -- shortening a selector keeps a finding, dropping a finding loses
+    // one -- and then as many of the survivors as fit are taken, in the order
+    // they were already in.
+    //
+    // The overhead is MEASURED, not guessed: everything the result carries that
+    // is not a finding, serialized, so the budget is spent on the actual answer.
+    // `truncation` and the counts are integers that are not known until after
+    // the selection, so a small allowance stands in for them; being generous
+    // there costs a finding, and being wrong the other way costs the promise.
+    const clipped = byCount.map(clipFinding);
+    // BOUNDED, BECAUSE THE PAGE CHOOSES THEM. `finalRoutes` is a path and query
+    // read off the document, and `blockedSubframeOrigins` had no count cap at
+    // all -- one entry per distinct off-origin frame. Review measured a page
+    // redirecting to a long same-origin URL pushing the answer to 53,836 bytes
+    // with zero findings returned: over the smallest result the host refused,
+    // and the budget spent on a string the page wrote.
+    const routes = [...finalRoutes].slice(0, MAX_NAMED_ROUTES).map((r) => String(r).slice(0, MAX_NAMED_LENGTH));
+    const subframes = [...blockedSubframes].slice(0, MAX_NAMED_ROUTES).map((o) => String(o).slice(0, MAX_NAMED_LENGTH));
+    const overhead =
+      jsonBytes({
+        ok: true,
+        runId,
+        route: safeRoute,
+        ...(routes.length ? { finalRoutes: routes } : {}),
+        url,
+        ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
+        engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true },
+        viewports: perViewport,
+        limits: LIMITS_SENTENCE,
+      }) + OVERHEAD_SLACK;
+    const kept = fitToBytes(clipped, overhead);
+    const omittedByBytes = clipped.length - kept.length;
 
     // ONE RESULT, BUILT ONCE.
     //
@@ -828,11 +993,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       route: safeRoute,
       // Present only when a same-origin redirect landed somewhere else. The
       // findings describe THIS document, not `route`.
-      ...(finalRoutes.size ? { finalRoutes: [...finalRoutes] } : {}),
+      ...(routes.length ? { finalRoutes: routes } : {}),
       url,
       // Off-origin documents this run refused to load INSIDE the page. Present
       // only when there were some: the page was measured without them.
-      ...(blockedSubframes.size ? { blockedSubframeOrigins: [...blockedSubframes] } : {}),
+      ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
       engine: {
         accessibility: axeVersion ? `axe-core ${axeVersion}` : null,
         error: engineError,
@@ -864,9 +1029,24 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         omitted: Math.max(0, detectedTotal - kept.length),
         // Discarded inside the page, before Stacki ever saw them.
         omittedBeforeScoring: omittedBefore,
-        // Discarded by the response budget, after scoring.
-        omittedByResponseBudget: Math.max(0, sorted.length - kept.length),
+        // Discarded by the finding-count cap, after scoring. This counts ONLY
+        // that layer: it used to absorb everything between scoring and the
+        // answer, and a byte budget hiding inside it would be exactly the
+        // silent discard the rest of this block exists to prevent.
+        omittedByResponseBudget: Math.max(0, sorted.length - byCount.length),
+        // And discarded because the answer would not have fitted through the
+        // host. Its own number, because it is its own reason: a caller seeing
+        // this one knows to narrow the route or the viewports rather than to
+        // assume the page has sixty problems.
+        omittedByByteBudget: omittedByBytes,
+        // Findings that came back whole, but with a field of their own
+        // shortened. `truncated` is about the LIST being short and stays
+        // about that; this is the other kind of loss, and a reader who is not
+        // told cannot know that the selector they were handed will not match.
+        findingsWithShortenedFields: kept.filter((f) => Array.isArray(f.truncatedFields) && f.truncatedFields.length).length,
         responseCap: MAX_FINDINGS,
+        responseByteCap: MAX_RESPONSE_BYTES,
+        fieldCaps: FIELD_CAPS,
         incompleteReserved: INCOMPLETE_SHARE,
       },
       dropped: {
@@ -887,10 +1067,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       captures,
       // Said in the payload, not only in the documentation, because this is the
       // sentence somebody will quote out of context.
-      limits:
-        'Automated rules find roughly half of the accessibility problems a real audit finds. No violations does not ' +
-        'mean accessible and does not mean WCAG compliant. `incomplete` findings are neither passes nor failures - ' +
-        'a person has to look at them.',
+      limits: LIMITS_SENTENCE,
     };
 
     // AN AUDIT THAT COULD NOT CLEAN UP IS NOT AN ISOLATED AUDIT.
@@ -900,7 +1077,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // next audit may now see what this one left behind. A warning beside ok:true
     // would be the swallow this replaced, wearing a different hat.
     if (cleanupReset && cleanupReset.ok === false) {
-      const measured = finalRoutes.size ? [...finalRoutes].join(', ') : safeRoute;
+      // Bounded like everything else in the answer: this is a page-chosen
+      // string, and it is added AFTER the budget has been spent. Review
+      // measured a 72,573-byte message on this path.
+      const measured = (routes.length ? routes.join(', ') : String(safeRoute)).slice(0, MAX_NAMED_LENGTH * 2);
       return {
         ...result,
         ok: false,
@@ -930,6 +1110,10 @@ module.exports = {
   liveWindows,
   axeSource,
   MAX_FINDINGS,
+  // Exported for the same reason MAX_FINDINGS is: a budget a test can only
+  // guess at is a budget that can be raised to make a failing test pass.
+  MAX_RESPONSE_BYTES,
+  FIELD_CAPS,
   MAX_CAPTURES,
   SETTLE_MS,
   LOAD_TIMEOUT_MS,

@@ -142,8 +142,11 @@ const kindCounts = (res) => ({
   // --- MORE UNDECIDED THAN THE BUDGET: it fills, and says it was cut.
   {
     const res = await audit(page({ incomplete: 120 }));
-    check('more incomplete than the budget fills it exactly', res.returnedFindingCount === 60, short(res.returnedFindingCount));
+    check('more incomplete than the budget fills it', res.returnedFindingCount > 0 && res.returnedFindingCount <= 60, short(res.returnedFindingCount));
+    // The COUNT layer's own number, isolated: sixty of the hundred and twenty
+    // were dropped here, whatever the byte layer went on to do afterwards.
     check('  and says so, with the true total', res.truncated === true && res.findingCount === 120 && res.truncation.omittedByResponseBudget === 60, short(res.truncation));
+    check('  with both layers accounting for every one that did not come back', res.truncation.omittedByResponseBudget + res.truncation.omittedByByteBudget === 120 - res.returnedFindingCount, short(res.truncation));
   }
 
   // --- THE BUCKET THE RESERVE EXISTS FOR: a busy page must be unchanged.
@@ -152,12 +155,27 @@ const kindCounts = (res) => ({
   // With more violations than the whole budget, `incomplete` is severity `info`
   // and sorts last, so a flat slice would take sixty violations and send the
   // undecided bucket to zero. Fifteen of it survives, exactly as before.
+  //
+  // THE NUMBERS ARE RELATIONAL, AND THAT IS DELIBERATE. There is now a second
+  // cap after this one -- MAX_RESPONSE_BYTES, which bounds the size of the
+  // answer rather than the length of the list -- and on a fixture of this many
+  // findings it is the one that bites. Pinning `=== 15` here would be pinning
+  // the interaction of two budgets, and would go red for a reason that has
+  // nothing to do with the property this section exists to protect: that the
+  // undecided bucket keeps a floor instead of being emptied by findings that
+  // sort above it. `test/audit-byte-budget.js` owns the byte layer.
   {
     const res = await audit(page({ violations: 96, incomplete: 48 }));
     const counts = kindCounts(res);
-    check('a busy page still reserves a quarter for the undecided', counts.incomplete === 15, short(counts));
-    check('  and gives the rest to what was decided', counts.standard === 45, short(counts));
-    check('  filling the budget and no more', res.returnedFindingCount === 60, short(res.returnedFindingCount));
+    const returned = res.returnedFindingCount;
+    check('a busy page still reserves a share for the undecided', counts.incomplete >= Math.floor(returned / 4) - 1 && counts.incomplete > 0, short({ counts, returned }));
+    check('  and gives the rest to what was decided', counts.standard === returned - counts.incomplete && counts.standard > counts.incomplete, short(counts));
+    // NOT `returned === standard + incomplete`: these fixtures produce no
+    // mechanical or advisory findings, and `returnedFindingCount` IS
+    // `findings.length` in the product, so that conjunct was true whatever the
+    // budget did. What it meant is that the answer is AT a cap rather than
+    // short of one.
+    check('  filling the budget and no more', returned <= 60 && res.truncation.omittedByResponseBudget + res.truncation.omittedByByteBudget > 0, short({ returned, truncation: res.truncation }));
     check('  while reporting the true total', res.findingCount === 144 && res.truncated === true, short({ detected: res.findingCount }));
   }
 
@@ -175,7 +193,8 @@ const kindCounts = (res) => ({
     const res = await audit(page({ violations: 12, incomplete: 120 }));
     const counts = kindCounts(res);
     check('every decided finding survives a flood of undecided ones', counts.standard === 12, short(counts));
-    check('  and the undecided fill what is left', counts.incomplete === 48 && res.returnedFindingCount === 60, short({ counts, returned: res.returnedFindingCount }));
+    check('  and the undecided fill what is left', counts.incomplete > 12 && res.returnedFindingCount === counts.standard + counts.incomplete, short({ counts, returned: res.returnedFindingCount }));
+    check('  up to whichever cap ran out first', res.returnedFindingCount <= 60 && res.findingCount === 132, short(res.truncation));
   }
 
   // --- AND THE SENTENCE THAT MUST BE ON EVERY ANSWER.

@@ -80,19 +80,17 @@ function attrsAsWritten(node) {
   return flat(node.attrSource) === flat(serializeAttrs(node.props)) ? node.attrSource : null;
 }
 
+/** One attribute, as this serializer writes it. */
+function attrText(name, v) {
+  if (v?.type === 'spread') return `{...${v.value}}`;
+  if (v == null || v.type === 'bare') return name;
+  if (v.type === 'expr') return `${name}={${v.value}}`;
+  return `${name}="${String(v.value).replace(/"/g, '&quot;')}"`;
+}
+
 function serializeAttrs(props) {
   const parts = [];
-  for (const [name, v] of Object.entries(props || {})) {
-    if (v?.type === 'spread') {
-      parts.push(`{...${v.value}}`);
-    } else if (v == null || v.type === 'bare') {
-      parts.push(name);
-    } else if (v.type === 'expr') {
-      parts.push(`${name}={${v.value}}`);
-    } else {
-      parts.push(`${name}="${String(v.value).replace(/"/g, '&quot;')}"`);
-    }
-  }
+  for (const [name, v] of Object.entries(props || {})) parts.push(attrText(name, v));
   return parts.length ? ' ' + parts.join(' ') : '';
 }
 
@@ -1126,6 +1124,304 @@ function serializePage(model) {
   // Blank lines the file ended on.
   for (let i = 0; i < (model.trailingBlank || 0); i++) lines.push('');
   return lines.join('\n') + '\n';
+}
+
+// ---------------------------------------------------------------------------
+// Writing a change WITHOUT rewriting the file
+// ---------------------------------------------------------------------------
+//
+// `serializePage` prints the whole document from the model. That is correct and
+// it is what a new file needs, but it is not what an EDIT needs: parsing a real
+// page and serializing it straight back is not the identity function -- see
+// test/expectations.json, which has carried the known losses for a long time --
+// so every semantic write reformatted everything it touched. One `set_prop` on
+// a 250-line page moved three comments away from the imports they annotated,
+// re-indented the body, and changed quotes nobody had asked about. In a project
+// without git, which is the ordinary case for a new Stacki project, the
+// original was simply gone.
+//
+// The fix is not to make the serializer lossless. That is unbounded work on the
+// parser the whole editor stands on, and it would still rewrite the file. The
+// fix is to stop rewriting the file: find the one node the model changed, and
+// put its new text where its old text was. Everything else in the file is then
+// untouched BY CONSTRUCTION rather than by the serializer being careful.
+//
+// AND IT IS CHECKED BEFORE IT IS WRITTEN. The spliced text is parsed again and
+// required to mean what the model means -- both sides through the same
+// canonicalizing serializer, so formatting cannot make them differ and meaning
+// cannot make them agree. Anything that fails any test on the way falls back to
+// `serializePage`, which is exactly what this path did before. The worst case
+// is the old behaviour; there is no case that is worse than it.
+
+/** The whitespace at the start of the line `offset` sits on, if it is all whitespace. */
+function indentAt(source, offset) {
+  const lineStart = source.lastIndexOf('\n', offset - 1) + 1;
+  const lead = source.slice(lineStart, offset);
+  return /^[ \t]*$/.test(lead) ? lead : '';
+}
+
+/** One node's text, at the indentation the file already uses there. */
+function nodeText(node, indent) {
+  const lines = [];
+  // `blankBefore` is the gap in FRONT of the node, and the span being replaced
+  // starts at the node itself -- emitting it here would add a blank line on
+  // every save.
+  serializeNode({ ...node, blankBefore: 0 }, indent, lines);
+  const text = lines.join('\n');
+  // The first line's indent is already in the file, before the span starts.
+  return text.startsWith(indent) ? text.slice(indent.length) : text;
+}
+
+// One attribute in an opening tag, as the file actually wrote it: the
+// whitespace in front of it, its name, and its value with whatever quotes the
+// author chose. Deliberately the same shapes TAG_RE already allows through.
+const ATTR_RE = /(\s+)(?:(\{\.\.\.(?:[^{}]|\{[^{}]*\})*\})|([A-Za-z_@:$][\w:.$-]*)(\s*=\s*(?:"[^"]*"|'[^']*'|\{(?:[^{}]|\{[^{}]*\})*\}|[^\s"'>]+))?)/g;
+
+/**
+ * The attribute text with ONE attribute's worth of change made to it.
+ *
+ * Rebuilding the whole tag from the model would be correct and would also
+ * rewrite `class='x'` as `class="x"` on an edit that had nothing to do with
+ * `class`. So the attributes that did not change keep their own bytes, the one
+ * that did is written the ordinary way, and a new one is appended. Anything
+ * this cannot account for returns null and the caller rebuilds the tag.
+ */
+function patchAttrs(text, baseProps, nextProps) {
+  const base = baseProps || {};
+  const next = nextProps || {};
+  const seen = new Set();
+  let out = '';
+  let cursor = 0;
+  ATTR_RE.lastIndex = 0;
+  let m;
+  while ((m = ATTR_RE.exec(text)) !== null) {
+    // Anything between attributes that the pattern did not claim means this
+    // tag is a shape the patcher does not understand.
+    if (m.index !== cursor) return null;
+    cursor = m.index + m[0].length;
+    const [, space, spread, name] = m;
+    if (spread) {
+      // A spread has no name to key on. Kept verbatim while the model still
+      // holds one that says the same thing, and bailed on otherwise.
+      const stillThere = Object.values(next).some((v) => v?.type === 'spread' && `{...${v.value}}` === spread);
+      if (!stillThere) return null;
+      out += space + spread;
+      continue;
+    }
+    // A name that appears twice is written once. `<div class="a" class="b">` is
+    // one attribute to every HTML parser, and rewriting both occurrences
+    // produced `class="c" class="c"` -- text the check accepts, because the
+    // reparse dedupes it back to the same model.
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (!Object.prototype.hasOwnProperty.call(next, name)) continue; // removed
+    const before = attrText(name, base[name]);
+    const after = attrText(name, next[name]);
+    // Unchanged in meaning: the file's own bytes, quotes and all.
+    out += space + (before === after ? m[0].slice(space.length) : after);
+  }
+  // What is left is the whitespace before the tag's own bracket -- the line
+  // break a multi-line attribute block ends on. Anything else means the
+  // pattern did not understand this tag.
+  const tail = text.slice(cursor);
+  if (!/^\s*$/.test(tail)) return null;
+  for (const [name, v] of Object.entries(next)) {
+    if (seen.has(name) || v?.type === 'spread') continue;
+    out += ` ${attrText(name, v)}`;
+  }
+  // A new attribute goes with the others, in front of that break, rather than
+  // after it on the line the bracket is on.
+  return out + tail;
+}
+
+/** The frontmatter as this serializer would write it, for comparing two models. */
+function frontmatterText(model) {
+  const lines = [];
+  serializeFrontmatter(model, lines);
+  return lines.join('\n');
+}
+
+/** The node itself, without its subtree, to ask whether IT changed or something inside it did. */
+const headOf = (node) => ({ ...node, children: Array.isArray(node.children) ? [] : node.children });
+
+/**
+ * The single node two trees disagree about, or null when it is not one node.
+ *
+ * Descends as far as the change goes: a prop set on a component three levels
+ * down reports that component, not the page's root. More than one sibling
+ * changed, or a tree of a different shape, is not a local edit and says so.
+ */
+function locateChange(baseNodes, nextNodes) {
+  if (!Array.isArray(baseNodes) || !Array.isArray(nextNodes)) return null;
+  if (baseNodes.length !== nextNodes.length) return null;
+  // COMPARED BY MEANING, NOT BY SERIALIZED TEXT. A `.map()` body carries its
+  // own as-written source, which goes stale the moment a child inside it is
+  // mutated -- so the two sides' TEXT differed at the map while their meaning
+  // differed only at the component inside it, and the splice replaced the whole
+  // expression and reformatted it.
+  let at = -1;
+  for (let i = 0; i < baseNodes.length; i += 1) {
+    if (!sameMeaning(baseNodes[i], nextNodes[i])) {
+      if (at !== -1) return null;
+      at = i;
+    }
+  }
+  if (at === -1) return { unchanged: true };
+  const base = baseNodes[at];
+  const next = nextNodes[at];
+  const hasKids = Array.isArray(base.children) && Array.isArray(next.children);
+  // Only the subtree differs: go further in, so the span replaced is as small
+  // as the change actually is.
+  if (hasKids && sameMeaning(headOf(base), headOf(next))) {
+    const deeper = locateChange(base.children, next.children);
+    if (deeper && !deeper.unchanged) return deeper;
+    return { base, next };
+  }
+  // Only the opening tag differs, and the whole subtree under it is untouched.
+  // Replacing the node would reprint every one of those children for an edit
+  // that was one attribute long.
+  const sameKids =
+    hasKids &&
+    base.children.length === next.children.length &&
+    base.children.every((c, i) => sameMeaning(c, next.children[i]));
+  // A self-closing tag IS its opening tag: there is no subtree to preserve, but
+  // there is a multi-line attribute block, and reprinting the node flattens it.
+  const selfClosing = base.children === null && next.children === null;
+  if (sameKids || selfClosing) return { base, next, headOnly: true };
+  return { base, next };
+}
+
+// The fields that describe how a node was WRITTEN rather than what it says: a
+// parse-local id, source offsets, and the four verbatim caches the serializer
+// consults to keep a file's own layout. Everything not named here is compared,
+// so a field this list has never heard of makes two nodes differ and the write
+// falls back -- which is the safe direction.
+const AS_WRITTEN = new Set(['id', 'start', 'end', 'source', 'attrSource', 'headSource', 'closeSource']);
+
+/**
+ * Do these two models say the same thing?
+ *
+ * Comparing serialized text cannot answer this. `serializePage` is not
+ * canonicalizing -- `attrsAsWritten` and its three siblings deliberately keep a
+ * file's own layout -- so the same meaning has many spellings, and a correct
+ * splice was rejected whenever the spliced file kept a layout the model's stale
+ * caches had already lost. Measured: a `set_prop` on a component inside a
+ * `.map()`, and a multi-line attribute block written with double quotes, both
+ * fell back to rewriting the whole document.
+ */
+function sameMeaning(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return a === b;
+  if (typeof a !== 'object' || typeof b !== 'object') return a === b;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => sameMeaning(v, b[i]));
+  }
+  // ONLY A NODE HAS AS-WRITTEN FIELDS. Applying the skip list at every depth
+  // skipped `props.id` as well -- a prop legitimately called `id` -- and a
+  // `set_prop` that added one then read back as no change at all.
+  const isNode = typeof a.kind === 'string' || typeof b.kind === 'string';
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)].filter((k) => !(isNode && AS_WRITTEN.has(k))));
+  for (const k of keys) {
+    // `undefined` and absent are the same thing here: one side came from a
+    // parse and the other from a model the editor has been mutating.
+    if (a[k] === undefined && b[k] === undefined) continue;
+    if (!sameMeaning(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * The bytes to write for `model`, keeping everything `source` already said.
+ *
+ * Falls back to a full serialization whenever the change cannot be placed
+ * confidently -- a different tree shape, a frontmatter edit, a node with no
+ * recorded span, or a splice that does not read back as the model asked for.
+ */
+function anchoredSerialize(source, model) {
+  const canonical = serializePage(model);
+  if (typeof source !== 'string' || !source) return canonical;
+
+  let base = null;
+  try {
+    base = parsePage(source, { locs: true });
+  } catch {
+    return canonical;
+  }
+  if (!base?.editable || !base.model) return canonical;
+
+  // A frontmatter change is not a body edit, and the import block is rebuilt
+  // from the model rather than patched -- so those go the old way.
+  if (frontmatterText(base.model) !== frontmatterText(model)) return canonical;
+  if ((base.model.trailingBlank || 0) !== (model.trailingBlank || 0)) return canonical;
+  if (!!base.model.hadFrontmatter !== !!model.hadFrontmatter) return canonical;
+
+  const spot = locateChange(base.model.nodes || [], model.nodes || []);
+  if (!spot) return canonical;
+
+  let spliced;
+  if (spot.unchanged) {
+    // Nothing in the page's markup moved. Chunk edits land here: their content
+    // lives in another file and writeChunks handles it, and the page keeping
+    // its exact bytes is the correct answer rather than a missed opportunity.
+    spliced = source;
+  } else {
+    const { start, end } = spot.base;
+    if (typeof start !== 'number' || typeof end !== 'number') return canonical;
+    if (!(start >= 0 && end > start && end <= source.length)) return canonical;
+    // THE SPAN MUST BE THE NODE, AND NOTHING AROUND IT.
+    //
+    // A text node's range starts where the PREVIOUS node ended, so it carries
+    // the line break and indent that sit between them -- and `serializeNode`
+    // strips a text run's boundary spaces, on the assumption that the newlines
+    // either side already are that whitespace. Replacing the wide span with the
+    // narrow text therefore deleted a space the page renders:
+    // `<label>Name: <input /></label>` came back as `<label>Name:<input />`.
+    // The check could not see it, because the same stripping happens on both
+    // sides of the comparison. So a span that begins or ends in whitespace is
+    // not this node's text, and is not spliced.
+    const held = source.slice(start, end);
+    if (/^\s|\s$/.test(held)) return canonical;
+
+    spliced = null;
+    if (spot.headOnly) {
+      // The opening tag, exactly as the parser found it, so the span replaced
+      // is the tag and not the element. TAG_RE is sticky: it matches here or
+      // not at all.
+      TAG_RE.lastIndex = start;
+      const tag = TAG_RE.exec(source);
+      if (tag && tag.index === start && tag[1] === spot.next.name) {
+        const attrsAt = start + 1 + tag[1].length;
+        const patched = patchAttrs(tag[2], spot.base.props, spot.next.props);
+        if (patched !== null) {
+          spliced = source.slice(0, attrsAt) + patched + source.slice(attrsAt + tag[2].length);
+        }
+      }
+    }
+    if (spliced === null) {
+      spliced = source.slice(0, start) + nodeText(spot.next, indentAt(source, start)) + source.slice(end);
+    }
+  }
+
+  // READ IT BACK AND CHECK IT SAYS WHAT WAS ASKED FOR.
+  //
+  // Not by comparing serialized text: `serializePage` keeps a file's own layout
+  // where it can, so the same meaning has many spellings and a correct splice
+  // was thrown away whenever the spliced file kept a layout the model's stale
+  // caches had lost. `sameMeaning` compares the two trees on everything except
+  // the as-written caches, and treats any field it does not know about as
+  // meaning -- so the unknown case falls back rather than being waved through.
+  let check = null;
+  try {
+    check = parsePage(spliced);
+  } catch {
+    return canonical;
+  }
+  if (!check?.editable || !check.model) return canonical;
+  if (!sameMeaning(check.model.nodes, model.nodes)) return canonical;
+  if (frontmatterText(check.model) !== frontmatterText(model)) return canonical;
+  return spliced;
 }
 
 // Inline runs (text + simple tags like <strong>/<em>) serialize on a single
@@ -3026,6 +3322,8 @@ module.exports = {
   parsePage,
   locateSelection,
   serializePage,
+  // The write path for an EDIT: keeps the file and patches the change into it.
+  anchoredSerialize,
   serializePageMarked,
   parseTemplate,
   serializeNodes,

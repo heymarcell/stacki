@@ -375,7 +375,12 @@ const settle = (ms = 60) => new Promise((done) => setTimeout(done, ms));
  * the human — select something, edit a file behind the agent's back, read what
  * is on disk.
  */
-async function start(root, { agentMode = 'full', realDevServer = false } = {}) {
+// `devUrl` seeds the address the harness reports as main's dev server without
+// starting one. A real Astro install takes a minute and answers a question the
+// caller may not be asking: a suite about what `project.probe` is ALLOWED to
+// reach needs a project origin it controls, not a project origin that works.
+// Anything that actually renders still needs `realDevServer`.
+async function start(root, { agentMode = 'full', realDevServer = false, devUrl = null } = {}) {
   const { handlers, callMain } = loadMain();
   const dom = makeDom();
 
@@ -384,7 +389,7 @@ async function start(root, { agentMode = 'full', realDevServer = false } = {}) {
   let payload = null;
   // Where main's dev server is, as of the last start or stop that went through
   // this bridge — the harness's stand-in for reading `devServer` in main.
-  let devUrlNow = null;
+  let devUrlNow = devUrl;
   // The app's own answer to an mcp:ask, registered by its effect.
   let askHandler = null;
   const replies = new Map();

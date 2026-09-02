@@ -157,12 +157,34 @@ applies its own fixes.
 
 ## Bounds, and what the numbers mean
 
-There are three caps, and they used to hide from each other. Two of them apply
+There are four caps, and they used to hide from each other. Two of them apply
 *inside the page*, before Stacki has seen anything: at most 12 accessibility
 nodes per rule, and at most 40 geometry culprits per viewport. The third is the
 response budget of 60 findings. `findingCount` was the number that survived all
 three, and was described as "the true one" — so a rule with fifty violations
 reported twelve and called that the total.
+
+The fourth is **the size of the answer**, and it is the one that binds in
+practice. A cap on the number of findings says nothing about how big they are:
+sixty findings off a dense page serialize to about 80 KB, and a native Claude
+Code dogfood had 19 of 72 audit calls refused by the host — `result (N
+characters) exceeds maximum allowed tokens`, between 52,640 and 428,948
+characters, in the default configuration, on the plainest possible call — while
+`responseCap: 60` was satisfied every time.
+
+So the result is bounded in **bytes**, measured on the serialized payload rather
+than estimated from the list. Bytes and not tokens on purpose: Stacki does not
+know the host's tokenizer, its version or its limit, and a budget tuned to one
+client breaks on the next. The envelope also sends the payload twice — once as
+`structuredContent` and once as a JSON string in a text block — so the wire cost
+is about twice the number below.
+
+Individual fields are capped too, because the count cap is not a bound while one
+field is unbounded: three findings carrying a 20 KB selector serialize to half a
+megabyte and never approach sixty. A finding whose own fields were shortened
+names them in `truncatedFields`, because a clipped selector still looks like a
+selector and a reader who is not told cannot know that the one they were handed
+will not match.
 
 | field | means |
 | --- | --- |
@@ -170,12 +192,23 @@ reported twelve and called that the total.
 | `returnedFindingCount` | how many are in `findings` |
 | `omittedFindingCount` | the difference |
 | `truncated` | true if anything was dropped at **any** layer |
-| `truncation` | where it went: `omittedBeforeScoring` (in-page caps) vs `omittedByResponseBudget` |
+| `truncation.omittedBeforeScoring` | dropped inside the page, before Stacki saw them |
+| `truncation.omittedByResponseBudget` | dropped by the finding-**count** cap, and only that layer |
+| `truncation.omittedByByteBudget` | dropped because the answer would not have fitted through the host |
+| `truncation.responseCap` · `responseByteCap` | the two budgets, named |
+| `findings[].truncatedFields` | fields on this finding that were shortened; absent when none were |
 
 A caller reading 12 no longer has to wonder whether that means "there were 12" or
-"there may have been 500". A quarter of the response budget is reserved for
-`incomplete`, so a page with many violations cannot silently empty the one bucket
-whose whole purpose is honest uncertainty.
+"there may have been 500". A quarter of each budget is reserved for `incomplete`,
+so a page with many violations cannot silently empty the one bucket whose whole
+purpose is honest uncertainty — and the byte pass fills the two buckets
+separately for exactly the reason the count pass does.
+
+The two layers are counted separately on purpose. `omittedByResponseBudget` used
+to absorb everything between scoring and the answer; a byte budget hiding inside
+it would be the silent discard this whole section exists to prevent. A caller
+seeing `omittedByByteBudget` knows to narrow the route or the viewports rather
+than to conclude the page has sixty problems.
 
 Captures are off by default, capped in number, and encoded through the same
 bounded encoder `capture` uses.
