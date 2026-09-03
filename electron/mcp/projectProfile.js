@@ -100,6 +100,20 @@ function breakpointsFrom(sources) {
   return [...seen.values()].sort((a, b) => a.px - b.px);
 }
 
+// The dependencies that generate CSS the project does not author. A fixed list
+// of names, matched exactly: a name-shape heuristic over the project's classes
+// would mislabel the author's own, and there is no need to guess when
+// package.json states it.
+const CSS_GENERATOR_DEPS = [
+  'tailwindcss',
+  '@tailwindcss/vite',
+  '@tailwindcss/postcss',
+  '@astrojs/tailwind',
+  'unocss',
+  '@unocss/astro',
+  '@unocss/vite',
+];
+
 /** package.json, as facts rather than as a blob. */
 function packageFacts(text) {
   let pkg;
@@ -114,6 +128,7 @@ function packageFacts(text) {
     .sort();
   return {
     readable: true,
+    cssPackages: CSS_GENERATOR_DEPS.filter((name) => deps[name]).map((name) => ({ name, version: String(deps[name]) })),
     name: typeof pkg.name === 'string' ? pkg.name : null,
     type: pkg.type || null,
     astro: deps.astro || null,
@@ -163,14 +178,29 @@ async function buildProfile(run) {
   const sourceList = capped(styleSources?.sources || [], CAPS.styleSources);
   const cssTexts = [];
   for (const s of sourceList.items) {
-    if (s.kind !== 'file') continue;
-    const path = s.label;
+    // A `<style>` block of the open file has no path to read back; a component
+    // file has one, and its page-wide block can hold the only media query in a
+    // project. Skipping every source that was not a plain `file` lost those.
+    if (s.kind !== 'file' && s.kind !== 'astro') continue;
+    // The label of a component source is a bare filename ("Nav.astro"), which
+    // read_source cannot resolve. `path` is the project-relative one.
+    const path = s.path || (s.kind === 'file' ? s.label : null);
+    if (!path) continue;
     const got = await ask('style', 'read_source', { path });
     if (got?.ok === false) continue;
-    if (typeof got?.text === 'string') cssTexts.push({ path, text: got.text });
+    // style.read_source answers under `css`. Reading `got.text` — the shape
+    // source.read uses — meant cssTexts was empty in every project there has
+    // ever been, and the note below then stated as a fact that the project had
+    // no breakpoints. Both spellings are accepted so a rename cannot silently
+    // do it again, and `stylesheetsRead` below makes an empty list checkable.
+    const text = typeof got?.css === 'string' ? got.css : typeof got?.text === 'string' ? got.text : null;
+    if (text !== null) cssTexts.push({ path, text });
   }
 
   const pkg = pkgRead?.ok === false ? { readable: false } : packageFacts(pkgRead?.text ?? '');
+  // Null rather than [] when package.json could not be read at all: "none of
+  // these are depended on" and "nobody could tell" are different answers.
+  const cssPackages = pkg.readable ? pkg.cssPackages : null;
   const tokens = capped(tokensFrom(variables), CAPS.tokens);
   const pages = capped(scan.pages, CAPS.pages);
   const components = capped(scan.components, CAPS.components);
@@ -238,13 +268,40 @@ async function buildProfile(run) {
         items: bps.items,
         total: bps.total,
         truncated: bps.truncated,
+        // How many of the sources above were actually read back. Without it,
+        // "no breakpoints" and "nothing was read" are the same answer — and for
+        // a long time it WAS the same answer, given confidently.
+        stylesheetsRead: cssTexts.length,
+        stylesheetsOffered: sourceList.total,
         // Said explicitly, because "no breakpoints" and "we did not look" are
         // very different facts and an agent should not have to guess which it got.
         note:
-          bps.total === 0
-            ? 'No width media queries were found in this project’s stylesheets. It has no authored breakpoints.'
-            : 'Read from @media width queries in the project’s own stylesheets.',
+          bps.total > 0
+            ? 'Read from @media width queries in the project’s own stylesheets.'
+            : cssTexts.length > 0
+              ? `No width media queries in the ${cssTexts.length} stylesheet${cssTexts.length === 1 ? '' : 's'} read. This project has no authored breakpoints.`
+              : 'No stylesheet could be read, so no breakpoint was looked for. This says nothing about whether the project has any.',
         source: 'style.read_source over style.list_sources',
+      },
+      // WHAT GENERATES CSS THIS PROJECT DOES NOT AUTHOR.
+      //
+      // Kept out of `framework.integrations` on purpose. That list is built by
+      // filtering package.json for `@astrojs/*`, and Tailwind 4 ships as a Vite
+      // plugin — so its absence from that list is a fact about the list, not
+      // about the project, and folding it in would make a correct field wrong.
+      // What is stated here is only what package.json says outright: the name
+      // and the version. WHICH utilities the framework generates, and whether a
+      // given class on an element is one of them, are not knowable from the
+      // project's own files at all — `project.classes` reports `grid` and
+      // `pricing-grid` side by side — so nothing here guesses at either.
+      css: {
+        packages: cssPackages,
+        note:
+          'Names and versions quoted from package.json. A CSS framework that ships as a Vite plugin (Tailwind 4) is ' +
+          'not an Astro integration, so it will never appear in framework.integrations — its absence there is not ' +
+          'evidence it is unused. The CSS these generate exists only in what the dev server serves; it is in no ' +
+          'project file, and Stacki does not report which utilities they emit or which classes on an element are theirs.',
+        source: 'package.json (via source.read)',
       },
       classes: {
         items: classList.items,
@@ -272,4 +329,4 @@ async function buildProfile(run) {
   };
 }
 
-module.exports = { buildProfile, CAPS, MAX_PROFILE_BYTES, tokensFrom, breakpointsFrom, packageFacts };
+module.exports = { buildProfile, CAPS, MAX_PROFILE_BYTES, CSS_GENERATOR_DEPS, tokensFrom, breakpointsFrom, packageFacts };

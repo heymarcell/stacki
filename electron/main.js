@@ -4867,11 +4867,31 @@ handle('style:listFiles', async (_e, projectPath) => {
 // A component's `<style is:global>` is page CSS. Astro leaves those rules
 // unhashed, so they style whatever the page renders — including elements that
 // live in a different file from the one being edited, which is exactly the case
-// the style panel used to be blind to. Scoped `<style>` blocks are deliberately
-// left out: Astro hashes them to their own component's elements, so their rules
-// can't reach a selection made from another file.
-const ASTRO_GLOBAL_STYLE = /<style\b[^>]*\bis:global\b[^>]*>/i;
+// the style panel used to be blind to. A scoped `<style>` is hashed to its own
+// component's elements, so its rules can't reach a selection made from another
+// file — with one exception, and it is the reason this scan is not a single
+// regex: `:global(.thing)` inside a scoped block is left UNHASHED by Astro and
+// does reach the page. A component whose only page-wide CSS is written that way
+// used to be invisible here, and the rule it contributes went missing from
+// every cascade the panel and the agent computed. Both kinds are offered now;
+// which rules of a file are actually taken is decided in webflow.ts, where the
+// text is parsed rather than pattern-matched.
+const ASTRO_STYLE_BLOCK = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
 const ASTRO_SCAN_LIMIT = 512 * 1024; // a .astro file this big isn't a component
+
+/** Whether any `<style>` in this component contributes CSS to the whole page. */
+function astroStyleReachesPage(text) {
+  ASTRO_STYLE_BLOCK.lastIndex = 0;
+  let match;
+  while ((match = ASTRO_STYLE_BLOCK.exec(text))) {
+    if (/\bis:global\b/i.test(match[1])) return true;
+    // Only a selector that is ENTIRELY `:global(...)` escapes the component;
+    // `:global(.a) .b` still hashes `.b`. The parser applies that rule exactly,
+    // so this only has to be cheap enough to skip the files that cannot match.
+    if (/:global\s*\(/.test(match[2])) return true;
+  }
+  return false;
+}
 
 function listAstroStyleFiles(root) {
   const out = [];
@@ -4895,7 +4915,7 @@ function listAstroStyleFiles(root) {
       try {
         const { size } = fs.statSync(full);
         if (size > ASTRO_SCAN_LIMIT) continue;
-        if (!ASTRO_GLOBAL_STYLE.test(fs.readFileSync(full, 'utf8'))) continue;
+        if (!astroStyleReachesPage(fs.readFileSync(full, 'utf8'))) continue;
         out.push({ rel: toPosix(relPath), name: entry.name, path: full, size });
       } catch {
         /* unreadable — nothing to offer for it */
@@ -4911,6 +4931,100 @@ function listAstroStyleFiles(root) {
 handle('style:listAstroStyles', async (_e, projectPath) => {
   if (!projectPath) return { files: [] };
   return { files: listAstroStyleFiles(projectPath) };
+});
+
+// Which stylesheets this page actually pulls in.
+//
+// listCssFiles above walks the WHOLE project, because the panel's "add custom
+// styles in:" picker should offer every stylesheet somebody might want to write
+// into. As an input to a CASCADE that is wrong in a way that produces confident
+// nonsense: a stylesheet no page imports was reported as overriding one every
+// page loads. Nothing here can prove a file is unreachable — an `@import` deep
+// in a package, a framework's own injection, `astro.config` — so this answers
+// only the positive half: the files reached by following imports from the open
+// page, through the layouts and components it imports, and through `@import`
+// inside the stylesheets themselves. Everything else stays UNKNOWN rather than
+// being called unreachable.
+const IMPORT_SPECIFIER = /\bimport\s+(?:[^'"]*?\bfrom\s*)?['"]([^'"]+)['"]/g;
+const CSS_AT_IMPORT = /@import\s+(?:url\()?\s*['"]([^'"]+)['"]/g;
+const REACH_DEPTH = 4;
+
+function listReachingStyles(root, fromRel) {
+  const seen = new Set();
+  const css = new Set();
+  const visit = (rel, depth) => {
+    if (depth > REACH_DEPTH || !rel || seen.has(rel)) return;
+    seen.add(rel);
+    let text;
+    try {
+      text = fs.readFileSync(path.join(root, rel), 'utf8');
+    } catch {
+      return; // a file that cannot be read tells us nothing either way
+    }
+    const isCss = /\.(css|scss|sass|less)$/i.test(rel);
+    const pattern = isCss ? CSS_AT_IMPORT : IMPORT_SPECIFIER;
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text))) {
+      const spec = match[1];
+      // Only a relative specifier can be resolved to a file in this project
+      // with certainty. A bare one ("tailwindcss", "@fontsource/inter/400.css")
+      // resolves through node_modules, which is not what this is measuring.
+      if (!spec.startsWith('.')) continue;
+      const target = toPosix(path.relative(root, path.resolve(path.dirname(path.join(root, rel)), spec)));
+      if (!target || target.startsWith('..')) continue;
+      if (/\.(css|scss|sass|less)$/i.test(target)) {
+        css.add(target);
+        visit(target, depth + 1);
+      } else if (/\.(astro|jsx?|tsx?|svelte|vue)$/i.test(target)) {
+        visit(target, depth + 1);
+      }
+    }
+  };
+  visit(toPosix(String(fromRel || '')), 0);
+  return [...css].sort();
+}
+
+handle('style:reachingFiles', async (_e, { projectPath, file } = {}) => {
+  if (!projectPath || !file) return { files: [], from: null };
+  const abs = path.resolve(String(projectPath));
+  const rel = toPosix(path.isAbsolute(String(file)) ? path.relative(abs, String(file)) : String(file));
+  if (!rel || rel.startsWith('..')) return { files: [], from: null };
+  return { files: listReachingStyles(abs, rel), from: rel };
+});
+
+// The dependency that generates CSS this project does not author.
+//
+// Tailwind 4 is a Vite plugin, not an Astro integration, so the framework's own
+// integration list cannot see it — and its utilities exist only in what the dev
+// server serves. The name and the version as package.json spells them is the
+// one exact thing that can be said about them. No class-name sniffing: `grid`
+// and `pricing-grid` sit side by side in every project's class list, and a
+// name-shape guess would mislabel the author's own classes.
+const CSS_GENERATOR_DEPS = [
+  'tailwindcss',
+  '@tailwindcss/vite',
+  '@tailwindcss/postcss',
+  '@astrojs/tailwind',
+  'unocss',
+  '@unocss/astro',
+  '@unocss/vite',
+];
+
+function cssGeneratorPackages(root) {
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  } catch {
+    return null; // no package.json read — which is not the same as no framework
+  }
+  const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  return CSS_GENERATOR_DEPS.filter((name) => deps[name]).map((name) => ({ name, version: String(deps[name]) }));
+}
+
+handle('style:generators', async (_e, projectPath) => {
+  if (!projectPath) return { packages: null };
+  return { packages: cssGeneratorPackages(path.resolve(String(projectPath))) };
 });
 
 handle('style:readFile', async (_e, filePath) => {

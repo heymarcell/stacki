@@ -24,9 +24,30 @@ function subjectHasState(text: string): boolean {
 }
 
 export type DeclStatus = {
+  /**
+   * Whether this declaration is the one that applies AT REST. False only when
+   * another base declaration for the same property beat it.
+   *
+   * Read it with `resolved`. For a conditional declaration (@media, :hover)
+   * this is true because nothing at rest overrides it — which is not the same
+   * statement as "this is the value the element has", and a caller that cannot
+   * tell the two apart will report two winners for one property.
+   */
   winning: boolean
   /** Selector of the declaration that overrides this one, when not winning. */
   overriddenBy: string | null
+  /** Where that overriding declaration was authored. Three rules in three
+   *  stylesheets can share a selector, so the text alone cannot name it. */
+  overriddenByOrigin: { selector: string; source: string; sourceLabel: string } | null
+  /**
+   * Whether `winning` is the result of a cascade at all.
+   *
+   * False for a conditional rule: it applies only inside its @media query or
+   * its interaction state, and resolving it would need a viewport and a pointer
+   * this module is not given. The panel shows those as "what applies in that
+   * state" and needs no more; anything asserting a winner has to stop here.
+   */
+  resolved: boolean
 }
 
 export type MatchedRule = {
@@ -122,7 +143,19 @@ export async function computeRuleModel(rules: ParsedRule[], target: MatchTarget)
   }
 
   // Cascade winners among base hits, keyed by property.
-  type Contribution = { declId: string; prop: string; important: boolean; specificity: Specificity; seq: number; selectorText: string }
+  type Contribution = {
+    declId: string
+    prop: string
+    important: boolean
+    specificity: Specificity
+    seq: number
+    selectorText: string
+    /** The source the winner was authored in, carried through the sort so a
+     *  losing declaration can name the file that beat it and not only the
+     *  selector — which several stylesheets can share, and here do. */
+    embedKey: string
+    embedLabel: string
+  }
   const contributions: Contribution[] = []
   let seq = 0
   for (const hit of hits) {
@@ -135,11 +168,13 @@ export async function computeRuleModel(rules: ParsedRule[], target: MatchTarget)
         specificity: hit.strongestBase.specificity,
         seq: seq++,
         selectorText: hit.strongestBase.selector.text,
+        embedKey: hit.rule.embedKey,
+        embedLabel: hit.rule.embedLabel,
       })
     }
   }
 
-  const winners = new Map<string, { declId: string; selectorText: string }>()
+  const winners = new Map<string, Contribution>()
   const byProp = new Map<string, Contribution[]>()
   contributions.forEach((c) => {
     const list = byProp.get(c.prop) ?? []
@@ -147,8 +182,7 @@ export async function computeRuleModel(rules: ParsedRule[], target: MatchTarget)
     byProp.set(c.prop, list)
   })
   byProp.forEach((list, prop) => {
-    const winner = [...list].sort((a, b) => compareCascade(a, b, a.seq, b.seq))[0]
-    winners.set(prop, { declId: winner.declId, selectorText: winner.selectorText })
+    winners.set(prop, [...list].sort((a, b) => compareCascade(a, b, a.seq, b.seq))[0])
   })
 
   const base: MatchedRule[] = []
@@ -158,13 +192,22 @@ export async function computeRuleModel(rules: ParsedRule[], target: MatchTarget)
     const declStatus: Record<string, DeclStatus> = {}
     for (const decl of hit.rule.declarations) {
       if (hit.conditional) {
-        declStatus[decl.declId] = { winning: true, overriddenBy: null }
+        // Nothing at rest overrides it, and nothing here resolved it either.
+        declStatus[decl.declId] = { winning: true, overriddenBy: null, overriddenByOrigin: null, resolved: false }
         continue
       }
       const winner = winners.get(decl.prop)
-      declStatus[decl.declId] = winner && winner.declId === decl.declId
-        ? { winning: true, overriddenBy: null }
-        : { winning: false, overriddenBy: winner ? winner.selectorText : null }
+      declStatus[decl.declId] =
+        winner && winner.declId === decl.declId
+          ? { winning: true, overriddenBy: null, overriddenByOrigin: null, resolved: true }
+          : {
+              winning: false,
+              overriddenBy: winner ? winner.selectorText : null,
+              overriddenByOrigin: winner
+                ? { selector: winner.selectorText, source: winner.embedKey, sourceLabel: winner.embedLabel }
+                : null,
+              resolved: true,
+            }
     }
 
     const matched: MatchedRule = {

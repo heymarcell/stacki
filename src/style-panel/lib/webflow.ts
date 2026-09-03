@@ -20,6 +20,7 @@
 
 import { collectRules, renderEmbed, splitEmbed } from './css'
 import postcss from 'postcss'
+import type { Root } from 'postcss'
 import { findNode, getHost, onHostChange, propText, walkNodes, type HostNode } from './host'
 import type { StateKey } from './resolved'
 import type {
@@ -172,6 +173,12 @@ export async function resolveIdentityElement(selected: AnyEl): Promise<AnyEl> {
 
 // ───────────────────────────── Style sources ─────────────────────────────
 
+/** The two file lists styleSources() builds from — see scanPage's override. */
+export type StyleFileLists = {
+  files?: Array<{ rel: string; name: string; path: string; size: number }>
+  astroFiles?: Array<{ rel: string; name: string; path: string; size: number }>
+}
+
 export type EmbedSource = {
   key: string
   label: string
@@ -187,6 +194,11 @@ export type EmbedSource = {
     | { kind: 'file'; path: string }
     | { kind: 'node'; nodeId: string }
     | { kind: 'astro'; path: string }
+  /** Whether the CSS this source offers reaches the whole page ('global') or
+   *  only the elements the open component itself renders ('scoped'). A caller
+   *  that cannot tell the two apart cannot tell a rule that will apply
+   *  everywhere from one Astro has hashed to a single component. */
+  scope: 'global' | 'scoped'
 }
 
 export type EmbedDoc = {
@@ -194,6 +206,14 @@ export type EmbedDoc = {
   code: string
   segments: string[]
   regions: StyleRegion[]
+  /**
+   * Rules this source contributes to the page but that must never be written
+   * back through it — the `:global(...)` rules of a scoped `<style>` block.
+   * The block itself stays verbatim in `regions` (root null), so serializeDoc
+   * cannot touch it; these are a second, pruned parse of the same text, for
+   * reading only. See escapedRegion.
+   */
+  escaped?: StyleRegion[]
 }
 
 export type EmbedScan = {
@@ -231,12 +251,14 @@ export function embedSourceClassSuffix(): string {
 // Every source of CSS that reaches this page, in cascade order: stylesheets
 // first (they're linked in <head>), then the page's own <style> blocks, which
 // come later in the document and so win ties.
-function styleSources(): EmbedSource[] {
+function styleSources(override?: StyleFileLists | null): EmbedSource[] {
   const host = getHost()
+  const files = override?.files ?? host.files
+  const astroFiles = override?.astroFiles ?? host.astroFiles
   const out: EmbedSource[] = []
   let order = 0
 
-  for (const f of host.files) {
+  for (const f of files) {
     out.push({
       key: `file:${f.path}`,
       label: f.rel,
@@ -246,6 +268,7 @@ function styleSources(): EmbedSource[] {
       order: order++,
       element: f.path,
       origin: { kind: 'file', path: f.path },
+      scope: 'global',
     })
   }
 
@@ -255,7 +278,7 @@ function styleSources(): EmbedSource[] {
   // empty panel even though the element is clearly styled on the canvas. The
   // open file is skipped: its own <style> blocks come from the model below,
   // and reading it twice would let the two copies write over each other.
-  for (const f of host.astroFiles) {
+  for (const f of astroFiles) {
     if (host.openFilePath && f.path === host.openFilePath) continue
     out.push({
       key: `astro:${f.path}`,
@@ -266,6 +289,9 @@ function styleSources(): EmbedSource[] {
       order: order++,
       element: f.path,
       origin: { kind: 'astro', path: f.path },
+      // Only the blocks that reach the page are parsed out of a component
+      // file (docForSource), so everything this source offers is page-wide.
+      scope: 'global',
     })
   }
 
@@ -281,6 +307,9 @@ function styleSources(): EmbedSource[] {
       order: order++,
       element: n.id,
       origin: { kind: 'node', nodeId: n.id },
+      // The open file's own `<style>`: hashed to what this file renders unless
+      // it says otherwise, and the elements being styled are this file's.
+      scope: isGlobal ? 'global' : 'scoped',
     })
   })
 
@@ -290,13 +319,23 @@ function styleSources(): EmbedSource[] {
 // Both scans return the same thing: this app has no page/component boundary
 // to cross — opening a component swaps the model, and the sources are read
 // from whatever is open.
-export async function scanPage(): Promise<PageScan> {
+export async function scanPage(
+  /**
+   * Stylesheets to scan instead of the ones on the host record. The panel's own
+   * effects are what put them there, and the panel mounts only when somebody
+   * opens the Style tab — so a session driven entirely through MCP can reach
+   * this with an empty list and get an empty cascade that says nothing about
+   * the element. The agent passes its own list; nothing is written back, so the
+   * panel's record stays the panel's.
+   */
+  override?: StyleFileLists | null,
+): Promise<PageScan> {
   const { parentByKey, childrenByKey, elementByKey } = buildTreeMaps()
   return {
     parentByKey,
     childrenByKey,
     elementByKey,
-    pageEmbeds: styleSources(),
+    pageEmbeds: styleSources(override),
     instances: [],
     inComponentContext: false,
   }
@@ -349,23 +388,96 @@ function isGlobalRegion(region: StyleRegion): boolean {
   return region.openTag == null || /\bis:global\b/.test(region.openTag)
 }
 
+/** A selector written entirely as `:global(...)`, unwrapped — or null. */
+function unwrapGlobal(selector: string): string | null {
+  const text = selector.trim()
+  if (!/^:global\s*\(/i.test(text) || !text.endsWith(')')) return null
+  // Balanced to the END of the string: `:global(.a):hover` and `:global(.a) .b`
+  // both leave something outside the wrapper, and that something is hashed.
+  let depth = 0
+  for (let i = text.indexOf('('); i < text.length; i += 1) {
+    if (text[i] === '(') depth += 1
+    else if (text[i] === ')') {
+      depth -= 1
+      if (depth === 0) return i === text.length - 1 ? text.slice(text.indexOf('(') + 1, i).trim() || null : null
+    }
+  }
+  return null
+}
+
+/**
+ * What a SCOPED `<style>` block contributes to the rest of the page.
+ *
+ * Astro hashes a scoped block to the elements its own component renders, so
+ * none of it can reach a selection made from another file — except a selector
+ * written entirely as `:global(...)`, which Astro leaves alone. Those rules do
+ * apply, they can win, and a cascade that omits them is missing a declaration
+ * that is really there. So the block is parsed a second time and pruned down to
+ * exactly those rules, each unwrapped to the selector the browser will see.
+ *
+ * The original block stays verbatim in the doc's own regions (root null), which
+ * is what stops serializeDoc from ever writing this pruned copy back over the
+ * author's file. Nothing here is editable; writeEmbedDoc refuses rather than
+ * lose an edit silently, and the rules are flagged so callers can say why.
+ */
+function escapedRegion(region: StyleRegion): StyleRegion | null {
+  let root: Root
+  try {
+    root = postcss.parse(region.css)
+  } catch {
+    return null // an unparseable scoped block offers the page nothing
+  }
+  root.walkRules((rule) => {
+    const unwrapped = rule.selectors.map(unwrapGlobal)
+    if (unwrapped.some((sel) => sel === null)) {
+      rule.remove()
+      return
+    }
+    rule.selectors = unwrapped as string[]
+  })
+  root.walkAtRules((at) => {
+    if (!at.nodes || at.nodes.length === 0) at.remove()
+  })
+  let kept = 0
+  root.walkRules(() => {
+    kept += 1
+  })
+  if (!kept) return null
+  return { start: region.start, end: region.end, css: region.css, root, openTag: region.openTag }
+}
+
+// Rules that came out of a pruned scoped block. A write aimed at one of them
+// would be serialized away in silence, so everything that can write asks first.
+const readOnlyRules = new WeakSet<ParsedRule>()
+
+/** Whether this rule was read out of a source Stacki must not write back. */
+export function isReadOnlyRule(rule: ParsedRule): boolean {
+  return readOnlyRules.has(rule)
+}
+
 function docForSource(source: EmbedSource, code: string): EmbedDoc {
   // A component file is markup with <style> blocks in it — the shape the embed
-  // model was built for. Only its global blocks are parsed; a scoped block is
-  // left as untouched text, so renderEmbed writes it back verbatim and
-  // rebuildRules (which skips region.root === null) never offers its rules for
-  // an element in another component.
+  // model was built for. Only its global blocks are parsed for editing; a
+  // scoped block is left as untouched text, so renderEmbed writes it back
+  // verbatim and rebuildRules (which skips region.root === null) never offers
+  // its hashed rules for an element in another component. Its `:global(...)`
+  // rules are a different matter — see escapedRegion.
   if (source.origin.kind === 'astro') {
     const { segments, regions } = splitEmbed(code)
+    const escaped: StyleRegion[] = []
     for (const region of regions) {
-      if (!isGlobalRegion(region)) continue
+      if (!isGlobalRegion(region)) {
+        const reaching = escapedRegion(region)
+        if (reaching) escaped.push(reaching)
+        continue
+      }
       try {
         region.root = postcss.parse(region.css)
       } catch (err) {
         region.parseError = String((err as Error)?.message || err)
       }
     }
-    return { source, code, segments, regions }
+    return { source, code, segments, regions, escaped }
   }
   const region: StyleRegion = { start: 0, end: code.length, css: code, root: null }
   try {
@@ -432,6 +544,20 @@ export async function writeEmbedDoc(
    *  so the canvas doesn't wait out a typing debounce for a single click. */
   live = false,
 ): Promise<{ ok: true; code: string } | { ok: false; error: string }> {
+  // An edit to a `:global()` rule of a scoped block has nowhere to go: the
+  // block is verbatim in doc.regions, so serializeDoc would hand back the file
+  // unchanged and this would report a write that never happened. Refuse while
+  // the edit is still in hand, rather than lose it and say nothing.
+  for (const region of doc.escaped || []) {
+    if (region.root && region.root.toString() !== region.css) {
+      return {
+        ok: false,
+        error:
+          `${doc.source.label} offers that rule through a scoped <style> block's :global(), which Stacki reads but ` +
+          'does not write. Edit the block in the component, or author the rule in a stylesheet.',
+      }
+    }
+  }
   const code = serializeDoc(doc)
   // What the file held before this write — the undo target, captured before
   // doc.code is advanced below.
@@ -486,6 +612,7 @@ async function writeStyleFileAndReload(doc: EmbedDoc, path: string, text: string
   const fresh = docForSource(doc.source, text)
   doc.segments = fresh.segments
   doc.regions = fresh.regions
+  doc.escaped = fresh.escaped
   doc.code = text
   for (const fn of docsReloaded) fn()
 }
@@ -511,6 +638,23 @@ export function rebuildRules(docs: EmbedDoc[]): ParsedRule[] {
           order,
         }),
       )
+    })
+    // The `:global(...)` rules of the file's scoped blocks. They come after the
+    // file's own global blocks in document order, which is where they are in
+    // the file. Region indices continue past the real ones so no two
+    // declarations in one source can be handed the same id.
+    ;(doc.escaped || []).forEach((region, index) => {
+      const collected = collectRules(region, {
+        embedKey: doc.source.key,
+        embedLabel: doc.source.label,
+        fromComponent: doc.source.fromComponent,
+        componentName: doc.source.componentName,
+        regionIndex: doc.regions.length + index,
+        idSeed: doc.source.key,
+        order,
+      })
+      for (const rule of collected) readOnlyRules.add(rule)
+      rules.push(...collected)
     })
   }
   return rules

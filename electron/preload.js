@@ -1637,6 +1637,77 @@ if (!process.isMainFrame) {
     ),
   });
 
+  // The rules the DOCUMENT says match this element.
+  //
+  // Everything else the panel and the agent know about CSS comes from reading
+  // the project's own files, and a whole class of CSS is not in them: Tailwind
+  // utilities, UnoCSS, anything a PostCSS plugin emits. It exists only in what
+  // the dev server serves, which is this document — so this is the only place
+  // it can be seen at all. Nothing here is editable and nothing here gets a
+  // file: a generated rule has no authored location, and handing one back with
+  // a source would invite a write that can only fail.
+  //
+  // Written as a plain named function taking its document, so the same text can
+  // be run against a document a test controls (test/style-cascade-truth.js);
+  // the preload runs in an isolated world nothing can require.
+  function matchedRulesIn(doc, el, limit) {
+    const out = [];
+    // A stylesheet from another origin throws on .cssRules. That is a rule that
+    // may well apply and cannot be read, so it is counted rather than ignored —
+    // "none found" and "none readable" are different answers.
+    let unreadable = 0;
+    const sheets = doc.styleSheets || [];
+    for (let i = 0; i < sheets.length; i++) {
+      let top;
+      try {
+        top = sheets[i].cssRules;
+      } catch {
+        unreadable++;
+        continue;
+      }
+      if (!top) {
+        unreadable++;
+        continue;
+      }
+      const where = (sheets[i].href && String(sheets[i].href)) || 'inline <style>';
+      const walk = (list, atContext) => {
+        for (let j = 0; j < list.length && out.length < limit; j++) {
+          const rule = list[j];
+          const nested = rule.cssRules;
+          if (nested && nested.length) {
+            const condition =
+              rule.conditionText || (rule.media && rule.media.mediaText) || '';
+            walk(nested, condition ? atContext.concat(`@${rule.name || 'media'} ${condition}`) : atContext);
+            continue;
+          }
+          const selector = rule.selectorText;
+          if (typeof selector !== 'string' || !selector) continue;
+          let hit = false;
+          try {
+            hit = el.matches(selector);
+          } catch {
+            continue; // a selector this engine will not test is not a match
+          }
+          if (!hit) continue;
+          out.push({
+            selector,
+            cssText: (rule.style && rule.style.cssText) || '',
+            atContext,
+            stylesheet: where,
+            origin: 'document',
+            editable: false,
+          });
+        }
+      };
+      walk(top, []);
+    }
+    return { rules: out, unreadable };
+  }
+
+  // Enough to explain what is painting an element without shipping the whole
+  // of a utility framework's output.
+  const MAX_DOCUMENT_RULES = 60;
+
   window.addEventListener('message', (e) => {
     if (e.source !== window.parent) return;
     const d = e.data;
@@ -1723,6 +1794,7 @@ if (!process.isMainFrame) {
           computedProps,
           identity: els[0] ? identityOf(els[0]) : null,
           matched,
+          documentRules: d.rules && els[0] ? matchedRulesIn(document, els[0], MAX_DOCUMENT_RULES) : null,
         },
         '*'
       );
@@ -2022,6 +2094,11 @@ contextBridge.exposeInMainWorld('avb', {
 
   // Style panel targets
   listStyleFiles: invoke('style:listFiles'),
+  // Which stylesheets the open page actually imports, and which dependency
+  // generates CSS the project does not author — both facts the cascade has to
+  // state rather than let a caller assume. See electron/main.js.
+  stylesReaching: invoke('style:reachingFiles'),
+  styleGenerators: invoke('style:generators'),
   listAstroStyleFiles: invoke('style:listAstroStyles'),
   readStyleFile: invoke('style:readFile'),
   writeStyleFile: invoke('style:writeFile'),

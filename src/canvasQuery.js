@@ -55,9 +55,12 @@ export function tellCanvas(message) {
 
 // Ask the page about one node: what it renders as, which of `selectors` target
 // it, what `compute` values resolve to on it, and its computed style for `props`.
+// `rules` additionally asks for the rules the DOCUMENT says match it, which is
+// the only way to see CSS the project does not author (Tailwind's utilities and
+// anything else generated at build time).
 // Resolves null when the canvas can't answer — the caller then falls back rather
 // than treating silence as "no".
-export function queryCanvas(path, selectors = [], compute = [], props = []) {
+export function queryCanvas(path, selectors = [], compute = [], props = [], { rules = false } = {}) {
   if (!frame || typeof path !== 'string') return Promise.resolve(null);
   const id = nextId++;
   return new Promise((resolve) => {
@@ -68,7 +71,7 @@ export function queryCanvas(path, selectors = [], compute = [], props = []) {
     const entry = {
       resolve,
       timer,
-      message: { type: 'avb:query', id, path, selectors, compute, props },
+      message: { type: 'avb:query', id, path, selectors, compute, props, rules },
       held: false,
     };
     pending.set(id, entry);
@@ -112,6 +115,10 @@ export function receiveCanvasReply(data) {
           matched: data.matched || {},
           computed: data.computed || {},
           computedProps: data.computedProps || {},
+          // Null, not [], when the rules were not asked for or the page could
+          // not read them: "nobody looked" and "nothing matched" are different
+          // answers and the caller has to be able to tell them apart.
+          documentRules: data.documentRules || null,
         }
       : null
   );
