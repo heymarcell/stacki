@@ -96,13 +96,34 @@ const Finding = z.object({
   truncatedFields: z.array(z.string()).optional(),
 });
 
+// A CAPTURE ROW DESCRIBES A PICTURE. IT IS NOT THE PICTURE.
+//
+// `data` used to be here, and a single base64 string was 98.8% of a real
+// response: one viewport, one rule, zero findings, 127,029 characters, and the
+// host replaced the whole result with a file pointer. The bytes now travel as
+// MCP `image` content blocks, in the order the rows with `included: true`
+// appear, which is where the protocol puts images and where Stacki's own
+// `capture` tool has always put them.
+//
+// `included` is required and there is no `data` field to be half-present: a row
+// can say "no image was sent for this viewport", and it cannot imply one that is
+// not there. The sizes are nullable for exactly that row.
 const Capture = z.object({
   viewport: z.object({ key: z.string(), width: z.number().int(), height: z.number().int() }),
-  mimeType: z.string(),
-  bytes: z.number().int(),
-  width: z.number().int(),
-  height: z.number().int(),
-  data: z.string(),
+  // True when an image block for this viewport is in the response.
+  included: z.boolean(),
+  mimeType: z.string().nullable(),
+  bytes: z.number().int().nullable(),
+  width: z.number().int().nullable(),
+  height: z.number().int().nullable(),
+  // The identity of the picture, so a before and an after can be compared
+  // without either being sent twice.
+  sha256: z.string().nullable(),
+  // Always true, and said rather than assumed: an audit capture is the project's
+  // own page loaded again at the requested width in a window of the audit's own.
+  // It is not the Stacki UI and not the person's current breakpoint.
+  renderedOffscreen: z.boolean(),
+  note: z.string(),
 });
 
 const AuditOutput = z.object({
@@ -158,6 +179,10 @@ const AuditOutput = z.object({
   truncation: z
     .object({
       detected: z.number().int(),
+      // What the page handed Stacki, after the two in-page caps and before
+      // either response cap. `counts` below breaks THIS number down by kind.
+      // Optional so a payload minted before it existed still validates.
+      scored: z.number().int().optional(),
       returned: z.number().int(),
       omitted: z.number().int(),
       omittedBeforeScoring: z.object({ geometryCulprits: z.number().int(), axeNodes: z.number().int() }),
@@ -175,6 +200,9 @@ const AuditOutput = z.object({
       incompleteReserved: z.number().int(),
     })
     .optional(),
+  // BY KIND, OVER THE SCORED SET -- `truncation.scored`, which is what the page
+  // handed Stacki. These sum to that and to neither `findingCount` (which counts
+  // what the page capped too) nor `returnedFindingCount` (what fitted).
   counts: z.object({
     mechanical: z.number().int(),
     standard: z.number().int(),
@@ -182,6 +210,9 @@ const AuditOutput = z.object({
     incomplete: z.number().int(),
   }).optional(),
   captures: z.array(Capture).optional(),
+  // What to do about a picture, or a route, the answer could not carry whole.
+  // Present only when there is something to do.
+  next: z.string().optional(),
   dropped: z
     .object({
       culpritsTruncatedAtViewports: z.array(z.string()),
@@ -202,10 +233,16 @@ const DESCRIPTION = [
   'a person has to look at. No violations does NOT mean accessible or WCAG compliant, and nothing here produces',
   'a design or quality score. The audit never writes to the project, never clicks or submits anything, and runs',
   'in a window of its own — it does not touch what the person is looking at, and it starts from a wiped browser',
-  'session so one audit never inherits another\'s cookies or storage. `findingCount` is the TRUE number detected;',
+  'session so one audit never inherits another\'s cookies or storage. It will not NAVIGATE off the project\'s',
+  'origin: an absolute route, a redirect, a frame navigation are refused before the request leaves the process.',
+  'It is not a network fence — the page renders as a visitor renders it, so its own subresources are fetched and',
+  'its scripts run, because a page stripped of its stylesheet is not the page whose layout you asked about.',
+  '`findingCount` is the TRUE number detected;',
   '`returnedFindingCount` is how many came back, and `truncation` says where the rest went — including',
   '`omittedByByteBudget`, findings dropped because the answer would not have fitted through the host. A finding',
-  'whose own fields were shortened to fit names them in `truncatedFields`. Needs `inspect`.',
+  'whose own fields were shortened to fit names them in `truncatedFields`. `truncation.scored` is what the page ' +
+  'handed Stacki after its own caps, and `counts` breaks THAT number down by kind — not `findingCount` and not ' +
+  '`returnedFindingCount`. Needs `inspect`.',
 ].join(' ');
 
 /**
@@ -251,11 +288,27 @@ function registerAuditTool(server, { audit, api }) {
           .array(z.string())
           .max(40)
           .optional()
-          .describe('Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix.'),
+          .describe(
+            'Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix. ' +
+              'This scopes the ACCESSIBILITY engine and only that: the geometry probe is not a rule in this list ' +
+              'and always runs. A rule id the engine does not have comes back in `engine.unknownRules` rather ' +
+              'than being accepted in silence. An EMPTY list means no accessibility pass at all — no engine, no ' +
+              'run, `engine.accessibility: null` — which is how you get geometry and a picture without paying ' +
+              'for a full WCAG run.'
+          ),
         capture: z
           .boolean()
           .optional()
-          .describe('Return a screenshot per viewport, taken in the same state the findings were measured in. Off by default: findings are the useful part and images are large.'),
+          .describe(
+            'Return a screenshot per viewport, taken in the same state the findings were measured in. Off by ' +
+              'default: findings are the useful part. The picture arrives as an IMAGE BLOCK in the response, not ' +
+              'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about, and ' +
+              '`included` says whether an image was actually sent for it. Each picture is the page rendered ' +
+              'OFFSCREEN at the width you asked for, as a visitor sees it — not the Stacki UI and not the ' +
+              'breakpoint the person has open. This, with viewports:[{width,height}] and rules:[], is how to see ' +
+              'a route at a width of your own choosing; the `capture` tool cannot change the person\'s breakpoint ' +
+              'and will not resize their window.'
+          ),
       }),
       outputSchema: AuditOutput,
       // ANNOTATIONS, MEASURED AGAINST WHAT THE SPEC ACTUALLY SAYS.
@@ -302,7 +355,15 @@ function registerAuditTool(server, { audit, api }) {
       // Compact, exactly as this tool has always answered: the text block is a
       // second copy of the findings and indenting it is bytes for nothing.
       if (denied) return answer(denied, { spaces: 0 });
-      return answer(await audit(args), { spaces: 0 });
+      // THE PICTURES RIDE BESIDE THE PAYLOAD, NOT INSIDE IT.
+      //
+      // `images` is the engine's second channel and is destructured off here so
+      // it cannot reach `structuredContent`: base64 in the JSON is what made a
+      // captured audit undeliverable. `answer` puts the blocks first, exactly as
+      // electron/mcp/tools.js orders the capture tool's, so a host that shows
+      // only the first block shows the picture.
+      const { images = [], ...body } = await audit(args);
+      return answer(body, { spaces: 0, images });
     }
   );
   return true;

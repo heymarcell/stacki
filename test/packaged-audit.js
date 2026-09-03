@@ -198,7 +198,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           const capAfter = (shotAfter?.captures || [])[0] || null;
           check('  a capture of the corrected state comes back', !!capAfter, brief(shotAfter?.captures?.length));
           if (capBefore && capAfter) {
-            check('  and it is not the picture of the broken state', capAfter.data !== capBefore.data, `${capBefore.bytes} -> ${capAfter.bytes} bytes`);
+            // The image rides in the response's image blocks, not in this row; the
+            // row carries a digest of it. Same claim, and one that cannot pass by
+            // both sides being undefined.
+            check('  and it is not the picture of the broken state', !!capAfter.sha256 && capAfter.sha256 !== capBefore.sha256, `${capBefore.bytes} -> ${capAfter.bytes} bytes`);
             check('  at the viewport the fix was measured at', capAfter.viewport.width === 375, brief(capAfter.viewport));
           }
           // VIEWPOINT 3 restated: the running page no longer overflows at all.

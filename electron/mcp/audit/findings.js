@@ -51,6 +51,43 @@ function findingId({ ruleId, viewport, where }) {
 }
 
 /**
+ * WHERE, MEANING WHICH RENDERED NODE -- not which node in the source.
+ *
+ * A model path is a SOURCE position, and a `.map()` has exactly one of those
+ * however many rows it draws: the serializer emits the identical `data-avb-p`
+ * on every iteration, by construction. So "the most stable locator available"
+ * used to resolve five different `<time>` elements to one string, and a native
+ * dogfood measured the result -- `f_4Sjf8vrN_o4ea-Kn` five times over, 22
+ * findings sharing 6 ids. An id that cannot tell five rows apart cannot say a
+ * row was fixed: it survives until the LAST instance is fixed, and the loop this
+ * whole file exists to support silently stops working on the one page shape
+ * every real site has.
+ *
+ * The disambiguator was already in the payload -- `target.selectorMatch`, which
+ * the geometry probe has computed all along -- and simply was not in the hash.
+ * ONE builder now, for both producers, so the two cannot drift apart again: the
+ * occurrence is appended exactly when `targetOf` publishes it, which is exactly
+ * when the selector is ambiguous. If a reader can see `selectorMatch` on a
+ * finding, it is in that finding's identity; if they cannot, it is not.
+ *
+ * WHAT IT COSTS, said plainly: an id now moves when an element's ORDINAL among
+ * its selector's matches changes -- deleting the second of five rows renumbers
+ * the three below it. That is the trade the selector branch already made, and it
+ * is strictly better than an id that cannot distinguish "one of five fixed" from
+ * "none of five fixed".
+ *
+ * One spelling changed with the unification, deliberately: the overflow builder
+ * used to append `[0]` to its selector fallback unconditionally while the
+ * accessibility builder appended nothing. Every id where the disambiguator is
+ * absent from the payload is otherwise byte-identical to the one minted before
+ * this existed, which test/audit-identity.js pins to literal constants.
+ */
+function whereOf({ modelPath, exact, selector, match }) {
+  const at = match && match.of > 1 ? `[${match.index}]` : '';
+  return `${modelPath && exact ? modelPath : selector || 'document'}${at}`;
+}
+
+/**
  * A source location, only when Stacki can actually prove one.
  *
  * THE RULE THIS ENFORCES: a StackiRef is never minted from a CSS selector. If
@@ -130,10 +167,9 @@ function overflowFinding({ viewport, culprit, documentOverflowBy, measured = nul
   // Four levels of tag.class matches every card in a row, so two real defects on
   // two different cards used to hash to ONE id -- and fixing either made both
   // look fixed. The match index disambiguates without making `selector` invalid.
-  const where =
-    target.modelPath && target.exact
-      ? target.modelPath
-      : `${culprit.selector}[${culprit.match?.index ?? 0}]`;
+  // It used to be applied only on the fallback branch, which left the GOOD case
+  // -- an element with a real model path -- colliding. See whereOf().
+  const where = whereOf({ modelPath: target.modelPath, exact: target.exact, selector: culprit.selector, match: culprit.match });
   // AT 320 THIS IS STILL A MEASUREMENT. See reflowNote() below.
   const isReflow = viewport.standard != null;
   return {
@@ -232,8 +268,14 @@ function axeFinding({ viewport, rule, node, bucket }) {
   const selector = Array.isArray(node.target)
     ? node.target.join(node.target.length > 1 ? ' >>> ' : ' ')
     : String(node.target || '');
-  const target = targetOf({ selector, refPath, tag: node.tag, crossBoundary: !!node.crossBoundary });
-  const where = target.modelPath && target.exact ? target.modelPath : selector;
+  // `match` comes from the page, where axeScript's locate() resolves the
+  // selector and asks which of its matches this node is. Passing it does two
+  // things at once: it puts `selectorMatch` on an accessibility finding for the
+  // first time -- until now nothing in the payload could tell five identical
+  // boxes apart even by hand -- and it makes the id the identity of a RENDERED
+  // node rather than of a source position.
+  const target = targetOf({ selector, refPath, tag: node.tag, crossBoundary: !!node.crossBoundary, match: node.match });
+  const where = whereOf({ modelPath: target.modelPath, exact: target.exact, selector, match: node.match });
   const wcag = (rule.tags || []).filter((t) => /^wcag\d/.test(t));
   return {
     id: findingId({ ruleId: rule.id, viewport: viewport.key, where }),
@@ -279,6 +321,7 @@ module.exports = {
   SEVERITIES,
   findingId,
   targetOf,
+  whereOf,
   overflowFinding,
   unattributedOverflowFinding,
   axeFinding,

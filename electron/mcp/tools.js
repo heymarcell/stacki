@@ -216,7 +216,13 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
       description:
         'A picture of what Stacki is rendering right now, at the current breakpoint: the selected element ' +
         '(the selected occurrence of a repeated node, scrolled into view, with the editor overlays hidden) ' +
-        'or the whole preview viewport. Returns the image plus the same source reference get_context gives.',
+        'or the whole preview viewport. Returns the image plus the same source reference get_context gives. ' +
+        'It photographs the person\'s window at the breakpoint THEY have chosen, and there is no way to change ' +
+        'that from here — resizing somebody\'s editor to take a screenshot is not something this server does. ' +
+        'To see a route at a width of your own, use audit({route, viewports:[{width,height}], rules:[], ' +
+        'capture:true}): it renders the page offscreen in a window of its own, at exactly that width, and never ' +
+        'touches what the person is looking at. `rules:[]` skips the accessibility pass, so that costs a page ' +
+        'load and a photograph and nothing else. It needs `inspect`, because it is an audit.',
       inputSchema: z.object({
         target: z
           .enum(['selection', 'viewport'])

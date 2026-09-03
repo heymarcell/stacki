@@ -163,6 +163,28 @@ const OVERFLOW = `(() => {
 
       // And so does any ancestor between it and the root. If one of those
       // contains it, this is a scroll container's content, not a page defect.
+      //
+      // AND THE OTHER HALF OF THIS, WHICH IS NOT MEASURED HERE AND WILL NOT BE.
+      //
+      // The obvious complaint is that a page which CLIPS its overflow produces
+      // no finding at all: with html and body both clipping, or the wide content
+      // inside a clipping wrapper, the document does not scroll and this whole
+      // block never runs. That silence is correct -- the document really does not
+      // scroll -- and the tempting fix is a "this box clips its own content"
+      // rule. It was measured before being rejected. Over a page built from
+      // ordinary idioms (a rounded card, a text-overflow:ellipsis heading, an
+      // overflow-x:auto carousel, a decorative panel, a marquee) the naive rule
+      // fired THREE times with no defect present; adding a real 2000px defect
+      // made it four, and the deliberate marquee's 2246px outranked the real
+      // 1625px. Three false positives, zero true positives, no separation by
+      // magnitude. Same class of mistake as blaming a skip link at left:-9999px,
+      // which the comment above already records.
+      //
+      // Worth knowing while reading it: overflow:hidden IS a scroll container --
+      // setting scrollLeft on one moves it, so clipped content stays reachable
+      // by focus and by script. Only overflow-x:clip is genuinely unscrollable,
+      // so "clipped" and "unreachable" are different claims. Said in
+      // docs/audit.md as a known limit rather than papered over here.
       let contained = false;
       let containedBy = null;
       let p = el.parentElement;

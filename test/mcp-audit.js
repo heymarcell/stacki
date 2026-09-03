@@ -330,6 +330,19 @@ let stopPreview = null;
     const b = new Set((again.findings || []).map((f) => f.id));
     const same = a.size === b.size && [...a].every((id) => b.has(id));
     check('and every finding id is identical', same, `first ${a.size}, second ${b.size}`);
+    // STABLE IS HALF THE CLAIM. Comparing two SETS cannot see an N-way collapse:
+    // when one model node rendered five times shared one id, both sets held that
+    // id once and this check was green. The count is what says they are distinct.
+    check(
+      'and every finding has an id of its own',
+      findings.length === a.size,
+      `${findings.length} findings, ${a.size} ids`
+    );
+    check(
+      '  on the second run too',
+      (again.findings || []).length === b.size,
+      `${(again.findings || []).length} findings, ${b.size} ids`
+    );
   }
 
   // --- the clean control route, in the SAME project, reports nothing
@@ -753,9 +766,13 @@ let stopPreview = null;
       const after = (shotAfterFix.captures || [])[0];
       check('a capture after the fix comes back', !!after, short(shotAfterFix.captures?.length));
       if (after) {
+        // The bytes ride in the response's image blocks now, not in the capture
+        // ROW, so the row carries a digest of them instead. Comparing digests is
+        // the same claim and a better one: two 150 KB base64 strings compared for
+        // inequality would also have passed if both were undefined.
         check(
           'and it is not the picture taken before the fix',
-          after.data !== shotBeforeFix.data,
+          !!after.sha256 && after.sha256 !== shotBeforeFix.sha256,
           `${shotBeforeFix.bytes} -> ${after.bytes} bytes`
         );
       }
