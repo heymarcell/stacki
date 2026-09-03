@@ -77,6 +77,29 @@ const clip = (text, max) => {
 
 const take = (list, limit) => (Array.isArray(list) ? list.slice(0, limit) : []);
 
+/**
+ * Where each line of a file begins, 1-based line N at `starts[N - 1]`.
+ *
+ * A `split` sees an empty segment after the file's final newline and calling
+ * that a line is how a read of a ten-line file came back saying eleven. The
+ * terminator ENDS the last line; it does not begin another one. So the count
+ * this yields is the count a person gets from their editor's gutter, and
+ * slicing by it gives back whole lines with their own line endings attached —
+ * which is what makes a range read and a range replacement the same bytes.
+ */
+function lineStarts(text) {
+  if (text === '') return [];
+  const starts = [0];
+  const re = /\r\n|\n/g;
+  let m;
+  while ((m = re.exec(text))) starts.push(m.index + m[0].length);
+  if (starts[starts.length - 1] === text.length) starts.pop();
+  return starts;
+}
+
+/** Lines `from`..`to` inclusive, terminators included, as they sit in the file. */
+const sliceLines = (text, starts, from, to) => text.slice(starts[from - 1], to < starts.length ? starts[to] : text.length);
+
 // The two things the API layer supplies, with the behaviour to fall back on
 // when it has not — so `runMain` stays a function of its context and can be
 // driven straight in a test.
@@ -111,11 +134,36 @@ const source = {
     } catch (err) {
       return problem('no_file', `Stacki could not read ${at.rel}: ${err.code === 'ENOENT' ? 'there is no such file' : err.message}.`);
     }
-    const lines = text.split('\n');
-    const from = Math.max(1, input.startLine || 1);
-    const to = Math.min(lines.length, input.endLine || Math.min(lines.length, from + MAX_SNIPPET_LINES - 1));
-    const slice = input.startLine || input.endLine ? lines.slice(from - 1, to).join('\n') : text;
-    const body = clip(slice, MAX_TEXT_BYTES);
+    const starts = lineStarts(text);
+    const total = starts.length;
+    const asked = input.startLine != null || input.endLine != null;
+    const from = asked ? Number(input.startLine ?? 1) : 1;
+    const wantedEnd = input.endLine != null ? Number(input.endLine) : null;
+    // A RANGE THAT CANNOT EXIST IS NOT A SUCCESSFUL EMPTY READ. Clamping the
+    // high end while leaving the low one alone manufactured pairs like
+    // 9000–250, echoed back as though they described what came out; and
+    // `slice(8999, 250)` is legitimately [], so an impossible request answered
+    // ok with nothing in it. `source.replace_range` has always refused the same
+    // input precisely, and this is the same refusal in the same words.
+    if (asked) {
+      if (!Number.isInteger(from) || from < 1) {
+        return problem('bad_range', `startLine must be a whole line number of at least 1; ${JSON.stringify(input.startLine)} is not.`);
+      }
+      if (from > total) {
+        return problem('bad_range', `${at.rel} has ${total} lines; line ${from} is not in it.`);
+      }
+      if (wantedEnd != null && (!Number.isInteger(wantedEnd) || wantedEnd < 1)) {
+        return problem('bad_range', `endLine must be a whole line number of at least 1; ${JSON.stringify(input.endLine)} is not.`);
+      }
+      if (wantedEnd != null && wantedEnd < from) {
+        return problem('bad_range', `${at.rel}: ${from}–${wantedEnd} is not a range — endLine must be at least startLine.`);
+      }
+    }
+    // An endLine PAST the end stays a read: "lines 200 to 400" of a 250-line
+    // file is a reasonable thing to ask. It says so, so a short answer can be
+    // told from a coincidence.
+    const to = Math.min(total, wantedEnd ?? from + MAX_SNIPPET_LINES - 1);
+    const body = clip(asked ? sliceLines(text, starts, from, to) : text, MAX_TEXT_BYTES);
     return {
       value: {
         path: at.rel,
@@ -124,14 +172,17 @@ const source = {
         // passing it back — with nothing for a caller to copy or forget.
         ref: refFor(ctx, at.rel),
         // The digest is of the WHOLE file however much of it was read, because
-        // that is what a write will be checked against.
+        // that is what a write will be checked against. `wholeFileBytes` is its
+        // companion, and `bytes` is neither of them: it is the payload.
         digest: digestOf(text),
-        lines: lines.length,
-        startLine: input.startLine || input.endLine ? from : 1,
-        endLine: input.startLine || input.endLine ? to : lines.length,
+        lines: total,
+        startLine: asked ? from : Math.min(1, total),
+        endLine: asked ? to : total,
         text: body.text,
         truncated: body.truncated,
-        bytes: Buffer.byteLength(text, 'utf8'),
+        bytes: Buffer.byteLength(body.text, 'utf8'),
+        wholeFileBytes: Buffer.byteLength(text, 'utf8'),
+        ...(wantedEnd != null && wantedEnd > total ? { clampedEnd: true } : {}),
       },
     };
   },
@@ -172,13 +223,32 @@ const source = {
     const before = digestOf(current);
     const guard = guardWrite(ctx, at, input, at.rel);
     if (guard.error) return guard;
-    const lines = current.split('\n');
+    // The file's own line ending, and lines with no \r riding along on them.
+    // Splicing \n-joined segments into a CRLF file left one bare LF in the
+    // middle of it, which is a change nobody asked for in a file nobody was
+    // editing by hand.
+    const eol = /\r\n/.test(current) ? '\r\n' : '\n';
+    const lines = current.split(/\r?\n/);
+    // The last segment of a terminated file is the empty string after its final
+    // newline. It is not a line — it is the position AFTER the last one, and
+    // `startLine === lines.length` is how an agent appends at the end.
+    const appendPos = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
     const from = Number(input.startLine);
     const to = Number(input.endLine ?? input.startLine);
     if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from || from > lines.length) {
-      return problem('bad_request', `${at.rel} has ${lines.length} lines; ${from}–${to} is not a range in it.`);
+      // `appendPos`, not `lines.length`: the empty segment after a terminated
+      // file's final newline is a position, not a line, and counting it told an
+      // agent a three-line file had four — a number it would then use.
+      return problem('bad_request', `${at.rel} has ${appendPos} lines; ${from}–${to} is not a range in it.`);
     }
-    const next = [...lines.slice(0, from - 1), ...String(input.text).split('\n'), ...lines.slice(Math.min(to, lines.length))].join('\n');
+    // THE CONTRACT: `text` is a sequence of whole lines. Exactly one trailing
+    // newline terminates the last of them and is consumed — every other one is
+    // a blank line the caller meant — and `text: ''` deletes the range rather
+    // than blanking it. Splicing `text.split('\n')` straight in made all three
+    // wrong at once: 'A\n' became A plus an empty line, '' became one empty
+    // line, and there was no way to say "delete this".
+    const body = input.text === '' ? [] : String(input.text).replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n');
+    const next = [...lines.slice(0, from - 1), ...body, ...lines.slice(Math.min(to, appendPos))].join(eol);
     const wrote = await putText(ctx, at.rel, next);
     if (wrote.error) return wrote;
     return {
@@ -210,15 +280,37 @@ const source = {
     // makes an error envelope when the mapper reports one or the call throws —
     // so an unresolvable specifier, or a file too large to read, arrived as
     // ok:true with every field null.
-    result: (raw, input) =>
-      raw?.ok === false
-        ? problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`)
-        : {
-            file: raw?.rel ? toPosix(raw.rel) : null,
-            name: input?.name ?? null,
-            text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
-            line: Number.isInteger(raw?.line) ? raw.line : null,
-          },
+    // AND IT IS THE WHOLE FILE. Stacki has no JavaScript parser in the main
+    // process — the only symbol machinery is one regex that finds where a
+    // declaration STARTS, with nothing that could find where it ends — so
+    // there is no honest way to cut `money` out of a module. What comes back
+    // is the file the symbol is declared in, and the payload says so rather
+    // than letting the operation's name imply a span it did not compute. An
+    // agent that wants the span composes: `declarationLine` into
+    // `source.read {startLine, endLine}`.
+    result: (raw, input) => {
+      if (raw?.ok === false) {
+        return problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`);
+      }
+      const text = String(raw?.text ?? '');
+      const body = clip(text, MAX_TEXT_BYTES);
+      // Null, not zero. `declarationLine` answered 0 for "no such declaration"
+      // and 0 is not a line, so a miss arrived looking like a position.
+      const at = Number.isInteger(raw?.declarationLine) && raw.declarationLine > 0 ? raw.declarationLine : null;
+      return {
+        file: raw?.rel ? toPosix(raw.rel) : null,
+        name: input?.name ?? null,
+        text: body.text,
+        wholeFile: true,
+        lines: lineStarts(text).length,
+        truncated: body.truncated,
+        declarationLine: at,
+        // The name this field had before it said what it meant. Kept so a
+        // client reading `line` today does not break; `declarationLine` is the
+        // one to read.
+        line: at,
+      };
+    },
   },
 
   resolve_path: {
@@ -980,23 +1072,61 @@ const style = {
   variables: {
     channel: 'css:variables',
     args: (_i, ctx) => ctx.root,
+    // `limit` IS ABOUT THE VARIABLES, which is the only unit a caller could
+    // have meant: it capped the FILE array, and `values` — a flat name→value
+    // map of the whole project, and the bulk of the bytes — went past it
+    // untouched. An agent asking for five tokens got seventy-one in fourteen
+    // kilobytes, with `truncated: false` to say nothing had been left out.
+    // So the walk below keeps CELLS until the limit is reached, drops the rows,
+    // blocks, groups and files left empty behind it, and reports what it did.
     result: (raw, input) => {
       const files = raw?.files || [];
       const limit = Math.min(input.limit || 200, MAX_LIST);
+      let kept = 0;
+      let total = 0;
+      const names = new Set();
+      const trimmed = [];
+      for (const f of files) {
+        const groups = [];
+        for (const g of take(f.groups, 60)) {
+          const blocks = [];
+          for (const b of g.blocks || []) {
+            const rows = [];
+            for (const r of b.rows || []) {
+              const cells = [];
+              for (const c of r.cells || []) {
+                total += 1;
+                if (kept >= limit) continue;
+                kept += 1;
+                if (c?.name) names.add(c.name);
+                cells.push(c);
+              }
+              if (cells.length) rows.push({ ...r, cells });
+            }
+            if (rows.length) blocks.push({ ...b, rows });
+          }
+          if (blocks.length) groups.push({ ...g, blocks });
+        }
+        // A file whose variables all fell past the limit is not part of the
+        // answer; one that reported an error is, because that IS its answer.
+        if (groups.length || f.error) {
+          trimmed.push({ path: f.rel, name: f.name, error: f.error || null, count: f.count ?? null, groups });
+        }
+      }
+      const values = raw?.values || {};
       return {
         // One entry per stylesheet that declares custom properties, with the
-        // sections the Variables panel shows. `values` is every name in the
-        // project resolved to its value, which is what a caller actually wants
-        // when it is chasing a var() it found in a declaration.
-        files: take(files, limit).map((f) => ({
-          path: f.rel,
-          name: f.name,
-          error: f.error || null,
-          count: f.count ?? null,
-          groups: take(f.groups, 60),
-        })),
-        values: raw?.values || {},
-        truncated: files.length > limit,
+        // sections the Variables panel shows. `values` is every name resolved
+        // to its value, which is what a caller actually wants when it is
+        // chasing a var() it found in a declaration — narrowed to what came
+        // back when the walk left something out, and whole when it did not.
+        files: trimmed,
+        filesTotal: files.length,
+        values: kept < total ? Object.fromEntries(Object.entries(values).filter(([name]) => names.has(name))) : values,
+        valuesTotal: Object.keys(values).length,
+        returned: kept,
+        total,
+        truncated: kept < total,
         error: raw?.error || null,
       };
     },
@@ -1038,12 +1168,22 @@ const project = {
     // The panel shows the path to the node binary because a person may need to
     // go and look at it. Nothing an agent can do with it is worth telling it
     // where somebody's home directory is.
+    // `kind` IS FOUR VALUES AND THE HEALTHY ONE WAS CALLED 'unknown'. It is the
+    // dev-server verdict — not, as it was read, a statement about the package
+    // manager — and 'unknown' meant node is here, the dependencies are here and
+    // the version satisfies Astro: nothing is wrong. A value nobody can act on,
+    // for the case where everything is fine. Translated here rather than in the
+    // handler, because the preview's error panel reads the handler's own answer
+    // and switches on 'unknown'.
     result: (raw) => ({
-      kind: raw?.kind ?? 'unknown',
+      kind: raw?.kind === 'unknown' || raw?.kind == null ? 'ready' : raw.kind,
       nodeFound: !!raw?.nodePath,
       nodeVersion: raw?.nodeVersion ?? null,
       astroVersion: raw?.astroVersion ?? null,
       requires: raw?.requires ?? null,
+      // Which one to run, and what said so. 'default' in `from` means no
+      // lockfile was found and npm is the fallback, not a detection.
+      packageManager: raw?.packageManager ?? null,
     }),
   },
   // PROBE THE PROJECT'S PREVIEW, not an arbitrary address.
@@ -1154,6 +1294,25 @@ const git = {
       if (!String(input.message || '').trim()) return problem('bad_request', 'A commit message is required.');
       return { projectPath: ctx.root, message: input.message, paths: input.paths || null };
     },
+    // THE COMMIT THAT WAS MADE, not the fact that one was. The handler answers
+    // `{ ok: true, files: null }` — a count or a null, never a sha and never a
+    // branch — because it was written for a panel that re-reads the repository
+    // itself. An agent has no panel, so the only way to learn what it had just
+    // done was to ask git in a second call. Both answers below come from
+    // handlers that already exist and are already bounded.
+    result: async (raw, _input, ctx) => {
+      const info = await ctx.callMain('git:info', ctx.root);
+      const at = info?.head || null;
+      const changed = at ? await ctx.callMain('git:commitFiles', { projectPath: ctx.root, ref: at }) : null;
+      return {
+        head: at,
+        branch: info?.branch || null,
+        files: take(changed?.files || changed, MAX_LIST),
+        // What the handler said about the pathspec: null for "everything",
+        // otherwise how many paths were picked.
+        picked: raw?.files ?? null,
+      };
+    },
   },
   checkout: {
     channel: 'git:checkout',
@@ -1161,7 +1320,20 @@ const git = {
   },
   merge: { channel: 'git:merge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
   resolve_merge: { channel: 'git:resolveMerge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }) },
-  delete_branch: { channel: 'git:deleteBranch', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }) },
+  delete_branch: {
+    channel: 'git:deleteBranch',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }),
+    // A REFUSAL WITH NO CODE IS A REFUSAL AN AGENT HAS TO READ ENGLISH TO
+    // CLASSIFY. `{ ok: false, unmerged: true }` is exactly the shape runMain
+    // spreads into an envelope, so `code` came out undefined while every other
+    // refusal in the surface has one. The handler's own sentence is good and is
+    // kept; only the code is added.
+    result: async (raw, input, ctx) => {
+      if (raw?.ok === false && raw.unmerged) return problem('unmerged_branch', String(raw.message || `"${input.branch}" has commits that are not on any other branch.`));
+      const info = await ctx.callMain('git:info', ctx.root);
+      return { deleted: input.branch, branches: take(info?.branches, MAX_LIST), branch: info?.branch || null };
+    },
+  },
   restore_file: {
     channel: 'git:restoreFile',
     args: (input, ctx) => {
@@ -1171,8 +1343,31 @@ const git = {
       // otherwise, which is what the panel's own restore does.
       return { projectPath: ctx.root, ref: input.ref || 'HEAD', path: at };
     },
+    // The same two things: a code on the in-band refusal, and evidence on the
+    // success. The digest is of what is on disk NOW — the whole point of the
+    // operation is that those bytes changed, and a caller that has to re-read
+    // the file to find out what it got has not been told anything.
+    result: (raw, input, ctx) => {
+      const at = gitPath(input, ctx);
+      if (at.error) return at;
+      if (raw?.ok === false && raw.missing) return problem('missing_at_ref', String(raw.message || `That version does not have ${at}.`));
+      return { file: at, ref: input.ref || 'HEAD', afterDigest: digestOfFile(path.resolve(ctx.root, at)) };
+    },
   },
-  restore_project: { channel: 'git:restoreProject', args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }) },
+  restore_project: {
+    channel: 'git:restoreProject',
+    args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }),
+    // Counts rather than a list: going back can touch the whole tree, and an
+    // answer that named every file would be the one thing this API promises not
+    // to send. `parked` stays — it is how the caller knows the work it had is
+    // recoverable.
+    result: async (raw, input, ctx) => {
+      const status = await ctx.callMain('git:status', { projectPath: ctx.root });
+      const info = await ctx.callMain('git:info', ctx.root);
+      const list = status?.files || status || [];
+      return { parked: raw?.parked ?? false, ref: input.ref, head: info?.head || null, branch: info?.branch || null, changedFiles: Array.isArray(list) ? list.length : null };
+    },
+  },
   park: { channel: 'git:park', args: (_i, ctx) => ({ projectPath: ctx.root }) },
   unpark: {
     channel: 'git:unpark',
@@ -1200,10 +1395,24 @@ const git = {
       }
       return { projectPath: ctx.root, branch };
     },
+    // What is now true of the remote, read from git rather than assumed from
+    // the absence of an exception. `ahead` is the load-bearing one: it is zero
+    // exactly when the push landed everything, and a caller can tell a
+    // successful push from a successful no-op without another call.
+    result: async (raw, input, ctx) => {
+      const info = await ctx.callMain('git:info', ctx.root);
+      return { branch: info?.branch || input.branch || null, remote: info?.remote || null, head: info?.head || null, ahead: info?.ahead ?? null, hasUpstream: info?.hasUpstream ?? null };
+    },
   },
   publish: {
     channel: 'git:publish',
     args: (input, ctx) => ({ projectPath: ctx.root, repoName: input.repoName, isPrivate: input.private !== false }),
+    // Three different things used to be one `code: 'failed'`: gh not installed,
+    // gh installed and signed out, and GitHub itself refusing. The handler now
+    // tells them apart and says which — returned rather than thrown, so the
+    // code survives the generic catch — and this turns that into the refusal
+    // shape the rest of the surface uses.
+    result: (raw) => (raw?.ok === false ? problem(String(raw.code || 'failed'), String(raw.message || 'The publish did not happen.')) : raw),
   },
 };
 
@@ -1239,7 +1448,10 @@ async function runMain(domain, action, input, ctx) {
     }
     return { ok: false, code: 'failed', message };
   }
-  const shaped = entry.result ? entry.result(raw, input, ctx) : raw;
+  // Awaited, because a result mapper may need to ASK: a commit that answers
+  // with the sha it made has to read the sha, and reading it is what makes
+  // the field evidence rather than a claim.
+  const shaped = entry.result ? await entry.result(raw, input, ctx) : raw;
   // A RESULT MAPPER MAY REFUSE, the same way an args mapper may — `problem()`
   // in either place means the same thing. Several handlers signal failure in
   // band (`{ ok: false, reason }`) rather than by throwing, and without this

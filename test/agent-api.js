@@ -741,7 +741,9 @@ const PINNED_RISK = {
     check('a range replace replaces the range', range.ok && fs.readFileSync(path.join(ROOT, file), 'utf8') === 'a\nB\nd\n', range.message);
     const badRange = await runMain('source', 'replace_range', { path: file, startLine: 99, text: 'x', expectedDigest: digestOf('a\nB\nd\n') }, ctx);
     check('a range that is not in the file is a bad request', badRange.code === 'bad_request', badRange.code);
-    check('and says how long the file actually is', /\b4 lines\b/.test(badRange.message), badRange.message);
+    // 'a\nB\nd\n' is THREE lines. It used to be reported as four, because the
+    // empty string after the final newline was counted as one.
+    check('and says how long the file actually is', /\b3 lines\b/.test(badRange.message), badRange.message);
 
     for (const bad of ['/etc/passwd', '../../../etc/passwd', 'src/../../escape.txt']) {
       const answer = await runMain('source', 'read', { path: bad }, ctx);

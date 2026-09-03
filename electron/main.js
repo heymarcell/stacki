@@ -1318,7 +1318,28 @@ function run(cmd, args, cwd, opts = {}) {
 }
 
 async function git(projectPath, args, opts = {}) {
-  return run('git', args, projectPath, opts);
+  try {
+    return await run('git', args, projectPath, opts);
+  } catch (err) {
+    // WHAT GIT SAID, NOT WHAT IT WAS ASKED. execFile rejects with
+    // `Command failed: <the whole argv>` — a commit message, a branch name, a
+    // pathspec, whatever the caller passed — and only an Error's `message`
+    // survives the IPC boundary, so that argv was the thing every refusal
+    // arrived carrying. git's own words are on stderr, or on stdout (a commit
+    // with nothing to commit says so there), and those are what a caller can
+    // act on.
+    const said = [err.stderr, err.stdout]
+      .map((text) => String(text || '').trim())
+      .filter(Boolean)
+      .join('\n');
+    const next = new Error(said || `git ${args?.[0] || 'command'} did not succeed.`);
+    // The handlers that classify their own failures read these — gitBranches
+    // looks for "not fully merged" in stderr — so they travel with the message.
+    next.stdout = err.stdout;
+    next.stderr = err.stderr;
+    next.code = err.code;
+    throw next;
+  }
 }
 
 function findFreePort(start) {
@@ -1750,18 +1771,24 @@ handle('project:newDialog', async () => {
   return { canceled: false, projectPath: dir };
 });
 
-// Detects the project's package manager from its lockfile.
+// Which package manager this project uses, AND WHAT SAYS SO. `npm` is the
+// fallback rather than a detection, and reporting the two the same way would be
+// the overclaim: a project with no lockfile has not told anybody anything. So
+// `from` names the file the answer was read out of, or 'default'.
 function detectPackageManager(dir) {
-  if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
-  if (fs.existsSync(path.join(dir, 'yarn.lock'))) return 'yarn';
-  if (fs.existsSync(path.join(dir, 'bun.lockb')) || fs.existsSync(path.join(dir, 'bun.lock')))
-    return 'bun';
-  return 'npm';
+  const found = [
+    ['pnpm-lock.yaml', 'pnpm'],
+    ['yarn.lock', 'yarn'],
+    ['bun.lockb', 'bun'],
+    ['bun.lock', 'bun'],
+    ['package-lock.json', 'npm'],
+  ].find(([file]) => fs.existsSync(path.join(dir, file)));
+  return found ? { name: found[1], from: found[0] } : { name: 'npm', from: 'default' };
 }
 
 async function installDependencies(dir) {
   ensureToolPath(); // npm/pnpm/yarn are Node shims — same PATH problem as astro
-  const pm = detectPackageManager(dir);
+  const { name: pm } = detectPackageManager(dir);
   send('progress', { message: `Installing dependencies (${pm} install)…` });
   const args = pm === 'npm' ? ['install', '--no-audit', '--no-fund'] : ['install'];
   try {
@@ -5184,9 +5211,12 @@ function resolveImportPath(projectPath, fromFile, spec) {
   return null;
 }
 
-// 1-based line of `name`'s top-level declaration, so the editor can open on it.
+// 1-based line of `name`'s top-level declaration, so the editor can open on it,
+// or null when there is none to open on. It answered 0 for both "no name was
+// asked about" and "no declaration found", and 0 is not a line — so a caller
+// could not tell a miss from the top of the file.
 function declarationLine(text, name) {
-  if (!name) return 0;
+  if (!name) return null;
   const re = new RegExp(
     // `[ \t]*`, not `\s*`: with the m flag `\s` eats the newlines before the
     // declaration, and the match would start on a blank line above it.
@@ -5194,7 +5224,7 @@ function declarationLine(text, name) {
     'm'
   );
   const m = re.exec(text);
-  if (!m) return 0;
+  if (!m) return null;
   return text.slice(0, m.index).split('\n').length;
 }
 
@@ -5208,11 +5238,16 @@ handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name }) => {
   const stat = fs.statSync(abs);
   if (stat.size > MAX_EDITABLE_BYTES) return { ok: false, reason: 'too-large' };
   const text = fs.readFileSync(abs, 'utf8');
+  const declaredAt = declarationLine(text, name);
   return {
     ok: true,
     rel: path.relative(projectPath, abs),
     text,
-    line: declarationLine(text, name),
+    // `line` is the editor's revealLine and wants a number it can scroll to,
+    // so a miss stays 0 there. `declarationLine` is the same answer with "there
+    // is no declaration" spelled as null, which is what the Agent API reports.
+    line: declaredAt ?? 0,
+    declarationLine: declaredAt,
   };
 });
 
@@ -5443,7 +5478,28 @@ handle('dev:diagnose', async (_e, projectPath) => {
   else if (!hasDeps || !astroVersion) kind = 'no-deps';
   else if (!nodeOk) kind = 'node-too-old';
 
-  return { kind, nodePath, nodeVersion, astroVersion, requires, launchedFromGui: !process.env.SHELL };
+  // WHICH PACKAGE MANAGER, because this is the operation somebody calls when a
+  // build will not start, and "run the install" is the commonest thing they are
+  // about to be told. Stacki has detected this from lockfiles since the install
+  // button existed and exposed it nowhere; `declared` is package.json's corepack
+  // field, which is a different fact and can disagree.
+  let declared = null;
+  try {
+    declared = JSON.parse(fs.readFileSync(path.join(projectPath, 'package.json'), 'utf8')).packageManager || null;
+  } catch {
+    /* no package.json, or not readable — `detected` still stands on its own */
+  }
+  const pm = detectPackageManager(projectPath);
+
+  return {
+    kind,
+    nodePath,
+    nodeVersion,
+    astroVersion,
+    requires,
+    packageManager: { detected: pm.name, from: pm.from, declared },
+    launchedFromGui: !process.env.SHELL,
+  };
 });
 
 // ---------------------------------------------------------------------------
@@ -5568,7 +5624,7 @@ handle('git:info', async (_e, projectPath) => {
 // Is the GitHub CLI usable? Checked when the publish dialog opens so a
 // missing or logged-out `gh` is stated up front, instead of surfacing as a
 // failure after the user has filled the form in.
-handle('git:ghStatus', async (_e, projectPath) => {
+async function ghStatus(projectPath) {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
@@ -5583,7 +5639,9 @@ handle('git:ghStatus', async (_e, projectPath) => {
   } catch {
     return { installed: true, authed: false };
   }
-});
+}
+
+handle('git:ghStatus', async (_e, projectPath) => ghStatus(projectPath));
 
 handle('git:init', async (_e, projectPath) => {
   await git(projectPath, ['init', '-b', 'main']);
@@ -5939,11 +5997,41 @@ handle('git:push', async (_e, { projectPath, branch }) => {
   return { ok: true };
 });
 
+/** What gh said went wrong, without the command line or the caller's own name for it. */
+function ghComplaint(err, repoName) {
+  const said = String(err?.stderr || err?.message || '')
+    .replace(/^Command failed:[^\n]*\n?/, '')
+    .split('\n')
+    // gh's sign-in advice belongs to the branch above; the GH_TOKEN line names
+    // an environment variable and is not a fact about this repository.
+    .filter((line) => line.trim() && !/gh auth login|GH_TOKEN/i.test(line))
+    .join(' ')
+    .trim();
+  const safe = repoName ? said.split(String(repoName)).join('that name') : said;
+  return safe.slice(-400) || 'it did not say why.';
+}
+
+// WHY THIS CAN FAIL IS THREE DIFFERENT ANSWERS, and they used to be one.
+// `gh` missing, `gh` signed out and GitHub refusing all arrived as the generic
+// `code: 'failed'` with execFile's `Command failed: <the whole argv>` echoed
+// back — the repository name the caller chose, every flag, and gh's own stderr
+// including its GH_TOKEN hint. Two of those three are detectable and one of
+// them is already detected one call away, by `ghStatus`.
+//
+// The sign-in check is made AFTER `repo create` has refused rather than before
+// it, deliberately: an unauthenticated gh cannot create anything, so nothing is
+// risked by letting it say so itself, and the successful path stays exactly the
+// two gh invocations the boundary test in test/support/fakeGh.js pins. A probe
+// on the way in would be a third.
 handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
-    throw new Error('GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.');
+    return {
+      ok: false,
+      code: 'gh_missing',
+      message: 'The GitHub CLI (gh) is not installed. Install it from https://cli.github.com, then run `gh auth login`. Nothing was created.',
+    };
   }
   const args = [
     'repo',
@@ -5956,7 +6044,23 @@ handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
     'origin',
     '--push',
   ];
-  const result = await run('gh', args, projectPath, { timeout: 180000 });
+  let result;
+  try {
+    result = await run('gh', args, projectPath, { timeout: 180000 });
+  } catch (err) {
+    const status = await ghStatus(projectPath);
+    if (!status.authed) {
+      return {
+        ok: false,
+        code: 'gh_auth_required',
+        message: 'The GitHub CLI is installed but not signed in. Sign in with `gh auth login` and try again. Nothing was created.',
+      };
+    }
+    // gh's own words about what GitHub said, and nothing else: the command line
+    // is Stacki's, the repository name is the caller's, and the environment
+    // hints in gh's stderr are not for an agent to read.
+    return { ok: false, code: 'publish_failed', message: `GitHub would not create the repository: ${ghComplaint(err, repoName)}` };
+  }
   const output = result.stdout + result.stderr;
   // gh prints the new repo's URL; fall back to the remote it just set.
   let url = (output.match(/https:\/\/github\.com\/[^\s"']+/) || [])[0] || null;

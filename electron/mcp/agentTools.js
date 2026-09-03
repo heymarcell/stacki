@@ -213,6 +213,15 @@ const TargetInput = z.discriminatedUnion('action', [
     action: z.literal('read'),
     ...withTarget({
       navigate: z.boolean().optional().describe('Whether Stacki may open the page and drill into the components to reach it. Default true.'),
+      compact: z
+        .boolean()
+        .optional()
+        .describe(
+          'Leave out `snippet`, the markup around the target, and set `snippetOmitted` instead. ' +
+            'Walking down a tree returns overlapping snippets of the same region once per level — ' +
+            'six levels of one page measured 81KB, of which 17KB was the same markup five times. ' +
+            'Use it while navigating and read the source once at the end. Default false.'
+        ),
     }),
   }),
   z.object({
@@ -221,9 +230,15 @@ const TargetInput = z.discriminatedUnion('action', [
   }),
   z.object({
     action: z.literal('enter'),
-    ...withTarget({ occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of the instance to open — the third card, not the first.') }),
+    ...withTarget({
+      occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of the instance to open — the third card, not the first.'),
+      compact: z.boolean().optional().describe('Leave out `snippet` and set `snippetOmitted` instead. See target.read.'),
+    }),
   }),
-  z.object({ action: z.literal('exit') }),
+  z.object({
+    action: z.literal('exit'),
+    compact: z.boolean().optional().describe('Leave out `snippet` and set `snippetOmitted` instead. See target.read.'),
+  }),
   z.object({
     action: z.literal('edit'),
     ...withTarget({ ...guard, operations: z.array(Operation).min(1).max(30), label: z.string().max(80).optional() }),
@@ -324,7 +339,16 @@ const StyleInput = z.discriminatedUnion('action', [
   }),
   z.object({ action: z.literal('read_source'), path: RelPath }),
   z.object({ action: z.literal('write_source'), path: RelPath, css: z.string().max(2_000_000), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
-  z.object({ action: z.literal('variables'), limit: z.number().int().min(1).max(400).optional() }),
+  z.object({
+    action: z.literal('variables'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(400)
+      .optional()
+      .describe('How many CSS custom properties to return — variables, not files. Default 200. The answer reports returned, total and truncated.'),
+  }),
   z.object({
     action: z.literal('set_variable'),
     // The offsets are the ones `variables` reported for that cell. They are
@@ -397,8 +421,18 @@ const SourceInput = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     path: RelPath,
-    startLine: z.number().int().min(1).optional(),
-    endLine: z.number().int().min(1).optional(),
+    startLine: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe('First line to return, 1-based. Past the end of the file is refused with bad_range rather than answered with nothing.'),
+    endLine: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe('Last line to return, inclusive. Past the end is clamped and the answer says clampedEnd; below startLine is refused. Lines come back whole, with their own line endings, so the text can go straight back to replace_range.'),
   }),
   z.object({
     action: z.literal('write'),
@@ -410,13 +444,25 @@ const SourceInput = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('replace_range'),
     path: RelPath,
-    startLine: z.number().int().min(1),
-    endLine: z.number().int().min(1).optional(),
-    text: z.string().max(2_000_000),
+    startLine: z.number().int().min(1).describe('First line to replace, 1-based. One past the last line appends at the end of the file.'),
+    endLine: z.number().int().min(1).optional().describe('Last line to replace, inclusive. Defaults to startLine.'),
+    text: z
+      .string()
+      .max(2_000_000)
+      .describe(
+        'The replacement, as whole lines. One trailing newline terminates the last of them and is consumed; a second one is a blank ' +
+          'line you meant. An empty string DELETES the range. The lines are written with the file’s own line endings.'
+      ),
     ref: FileRef.optional(),
     expectedDigest: Digest.optional(),
   }),
-  z.object({ action: z.literal('read_symbol'), fromFile: RelPath, spec: z.string().max(1024), name: z.string().max(200) }),
+  z
+    .object({ action: z.literal('read_symbol'), fromFile: RelPath, spec: z.string().max(1024), name: z.string().max(200) })
+    .describe(
+      'The WHOLE FILE the symbol is declared in, with declarationLine pointing at its declaration (null when there is none to point ' +
+        'at). Stacki has no JavaScript parser and cannot cut a symbol out of a module; to read just the declaration, put ' +
+        'declarationLine into source.read’s startLine and endLine.'
+    ),
   z.object({ action: z.literal('resolve_path'), fromFile: RelPath, spec: z.string().max(1024) }),
 ]);
 
@@ -550,7 +596,16 @@ const ProjectInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('classes'), limit: z.number().int().min(1).max(2000).optional() }),
   z.object({ action: z.literal('dependencies') }),
   z.object({ action: z.literal('install') }),
-  z.object({ action: z.literal('diagnose') }),
+  z
+    .object({ action: z.literal('diagnose') })
+    .describe(
+      'Why the dev server will or will not start. `kind` is one of: ready (node is here, the dependencies are installed and the ' +
+        'version satisfies Astro — nothing is wrong), no-node (no node binary could be found), no-deps (node_modules or astro is ' +
+        'missing — install them), node-too-old (the node found does not satisfy Astro’s engines range). Also reports ' +
+        'packageManager as {detected, from, declared}: which one to run, which lockfile said so — `from: "default"` means no ' +
+        'lockfile was found and npm is the fallback rather than a detection — and package.json’s own packageManager field, which ' +
+        'can disagree with the lockfile.'
+    ),
   z.object({ action: z.literal('probe'), url: z.string().max(2048).optional() }),
   z.object({ action: z.literal('dev_status') }),
   z.object({ action: z.literal('dev_start') }),
