@@ -143,20 +143,36 @@ export function describe(mod) {
 
 const schemaCache = new Map();
 
+// "There is no collection called that" and "this collection declares no schema"
+// are different answers, and both used to come back as null — so validate
+// answered {issues: [], unchecked: true} to each, and an agent that misspelled a
+// collection name was told its data was fine. The cache then memoised the
+// ambiguity, so asking again could not clear it up. This is the missing third
+// state, cached like the other two.
+const NO_COLLECTION = Symbol('no such collection');
+
 function schemaOf(mod, name) {
   if (schemaCache.has(name)) return schemaCache.get(name);
-  const collection = mod?.collections?.[name];
+  const collections = mod?.collections;
+  const known = !!collections && typeof collections === 'object' && Object.prototype.hasOwnProperty.call(collections, name);
+  const collection = known ? collections[name] : null;
   const raw = collection?.schema ?? collection?.loader?.schema ?? null;
   const schema = typeof raw === 'function' ? raw({ image: imageStub }) : raw;
-  schemaCache.set(name, schema || null);
-  return schema || null;
+  const answer = known ? schema || null : NO_COLLECTION;
+  schemaCache.set(name, answer);
+  return answer;
 }
 
 export function validate(mod, { collection, data }) {
   const schema = schemaOf(mod, collection);
+  if (schema === NO_COLLECTION) {
+    return { issues: [], unknownCollection: true, message: `${collection} is not a collection in this project.` };
+  }
   // No schema means every shape is allowed — which is a real answer, not a
   // missing one.
-  if (!schema) return { issues: [], unchecked: true };
+  if (!schema) {
+    return { issues: [], unchecked: true, reason: `${collection} declares no schema, so any shape of entry is allowed.` };
+  }
   const result = schema.safeParse(data);
   if (result.success) return { issues: [] };
   return {

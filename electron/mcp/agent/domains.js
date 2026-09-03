@@ -469,6 +469,135 @@ function cmsRel(ctx, value) {
 /** And back: what a caller sees is always project-relative. */
 const cmsPublic = (r) => `${CMS_PREFIX}${r}`;
 
+// The digest content.entries hands back for one entry.
+//
+// A client passes it straight back as the guard on its write, so both sides
+// have to mint it from the same bytes — which is why it is a function rather
+// than an expression copied into two places that could drift by one field.
+const entryDigest = (e) =>
+  e && (e.body != null || e.data != null) ? digestOf(JSON.stringify({ data: e.data ?? null, body: e.body ?? null })) : null;
+
+const entryFile = (e) => e?.rel ?? e?.file ?? null;
+
+/** One collection's entries, or the refusal that says why there are none. */
+async function listCollection(name, ctx) {
+  try {
+    return { ok: true, raw: await ctx.callMain('content:entries', { projectPath: ctx.root, name }) };
+  } catch (err) {
+    return { error: problem('no_collection', String(err?.message || err)).error };
+  }
+}
+
+/**
+ * The entry a write is about, resolved HERE rather than taken from the caller.
+ *
+ * `content.write_entry` used to accept an `entry` object and hand its `file` to
+ * `path.resolve`, which accepts `..` segments and returns an absolute argument
+ * unchanged. That made it the one write in this API outside the fence every
+ * other one is inside — `source.write` refuses `../x.md` with `outside_project`
+ * and this wrote the file. The same trust broke file-backed collections the
+ * other way: `content.entries` did not report `locator`, so an entry handed
+ * back carried no record address, and the write landed on the TOP of the data
+ * file — a two-record array grew a third element that was a bare string, and
+ * the envelope said ok.
+ *
+ * Both are one mistake: believing a client string about where an entry lives.
+ * So the collection is listed again, and what is written is the entry
+ * `listEntries` produced — `file` and `locator` both computed from the open
+ * project root. There is no path by which a client string becomes a filesystem
+ * path.
+ *
+ * `entry` is still accepted for one release, as a SELECTOR into that listing
+ * and nothing else: it may choose which entry, never where one lives. A hint
+ * that selects nothing is refused rather than followed.
+ */
+async function findContentEntry(input, ctx) {
+  const hint = input.entry && typeof input.entry === 'object' ? input.entry : null;
+  const wantedId = typeof input.id === 'string' && input.id ? input.id : typeof hint?.id === 'string' ? hint.id : null;
+  const wantedFile = typeof hint?.file === 'string' ? hint.file : null;
+  if (!wantedId && !wantedFile) {
+    return problem('bad_request', 'id is required — the id of the entry, exactly as content.entries reported it.');
+  }
+
+  const named = typeof input.collection === 'string' && input.collection.trim() ? input.collection.trim() : null;
+  // WITHOUT A COLLECTION NAME, the collections are searched for the entry the
+  // hint describes. That is the deprecated shape kept working for one release,
+  // and it is still a server-side resolution: the hint says which entry, the
+  // project says where it is.
+  let names = named ? [named] : null;
+  if (!names) {
+    let all;
+    try {
+      all = await ctx.callMain('content:collections', ctx.root);
+    } catch (err) {
+      return problem('failed', String(err?.message || err));
+    }
+    names = (all?.collections || []).map((c) => c.name).filter(Boolean);
+  }
+
+  const matches = [];
+  let readOnly = null;
+  for (const name of names) {
+    const listed = await listCollection(name, ctx);
+    if (listed.error) {
+      if (named) return { error: listed.error };
+      continue;
+    }
+    if (listed.raw?.readOnly) {
+      if (named) return problem('read_only', listed.raw.reason || `${name} cannot be written through Stacki.`);
+      readOnly = readOnly || { name, reason: listed.raw.reason };
+      continue;
+    }
+    for (const e of listed.raw?.entries || []) {
+      // Where the hint carries both, both have to agree: an id can repeat
+      // across collections and the file is what says which one this is.
+      if (wantedId && e.id !== wantedId) continue;
+      if (wantedFile && entryFile(e) !== wantedFile) continue;
+      matches.push({ collection: name, entry: e });
+    }
+  }
+
+  if (!matches.length) {
+    if (readOnly) return problem('read_only', readOnly.reason || `${readOnly.name} cannot be written through Stacki.`);
+    return problem(
+      'no_entry',
+      named
+        ? `${named} has no entry ${wantedId ?? wantedFile}. content.entries lists the ones it has.`
+        : `Stacki found no entry ${wantedId ?? wantedFile} in any collection. Send \`collection\` and \`id\` — content.entries reports both.`
+    );
+  }
+  if (matches.length > 1) {
+    return problem(
+      'bad_request',
+      `${wantedId ?? wantedFile} is an entry in ${matches.map((m) => m.collection).join(' and ')}. Send \`collection\` to say which.`
+    );
+  }
+
+  const [{ collection, entry }] = matches;
+  // Belt and braces. The file came from `listEntries`, which built it from the
+  // project root — this says so rather than assuming it, because the assumption
+  // is exactly what failed before.
+  const at = rel(ctx, entryFile(entry), 'entry file');
+  if (at.error) return at;
+  return { collection, entry: { ...entry, file: at.rel }, abs: at.abs };
+}
+
+/**
+ * One resolution per call.
+ *
+ * `mainWithSync` needs the entry's file BEFORE the write, to snapshot it for
+ * the undo stack; the args mapper needs the whole entry to dispatch. Resolving
+ * twice would walk every file in the collection twice and leave a window in
+ * which the two answers could disagree — so the promise is memoised on the
+ * context object, which `run()` makes fresh for every call.
+ */
+function resolveContentEntry(input, ctx) {
+  const cache = (ctx.__contentEntry ||= new Map());
+  const key = JSON.stringify([input.collection ?? null, input.id ?? null, input.entry?.id ?? null, input.entry?.file ?? null]);
+  if (!cache.has(key)) cache.set(key, findContentEntry(input, ctx));
+  return cache.get(key);
+}
+
 const content = {
   cms_list: {
     channel: 'cms:list',
@@ -586,11 +715,20 @@ const content = {
         entries: take(list, limit).map((e) => ({
           id: e.id ?? null,
           slug: e.slug ?? null,
-          file: e.rel ?? e.file ?? null,
+          file: entryFile(e),
+          // WHERE THE RECORD IS INSIDE THAT FILE, and it is the only thing that
+          // makes an entry writable. A file-backed collection keeps every entry
+          // in one data file; without the locator an entry written back
+          // addressed the top of the file rather than its own record, so a
+          // two-record array grew a third element that was a bare string while
+          // the record the caller meant stayed as it was.
+          locator: Array.isArray(e.locator) ? e.locator : [],
+          format: e.format ?? null,
+          keyed: !!e.keyed,
           data: e.data ?? null,
           // A whole markdown body per entry turns a listing into a book.
           body: e.body == null ? null : clip(e.body, 2000).text,
-          digest: e.body != null || e.data != null ? digestOf(JSON.stringify({ data: e.data ?? null, body: e.body ?? null })) : null,
+          digest: entryDigest(e),
         })),
         truncated: list.length > limit,
       };
@@ -598,22 +736,66 @@ const content = {
   },
   write_entry: {
     channel: 'content:writeEntry',
-    args: (input, ctx) => {
-      if (!input.entry || typeof input.entry !== 'object') {
-        return problem('bad_request', 'entry is required — pass the entry object content.entries reported.');
-      }
+    args: async (input, ctx) => {
       if (input.edits !== undefined && !Array.isArray(input.edits)) {
         return problem('bad_request', 'edits is a list of { path, value } — one per field to change.');
       }
-      // `[]`, not `{}`. The implementation maps over this; an object arrived at
-      // `.map` and took the operation down for every caller, including the ones
-      // that sent no edits at all and only wanted to rewrite the body.
-      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || [], body: input.body };
+      const found = await resolveContentEntry(input, ctx);
+      if (found.error) return found;
+      // THE VERSION GUARD, WITH NOTHING TO REMEMBER. content.entries already
+      // mints a digest per entry and the client hands it straight back inside
+      // the entry object, so the common case is guarded without a caller asking
+      // for it — and a caller that names no version at all is refused, exactly
+      // as content.cms_write refuses one. Same function, same envelopes.
+      const stale = checkDigest({
+        expected: typeof input.expectedDigest === 'string' ? input.expectedDigest : input.entry?.digest,
+        actual: entryDigest(found.entry),
+        what: `${found.collection}/${found.entry.id}`,
+        requireForExisting: true,
+      });
+      if (stale) return { error: stale };
+      return {
+        projectPath: ctx.root,
+        collection: found.collection,
+        entry: found.entry,
+        // The agent path opts INTO the schema check the CMS panel deliberately
+        // does not want; `allowInvalid` still checks and still reports, it just
+        // writes anyway — so an override is a decision on the record.
+        validate: true,
+        allowInvalid: input.allowInvalid === true,
+        // `[]`, not `{}`. The implementation maps over this; an object arrived
+        // at `.map` and took the operation down for every caller, including the
+        // ones that sent no edits at all and only wanted to rewrite the body.
+        edits: input.edits || [],
+        body: input.body,
+      };
     },
   },
   validate: {
     channel: 'content:validate',
-    args: (input, ctx) => ({ projectPath: ctx.root, collection: input.collection, data: input.data }),
+    args: (input, ctx) => {
+      if (input.data === undefined) {
+        return problem('bad_request', 'data is required — the entry data to check, as an object of fields.');
+      }
+      return { projectPath: ctx.root, collection: input.collection, data: input.data };
+    },
+    // AN EMPTY `issues` LIST MEANS TWO THINGS AND THEY ARE NOT THE SAME. It
+    // meant "the schema is satisfied" and "there was no schema to satisfy", and
+    // an unknown collection landed in the second — so a misspelled name came
+    // back as an all-clear. `checked` is the field that separates them, and an
+    // unknown collection is now the refusal content.entries already gives.
+    result: (raw, input) => {
+      if (raw?.unknownCollection) {
+        return problem('no_collection', raw.message || `${input.collection} is not a collection in this project.`);
+      }
+      const unchecked = !!raw?.unchecked || !!raw?.error;
+      return {
+        collection: input.collection,
+        issues: raw?.issues || [],
+        checked: !unchecked,
+        ...(unchecked ? { unchecked: true, reason: raw?.reason ?? raw?.error ?? null } : {}),
+      };
+    },
   },
   targets: { channel: 'content:targets', args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection }) },
   rename_plan: {
@@ -985,7 +1167,9 @@ const git = {
     args: (input, ctx) => {
       const at = gitPath(input, ctx);
       if (at.error) return at;
-      return { projectPath: ctx.root, ref: input.ref, path: at };
+      // "PUT THIS FILE BACK" means "back to the last commit" unless it says
+      // otherwise, which is what the panel's own restore does.
+      return { projectPath: ctx.root, ref: input.ref || 'HEAD', path: at };
     },
   },
   restore_project: { channel: 'git:restoreProject', args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }) },
@@ -1000,7 +1184,23 @@ const git = {
         ? problem('failed', String(raw.error))
         : { restored: raw?.restored !== false, ...(raw?.error ? { note: String(raw.error) } : {}) },
   },
-  push: { channel: 'git:push', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
+  push: {
+    channel: 'git:push',
+    // A push with no branch named pushes the branch the person is looking at.
+    // `git push -u origin <branch>` sets the upstream either way, so this is the
+    // ordinary intent rather than a guess. The window publishes the branch it is
+    // showing; where it has not published one yet, git is asked, which is the
+    // same answer one moment fresher. Only when neither knows is `branch`
+    // required — and then it says so rather than picking one.
+    args: async (input, ctx) => {
+      let branch = input.branch || ctx.branch;
+      if (!branch) branch = (await ctx.callMain('git:info', ctx.root))?.branch || null;
+      if (!branch) {
+        return problem('bad_request', 'Stacki could not work out which branch to push, so `branch` is required.');
+      }
+      return { projectPath: ctx.root, branch };
+    },
+  },
   publish: {
     channel: 'git:publish',
     args: (input, ctx) => ({ projectPath: ctx.root, repoName: input.repoName, isPrivate: input.private !== false }),
@@ -1055,4 +1255,4 @@ async function runMain(domain, action, input, ctx) {
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 
-module.exports = { runMain, DOMAINS, outlineOf, summarizeScan, MAX_LIST, MAX_TEXT_BYTES };
+module.exports = { runMain, resolveContentEntry, DOMAINS, outlineOf, summarizeScan, MAX_LIST, MAX_TEXT_BYTES };

@@ -8,8 +8,11 @@
 //
 // The schemas are discriminated unions on `action`, so the arguments an action
 // needs are required and the ones it does not are not merely optional but
-// absent. A call that names `set_prop` and forgets the prop is refused by the
-// protocol rather than by a sentence from us.
+// absent. That is what a client is shown, and it has not changed — but the
+// CHECK is run here rather than by the host. It used to be the host's, and a
+// call that named `set_prop` and forgot the prop got a bare English sentence
+// with no structuredContent, which is the one answer in this surface an agent
+// cannot branch on. See `advertised()` and `badArguments()` below.
 //
 // The annotations are honest and they are NOT the gate. `destructiveHint` says
 // what an operation is; `electron/mcp/agent/permissions.js` says whether it
@@ -467,7 +470,24 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('entries'), collection: z.string().max(200), limit: z.number().int().min(1).max(400).optional() }),
   z.object({
     action: z.literal('write_entry'),
-    entry: z.record(z.string(), z.unknown()).describe('The entry object content.entries reported — it carries where the entry lives.'),
+    // WHICH ENTRY, NEVER WHERE IT LIVES.
+    //
+    // This used to take the whole `entry` object a read handed back and use its
+    // `file` as the path to write. `path.resolve` accepts `..` segments and
+    // returns an absolute argument unchanged, so that was the one write in this
+    // surface outside the project fence — and an entry that had lost its
+    // `locator` on the way through addressed the top of a file-backed
+    // collection instead of its own record. Stacki resolves the entry itself
+    // now, through the same listing `content.entries` answers from.
+    collection: z.string().max(200).optional().describe('The collection the entry belongs to. Required unless `entry` identifies one on its own.'),
+    id: z.string().max(300).optional().describe('The entry, by the id content.entries reported. Required unless `entry` carries one.'),
+    entry: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        'Deprecated, and accepted for one release as a SELECTOR only: Stacki reads its id and file to pick the ' +
+          'entry out of the collection and takes nothing else from it. Send `collection` and `id` instead.'
+      ),
     // A LIST, because that is what the implementation applies: contentEntries.js
     // `writeEntry` calls `edits.map(...)` over `{ path, value }` locators. This
     // was declared as an object of fields, which no client could make work —
@@ -486,6 +506,16 @@ const ContentInput = z.discriminatedUnion('action', [
       .optional()
       .describe('The fields to change, each addressed by a path into the entry data.'),
     body: z.string().max(1_000_000).optional().describe('The markdown body, when the entry has one.'),
+    expectedDigest: Digest.optional().describe(
+      'The digest content.entries reported for this entry. Not needed when you pass `entry` back, which carries it.'
+    ),
+    allowInvalid: z
+      .boolean()
+      .optional()
+      .describe(
+        'The entry is checked against the collection schema and a write that breaks it is refused with field-level ' +
+          'issues. Say true to write it anyway — the issues are still reported, so the override is on the record.'
+      ),
   }),
   z.object({ action: z.literal('validate'), collection: z.string().max(200), data: z.unknown() }),
   z.object({ action: z.literal('targets'), collection: z.string().max(200) }),
@@ -546,11 +576,11 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
   z.object({ action: z.literal('resolve_merge'), branch: z.string().max(300), choices: z.record(z.string(), z.unknown()) }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
-  z.object({ action: z.literal('restore_file'), ref: z.string().max(200), path: RelPath }),
+  z.object({ action: z.literal('restore_file'), ref: z.string().max(200).optional().describe('The revision to come back to. Defaults to HEAD — the last commit.'), path: RelPath }),
   z.object({ action: z.literal('restore_project'), ref: z.string().max(200) }),
   z.object({ action: z.literal('park') }),
   z.object({ action: z.literal('unpark') }),
-  z.object({ action: z.literal('push'), branch: z.string().max(300) }),
+  z.object({ action: z.literal('push'), branch: z.string().max(300).optional().describe('The branch to push. Defaults to the branch the project is on.') }),
   z.object({ action: z.literal('publish'), repoName: z.string().max(200), private: z.boolean().optional() }),
 ]);
 
@@ -642,12 +672,18 @@ function registerAgentTools(server, { api }) {
       {
         title: `Stacki ${name}`,
         description: DESCRIPTIONS[name],
-        inputSchema,
+        inputSchema: advertised(inputSchema),
         outputSchema: Envelope,
         annotations,
       },
       async (args) => {
-        const { action, ...rest } = args || {};
+        // THE CHECK THE HOST NO LONGER DOES, one step later and in the one
+        // place that can shape a refusal. Same schema, same zod — and
+        // `parsed.data`, not `args`, so every default and coercion the schema
+        // declares is still applied exactly where it was.
+        const parsed = inputSchema.safeParse(args || {});
+        if (!parsed.success) return answer(badArguments(name, args?.action, parsed.error));
+        const { action, ...rest } = parsed.data;
         const shaped = normalise(name, action, rest);
         // Declaring `text` optional is what lets `value` be accepted; the cost
         // is that a call with NEITHER now reaches here instead of being refused
@@ -673,6 +709,96 @@ function registerAgentTools(server, { api }) {
   domain('asset', AssetInput, annotationsFor('asset'));
   domain('project', ProjectInput, annotationsFor('project'));
   domain('git', GitInput, annotationsFor('git', { remote: true }));
+}
+
+/**
+ * The strict schema, advertised — and checked by Stacki rather than by the host.
+ *
+ * The SDK validates `tools/call` arguments against a tool's input schema BEFORE
+ * the handler runs, and a failure there is a protocol error: a bare English
+ * sentence, `isError`, and no structuredContent at all. Measured against a real
+ * client, that is what every argument mistake on all eight domain tools came
+ * back as —
+ *
+ *   git {action:'push'}
+ *     -> "Input validation error: Invalid arguments for tool git:
+ *         branch: Invalid input: expected string, received undefined"
+ *
+ * — the one shape in this surface an agent cannot branch on, and the DEFAULT
+ * for the 73 operations that declare a required argument rather than a handful
+ * of cases.
+ *
+ * A tool schema only has to be a Standard Schema: `tools/list` converts it with
+ * `~standard.jsonSchema[io]()` and `tools/call` checks it with
+ * `~standard.validate`. So the conversion is delegated to the real schema —
+ * byte for byte what it published before, which test/schema-dispatch-contract.js
+ * measures — and the check is made a pass-through, so the identical zod schema
+ * can run inside the handler where a failure becomes Stacki's own refusal.
+ *
+ * The strictness is NOT relaxed: nothing here loosens a type, and a client
+ * reading tools/list sees exactly what it saw before.
+ */
+function advertised(schema) {
+  const std = schema['~standard'];
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'stacki',
+      jsonSchema: std.jsonSchema || {
+        input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
+        output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+      },
+      // Deliberately accepts everything. The handler runs the same schema a
+      // moment later; validating twice would only mean the host's copy won.
+      validate: (value) => ({ value }),
+    },
+  };
+}
+
+/**
+ * An argument failure, in Stacki's own shape.
+ *
+ * `issues` is the same `{path, message, code}` vocabulary content.validate
+ * answers with, so "a field is wrong" has one shape across this API whether the
+ * field is in a content entry or in a tool call.
+ */
+function badArguments(domain, action, error) {
+  const known = actionsOf(domain);
+  // An action the tool does not have is a bad ACTION, not a bad argument — the
+  // same envelope the dispatcher produces, rather than zod's "Invalid
+  // discriminator value" followed by the list in prose.
+  if (typeof action !== 'string' || !known.includes(action)) {
+    return {
+      ok: false,
+      code: 'bad_action',
+      operation: `${domain}.${typeof action === 'string' ? action : ''}`,
+      message: `Stacki has no ${domain}.${typeof action === 'string' ? action : '(no action)'}. Call get_capabilities for what it does have.`,
+      actions: known,
+    };
+  }
+  const issues = (error?.issues || []).map((issue) => {
+    const at = (issue.path || []).map((p) => (p && typeof p === 'object' ? p.key : typeof p === 'symbol' ? String(p) : p));
+    // Zod's sentence for a value that simply is not there reads "Invalid input:
+    // expected nonoptional, received undefined" on an unknown-typed field,
+    // which names nothing an agent can act on. A missing value gets Stacki's
+    // sentence; every other issue keeps zod's, which is more precise than
+    // anything written here would be.
+    const absent = /received undefined/.test(String(issue.message || ''));
+    return {
+      path: at,
+      message: absent ? `${at.join('.') || 'This argument'} is required.` : issue.message,
+      code: issue.code,
+    };
+  });
+  return {
+    ok: false,
+    code: 'bad_arguments',
+    operation: `${domain}.${action}`,
+    issues,
+    message: `${domain}.${action} could not run — ${issues
+      .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
+      .join('; ')}`,
+  };
 }
 
 /**
@@ -712,15 +838,26 @@ function normalise(domain, action, args) {
  * so a client that reads only that still knows, but the sentence is the part
  * an agent can act on.
  */
-function answer(result, { spaces = 2 } = {}) {
+function answer(result, { spaces = 2, images = [] } = {}) {
   const body = result && typeof result === 'object' ? result : { ok: false, code: 'failed', message: 'Stacki gave no answer.' };
+  // A SECOND CHANNEL, FOR THE ANSWERS THAT ARE PARTLY A PICTURE.
+  //
+  // An envelope is JSON and always will be, but some answers are worth more
+  // with the pixels beside them — and a client can only see an image if it
+  // arrives as an image block, not as base64 inside a string. Blocks first,
+  // exactly as electron/mcp/tools.js orders the capture tool's, so a host that
+  // shows only the first block shows the picture. Nothing is dropped silently:
+  // an entry with no data is not sent rather than sent empty.
+  const pictures = (Array.isArray(images) ? images : [images])
+    .filter((i) => i && typeof i.data === 'string' && i.data)
+    .map((i) => ({ type: 'image', data: i.data, mimeType: i.mimeType || 'image/png' }));
   return {
     // `spaces` exists for one caller and one reason: the text block is a second
     // copy of the same payload, and an audit's payload is findings. Indenting it
     // costs a third again in bytes on the largest answer this endpoint sends, on
     // a wire where the catalogue already costs 140 KB a session. The envelope
     // answers stay indented, because they are small and a person reads them.
-    content: [{ type: 'text', text: JSON.stringify(body, null, spaces) }],
+    content: [...pictures, { type: 'text', text: JSON.stringify(body, null, spaces) }],
     structuredContent: body,
     ...(body.ok === false ? { isError: true } : {}),
   };

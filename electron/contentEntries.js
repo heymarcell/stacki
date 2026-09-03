@@ -276,11 +276,16 @@ function fileEntries(projectPath, collection) {
 }
 
 /**
- * Applies edits to one entry. `edits` are { path, value } against the entry's
- * own data — the locator that puts it inside its file is added here — plus an
- * optional `body` for the formats that have one.
+ * What writing an entry WOULD do, without doing it.
+ *
+ * The write is split here so that something can look at the bytes before they
+ * land. `data` is the record read back OUT of those bytes at the entry's own
+ * locator — not a JavaScript re-application of the edits — so a caller that
+ * checks it against a schema is checking exactly what the file will hold. A
+ * second implementation of the edits would be the one thing this module exists
+ * to avoid; ./formats patches the file, and only the file knows what that made.
  */
-function writeEntry(projectPath, entry, edits, { body } = {}) {
+function planEntryWrite(projectPath, entry, edits, { body } = {}) {
   const abs = path.resolve(projectPath, entry.file);
   const format = formatFor(entry.file);
   if (!format) throw new Error(`Stacki cannot write ${path.extname(entry.file)} files.`);
@@ -299,8 +304,26 @@ function writeEntry(projectPath, entry, edits, { body } = {}) {
     format === frontmatter
       ? frontmatter.applyEdits(text, prefixed, { body })
       : format.applyEdits(text, prefixed);
-  if (next === text) return { ok: true, changed: false };
-  fs.writeFileSync(abs, next, 'utf8');
+
+  const plan = { abs, format, text, next, changed: next !== text, data: undefined, readBackError: null };
+  try {
+    const parsed = format === frontmatter ? frontmatter.parse(next).data || {} : format.parseData(next);
+    plan.data = locator.reduce((node, key) => (node == null ? undefined : node[key]), parsed);
+  } catch (err) {
+    plan.readBackError = String(err?.message || err);
+  }
+  return plan;
+}
+
+/**
+ * Applies edits to one entry. `edits` are { path, value } against the entry's
+ * own data — the locator that puts it inside its file is added here — plus an
+ * optional `body` for the formats that have one.
+ */
+function writeEntry(projectPath, entry, edits, { body } = {}) {
+  const plan = planEntryWrite(projectPath, entry, edits, { body });
+  if (!plan.changed) return { ok: true, changed: false };
+  fs.writeFileSync(plan.abs, plan.next, 'utf8');
   return { ok: true, changed: true };
 }
 
@@ -344,6 +367,7 @@ function coveredPaths(collections) {
 
 module.exports = {
   listEntries,
+  planEntryWrite,
   writeEntry,
   countEntries,
   coveredPaths,

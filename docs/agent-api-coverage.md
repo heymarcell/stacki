@@ -100,7 +100,7 @@ says so.
 | `config` | Inspect | main | — | electron/contentConfig.js | The project's content collection configuration. |
 | `collections` | Inspect | main | — | electron/contentConfig.js | Content collections and their schemas. |
 | `entries` | Inspect | main | — | electron/contentEntries.js | The entries in a collection. |
-| `write_entry` | Edit project | main | — | electron/contentEntries.js | Write fields and body of an entry. |
+| `write_entry` | Edit project | main | ⌘Z | electron/contentEntries.js | Write fields and body of an entry. |
 | `validate` | Inspect | main | — | electron/contentConfig.js | Check data against a collection schema. |
 | `targets` | Inspect | main | — | electron/contentEntries.js | Where a collection may be written. |
 | `rename_plan` | Inspect | main | — | electron/contentRefs.js | What renaming an entry would touch. |
@@ -199,5 +199,5 @@ says so.
 
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
-- 31 land on Stacki's own undo stack.
+- 32 land on Stacki's own undo stack.
 - 57 capabilities deliberately kept out.

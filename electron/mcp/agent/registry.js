@@ -154,7 +154,7 @@ const OPERATIONS = {
     config: { risk: 'read', via: 'main', channel: 'content:config', summary: "The project's content collection configuration.", reuses: 'electron/contentConfig.js' },
     collections: { risk: 'read', via: 'main', channel: 'content:collections', summary: 'Content collections and their schemas.', reuses: 'electron/contentConfig.js' },
     entries: { risk: 'read', via: 'main', channel: 'content:entries', summary: 'The entries in a collection.', reuses: 'electron/contentEntries.js' },
-    write_entry: { risk: 'write', via: 'main', channel: 'content:writeEntry', summary: 'Write fields and body of an entry.', reuses: 'electron/contentEntries.js' },
+    write_entry: { risk: 'write', via: 'main', channel: 'content:writeEntry', undoable: true, summary: 'Write fields and body of an entry.', reuses: 'electron/contentEntries.js' },
     validate: { risk: 'read', via: 'main', channel: 'content:validate', summary: 'Check data against a collection schema.', reuses: 'electron/contentConfig.js' },
     targets: { risk: 'read', via: 'main', channel: 'content:targets', summary: 'Where a collection may be written.', reuses: 'electron/contentEntries.js' },
     rename_plan: { risk: 'read', via: 'main', channel: 'content:renamePlan', summary: 'What renaming an entry would touch.', reuses: 'electron/contentRefs.js' },

@@ -93,7 +93,7 @@ const { createStarter } = require('./starter');
 const { openingBounds } = require('./windowBounds');
 const { componentFile } = require('./componentFile');
 const { componentUsage, instancesIn } = require('./componentUsage');
-const { listEntries, writeEntry, countEntries, coveredPaths } = require('./contentEntries');
+const { listEntries, planEntryWrite, countEntries, coveredPaths } = require('./contentEntries');
 const { planRename, applyRename } = require('./contentRefs');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
 const { probeUrl } = require('./devProbe')
@@ -2999,12 +2999,89 @@ handle('content:entries', async (_e, { projectPath, name }) => {
 
 // A save is a list of edits against one entry, not a new copy of the file: see
 // contentEntries.js and ./formats for what that protects.
-handle('content:writeEntry', async (_e, { projectPath, entry, edits, body }) => {
-  const result = writeEntry(projectPath, entry, edits || [], { body });
+handle('content:writeEntry', async (_e, { projectPath, entry, edits, body, collection = null, validate = false, allowInvalid = false }) => {
+  const plan = planEntryWrite(projectPath, entry, edits || [], { body });
+  // WHO ASKS TO BE CHECKED, AND WHY IT IS NOT EVERYBODY.
+  //
+  // The CMS panel writes on a 400ms debounce and validates on a separate one,
+  // painting the issues into the form as somebody types. That is right for a
+  // person watching a form and wrong for an agent, which reads {ok:true} and
+  // moves on — so the agent path asks for the check and the panel keeps the
+  // behaviour it has always had.
+  const status = validate
+    ? await entryValidation(projectPath, collection, plan)
+    : { validation: 'unchecked', validationReason: 'The caller did not ask for this entry to be checked.', issues: [] };
+  const issues = status.issues || [];
+  const said = {
+    collection,
+    id: entry.id ?? null,
+    file: entry.file,
+    validation: status.validation,
+    validationReason: status.validationReason ?? null,
+    ...(issues.length ? { issues } : {}),
+  };
+  // REFUSED BEFORE ANYTHING IS WRITTEN, not rolled back afterwards. The plan
+  // exists so that the bytes can be judged while they are still only a plan.
+  if (issues.length && !allowInvalid) {
+    return {
+      ok: false,
+      code: 'invalid_entry',
+      changed: false,
+      ...said,
+      message:
+        `That entry does not satisfy ${collection}'s schema, so nothing was written. ` +
+        'Fix the fields named in `issues`, or pass allowInvalid: true to write it anyway.',
+    };
+  }
+  if (plan.changed) fs.writeFileSync(plan.abs, plan.next, 'utf8');
   markSelfWrite(path.resolve(projectPath, entry.file));
   send('cms:changed', {});
-  return result;
+  // WHICH ENTRY THIS WAS. The agent path no longer sends a file — it sends a
+  // collection and an id and Stacki resolves the rest — so the answer has to
+  // say what it acted on, or an agent has only its own guess about it.
+  return { ok: true, changed: plan.changed, ...said };
 });
+
+/**
+ * Whether the bytes a write would land can be checked against a schema, and
+ * what came back.
+ *
+ * Four answers and there is no fifth: no content config, a config that would
+ * not read, a collection that declares no schema, and a real check. The one
+ * thing this must never do is report `checked` for a collection whose schema it
+ * never had — an agent acting on false confidence is worse off than one told
+ * the limitation by name.
+ */
+async function entryValidation(projectPath, name, plan) {
+  if (plan.readBackError) {
+    return { validation: 'unavailable', validationReason: `The edited file could not be read back — ${plan.readBackError}`, issues: [] };
+  }
+  if (!name) {
+    return { validation: 'unavailable', validationReason: 'Stacki was not told which collection this entry belongs to.', issues: [] };
+  }
+  const config = await readContentConfig(projectPath);
+  if (config.missing) {
+    return { validation: 'unavailable', validationReason: 'This project has no content config, so there is no schema to check against.', issues: [] };
+  }
+  if (config.error) return { validation: 'unavailable', validationReason: config.error, issues: [] };
+  const collection = (config.collections || []).find((c) => c.name === name);
+  if (!collection) {
+    return { validation: 'unavailable', validationReason: `${name} is not a collection in this project.`, issues: [] };
+  }
+  if (collection.error) return { validation: 'unchecked', validationReason: collection.error, issues: [] };
+  if (collection.freeform || collection.schema == null) {
+    return { validation: 'unchecked', validationReason: `${name} declares no schema, so any shape of entry is allowed.`, issues: [] };
+  }
+  const said = await validateEntry(projectPath, { collection: name, data: plan.data });
+  if (said?.error) return { validation: 'unavailable', validationReason: said.error, issues: [] };
+  if (said?.unknownCollection) {
+    return { validation: 'unavailable', validationReason: said.message || `${name} is not a collection in this project.`, issues: [] };
+  }
+  if (said?.unchecked) {
+    return { validation: 'unchecked', validationReason: said.reason || `${name} declares no schema.`, issues: [] };
+  }
+  return { validation: 'checked', validationReason: null, issues: said?.issues || [] };
+}
 
 handle('content:validate', async (_e, { projectPath, collection, data }) =>
   validateEntry(projectPath, { collection, data })
