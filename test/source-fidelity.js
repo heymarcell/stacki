@@ -338,6 +338,106 @@ const linesChanged = (before, after) => {
         check('the label reports a text child to edit', false, short(kids?.target?.children));
       }
     }
+
+    // --- THE QUOTES THE AUTHOR CHOSE, ON AN ATTRIBUTE THE EDIT REWRITES.
+    //
+    // Every check above passes without this one, because `patchAttrs` keeps a
+    // tag's own bytes for every attribute whose MEANING is unchanged. The
+    // moment a VALUE changes the attribute is written out again -- and it was
+    // written with double quotes whatever the file said, so `add_class` on
+    // `class='x'` came back as `class="x y"`. Two bytes nobody asked for, on
+    // the surgical path, where no amount of shrinking the blast radius reaches
+    // them.
+    {
+      const beforeQuote = app.read(PAGE);
+      const p6 = await run('target', 'read');
+      const card = p6.target?.children?.find((c) => c.tag === 'Card');
+      const set6 = await run('target', 'set_prop', { ref: card.ref, name: 'body', value: 'across lines still' });
+      await H.settle(250);
+      const afterQuote = app.read(PAGE);
+      check(
+        "rewriting a single-quoted value keeps the author's quotes",
+        set6.ok === true && afterQuote.includes("body='across lines still'"),
+        short({ ok: set6.ok, at: afterQuote.slice(afterQuote.indexOf('<Card'), afterQuote.indexOf('<Card') + 180) })
+      );
+      check(
+        '  and changes the value and nothing else',
+        afterQuote.replace("body='across lines still'", "body='across lines on purpose'") === beforeQuote,
+        short({ span: changedSpan(beforeQuote, afterQuote) })
+      );
+
+      // --- AND THE ONE VALUE THOSE QUOTES CANNOT HOLD. There is no escape for
+      //     `'` inside a single-quoted attribute, so the choice is the other
+      //     quote or invalid markup.
+      const beforeApos = app.read(PAGE);
+      // A fresh ref: the edit above moved the file on, and a ref carries the
+      // revision it was read at.
+      const p7 = await run('target', 'read');
+      const sameCard = p7.target?.children?.find((c) => c.tag === 'Card');
+      const set7 = await run('target', 'set_prop', { ref: sameCard.ref, name: 'body', value: "it's here" });
+      await H.settle(250);
+      const afterApos = app.read(PAGE);
+      check(
+        'a value carrying an apostrophe takes double quotes instead',
+        set7.ok === true && afterApos.includes('body="it\'s here"'),
+        short({ ok: set7.ok, at: afterApos.slice(afterApos.indexOf('<Card'), afterApos.indexOf('<Card') + 180) })
+      );
+      check(
+        '  and still changes only that attribute',
+        afterApos.replace('body="it\'s here"', "body='across lines still'") === beforeApos,
+        short({ span: changedSpan(beforeApos, afterApos) })
+      );
+      const p8 = await run('target', 'read');
+      const readBack = await run('target', 'read', { ref: p8.target?.children?.find((c) => c.tag === 'Card')?.ref });
+      check(
+        '  and reads back as the value that was asked for',
+        readBack.target?.props?.body?.value === "it's here",
+        short(readBack.target?.props)
+      );
+    }
+
+    // --- A STRUCTURAL EDIT, IN THE FILE THAT CARRIES EVERYTHING ELSE.
+    //
+    // Everything above is one attribute on one node, which is the case this
+    // path always handled. An insert changes how many children a level has, and
+    // the answer to that used to be "reprint the level" -- here `<Base>`, which
+    // is the whole body: 844 bytes rewritten to add 30, the tabs turned into
+    // spaces and the frontmatter comments torn off their imports.
+    // test/source-fidelity-matrix.js measures every operation across four
+    // differently-written files; this asks the one question that needs THIS
+    // fixture, which also holds a `.map()` and a rendered space inside a
+    // <label> that the insert never named.
+    {
+      const beforeInsert = app.read(PAGE);
+      const p9 = await run('target', 'read');
+      const footer = p9.target?.children?.find((c) => c.tag === 'footer');
+      check('the page reports its footer', !!footer?.ref, short(p9.target?.children?.map((c) => c.tag)));
+      const inserted = await run('target', 'append_child', {
+        ref: footer.ref,
+        node: { kind: 'element', tag: 'img', props: { src: '/logo.png', alt: 'Logo' } },
+      });
+      await H.settle(250);
+      const afterInsert = app.read(PAGE);
+      const line = '\n        <img src="/logo.png" alt="Logo" />';
+      check('a child can be appended', inserted.ok === true && afterInsert.includes('<img src="/logo.png"'), short(inserted));
+      check(
+        "  at the file's own four-space indentation",
+        afterInsert.includes(`${line}\n    </footer>`),
+        short(afterInsert.slice(afterInsert.indexOf('<footer'), afterInsert.indexOf('<footer') + 200))
+      );
+      check(
+        '  and every other byte in the file is the byte that was there',
+        afterInsert.replace(line, '') === beforeInsert,
+        short({ span: changedSpan(beforeInsert, afterInsert) })
+      );
+      check(
+        '  including the map, the label and the comments above the imports',
+        afterInsert.includes('\n        {plans.map(') &&
+          /Full name:(\s|&nbsp;)/.test(afterInsert.slice(afterInsert.indexOf('Full name:'))) &&
+          /\/\/ Component imports\nimport Hero/.test(afterInsert),
+        short(frontmatterOf(afterInsert))
+      );
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);

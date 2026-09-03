@@ -80,12 +80,24 @@ function attrsAsWritten(node) {
   return flat(node.attrSource) === flat(serializeAttrs(node.props)) ? node.attrSource : null;
 }
 
-/** One attribute, as this serializer writes it. */
-function attrText(name, v) {
+/**
+ * One attribute, as this serializer writes it.
+ *
+ * `quote` is the quote character the file already used for this attribute, for
+ * the case where an EDIT rewrites one that was there. Writing `class='x'` back
+ * as `class="x"` is a change to a line the author wrote and the edit never
+ * named -- the same bargain `serializeImports` strikes for an import specifier,
+ * made here for the same reason. A value carrying the author's own quote is
+ * written the ordinary way instead: there is no escape for `'` inside a
+ * single-quoted attribute, so the choice is double quotes or invalid markup.
+ */
+function attrText(name, v, quote = '"') {
   if (v?.type === 'spread') return `{...${v.value}}`;
   if (v == null || v.type === 'bare') return name;
   if (v.type === 'expr') return `${name}={${v.value}}`;
-  return `${name}="${String(v.value).replace(/"/g, '&quot;')}"`;
+  const text = String(v.value);
+  if (quote === "'" && !text.includes("'")) return `${name}='${text}'`;
+  return `${name}="${text.replace(/"/g, '&quot;')}"`;
 }
 
 function serializeAttrs(props) {
@@ -949,6 +961,12 @@ function parsePage(source, opts = {}) {
   // shuffle one group past the other.
   imports.sort((a, b) => (a.at ?? Infinity) - (b.at ?? Infinity));
   cuts.sort((a, b) => a[0] - b[0]);
+  // The same ranges again, this time as offsets into the FILE, so an anchored
+  // write can cut one import statement out of the block instead of rebuilding
+  // the block. `at` is the frontmatter-relative start each import entry already
+  // records, which is what ties a statement to the specifiers it declared.
+  const fmBodyAt = fm ? /^---\r?\n/.exec(fm[0])[0].length : 0;
+  const importSpans = cuts.map(([a, b]) => ({ at: a, from: a + fmBodyAt, to: b + fmBodyAt }));
 
   // Whatever stands above the first import belongs above it. A page that
   // opens with a `/** … */` describing it had that comment hoisted below the
@@ -1063,7 +1081,7 @@ function parsePage(source, opts = {}) {
       nodes: topNodes,
       // Only when offsets were asked for: it describes the file on disk, and
       // the live model is edited out from under it.
-      ...(opts.locs ? { bodyStart } : {}),
+      ...(opts.locs ? { bodyStart, importSpans } : {}),
     },
   };
 }
@@ -1160,13 +1178,13 @@ function indentAt(source, offset) {
   return /^[ \t]*$/.test(lead) ? lead : '';
 }
 
-/** One node's text, at the indentation the file already uses there. */
-function nodeText(node, indent) {
+/** One node's text, at the indentation and the nesting step the file already uses there. */
+function nodeText(node, indent, step = '  ') {
   const lines = [];
   // `blankBefore` is the gap in FRONT of the node, and the span being replaced
   // starts at the node itself -- emitting it here would add a blank line on
   // every save.
-  serializeNode({ ...node, blankBefore: 0 }, indent, lines);
+  serializeNode({ ...node, blankBefore: 0 }, indent, lines, step);
   const text = lines.join('\n');
   // The first line's indent is already in the file, before the span starts.
   return text.startsWith(indent) ? text.slice(indent.length) : text;
@@ -1215,8 +1233,12 @@ function patchAttrs(text, baseProps, nextProps) {
     if (seen.has(name)) continue;
     seen.add(name);
     if (!Object.prototype.hasOwnProperty.call(next, name)) continue; // removed
-    const before = attrText(name, base[name]);
-    const after = attrText(name, next[name]);
+    // The quote this attribute was written with, so a rewritten VALUE lands
+    // between the author's own quotes rather than between this file's.
+    const wrote = /^\s*=\s*(['"])/.exec(m[4] || '');
+    const quote = wrote ? wrote[1] : '"';
+    const before = attrText(name, base[name], quote);
+    const after = attrText(name, next[name], quote);
     // Unchanged in meaning: the file's own bytes, quotes and all.
     out += space + (before === after ? m[0].slice(space.length) : after);
   }
@@ -1243,53 +1265,6 @@ function frontmatterText(model) {
 
 /** The node itself, without its subtree, to ask whether IT changed or something inside it did. */
 const headOf = (node) => ({ ...node, children: Array.isArray(node.children) ? [] : node.children });
-
-/**
- * The single node two trees disagree about, or null when it is not one node.
- *
- * Descends as far as the change goes: a prop set on a component three levels
- * down reports that component, not the page's root. More than one sibling
- * changed, or a tree of a different shape, is not a local edit and says so.
- */
-function locateChange(baseNodes, nextNodes) {
-  if (!Array.isArray(baseNodes) || !Array.isArray(nextNodes)) return null;
-  if (baseNodes.length !== nextNodes.length) return null;
-  // COMPARED BY MEANING, NOT BY SERIALIZED TEXT. A `.map()` body carries its
-  // own as-written source, which goes stale the moment a child inside it is
-  // mutated -- so the two sides' TEXT differed at the map while their meaning
-  // differed only at the component inside it, and the splice replaced the whole
-  // expression and reformatted it.
-  let at = -1;
-  for (let i = 0; i < baseNodes.length; i += 1) {
-    if (!sameMeaning(baseNodes[i], nextNodes[i])) {
-      if (at !== -1) return null;
-      at = i;
-    }
-  }
-  if (at === -1) return { unchanged: true };
-  const base = baseNodes[at];
-  const next = nextNodes[at];
-  const hasKids = Array.isArray(base.children) && Array.isArray(next.children);
-  // Only the subtree differs: go further in, so the span replaced is as small
-  // as the change actually is.
-  if (hasKids && sameMeaning(headOf(base), headOf(next))) {
-    const deeper = locateChange(base.children, next.children);
-    if (deeper && !deeper.unchanged) return deeper;
-    return { base, next };
-  }
-  // Only the opening tag differs, and the whole subtree under it is untouched.
-  // Replacing the node would reprint every one of those children for an edit
-  // that was one attribute long.
-  const sameKids =
-    hasKids &&
-    base.children.length === next.children.length &&
-    base.children.every((c, i) => sameMeaning(c, next.children[i]));
-  // A self-closing tag IS its opening tag: there is no subtree to preserve, but
-  // there is a multi-line attribute block, and reprinting the node flattens it.
-  const selfClosing = base.children === null && next.children === null;
-  if (sameKids || selfClosing) return { base, next, headOnly: true };
-  return { base, next };
-}
 
 // The fields that describe how a node was WRITTEN rather than what it says: a
 // parse-local id, source offsets, and the four verbatim caches the serializer
@@ -1332,6 +1307,506 @@ function sameMeaning(a, b) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// WHERE THE CHANGE IS, AS A LIST OF SPLICES
+// ---------------------------------------------------------------------------
+//
+// This used to ask for THE ONE node two trees disagreed about and answer null
+// for anything else. Every STRUCTURAL edit is anything else: an insert, a
+// removal, a duplicate and a move all change how many children a level has,
+// and the answer to null was to reprint the nearest ancestor whose child count
+// had not changed -- which on an ordinary page wrapped in a layout is the whole
+// body. Measured on a tab-indented page: `insert_after` on one component
+// rewrote 844 bytes to add 30, turned the tabs into two-space indentation,
+// requoted every attribute in the file and moved the frontmatter comments off
+// the imports they annotate. Nothing about the page's MEANING changed, which is
+// why every check there was stayed green.
+//
+// So the question is "which contiguous runs of siblings differ", answered by
+// lining the two child lists up against each other. A run the same length on
+// both sides is the old node-for-node case; a run that grew is an insertion; a
+// run that shrank is a cut; and the bytes BETWEEN the runs are never looked at,
+// which is what makes them survive.
+//
+// The safety property is unchanged. Every splice below is applied to the file,
+// the result is parsed again, and it has to MEAN what the model means or the
+// whole thing is thrown away for a full serialization. A correct fallback is
+// better than a wrong splice.
+
+/** The whitespace in front of `offset` on its line, or null when something else is there. */
+function lineIndentOf(source, offset) {
+  const lineStart = source.lastIndexOf('\n', offset - 1) + 1;
+  const lead = source.slice(lineStart, offset);
+  return /^[ \t]*$/.test(lead) ? lead : null;
+}
+
+/** The line ending this file is written with. */
+const eolOf = (source) => (source.includes('\r\n') ? '\r\n' : '\n');
+
+/** Text this serializer produced, in the file's own line ending. */
+const withEol = (text, eol) => (eol === '\n' ? text : text.replace(/\r?\n/g, eol));
+
+/**
+ * One step of nesting, as this file's own body writes it.
+ *
+ * `serializeNode` indents by two spaces because something has to be chosen for
+ * a file that does not exist yet. Grafted onto a file written with tabs it
+ * produced `\t  <Card` -- one tab and two spaces inside a single element -- on
+ * every insert. The file has already said what a step is; this reads it back.
+ */
+function indentStepOf(source) {
+  const fence = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(source);
+  const body = source.slice(fence ? fence[0].length : 0);
+  let tabbed = false;
+  let smallest = null;
+  for (const line of body.split('\n')) {
+    const lead = (/^[ \t]+(?=\S)/.exec(line) || [null])[0];
+    if (lead === null) continue;
+    if (lead.includes('\t')) tabbed = true;
+    else if (smallest === null || lead.length < smallest) smallest = lead.length;
+  }
+  if (tabbed) return '\t';
+  return smallest ? ' '.repeat(smallest) : '  ';
+}
+
+/**
+ * A block of source moved from one indentation to another.
+ *
+ * The same decision `reindentRun` makes for an inline run, and the same refusal
+ * at the end of it: tabs against spaces is not a shift, it is a guess, and a
+ * guess here is how `blockAsWritten` came to write four spaces followed by a
+ * tab. The first line carries no indent of its own -- the splice puts it where
+ * the file already had one.
+ */
+function reindentBlock(text, from, to) {
+  if (from === null || to === null) return null;
+  if (from === to || !text.includes('\n')) return text;
+  const lines = text.split('\n');
+  if (to.startsWith(from)) {
+    const add = to.slice(from.length);
+    return lines.map((line, i) => (i === 0 || !line.trim() ? line : add + line)).join('\n');
+  }
+  if (from.startsWith(to)) {
+    const drop = from.slice(to.length);
+    return lines.map((line, i) => (i === 0 || !line.startsWith(drop) ? line : line.slice(drop.length))).join('\n');
+  }
+  return null;
+}
+
+/**
+ * The two child lists, lined up: the runs that differ, and nothing else.
+ *
+ * A longest-common-subsequence over the siblings with `sameMeaning` as the
+ * equality test -- the same predicate the write is checked against, so a node
+ * that only moved is recognised as the node it is rather than as a delete and
+ * an unrelated insert, and a duplicate is recognised as a copy of the one
+ * beside it.
+ *
+ * COMPARED BY MEANING, NOT BY SERIALIZED TEXT. A `.map()` body carries its own
+ * as-written source, which goes stale the moment a child inside it is mutated
+ * -- so the two sides' TEXT differed at the map while their meaning differed
+ * only at the component inside it, and the splice replaced the whole expression
+ * and reformatted it.
+ */
+function alignChildren(baseNodes, nextNodes) {
+  // The siblings that still match at either end come off first. An edit
+  // touches one or two of them, so this is what keeps the quadratic table to
+  // the handful in the middle rather than to the length of the list -- a page
+  // with two hundred sections at one level is otherwise forty thousand deep
+  // comparisons for a change to one of them.
+  let head = 0;
+  while (head < baseNodes.length && head < nextNodes.length && sameMeaning(baseNodes[head], nextNodes[head])) {
+    head += 1;
+  }
+  let tail = 0;
+  while (
+    tail < baseNodes.length - head &&
+    tail < nextNodes.length - head &&
+    sameMeaning(baseNodes[baseNodes.length - 1 - tail], nextNodes[nextNodes.length - 1 - tail])
+  ) {
+    tail += 1;
+  }
+  const baseMid = baseNodes.slice(head, baseNodes.length - tail);
+  const nextMid = nextNodes.slice(head, nextNodes.length - tail);
+  const n = baseMid.length;
+  const m = nextMid.length;
+  if (n * m > 40000) return null;
+  const same = Array.from({ length: n }, () => new Array(m).fill(false));
+  for (let i = 0; i < n; i += 1) {
+    for (let j = 0; j < m; j += 1) same[i][j] = sameMeaning(baseMid[i], nextMid[j]);
+  }
+  const lcs = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      lcs[i][j] = same[i][j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const runs = [];
+  let i = 0;
+  let j = 0;
+  let baseFrom = 0;
+  let nextFrom = 0;
+  const closeRun = () => {
+    if (i > baseFrom || j > nextFrom) {
+      runs.push({ baseFrom: baseFrom + head, baseTo: i + head, nextFrom: nextFrom + head, nextTo: j + head });
+    }
+    baseFrom = i;
+    nextFrom = j;
+  };
+  while (i < n && j < m) {
+    if (same[i][j]) {
+      closeRun();
+      i += 1;
+      j += 1;
+      baseFrom = i;
+      nextFrom = j;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  i = n;
+  j = m;
+  closeRun();
+  return runs;
+}
+
+/**
+ * The base node whose bytes ARE this node's, if the file already holds them.
+ *
+ * A duplicate and a move both write a node that is already in the file, and
+ * reprinting it loses whatever the author did to it -- the line breaks in its
+ * attribute block, the quotes, the hand-wrapped prose inside it. Copying its
+ * own bytes is both smaller and more faithful, and it is the only way "move"
+ * can mean that the moved bytes are the same bytes.
+ */
+function twinFinder(baseNodes) {
+  let flat = null;
+  return (node) => {
+    if (flat === null) {
+      flat = [];
+      const walk = (list) => {
+        for (const n of list || []) {
+          if (typeof n.start === 'number' && typeof n.end === 'number') flat.push(n);
+          if (Array.isArray(n.children)) walk(n.children);
+        }
+      };
+      walk(baseNodes);
+    }
+    return flat.find((b) => sameMeaning(b, node)) || null;
+  };
+}
+
+/** One node's bytes for a place in the file that does not hold them yet. */
+function printNode(node, indent, ctx) {
+  const twin = ctx.twin(node);
+  if (twin) {
+    const copied = reindentBlock(
+      ctx.source.slice(twin.start, twin.end),
+      lineIndentOf(ctx.source, twin.start),
+      indent
+    );
+    if (copied !== null) return copied;
+  }
+  return withEol(nodeText(node, indent, ctx.step), ctx.eol);
+}
+
+/** How this element's children are written, or null when they cannot be reached separately. */
+function childContext(base, next, ctx) {
+  if (base.kind !== next.kind) return null;
+  if (base.kind === 'element' || base.kind === 'component') {
+    if (base.chunkFile || base.chunkAggregate) return null;
+    const baseInline = base.children.length > 0 && isInlineRun(base.children);
+    const nextInline = next.children.length > 0 && isInlineRun(next.children);
+    // The element stops (or starts) being written on one line, so the bytes
+    // around every child move too. That is the whole node's business.
+    if (baseInline !== nextInline) return null;
+    return { ...ctx, inline: baseInline, structural: true };
+  }
+  // A loop, a condition and a branch keep the file's own block verbatim and
+  // there is no rule here for putting a sibling INTO one, so only an aligned,
+  // same-shaped child list is patched in place -- which is what this did
+  // before, and it is what test/loop-source.js is about.
+  if (base.kind === 'map' || base.kind === 'cond' || base.kind === 'branch') {
+    return { ...ctx, inline: false, structural: false };
+  }
+  return null;
+}
+
+/** The opening tag rewritten in place -- attributes, and the tag's own name. */
+function spliceHead(source, base, next) {
+  TAG_RE.lastIndex = base.start;
+  const tag = TAG_RE.exec(source);
+  if (!tag || tag.index !== base.start) return null;
+  const attrsAt = base.start + 1 + tag[1].length;
+  const patched = patchAttrs(tag[2], base.props, next.props);
+  if (patched === null) return null;
+  const out = [{ start: attrsAt, end: attrsAt + tag[2].length, text: patched }];
+  if (tag[1] === next.name) return out;
+  // `set_tag` is two names and nothing else. Reprinting the node instead put
+  // every one of its children back through the serializer for an edit that
+  // changed six characters.
+  if (!/^[A-Za-z][\w.-]*$/.test(next.name || '')) return null;
+  out.push({ start: base.start + 1, end: base.start + 1 + tag[1].length, text: next.name });
+  if (base.children === null) return out;
+  const closeAt = source.lastIndexOf('</', base.end);
+  if (closeAt < attrsAt) return null;
+  const close = /^<\/([A-Za-z][\w.-]*)\s*>$/.exec(source.slice(closeAt, base.end));
+  if (!close || close[1] !== tag[1]) return null;
+  out.push({ start: closeAt + 2, end: closeAt + 2 + close[1].length, text: next.name });
+  return out;
+}
+
+/** One node's whole span, replaced by what the model now says it is. */
+function replaceNodeSplice(source, base, next, ctx) {
+  const { start, end } = base;
+  if (ctx.inline) return [{ start, end, text: withEol(inlineString([next]), ctx.eol) }];
+  // A TEXT NODE'S SPAN IS NOT ITS WORDS.
+  //
+  // It starts where the PREVIOUS node ended, so it carries the line break and
+  // the indent that sit between them -- and `serializeNode` strips a text run's
+  // boundary spaces, on the assumption that those breaks already ARE that
+  // whitespace. Replacing the wide span with the narrow text deleted a space
+  // the page renders: `<label>Name: <input /></label>` came back as
+  // `<label>Name:<input />`, and the check could not see it because the same
+  // stripping happens on both sides of the comparison. Refusing outright was
+  // the first answer, and its fallback reprinted the whole document for a
+  // three-word edit. So the boundary bytes the file already has are left
+  // exactly where they are and only the words between them are replaced --
+  // which is the property the refusal was defending in the first place.
+  const held = source.slice(start, end);
+  if (base.kind === 'text' && next.kind === 'text') {
+    const lead = /^\s*/.exec(held)[0];
+    const trail = held.length > lead.length ? /\s*$/.exec(held)[0] : '';
+    let written = withEol(textOut(next), ctx.eol);
+    if (lead) written = written.replace(/^\s+/, '');
+    if (trail) written = written.replace(/\s+$/, '');
+    if (!written.trim()) return null;
+    return [{ start: start + lead.length, end: end - trail.length, text: written }];
+  }
+  if (/^\s|\s$/.test(held)) return null;
+  const indent = indentAt(source, start);
+  return [{ start, end, text: withEol(nodeText(next, indent, ctx.step), ctx.eol) }];
+}
+
+/** A node removed, with the indentation and the line break that carried it. */
+function cutNodeSplice(source, base, ctx) {
+  const { start, end } = base;
+  if (typeof start !== 'number' || typeof end !== 'number') return null;
+  if (ctx.inline) return { start, end, text: '' };
+  let from = start;
+  let to = end;
+  const lineStart = source.lastIndexOf('\n', from - 1) + 1;
+  if (!/^[ \t]*$/.test(source.slice(lineStart, from))) return null;
+  const trailing = /^[ \t]+(?=\r?\n)/.exec(source.slice(to));
+  if (trailing) to += trailing[0].length;
+  if (lineStart > 0) {
+    from = lineStart - 1;
+    if (source[from - 1] === '\r') from -= 1;
+    // The blank lines the author left in front of it go with it; left behind,
+    // they attach to whatever follows and the reparse no longer agrees with
+    // the model about where the gaps are.
+    for (let left = base.blankBefore || 0; left > 0; left -= 1) {
+      const above = source.lastIndexOf('\n', from - 1) + 1;
+      if (above > from || !/^[ \t]*$/.test(source.slice(above, from))) break;
+      if (above === 0) break;
+      from = above - 1;
+      if (source[from - 1] === '\r') from -= 1;
+    }
+  } else {
+    // The first line of the file: there is no break in front to take, so the
+    // one behind goes instead -- the rule `parsePage` already uses for imports.
+    const eol = /^[ \t]*\r?\n/.exec(source.slice(to));
+    if (!eol) return null;
+    to += eol[0].length;
+  }
+  return { start: from, end: to, text: '' };
+}
+
+/** New siblings, at the position the aligned lists put them in. */
+function insertSplice(source, baseNodes, at, newNodes, ctx) {
+  if (!baseNodes.length) return null;
+  if (ctx.inline) {
+    const anchor = at > 0 ? baseNodes[at - 1].end : baseNodes[0].start;
+    if (typeof anchor !== 'number') return null;
+    return [{ start: anchor, end: anchor, text: withEol(inlineString(newNodes), ctx.eol) }];
+  }
+  const anchorNode = at > 0 ? baseNodes[at - 1] : baseNodes[0];
+  if (typeof anchorNode.start !== 'number' || typeof anchorNode.end !== 'number') return null;
+  const indent = lineIndentOf(source, anchorNode.start);
+  if (indent === null) return null;
+  const gaps = (node) => ctx.eol.repeat(1 + (node.blankBefore || 0));
+  if (at > 0) {
+    const text = newNodes.map((node) => gaps(node) + indent + printNode(node, indent, ctx)).join('');
+    return [{ start: anchorNode.end, end: anchorNode.end, text }];
+  }
+  const text = newNodes.map((node) => printNode(node, indent, ctx) + gaps(node) + indent).join('');
+  return [{ start: anchorNode.start, end: anchorNode.start, text }];
+}
+
+/** A run of siblings replaced by a run of a different length -- one span, whole. */
+function rangeSplice(source, baseRun, nextRun, ctx) {
+  const start = baseRun[0].start;
+  const end = baseRun[baseRun.length - 1].end;
+  if (typeof start !== 'number' || typeof end !== 'number') return null;
+  if (ctx.inline) return [{ start, end, text: withEol(inlineString(nextRun), ctx.eol) }];
+  const indent = lineIndentOf(source, start);
+  if (indent === null) return null;
+  const text = nextRun.map((node) => printNode(node, indent, ctx)).join(ctx.eol + indent);
+  return [{ start, end, text }];
+}
+
+/** Every splice one pair of nodes asks for, or null when it cannot be placed. */
+function nodeSplices(source, base, next, ctx) {
+  if (sameMeaning(base, next)) return [];
+  const { start, end } = base;
+  if (typeof start !== 'number' || typeof end !== 'number') return null;
+  if (!(start >= 0 && end > start && end <= source.length)) return null;
+
+  const hasKids = Array.isArray(base.children) && Array.isArray(next.children);
+  const inner = hasKids ? childContext(base, next, ctx) : null;
+  const deeper = inner ? collectSplices(source, base.children, next.children, inner) : null;
+  // Only the subtree differs: go further in, so the span replaced is as small
+  // as the change actually is.
+  if (hasKids && sameMeaning(headOf(base), headOf(next))) {
+    if (deeper) return deeper;
+    return replaceNodeSplice(source, base, next, ctx);
+  }
+  // The opening tag differs too. The two are independent spans -- the tag, and
+  // whatever inside it moved -- and doing them together is what a batched
+  // `target.edit` is: one `set_prop` and one `append_child` on the same element
+  // used to fall out of both paths and reprint the element.
+  const kind = base.kind === 'element' || base.kind === 'component';
+  if (kind && deeper) {
+    const head = spliceHead(source, base, next);
+    if (head) return [...head, ...deeper];
+  }
+  // A self-closing tag IS its opening tag: there is no subtree to preserve, but
+  // there is a multi-line attribute block, and reprinting the node flattens it.
+  if (kind && base.children === null && next.children === null) {
+    const head = spliceHead(source, base, next);
+    if (head) return head;
+  }
+  return replaceNodeSplice(source, base, next, ctx);
+}
+
+/** Every splice two child lists ask for, or null when any of it cannot be placed. */
+function collectSplices(source, baseNodes, nextNodes, ctx) {
+  if (!Array.isArray(baseNodes) || !Array.isArray(nextNodes)) return null;
+  const runs = alignChildren(baseNodes, nextNodes);
+  if (!runs) return null;
+  const out = [];
+  for (const run of runs) {
+    const removed = run.baseTo - run.baseFrom;
+    const added = run.nextTo - run.nextFrom;
+    if (removed === added) {
+      for (let k = 0; k < removed; k += 1) {
+        const one = nodeSplices(source, baseNodes[run.baseFrom + k], nextNodes[run.nextFrom + k], ctx);
+        if (!one) return null;
+        out.push(...one);
+      }
+      continue;
+    }
+    if (!ctx.structural) return null;
+    if (removed === 0) {
+      const ins = insertSplice(source, baseNodes, run.baseFrom, nextNodes.slice(run.nextFrom, run.nextTo), ctx);
+      if (!ins) return null;
+      out.push(...ins);
+      continue;
+    }
+    if (added === 0) {
+      for (let k = run.baseFrom; k < run.baseTo; k += 1) {
+        const cut = cutNodeSplice(source, baseNodes[k], ctx);
+        if (!cut) return null;
+        out.push(cut);
+      }
+      continue;
+    }
+    const range = rangeSplice(
+      source,
+      baseNodes.slice(run.baseFrom, run.baseTo),
+      nextNodes.slice(run.nextFrom, run.nextTo),
+      ctx
+    );
+    if (!range) return null;
+    out.push(...range);
+  }
+  return out;
+}
+
+/**
+ * The import block with a statement cut out of it, or one put in.
+ *
+ * `target.remove` prunes the import nothing reads any more, which is a change
+ * to the frontmatter -- and the frontmatter is rebuilt from the model rather
+ * than patched, so the whole file went through `serializePage` and every
+ * comment between the imports was torn off the import it annotates. `parsePage`
+ * already records exactly where each statement is; this cuts there instead.
+ * Anything more involved than one statement gone or one statement added is
+ * still answered by rebuilding.
+ */
+function spliceImports(source, baseModel, model, eol) {
+  if ((baseModel.frontmatterLead || '') !== (model.frontmatterLead || '')) return null;
+  if ((baseModel.extraFrontmatter || '') !== (model.extraFrontmatter || '')) return null;
+  if ((baseModel.extraFrontmatterSpaced ?? true) !== (model.extraFrontmatterSpaced ?? true)) return null;
+  const spans = baseModel.importSpans;
+  if (!Array.isArray(spans) || !spans.length) return null;
+  const key = (i) => JSON.stringify([i.name, i.imported ?? null, i.path, !!i.named, !!i.typeOnly]);
+  const baseKeys = (baseModel.imports || []).map(key);
+  const nextKeys = (model.imports || []).map(key);
+  const gone = (baseModel.imports || []).filter((i) => !nextKeys.includes(key(i)));
+  const added = (model.imports || []).filter((i) => !baseKeys.includes(key(i)));
+  // One statement gone, or one put in. Neither means the difference is
+  // somewhere else in the frontmatter; both at once is a rewrite, not a splice.
+  if (!gone.length === !added.length) return null;
+
+  if (gone.length) {
+    const statements = new Set(gone.map((i) => i.at));
+    // A statement is cut whole or not at all: taking one specifier out of
+    // `import { Image, Picture }` means rewriting the line, not removing it.
+    if (baseModel.imports.some((i) => statements.has(i.at) && !gone.includes(i))) return null;
+    // And what is left has to be, in order, what the model holds -- otherwise
+    // something else moved in there too.
+    const left = baseModel.imports.filter((i) => !gone.includes(i)).map(key);
+    if (left.join('|') !== nextKeys.join('|')) return null;
+    const cuts = [];
+    for (const span of spans) {
+      if (!statements.has(span.at)) continue;
+      let to = span.to;
+      const eolAfter = /^[ \t]*\r?\n/.exec(source.slice(to));
+      if (eolAfter) to += eolAfter[0].length;
+      cuts.push({ start: span.from, end: to, text: '' });
+    }
+    return cuts.length === statements.size ? cuts : null;
+  }
+
+  // An addition goes after the last statement the file wrote, which is where
+  // the model put it.
+  if (baseKeys.join('|') !== nextKeys.slice(0, baseKeys.length).join('|')) return null;
+  // A named specifier joining a module the file already imports belongs ON that
+  // line, and writing a second line for it is a different file than the model
+  // describes even though it means the same thing.
+  if (added.some((i) => i.named && baseModel.imports.some((b) => b.path === i.path))) return null;
+  const lines = [];
+  serializeImports({ imports: added }, lines);
+  const last = spans[spans.length - 1];
+  return [{ start: last.to, end: last.to, text: lines.map((line) => eol + line).join('') }];
+}
+
+/** The splices applied back to front, so an earlier one cannot shift a later one. */
+function applySplices(source, edits) {
+  const ordered = [...edits].sort((a, b) => b.start - a.start || b.end - a.end);
+  let out = source;
+  let limit = source.length;
+  for (const edit of ordered) {
+    if (!(edit.start >= 0 && edit.end >= edit.start && edit.end <= limit)) return null;
+    out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
+    limit = edit.start;
+  }
+  return out;
+}
+
 /**
  * The bytes to write for `model`, keeping everything `source` already said.
  *
@@ -1351,58 +1826,39 @@ function anchoredSerialize(source, model) {
   }
   if (!base?.editable || !base.model) return canonical;
 
-  // A frontmatter change is not a body edit, and the import block is rebuilt
-  // from the model rather than patched -- so those go the old way.
-  if (frontmatterText(base.model) !== frontmatterText(model)) return canonical;
   if ((base.model.trailingBlank || 0) !== (model.trailingBlank || 0)) return canonical;
   if (!!base.model.hadFrontmatter !== !!model.hadFrontmatter) return canonical;
 
-  const spot = locateChange(base.model.nodes || [], model.nodes || []);
-  if (!spot) return canonical;
-
-  let spliced;
-  if (spot.unchanged) {
-    // Nothing in the page's markup moved. Chunk edits land here: their content
-    // lives in another file and writeChunks handles it, and the page keeping
-    // its exact bytes is the correct answer rather than a missed opportunity.
-    spliced = source;
-  } else {
-    const { start, end } = spot.base;
-    if (typeof start !== 'number' || typeof end !== 'number') return canonical;
-    if (!(start >= 0 && end > start && end <= source.length)) return canonical;
-    // THE SPAN MUST BE THE NODE, AND NOTHING AROUND IT.
-    //
-    // A text node's range starts where the PREVIOUS node ended, so it carries
-    // the line break and indent that sit between them -- and `serializeNode`
-    // strips a text run's boundary spaces, on the assumption that the newlines
-    // either side already are that whitespace. Replacing the wide span with the
-    // narrow text therefore deleted a space the page renders:
-    // `<label>Name: <input /></label>` came back as `<label>Name:<input />`.
-    // The check could not see it, because the same stripping happens on both
-    // sides of the comparison. So a span that begins or ends in whitespace is
-    // not this node's text, and is not spliced.
-    const held = source.slice(start, end);
-    if (/^\s|\s$/.test(held)) return canonical;
-
-    spliced = null;
-    if (spot.headOnly) {
-      // The opening tag, exactly as the parser found it, so the span replaced
-      // is the tag and not the element. TAG_RE is sticky: it matches here or
-      // not at all.
-      TAG_RE.lastIndex = start;
-      const tag = TAG_RE.exec(source);
-      if (tag && tag.index === start && tag[1] === spot.next.name) {
-        const attrsAt = start + 1 + tag[1].length;
-        const patched = patchAttrs(tag[2], spot.base.props, spot.next.props);
-        if (patched !== null) {
-          spliced = source.slice(0, attrsAt) + patched + source.slice(attrsAt + tag[2].length);
-        }
-      }
-    }
-    if (spliced === null) {
-      spliced = source.slice(0, start) + nodeText(spot.next, indentAt(source, start)) + source.slice(end);
-    }
+  const eol = eolOf(source);
+  const edits = [];
+  // A frontmatter change is not a body edit. One import gone or one added is
+  // the exception, because that is what a structural edit to the BODY produces
+  // -- `target.remove` prunes the import nothing reads any more -- and sending
+  // the whole file through `serializePage` for it is how a delete came to move
+  // three comments off the imports they annotate.
+  if (frontmatterText(base.model) !== frontmatterText(model)) {
+    const imports = spliceImports(source, base.model, model, eol);
+    if (!imports) return canonical;
+    edits.push(...imports);
   }
+
+  const ctx = {
+    source,
+    eol,
+    step: indentStepOf(source),
+    inline: false,
+    structural: true,
+    twin: twinFinder(base.model.nodes || []),
+  };
+  const body = collectSplices(source, base.model.nodes || [], model.nodes || [], ctx);
+  if (!body) return canonical;
+  edits.push(...body);
+
+  // Nothing in the page's markup moved. Chunk edits land here: their content
+  // lives in another file and writeChunks handles it, and the page keeping its
+  // exact bytes is the correct answer rather than a missed opportunity.
+  const spliced = edits.length ? applySplices(source, edits) : source;
+  if (spliced === null) return canonical;
 
   // READ IT BACK AND CHECK IT SAYS WHAT WAS ASKED FOR.
   //
@@ -1591,7 +2047,7 @@ function blockAsWritten(node, indent) {
 // A conditional without the { } that put it in markup context. An else-if
 // chain is one of these directly inside another's else — writing the braces
 // there would make it an object literal, not a nested condition.
-function serializeCondBody(node, indent, lines) {
+function serializeCondBody(node, indent, lines, step = '  ') {
   const kidsOf = (i) => node.children?.[i]?.children || [];
   const thenKids = kidsOf(0);
   const elseKids = node.op === '&&' ? null : kidsOf(1);
@@ -1610,7 +2066,7 @@ function serializeCondBody(node, indent, lines) {
       raw.split('\n').forEach((line, i) => lines.push(i === 0 ? at + line : line));
       return;
     }
-    for (const child of kids) serializeNode(child, at, lines);
+    for (const child of kids) serializeNode(child, at, lines, step);
   };
   if (thenKids.length) {
     lines.push(indent + head + '(');
@@ -1620,14 +2076,18 @@ function serializeCondBody(node, indent, lines) {
     lines.push(indent + head + 'null' + tail);
   }
   if (chained) {
-    serializeCondBody(chained, indent, lines);
+    serializeCondBody(chained, indent, lines, step);
   } else if (elseKids && elseKids.length) {
     branchOut(elseKids, indent + '  ');
     lines.push(indent + ')');
   }
 }
 
-function serializeNode(node, indent, lines) {
+// `step` is one level of nesting, and it is the FILE's rather than this
+// serializer's: a page written with tabs got `\t  <Card` -- a tab and two
+// spaces inside one element -- every time a subtree was printed into it. It
+// defaults to two spaces, which is what a file that does not exist yet gets.
+function serializeNode(node, indent, lines, step = '  ') {
   // Chunk containers: children live in external .html files (set:html),
   // never in the page — emit the component self-closing, skip the subtree.
   if (node.kind === 'chunk-group') return; // synthetic, not in page source
@@ -1683,7 +2143,7 @@ function serializeNode(node, indent, lines) {
         for (const line of node.body) lines.push(indent + '    ' + line);
         lines.push(indent + '    return (');
         for (const child of node.children || []) {
-          serializeNode(child, indent + '      ', lines);
+          serializeNode(child, indent + '      ', lines, step);
         }
         lines.push(indent + '    );');
         lines.push(indent + '  })');
@@ -1695,7 +2155,7 @@ function serializeNode(node, indent, lines) {
       if (node.bare) {
         lines.push(indent + '  ' + node.head.replace(/\($/, '').trimEnd());
         for (const child of node.children || []) {
-          serializeNode(child, indent + '    ', lines);
+          serializeNode(child, indent + '    ', lines, step);
         }
         lines.push(indent + '  )');
         lines.push(indent + '}');
@@ -1717,7 +2177,7 @@ function serializeNode(node, indent, lines) {
         lines.push(indent + '  ' + node.head);
       }
       for (const child of node.children || []) {
-        serializeNode(child, indent + '  ' + inner + '  ', lines);
+        serializeNode(child, indent + '  ' + inner + '  ', lines, step);
       }
       lines.push(indent + '  ' + inner + '))');
       lines.push(indent + '}');
@@ -1730,14 +2190,14 @@ function serializeNode(node, indent, lines) {
         return;
       }
       lines.push(indent + '{');
-      serializeCondBody(node, indent + '  ', lines);
+      serializeCondBody(node, indent + '  ', lines, step);
       lines.push(indent + '}');
       return;
     }
     case 'branch':
       // Written by the condition above; standing on its own it is just its
       // contents.
-      for (const child of node.children || []) serializeNode(child, indent, lines);
+      for (const child of node.children || []) serializeNode(child, indent, lines, step);
       return;
     case 'comment':
       lines.push(
@@ -1808,7 +2268,7 @@ function serializeNode(node, indent, lines) {
         return;
       }
       openTag('>');
-      for (const child of node.children) serializeNode(child, indent + '  ', lines);
+      for (const child of node.children) serializeNode(child, indent + step, lines, step);
       for (let i = 0; i < (node.blankAfter || 0); i++) lines.push('');
       for (const line of `${indent}${closeTag}`.split('\n')) lines.push(line);
     }
