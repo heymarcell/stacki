@@ -527,7 +527,7 @@ function createAgentApi({
       // different file — so it is given the same source trail, snippet and ref
       // a read gets, and the evidence is `exact` because the app just walked
       // there itself.
-      return withSource(answer, ctx, action === 'read' ? writable : true);
+      return withSource(answer, ctx, action === 'read' ? writable : true, { compact: args?.compact === true });
     }
 
     if (!SINGLE[action] && action !== 'edit') return no('bad_action', `target has no action "${action}".`);
@@ -695,7 +695,7 @@ function createAgentApi({
    * of file:line pointers and the snippet of the markup itself are attached on
    * the way out, which is what makes a target read enough on its own.
    */
-  function withSource(answer, ctx, writable) {
+  function withSource(answer, ctx, writable, { compact = false } = {}) {
     const t = answer.target;
     if (!t) return answer;
     const trail = resolveTrail(t.keys) || [];
@@ -792,7 +792,14 @@ function createAgentApi({
         peers: answer.peers || null,
         source: leaf,
         sourceTrail: trail.length ? trail : null,
-        snippet: leaf ? snippetOf(ctx.root, leaf) : null,
+        // The markup around the target, unless the caller said not to. Walking a
+        // tree asks for a node's parent, then its parent, and each answer
+        // carries a snippet of the same region: six levels of one page measured
+        // 81KB with 17KB of it the same markup five times. `snippetOmitted`
+        // rather than a bare null, so "you did not ask" is distinguishable from
+        // "there is no source for this".
+        snippet: compact || !leaf ? null : snippetOf(ctx.root, leaf),
+        ...(compact && leaf ? { snippetOmitted: true } : {}),
         ref: nodeRef(
           {
             keys: t.keys,

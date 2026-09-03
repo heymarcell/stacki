@@ -175,6 +175,14 @@ and `test/agent-canvas.js` both do exactly this.
 For disk-backed things the evidence is a content digest of the bytes, never an
 mtime.
 
+**Refused is not dead.** Reads carry no expectation — `target.read { ref }` with
+a stale ref re-resolves it by the marks it recorded and answers with the object
+as it is now, plus a current writable ref. So `stale_target` costs one call to
+recover from, not a re-discovery, and the guard can stay as strict as it is
+without making an agent start again. The cost that remains is real and is the
+price of the guarantee: editing a node bumps the document, so refs read for its
+siblings are stale, and N siblings is N reads.
+
 ## The mutation path
 
 An agent's edit is not a parallel route into the document. It is the route a
@@ -341,7 +349,7 @@ the user's.
 
 | | |
 | --- | --- |
-| **Visual only** | What this endpoint did before the Agent API existed: the selection, a picture of it, the review threads, and moving the view. No project files. |
+| **Visual only** | What this endpoint did before the Agent API existed: the selection, a picture of it, the review threads, and moving the view. No file may be opened, listed or written — but `get_context` is not a registry operation and is not gated, so this level still discloses the project's path on disk, the file and line range the selection came from, and that node's own text and classes. |
 | **Inspect project** | Also READ the project — the source of any file, content and data, asset text, git history. Nothing changes, and the whole repository becomes visible to the agent. |
 | **Edit project** | Also change things: text, props, classes, structure, styles, variables, pages, components, content, assets, undo, redo. |
 | **Full control** | Also destructive and remote: deletes, dependency installs, and git — commit, checkout, restore, merge, push, publish. |

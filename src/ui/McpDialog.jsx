@@ -136,13 +136,20 @@ async function copyText(text) {
 // The one thing this must not do is soften "Inspect project". It is the level
 // at which an agent can read every file in the repository, and the earlier
 // wording — "read what is on screen" — described the level below it.
+//
+// Nor may "Visual only" claim to be file-blind. It said "It cannot read your
+// project's files" until an agent at that level was handed the project's path,
+// the selection's file and line range and its text, all through get_context,
+// which is not a registry operation and not gated. test/contract-wording.js
+// drives that answer and fails if the sentence comes back.
 const ACCESS = [
   {
     key: 'visual',
     label: 'Visual only',
     blurb:
       'See what you have selected and take a picture of it, and read and reply to your comments. ' +
-      'It cannot read your project’s files.',
+      'It can see where the project is on disk, which file and lines the selection came from, and ' +
+      'that element’s own text and classes — but it cannot open, list or change any file.',
   },
   {
     key: 'inspect',

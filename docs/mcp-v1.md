@@ -58,8 +58,8 @@ handler, all proven by raw HTTP in `test/mcp.js`:
 | --- | --- | --- |
 | Server instructions | 1,838 bytes, capped at 2,000 by `test/mcp.js` | every connection |
 | Tools | **14** | `tools/list` is **140,885 bytes** |
-| Agent operations | **111** across 8 domains — 110 reachable, 1 BOUNDARY (`git.publish`) | in the tool schemas above |
-| Permission answers | **444** (111 operations × 4 levels) | — |
+| Agent operations | **<!--count:total-->111<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->110<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
+| Permission answers | **<!--count:permAnswers-->444<!--/-->** (<!--count:total-->111<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
 | Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,229 bytes; a read costs only when asked |
 | Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,131 bytes |
 
@@ -81,7 +81,7 @@ bytes and is serialised once per domain tool — **41,589 bytes, 30% of the whol
 catalogue, all identical**. There is no mechanism in the protocol for tools to
 share a schema: each tool's `outputSchema` is a standalone document, so `$ref`
 cannot cross between them. The only ways to remove that cost are to collapse the
-domain tools into fewer tools, which would change the 111/14 contract, or to
+domain tools into fewer tools, which would change the <!--count:total-->111<!--/-->/14 contract, or to
 declare less than the tools actually return, which would break the strict clients
 this server exists to be correct for. **v1 states the cost rather than hiding
 it.**
@@ -159,10 +159,10 @@ see the same thing.
 
 | | |
 | --- | --- |
-| **Visual only** — the default, on every project, always | see the selection, photograph it, read and reply to comments. **0 of 111 operations.** |
-| **Inspect project** | also read the project: source, content, assets, git history, the project profile, and `audit`. 48 operations. |
-| **Edit project** | also change things, on the undo stack. 94 operations. |
-| **Full control** | also deletes, dependency installs and git. 111 operations, and it lasts the session only. |
+| **Visual only** — the default, on every project, always | see the selection, photograph it, read and reply to comments. **<!--count:visualOps-->0<!--/--> of <!--count:total-->111<!--/--> operations.** |
+| **Inspect project** | also read the project: source, content, assets, git history, the project profile, and `audit`. <!--count:inspectOps-->48<!--/--> operations. |
+| **Edit project** | also change things, on the undo stack. <!--count:editOps-->94<!--/--> operations. |
+| **Full control** | also deletes, dependency installs and git. <!--count:fullOps-->111<!--/--> operations, and it lasts the session only. |
 
 Granted **per project**. Opening another project starts at Visual only again.
 Nothing an agent can send changes the level; it is a decision a person makes in
@@ -209,6 +209,21 @@ A finding claims exactly one of four things:
 - **Running an audit changes nothing.** No project file, no click, no focus, no
   scroll, no navigation, no move of the person's viewport. Every window it opens
   is registered and destroyed in a `finally`, and the count is asserted.
+- **The fence is on DOCUMENTS, and that is the whole of it.** No argument can
+  name a host — `route` is a path joined onto the project's own preview origin —
+  and no document from another origin loads in any frame: a redirect or
+  navigation off it fails the run as `route_outside_project`, and an off-origin
+  subframe is dropped and named in `blockedSubframeOrigins`. So nothing outside
+  this project is ever measured or reported. **Subresources are a different
+  question and the honest answer is no.** The page is the real one: it fetches
+  its own scripts, stylesheets, fonts and images wherever the project points
+  them, its JavaScript runs and can request anything, and those requests carry
+  the project origin as `Referer`. Blocking them would change what the page IS,
+  and an audit of a page that could not load its own fonts would measure a
+  layout nobody has. The audit's browser session is wiped at every run boundary,
+  so nothing it fetched is kept. Measured with two loopback origins and a live
+  sink in `test/contract-wording.js`, which also fails if this document goes back
+  to claiming more.
 
 **Stacki will never ship a design score, a quality percentage, a professionalism
 rating, a compliance badge, or the sentence "WCAG compliant".** Automated rules
@@ -272,7 +287,7 @@ Summary of what v1 claims:
 | --- | --- |
 | Connection preamble | ~146 KB, once per session |
 | `get_context` | small; 75 essential computed properties by default |
-| `get_capabilities()` with no topic | ~13-14 KB (111 action rows) |
+| `get_capabilities()` with no topic | ~13-14 KB (<!--count:total-->111<!--/--> action rows) |
 | `stacki://project/profile` | 3 KB on a small project; capped at a budget, and it says when it trimmed |
 | `audit`, default | 3 viewports × one real page load each, plus axe |
 
@@ -287,7 +302,7 @@ your own timeouts accordingly.
 v1 is a promise about behaviour, not a freeze.
 
 **Stable — a change here is a breaking change:** the protocol revisions served,
-the transport gates, the 14 tools and their names, the 111 operations and their
+the transport gates, the 14 tools and their names, the <!--count:total-->111<!--/--> operations and their
 names, the four permission levels and the default, the four finding kinds and
 what each claims, refusal codes, ref opacity and staleness semantics, the trust
 boundary, and the refusal to produce a score.
