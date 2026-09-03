@@ -1282,6 +1282,37 @@ export default function App() {
     });
   }, []);
 
+  // The import each component in a batch of operations would need, asked for
+  // before the model is touched.
+  //
+  // An agent's insert is one synchronous applyOperations, and the specifier
+  // takes a round trip to main — so a component placed this way used to land
+  // in a page that never imported it, markup Astro cannot build, reported as
+  // ok. This is the Insert panel's own resolveImportPath, over the names the
+  // batch is about, which is why an agent's import is spelled exactly the way
+  // a person's is. A name that cannot be answered for is left out, and
+  // buildNode refuses the insert rather than writing markup without it.
+  const importPathsForInserts = useCallback(
+    async (operations) => {
+      const out = {};
+      for (const op of operations || []) {
+        if (op?.node?.kind !== 'component') continue;
+        const name = String(op.node.name || '').trim();
+        if (!name || name in out) continue;
+        const comp = insertables.find((c) => c.name === name);
+        if (!comp?.path) continue;
+        try {
+          const paths = await resolveImportPath(comp.path);
+          if (paths?.relative) out[name] = paths;
+        } catch {
+          /* main could not answer; the insert refuses rather than guessing */
+        }
+      }
+      return out;
+    },
+    [insertables, resolveImportPath]
+  );
+
   // target: {parentId: string|null, index: number} | null (append at end)
   const addComponent = useCallback(
     async (componentName, target) => {
@@ -4945,9 +4976,14 @@ export default function App() {
      * answers so whoever asked can read the file that resulted.
      */
     commit: async (operations, { label } = {}) => {
+      // Resolved BEFORE the mutation, because the mutation cannot await: this
+      // is the one place a component an agent places can be given the import
+      // it needs, and an insert that cannot have one is refused here rather
+      // than written half-done.
+      const importPaths = await importPathsForInserts(operations);
       let outcome = null;
       mutateModel((m) => {
-        const run = applyOperations(m, operations, { insertables });
+        const run = applyOperations(m, operations, { insertables, importPaths });
         outcome = run;
         return run.ok ? run.model : m;
       }, true);

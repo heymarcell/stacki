@@ -473,13 +473,13 @@ async function runFixture(f) {
 // A frontmatter change used to send the whole file through the serializer,
 // which is how `remove` came to tear the comments off the imports they
 // annotate. The REMOVAL half of that is measured above, end to end, because
-// `target.remove` prunes the import nothing reads any more. The ADDITION half
-// cannot be reached that way: `buildNode` only carries an import for an
-// insertable that knows its own import path, and the renderer's insertables do
-// not carry one -- a component inserted through `target.append_child` lands in
-// the page unimported today, which is a defect in a file this suite's fix does
-// not touch. So this half is driven straight at the writer, where the splice
-// lives, rather than left unmeasured.
+// `target.remove` prunes the import nothing reads any more.
+//
+// The ADDITION half is driven straight at the writer instead, because what it
+// is measuring is the SPLICE: that one import statement goes in under the last
+// one the file wrote and no other byte moves. That an inserted component brings
+// its import at all is a different guarantee, belonging to the model rather
+// than the printer, and test/insert-import.js measures it end to end.
 
 function importInsert() {
   for (const f of FIXTURES) {
