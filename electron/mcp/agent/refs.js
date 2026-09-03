@@ -43,6 +43,7 @@
 // refs exist.
 
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 const VERSION = 1;
 const PREFIX = 'stacki';
@@ -120,7 +121,7 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
     s: session,
     t: now(),
     x: now() + ttlMs,
-    d: data && typeof data === 'object' ? data : {},
+    d: relativized(data && typeof data === 'object' ? data : {}, projectRoot),
   };
   if (!writable) payload.w = false;
   // What the read that produced this ref saw. Absent for a ref minted about
@@ -129,6 +130,42 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
   if (observed && typeof observed === 'object' && Object.keys(observed).length) payload.o = observed;
   const body = b64(JSON.stringify(payload));
   return `${PREFIX}:${body}.${sign(body)}`;
+}
+
+/**
+ * The rule above, enforced here rather than asserted in a comment.
+ *
+ * "Nothing absolute" was a sentence one caller did not obey: the anchor a
+ * `target.select` minted from carried the project's real path in `page.file`
+ * while the observation beside it stayed relative, so a token clients are told
+ * to log opaquely had somebody's home directory base64'd inside it. Fixing the
+ * caller fixes that caller; doing it at the mint is what stops the next one.
+ *
+ * A path under the project becomes the project-relative one — which is what
+ * every other consumer of that field already computes — and anything else
+ * absolute is dropped, because a ref that names a place outside the project
+ * has no business resolving here anyway. `route` is exempt: it is the site's
+ * address, and "/" is not a filesystem path.
+ */
+function relativized(data, projectRoot) {
+  const root = typeof projectRoot === 'string' && projectRoot ? projectRoot : null;
+  const walk = (value, key) => {
+    if (typeof value === 'string') {
+      if (key === 'route' || !path.isAbsolute(value)) return value;
+      if (root && (value === root || value.startsWith(`${root}${path.sep}`))) {
+        return path.relative(root, value).split(path.sep).join('/');
+      }
+      return null;
+    }
+    if (Array.isArray(value)) return value.map((item) => walk(item, key));
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = walk(v, k);
+      return out;
+    }
+    return value;
+  };
+  return walk(data, null);
 }
 
 /**

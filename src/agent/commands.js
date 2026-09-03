@@ -62,8 +62,13 @@ async function locate(app, anchor, { navigate = true } = {}) {
 
   const moved = await app.focusAnchor(anchor);
   if (!moved || moved.anchorState !== 'attached') {
+    // The note is the focus walk's own sentence, written for whichever caller
+    // this is — a ref, not a review, so it does not talk about a review's
+    // creationContext. The reason is the machine-readable half of the same
+    // fact, and the sibling exit above has always carried one.
     return fail(moved?.transient ? 'not_ready' : 'no_node', moved?.note || 'Stacki could not get to that element.', {
       restored: moved?.restored || null,
+      reason: moved?.reason ?? null,
     });
   }
   const found = resolveNode(app.model()?.nodes || [], leafOf({ ...anchor, keys: moved.keys })?.indexPath, anchor?.fingerprint, {
@@ -95,6 +100,9 @@ function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
       crumbLabel: a.crumbLabel,
       keysFor: a.keysFor,
       crumbsFor: a.crumbsFor,
+      // For any node, not just the selection: a child's ref carries its sibling
+      // run for the same reason the target's own ref does.
+      peersFor: a.peersFor,
       canvas: id === a.selectedId() ? a.canvas() : null,
       renderedClasses: id === a.selectedId() ? a.renderedClasses() : null,
       componentChain: a.componentChain(),
@@ -108,9 +116,28 @@ function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
   };
 }
 
-/** The document's identity right now — what a write names to prove it is current. */
+/**
+ * The document's identity right now — what a write names to prove it is current.
+ *
+ * TWO THINGS ARE CALLED `digest` IN THIS API AND THEY ARE NOT THE SAME KIND.
+ *
+ *   modelDigest   this one. An identity for the PARSE the editor is holding,
+ *                 node ids and all (src/agent/digest.js says why they are left
+ *                 in). It is not a hash of the file: re-reading a byte-identical
+ *                 file produces a different one, and that is the point — a ref
+ *                 minted against the old parse should stop being trusted.
+ *
+ *   contentDigest sha256 of a file's bytes, on `changedFiles` and on what an
+ *                 undo says it restored. Content-stable: identical bytes always
+ *                 give the identical digest.
+ *
+ * `digest` stays as the name the wire has always used — it is what
+ * `expectedDigest` is compared against and what a ref bakes in — and
+ * `modelDigest` is the same value under a name that says which kind it is.
+ */
 function documentOf(app) {
-  return { file: app.openFile(), revision: app.revision(), digest: app.digest() };
+  const parse = app.digest();
+  return { file: app.openFile(), revision: app.revision(), digest: parse, modelDigest: parse };
 }
 
 /**
@@ -164,7 +191,12 @@ export function createAgentCommands(getApp) {
 
     if (action === 'select') {
       a.select(id, args.occurrence);
-      return { ok: true, selected: true, navigated, note, document: documentOf(a), keys: a.keysFor(id) };
+      // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process
+      // mints the ref for what is now selected, and without this it had nothing
+      // but the caller's word: a node recovered on position alone across a
+      // branch came back as a write handle, which is the one thing the evidence
+      // rules exist to withhold.
+      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys: a.keysFor(id) };
     }
 
     // Going inside a component instance, and coming back out — the two
@@ -347,15 +379,35 @@ export function createAgentCommands(getApp) {
 
   async function project(action, args = {}) {
     const a = app();
+    // WHAT CAME OFF THE STACK, not what the editor has open.
+    //
+    // This answered with `document: documentOf(a)` alone, which is the document
+    // on the canvas and has nothing to do with which entry was undone: undoing
+    // a change to src/styles/site.css reported src/pages/index.astro, three
+    // times in a row, with the stylesheet named nowhere in the envelope. The
+    // open document is still worth reporting — a model undo IS about it — so it
+    // stays, beside a `restored` that says what was actually put back.
     if (action === 'undo') {
       const before = a.historyDepth();
-      await a.undo();
-      return { ok: true, undone: a.historyDepth().past < before.past, history: a.historyDepth(), document: documentOf(a) };
+      const restored = await a.undo();
+      return {
+        ok: true,
+        undone: a.historyDepth().past < before.past,
+        restored: restored || null,
+        history: a.historyDepth(),
+        document: documentOf(a),
+      };
     }
     if (action === 'redo') {
       const before = a.historyDepth();
-      await a.redo();
-      return { ok: true, redone: a.historyDepth().future < before.future, history: a.historyDepth(), document: documentOf(a) };
+      const restored = await a.redo();
+      return {
+        ok: true,
+        redone: a.historyDepth().future < before.future,
+        restored: restored || null,
+        history: a.historyDepth(),
+        document: documentOf(a),
+      };
     }
     if (action === 'dev_status') {
       return { ok: true, ...a.preview() };

@@ -289,14 +289,21 @@ const ActionOutput = z.object({
   code: nullableString,
   message: nullableString,
   revision: z.number().int(),
-  // What a focus managed to put back. Absent for everything else.
+  // WHAT A FOCUS HAD TO PUT BACK, AND DID. Absent for everything else.
+  //
+  // Each flag is false both when the stage failed and when there was nothing to
+  // do — the page was already open, no breakpoint was recorded, the node is not
+  // inside a component. They used to be set as the walk passed each stage
+  // whether or not it did anything, so `component: true` came back for a
+  // page-level node no component was ever walked to reach. Do not branch on
+  // them: `code` says whether the focus landed, and `note` says what happened.
   restored: z
     .object({
-      page: z.boolean(),
-      breakpoint: z.boolean(),
-      component: z.boolean(),
-      node: z.boolean(),
-      occurrence: z.boolean(),
+      page: z.boolean().describe('Stacki had to navigate to another page, and did.'),
+      breakpoint: z.boolean().describe('A breakpoint was recorded and Stacki could set it.'),
+      component: z.boolean().describe('The node is inside a component and Stacki walked down into it.'),
+      node: z.boolean().describe('The element itself was identified and selected.'),
+      occurrence: z.boolean().describe('The particular rendered copy was found on the page and scrolled to.'),
     })
     .nullable()
     .optional(),

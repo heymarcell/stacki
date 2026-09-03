@@ -34,6 +34,9 @@ import { resolveBinding } from './bindingSource.js';
 // Caps. One enormous class attribute, a page of copy or a section with two
 // hundred children must not be able to fill a response on its own.
 const MAX_TEXT = 600;
+// The words shown in a child or parent summary. A preview, not an identity:
+// see `summarize`.
+const PREVIEW_TEXT = 120;
 const MAX_PROPS = 40;
 const MAX_PROP_VALUE = 300;
 const MAX_CLASSES = 60;
@@ -88,13 +91,27 @@ function labelOf(node, crumbLabel) {
   return clip(node.name || node.kind, MAX_LABEL);
 }
 
-function summarize(node, crumbLabel, keysFor, crumbsFor = null) {
+function summarize(node, crumbLabel, keysFor, crumbsFor = null, peersFor = null) {
   if (!node) return null;
+  const words = textOf(node).join(' ').trim();
   return {
     kind: node.kind || null,
     tag: tagOf(node),
     label: labelOf(node, crumbLabel),
-    text: clip(textOf(node).join(' '), 120),
+    text: clip(words, PREVIEW_TEXT),
+    // WHETHER THOSE WORDS ARE THE WHOLE OF THEM.
+    //
+    // The caller mints a ref from this summary, and src/reviewAnchor.js matches
+    // a fingerprint's text against the node's FULL words — so a preview with an
+    // ellipsis on the end can never equal anything, and the ref was dead on
+    // arrival for any child with more than a hundred and twenty characters and
+    // a same-tag sibling. Measured: the ref failed on the very next call, with
+    // no edit and no revision movement, and answered `ambiguous`.
+    //
+    // A truncated preview is presentation, not identity. Saying so here lets
+    // the ref carry the sibling run instead, which is evidence rather than a
+    // string that cannot match.
+    textClipped: words.length > PREVIEW_TEXT,
     childCount: Array.isArray(node.children) ? node.children.length : null,
     // Enough for the caller to mint a ref for this one, so walking the tree is
     // reading the answer rather than making another round trip per node.
@@ -106,6 +123,11 @@ function summarize(node, crumbLabel, keysFor, crumbsFor = null) {
     // node itself, one rung further down — the same evidence a review anchor
     // carries, spelled the same way, so it reads them the same.
     breadcrumbs: typeof crumbsFor === 'function' ? crumbsFor(node.id) : null,
+    // The sibling run at every level down to this node — what tells "nothing
+    // moved" apart from "something was inserted above me". The node's own ref
+    // has carried this from the start (it is why it survives the same
+    // truncation); a child's ref had only the slot.
+    peers: typeof peersFor === 'function' ? peersFor(node.id) : null,
     kindOfThing: node.kind === 'component' && !node.dynamicTag ? 'component_instance' : null,
   };
 }
@@ -260,6 +282,7 @@ export function readTarget({
   crumbLabel = null,
   keysFor = null,
   crumbsFor = null,
+  peersFor = null,
   canvas = null,
   renderedClasses = null,
   componentChain = null,
@@ -272,8 +295,10 @@ export function readTarget({
   if (!node) return null;
   const ancestors = ancestorChain(model?.nodes || [], node.id) || [];
   const keysOf = typeof keysFor === 'function' ? keysFor : null;
+  const peersOf = typeof peersFor === 'function' ? peersFor : null;
   const parent = findParentNode(model?.nodes || [], node.id);
   const nature = textNature(node);
+  const ownWords = textOf(node).join(' ').trim();
   const bindings = bindingsOf(node, { model, ancestors, keys });
   const authored = [
     ...new Set([
@@ -297,7 +322,11 @@ export function readTarget({
       nature: nature.kind,
       // What the node reads as, however deep the words are — the same reading
       // get_context reports and a review fingerprints against.
-      value: clip(textOf(node).join(' '), MAX_TEXT),
+      value: clip(ownWords, MAX_TEXT),
+      // And whether that reading is the whole of it. Same reason as
+      // `summarize`'s `textClipped`: a clipped value is a preview, and a
+      // fingerprint built from one names words no node will ever have.
+      truncated: ownWords.length > MAX_TEXT,
       // And what set_text would actually replace, which is only ever this
       // node's own text. The two differ for anything with children, and an
       // agent that took the first for the second would type a section's whole
@@ -323,11 +352,11 @@ export function readTarget({
     bound: isDataBound(node),
     bindings,
     occurrence: occurrenceOf(node, { canvas, bindings, ancestors }),
-    parent: summarize(parent, crumbLabel, keysOf, crumbsFor),
+    parent: summarize(parent, crumbLabel, keysOf, crumbsFor, peersOf),
     children: Array.isArray(node.children)
       ? node.children
           .slice(0, MAX_CHILDREN)
-          .map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf, crumbsFor) }))
+          .map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf, crumbsFor, peersOf) }))
       : null,
     childrenOmitted: Array.isArray(node.children) ? Math.max(0, node.children.length - MAX_CHILDREN) : 0,
     hidden: !!hidden,

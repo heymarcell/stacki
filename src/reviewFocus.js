@@ -94,7 +94,21 @@ export function hostPathFor(file, trail, isPage) {
   return isPage ? path : `${file}|${path}`;
 }
 
-/** Everything a focus could restore, all false. */
+/**
+ * Everything a focus could restore, all false.
+ *
+ * WHAT EACH FLAG MEANS: Stacki had to put this stage back, and did. False for
+ * a stage that failed AND for a stage there was nothing to do — the page was
+ * already open, there was no breakpoint recorded, the node is not inside a
+ * component. The two are deliberately not distinguished here, because this is
+ * for the note and for the record; `code` and `anchorState` are what an agent
+ * branches on.
+ *
+ * They used to be set unconditionally as the walk passed each stage, which made
+ * `component: true` the answer for a page-level node that no component was ever
+ * walked to reach. A flag called `restored` that is true when nothing was
+ * restored is worse than no flag.
+ */
 export const nothingRestored = () => ({
   page: false,
   breakpoint: false,
@@ -122,7 +136,7 @@ const why = {
     'it was selected, and then Stacki navigated somewhere else — the project may still have been opening. Try again',
 };
 
-export function focusNote({ restored, anchorState, plan, reason, liveOccurrenceCount = null } = {}) {
+export function focusNote({ restored, anchorState, plan, reason, liveOccurrenceCount = null, forReview = true } = {}) {
   const r = restored || nothingRestored();
   if (anchorState === 'attached') {
     const notes = [];
@@ -156,17 +170,31 @@ export function focusNote({ restored, anchorState, plan, reason, liveOccurrenceC
     return notes.length ? notes.join(' ') : null;
   }
 
-  if (!r.page) {
-    return `The page this review was left on (${plan?.page?.file || 'unknown'}) is not in this project any more, so there is nothing to show. The review still says what it was about.`;
+  // Each stage is asked about the PLAN — "was there anything to do here" —
+  // and then about the flag. Asking the flag alone read `restored.component`
+  // as "a component was walked", which it never was: it was true whether or
+  // not there were any drills, so a page-level failure took a sentence about
+  // components by accident.
+  //
+  // And the same three failures have to be sayable to somebody who is not
+  // looking at a review. `target.read { ref }` walks this exact code, and an
+  // agent following a ref of its own was being told to go and read a review's
+  // creationContext for a review that does not exist.
+  const because = why[reason] || 'it no longer resolves';
+  if (plan?.page?.needed && !r.page) {
+    return forReview
+      ? `The page this review was left on (${plan?.page?.file || 'unknown'}) is not in this project any more, so there is nothing to show. The review still says what it was about.`
+      : `${plan?.page?.file || 'That page'} is not in this project any more, so that ref cannot be resolved. Nothing was selected.`;
   }
-  if (!r.component) {
-    return `The page is open, but the way down to this review — through ${
-      (plan?.drills || []).map((d) => `<${d.opens}>`).join(' › ') || 'its component'
-    } — could not be walked: ${why[reason] || 'it no longer resolves'}. Read the review's creationContext for what it was about.`;
+  if (plan?.drills?.length && !r.component) {
+    const through = (plan?.drills || []).map((d) => `<${d.opens}>`).join(' › ') || 'its component';
+    return forReview
+      ? `The page is open, but the way down to this review — through ${through} — could not be walked: ${because}. Read the review's creationContext for what it was about.`
+      : `The page is open, but the way down to that element — through ${through} — could not be walked: ${because}. Nothing was selected. Read the target again, or have the person select it.`;
   }
-  return `The page is open, but this review's element could not be identified — ${
-    why[reason] || 'it no longer resolves'
-  }. It is orphaned; nothing was selected. Read the review's creationContext for what it was about.`;
+  return forReview
+    ? `The page is open, but this review's element could not be identified — ${because}. It is orphaned; nothing was selected. Read the review's creationContext for what it was about.`
+    : `The element that ref names could not be identified in ${plan?.leaf?.file || 'the open file'} — ${because}. Nothing was selected. Read the target again, or have the person select it.`;
 }
 
 export default focusPlan;

@@ -195,6 +195,20 @@ function createAgentApi({
   function nodeRef(anchor, { writable = true, observed = null } = {}) {
     const ctx = context();
     if (!ctx.root || !anchor) return null;
+    // AND A WRITE HANDLE HAS TO CARRY WHAT IT SAW.
+    //
+    // The guard that refuses a stale write compares the ref's observation
+    // against the document now, so a ref minted writable with no observation
+    // is not a weaker guard — it is no guard at all, and it read as ok:true
+    // through every write in the API. Two callers forgot (get_context's ref
+    // and a comment focus's), and a third never had one to forget.
+    //
+    // Degraded rather than thrown: read-only is a first-class, tested state,
+    // so a caller that forgets gets a ref that reads and refuses to write
+    // instead of an unguarded one. A ref for something with no version to be
+    // stale against — a file that does not exist yet — is a different kind and
+    // is minted elsewhere.
+    const versioned = !!(observed && (observed.revision != null || observed.digest != null));
     return refs.mint(
       'node',
       {
@@ -214,8 +228,37 @@ function createAgentApi({
       // What the read that produced this saw. A write through this ref is
       // checked against it, which is what makes concurrency protection
       // something a client cannot forget to ask for.
-      { projectRoot: ctx.root, writable, observed }
+      { projectRoot: ctx.root, writable: writable && versioned, observed }
     );
+  }
+
+  /**
+   * The document the app has last published about itself, as an observation.
+   *
+   * The two refs an agent is handed without asking for a read — the one
+   * get_context returns and the one a comment focus returns — are minted out
+   * here rather than out of a renderer answer, so this is where the version
+   * they saw has to come from. It is the same `document` a read answers with,
+   * carried on the payload the window publishes on every render.
+   *
+   * A payload that is a render behind names an OLDER revision than the truth,
+   * and the write through such a ref is refused rather than accepted. That is
+   * the direction a lag has to fail in, and it is why this is allowed to read
+   * a published fact rather than having to ask the window for a fresh one.
+   */
+  function publishedDocument() {
+    const doc = readPayload()?.document || null;
+    if (!doc || (doc.revision == null && doc.digest == null)) return null;
+    return doc;
+  }
+
+  /**
+   * A node ref for something the WINDOW is pointing at, not something a read
+   * returned. Same mint, same guard — the observation comes from the payload
+   * because there is no answer to take it from.
+   */
+  function publishedNodeRef(anchor, { writable = true } = {}) {
+    return nodeRef(anchor, { writable, observed: publishedDocument() });
   }
 
   /**
@@ -243,32 +286,75 @@ function createAgentApi({
   }
 
   /**
-   * Whether a ref's observation still holds.
+   * Whether a writable node ref may be used to write at all.
    *
-   * `null` when it does — or when the ref carried none, which is a ref about
-   * something that had no version to be stale against. Otherwise the refusal,
-   * with what is true now so a re-read is one call rather than a guess.
+   * The staleness comparison itself is the renderer's — it is the only place
+   * that knows what the document is right now — and it is reached by putting
+   * the ref's observation on the command. This is the step before that: a
+   * writable ref that carries NO observation would send `undefined`, and the
+   * renderer's guard is written `if (args.expectedRevision != null && ...)`,
+   * so an absent expectation skips the check in silence. That is the whole of
+   * how an unguarded write used to happen, and it is why this refuses rather
+   * than letting the absence mean "no objection".
+   *
+   * `null` when there is nothing to object to. There was a function of this
+   * name here before that was never called from anywhere; this is the same
+   * question, asked.
    */
-  function checkObservation(parsed, current, what) {
-    const seen = parsed?.observed;
-    if (!seen) return null;
-    if (seen.revision != null && current.revision != null && seen.revision !== current.revision) {
-      return no(
-        'stale_target',
-        `${what} has changed since you read it (revision ${seen.revision} → ${current.revision}). Nothing was changed. ` +
-          'Read the target again and re-apply your change to what is there now.',
-        { observed: seen, current }
-      );
+  function requireObservation(parsed) {
+    if (!parsed?.ok || parsed.kind !== 'node' || parsed.writable !== true) return null;
+    const seen = parsed.observed;
+    if (seen && (seen.revision != null || seen.digest != null)) return null;
+    return no(
+      'bad_ref',
+      'That ref was issued without a record of the version it saw, so a write through it could not be checked ' +
+        'against the document. Read the target again and use the ref that read hands back.'
+    );
+  }
+
+  /**
+   * What a write must prove about the document, from the ref and the caller.
+   *
+   * THE REF WINS. It used to be `args.expectedRevision ?? seen.observed.revision`,
+   * which put the CLIENT'S value first — so the same stale ref was refused
+   * with no arguments and accepted with two, and a guard a caller can switch
+   * off by naming any current number is not a guard. The file path has always
+   * done it the other way round (domains.js: `expected = fromRef.digest ?? expected`),
+   * and these are two halves of one surface.
+   *
+   * An explicit expectation is still honoured — it is the only expectation
+   * there is for a call with no ref, which acts on the live selection — and
+   * where a call carries both, a DISAGREEMENT is refused rather than silently
+   * resolved either way. That can only ever add a refusal.
+   */
+  function expectationsFor(args, seen) {
+    const observed = seen?.observed || null;
+    if (
+      args.expectedRevision != null &&
+      observed?.revision != null &&
+      args.expectedRevision !== observed.revision
+    ) {
+      return {
+        error: no(
+          'bad_request',
+          `That ref saw revision ${observed.revision} and you named ${args.expectedRevision}. ` +
+            'Drop the argument, or read the target again and use the ref that read hands back.'
+        ),
+      };
     }
-    if (seen.digest != null && current.digest != null && seen.digest !== current.digest) {
-      return no(
-        'stale_target',
-        `${what} has changed since you read it — somebody or something else edited it. Nothing was changed. ` +
-          'Read it again and re-apply your change to what is there now.',
-        { observed: seen, current }
-      );
+    if (args.expectedDigest != null && observed?.digest != null && args.expectedDigest !== observed.digest) {
+      return {
+        error: no(
+          'bad_request',
+          'That ref saw a different version of the document than the digest you named. ' +
+            'Drop the argument, or read the target again and use the ref that read hands back.'
+        ),
+      };
     }
-    return null;
+    return {
+      expectedRevision: observed?.revision ?? args.expectedRevision,
+      expectedDigest: observed?.digest ?? args.expectedDigest,
+    };
   }
 
   function readRef(ref, kind) {
@@ -422,7 +508,20 @@ function createAgentApi({
       if (action === 'select') {
         return {
           ...answer,
-          ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true, observed: answer.document || null }),
+          // WITH THE MARKS THE INCOMING REF CARRIED. Minted without them this
+          // was a bare index path plus an observation — safe only for as long
+          // as nothing moved, which is not what a ref is for.
+          //
+          // Writable on the renderer's judgement rather than on the caller's:
+          // selecting re-resolves the node in the tree that is actually open
+          // and re-derives the same evidence rule a pin is drawn under, so a
+          // node it could not vouch for does not become writable by being
+          // selected. Strictly narrower than the `writable: true` this used to
+          // pass unconditionally.
+          ref: nodeRef(anchorFromAnswer(answer, ctx, anchor), {
+            writable: answer.writable !== false,
+            observed: answer.document || null,
+          }),
         };
       }
       // enter and exit both answer with a target, and it is a target inside a
@@ -440,6 +539,8 @@ function createAgentApi({
           'was not made for. Read the target again on this checkout, or have the person select it.'
       );
     }
+    const unobserved = requireObservation(seen);
+    if (unobserved) return unobserved;
 
     let operations;
     if (action === 'edit') {
@@ -466,6 +567,15 @@ function createAgentApi({
       }
     }
 
+    // The ref's own observation is the guard, and it is not optional: it was
+    // baked in by the read that handed the ref over, and it wins over anything
+    // the caller names. A call with NO ref acts on the live selection, which is
+    // by definition what is in front of the person right now — there is no
+    // earlier observation for it to be stale against, and an explicit
+    // expectation is then the only one there is.
+    const expected = expectationsFor(args, seen);
+    if (expected.error) return expected.error;
+
     const watching = filesOf(anchor || currentAnchor(ctx));
     const before = snapshot(watching);
     const answer = await command(
@@ -474,17 +584,8 @@ function createAgentApi({
         action: 'edit',
         anchor,
         operations,
-        // The ref's own observation is the guard, and it is not optional: it
-        // was baked in by the read that handed the ref over. An explicit
-        // expectedRevision/expectedDigest still works and is checked as well —
-        // a caller that wants to name what it believes may.
-        //
-        // A call with NO ref acts on the live selection, which is by definition
-        // what is in front of the person right now. There is no earlier
-        // observation for it to be stale against, and that is the honest way to
-        // say "whatever is there now" rather than an accidental escape hatch.
-        expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
-        expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
+        expectedRevision: expected.expectedRevision,
+        expectedDigest: expected.expectedDigest,
         label: action,
       },
       NAVIGATING_TIMEOUT_MS
@@ -501,7 +602,7 @@ function createAgentApi({
       gone: !!answer.gone,
       // Both sides of the change, so the next write can name this one without
       // a second read.
-      revisionBefore: answer.documentBefore?.revision ?? args.expectedRevision ?? null,
+      revisionBefore: answer.documentBefore?.revision ?? expected.expectedRevision ?? null,
       revisionAfter: answer.document?.revision ?? null,
       documentBefore: answer.documentBefore || null,
       document: answer.document || null,
@@ -525,7 +626,15 @@ function createAgentApi({
       // would find the node on position alone and say so — correct, and a
       // needless downgrade of something we can simply keep current.
       fingerprint: answer.fingerprint || (answer.target ? fingerprintOf(answer.target) : previous?.fingerprint || null),
-      page: answer.target?.page || previous?.page || { file: payload?.page?.file || null, route: payload?.page?.route || null },
+      // Project-relative, like every other reader of this field — `payload.page.file`
+      // is an on-disk path, and this arm was the one place it went into a ref
+      // as one. refs.mint now catches it as well; this is where it stops being
+      // wrong rather than merely being caught.
+      page: answer.target?.page ||
+        previous?.page || {
+          file: payload?.page?.file ? relativeTo(ctx.root, payload.page.file) : null,
+          route: payload?.page?.route || null,
+        },
       occurrence: answer.target?.occurrence?.index ?? previous?.occurrence ?? null,
       occurrenceCount: answer.target?.occurrence?.count ?? previous?.occurrenceCount ?? null,
       instanceOccurrence: previous?.instanceOccurrence ?? payload?.selection?.instanceOccurrence ?? null,
@@ -544,10 +653,36 @@ function createAgentApi({
   const fingerprintOf = (t) => ({
     nodeKind: t.kind || null,
     tag: t.tag || null,
-    text: t.text?.value || null,
+    // The words, but only when they are ALL the words. A clipped reading is a
+    // preview; the resolver compares a fingerprint's text against a node's full
+    // text, so recording a preview records something no node can equal. The
+    // breadcrumbs and the peer runs are what identify it in that case, and they
+    // are evidence rather than a string that cannot match.
+    text: t.text?.truncated ? null : t.text?.value || null,
     breadcrumbs: t.breadcrumbs || null,
     peers: t.peers || null,
   });
+
+  /**
+   * The marks for a component instance nobody read.
+   *
+   * A binding's instance lives in the document above this one, and this process
+   * is not holding that tree — so there is nothing to fingerprint it from
+   * except the key chain, which is enough for the one thing that matters. The
+   * chain is `[page#path, Component.astro#path, ...]`; the instance at
+   * `instanceKeys` is the door into the NEXT file in it, so the component it
+   * opens is that file's name. That is exactly what a review's drill step
+   * checks (`opens` in src/reviewFocus.js), spelled the same way, and it is
+   * what stops the index path resolving to whatever was inserted above it.
+   */
+  function instanceFingerprint(keys, instanceKeys) {
+    const chain = Array.isArray(keys) ? keys : [];
+    const depth = Array.isArray(instanceKeys) ? instanceKeys.length : 0;
+    const next = typeof chain[depth] === 'string' ? chain[depth] : null;
+    const file = next && next.includes('#') ? next.slice(0, next.indexOf('#')) : null;
+    const name = file ? (file.split('/').pop() || '').replace(/\.(astro|md|mdx)$/i, '') : null;
+    return name ? { nodeKind: 'component', tag: name } : null;
+  }
 
   const currentAnchor = (ctx) => ({
     keys: ctx.payload?.selection?.keys || [],
@@ -578,12 +713,17 @@ function createAgentApi({
               fingerprint: {
                 nodeKind: summary.kind || null,
                 tag: summary.tag || null,
-                text: summary.text || null,
-                // Without this the ref is only about the slot, and a sibling
+                // The preview only when it is the whole reading — see
+                // fingerprintOf. A child with more than a summary's worth of
+                // words and a same-tag sibling was unresolvable on the very
+                // next call because this stored the ellipsised version.
+                text: summary.textClipped ? null : summary.text || null,
+                // Without these the ref is only about the slot, and a sibling
                 // inserted above it turns "this node" into "whatever is here
                 // now" — which the resolver correctly refuses, leaving an
                 // agent with a dead ref for a node that plainly still exists.
                 breadcrumbs: summary.breadcrumbs || null,
+                peers: summary.peers || null,
               },
               page: t.page,
               branch: ctx.branch,
@@ -604,11 +744,33 @@ function createAgentApi({
           source: {
             ...source,
             instanceRef: nodeRef(
-              { keys: source.instanceKeys, fingerprint: null, page: t.page, branch: ctx.branch },
-              // The instance lives in the page, which is a different document
-              // from the one this read was of — so it carries no observation of
-              // its own and a write through it reads that document first.
-              { writable: true }
+              {
+                keys: source.instanceKeys,
+                // WHICH COMPONENT THAT SLOT IS EXPECTED TO OPEN.
+                //
+                // This was `null`, which made the ref a bare index path: with
+                // no kind and no tag src/reviewAnchor.js's sameSort matches
+                // anything, so inserting an <hr> above the <Hero> this named
+                // turned it into a ref for the <hr> — at confidence `exact`.
+                // Measured: it wrote a prop onto the <hr>.
+                //
+                // The key chain says which file the instance opens, and a
+                // component named by the file it opens is not a second idea of
+                // identity — it is the same check a review's drill step makes
+                // (src/reviewFocus.js's `opens`).
+                fingerprint: instanceFingerprint(t.keys, source.instanceKeys),
+                page: t.page,
+                branch: ctx.branch,
+              },
+              // The instance lives in the page, which is a DIFFERENT document
+              // from the one this read was of — there is no observation here to
+              // give it, so this is a pointer to GO THERE rather than a handle
+              // to write through. `target.select { ref }` navigates to the page,
+              // puts the instance in front of the person and hands back a ref
+              // with the marks, the observation and the permission a write
+              // needs; `target.read { ref }` follows it without changing what
+              // is selected, and inherits the caution.
+              { writable: false }
             ),
           },
         };
@@ -693,22 +855,59 @@ function createAgentApi({
     // taken from disk again.
     if (op.via === 'main') return mainWithSync('style', action, args, ctx, op);
 
+    // THE SAME THREE THINGS TARGET TAKES OFF A REF, because a ref may only ever
+    // become more restrictive as it travels. This took `parsed.data` and dropped
+    // `writable` and `observed` on the floor, so a node ref the Visual Review
+    // evidence rules had deliberately withheld write permission from wrote
+    // `gap: 4rem` into a stylesheet. Measured; the identical ref was correctly
+    // refused by target one line of code away.
     let anchor = null;
+    let writable = true;
+    let seen = null;
     if (args.ref) {
       const parsed = readRef(args.ref, 'node');
       if (!parsed.ok) return parsed;
       anchor = parsed.data;
+      writable = parsed.writable;
+      seen = parsed;
     }
     if (action === 'read' || action === 'list_sources') {
       const answer = await command({ domain: 'style', action, anchor, properties: args.properties }, NAVIGATING_TIMEOUT_MS);
       if (!answer.ok) return answer;
       return withStyleRefs(answer, ctx);
     }
+    if (args.ref && !writable) {
+      return no(
+        'not_editable',
+        'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
+          'was not made for. Read the target again on this checkout, or have the person select it.'
+      );
+    }
+    const unobserved = requireObservation(seen);
+    if (unobserved) return unobserved;
+    // For an external stylesheet this observation is about the .astro file
+    // rather than the CSS, and styleAgent has its own source-digest guard for
+    // the declaration itself. It is the <style> block in the open document that
+    // this is the guard for — and the writable flag above matters in every case.
+    const expected = expectationsFor(args, seen);
+    if (expected.error) return expected.error;
+
     // A style write lands in a stylesheet or a <style> block; both are files
     // this process can read either side of the write.
     const watching = filesOf(anchor || currentAnchor(ctx), styleFilesOf(args));
     const before = snapshot(watching);
-    const answer = await command({ domain: 'style', action, anchor, ...args, ref: undefined }, NAVIGATING_TIMEOUT_MS);
+    const answer = await command(
+      {
+        domain: 'style',
+        action,
+        anchor,
+        ...args,
+        ref: undefined,
+        expectedRevision: expected.expectedRevision,
+        expectedDigest: expected.expectedDigest,
+      },
+      NAVIGATING_TIMEOUT_MS
+    );
     if (!answer.ok) return answer;
     const files = [...new Set([...watching, answer.source?.file || null].filter(Boolean))];
     return {
@@ -747,11 +946,43 @@ function createAgentApi({
         sourceRef: rule.source?.file ? sourceRef(rule.source.file) : null,
         declarations: (rule.declarations || []).map((decl) => ({
           ...decl,
+          // A name, not a handle: no operation takes a cssvar ref, and minting
+          // it writable said otherwise.
           variableRefs: (decl.variables || []).map((name) =>
-            refs.mint('cssvar', { name }, { projectRoot: ctx.root })
+            refs.mint('cssvar', { name }, { projectRoot: ctx.root, writable: false })
           ),
         })),
       })),
+    };
+  }
+
+  /**
+   * An undo says which files it put back; this says what is in them now.
+   *
+   * The renderer is the only thing that knows which entry came off the stack,
+   * and this process is the only thing that can read a file — so the two halves
+   * meet here. The digest is sha256 of the bytes, the same `digestOf` that
+   * stamps `changedFiles`, and it is deliberately a different KIND of thing
+   * from `document.modelDigest` beside it: content-addressed, so a caller can
+   * check a restore against a digest it took before the change.
+   *
+   * There is no `beforeDigest` here and it is not missing by accident: which
+   * files an undo will touch is not knowable until it has touched them, so a
+   * before-image would have to be a guess. What this proves is what the files
+   * hold now, which is what a restore is a claim about.
+   */
+  function withRestoreEvidence(answer) {
+    const files = answer?.restored?.files;
+    if (!answer?.ok || !Array.isArray(files) || !files.length) return answer;
+    return {
+      ...answer,
+      restored: {
+        ...answer.restored,
+        files: files.map((file) => {
+          const text = readFile(file);
+          return { file, contentDigest: text === null ? null : digestOf(text) };
+        }),
+      },
     };
   }
 
@@ -1058,6 +1289,17 @@ function createAgentApi({
               'was not made for. Read the target again on this checkout, or have the person select it.'
           );
         }
+        let expected = { expectedRevision: args.expectedRevision, expectedDigest: args.expectedDigest };
+        if (op.risk !== 'read') {
+          const unobserved = requireObservation(seen);
+          if (unobserved) return unobserved;
+          // The ref's own observation is the guard, exactly as it is for
+          // target.edit: it was baked in by the read that handed the ref over,
+          // the caller does not have to repeat it, and naming a different one
+          // does not overrule it.
+          expected = expectationsFor(args, seen);
+          if (expected.error) return expected.error;
+        }
         const answer = await command(
           {
             domain,
@@ -1065,15 +1307,12 @@ function createAgentApi({
             ...args,
             anchor,
             ref: undefined,
-            // The ref's own observation is the guard, exactly as it is for
-            // target.edit: it was baked in by the read that handed the ref over,
-            // and the caller does not have to repeat it.
-            expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
-            expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
+            expectedRevision: expected.expectedRevision,
+            expectedDigest: expected.expectedDigest,
           },
           action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
         );
-        return answer;
+        return withRestoreEvidence(answer);
       }
       return await mainWithSync(domain, action, args, ctx, op);
     } catch (err) {
@@ -1086,6 +1325,8 @@ function createAgentApi({
     capabilities,
     info,
     nodeRef,
+    publishedNodeRef,
+    publishedDocument,
     sourceRef,
     readRef,
     // THE SAME GATE, FOR THE ONE CALLER THAT IS NOT AN OPERATION.

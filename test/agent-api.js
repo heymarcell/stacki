@@ -104,6 +104,43 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   check('reopening a project invalidates every ref about the last one', afterReopen.code === 'stale_ref', afterReopen.code);
   check('and a ref minted after it works again', refs.parse(refs.mint('node', anchor, { projectRoot: ROOT }), { projectRoot: ROOT }).ok);
 
+  // NOTHING ABSOLUTE, enforced rather than asserted in a comment. One minter
+  // read the payload's page path raw, so a ref clients are told to log opaquely
+  // carried somebody's home directory base64'd inside it while the observation
+  // beside it stayed relative. The choke point is what stops the next one.
+  const decode = (r) => {
+    const rest = String(r).slice('stacki:'.length);
+    return JSON.parse(Buffer.from(rest.slice(0, rest.lastIndexOf('.')), 'base64url').toString('utf8'));
+  };
+  const leaky = decode(
+    refs.mint(
+      'node',
+      { keys: ['src/pages/index.astro#0'], page: { file: path.join(ROOT, 'src/pages/index.astro'), route: '/' } },
+      { projectRoot: ROOT }
+    )
+  );
+  check('a path under the project goes into a ref project-relative', leaky.d.page.file === 'src/pages/index.astro', short(leaky.d.page));
+  check('and the route, which is not a path, is left alone', leaky.d.page.route === '/', short(leaky.d.page));
+  const foreign = decode(refs.mint('node', { page: { file: '/etc/passwd' } }, { projectRoot: ROOT }));
+  check('a path outside the project does not go in at all', foreign.d.page.file === null, short(foreign.d.page));
+
+  // A WRITE HANDLE CARRIES WHAT IT SAW. The guard that refuses a stale write
+  // compares against the ref's observation, so a writable ref without one is
+  // not a weaker guard — it is none, and it read as ok:true through every write
+  // in the API. Minting degrades rather than throwing: read-only is a
+  // first-class state and a caller that forgets gets one.
+  {
+    const seen = { file: 'src/pages/index.astro', revision: 3, digest: 'abc-1' };
+    const nodeApi = createAgentApi({ getProjectRoot: () => ROOT, getAgentMode: () => 'full' });
+    const bare = refs.parse(nodeApi.nodeRef(anchor, { writable: true }), { projectRoot: ROOT });
+    check('a node ref asked for writable with nothing observed is issued read-only', bare.ok && bare.writable === false, short(bare));
+    const observed = refs.parse(nodeApi.nodeRef(anchor, { writable: true, observed: seen }), { projectRoot: ROOT });
+    check('and one that names what it saw is writable', observed.ok && observed.writable === true, short(observed));
+    check('and carries the revision it saw', observed.observed?.revision === 3, short(observed.observed));
+    const withheld = refs.parse(nodeApi.nodeRef(anchor, { writable: false, observed: seen }), { projectRoot: ROOT });
+    check('and an observation does not make a withheld ref writable', withheld.ok && withheld.writable === false, short(withheld));
+  }
+
   check('every kind a ref can name is declared', refs.KINDS.includes('node') && refs.KINDS.includes('source'));
   let threw = false;
   try {

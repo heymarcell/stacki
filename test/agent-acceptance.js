@@ -892,7 +892,11 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
       ask: app.ask,
       readPayload: app.payload,
       resolveTrail: app.resolveTrail,
-      mintRef: (anchor, opts) => api.nodeRef(anchor, opts),
+      // The same mint electron/mcp/index.js hands the ledger: a focus ref names
+      // what the WINDOW is pointing at, so its observation comes from the
+      // published payload. Minting it through nodeRef instead leaves it with no
+      // observation, which is now refused rather than written.
+      mintRef: (anchor, opts) => api.publishedNodeRef(anchor, opts || {}),
     });
 
     // The person: drill into the component and click its heading.
