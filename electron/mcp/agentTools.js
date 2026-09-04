@@ -702,15 +702,60 @@ const DESCRIPTIONS = {
     'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
     'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
   source:
-    'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
-    'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
-    '.astro markup: it keeps undo, the preview and the editor in step. Paths are project-relative. Replacing a ' +
+    'Project files as text, and the LAST resort rather than the first. It is the fallback for code Stacki cannot ' +
+    'model as a tree — a .ts or .js module, a config, a framework component — and the honest route when target ' +
+    'reports a file unrepresentable. It is NOT the way to answer a question about the project: use project or ' +
+    'page for structure, target for .astro markup, style for CSS and content for collection entries. Those keep ' +
+    'undo, the preview and the editor in step, and they answer from what Stacki has already parsed; reading the ' +
+    'files to work the same thing out costs more calls and can be wrong. Paths are project-relative. Replacing a ' +
     'file that already exists needs the ref your read gave you (or its digest); creating one does not.',
-  page: 'Pages, page folders and components as project objects: list, read, create, move, delete, and where a component is used.',
-  content: 'The CMS data files and the content collections: list, read, write, create, delete, validate, rename, and the entries themselves.',
-  asset: 'Files already inside the project, under public/ and src/: list, measure, read and write text ones, make folders, move, rename, delete.',
-  project: 'The open project itself: what is in it, which classes it uses, whether the preview is up, why it is not — and Stacki’s own undo and redo.',
-  git: 'The repository, through Stacki’s own git operations. Reading is always available; committing, switching, restoring, merging and pushing need full control.',
+  // THESE FIVE WERE ONE-LINE CATALOGUE LABELS, AND A CATALOGUE LABEL IS NOT
+  // RETRIEVAL METADATA.
+  //
+  // With tool search on — the default on the host this is measured against — a
+  // description is what a tool is FOUND by, and these listed their verbs
+  // without ever saying which question they answer. Measured over sixteen
+  // held-out sessions: `source` took 30 of 80 calls, and not one of them was on
+  // the single file in the fixture that `source`'s own description names as the
+  // case it exists for. Asked "which component renders the header?", the model
+  // read four files by hand rather than call `page.component_usage`, which is
+  // the operation for exactly that.
+  //
+  // So each now leads with the question a person actually types, in their
+  // words rather than the API's. They are still far shorter than `capture` and
+  // `get_comments`, and `test/host-limits.js` holds the ceiling.
+  page:
+    'Pages, folders and components as project objects, and the fast answer to "which component renders this?", ' +
+    '"what routes does this project have?" and "where is this component used?". list gives every route with its ' +
+    'file; component_usage names every page an component appears on; dynamic_paths asks the running dev server ' +
+    'what a [slug] route really stands for. Reach for this BEFORE reading files: it answers structure questions ' +
+    'from what Stacki has already parsed, and reading the pages by hand to work the same thing out is the long ' +
+    'way round. Also create, move, rename and delete.',
+  content:
+    'Content collections and CMS data — the answer to "rename that blog post", "what collections does this ' +
+    'project have?" and "change the title of this entry". Reads the real Astro content config, so it knows each ' +
+    'collection\u2019s schema and validates an entry against it before writing. Entries are objects with fields, ' +
+    'not files to be text-edited: editing frontmatter through source instead loses the schema check and the ' +
+    'references between entries. Also create, delete, rename and validate.',
+  asset:
+    'Images, fonts, downloads and data files already in the project, under public/ and src/ — the answer to ' +
+    '"what images does this use?", "how big is that?" and "move this into a folder". list and measure without ' +
+    'reading the bytes; read and write the text ones; make folders, move, rename, delete. Renaming or moving ' +
+    'updates what refers to it. This is for files that exist; it does not download or generate anything.',
+  project:
+    'The open project as a whole, and the first thing to ask when you do not know what you are looking at: ' +
+    'info and scan give the routes, components, layouts and stylesheets in one call; classes gives every class ' +
+    'name in use. Also whether the preview is running, why it is not, and how to start it — and Stacki\u2019s own ' +
+    'undo and redo, which is what "undo that" means here, not git. probe fetches a page from the project\u2019s own ' +
+    'dev server and nothing else. If a resource-capable client is available, stacki://project/profile is the ' +
+    'same picture in one read.',
+  git:
+    'The repository, through Stacki\u2019s own git operations — "commit what we changed", "what has changed?", ' +
+    '"put that file back", "make a branch". status and info and history and diffs are readable at any level; ' +
+    'committing, switching, restoring, merging and pushing need full control. A refusal names its cause — a ' +
+    'merge conflict, uncommitted work in the way, a branch that is not there — rather than saying it failed. ' +
+    'publish creates a repository on GitHub under the person\u2019s own account, which is the one thing here that ' +
+    'reaches outside this machine.',
 };
 
 // --- registration ------------------------------------------------------------
