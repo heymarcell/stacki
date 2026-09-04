@@ -70,6 +70,30 @@ function rel(ctx, value, what = 'path') {
   return found;
 }
 
+/**
+ * A path the page handlers spell relative to src/pages, resolved like any other.
+ *
+ * `page.move`'s `to` and the folder actions' `dir`/`from`/`to` are relative to
+ * the pages directory rather than to the project, and that is why they were the
+ * only path arguments in this surface that never reached rel(). What fenced
+ * them instead was the handler's own `path.resolve` + `startsWith`, which is a
+ * check on the SPELLING — and a symlink under src/pages is spelled like
+ * everything else in there. Measured: `to: 'out/MOVED.astro'` through such a
+ * link moved a page OUT of the project on `edit`, `dir: 'out/newdir'` created a
+ * directory outside it, and `folder_delete` ran fs.rmSync(recursive, force) on
+ * one, while asset.write_text and source.write refused the identical route with
+ * outside_project in the same run.
+ *
+ * So they go through the same resolver as the rest, realpath step included, and
+ * the handler is handed the absolute path it would have computed itself — its
+ * own fence still holds, this one is simply the half that survives a link.
+ */
+function pagesRel(ctx, value, what = 'page folder') {
+  const raw = String(value ?? '').trim().replace(/^\/+/, '');
+  if (!raw) return { error: { ok: false, code: 'bad_path', message: `A ${what} inside src/pages is required, relative to it.` } };
+  return rel(ctx, `src/pages/${raw}`, what);
+}
+
 const clip = (text, max) => {
   const s = String(text ?? '');
   return s.length > max ? { text: s.slice(0, max), truncated: true } : { text: s, truncated: false };
@@ -448,18 +472,37 @@ const page = {
     args: (input, ctx) => {
       const from = rel(ctx, input.from, 'page path');
       if (from.error) return from;
-      const to = String(input.to || '').replace(/^\/+/, '');
-      if (!to || path.isAbsolute(to) || to.includes('\0')) {
-        return problem('bad_path', 'to must be a path inside src/pages, relative to it.');
-      }
-      return { projectPath: ctx.root, from: from.abs, to };
+      const to = pagesRel(ctx, input.to, 'page path');
+      if (to.error) return to;
+      return { projectPath: ctx.root, from: from.abs, to: to.abs };
     },
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.newPath || '') }),
   },
 
-  folder_create: { channel: 'pagefolder:create', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
-  folder_rename: { channel: 'pagefolder:rename', args: (input, ctx) => ({ projectPath: ctx.root, from: input.from, to: input.to }) },
-  folder_delete: { channel: 'pagefolder:delete', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
+  folder_create: {
+    channel: 'pagefolder:create',
+    args: (input, ctx) => {
+      const dir = pagesRel(ctx, input.dir);
+      return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
+    },
+  },
+  folder_rename: {
+    channel: 'pagefolder:rename',
+    args: (input, ctx) => {
+      const from = pagesRel(ctx, input.from);
+      if (from.error) return from;
+      const to = pagesRel(ctx, input.to);
+      if (to.error) return to;
+      return { projectPath: ctx.root, from: from.abs, to: to.abs };
+    },
+  },
+  folder_delete: {
+    channel: 'pagefolder:delete',
+    args: (input, ctx) => {
+      const dir = pagesRel(ctx, input.dir);
+      return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
+    },
+  },
 
 
   component_usage: {
@@ -983,14 +1026,23 @@ const asset = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
+    // THE RESOLVED PATH, in the answer and in the ref. Both were the client's
+    // own string, and every other minter in this file puts the resolved one
+    // there — so a read of 'public/./robots.txt' handed back a ref that
+    // `refObservation` then refused as `wrong_target` against the normalised
+    // path the write resolves to, accusing the caller of naming a different
+    // file with a ref the read had just given it. Fail-closed, and still the
+    // opposite of what a ref is for: nothing to remember and nothing to spell
+    // twice.
     result: (raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'asset path');
       const body = clip(raw?.text ?? '', MAX_TEXT_BYTES);
       return {
-        path: input.path,
-        ref: refFor(ctx, input.path),
+        path: at.error ? input.path : at.rel,
+        ref: refFor(ctx, at.error ? input.path : at.rel),
         text: body.text,
         truncated: body.truncated,
-        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+        digest: digestOfFile(at.error ? path.resolve(ctx.root, input.path) : at.abs),
       };
     },
   },
@@ -1031,6 +1083,18 @@ const asset = {
       if (to.error) return to;
       return { projectPath: ctx.root, fromRel: from.rel, toDirRel: to.rel };
     },
+    // WHERE THE FILE LANDED, from the handler rather than from the request.
+    // `assets:move` renames around a collision (`uniqueDest`), so an agent told
+    // only `{ok:true}` had no way to find the file it had just moved — and the
+    // undo record derived the same wrong path from the same arguments and moved
+    // somebody else's file back over the original.
+    //
+    // AND THE HANDLER'S OWN `ok:false` SURVIVES THE MAPPER. A mapper that only
+    // shapes the success turns an in-band refusal into an `{ok:true}` with an
+    // empty answer, which is worse than the generic code it was added to
+    // improve on; handed back whole, runMain refuses it with the handler's own
+    // code and sentence.
+    result: (raw, input) => (raw?.ok === false ? raw : { from: input.path, path: raw?.rel ?? null }),
   },
   rename: {
     channel: 'assets:rename',
@@ -1039,6 +1103,10 @@ const asset = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel, newName: input.name };
     },
+    // Same reason: the handler strips `/` and `\\` from the name, so the file
+    // is not at `dirname(path)/name` and the caller is the last one to find
+    // out — and an in-band refusal is passed through rather than shaped away.
+    result: (raw, input) => (raw?.ok === false ? raw : { from: input.path, path: raw?.rel ?? null }),
   },
   delete: {
     channel: 'assets:delete',
@@ -1081,14 +1149,18 @@ const style = {
       if (at.error) return at;
       return at.abs;
     },
+    // Resolved, for the reason asset.read_text is: the ref a read hands out has
+    // to name the file the write will resolve to, or it is a ref that cannot be
+    // used to write the file it was made by reading.
     result: (raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'stylesheet path');
       const body = clip(raw?.css ?? raw?.text ?? '', MAX_TEXT_BYTES);
       return {
-        path: input.path,
-        ref: refFor(ctx, input.path),
+        path: at.error ? input.path : at.rel,
+        ref: refFor(ctx, at.error ? input.path : at.rel),
         css: body.text,
         truncated: body.truncated,
-        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+        digest: digestOfFile(at.error ? path.resolve(ctx.root, input.path) : at.abs),
       };
     },
   },
@@ -1562,6 +1634,32 @@ const ERRNO_CODES = {
 };
 
 /**
+ * What git says, and what it means.
+ *
+ * Ordered, and matched against the whole of git's message — its first line is
+ * `fatal: ambiguous argument 'x'` and the part that says WHY is on the next
+ * one. `nothing to commit` is given a sentence of Stacki's own because git's is
+ * a status report about a branch rather than an answer to "commit this"; the
+ * others keep git's, which already names the ref or the pathspec the caller
+ * got wrong.
+ */
+const GIT_CAUSES = [
+  [
+    /nothing to commit|no changes added to commit|nothing added to commit/i,
+    'nothing_to_commit',
+    () => 'There is nothing to commit — no file in the project has changed since the last commit.',
+  ],
+  [/pathspec .* did not match/i, 'no_file', null],
+  // BEFORE the ref rule, and deliberately: `fatal: invalid reference: x` is
+  // what `git switch x` says, and the argument the caller got wrong there is a
+  // branch. An operation that takes a `branch` answering `no_ref` while its
+  // neighbour answers `no_branch` for the same mistake is a distinction the
+  // caller has to know git to make.
+  [/branch .* not found|not something we can merge|couldn't find remote ref|no such branch|invalid reference/i, 'no_branch', null],
+  [/unknown revision or path not in the working tree|invalid object name|not a valid object name|bad revision|unknown revision/i, 'no_ref', null],
+];
+
+/**
  * A handler that threw, in the envelope's own vocabulary.
  *
  * `runMain`'s catch is the only thing between a throw and the wire, and it
@@ -1589,6 +1687,18 @@ function thrownFailure(err, ctx) {
   if (/not a git repository/i.test(message)) {
     return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
   }
+  // AND THE REST OF GIT'S OWN VOCABULARY. git names these causes exactly and
+  // then says them in its own words — several lines of them, with the
+  // `Use '--' to separate paths from revisions` help block attached — and every
+  // one of them reached the wire as `failed`, the code that means nobody knows.
+  // `nothing to commit` is the commonest refusal in the whole domain and was
+  // indistinguishable from a commit that genuinely broke. The neighbours were
+  // done one at a time (`unmerged_branch`, `missing_at_ref`); this is the table
+  // that closes the rest, and it classifies without inventing: git's sentence
+  // is kept, because git is describing its own repository better than a
+  // rewrite here could.
+  const cause = GIT_CAUSES.find(([pattern]) => pattern.test(message));
+  if (cause) return { ok: false, code: cause[1], message: cause[2] ? cause[2](message) : message };
   // An fs error names its own cause and its own path, and says both in Node's
   // words. Both are rewritten: the errno becomes a code a client can branch
   // on, and the sentence becomes one about the file the caller asked for.

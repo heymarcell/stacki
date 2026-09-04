@@ -1204,7 +1204,8 @@ function createAgentApi({
     // Normalised the moment it arrives, so the three returns below spread a
     // result that cannot collide with the `changedFiles` they stamp.
     const result = ownChangedFiles(await runMain(domain, action, args, ctx));
-    const undone = result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching);
+    const undone =
+      result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching, result);
     const moved = watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel));
     const reloadNeeded = editing.some((rel) => moved.includes(rel));
     if (!moved.length) return { ...result, ...(op.undoable ? { undoable: undone } : {}) };
@@ -1280,26 +1281,44 @@ function createAgentApi({
    * is itself read backwards. Anything that does not fit one of those is not
    * recorded, because a half-inverse on an undo stack is worse than a gap in it.
    */
-  async function recordUndo(domain, action, args, ctx, op, before, watching) {
+  async function recordUndo(domain, action, args, ctx, op, before, watching, result) {
     if (!op.undoable) return false;
     let restore = null;
-    if (domain === 'asset' && action === 'rename') {
-      const dir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
-      const landed = dir ? `${dir}/${args.name}` : args.name;
-      restore = {
-        kind: 'asset_rename',
-        back: { rel: landed, name: String(args.path).slice(String(args.path).lastIndexOf('/') + 1) },
-        forward: { rel: args.path, name: args.name },
-      };
-    } else if (domain === 'asset' && action === 'move') {
-      const name = String(args.path).slice(String(args.path).lastIndexOf('/') + 1);
-      const fromDir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
-      const landed = args.toFolder ? `${args.toFolder}/${name}` : name;
-      restore = {
-        kind: 'asset_move',
-        back: { fromRel: landed, toDirRel: fromDir },
-        forward: { fromRel: args.path, toDirRel: args.toFolder },
-      };
+    if (domain === 'asset' && (action === 'rename' || action === 'move')) {
+      // THE PATH THE HANDLER REPORTS, never the one the arguments imply. Both
+      // handlers move the file somewhere the caller did not ask for:
+      // `assets:rename` strips `/` and `\\` out of the name, and `assets:move`
+      // renames around a collision. An inverse computed from `args` therefore
+      // names a path the file is not at — measured, it moved a DIFFERENT,
+      // pre-existing file back over the original, destroying one and stranding
+      // the other, and answered `{ok:true, undone:true}`.
+      const landed = typeof result?.path === 'string' && result.path ? result.path : null;
+      const was = String(args.path);
+      const nameOf = (rel) => rel.slice(rel.lastIndexOf('/') + 1);
+      const dirOf = (rel) => rel.slice(0, rel.lastIndexOf('/'));
+      // No landing path means no inverse. A half-inverse on the stack is worse
+      // than a gap in it, and `undoable: false` is the honest answer.
+      if (!landed) return false;
+      if (action === 'rename') {
+        restore = {
+          kind: 'asset_rename',
+          back: { rel: landed, name: nameOf(was) },
+          forward: { rel: was, name: nameOf(landed) },
+        };
+      } else {
+        // AND A MOVE THAT ALSO RENAMED CANNOT BE UNDONE IN ONE STEP. The undo
+        // vocabulary the panels share has a move and a rename and no way to say
+        // both at once, so a collision — logo.svg landing as logo-1.svg —
+        // has no inverse that puts the name back. Not recorded, and said out
+        // loud on the envelope as `undoable: false`, rather than recorded as a
+        // move that would leave the file under the collision's name.
+        if (nameOf(landed) !== nameOf(was)) return false;
+        restore = {
+          kind: 'asset_move',
+          back: { fromRel: landed, toDirRel: dirOf(was) },
+          forward: { fromRel: was, toDirRel: dirOf(landed) },
+        };
+      }
     } else {
       // A content change: the bytes, for every file that actually moved and
       // existed on both sides. A file that appeared or vanished is not a

@@ -2574,13 +2574,22 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   // it would have to be rewritten in place. Until that rewrite exists, refuse
   // — moving the file alone would leave the site pointing at nothing, quietly.
   if (rootOfRel(fromRel) !== rootOfRel(toDirRel)) {
-    throw new Error(
+    // Named, not bare. This is a refusal the handler decided on and can explain
+    // in a paragraph, and a bare Error reaches the Agent API as `code: 'failed'`
+    // — the one code a client cannot branch on — for the one cause in this
+    // handler that is not a mistake but a deliberate limit.
+    throw refuse(
+      'unsupported',
       'Moving between public/ and src/ changes how the file is referenced ' +
         '(URL vs import), so it needs the references updated too. Not supported yet — ' +
         'move it outside the app and fix the references by hand.'
     );
   }
-  if (!fs.existsSync(from)) return { ok: false };
+  // Refused in band WITH A NAME, the way assets:delete below is: the Assets
+  // panel branches on `ok` and does not read the rest, and without the code and
+  // the sentence this reached the Agent API as `failed` / "That operation was
+  // refused." — the generic answer for a cause this line knows exactly.
+  if (!fs.existsSync(from)) return { ok: false, code: 'no_file', message: `${fromRel} is not in this project.` };
   // Refuse moving a folder into itself/its own subtree.
   if (fs.statSync(from).isDirectory() && (toDir === from || toDir.startsWith(from + path.sep))) {
     throw refuse('bad_path', 'Cannot move a folder into itself.');
@@ -2591,7 +2600,12 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   fs.mkdirSync(toDir, { recursive: true });
   fs.renameSync(from, dest);
   send('assets:changed', {});
-  return { ok: true };
+  // WHERE THE FILE ACTUALLY WENT. `uniqueDest` renames around a collision, so
+  // the landing path is not `toDirRel/basename(fromRel)` and only this line
+  // knows it. Whoever asked has to be told: the Agent API builds its undo
+  // inverse from this, and an inverse built from the request instead moved a
+  // DIFFERENT, pre-existing file back over the original path.
+  return { ok: true, rel: toPosix(path.relative(projectPath, dest)) };
 });
 
 handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
@@ -2599,13 +2613,17 @@ handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   if (!clean) throw refuse('bad_request', 'Invalid name');
   const from = assetAbs(projectPath, rel);
   const dest = path.join(path.dirname(from), clean);
-  if (dest === from) return { ok: true };
+  const landed = () => toPosix(path.relative(projectPath, dest));
+  if (dest === from) return { ok: true, rel: landed() };
   if (fs.existsSync(dest)) throw refuse('exists', 'Something with that name already exists.');
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
   send('assets:changed', {});
-  return { ok: true };
+  // The name the file is under, which is not the name that was asked for: `/`
+  // and `\\` are stripped above, so 'sub/KEEP.svg' lands as 'subKEEP.svg'. The
+  // caller that undoes this has to name the file that exists.
+  return { ok: true, rel: landed() };
 });
 
 // To the system's bin, not to nothing. An asset is somebody's photograph as
@@ -3465,6 +3483,7 @@ handle('page:move', async (_e, { projectPath, from, to }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const dest = path.resolve(pagesDir, to);
   if (!dest.startsWith(pagesDir + path.sep)) throw refuse('outside_project', 'Invalid destination.');
+  if (!reallyUnder(pagesDir, dest)) throw refuse('outside_project', 'Invalid destination.');
   if (path.resolve(from) === dest) return { newPath: dest };
   if (fs.existsSync(dest)) throw refuse('exists', 'A page with that name already exists there.');
   fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -3496,10 +3515,45 @@ const resolvePagesDir = (projectPath, rel) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const full = path.resolve(pagesDir, rel);
   if (full !== pagesDir && !full.startsWith(pagesDir + path.sep)) {
-    throw new Error('Invalid folder.');
+    throw refuse('outside_project', 'Invalid folder.');
   }
+  if (!reallyUnder(pagesDir, full)) throw refuse('outside_project', 'Invalid folder.');
   return full;
 };
+
+/**
+ * Whether `target` is really under `dir`, links followed.
+ *
+ * `startsWith` compares SPELLINGS, and a symlink under src/pages is spelled
+ * like every other path in there — so the lexical fence above let mkdirSync and
+ * fs.rmSync(recursive, force) run outside the project altogether, and page:move
+ * carry a page out of it. Checked from the nearest parent that exists, because
+ * the folder being created does not exist yet and that parent is where it would
+ * actually land. The Agent API resolves these arguments too (domains.js
+ * `pagesRel`); this is the same fence for the Pages panel, which calls these
+ * handlers over IPC and never goes near that resolver.
+ */
+function reallyUnder(dir, target) {
+  const real = realpathOfNearest(target);
+  const realDir = realpathOfNearest(dir);
+  if (!real || !realDir) return false;
+  return real === realDir || real.startsWith(realDir + path.sep);
+}
+
+/** The real path of `abs`, or of the closest ancestor that exists. */
+function realpathOfNearest(abs) {
+  let at = abs;
+  for (let i = 0; i < 64; i++) {
+    try {
+      return fs.realpathSync(at);
+    } catch {
+      const up = path.dirname(at);
+      if (up === at) return null;
+      at = up;
+    }
+  }
+  return null;
+}
 
 handle('pagefolder:create', async (_e, { projectPath, dir }) => {
   fs.mkdirSync(resolvePagesDir(projectPath, dir), { recursive: true });

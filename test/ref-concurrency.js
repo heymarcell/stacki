@@ -1047,6 +1047,84 @@ async function open(extra = {}) {
     app.stop();
   }
 
+  // ── 17. A file ref names the file the READ resolved ────────────────────────
+  //
+  // A ref is handed out BY a read, and a write is supposed to be able to carry
+  // it straight back — "nothing to remember and nothing to copy wrongly".
+  // `asset.read_text` and `style.read_source` minted theirs from the CLIENT'S
+  // OWN STRING while every other minter in the file used the resolved path, so
+  // a read spelled 'public/./robots.txt' handed back a ref that the write then
+  // refused as `wrong_target`, accusing the caller of naming a different file
+  // with the ref that read had just given it. Fail-closed and still wrong: the
+  // same file had two ref identities that did not compare equal.
+  //
+  // Spellings a resolver is expected to absorb, all naming ONE file, and the
+  // oracle is the bytes: the write through each ref has to land.
+  {
+    const { root, app, run } = await open();
+    const spellings = (rel) => {
+      const cut = rel.lastIndexOf('/');
+      const dir = rel.slice(0, cut);
+      const name = rel.slice(cut + 1);
+      return [rel, `${dir}/./${name}`, `./${rel}`, `${dir}//${name}`, `${dir}/nowhere/../${name}`];
+    };
+
+    const CSS = 'src/styles/site.css';
+    const ROBOTS = 'public/robots.txt';
+
+    for (const spelling of spellings(ROBOTS)) {
+      const read = await run('asset', 'read_text', { path: spelling });
+      check(`asset.read_text reads ${spelling}`, read.ok === true, short(read));
+      check('  and answers with the resolved path', read.path === ROBOTS, short({ path: read.path }));
+      check('  and mints the ref against that path', dec(read.ref)?.d?.path === ROBOTS, short(dec(read.ref)?.d));
+      const marker = `# spelled ${spelling}\n`;
+      const wrote = await run('asset', 'write_text', { path: ROBOTS, ref: read.ref, text: marker });
+      check('  and the write through that ref lands', wrote.ok === true, short(wrote));
+      check('  on disk', app.read(ROBOTS) === marker, short(app.read(ROBOTS)));
+    }
+
+    for (const spelling of spellings(CSS)) {
+      const read = await run('style', 'read_source', { path: spelling });
+      check(`style.read_source reads ${spelling}`, read.ok === true, short(read));
+      check('  and answers with the resolved path', read.path === CSS, short({ path: read.path }));
+      check('  and mints the ref against that path', dec(read.ref)?.d?.path === CSS, short(dec(read.ref)?.d));
+      const css = `${read.css}/* spelled ${spelling} */\n`;
+      const wrote = await run('style', 'write_source', { path: CSS, ref: read.ref, css });
+      check('  and the write through that ref lands', wrote.ok === true, short(wrote));
+      check('  on disk', app.read(CSS) === css, short(app.read(CSS).slice(-60)));
+    }
+
+    // THE NEIGHBOURS, which have always resolved before minting. They are here
+    // so that "every read agrees about what a file is called" is one statement
+    // rather than two, and so a fix that normalised only where it was measured
+    // shows up.
+    for (const spelling of spellings(CSS)) {
+      const read = await run('source', 'read', { path: spelling });
+      check(`source.read mints against the resolved path for ${spelling}`, dec(read.ref)?.d?.path === CSS, short(dec(read.ref)?.d));
+    }
+    for (const spelling of spellings('src/data/site.json')) {
+      const read = await run('content', 'cms_read', { path: spelling });
+      check(`content.cms_read mints against the resolved path for ${spelling}`, dec(read.ref)?.d?.path === 'src/data/site.json', short(dec(read.ref)?.d));
+    }
+
+    // THE CONTROL THAT KEEPS IT HONEST. Normalising must not turn the guard
+    // off: a ref for a different file, used here, is still refused and still
+    // writes nothing.
+    const other = await run('asset', 'read_text', { path: ROBOTS });
+    const cssBefore = app.read(CSS);
+    const crossed = await run('style', 'write_source', { path: CSS, ref: other.ref, css: 'body{}\n' });
+    check('a ref for another file is still refused', crossed.ok === false && crossed.code === 'wrong_target', short(crossed));
+    check('  and nothing was written', app.read(CSS) === cssBefore, short(app.read(CSS).slice(-60)));
+    // A climb that comes back in is the same file, and says so.
+    const roundTrip = await run('asset', 'read_text', { path: `../${path.basename(root)}/${ROBOTS}` });
+    check('a spelling that climbs out and back in names the one file', roundTrip.ok === true && roundTrip.path === ROBOTS, short({ ok: roundTrip.ok, path: roundTrip.path }));
+    // And one that genuinely leaves is still refused before any of this.
+    const outside = await run('asset', 'read_text', { path: '../not-in-any-project.txt' });
+    check('a spelling that leaves the project is still refused', outside.ok === false && outside.code === 'outside_project', short(outside));
+
+    app.stop();
+  }
+
   for (const root of projects) H.removeProject(root);
 
   if (failures.length) {
