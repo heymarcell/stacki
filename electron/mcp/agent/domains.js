@@ -596,8 +596,9 @@ async function listCollection(name, ctx) {
  * Both are one mistake: believing a client string about where an entry lives.
  * So the collection is listed again, and what is written is the entry
  * `listEntries` produced — `file` and `locator` both computed from the open
- * project root. There is no path by which a client string becomes a filesystem
- * path.
+ * project root. No client string becomes a filesystem path on THIS operation;
+ * the one other place in the domain where one did is `rename`, whose `to` is a
+ * filename for a glob collection and is fenced by `renameTarget` below.
  *
  * `entry` is still accepted for one release, as a SELECTOR into that listing
  * and nothing else: it may choose which entry, never where one lives. A hint
@@ -688,6 +689,32 @@ function resolveContentEntry(input, ctx) {
   const key = JSON.stringify([input.collection ?? null, input.id ?? null, input.entry?.id ?? null, input.entry?.file ?? null]);
   if (!cache.has(key)) cache.set(key, findContentEntry(input, ctx));
   return cache.get(key);
+}
+
+/**
+ * The id a rename is moving TO, before it becomes a filename.
+ *
+ * `write_entry` was closed by never letting a client string say where an entry
+ * lives; the table entry two below it still did. For a glob collection the id
+ * IS the filename — `planRename` builds `dirname(entry.file)/<to><ext>` and
+ * `applyRename` hands that to `mkdirSync` and `renameSync` — so a `to` of
+ * '../../../../elsewhere/x' moved a project file out of the project and
+ * replaced whatever already sat there, silently, on {ok:true}. Same domain,
+ * same `write` risk, same Edit level as the hole that was fixed: the fix was
+ * applied to an instance rather than to the class.
+ *
+ * A nested id stays legal — a glob collection's ids carry the path under its
+ * base, so 'drafts/second' is an ordinary id and renaming to one has to keep
+ * working. What an id may not do is climb out, be absolute, or carry a NUL,
+ * which is exactly `resolveInProject` against the project ROOT. Checking there
+ * rather than against the entry's own directory is deliberate and is not a
+ * weaker test: the destination directory is always at or below the root, so a
+ * `to` whose net climb keeps it inside the root keeps it inside every directory
+ * deeper than the root as well.
+ */
+function renameTarget(ctx, to) {
+  const at = rel(ctx, to, 'new id');
+  return at.error ? at : null;
 }
 
 const content = {
@@ -892,11 +919,19 @@ const content = {
   targets: { channel: 'content:targets', args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection }) },
   rename_plan: {
     channel: 'content:renamePlan',
-    args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection, from: input.from, to: input.to }),
+    args: (input, ctx) => {
+      const fenced = renameTarget(ctx, input.to);
+      if (fenced) return fenced;
+      return { projectPath: ctx.root, name: input.collection, from: input.from, to: input.to };
+    },
   },
   rename: {
     channel: 'content:rename',
-    args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection, from: input.from, to: input.to }),
+    args: (input, ctx) => {
+      const fenced = renameTarget(ctx, input.to);
+      if (fenced) return fenced;
+      return { projectPath: ctx.root, name: input.collection, from: input.from, to: input.to };
+    },
   },
   sample_entry: {
     channel: 'content:sampleEntry',

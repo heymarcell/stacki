@@ -29,7 +29,7 @@ const z = require('zod');
 const { registerReviewTools } = require('./reviewTools');
 const { registerResources, registerPrompts } = require('./intelligence');
 const { registerAuditTool } = require('./auditTool');
-const { registerAgentTools } = require('./agentTools');
+const { registerAgentTools, publishChecked } = require('./agentTools');
 
 const INSTRUCTIONS = [
   'Stacki is the Astro project open in the Stacki desktop app: this server reports its live visual state and',
@@ -178,7 +178,8 @@ const MAX_PADDING = 256;
  * describes the surface and nothing else.
  */
 function registerTools(server, { getContext, capture, getComments, comment, api = null, audit = null, clientName = null }) {
-  server.registerTool(
+  publishChecked(
+    server,
     'get_context',
     {
       title: 'Stacki visual context',
@@ -209,7 +210,8 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
     }
   );
 
-  server.registerTool(
+  publishChecked(
+    server,
     'capture',
     {
       title: 'Stacki screenshot',
@@ -259,7 +261,20 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
     }
   );
 
-  registerReviewTools(server, { getComments, comment, clientName });
+  // THE SAME ARGUMENT CHECK, ON THE TOOLS REGISTERED FROM OTHER FILES.
+  //
+  // `comment` and `get_comments` answered a mistyped argument with the raw host
+  // sentence long after the eight domain tools had stopped — and they are the
+  // two tools the `visual` level exists for, so that shape was the first thing
+  // an agent at the lowest level could hit. The property is one of the SURFACE
+  // rather than of any one registration site, so it is applied here, where the
+  // surface is composed: a file added beside reviewTools.js tomorrow gets it
+  // without knowing to ask. `registerTool` is the only thing reviewTools.js
+  // asks of the server, so the facade offers exactly that and nothing else: a
+  // file that grows a second need fails loudly here rather than quietly losing
+  // a method off a spread class instance.
+  const checked = { registerTool: (name, config, handler) => publishChecked(server, name, config, handler) };
+  registerReviewTools(checked, { getComments, comment, clientName });
   // The editor half. Absent only in a test that builds the endpoint without an
   // app behind it.
   if (api) registerAgentTools(server, { api });

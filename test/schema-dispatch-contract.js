@@ -25,7 +25,16 @@
 //   input BEFORE the handler runs and a failure there is a protocol error. The
 //   handler's own refusal shaping was never reached, so `{ok:false, code, …}`
 //   — the thing the whole surface is built on — did not exist for the 73
-//   operations that declare a required argument.
+//   operations that declare a required argument. Fixing that for the eight
+//   DOMAIN tools left five of the thirteen PUBLISHED ones still answering with
+//   the raw sentence, `capture` and `comment` among them — so the sweep runs
+//   over tools/list rather than over the registry.
+//
+//   And a declared OUTPUT schema that nothing validates is decoration. The
+//   audit tool shipped three fields its own schema rejected; a strict client
+//   hard-fails on that, because the SDK refuses the whole call with "Output
+//   validation error" and the agent gets no answer at all rather than a wrong
+//   one. Every tool's answer is checked against the schema that tool publishes.
 //
 // This file is what stops either coming back under a different operation. It
 // reads the SHIPPING TABLES and the REAL tools/list, never a typed list, so
@@ -41,6 +50,9 @@ const { DOMAINS, actionsOf, find } = require('../electron/mcp/agent/registry.js'
 const { NORMALIZE } = require('../electron/mcp/agent/index.js');
 const { DOMAINS: DISPATCH } = require('../electron/mcp/agent/domains.js');
 const { answer } = require('../electron/mcp/agentTools.js');
+const { createContextStore } = require('../electron/mcp/contextStore.js');
+const { createCapture } = require('../electron/mcp/capture.js');
+const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 const { startWireRig } = require('./support/mcpWireRig.js');
 
 const failures = [];
@@ -271,6 +283,137 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
       );
     }
     check('most of the surface had something to get wrong', spoiled > 80, `${spoiled} of ${OPERATIONS.length}`);
+
+    // ── EVERY PUBLISHED TOOL, not only the eight domains ─────────────────────
+    //
+    // The sweep above is over the registry's 111 operations, which are reached
+    // through eight of the thirteen tools this server publishes. The other five
+    // — get_context, capture, get_comments, comment, get_capabilities — were
+    // never in it, and every one of them still answered a mistyped argument
+    // with the host's own sentence, no structuredContent, nothing to branch on:
+    //
+    //   capture {target: 12345}
+    //     -> "Input validation error: Invalid arguments for tool capture:
+    //         target: Invalid option: expected one of "selection"|"viewport""
+    //
+    // `capture` and `comment` are the two tools the `visual` level exists for,
+    // so that was the first shape an agent at the lowest level could hit.
+    //
+    // Driven off tools/list rather than off a list written here, so a
+    // fourteenth tool is covered the day it is published.
+    {
+      /** The action a top-level tool has none of, and a domain tool needs. */
+      const openingFor = (tool) => {
+        for (const branch of branchesOf(tool.inputSchema)) {
+          const spoil = spoilable(branch);
+          if (!spoil) continue;
+          const action = actionOf(branch);
+          return {
+            bad: { ...(action ? { action } : {}), [spoil.name]: spoil.value },
+            field: spoil.name,
+          };
+        }
+        return null;
+      };
+
+      let swept = 0;
+      for (const tool of listed.tools) {
+        const opening = openingFor(tool);
+        if (!check(`${tool.name} publishes an argument that can be got wrong`, !!opening, short(tool.inputSchema, 200))) continue;
+        swept += 1;
+        const res = await rig.client.callTool({ name: tool.name, arguments: opening.bad });
+        const said = res?.structuredContent;
+        check(
+          `${tool.name} answers a bad ${opening.field} with structured content`,
+          !!said,
+          short(res?.content?.[0]?.text)
+        );
+        check(`  ${tool.name}: as Stacki's own refusal, not a host sentence`, said?.ok === false && said?.code === 'bad_arguments', short(said?.code ?? res?.content?.[0]?.text));
+        check(`  ${tool.name}: naming the field that is wrong`, (said?.issues || []).some((i) => Array.isArray(i.path) && i.path[0] === opening.field), short(said?.issues));
+      }
+      check('the sweep covered every published tool', swept === listed.tools.length, `${swept} of ${listed.tools.length}: ${listed.tools.map((t) => t.name).join(', ')}`);
+
+      // AND THE SHIM DID NOT BUY IT BY LOOSENING THE SCHEMA. `advertised()`
+      // publishes the real schema and makes the host's own validation a
+      // pass-through; a version of it that published something laxer would
+      // stop the raw sentence by making the argument legal, which is the
+      // opposite of the fix. So the constraint each of these tools used to
+      // refuse with is read back off the wire.
+      const PUBLISHED = [
+        ['get_context', 'styleDetail', ['none', 'essential', 'full']],
+        ['capture', 'target', ['selection', 'viewport']],
+        ['get_comments', 'scope', ['project', 'page', 'selection']],
+        ['comment', 'action', ['create', 'reply', 'focus', 'resolve', 'defer', 'reopen']],
+      ];
+      for (const [name, field, values] of PUBLISHED) {
+        const spec = tools.get(name)?.inputSchema?.properties?.[field];
+        check(`${name} still publishes ${field} as the enum it refuses on`, same(spec?.enum || [], values), short(spec));
+      }
+    }
+
+    // ── WHAT A TOOL ANSWERS, AGAINST WHAT IT DECLARED ────────────────────────
+    //
+    // Validated with the SDK's OWN validator — the same one the endpoint uses
+    // to decide whether to hand the client an answer or a protocol error — so
+    // this cannot pass on a second implementation's more forgiving reading.
+    {
+      const validator = new AjvJsonSchemaValidator();
+      const verdictOf = async (schema, payload) =>
+        payload === undefined || payload === null
+          ? { valid: false, errorMessage: 'no structuredContent' }
+          : validator.getValidator(schema)(payload);
+
+      // TWO OF THE THIRTEEN ARE NOT THE PRODUCT ON THIS WIRE.
+      // test/support/mcpWireRig.js substitutes its own implementations for the
+      // app's two canvas tools: `getContext` hands back the App's RAW renderer
+      // payload rather than the snapshot contextStore mints from it (no
+      // revision, no timestamp, `present` where the schema says `status`), and
+      // `capture` answers a meta with `view: null` because the harness has no
+      // canvas. Grading those two on this wire would grade the rig. So the
+      // SHIPPING implementations are graded instead, in this process, against
+      // the very schemas tools.js publishes for them — which is the stronger
+      // measurement anyway: contextStore is fed the App's real payload.
+      const SUBSTITUTED = ['get_context', 'capture'];
+      check('the two tools the rig substitutes are still published', SUBSTITUTED.every((n) => tools.has(n)), short([...tools.keys()]));
+
+      let graded = 0;
+      for (const tool of listed.tools) {
+        if (SUBSTITUTED.includes(tool.name)) continue;
+        if (!check(`${tool.name} declares an output schema`, !!tool.outputSchema, tool.name)) continue;
+        const branch = branchesOf(tool.inputSchema)[0];
+        const action = actionOf(branch);
+        const res = await rig.client.callTool({ name: tool.name, arguments: action ? { action } : {} });
+        const verdict = await verdictOf(tool.outputSchema, res?.structuredContent);
+        graded += 1;
+        check(`${tool.name} answers within its own declared output schema`, verdict.valid === true, `${verdict.errorMessage || ''}\n    ${short(res?.structuredContent)}`);
+      }
+      check('every tool the wire can grade was graded', graded === listed.tools.length - SUBSTITUTED.length, `${graded} of ${listed.tools.length - SUBSTITUTED.length}`);
+
+      // get_context, off the wire: the shipping store, fed the App's own
+      // published payload, against the schema get_context publishes.
+      {
+        const schema = tools.get('get_context')?.outputSchema;
+        const store = createContextStore({ resolveTrail: (keys) => rig.harness.resolveTrail(keys) });
+        const cold = await verdictOf(schema, store.read());
+        check('the cold-start snapshot validates against the schema get_context publishes', cold.valid === true, cold.errorMessage || '');
+        store.publish(rig.harness.payload());
+        const live = await verdictOf(schema, store.read());
+        check('  and so does the snapshot minted from the App’s real payload', live.valid === true, `${live.errorMessage || ''}\n    ${short(store.read())}`);
+        // AND IT IS THE APP'S PAYLOAD, not the cold start passing under its
+        // name: a store nobody published to knows no project and no page, so a
+        // validator that only ever sees `{root: null}` has proved nothing.
+        check('  which is really the App’s payload and not the cold start again', typeof store.read().project?.root === 'string' && !!store.read().page?.file, short(store.read().project));
+        check('  with the selection the App has, described', store.read().selection?.status !== 'no_project' && !!store.read().selection?.tag, short(store.read().selection?.tag));
+
+        // capture, off the wire: the shipping implementation with no window,
+        // which is the answer a real client gets when Stacki is not showing
+        // anything — meta and no picture, never a bare refusal.
+        const capture = createCapture({ getWindow: () => null, ask: async () => null, readSnapshot: () => store.read() });
+        const shot = await capture({ target: 'selection', paddingPx: 48, format: 'png' });
+        const meta = await verdictOf(tools.get('capture')?.outputSchema, shot?.meta);
+        check('capture’s own meta validates against the schema capture publishes', meta.valid === true, `${meta.errorMessage || ''}\n    ${short(shot?.meta)}`);
+      }
+    }
   } finally {
     const said = await rig.stop();
     problems.push(...(said?.problems || []));

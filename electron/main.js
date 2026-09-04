@@ -95,6 +95,7 @@ const { componentFile } = require('./componentFile');
 const { componentUsage, instancesIn } = require('./componentUsage');
 const { listEntries, planEntryWrite, countEntries, coveredPaths } = require('./contentEntries');
 const { planRename, applyRename } = require('./contentRefs');
+const { resolveInProject } = require('./mcp/agent/paths');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
 const { probeUrl } = require('./devProbe')
 const { trustedPreviewUrl } = require('./projectOrigin.js');
@@ -3114,6 +3115,25 @@ handle('content:validate', async (_e, { projectPath, collection, data }) =>
   validateEntry(projectPath, { collection, data })
 );
 
+/**
+ * Where the file would actually land, checked before it lands there.
+ *
+ * A glob collection's id IS its filename, so `to` is a path fragment and
+ * `applyRename` resolves it, creates directories for it and `renameSync`s onto
+ * it — which for an id like '../../../elsewhere/x' means moving the entry out
+ * of the project and replacing whatever was already at the destination. The
+ * agent surface fences its own `to` (see `renameTarget` in mcp/agent/domains.js
+ * for why the root is the right thing to fence against), and this is the fence
+ * the CMS panel crosses as well. It is on the destination the plan computed
+ * rather than on the argument, so a collection whose base is a symlink out of
+ * the project is caught here too.
+ */
+function guardRenameDestination(projectPath, plan) {
+  if (plan?.move?.kind !== 'file') return;
+  const at = resolveInProject(projectPath, plan.move.to, { what: 'new id' });
+  if (!at.ok) throw new Error(at.message);
+}
+
 // What renaming an entry's id would change, and then changing it. Two calls,
 // because an id is what every reference to the entry holds: the plan is shown
 // before anything is written, so a rename that would touch six other entries
@@ -3121,6 +3141,7 @@ handle('content:validate', async (_e, { projectPath, collection, data }) =>
 handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  guardRenameDestination(projectPath, plan);
   // The entry data itself is big and the renderer only needs the shape of the
   // change.
   return { ...plan, entry: { id: plan.entry.id, file: plan.entry.file } };
@@ -3129,6 +3150,7 @@ handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
 handle('content:rename', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  guardRenameDestination(projectPath, plan);
   const result = applyRename(projectPath, plan);
   for (const file of result.files) markSelfWrite(path.resolve(projectPath, file));
   send('cms:changed', {});

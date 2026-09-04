@@ -656,10 +656,14 @@ const DESCRIPTIONS = {
     'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
     'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
   style:
-    'Why an element looks the way it does, and how to change it. read lists every declaration reaching it, in ' +
-    'cascade order, with the selector, the file it was authored in, whether it wins, what overrides it, and any ' +
-    'CSS variables it reads — so "make the gap larger" needs no grep for a class name. Writes go through the ' +
-    'Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
+    'Why an element looks the way it does, and how to change it. read lists every AUTHORED declaration Stacki ' +
+    'can see reaching it, in cascade order, with the selector, the file it was authored in, whether it wins, ' +
+    'what overrides it, and any CSS variables it reads — so "make the gap larger" needs no grep for a class ' +
+    'name. CSS a build step generates (Tailwind, UnoCSS) is in no project file, so it cannot be in that scan: ' +
+    '`coverage` says what the scan could not contain, `documentRules` is what the SERVED PAGE reports matching ' +
+    'the element, and `coverage.complete` is true only when nothing reaching it is unaccounted for. A rule from ' +
+    'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
+    'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
   source:
     'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
     'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
@@ -682,7 +686,8 @@ const DESCRIPTIONS = {
  * describes the surface and nothing else.
  */
 function registerAgentTools(server, { api }) {
-  server.registerTool(
+  publishChecked(
+    server,
     'get_capabilities',
     {
       title: 'What Stacki can do here',
@@ -810,6 +815,72 @@ function advertised(schema) {
   };
 }
 
+/** Zod's complaints, in the `{path, message, code}` vocabulary this API uses. */
+function issuesOf(error) {
+  return (error?.issues || []).map((issue) => {
+    const at = (issue.path || []).map((p) => (p && typeof p === 'object' ? p.key : typeof p === 'symbol' ? String(p) : p));
+    // Zod's sentence for a value that simply is not there reads "Invalid input:
+    // expected nonoptional, received undefined" on an unknown-typed field,
+    // which names nothing an agent can act on. A missing value gets Stacki's
+    // sentence; every other issue keeps zod's, which is more precise than
+    // anything written here would be.
+    const absent = /received undefined/.test(String(issue.message || ''));
+    return {
+      path: at,
+      message: absent ? `${at.join('.') || 'This argument'} is required.` : issue.message,
+      code: issue.code,
+    };
+  });
+}
+
+/**
+ * The same refusal for a tool that is not a domain.
+ *
+ * The fix below was applied to the eight domain tools and stopped there, so
+ * five of the thirteen published tools — get_context, capture, get_comments,
+ * comment and get_capabilities — still answered a mistyped argument with the
+ * raw host sentence this whole mechanism exists to remove. `capture` and
+ * `comment` are the two tools the `visual` level exists for, which made the raw
+ * shape the FIRST thing an agent at that level could hit.
+ *
+ * They have no `action` to be wrong about, so there is no bad_action half; the
+ * envelope is otherwise the domain one, down to the `issues` vocabulary.
+ */
+function badToolArguments(tool, error) {
+  const issues = issuesOf(error);
+  return {
+    ok: false,
+    code: 'bad_arguments',
+    operation: tool,
+    issues,
+    message: `${tool} could not run — ${issues.map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`).join('; ')}`,
+  };
+}
+
+/**
+ * Register a tool whose arguments Stacki checks rather than the host.
+ *
+ * Same trick as `domain()` above and for the same reason — `advertised()`
+ * publishes the real schema and lets everything through, and the handler runs
+ * the identical zod a moment later so a failure becomes an envelope. Exported
+ * because three of the five non-domain tools are registered from other files;
+ * a second copy of this in each of them is how the eight and the five drifted
+ * apart in the first place.
+ *
+ * A refusal carries `isError`, which is what stops the SDK validating it
+ * against a tool's payload output schema: a refusal is not a payload, and
+ * `get_context` declaring its snapshot shape must not mean a bad argument comes
+ * back as an output-validation crash instead of an answer.
+ */
+function publishChecked(server, name, config, handler) {
+  const schema = config.inputSchema;
+  return server.registerTool(name, { ...config, inputSchema: advertised(schema) }, async (args, extra) => {
+    const parsed = schema.safeParse(args || {});
+    if (!parsed.success) return answer(badToolArguments(name, parsed.error));
+    return handler(parsed.data, extra);
+  });
+}
+
 /**
  * An argument failure, in Stacki's own shape.
  *
@@ -831,20 +902,7 @@ function badArguments(domain, action, error) {
       actions: known,
     };
   }
-  const issues = (error?.issues || []).map((issue) => {
-    const at = (issue.path || []).map((p) => (p && typeof p === 'object' ? p.key : typeof p === 'symbol' ? String(p) : p));
-    // Zod's sentence for a value that simply is not there reads "Invalid input:
-    // expected nonoptional, received undefined" on an unknown-typed field,
-    // which names nothing an agent can act on. A missing value gets Stacki's
-    // sentence; every other issue keeps zod's, which is more precise than
-    // anything written here would be.
-    const absent = /received undefined/.test(String(issue.message || ''));
-    return {
-      path: at,
-      message: absent ? `${at.join('.') || 'This argument'} is required.` : issue.message,
-      code: issue.code,
-    };
-  });
+  const issues = issuesOf(error);
   return {
     ok: false,
     code: 'bad_arguments',
@@ -923,6 +981,11 @@ module.exports = {
   // Exported so the two tools that live outside this file can refuse in exactly
   // the same shape rather than in one that resembles it. See auditTool.js.
   answer,
+  // And so the non-domain tools refuse a bad argument in it too, rather than
+  // leaving five of the thirteen answering with a raw host sentence. See
+  // electron/mcp/tools.js, which composes the whole surface.
+  publishChecked,
+  badToolArguments,
   DESCRIPTIONS,
   Envelope,
   TargetInput,

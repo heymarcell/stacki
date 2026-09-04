@@ -45,7 +45,12 @@ const short = (v) => JSON.stringify(v ?? null).slice(0, 300);
 // The fixture's own two collections stay — the rig verifies them by name before
 // it hands the project over — and three more are added, because the defects
 // below cannot be reached through a glob collection with a lax schema.
-const CONFIG = `import { defineCollection, reference, z } from 'astro:content';
+// A FUNCTION, because two of the containment cases need a path that does not
+// exist until the rig has made the fixture: the project root is a mkdtemp and
+// the canary beside it is another, so the loader that points out of the project
+// can only be spelled once both are on disk. The config is written with a
+// placeholder and rewritten before the first content call.
+const CONFIG = (strayLoader) => `import { defineCollection, reference, z } from 'astro:content';
 import { glob, file } from 'astro/loaders';
 
 const notes = defineCollection({
@@ -96,11 +101,29 @@ const bespoke = defineCollection({
   schema: z.object({ title: z.string() }),
 });
 
-export const collections = { notes, links, people, work, loose, bespoke };
+// A COLLECTION WHOSE LOADER POINTS OUT OF THE PROJECT. Nothing stops a real
+// project doing this — '../shared/data.json' is an ordinary monorepo layout —
+// and it is the case where an entry genuinely RESOLVES and the path still leads
+// outside. That makes it the only shape that reaches the containment fence in
+// findContentEntry, rather than being turned away by the entry selector first.
+const strays = defineCollection({
+  loader: file('${strayLoader}'),
+  schema: z.object({ id: z.string(), name: z.string() }),
+});
+
+// And the same question asked through a symlink planted INSIDE the project, so
+// the realpath half of the fence is exercised too: every path this collection
+// reports is project-relative and one of them leads out.
+const linked = defineCollection({
+  loader: glob({ pattern: '**/*.md', base: './src/content/linked' }),
+  schema: z.object({ title: z.string() }),
+});
+
+export const collections = { notes, links, people, work, loose, bespoke, strays, linked };
 `;
 
 const EXTRA = {
-  'src/content.config.ts': CONFIG,
+  'src/content.config.ts': CONFIG('REWRITTEN-ONCE-THE-FIXTURE-EXISTS'),
   'src/data/people.json': `[
   { "id": "ada", "name": "Ada" },
   { "id": "bob", "name": "Bob" }
@@ -133,20 +156,52 @@ Nothing declares a shape for this.
   const canary = path.join(outside, 'canary.md');
   const CANARY_BYTES = '---\ntitle: nothing has written here\n---\n\nA file outside every project.\n';
   fs.writeFileSync(canary, CANARY_BYTES, 'utf8');
+  // Two more, for the two shapes that reach the fence rather than the selector:
+  // the data file a collection's own loader will be pointed at, and the file a
+  // symlink planted inside the project will point at.
+  const strayCanary = path.join(outside, 'strays.json');
+  const STRAY_BYTES = '[\n  { "id": "ada", "name": "Ada" },\n  { "id": "bob", "name": "Bob" }\n]\n';
+  fs.writeFileSync(strayCanary, STRAY_BYTES, 'utf8');
+  const linkedCanary = path.join(outside, 'linked.md');
+  const LINKED_BYTES = '---\ntitle: Also outside every project\n---\n\nReached only through a symlink.\n';
+  fs.writeFileSync(linkedCanary, LINKED_BYTES, 'utf8');
 
   const rig = await startWireRig({ era: 'modern', agentMode: 'edit', withDeps: true, extra: EXTRA });
   const problems = [];
   try {
+    // The two things that could not be spelled until the fixture was on disk,
+    // written before the first content call so nothing has read the config yet.
+    fs.writeFileSync(
+      path.join(rig.root, 'src/content.config.ts'),
+      CONFIG(path.relative(rig.root, strayCanary).split(path.sep).join('/')),
+      'utf8'
+    );
+    fs.mkdirSync(path.join(rig.root, 'src/content/linked'), { recursive: true });
+    fs.symlinkSync(linkedCanary, path.join(rig.root, 'src/content/linked/escape.md'));
     // ── F12a: containment ────────────────────────────────────────────────────
     //
-    // Both spellings of the escape the neighbouring `source.write` refuses. The
-    // relative one is computed from the fixture root, so it reaches this test's
-    // own directory rather than whatever happens to sit beside the fixture.
-    const escapes = [
+    // WHAT THE FIRST VERSION OF THIS BLOCK MEASURED, and why it is now in four
+    // parts. It sent `entry: {file, locator: []}` with a climbing path and with
+    // an absolute one, and accepted outside_project OR bad_request OR no_entry.
+    // Both cases are refused as `no_entry`: the file is only a SELECTOR into the
+    // listing, so resolution fails long before the containment fence is reached.
+    // Deleting the fence itself — the rel() call at the end of findContentEntry
+    // — therefore left this suite at 70/70 while a collection whose loader
+    // points out of the project happily wrote outside it. The suite's headline
+    // was containment and what it proved was the weaker, different statement
+    // that entry.file cannot name a location.
+    //
+    // Both statements are worth having. They are now measured separately, and
+    // the fence is measured by the only two shapes that can reach it: an entry
+    // that genuinely RESOLVES and still leads outside.
+
+    // (1) entry.file is a selector, and a selector that names nothing selects
+    //     nothing — whatever the string looks like.
+    const selectors = [
       ['a relative path that climbs out of the project', path.relative(rig.root, canary).split(path.sep).join('/')],
       ['an absolute path', canary],
     ];
-    for (const [what, file] of escapes) {
+    for (const [what, file] of selectors) {
       // Put the canary back between the two, and write a different value each
       // time, so neither case can be reported as harmless because the other one
       // had already done the damage.
@@ -156,18 +211,81 @@ Nothing declares a shape for this.
         entry: { file, locator: [] },
         edits: [{ path: ['title'], value: `WRITTEN FROM OUTSIDE THE PROJECT via ${what}` }],
       });
-      check(`write_entry refuses ${what}`, said.envelope?.ok === false, short(said.envelope));
-      check(
-        '  with a code that says why, not a crash',
-        ['outside_project', 'bad_request', 'no_entry'].includes(String(said.envelope?.code)),
-        short(said.envelope?.code)
-      );
-      // THE DISCRIMINATING HALF. An envelope-only assertion is satisfied by any
-      // unrelated refusal; the bytes are what say nothing left the project.
+      check(`entry.file naming ${what} is refused`, said.envelope?.ok === false, short(said.envelope));
+      // PINNED TO THE CODE THE OPERATION REALLY GIVES. A list that also admitted
+      // outside_project is what let this case be mistaken for a fence test.
+      check('  as no_entry: the hint chose no entry, which is not the same as being fenced', said.envelope?.code === 'no_entry', short(said.envelope?.code));
       check('  and the file outside the project is byte-identical', fs.readFileSync(canary, 'utf8') === CANARY_BYTES, 'the canary was written to');
     }
 
-    // The control that keeps the two halves honest: the same escape through the
+    // (2) THE FENCE. A collection whose own loader points out of the project —
+    //     '../shared/data.json' is an ordinary monorepo layout — lists entries
+    //     that resolve to a real file outside the root. Nothing between that
+    //     listing and the canary except the containment check.
+    {
+      const list = await rig.call('content', 'entries', { collection: 'strays' });
+      const entries = list.envelope?.entries || [];
+      check('a collection whose loader points out of the project is still listed', entries.length === 2, short(list.envelope));
+      const bob = entries.find((e) => e.id === 'bob');
+      check('  and its entries resolve to a file outside the root', typeof bob?.file === 'string' && bob.file.startsWith('..'), short(bob?.file));
+
+      const said = await rig.call('content', 'write_entry', {
+        collection: 'strays',
+        id: 'bob',
+        entry: bob,
+        edits: [{ path: ['name'], value: 'WRITTEN OUTSIDE THE PROJECT' }],
+      });
+      check('writing an entry that resolves outside the project is refused', said.envelope?.ok === false, short(said.envelope));
+      check('  as outside_project, which is the fence and nothing else', said.envelope?.code === 'outside_project', short(said.envelope?.code));
+      check('  and the file outside the project is byte-identical', fs.readFileSync(strayCanary, 'utf8') === STRAY_BYTES, fs.readFileSync(strayCanary, 'utf8').slice(0, 200));
+    }
+
+    // (3) The symlink twin, which is the half of the fence that survives a path
+    //     that looks project-relative all the way down. Every path this
+    //     collection reports is inside src/content; one of them is a link out.
+    {
+      const list = await rig.call('content', 'entries', { collection: 'linked' });
+      const entries = list.envelope?.entries || [];
+      const escape = entries.find((e) => typeof e.file === 'string' && e.file.includes('linked/escape'));
+      check('a symlink inside the project is listed as an in-project path', !!escape && !escape.file.startsWith('..'), short(entries.map((e) => e.file)));
+      const said = await rig.call('content', 'write_entry', {
+        collection: 'linked',
+        id: escape?.id,
+        entry: escape,
+        edits: [{ path: ['title'], value: 'WRITTEN THROUGH A SYMLINK' }],
+      });
+      check('following it out of the project is refused', said.envelope?.ok === false, short(said.envelope));
+      check('  as outside_project, which only the realpath half can say', said.envelope?.code === 'outside_project', short(said.envelope?.code));
+      check('  and the file the link points at is byte-identical', fs.readFileSync(linkedCanary, 'utf8') === LINKED_BYTES, fs.readFileSync(linkedCanary, 'utf8').slice(0, 200));
+    }
+
+    // (4) THE OPERATION TWO TABLE ENTRIES BELOW write_entry, and the identical
+    //     escape. `to` is an id, and a glob collection's id IS its filename, so
+    //     planRename builds `dirname(entry.file)/<to><ext>` and applyRename
+    //     hands that to mkdirSync and renameSync: a climbing `to` moved the
+    //     entry out of the project and REPLACED whatever was at the
+    //     destination, answering {ok:true, renamed:true}.
+    {
+      const climb = path.relative(path.join(rig.root, 'src/content/notes'), outside).split(path.sep).join('/');
+      const to = `${climb}/canary`;
+      const said = await rig.call('content', 'rename', { collection: 'notes', from: 'first', to });
+      check('content.rename refuses an id that climbs out of the project', said.envelope?.ok === false, short(said.envelope));
+      check('  as outside_project', said.envelope?.code === 'outside_project', short(said.envelope?.code));
+      check('  the file outside the project is byte-identical', fs.readFileSync(canary, 'utf8') === CANARY_BYTES, 'a rename overwrote the canary');
+      check('  and the entry is still inside the project', fs.existsSync(path.join(rig.root, 'src/content/notes/first.md')), 'the entry was moved out of the project');
+
+      const plan = await rig.call('content', 'rename_plan', { collection: 'notes', from: 'first', to });
+      check('  and the read-only planner refuses it rather than announcing where it would land', plan.envelope?.code === 'outside_project', short(plan.envelope));
+
+      // THE CONTROL. A nested id is an ordinary id for a glob collection, and a
+      // fence that also refused those would be a second bug wearing the first
+      // one's fix.
+      const nested = await rig.call('content', 'rename', { collection: 'notes', from: 'first', to: 'drafts/first' });
+      check('a nested id is still an ordinary id', nested.envelope?.ok === true, short(nested.envelope));
+      check('  and the file really moved, inside the project', fs.existsSync(path.join(rig.root, 'src/content/notes/drafts/first.md')), 'the nested rename did not land');
+    }
+
+    // The control that keeps all of it honest: the same escape through the
     // operation that has always refused it.
     {
       const said = await rig.call('source', 'write', { path: '../stacki-escape-probe.md', text: 'x' });
