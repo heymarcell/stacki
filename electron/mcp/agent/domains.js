@@ -143,6 +143,9 @@ const MAX_TEXT_BYTES = 120_000;
 // because a merge answers about MANY files at once and the budget is the whole
 // envelope, not one entry in it.
 const MAX_CONFLICT_BYTES = 8_000;
+// And across all of them. See the merge mapper: a cap that only ever asks
+// "is this ONE file small enough" is not a cap on the answer.
+const MAX_CONFLICT_ENVELOPE_BYTES = 24_000;
 const MAX_SNIPPET_LINES = 400;
 
 // --- source ------------------------------------------------------------------
@@ -1502,6 +1505,14 @@ const git = {
     result: (raw, input) => {
       if (raw?.ok === false && raw.conflicted) {
         const all = Array.isArray(raw.files) ? raw.files : [];
+        // A PER-FILE CAP IS NOT A BUDGET. Twenty conflicting files each just
+        // under the per-file limit is twenty times the limit, and this refusal
+        // is one envelope. So the per-file clip stays and a running total sits
+        // over it: once the budget is spent, later files keep their path and
+        // lose their hunks, and say so. `Buffer.byteLength`, not `.length` —
+        // the clip below measures characters, and a conflict in a CJK or
+        // emoji-carrying file is up to four bytes for each of them.
+        let spent = 0;
         const files = take(all, MAX_LIST).map((f) => {
           // ONLY THE REGIONS THAT ACTUALLY CLASH.
           //
@@ -1511,11 +1522,14 @@ const git = {
           // is one clash and three hundred lines of settled text; the settled
           // text is already on disk, unchanged, because the merge was unwound.
           const clashes = Array.isArray(f?.parts) ? f.parts.filter((part) => part && part.kind === 'clash') : null;
-          const packed = clip(JSON.stringify(clashes ?? null), MAX_CONFLICT_BYTES);
+          const encoded = JSON.stringify(clashes ?? null);
+          const bytes = Buffer.byteLength(encoded, 'utf8');
+          const fits = bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES;
+          if (fits) spent += bytes;
           return {
             path: f?.path ?? null,
-            hunks: packed.truncated ? null : clashes,
-            hunksOmitted: packed.truncated,
+            hunks: fits ? clashes : null,
+            hunksOmitted: !fits,
           };
         });
         return {
@@ -1523,7 +1537,8 @@ const git = {
             'merge_conflict',
             `Merging "${input.branch}" stopped on ${all.length} conflicting ${all.length === 1 ? 'file' : 'files'}. ` +
               'The merge was unwound, so the project is exactly as it was. Reconcile the files named here and ' +
-              'apply the result with git.resolve_merge.'
+              'apply the result with git.resolve_merge, whose `choices` takes "ours" or "theirs" per file, or an ' +
+              'array of "ours" | "theirs" | "both" | "merged" \u2014 one per hunk, in the order they are listed here.'
           ).error,
           branch: input.branch,
           into: raw.from ?? null,
@@ -1545,14 +1560,46 @@ const git = {
               'Commit them, park them, or discard them first — nothing was changed.'
           ).error,
           branch: input.branch,
-          into: raw.from ?? null,
+          // `from`, matching checkout's. Both refusals mean "the work in your
+          // tree is in the way"; naming the branch you are on two different
+          // things across two operations of one domain is a distinction a
+          // caller has to learn for nothing.
+          from: raw.from ?? null,
           files: take(raw.files, MAX_LIST),
         };
       }
       return raw;
     },
   },
-  resolve_merge: { channel: 'git:resolveMerge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }) },
+  resolve_merge: {
+    channel: 'git:resolveMerge',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }),
+    // A CHOICE THAT WAS NOT UNDERSTOOD IS NOT A RESOLUTION.
+    //
+    // The handler used to treat anything that was not the string 'theirs' as
+    // "keep ours" and then commit it, so a wrong shape discarded the other
+    // branch's work and answered `ok: true, changed: true` with
+    // `undoable: false`. It now refuses; this gives that refusal a code and
+    // states the vocabulary an agent should have been told in the first place.
+    result: (raw, input) => {
+      if (raw?.ok === false && Array.isArray(raw.badChoices)) {
+        const first = raw.badChoices[0] || {};
+        return {
+          ...problem(
+            'bad_choices',
+            `Nothing was merged: ${raw.badChoices.length} of the choices could not be understood, starting with ` +
+              `${first.path}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
+              '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk, in the order git reports ' +
+              "them. A file you leave out keeps this branch's version."
+          ).error,
+          branch: input.branch,
+          into: raw.from ?? null,
+          badChoices: take(raw.badChoices, MAX_LIST),
+        };
+      }
+      return raw;
+    },
+  },
   delete_branch: {
     channel: 'git:deleteBranch',
     args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }),
@@ -1879,6 +1926,10 @@ function refusal(raw) {
 
 module.exports = {
   runMain,
+  // Exported so the renderer's own answers get the same treatment. A message
+  // built in the renderer never passed through `thrownFailure`, so an absolute
+  // path in one reached the wire intact.
+  withoutHostPaths,
   // Exported for test/git-envelopes.js, which calls it with the error shapes
   // that reach it — including the ones no fixture can provoke end to end, like
   // a package manager's stderr with somebody's home directory in it.

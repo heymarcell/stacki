@@ -461,6 +461,18 @@ export function createAgentCommands(getApp) {
     if (action === 'redo') {
       const before = a.historyDepth();
       const restored = await a.redo();
+      // Same as undo: the stack shortens whatever the command did.
+      if (restored && restored.failed) {
+        return {
+          ok: false,
+          code: 'redo_failed',
+          message: `That change could not be redone: ${restored.failed}`,
+          redone: false,
+          restored,
+          history: a.historyDepth(),
+          document: documentOf(a),
+        };
+      }
       return {
         ok: true,
         redone: a.historyDepth().future < before.future,
