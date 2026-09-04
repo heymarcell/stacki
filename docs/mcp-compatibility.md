@@ -55,6 +55,7 @@ only the first while sounding like the second.
 | Logging, completions, sampling, roots, elicitation | — | — | **UNSUPPORTED** | not declared |
 | Packaged app serves all of the above | ✅ | ✅ | **TESTED** | every held-out trial ran against a real `Stacki.app`; `test/packaged-mcp.js`, `test/packaged-audit.js` |
 | Transport gates (Host, Origin, bearer, single path, no CORS) | — | raw HTTP | **TESTED** | `test/mcp.js` |
+| Request size limit | — | ✅ | **TESTED** | 32 MB, above the largest schema-legal request (a `content.write_entry` measures 11 MB); a body with no `Content-Length` is 411, and the refusal is delivered rather than reset — asserted through `fetch` with the body actually sent, in `test/mcp.js` |
 
 ## What the catalogue actually costs
 
