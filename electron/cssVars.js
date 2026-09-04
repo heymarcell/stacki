@@ -655,6 +655,68 @@ function setVariable(projectPath, { file, valueStart, valueEnd, expect, value })
 }
 
 /**
+ * The comment one heading range is in.
+ *
+ * A heading IS a comment, and `start`/`end` are where its WORDS are — that is
+ * what `readVariables` reports as titleStart/titleEnd and what the panel sends
+ * straight back. A caller that found the heading in the file itself sends the
+ * whole `/* … *\/` instead, and the two ranges are four bytes apart, so both
+ * have to arrive at the same comment.
+ *
+ * Everything else has to be refused, because these three operations write and
+ * cut at byte offsets: a range that starts outside a comment, or that runs past
+ * one comment's end into the next, is not a heading, and treating it as one is
+ * how a rule ends up with a bare word in it (CSS error recovery then swallows
+ * the declaration after it) or how a cut runs from here to the next `*\/` and
+ * takes twenty-eight declarations with it.
+ *
+ * Scanned from the top rather than searched backwards from `start`, so a `/*`
+ * inside a string — `content: "/*"` — cannot be mistaken for a comment opening,
+ * and an offset pointing at nothing cannot silently borrow the comment above.
+ */
+function commentAround(text, start, end) {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) return null;
+  let at = 0;
+  while (at < text.length) {
+    const ch = text[at];
+    if (ch === '"' || ch === "'") {
+      at += 1;
+      while (at < text.length && text[at] !== ch) at += text[at] === '\\' ? 2 : 1;
+      at += 1;
+      continue;
+    }
+    if (ch === '/' && text[at + 1] === '*') {
+      const close = text.indexOf('*/', at + 2);
+      const stop = close === -1 ? text.length : close + 2;
+      if (start >= at && end <= stop) return close === -1 ? null : { open: at, close };
+      // Past this comment's end without being inside it: the range straddles
+      // it, or it sits in the code before it. Either way there is no heading
+      // here, and no later comment can contain a range that starts this early.
+      if (start < stop) return null;
+      at = stop;
+      continue;
+    }
+    at += 1;
+  }
+  return null;
+}
+
+/** Where the words are inside that comment, whichever of the two ranges arrived. */
+function wordsOf(text, comment, start, end) {
+  let from = Math.max(start, comment.open + 2);
+  let to = Math.min(end, comment.close);
+  // A whole-comment range now spans the padding as well; the padding is what
+  // keeps `/* Title */` from being written as `/*Title*/`.
+  while (from < to && /\s/.test(text[from])) from += 1;
+  while (to > from && /\s/.test(text[to - 1])) to -= 1;
+  return { from, to };
+}
+
+const NOT_A_HEADING =
+  'That range is not a heading. A heading is the text inside a `/* … */` comment — pass the ' +
+  'titleStart and titleEnd the variables read reported for it.';
+
+/**
  * Renames a heading that is a comment.
  *
  * A file with one rule takes its headings from the comments in it, so the
@@ -676,7 +738,15 @@ function setSectionTitle(projectPath, { file, start, end, expect, title }) {
   if (expect !== undefined && current !== expect) {
     return { ok: false, stale: true, error: 'This file changed since the panel read it.' };
   }
-  fs.writeFileSync(abs, text.slice(0, start) + next + text.slice(end), 'utf8');
+  // The write goes INSIDE the comment even when the caller aimed at the whole
+  // of it. Writing over the delimiters left the new title as a bare identifier
+  // in the rule, which is not CSS: the browser recovered by discarding
+  // everything up to the next `;` — the title AND the declaration under it —
+  // and the operation still answered ok.
+  const comment = commentAround(text, start, end);
+  if (!comment) return { ok: false, error: NOT_A_HEADING };
+  const { from, to } = wordsOf(text, comment, start, end);
+  fs.writeFileSync(abs, text.slice(0, from) + next + text.slice(to), 'utf8');
   return { ok: true };
 }
 
@@ -698,9 +768,13 @@ function removeSection(projectPath, { file, start, end, expect }) {
   if (expect !== undefined && text.slice(start, end) !== expect) {
     return { ok: false, stale: true, error: 'This file changed since the panel read it.' };
   }
-  const open = text.lastIndexOf('/*', start);
-  const close = text.indexOf('*/', end);
-  if (open === -1 || close === -1) return { ok: false, error: 'That heading is no longer a comment.' };
+  // Searching backwards for `/*` and forwards for `*/` found a comment for any
+  // pair of offsets at all: given the whole comment rather than its words, the
+  // forward search started PAST this comment's `*/` and stopped at the NEXT
+  // one, and the cut between them took 2149 bytes and 28 declarations with it.
+  const comment = commentAround(text, start, end);
+  if (!comment) return { ok: false, error: NOT_A_HEADING };
+  const { open, close } = comment;
   let from = open;
   let to = close + 2;
   // A line of its own goes with it; a comment sharing a line with something
@@ -735,9 +809,13 @@ function moveHeading(projectPath, { file, selector, start, end, expect, before }
   if (expect !== undefined && text.slice(start, end) !== expect) {
     return { ok: false, stale: true, error: 'This file changed since the panel read it.' };
   }
-  const open = text.lastIndexOf('/*', start);
-  const close = text.indexOf('*/', end);
-  if (open === -1 || close === -1) return { ok: false, error: 'That heading is no longer a comment.' };
+  // Same guard as removeSection, for the same reason: the cut this makes is
+  // the same cut, and a range that is not one comment moved nothing — it
+  // deleted from here to the next `*/`, then threw an unclosed-block parse
+  // error at the caller.
+  const found = commentAround(text, start, end);
+  if (!found) return { ok: false, error: NOT_A_HEADING };
+  const { open, close } = found;
 
   const comment = text.slice(open, close + 2);
   let from = open;

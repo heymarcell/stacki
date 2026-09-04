@@ -1499,7 +1499,30 @@ async function runMain(domain, action, input, ctx) {
   // the refusal itself replaced the whole envelope with that string, which
   // arrives at a client spread into numbered characters.
   if (shaped?.error && typeof shaped.error === 'object' && shaped.error.ok === false) return shaped.error;
+  // AND A HANDLER'S OWN `ok:false` IS A REFUSAL TOO. The spread below carried
+  // one through word for word, so `css:setVariable` refusing a stale offset
+  // reached an agent as `{ok:false, stale:true, error:"This file changed since
+  // the panel read it."}` — no `code` to branch on, and the sentence under
+  // `error` where every other refusal in this surface says `message`. That is
+  // the one answer a client cannot act on, and it was the LAST guard before a
+  // write at a byte offset, so the agent that hit it had no way to tell "your
+  // offsets are stale, read again" from any other failure.
+  if (shaped && typeof shaped === 'object' && shaped.ok === false) return refusal(shaped);
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
+}
+
+/** A main-process `{ok:false, …}` said in the envelope's own vocabulary. */
+function refusal(raw) {
+  const { ok, code, message, error, reason, ...rest } = raw;
+  return {
+    ...rest,
+    ok: false,
+    // `stale` is a handler's own word for the guard that fired: the file moved
+    // under the offsets it was handed, which is `stale_target` everywhere else
+    // in this surface. Anything else it did not name is `failed`, as before.
+    code: typeof code === 'string' && code ? code : raw.stale ? 'stale_target' : 'failed',
+    message: String(message || error || reason || 'That operation was refused.'),
+  };
 }
 
 module.exports = { runMain, resolveContentEntry, DOMAINS, outlineOf, summarizeScan, MAX_LIST, MAX_TEXT_BYTES };

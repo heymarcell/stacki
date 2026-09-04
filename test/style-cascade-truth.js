@@ -195,20 +195,27 @@ const declsOf = (answer, prop) =>
   const gridStyles = await run('style', 'read', { ref: grid.ref, properties: ['gap', 'display'] });
   check('style.read answers about the grid', gridStyles.ok === true, short(gridStyles));
 
-  // ── F16c2 · one property, one winner ───────────────────────────────────────
+  // ── F16c2 · one property, one winner — and NOBODY claims one nobody has ────
   //
   // `.pricing-grid { gap: var(--gap) }` and `@media (min-width: 768px) { …
-  // gap: 2rem }` are both in site.css. Whatever the answer says about the
-  // media-query one, it cannot also be "this is the declaration that wins" —
-  // nothing here knows the viewport.
+  // gap: 2rem }` are both in site.css. There is no canvas here, so nothing
+  // measured a viewport — and at 768 wide the media query IS the value the
+  // element has. Neither declaration may claim to be the winner: the media one
+  // because its condition is undecided, and the base one for exactly the same
+  // reason, which is the half this file used to assert the wrong way round.
 
   await section(async () => {
     const gaps = declsOf(gridStyles, 'gap');
     check('every gap declaration reaching the grid is reported', gaps.length >= 3, short(gaps.map((d) => `${d.rule.selector}:${d.value}`)));
+    check(
+      'with no viewport measured, the answer says so rather than implying one',
+      gridStyles.viewport === null,
+      short(gridStyles.viewport)
+    );
     const claimedWinners = gaps.filter((d) => d.winning === true);
     check(
-      'and exactly one of them claims to win',
-      claimedWinners.length === 1,
+      'and NOTHING claims to win a property an undecided @media also sets',
+      claimedWinners.length === 0,
       short(gaps.map((d) => ({ sel: d.rule.selector, at: d.rule.atContext, value: d.value, winning: d.winning })))
     );
     const media = gaps.find((d) => (d.rule.atContext || []).length > 0);
@@ -217,6 +224,20 @@ const declsOf = (answer, prop) =>
       'and says the condition it is waiting for instead',
       media && Array.isArray(media.appliesWhen) && /min-width: 768px/.test(media.appliesWhen.join(' ')),
       short(media && media.appliesWhen)
+    );
+    // The one that would have said `winning: true` names what stopped it, so
+    // "undecided" is actionable rather than a shrug.
+    const contested = gaps.find((d) => Array.isArray(d.contestedBy) && d.contestedBy.length);
+    check('the declaration that would have won names what contests it', !!contested, short(gaps.map((d) => d.contestedBy || null)));
+    check(
+      '  by the query, not just by a selector it shares with its rival',
+      contested && /min-width: 768px/.test(String(contested.contestedBy[0].atContext || '')),
+      short(contested && contested.contestedBy)
+    );
+    check(
+      '  and by the file it was authored in',
+      contested && /^file:src\/styles\//.test(String(contested.contestedBy[0].source)),
+      short(contested && contested.contestedBy)
     );
   });
 
@@ -233,6 +254,14 @@ const declsOf = (answer, prop) =>
     check(
       'and the thing overriding it is named by source, not only by selector',
       loser && loser.overriddenBy && typeof loser.overriddenBy === 'object' && typeof loser.overriddenBy.source === 'string',
+      short(loser && loser.overriddenBy)
+    );
+    // Two rules with the same selector, one inside `@media`, is how a media
+    // query overrides a base declaration — so the winner's query travels with
+    // it, or the loser is told it lost to itself.
+    check(
+      'and by the query it is under, which here is none',
+      loser && Array.isArray(loser.overriddenBy.atContext) && loser.overriddenBy.atContext.length === 0,
       short(loser && loser.overriddenBy)
     );
     check(
@@ -858,6 +887,144 @@ const declsOf = (answer, prop) =>
 
   app.stop();
   H.removeProject(root);
+
+  // ── D1 · the winner is the winner AT THE VIEWPORT ─────────────────────────
+  //
+  // A native agent read an `<h3>` on a running page and was told
+  // `font-size: var(--text-2xl)` (2.125rem) was `winning: true,
+  // overriddenBy: null` — beside a `computed` of 56px, which is 3.5rem, which
+  // is what `@media (min-width: 50em)` sets three lines further down the same
+  // file. Two answers to one question, in one payload.
+  //
+  // A media query is not an interaction state. At a viewport where it holds it
+  // IS the resting cascade, so the cascade is resolved there — and this is the
+  // real cascade module, over really parsed CSS, asked the same question at
+  // three viewports.
+
+  await section(async () => {
+    const esbuild = require('esbuild');
+    const buildDir = path.join(__dirname, '..', 'node_modules', '.stacki-test');
+    fs.mkdirSync(buildDir, { recursive: true });
+    const bundlePath = path.join(buildDir, 'cascade-viewport.bundle.js');
+    await esbuild.build({
+      stdin: {
+        contents:
+          "export { computeRuleModel, atContextApplies } from './lib/cascade';\n" +
+          "export { extractStyleRegions, parseRegion, collectRules } from './lib/css';\n",
+        resolveDir: path.join(__dirname, '..', 'src', 'style-panel'),
+        loader: 'ts',
+      },
+      outfile: bundlePath,
+      bundle: true,
+      format: 'cjs',
+      platform: 'node',
+      external: ['react'],
+      logLevel: 'silent',
+    });
+    const { computeRuleModel, atContextApplies, extractStyleRegions, parseRegion, collectRules } = require(bundlePath);
+
+    // The shape of the stylesheet it happened in: a base declaration, and the
+    // same selector inside a min-width query further down the file.
+    const CSS = `
+.section-header h3 { font-size: var(--text-2xl); }
+ul.grid { gap: 1rem; }
+@media (min-width: 50em) {
+  .section-header h3 { font-size: var(--text-4xl); }
+  ul.grid { gap: 4rem; }
+}
+@media print {
+  .section-header h3 { font-size: 12pt; }
+}
+@media (prefers-color-scheme: dark) {
+  .section-header h3 { color: white; }
+}
+@media (prefers-reduced-motion) {
+  .section-header h3:hover { font-size: 1px; }
+}
+`;
+    const region = extractStyleRegions(`<style>${CSS}</style>`)[0];
+    parseRegion(region);
+    const rules = collectRules(region, {
+      embedKey: 'file:/p/src/styles/global.css',
+      embedLabel: 'global.css',
+      fromComponent: false,
+      componentName: null,
+      regionIndex: 0,
+      idSeed: 'd1',
+      order: { n: 0 },
+    });
+    check('the fixture stylesheet parsed into the rules this section is about', rules.length === 7, short(rules.map((r) => `${r.atContext.join('|')} ${r.selectorText}`)));
+
+    // The element is an h3 the browser says both `.section-header h3` rules
+    // match — the same answer primeDomMatches gets from the canvas.
+    const target = {
+      rootKey: 'h3',
+      view: {},
+      domMatched: new Map([
+        ['.section-header h3', true],
+        // The canvas answers about the element, not about the pointer: a
+        // :hover selector matches it the same way.
+        ['.section-header h3:hover', true],
+        ['ul.grid', false],
+      ]),
+    };
+    const fontSize = (model) =>
+      [...model.base, ...model.conditional].flatMap((entry) =>
+        entry.rule.declarations
+          .filter((d) => d.prop === 'font-size')
+          .map((d) => ({ at: entry.rule.atContext, value: d.value, ...entry.declStatus[d.declId] }))
+      );
+
+    const wide = fontSize(await computeRuleModel(rules, target, { viewport: { width: 1200, height: 900 } }));
+    const narrow = fontSize(await computeRuleModel(rules, target, { viewport: { width: 375, height: 812 } }));
+    const unknown = fontSize(await computeRuleModel(rules, target));
+
+    const inQuery = (list) => list.find((d) => d.at.some((a) => /min-width/.test(a)));
+    const inBase = (list) => list.find((d) => !d.at.length);
+
+    // 50em is 800px: the query holds at 1200 and does not at 375.
+    check('at 1200px the media declaration is the one that wins', inQuery(wide)?.winning === true, short(inQuery(wide)));
+    check('  resolved, not hedged', inQuery(wide)?.resolved === true && inQuery(wide)?.applies === true, short(inQuery(wide)));
+    check('  and the base declaration is told it lost', inBase(wide)?.winning === false, short(inBase(wide)));
+    check(
+      '  naming the query that beat it, not just the selector it shares with it',
+      /min-width: 50em/.test(String(inBase(wide)?.overriddenByOrigin?.atContext || '')),
+      short(inBase(wide)?.overriddenByOrigin)
+    );
+    check('at 375px the base declaration wins', inBase(narrow)?.winning === true, short(inBase(narrow)));
+    check('  and the media one says it does not apply here', inQuery(narrow)?.applies === false && inQuery(narrow)?.resolved === false, short(inQuery(narrow)));
+    check('exactly one declaration wins at each viewport', [wide, narrow].every((list) => list.filter((d) => d.winning === true && d.resolved).length === 1), short([wide, narrow].map((l) => l.map((d) => d.winning))));
+    // With nothing measured the cascade cannot rule the query in or out, so the
+    // base declaration carries the rule that contests it — which is what
+    // style.read turns into `winning: null` (see F16c2 above).
+    check(
+      'with no viewport the base declaration is flagged contested, by exactly the query',
+      inBase(unknown)?.contestedBy?.length === 1 && /min-width: 50em/.test(String(inBase(unknown).contestedBy[0].atContext)),
+      short(inBase(unknown))
+    );
+    check('and at a viewport that settles it, nothing is left contested', !inBase(wide)?.contestedBy && !inBase(narrow)?.contestedBy?.length, short([inBase(wide)?.contestedBy, inBase(narrow)?.contestedBy]));
+    // `@media (prefers-reduced-motion) { …:hover }` sets font-size under a
+    // condition nothing can decide — and still contests nothing, because a
+    // :hover rule is not what the element has at rest whatever the width is.
+    check(
+      'an undecidable query on a :hover selector contests nothing',
+      inBase(unknown)?.contestedBy?.length === 1 && !inBase(wide)?.contestedBy,
+      short(inBase(unknown)?.contestedBy)
+    );
+
+    // The conditions that are not about a viewport stay undecided at every
+    // viewport — and the ones that are do not become undecided.
+    check('a print rule does not apply to a canvas', atContextApplies(['@media print'], { width: 1200 }) === false);
+    check('prefers-color-scheme is not a width question', atContextApplies(['@media (prefers-color-scheme: dark)'], { width: 1200 }) === null);
+    check('@supports is not one either', atContextApplies(['@supports (display: grid)'], { width: 1200 }) === null);
+    check('a min-width in em resolves against 16px', atContextApplies(['@media (min-width: 50em)'], { width: 800 }) === true && atContextApplies(['@media (min-width: 50em)'], { width: 799 }) === false);
+    check('a max-width is the other end of the same line', atContextApplies(['@media (max-width: 767px)'], { width: 767 }) === true && atContextApplies(['@media (max-width: 767px)'], { width: 768 }) === false);
+    check('range syntax says the same thing', atContextApplies(['@media (width >= 50em)'], { width: 800 }) === true && atContextApplies(['@media (800px <= width)'], { width: 799 }) === false);
+    check('a query list is any of them', atContextApplies(['@media print, (min-width: 40em)'], { width: 800 }) === true);
+    check('`not` inverts a decided answer and not an undecided one', atContextApplies(['@media not print'], { width: 800 }) === true && atContextApplies(['@media not (prefers-reduced-motion)'], { width: 800 }) === null);
+    check('every level of the nesting has to hold', atContextApplies(['@media (min-width: 50em)', '@supports (display: grid)'], { width: 1200 }) === null);
+    check('and nothing is decided without a viewport', atContextApplies(['@media (min-width: 50em)'], null) === null);
+  });
 
   // ── F16b, the half that needs a real CSSOM ────────────────────────────────
   //

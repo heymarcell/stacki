@@ -771,6 +771,78 @@ function registerAgentTools(server, { api }) {
   domain('git', GitInput, annotationsFor('git', { remote: true }));
 }
 
+/** `{a, b, c?}` — the fields of one object argument, required ones first-class. */
+function fieldsOf(spec) {
+  if (!spec || typeof spec !== 'object') return null;
+  if (spec.type === 'array' && spec.items?.type === 'object') {
+    const inner = fieldsOf(spec.items);
+    return inner ? `[${inner}]` : '[{…}]';
+  }
+  if (spec.type !== 'object' || !spec.properties) return null;
+  const required = new Set(spec.required || []);
+  const names = Object.keys(spec.properties).map((name) => (required.has(name) ? name : `${name}?`));
+  return names.length ? `{${names.join(', ')}}` : null;
+}
+
+/**
+ * The argument shapes, where a host will actually show them.
+ *
+ * A discriminated union converts to `{type:'object', oneOf:[…]}` with no
+ * top-level `properties`, and a client that renders `properties` — which is
+ * most of them, and was the one a real agent drove this API with — therefore
+ * renders NOTHING. Four `style` operations were unusable because of it: an
+ * agent that could not see `edit` sent the fields at the top level, got back
+ * "edit is required", and had to guess what belonged inside it one refusal at
+ * a time. `remove_section` and `move_heading` were never reached at all.
+ *
+ * So every argument any branch takes is named at the top level too, with what
+ * each action wants of it. The shapes are READ OUT of the branches rather than
+ * written down again, so they cannot drift from the schema the handler checks;
+ * the branches are still published underneath, unchanged, and remain the exact
+ * contract. Nothing here narrows anything — a top-level entry describes, the
+ * `oneOf` decides.
+ */
+function summarised(json) {
+  const branches = Array.isArray(json?.oneOf) ? json.oneOf : Array.isArray(json?.anyOf) ? json.anyOf : null;
+  if (!branches || !branches.length || json.properties) return json;
+
+  const actions = [];
+  const seen = new Map(); // property -> { types, shapes: [`action: {…}`], actions }
+  for (const branch of branches) {
+    const action = branch?.properties?.action?.const ?? branch?.properties?.action?.enum?.[0];
+    if (typeof action !== 'string') return json; // not the action union this is for
+    actions.push(action);
+    const required = new Set(branch.required || []);
+    for (const [name, spec] of Object.entries(branch.properties || {})) {
+      if (name === 'action') continue;
+      if (!seen.has(name)) seen.set(name, { types: new Set(), shapes: [], actions: [] });
+      const entry = seen.get(name);
+      if (typeof spec?.type === 'string') entry.types.add(spec.type);
+      entry.actions.push(required.has(name) ? action : `${action} (optional)`);
+      const shape = fieldsOf(spec);
+      if (shape) entry.shapes.push(`${action}: ${shape}`);
+    }
+  }
+
+  const properties = {
+    action: {
+      type: 'string',
+      enum: actions,
+      description: 'Which operation to run. The other arguments are the ones that action takes.',
+    },
+  };
+  for (const [name, entry] of seen) {
+    const type = entry.types.size === 1 ? [...entry.types][0] : null;
+    properties[name] = {
+      ...(type ? { type } : {}),
+      description: entry.shapes.length
+        ? `${entry.shapes.join('; ')}. Used by: ${entry.actions.join(', ')}.`
+        : `Used by: ${entry.actions.join(', ')}.`,
+    };
+  }
+  return { ...json, properties, required: ['action'] };
+}
+
 /**
  * The strict schema, advertised — and checked by Stacki rather than by the host.
  *
@@ -790,23 +862,28 @@ function registerAgentTools(server, { api }) {
  *
  * A tool schema only has to be a Standard Schema: `tools/list` converts it with
  * `~standard.jsonSchema[io]()` and `tools/call` checks it with
- * `~standard.validate`. So the conversion is delegated to the real schema —
- * byte for byte what it published before, which test/schema-dispatch-contract.js
- * measures — and the check is made a pass-through, so the identical zod schema
- * can run inside the handler where a failure becomes Stacki's own refusal.
+ * `~standard.validate`. So the conversion is delegated to the real schema, and
+ * the check is made a pass-through, so the identical zod schema can run inside
+ * the handler where a failure becomes Stacki's own refusal.
  *
- * The strictness is NOT relaxed: nothing here loosens a type, and a client
- * reading tools/list sees exactly what it saw before.
+ * The strictness is NOT relaxed: nothing here loosens a type, and every branch
+ * the real schema converts to is published unchanged. `summarised()` adds a
+ * top-level description of the same branches — see above for the client that
+ * could not read them.
  */
 function advertised(schema) {
   const std = schema['~standard'];
+  const convert = std.jsonSchema || {
+    input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
+    output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+  };
   return {
     '~standard': {
       version: 1,
       vendor: 'stacki',
-      jsonSchema: std.jsonSchema || {
-        input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
-        output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+      jsonSchema: {
+        input: (o) => summarised(convert.input(o)),
+        output: (o) => convert.output(o),
       },
       // Deliberately accepts everything. The handler runs the same schema a
       // moment later; validating twice would only mean the host's copy won.

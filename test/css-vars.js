@@ -17,9 +17,13 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { JSDOM, VirtualConsole } = require('jsdom');
 const {
   readVariables,
   setVariable,
+  setSectionTitle,
+  removeSection,
+  moveHeading,
   readDeclarations,
   groupRules,
   labelForRule,
@@ -177,6 +181,175 @@ const cssFiles = (root) => {
     nested?.groups[0]?.columns[0]?.context?.includes('.card'),
     JSON.stringify(nested?.groups[0]?.columns[0]?.context)
   );
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// --- a heading is a comment, and a write to one has to leave it one ---------
+//
+// A native agent driving the packaged app retitled a section by the range it
+// had found in the file — the whole `/* … */` rather than the words inside it,
+// which is what `variables` reports. The rename wrote the new title over the
+// delimiters, the rule was left holding a bare identifier, and the browser did
+// what browsers do with one: it discarded everything up to the next `;`, so the
+// declaration UNDER the heading stopped existing. `--theme-transition` computed
+// as nothing on the running page, and the operation answered `{ok:true}`.
+//
+// So the oracle here is not the return value. It is what a CSS engine makes of
+// the bytes afterwards: the same custom properties, with the same values.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-heading-'));
+  fs.mkdirSync(path.join(dir, 'src', 'styles'), { recursive: true });
+  const rel = 'src/styles/tokens.css';
+  const file = path.join(dir, rel);
+  // Shaped like the stylesheet it happened in (astro-portfolio's global.css):
+  // tab-indented, a heading per run of variables, and a second rule after the
+  // first for a runaway cut to reach into.
+  const ORIGINAL = `/* Global variables */
+:root {
+\t/* Fonts */
+\t--font-body: "Public Sans", system-ui;
+\t--font-brand: Rubik, system-ui;
+
+\t/* Transitions */
+\t--theme-transition: 0.2s ease-in-out;
+}
+
+:root.theme-dark {
+\t--gray-0: #f3f4f7;
+\t--gray-50: #e3e6ee;
+}
+`;
+  const write = () => fs.writeFileSync(file, ORIGINAL, 'utf8');
+  const read = () => fs.readFileSync(file, 'utf8');
+
+  // What a BROWSER ends up with, not what the text says: a CSS engine's own
+  // error recovery is the thing that ate the token, and a parser that stops at
+  // the first mistake would never see it happen.
+  const asBrowserSeesIt = (css) => {
+    const dom = new JSDOM(`<style>${css}</style>`, { virtualConsole: new VirtualConsole() });
+    const computed = dom.window.getComputedStyle(dom.window.document.documentElement);
+    const out = new Map();
+    for (const name of new Set(ORIGINAL.match(/--[\w-]+(?=\s*:)/g) || [])) {
+      const value = String(computed.getPropertyValue(name) || '').trim();
+      if (value) out.set(name, value);
+    }
+    dom.window.close();
+    return out;
+  };
+  const sameVariables = (a, b) =>
+    a.size === b.size && [...a].every(([name, value]) => b.get(name) === value);
+  const declarations = (css) => {
+    try {
+      return readDeclarations(css).flatMap((r) => r.entries.filter((e) => e.kind === 'var').map((e) => e.name));
+    } catch (err) {
+      return `unparseable: ${err.message}`;
+    }
+  };
+
+  write();
+  const baseline = asBrowserSeesIt(ORIGINAL);
+  check(
+    'the fixture starts with three variables the page can read',
+    baseline.size === 3 && baseline.get('--theme-transition') === '0.2s ease-in-out',
+    JSON.stringify([...baseline])
+  );
+
+  // THE DOGFOOD'S CALL: start/end over the whole comment, expect the whole
+  // comment — the range an agent gets by finding the heading in the file.
+  {
+    const start = ORIGINAL.indexOf('/* Transitions */');
+    const out = setSectionTitle(dir, {
+      file: rel,
+      start,
+      end: start + '/* Transitions */'.length,
+      expect: '/* Transitions */',
+      title: 'Motion',
+    });
+    const after = read();
+    check('a heading given as a whole comment is retitled', out.ok === true, JSON.stringify(out));
+    check('  and is still a comment afterwards', after.includes('/* Motion */'), after.slice(start - 20, start + 40));
+    check('  so the stylesheet still parses', Array.isArray(declarations(after)), String(declarations(after)));
+    check(
+      '  and the browser still has every variable it had',
+      sameVariables(baseline, asBrowserSeesIt(after)),
+      JSON.stringify([...asBrowserSeesIt(after)])
+    );
+    check(
+      '  including the one the heading sits above',
+      asBrowserSeesIt(after).get('--theme-transition') === '0.2s ease-in-out',
+      JSON.stringify(asBrowserSeesIt(after).get('--theme-transition') ?? null)
+    );
+    check('  and nothing but the heading moved', after === ORIGINAL.replace('/* Transitions */', '/* Motion */'), after);
+  }
+
+  // The panel's own range — the words, as `variables` reports them — still
+  // renames exactly those words.
+  {
+    write();
+    const block = readVariables(dir)
+      .files[0].groups.flatMap((g) => g.blocks)
+      .find((b) => b.title === 'Transitions');
+    const out = setSectionTitle(dir, {
+      file: rel,
+      start: block.titleStart,
+      end: block.titleEnd,
+      expect: 'Transitions',
+      title: 'Motion',
+    });
+    check('the words range still renames', out.ok === true, JSON.stringify(out));
+    check('  writing only those words', read() === ORIGINAL.replace('Transitions', 'Motion'), read());
+  }
+
+  // A range that is not a heading is refused rather than written blind.
+  for (const [what, from, to] of [
+    ['a range over a declaration', ORIGINAL.indexOf('--theme-transition'), ORIGINAL.indexOf('--theme-transition') + 18],
+    ['a range from one heading past the next', ORIGINAL.indexOf('/* Fonts */'), ORIGINAL.indexOf('/* Transitions */') + 4],
+    ['a range at the end of the file', ORIGINAL.length - 2, ORIGINAL.length],
+  ]) {
+    write();
+    const out = setSectionTitle(dir, { file: rel, start: from, end: to, title: 'Motion' });
+    check(`${what} is refused`, out.ok === false && typeof out.error === 'string', JSON.stringify(out));
+    check(`  and ${what} writes nothing`, read() === ORIGINAL, read());
+  }
+
+  // removeSection and moveHeading cut at the same offsets, and used to find
+  // their comment by searching backwards for `/*` and forwards for `*/` — which
+  // for a whole-comment range started past this comment's end and stopped at
+  // the NEXT one, taking every declaration in between.
+  {
+    write();
+    const start = ORIGINAL.indexOf('/* Fonts */');
+    const out = removeSection(dir, { file: rel, start, end: start + '/* Fonts */'.length, expect: '/* Fonts */' });
+    const after = read();
+    check('removing a heading given as a whole comment', out.ok === true, JSON.stringify(out));
+    check('  takes the heading line and nothing else', after === ORIGINAL.replace('\t/* Fonts */\n', ''), after);
+    check(
+      '  so every variable is still on the page',
+      sameVariables(baseline, asBrowserSeesIt(after)),
+      JSON.stringify([...asBrowserSeesIt(after)])
+    );
+  }
+  {
+    write();
+    const start = ORIGINAL.indexOf('/* Transitions */');
+    const out = moveHeading(dir, {
+      file: rel,
+      selector: ':root',
+      start,
+      end: start + '/* Transitions */'.length,
+      expect: '/* Transitions */',
+      before: '--font-body',
+    });
+    const after = read();
+    check('moving a heading given as a whole comment', out.ok === true, JSON.stringify(out));
+    check('  moves it', after.indexOf('/* Transitions */') < after.indexOf('--font-body'), after);
+    check(
+      '  and leaves every declaration where a browser can still read it',
+      sameVariables(baseline, asBrowserSeesIt(after)),
+      JSON.stringify([...asBrowserSeesIt(after)])
+    );
+  }
 
   fs.rmSync(dir, { recursive: true, force: true });
 }

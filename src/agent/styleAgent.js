@@ -158,16 +158,45 @@ async function ownStyleFiles() {
   return { files: css?.files || [], astroFiles: astro?.files || [] };
 }
 
+/**
+ * THE VIEWPORT THE ANSWER IS ABOUT.
+ *
+ * `computed` comes from the canvas, and the canvas is a page at a width. A
+ * media query that holds at that width is not a hypothetical — it IS what the
+ * element has, and the cascade has to be resolved there or the winner it names
+ * is contradicted by the computed value printed beside it.
+ *
+ * The app measures this already: PreviewPane reports `viewportWidth` /
+ * `viewportHeight` — the iframe's own client box — and they travel in the MCP
+ * payload as `page.viewportWidth`. Taken from whoever is calling if they have
+ * it, and off the style-panel host otherwise.
+ *
+ * Null when nobody measured one, and null is answered as null: a width guessed
+ * from the device name would be wrong for the two devices that FILL the pane
+ * ('canvas') or are dragged ('custom'), and a wrong viewport is a confidently
+ * wrong winner, which is the defect this exists to fix rather than move.
+ */
+function measuredViewport(given) {
+  // Either shape: the canvas report as PreviewPane publishes it
+  // (`viewportWidth`), or a plain `{width, height}`.
+  const from = given && typeof given === 'object' ? given : getHost();
+  const width = Number(from.viewportWidth ?? from.width);
+  if (!Number.isFinite(width) || width <= 0) return null;
+  const height = Number(from.viewportHeight ?? from.height);
+  return { width, height: Number.isFinite(height) && height > 0 ? height : null };
+}
+
 /** Everything the page's CSS is, parsed once. */
-async function readCascade(node) {
+async function readCascade(node, given) {
   const scan = await scanPage(await ownStyleFiles());
   const { docs, errors } = await loadEmbedDocs(scan.pageEmbeds);
   const rules = rebuildRules(docs);
   const asked = await askCanvasAbout(node.id, rules);
   const { target, rootSnapshot } = await resolveTarget(node, scan, asked);
   await primeDomMatches(target, rules, asked);
-  const model = await computeRuleModel(rules, target);
-  return { docs, rules, model, rootSnapshot, errors, asked };
+  const viewport = measuredViewport(given);
+  const model = await computeRuleModel(rules, target, { viewport });
+  return { docs, rules, model, rootSnapshot, errors, asked, viewport };
 }
 
 /** What the engine says the element's properties actually resolve to, and the
@@ -496,8 +525,8 @@ async function generatorNote() {
  * `explainsComputed` reconciles what came back against what the engine actually
  * resolved: a property nothing here can account for is named, not omitted.
  */
-export async function readStyles(node, { pathOf, properties = null } = {}) {
-  const { docs, model, rootSnapshot, errors, asked } = await readCascade(node);
+export async function readStyles(node, { pathOf, properties = null, viewport: measuredAt = null } = {}) {
+  const { docs, model, rootSnapshot, errors, asked, viewport } = await readCascade(node, measuredAt);
   const all = [...model.base, ...model.conditional];
   const matched = all.slice(0, MAX_RULES);
   const [reaching, renderedComponents] = await Promise.all([reachingFiles(), reachingComponents()]);
@@ -507,27 +536,57 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
     const rule = entry.rule;
     const declarations = rule.declarations.slice(0, MAX_DECLS_PER_RULE).map((decl) => {
       const status = entry.declStatus?.[decl.declId] || {};
-      // A conditional declaration (@media, :hover) was never resolved against
-      // anything: nothing here knows the viewport or where the pointer is. It
-      // used to be reported `winning: true` beside the base declaration that
-      // also said it won — one property, two winners, in one response.
+      // A conditional declaration nothing resolved (:hover, or an @media at an
+      // unknown viewport) was never measured against anything: nothing here
+      // knows where the pointer is. It used to be reported `winning: true`
+      // beside the base declaration that also said it won — one property, two
+      // winners, in one response.
       const resolved = status.resolved !== false;
+      // AND THE OTHER HALF OF THE SAME SENTENCE. A base declaration a media
+      // query overrides at the viewport being measured is not the winner
+      // either, and saying so contradicts the `computed` value in this same
+      // payload — measured, twice, on a page whose h3 was 56px while this said
+      // `font-size: var(--text-2xl)` (34px) won. When the query could be
+      // decided the cascade above has already settled it; when it could not,
+      // `winning` is null and the rules that make it undecidable are named.
+      const contested = resolved && status.winning !== false && status.contestedBy?.length ? status.contestedBy : null;
       return {
         property: decl.prop,
         value: clip(decl.value),
         important: !!decl.important,
-        winning: resolved ? status.winning !== false : null,
+        winning: resolved ? (contested ? null : status.winning !== false) : null,
         appliesWhen: resolved
           ? null
           : (rule.atContext || []).length
             ? rule.atContext
             : entry.matchedSelectors.map((sel) => sel.text),
+        // Only ever present when it is the reason `winning` is null.
+        ...(contested
+          ? {
+              contestedBy: contested.map((by) => ({
+                selector: by.selector,
+                atContext: by.atContext,
+                source: publicKey(by.source),
+                sourceLabel: by.sourceLabel,
+              })),
+              // Kept to one line: it repeats per contested declaration, and the
+              // evidence is `contestedBy` rather than the sentence.
+              undecided:
+                'This wins among the rules that could be resolved; `contestedBy` sets the same property under a ' +
+                'condition nothing here could decide. `computed` is what the element actually has.',
+            }
+          : {}),
         // The selector alone cannot name the winner: three stylesheets in this
         // project can declare `.pricing-grid`, and one of them may be a file
         // this page never loads.
         overriddenBy: status.overriddenByOrigin
           ? {
               selector: status.overriddenByOrigin.selector,
+              // The query the winner is under. Without it, a base declaration
+              // beaten by `@media (min-width: 50em) { .section-header h3 }`
+              // was told it lost to `.section-header h3` — itself, as far as
+              // anything reading the answer could tell.
+              atContext: status.overriddenByOrigin.atContext || [],
               source: publicKey(status.overriddenByOrigin.source),
               sourceLabel: status.overriddenByOrigin.sourceLabel,
             }
@@ -632,6 +691,12 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
       omittedByCap: Math.max(0, all.length - MAX_RULES),
     },
     matchedRuleCount: model.matchedRuleCount,
+    // WHICH PAGE THIS IS ABOUT. `winning` is a statement about a rendered box,
+    // and a box has a width: `@media (min-width: 50em)` is the winner at 1200
+    // and not at 375. So the answer says where it was resolved — and null,
+    // meaning nothing measured one, is why a declaration a media query might
+    // override carries `winning: null` rather than a guess.
+    viewport: viewport ? { width: viewport.width, height: viewport.height ?? null } : null,
     computed,
     // The rules the served document says match, generated CSS included. Null —
     // never [] — when there was no preview to ask: nobody looked is not the
