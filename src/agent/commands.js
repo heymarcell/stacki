@@ -578,13 +578,23 @@ export function createAgentCommands(getApp) {
     } catch (err) {
       // A command that throws must not look like a command that timed out.
       //
-      // And a cause with a name must not arrive as the generic one. The main
-      // process carries a branchable code on the Error as `refusalCode` and
-      // `runMain` reads it; the renderer's throws reach the wire through here
-      // instead, so this reads the same field. Anything that does not carry one
-      // is genuinely unclassified and still says so.
-      const named = typeof err?.refusalCode === 'string' && err.refusalCode ? err.refusalCode : null;
-      return fail(named || 'command_failed', String(err?.message || err));
+      // AND `command_failed` IS THE HONEST CODE HERE, not a gap where a named
+      // one should be. This used to read `err.refusalCode` — the field
+      // electron/main.js's `refuse()` puts on an Error so `runMain` can lift a
+      // known cause into the envelope — on the theory that the renderer's
+      // throws should be named the same way. Nothing under src/ sets it, and
+      // nothing can usefully: every cause this file knows the name of is
+      // already RETURNED as `fail(code, …)` a few lines up rather than thrown,
+      // so what reaches this catch is an exception nobody planned. And a named
+      // cause could not arrive from the other side either — main.js says it at
+      // `refuse()`: "Electron's IPC serializer carries only the message across
+      // a channel", which is why the Agent API reads `refusalCode` in the main
+      // process, off the direct call, and not out here.
+      //
+      // A read with no writer is worse than no read: it reports a mechanism
+      // that is not running, and in the jsdom harness — one process, no
+      // serializer — a test written for it would go green on the harness.
+      return fail('command_failed', String(err?.message || err));
     }
   };
 }

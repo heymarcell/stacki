@@ -1585,6 +1585,17 @@ function alignChildren(baseNodes, nextNodes) {
  * attribute block, the quotes, the hand-wrapped prose inside it. Copying its
  * own bytes is both smaller and more faithful, and it is the only way "move"
  * can mean that the moved bytes are the same bytes.
+ *
+ * Only a node whose reprint is NOT its source can say that out loud, and for a
+ * long time no fixture had one: a `<Hero />` and a multi-line `<Card>` both come
+ * back out of `serializePage` spelled exactly as the file spelled them, so a
+ * move that reprinted them passed every byte check. The one in
+ * test/source-fidelity-matrix.js is `<h4><Card /> Developer</h4>` -- a component
+ * and a word on one line, which the serializer writes as three.
+ *
+ * `sameMeaning` skips the as-written caches, so the twin is the first node that
+ * means the same and not necessarily the one that reads the same; where those
+ * differ inside a `<pre>` the readback in `anchoredSerialize` catches it.
  */
 function twinFinder(baseNodes) {
   let flat = null;
@@ -1617,6 +1628,13 @@ function printNode(node, indent, ctx) {
     // these bytes travel exactly as written. The block then sits at its old
     // inner indentation, which is cosmetic; the alternative was silent data
     // loss.
+    //
+    // Measured in test/source-fidelity-matrix.js (whitespaceThePageRenders),
+    // and by the whole file rather than by the bytes between the tags: without
+    // this the damaged copy is refused downstream and the write falls back to
+    // reprinting the DOCUMENT, which keeps a `<pre>` perfectly well and tears
+    // the frontmatter comments off the imports they annotate. Asking only about
+    // the `<pre>` is how this line came to be deletable with nine suites green.
     if (HOLDS_RENDERED_SPACE.test(held)) return held;
     const copied = reindentBlock(held, lineIndentOf(ctx.source, twin.start), indent);
     if (copied !== null) return copied;
@@ -1713,6 +1731,12 @@ function replaceNodeSplice(source, base, next, ctx) {
   // three-word edit. So the boundary bytes the file already has are left
   // exactly where they are and only the words between them are replaced --
   // which is the property the refusal was defending in the first place.
+  //
+  // What the refusal costs is a REPRINT OF THE PARENT, and that is what
+  // test/source-fidelity-matrix.js (wordsWithoutTheBoundaryBytes) measures: the
+  // fixture puts the text beside an `<h4><Card /> Developer</h4>` written on one
+  // line, the one shape here whose reprint is not its source. Without this
+  // branch a three-word edit re-spells the element beside it into three lines.
   const held = source.slice(start, end);
   if (base.kind === 'text' && next.kind === 'text') {
     const lead = /^\s*/.exec(held)[0];
@@ -2097,12 +2121,16 @@ function anchoredSerialize(source, model) {
   // their whitespace-significant runs have to be the same bytes; comparing
   // them rather than the file keeps the layout the splice preserved out of it.
   //
-  // Belt and braces: `printNode` already refuses to shift a block holding one
-  // of these, and that refusal is the only producer the suite can drive today
-  // -- removing it turns test/source-fidelity-matrix.js red, removing this
-  // does not. It is here for the next path that copies bytes, and it was
-  // measured on its own by taking the refusal out and watching this catch the
-  // same move.
+  // This is not belt and braces for `printNode`'s refusal, which is what it was
+  // called for a while: it catches a run that refusal cannot see. The
+  // refusal asks whether the bytes being copied hold a `<pre>`; it cannot ask
+  // whether they are the RIGHT `<pre>`'s bytes. `twinFinder` answers with the
+  // first node `sameMeaning` accepts, and `sameMeaning` skips the as-written
+  // caches on purpose -- so two `<pre>` blocks that collapse to the same words
+  // are the same node to it, and moving the second copies the first's bytes.
+  // That is the producer here, it is driven in test/source-fidelity-matrix.js
+  // (theTwinThatIsNotTheSameBytes), and taking these three lines out turns that
+  // suite red on its own.
   const asked = renderedWhitespace(canonical);
   if (asked.length) {
     const got = renderedWhitespace(serializePage(check.model));

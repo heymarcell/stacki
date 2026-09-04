@@ -26,9 +26,12 @@
 //   handler's own refusal shaping was never reached, so `{ok:false, code, …}`
 //   — the thing the whole surface is built on — did not exist for the 73
 //   operations that declare a required argument. Fixing that for the eight
-//   DOMAIN tools left five of the thirteen PUBLISHED ones still answering with
+//   DOMAIN tools left six of the fourteen PUBLISHED ones still answering with
 //   the raw sentence, `capture` and `comment` among them — so the sweep runs
-//   over tools/list rather than over the registry.
+//   over the published tools rather than over the registry, and over a wire
+//   held equal to what the product composes rather than over the rig's own
+//   idea of the surface. `audit` was the sixth, and it survived a sweep that
+//   claimed to cover every tool because the rig did not publish it.
 //
 //   And a declared OUTPUT schema that nothing validates is decoration. The
 //   audit tool shipped three fields its own schema rejected; a strict client
@@ -107,15 +110,75 @@ check('and exactly 111 operations', OPERATIONS.length === 111, String(OPERATIONS
 const actionOf = (branch) => branch?.properties?.action?.const ?? branch?.properties?.action?.enum?.[0] ?? null;
 const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [schema] : []);
 
+/**
+ * How many tools the PRODUCT publishes, counted by the product's own composer.
+ *
+ * The sweep below used to compare itself against `tools/list` on this wire,
+ * which meant "every tool this rig happens to publish" — and the rig only
+ * registers `audit` when the caller hands one over, which this suite did not.
+ * So the one tool the header is about was in neither the bad-argument sweep nor
+ * the output grading, and the guard that was supposed to notice could not: the
+ * numerator and the denominator were the same list.
+ *
+ * `registerTools` is the function electron/mcp/server.js calls to compose the
+ * surface, given here exactly what electron/mcp/index.js gives it — an api and
+ * an audit — and handed a server that records names and offers nothing else. A
+ * fifteenth tool registered anywhere it reaches is counted the day it lands,
+ * and a rig that then fails to publish it is caught rather than believed.
+ */
+function productToolNames() {
+  const names = [];
+  const recorder = {
+    registerTool: (name) => {
+      names.push(name);
+      return { name };
+    },
+    // Not the tool surface, but registerTools composes the whole endpoint and
+    // both are registered on the way past. Recorded rather than ignored so a
+    // resource that starts calling registerTool is not silently a tool.
+    registerResource: () => ({}),
+    registerPrompt: () => ({}),
+  };
+  require('../electron/mcp/tools.js').registerTools(recorder, {
+    getContext: async () => ({}),
+    capture: async () => ({}),
+    getComments: async () => ({}),
+    comment: async () => ({}),
+    api: { run: async () => ({}), capabilities: () => ({}), checkAccess: () => null },
+    audit: async () => ({}),
+  });
+  return names;
+}
+
 (async () => {
   // `visual` allows nothing, so the whole sweep below can call every operation
   // — including the ones that install packages, start servers and talk to
   // remotes — without any of them running.
-  const rig = await startWireRig({ era: 'modern', agentMode: 'visual' });
+  //
+  // WITH AN AUDIT, because the product ships with one. test/support/mcpWireRig.js
+  // says it at the option: "A rig that omits it serves a 13-tool surface nobody
+  // has, which is how the agent benchmark came to measure a server that does not
+  // exist." The stub never runs here — at `visual` the gate refuses `audit.run`
+  // before the handler, and a malformed call is refused before that — so what is
+  // measured is the tool's registration, which is the thing that was wrong.
+  const rig = await startWireRig({
+    era: 'modern',
+    agentMode: 'visual',
+    audit: async () => ({ ok: true, route: '/', findingCount: 0, returnedFindingCount: 0, findings: [] }),
+  });
   const problems = [];
   try {
     const listed = await rig.client.listTools();
     const tools = new Map(listed.tools.map((t) => [t.name, t]));
+
+    // ── this wire is the product's surface, not a subset of it ───────────────
+    const PRODUCT_TOOLS = productToolNames();
+    check('the product composes fourteen tools', PRODUCT_TOOLS.length === 14, PRODUCT_TOOLS.join(', '));
+    check(
+      'and this wire publishes exactly those, so the sweep below is over the real surface',
+      same(PRODUCT_TOOLS, listed.tools.map((t) => t.name)),
+      `product: ${PRODUCT_TOOLS.join(', ')}\n    wire: ${listed.tools.map((t) => t.name).join(', ')}`
+    );
 
     // ── the schema and the registry describe the same set ────────────────────
     const advertised = new Map();
@@ -287,10 +350,11 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
     // ── EVERY PUBLISHED TOOL, not only the eight domains ─────────────────────
     //
     // The sweep above is over the registry's 111 operations, which are reached
-    // through eight of the thirteen tools this server publishes. The other five
-    // — get_context, capture, get_comments, comment, get_capabilities — were
-    // never in it, and every one of them still answered a mistyped argument
-    // with the host's own sentence, no structuredContent, nothing to branch on:
+    // through eight of the fourteen tools this server publishes. The other six
+    // — get_context, capture, get_comments, comment, get_capabilities, audit —
+    // were never in it, and every one of them still answered a mistyped
+    // argument with the host's own sentence, no structuredContent, nothing to
+    // branch on:
     //
     //   capture {target: 12345}
     //     -> "Input validation error: Invalid arguments for tool capture:
@@ -299,8 +363,12 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
     // `capture` and `comment` are the two tools the `visual` level exists for,
     // so that was the first shape an agent at the lowest level could hit.
     //
-    // Driven off tools/list rather than off a list written here, so a
-    // fourteenth tool is covered the day it is published.
+    // `audit` is the one this suite could not see. It was fixed for five of the
+    // six and missed on the sixth, and the guard below said "every published
+    // tool" while driving a rig that published thirteen — the tool the header
+    // of this file is about was in neither the sweep nor the grading. Driving
+    // off tools/list is not enough on its own; what the wire lists is held
+    // against what the product composes, up at PRODUCT_TOOLS.
     {
       /** The action a top-level tool has none of, and a domain tool needs. */
       const openingFor = (tool) => {
@@ -331,7 +399,14 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
         check(`  ${tool.name}: as Stacki's own refusal, not a host sentence`, said?.ok === false && said?.code === 'bad_arguments', short(said?.code ?? res?.content?.[0]?.text));
         check(`  ${tool.name}: naming the field that is wrong`, (said?.issues || []).some((i) => Array.isArray(i.path) && i.path[0] === opening.field), short(said?.issues));
       }
-      check('the sweep covered every published tool', swept === listed.tools.length, `${swept} of ${listed.tools.length}: ${listed.tools.map((t) => t.name).join(', ')}`);
+      // Against the PRODUCT's count, not this wire's. The two are held equal a
+      // few dozen lines up; saying it again here is what stops a rig that
+      // quietly stops publishing something from taking the guard with it.
+      check(
+        'the sweep covered every published tool',
+        swept === PRODUCT_TOOLS.length && swept === listed.tools.length,
+        `${swept} of ${listed.tools.length} on the wire, ${PRODUCT_TOOLS.length} in the product: ${listed.tools.map((t) => t.name).join(', ')}`
+      );
 
       // AND THE SHIM DID NOT BUY IT BY LOOSENING THE SCHEMA. `advertised()`
       // publishes the real schema and makes the host's own validation a
@@ -376,6 +451,24 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
       const SUBSTITUTED = ['get_context', 'capture'];
       check('the two tools the rig substitutes are still published', SUBSTITUTED.every((n) => tools.has(n)), short([...tools.keys()]));
 
+      // AND THE FOURTEENTH IS GRADED LIKE THE REST, which is only possible
+      // because its schema was written to make it possible: `audit` is the one
+      // tool here with a strict payload schema, at `visual` every call it gets
+      // is a gate refusal, and AuditOutput DECLARES the four fields
+      // permissions.refusal() carries rather than stripping them. So the
+      // refusal an agent at the lowest level actually receives is inside the
+      // schema that tool published, and the loop below can say so. Asserted
+      // here, separately, because "it graded" and "it graded a refusal from the
+      // gate" are different facts and the loop only proves the first.
+      {
+        const res = await rig.client.callTool({ name: 'audit', arguments: {} });
+        const said = res?.structuredContent;
+        check('audit at visual is refused by the gate', said?.ok === false && said?.code === 'permission_denied', short(said));
+        check('  and the client is told it failed rather than being handed a wrong answer', res?.isError === true, short({ isError: res?.isError }));
+        const verdict = await verdictOf(tools.get('audit')?.outputSchema, said);
+        check('  and that refusal validates against the schema audit publishes', verdict.valid === true, `${verdict.errorMessage || ''}\n    ${short(said)}`);
+      }
+
       let graded = 0;
       for (const tool of listed.tools) {
         if (SUBSTITUTED.includes(tool.name)) continue;
@@ -387,7 +480,11 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
         graded += 1;
         check(`${tool.name} answers within its own declared output schema`, verdict.valid === true, `${verdict.errorMessage || ''}\n    ${short(res?.structuredContent)}`);
       }
-      check('every tool the wire can grade was graded', graded === listed.tools.length - SUBSTITUTED.length, `${graded} of ${listed.tools.length - SUBSTITUTED.length}`);
+      check(
+        'every tool the wire can grade was graded',
+        graded === PRODUCT_TOOLS.length - SUBSTITUTED.length,
+        `${graded} of ${PRODUCT_TOOLS.length - SUBSTITUTED.length}`
+      );
 
       // get_context, off the wire: the shipping store, fed the App's own
       // published payload, against the schema get_context publishes.
@@ -428,6 +525,13 @@ const branchesOf = (schema) => schema?.anyOf || schema?.oneOf || (schema ? [sche
   }
   console.log(`schema-dispatch-contract: ${checked} passed  [${OPERATIONS.length} operations: schema, registry, dispatch and the shape of every refusal]`);
 })().catch((err) => {
+  // WHAT HAD ALREADY FAILED, BEFORE WHATEVER THREW.
+  //
+  // A wire that stops publishing a tool fails the surface check at the top and
+  // then throws at the first call to the missing tool, and the stack for
+  // "Tool audit not found" says nothing about which claim this suite was making
+  // when it went. The checks that had already been made are printed first.
+  if (failures.length) console.error(`schema-dispatch-contract: ${failures.length} of ${checked} had already failed\n${failures.join('\n')}`);
   console.error('schema-dispatch-contract: threw\n', err?.stack || err);
   process.exit(1);
 });

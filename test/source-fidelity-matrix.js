@@ -225,6 +225,13 @@ function operations(f) {
     `${eol}${ind}${ind}title=${q}Deep${q}` +
     `${eol}${ind}${ind}body=${q}nested on purpose${q}` +
     `${eol}${ind}/>`;
+  // The `<h4>` holding a component and a word ON ONE LINE, where the file put
+  // it, and the same line raised to the body. `serializePage` has no rule for
+  // putting a component on an inline line, so a REPRINT of this element is
+  // three lines; only copying its own bytes keeps it one.
+  const pillLine = `<h4 class=${q}pill-row${q}><Card title=${q}Tiny${q} /> Developer</h4>`;
+  const pillRow = `${eol}${ind}${ind}${pillLine}`;
+  const pillRowRaised = `${eol}${ind}${pillLine}`;
   return [
     {
       name: 'set_prop on a component',
@@ -431,6 +438,31 @@ function operations(f) {
       },
     },
     {
+      // THE MOVED BYTES ARE THE SAME BYTES, and the two moves above cannot say
+      // so: a `<Hero />` and a multi-line `<Card>` both come back out of
+      // `serializePage` spelled exactly as the file spelled them, so a move
+      // that REPRINTED them would pass every check on them. Copying the twin's
+      // own bytes -- the mechanism the writer calls "the only way 'move' can
+      // mean that the moved bytes are the same bytes" -- was therefore
+      // deletable with all nine parser suites green.
+      //
+      // This element is the one shape in the fixture whose reprint is NOT its
+      // source: a component and a word on one line, which the serializer
+      // writes as three lines because a component is not an inline tag. Move
+      // it up a level and the bytes have to arrive as one line at the body's
+      // indent. Reprinted, they arrive as three.
+      name: 'move an element written on one line up a nesting level',
+      target: 'pillRow',
+      call: (ref, ctx) => ['move', { ref, to: { parentRef: ctx.pageRef, index: 5 } }],
+      mark: `${pillRowRaised}${eol}${ind}<footer>`,
+      back: (after, before) => {
+        const cut = removeOnce(after, pillRowRaised);
+        if (cut === null) return null;
+        const at = before.indexOf(pillRow);
+        return at === -1 ? null : cut.slice(0, at) + pillRow + cut.slice(at);
+      },
+    },
+    {
       // The blank line the author left above it goes with it. Left behind, it
       // attaches to the <footer> and the readback no longer agrees with the
       // model -- and the fallback is the whole-document reprint this suite
@@ -507,10 +539,11 @@ async function runFixture(f) {
       if (which === 'footer') return byTag('footer')?.ref ?? null;
       if (which === 'fine') return byTag('p')?.ref ?? null;
       if (which === 'wideCard') return byTag('Card')?.ref ?? null;
-      if (which === 'inlineCard' || which === 'deepCard') {
+      if (which === 'inlineCard' || which === 'deepCard' || which === 'pillRow') {
         const section = byTag('section');
         if (!section?.ref) return null;
         const kids = (await run('target', 'read', { ref: section.ref })).target?.children || [];
+        if (which === 'pillRow') return kids.find((c) => c.tag === 'h4')?.ref ?? null;
         const cards = kids.filter((c) => c.tag === 'Card');
         return (which === 'inlineCard' ? cards[0] : cards[1])?.ref ?? null;
       }
@@ -748,29 +781,78 @@ function fileStartCut() {
   );
 }
 
+// --- THE SPACES AFTER THE NODE, WHICH ARE ON ITS LINE TOO -------------------
+//
+// `cutNodeSplice` takes the line break in front of the node and the run of
+// spaces or tabs BEHIND it, up to the break. Every fixture above is written
+// with no trailing whitespace anywhere, so the second half of that was
+// deletable with the suite green -- and an editor that leaves a space at the
+// end of a line is the ordinary case, not the odd one. Left behind, those bytes
+// land on the parent's own line (`<Base>  `), which is a change to a line the
+// call never named.
+
+function trailingSpacesOnTheLineItLeaves() {
+  const source = commentedPage("  <p class='a'>one</p>  \n  <p class='b'>two</p>\n");
+  const parsed = parsePage(source);
+  if (!check('a page with a trailing space after a node parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const gone = root.children.find((n) => n.props?.class?.value === 'a');
+  if (!check('  and the node with the trailing space is reachable', !!gone, short(root.children?.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== gone);
+  const after = anchoredSerialize(source, model);
+  if (!check('removing it removes it', !/class='a'/.test(after), short(changedSpan(source, after)))) return;
+  check(
+    '  and the spaces that were on its line go with it, rather than onto its parent',
+    after === commentedPage("  <p class='b'>two</p>\n"),
+    short({ span: changedSpan(commentedPage("  <p class='b'>two</p>\n"), after) })
+  );
+}
+
 // --- WHITESPACE THE BROWSER RENDERS ------------------------------------------
 //
-// Inside a <pre> or a <textarea> the leading spaces on each line are content.
-// Nothing else in this suite can see them: `parsePage` collapses the run into
-// value:'alpha beta gamma' and keeps the real bytes in `source`, which is an
-// as-written field the write path's readback gate skips -- so a cross-level
-// move deleted two spaces the page shows and every tree comparison agreed the
-// file still meant the same thing. The oracle here is the bytes between the
-// tags.
+// Inside a <pre> or a <textarea> the leading spaces on each line are content,
+// and inside a <script> or a <style> they can be the inside of a template
+// literal. Nothing else in this suite can see them: `parsePage` collapses the
+// run into value:'alpha beta gamma' and keeps the real bytes in `source`, which
+// is an as-written field the write path's readback gate skips -- so a
+// cross-level move deleted two spaces the page shows and every tree comparison
+// agreed the file still meant the same thing.
+//
+// THE ORACLE IS THE WHOLE FILE, not the bytes between the tags, and that is the
+// whole point of the frontmatter below. The writer defends this in two places
+// -- `printNode` refuses to shift a block holding one of these, and
+// `anchoredSerialize` reads the rendered runs back off both texts -- and taking
+// EITHER of them out leaves the content intact, because the refusal that
+// follows falls back to reprinting the document and a reprint keeps a <pre>
+// perfectly well. An earlier version of this asked only about the bytes between
+// the tags plus the untouched <footer>'s quotes, and a reprint satisfies both:
+// both mechanisms were deletable with this green. What a reprint does NOT
+// survive is a frontmatter comment sitting on the import it annotates, which is
+// the defect the whole suite was written for -- so the page carries two, and
+// the verdict is the file, byte for byte.
+
+/** The two-import frontmatter whose comments a reprint moves, and a body. */
+const commentedPage = (body) =>
+  `---\n// Layout import - the shell every page shares\nimport Base from '../layouts/Base.astro';\n` +
+  `// Component imports\nimport Card from '../components/Card.astro';\n---\n<Base>\n${body}</Base>\n`;
+
+// The four tags whose inner whitespace is content, and a body for each that
+// shows it: two leading spaces on the second line, in a page indented in two
+// spaces, so a shift out of one level slices exactly that prefix off.
+const RENDERED_SPACE_BODIES = {
+  pre: 'alpha\n  beta\ngamma',
+  textarea: 'alpha\n  beta\ngamma',
+  script: '\nconst t = `alpha\n  beta\ngamma`;\n',
+  style: '\n.a {\n  color: red;\n}\n',
+};
 
 function whitespaceThePageRenders() {
-  for (const tag of ['pre', 'textarea']) {
-    // TWO SPACES ON THE SECOND LINE, in a page indented in two spaces: a shift
-    // out of one level slices exactly that prefix off every line in the block,
-    // and those two are content. The <footer> nobody touches keeps the
-    // author's single quotes only if the write was a SPLICE -- a fall back to
-    // reprinting the document also preserves the <pre>, so without it
-    // "refused and reprinted the whole page" would read as success.
-    const body = 'alpha\n  beta\ngamma';
-    const source =
-      `---\nimport Base from '../layouts/Base.astro';\n---\n<Base>\n` +
+  for (const [tag, body] of Object.entries(RENDERED_SPACE_BODIES)) {
+    const inner =
       `  <div class='wrap'>\n    <${tag}>${body}</${tag}>\n  </div>\n` +
-      `  <footer class='end'>end</footer>\n</Base>\n`;
+      `  <footer class='end'>end</footer>\n`;
+    const source = commentedPage(inner);
     const parsed = parsePage(source);
     if (!check(`a page with a <${tag}> parses`, parsed.editable === true, short(parsed.reason))) continue;
     const model = structuredClone(parsed.model);
@@ -781,8 +863,8 @@ function whitespaceThePageRenders() {
     div.children = div.children.filter((n) => n !== node);
     root.children.splice(root.children.indexOf(div) + 1, 0, node);
     const after = anchoredSerialize(source, model);
-    // POSITIVE CONTROL: it really left the <div>, so "the content survived"
-    // cannot be satisfied by a write that did nothing at all.
+    // POSITIVE CONTROL: it really left the <div>, so nothing below can be
+    // satisfied by a write that did nothing at all.
     if (
       !check(
         `moving a <${tag}> out of its <div> moves it`,
@@ -792,6 +874,17 @@ function whitespaceThePageRenders() {
     ) {
       continue;
     }
+    const want = commentedPage(
+      `  <div class='wrap'></div>\n  <${tag}>${body}</${tag}>\n  <footer class='end'>end</footer>\n`
+    );
+    check(
+      `  and the file is the file it was, with the <${tag}> at the body's indent and NOTHING else moved`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+    // Said again as the property it is defending, so a failure above names
+    // which half went: the bytes the page shows, and the comment a reprint
+    // would hoist off its import.
     const held = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(after);
     check(
       `  and every space the browser renders inside it is still there`,
@@ -800,10 +893,130 @@ function whitespaceThePageRenders() {
     );
     check(
       `  and the page was spliced to do it, not reprinted`,
-      after.includes(`<footer class='end'>end</footer>`),
+      /\/\/ Component imports\nimport Card/.test(after),
       short({ span: changedSpan(source, after) })
     );
   }
+}
+
+// --- THE TWIN THAT MEANS THE SAME AND IS NOT THE SAME BYTES ------------------
+//
+// `twinFinder` answers "the base node whose bytes ARE this node's" with the
+// FIRST node in the file that `sameMeaning` accepts -- and `sameMeaning`
+// deliberately skips the as-written caches, so two <pre> blocks whose collapsed
+// value is the same string mean the same thing while their bytes do not.
+// Moving the second one copies the first one's bytes, and the page loses a line
+// break and two spaces it renders.
+//
+// This is the producer for `anchoredSerialize`'s rendered-whitespace readback,
+// which was otherwise unreachable: with `printNode`'s refusal in place the twin
+// copy never damages a run, so the gate was reached 4 times in this suite and
+// fired 0, and deleting it changed nothing anyone could measure. Here it fires,
+// the write falls back, and the file the author gets is the one they wrote.
+
+function theTwinThatIsNotTheSameBytes() {
+  const source = commentedPage(
+    `  <div class='wrap'>\n    <pre>alpha beta</pre>\n    <pre>alpha\n  beta</pre>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check('a page with two <pre> blocks that collapse to the same words parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const div = root.children.find((n) => n.name === 'div');
+  const pres = (div?.children || []).filter((n) => n.name === 'pre');
+  if (!check('  and both are where a move can reach them', pres.length === 2, short(div?.children?.map((n) => n.name)))) return;
+  // The two nodes are the same MEANING -- that is the premise, and if the
+  // parser ever stops collapsing them this fixture stops being the fixture.
+  if (
+    !check(
+      '  and the second one holds bytes the first one does not',
+      pres[0].children?.[0]?.value === pres[1].children?.[0]?.value &&
+        pres[1].children?.[0]?.source === 'alpha\n  beta',
+      short({ a: pres[0].children?.[0], b: pres[1].children?.[0] })
+    )
+  ) {
+    return;
+  }
+  div.children = div.children.filter((n) => n !== pres[1]);
+  root.children.splice(root.children.indexOf(div) + 1, 0, pres[1]);
+  const after = anchoredSerialize(source, model);
+  if (
+    !check(
+      'moving the second <pre> out of its <div> moves it',
+      /<pre>alpha beta<\/pre>\n  <\/div>/.test(after),
+      short(changedSpan(source, after))
+    )
+  ) {
+    return;
+  }
+  const held = /<pre>([\s\S]*?)<\/pre>[\s\S]*<pre>([\s\S]*?)<\/pre>/.exec(after);
+  check(
+    '  and the one that moved keeps ITS bytes, not the bytes of the one that means the same',
+    !!held && held[2] === 'alpha\n  beta',
+    short({ want: 'alpha\n  beta', got: held ? held[2] : null, span: changedSpan(source, after) })
+  );
+  check(
+    '  and the one that stayed is untouched',
+    !!held && held[1] === 'alpha beta',
+    short({ got: held ? held[1] : null })
+  );
+}
+
+// --- A TEXT NODE'S SPAN IS NOT ITS WORDS -------------------------------------
+//
+// The span starts where the previous node ended, so it carries the line break
+// and the indent between them, and `serializeNode` strips a text run's boundary
+// spaces on the assumption that those breaks already ARE that whitespace.
+// Replacing the wide span with the narrow text deleted a space the page renders
+// (`<label>Name: <input /></label>` came back as `<label>Name:<input />`), so
+// `replaceNodeSplice` leaves the boundary bytes where they are and replaces
+// only the words between them.
+//
+// Take that branch out and the fall-through refuses the text splice, which is
+// SAFE -- the words are right and the space survives -- and costs the parent
+// element a reprint. Every fixture above holds its text in an element the
+// serializer spells exactly as the file does, so the reprint was invisible and
+// the branch was deletable with nine parser suites green. The sibling here is
+// the one shape whose reprint is not its source: a component and a word on one
+// line. A three-word edit that re-spells the element beside it is the defect
+// this whole suite exists to catch, and now it is a byte away.
+
+function wordsWithoutTheBoundaryBytes() {
+  const pill = `  <h4 class='pill-row'><Card title='Tiny' /> Developer</h4>\n`;
+  const inner = `  <div class='wrap'>\n    intro words here\n${`  ${pill}`}  </div>\n  <footer class='end'>end</footer>\n`;
+  const source = commentedPage(inner);
+  const parsed = parsePage(source);
+  if (!check('a page whose text sits beside a one-line component run parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const div = model.nodes[0].children.find((n) => n.name === 'div');
+  const text = div?.children?.find((n) => n.kind === 'text');
+  if (!check('  and the text node is where an edit can reach it', !!text, short(div?.children?.map((n) => n.kind)))) return;
+  // What `target.set_text` hands the writer: a new value and no as-written
+  // cache, because the cache describes bytes that no longer say this.
+  text.value = text.value.replace('here', 'THERE');
+  delete text.source;
+  delete text.raw;
+  const after = anchoredSerialize(source, model);
+  if (
+    !check(
+      'setting the text really changes it',
+      after.includes('intro words THERE'),
+      short(changedSpan(source, after))
+    )
+  ) {
+    return;
+  }
+  check(
+    '  and the three words are the only bytes that moved',
+    after === source.replace('intro words here', 'intro words THERE'),
+    short({ span: changedSpan(source.replace('intro words here', 'intro words THERE'), after) })
+  );
+  check(
+    '  so the <h4> beside it, which the call never named, is still on one line',
+    after.includes(`<h4 class='pill-row'><Card title='Tiny' /> Developer</h4>`),
+    short({ span: changedSpan(source, after) })
+  );
 }
 
 // --- THE NESTING STEP, READ OFF THE TREE -------------------------------------
@@ -1135,6 +1348,9 @@ function overlappingSplices() {
   importInsert();
   fileStartCut();
   whitespaceThePageRenders();
+  trailingSpacesOnTheLineItLeaves();
+  theTwinThatIsNotTheSameBytes();
+  wordsWithoutTheBoundaryBytes();
   stepFromTheTree();
   tabsAgainstSpaces();
   trailingImportComment();

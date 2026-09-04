@@ -42,7 +42,25 @@ const { NAMES: VIEWPORT_NAMES, MAX_VIEWPORTS } = require('./viewports');
 // Code does -- recorded a refused audit as a call that worked. At the default
 // permission level `audit` is ALWAYS refused, so this was the common case rather
 // than the edge one.
-const { answer } = require('./agentTools');
+//
+// AND ONE ARGUMENT CHECK, FOR THE SAME REASON.
+//
+// The SDK validates `tools/call` arguments against a tool's input schema BEFORE
+// the handler runs, and a failure there is a protocol error: `isError`, one
+// English sentence, no structuredContent, nothing to branch on. Every other
+// tool in this surface was moved off that shape -- the eight domains through
+// `domain()`, the five non-domain ones through the facade in tools.js -- and
+// this one, registered from its own file straight onto the server, was missed.
+// So `audit {viewports: "phone"}`, the single likeliest mistake given that the
+// schema publishes viewport NAMES, came back as
+//
+//   "Input validation error: Invalid arguments for tool audit:
+//    viewports: Invalid input: expected array, received string"
+//
+// while the byte-identical mistake on any other tool came back as
+// `{ok:false, code:'bad_arguments', issues:[…]}`. `publishChecked` is the same
+// door the other thirteen go through, not a second one that resembles it.
+const { answer, publishChecked } = require('./agentTools');
 
 // The permission subject. Named like a registry operation so that a reader
 // grepping for what needs `inspect` finds it in the same shape as the rest.
@@ -249,6 +267,61 @@ const AuditOutput = z.object({
   limits: z.string().optional(),
 });
 
+// THE SHAPE OF A CALL, as its own const so the same zod object is both what
+// the tool publishes and what the handler checks -- a second copy of it is how
+// a published schema and an enforced one drift apart.
+const AuditInput = z.object({
+  route: z
+    .string()
+    .optional()
+    .describe(
+      'Route to audit, e.g. "/" or "/about". Defaults to the site root — NOT to the page Stacki has open; ' +
+        'call get_context first if you mean the page the person is looking at. Must resolve inside this project.'
+    ),
+  viewports: z
+    // z.string(), not z.enum(VIEWPORT_NAMES): an enum is refused by the SDK
+    // with "viewports.0: Invalid input", which does not say what the valid
+    // ones are. A plain string reaches resolveViewports(), which answers
+    // with the list. The COUNT stays in the schema, where a refusal needs
+    // no context to be useful.
+    .array(z.union([z.string(), z.object({ width: z.number().int(), height: z.number().int() })]))
+    .max(MAX_VIEWPORTS)
+    .optional()
+    .describe(
+      `Up to ${MAX_VIEWPORTS} viewports, by name (${VIEWPORT_NAMES.join(', ')}) or as {width,height}. ` +
+        'Defaults to phone, tablet and desktop. Each one is a real page load. `reflow` is 320px, the width ' +
+        'WCAG 2.2 SC 1.4.10 names — overflow found there names that criterion in `relatedStandard`, but stays a ' +
+        'MEASUREMENT: the criterion exempts content needing a two-dimensional layout, and geometry cannot tell an ' +
+        'exempt data table from a layout that failed to reflow.'
+    ),
+  rules: z
+    .array(z.string())
+    .max(40)
+    .optional()
+    .describe(
+      'Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix. ' +
+        'This scopes the ACCESSIBILITY engine and only that: the geometry probe is not a rule in this list ' +
+        'and always runs. A rule id the engine does not have comes back in `engine.unknownRules` rather ' +
+        'than being accepted in silence. An EMPTY list means no accessibility pass at all — no engine, no ' +
+        'run, `engine.accessibility: null` — which is how you get geometry and a picture without paying ' +
+        'for a full WCAG run.'
+    ),
+  capture: z
+    .boolean()
+    .optional()
+    .describe(
+      'Return a screenshot per viewport, taken in the same state the findings were measured in. Off by ' +
+        'default: findings are the useful part. The picture arrives as an IMAGE BLOCK in the response, not ' +
+        'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about — including ' +
+        'the ones no picture came back for — where `included` says whether an image was actually sent and ' +
+        '`omittedBecause` says why not when it was not. Each picture is the page rendered ' +
+        'OFFSCREEN at the width you asked for, as a visitor sees it — not the Stacki UI and not the ' +
+        'breakpoint the person has open. This, with viewports:[{width,height}] and rules:[], is how to see ' +
+        'a route at a width of your own choosing; the `capture` tool cannot change the person\'s breakpoint ' +
+        'and will not resize their window.'
+    ),
+});
+
 const DESCRIPTION = [
   'Render the real page in a real browser at real viewport widths and MEASURE it. Returns structured findings:',
   'page-level horizontal overflow from geometry, and accessibility violations from axe-core, each with the',
@@ -280,62 +353,13 @@ const DESCRIPTION = [
 function registerAuditTool(server, { audit, api }) {
   if (!audit || !api) return false;
 
-  server.registerTool(
+  publishChecked(
+    server,
     'audit',
     {
       title: 'Measure the running page',
       description: DESCRIPTION,
-      inputSchema: z.object({
-        route: z
-          .string()
-          .optional()
-          .describe(
-            'Route to audit, e.g. "/" or "/about". Defaults to the site root — NOT to the page Stacki has open; ' +
-              'call get_context first if you mean the page the person is looking at. Must resolve inside this project.'
-          ),
-        viewports: z
-          // z.string(), not z.enum(VIEWPORT_NAMES): an enum is refused by the SDK
-          // with "viewports.0: Invalid input", which does not say what the valid
-          // ones are. A plain string reaches resolveViewports(), which answers
-          // with the list. The COUNT stays in the schema, where a refusal needs
-          // no context to be useful.
-          .array(z.union([z.string(), z.object({ width: z.number().int(), height: z.number().int() })]))
-          .max(MAX_VIEWPORTS)
-          .optional()
-          .describe(
-            `Up to ${MAX_VIEWPORTS} viewports, by name (${VIEWPORT_NAMES.join(', ')}) or as {width,height}. ` +
-              'Defaults to phone, tablet and desktop. Each one is a real page load. `reflow` is 320px, the width ' +
-              'WCAG 2.2 SC 1.4.10 names — overflow found there names that criterion in `relatedStandard`, but stays a ' +
-              'MEASUREMENT: the criterion exempts content needing a two-dimensional layout, and geometry cannot tell an ' +
-              'exempt data table from a layout that failed to reflow.'
-          ),
-        rules: z
-          .array(z.string())
-          .max(40)
-          .optional()
-          .describe(
-            'Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix. ' +
-              'This scopes the ACCESSIBILITY engine and only that: the geometry probe is not a rule in this list ' +
-              'and always runs. A rule id the engine does not have comes back in `engine.unknownRules` rather ' +
-              'than being accepted in silence. An EMPTY list means no accessibility pass at all — no engine, no ' +
-              'run, `engine.accessibility: null` — which is how you get geometry and a picture without paying ' +
-              'for a full WCAG run.'
-          ),
-        capture: z
-          .boolean()
-          .optional()
-          .describe(
-            'Return a screenshot per viewport, taken in the same state the findings were measured in. Off by ' +
-              'default: findings are the useful part. The picture arrives as an IMAGE BLOCK in the response, not ' +
-              'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about — including ' +
-              'the ones no picture came back for — where `included` says whether an image was actually sent and ' +
-              '`omittedBecause` says why not when it was not. Each picture is the page rendered ' +
-              'OFFSCREEN at the width you asked for, as a visitor sees it — not the Stacki UI and not the ' +
-              'breakpoint the person has open. This, with viewports:[{width,height}] and rules:[], is how to see ' +
-              'a route at a width of your own choosing; the `capture` tool cannot change the person\'s breakpoint ' +
-              'and will not resize their window.'
-          ),
-      }),
+      inputSchema: AuditInput,
       outputSchema: AuditOutput,
       // ANNOTATIONS, MEASURED AGAINST WHAT THE SPEC ACTUALLY SAYS.
       //
@@ -375,6 +399,11 @@ function registerAuditTool(server, { audit, api }) {
         openWorldHint: true,
       },
     },
+    // `args` is `AuditInput`'s own parse RESULT, not what arrived: the check
+    // that used to be the host's is made by `publishChecked` a moment earlier,
+    // with this same schema, so a mistyped argument is refused as
+    // `bad_arguments` before the gate is asked and the engine never sees a
+    // shape it did not declare.
     async (args = {}) => {
       // THE SAME DOOR. See the note at the top of this file.
       const denied = api.checkAccess(AUDIT_OPERATION, AUDIT_RISK);
@@ -395,4 +424,4 @@ function registerAuditTool(server, { audit, api }) {
   return true;
 }
 
-module.exports = { registerAuditTool, AUDIT_OPERATION, AUDIT_RISK, AuditOutput, DESCRIPTION };
+module.exports = { registerAuditTool, AUDIT_OPERATION, AUDIT_RISK, AuditInput, AuditOutput, DESCRIPTION };

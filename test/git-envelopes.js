@@ -107,7 +107,8 @@ case "$1" in
       echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2
       exit 4
     fi
-    echo "GraphQL: Name already exists on this account (createRepository)" >&2
+    echo "GraphQL: Name $3 already exists on this account (createRepository)" >&2
+    echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2
     exit 1 ;;
 esac
 echo "fake gh: refusing unexpected command: $*" >&2
@@ -307,7 +308,14 @@ exit 64
         check('  as a sign-in problem, not a generic failure', env.code === 'gh_auth_required', short({ code: env.code, message: env.message }));
         check('  and it really did ask gh about authentication', calls().some((c) => c.startsWith('auth status')), short(calls()));
         check('  the message does not echo the command line', !/^Command failed:/.test(String(env.message)), short(env.message));
-        check('  nor the environment variable gh names in its stderr', !String(env.message).includes('GH_TOKEN'), short(env.message));
+        // ABOUT A CONSTANT, AND SAID SO. This branch never reaches
+        // `ghComplaint`: main.js answers `gh_auth_required` with a sentence it
+        // wrote itself, so what this proves is that the sentence somebody may
+        // rewrite tomorrow still names no environment variable. The SCRUBBER is
+        // proved on the authed branch below, where gh's own stderr goes through
+        // it — this check passes with the scrubber deleted and is not evidence
+        // about it.
+        check('  and the sentence Stacki wrote itself names no environment variable', !String(env.message).includes('GH_TOKEN'), short(env.message));
       });
 
       await withFakeGh('authed', async (calls) => {
@@ -316,7 +324,22 @@ exit 64
         check('  with its own code, not the same one as being signed out', env.code === 'publish_failed', short({ code: env.code, message: env.message }));
         check('  saying what GitHub said', /already exists/.test(String(env.message)), short(env.message));
         check('  without the command line', !/^Command failed:/.test(String(env.message)) && !String(env.message).includes('--remote'), short(env.message));
+        // THE TWO SCRUBBERS, ON STDERR THAT ACTUALLY CARRIES WHAT THEY REMOVE.
+        //
+        // These two checks used to be made against a fake gh whose stderr was
+        // `GraphQL: Name already exists on this account (createRepository)` —
+        // no repository name in it and no GH_TOKEN line — so both passed with
+        // `ghComplaint`'s filter and its `split(repoName).join('that name')`
+        // deleted outright. Real gh puts the name it was given in the GraphQL
+        // error and volunteers the GH_TOKEN hint underneath, so the fake now
+        // says both, and each check has a POSITIVE half beside it: what the
+        // scrubber left behind, not only what it took away. A `ghComplaint`
+        // that returned nothing at all would pass every negative here and fail
+        // both positives.
         check('  without the repository name Stacki was told to use', !String(env.message).includes('stacki-envelopes-never-created'), short(env.message));
+        check('  which was really in what gh said, and came back as "that name"', String(env.message).includes('that name'), short(env.message));
+        check('  nor the environment variable gh volunteered underneath', !String(env.message).includes('GH_TOKEN'), short(env.message));
+        check('  while the line that says why it failed survived that filter', /Name that name already exists on this account/.test(String(env.message)), short(env.message));
         check('  and gh was really the thing that failed', calls().some((c) => c.startsWith('repo create')), short(calls()));
       });
 

@@ -889,6 +889,18 @@ function advertised(schema) {
       // moment later; validating twice would only mean the host's copy won.
       validate: (value) => ({ value }),
     },
+    // AND THE REAL CHECK, STILL REACHABLE BY NAME.
+    //
+    // The SDK only ever looks at `~standard`, but this object is also what a
+    // caller reading a registration back is handed, and the one thing such a
+    // caller wants to ask is "would the tool accept this?" — test/contract-wording.js
+    // puts the sentences a guide tells an agent to send to the schema itself
+    // rather than to a reading of it. Delegated to the real schema, so the
+    // answer is the one the handler will give, not a second implementation of
+    // it; a shim that quietly answered "yes" to everything here would turn that
+    // suite green by making its question meaningless.
+    safeParse: (value) => schema.safeParse(value),
+    parse: (value) => schema.parse(value),
   };
 }
 
