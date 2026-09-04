@@ -11,9 +11,14 @@
 //
 // So this asks the same question for ALL of them, across files written the
 // several ordinary ways: tabs, two spaces, four spaces, CRLF, single quotes,
-// double quotes, comments between the imports, a `.map()` over repeated
-// content, an inline component child, a multi-line attribute block, Astro
-// expressions, nested components.
+// double quotes, comments between the imports — with a blank line and, in the
+// fifth fixture, without one — a `.map()` over repeated content, an inline
+// component child, an element holding nothing but text, a multi-line attribute
+// block, Astro expressions, nested components.
+//
+// And once for the operation whose bytes travel: `move` measured OUT AND BACK,
+// because a move is the one edit that can quietly change the two elements it
+// was not aimed at, and only the return trip asks about those.
 //
 // THE ORACLE IS BYTES. For each operation the intended delta is named exactly
 // — the attribute, the line, the moved node — taken back out of the result,
@@ -91,23 +96,37 @@ const indentsIn = (text) =>
 
 // --- the fixtures ------------------------------------------------------------
 //
-// One page, written four ways. The shapes are the ones a re-serialization is
+// One page, written five ways. The shapes are the ones a re-serialization is
 // known to destroy, and every one of them is ordinary: the comments sit above
 // the imports they annotate rather than in a block of their own, the
 // attributes are quoted the way the author quoted them, the Card's attributes
 // are spread over three lines on purpose, and the pricing grid is a `.map()`
 // rather than repeated markup.
+//
+// `tight` is the fifth: THE SAME COMMENTS WITH NO BLANK LINE AROUND THEM, and
+// a named import in front of the block. That is how the dogfood's page was
+// written, and the difference is not cosmetic -- with a blank line above it a
+// comment is its own paragraph and a reprint that hoists it below the imports
+// is merely ugly; with none, the comment is visibly torn off the statement it
+// annotates. Four fixtures all carried the blank lines, so the suite was
+// green while a real page came back with three comments stacked under the
+// import block. A gap in the fixtures is a defect in the suite.
 
-function makeSource({ ind, eol, q }) {
+function makeSource({ ind, eol, q, tight }) {
   const lines = [
     '---',
+    // A NAMED import first, which nothing else here has: `parsePage` collects
+    // default and named specifiers in two passes and sorts them back together,
+    // so which kind stands first decides which span an added import lands
+    // after.
+    ...(tight ? ["import { getCollection } from 'astro:content';"] : []),
     '// Layout import - the shell every page shares',
     "import Base from '../layouts/Base.astro';",
-    '',
+    ...(tight ? [] : ['']),
     '// Component imports',
     "import Hero from '../components/Hero.astro';",
     "import Card from '../components/Card.astro';",
-    '',
+    ...(tight ? [] : ['']),
     '// Page data',
     "import site from '../data/site.json';",
     '',
@@ -133,6 +152,15 @@ function makeSource({ ind, eol, q }) {
     `${ind}${ind}${ind}title=${q}Deep${q}`,
     `${ind}${ind}${ind}body=${q}nested on purpose${q}`,
     `${ind}${ind}/>`,
+    // A COMPONENT AND A WORD ON ONE LINE. `isInlineRun` says no -- a component
+    // is not an inline tag -- so `serializePage` prints this as three lines,
+    // and reading THAT back gives the word a trailing space the one-line
+    // spelling does not have. Nothing here edits it; it is the untouched
+    // bystander whose reparse used to differ from the reparse of the reprint,
+    // which is how a readback gate came to reject a correct splice over an
+    // element the call never named. The dogfood's page had one of these
+    // (`<Pill><Icon … /> Developer</Pill>`) and none of these fixtures did.
+    `${ind}${ind}<h4 class=${q}pill-row${q}><Card title=${q}Tiny${q} /> Developer</h4>`,
     `${ind}</section>`,
     `${ind}<Card`,
     `${ind}${ind}title=${q}Wide${q}`,
@@ -160,6 +188,7 @@ const FIXTURES = [
   { id: 'two-space', ind: '  ', eol: '\n', q: '"' },
   { id: 'four-space', ind: '    ', eol: '\n', q: "'" },
   { id: 'crlf', ind: '  ', eol: '\r\n', q: "'" },
+  { id: 'tight-comments', ind: '\t', eol: '\n', q: "'", tight: true },
 ].map((f) => ({ ...f, source: makeSource(f) }));
 
 // --- the operations ----------------------------------------------------------
@@ -267,6 +296,37 @@ function operations(f) {
       call: (ref) => ['append_child', { ref, node: IMG }],
       mark: `${eol}${ind}${ind}${IMG_TEXT}${eol}${ind}</section>`,
       back: (after) => removeOnce(after, `${eol}${ind}${ind}${IMG_TEXT}`),
+    },
+    {
+      // AN ELEMENT HOLDING NOTHING BUT TEXT, which is what `<h3>Heading</h3>`
+      // was on the dogfood's page. One text node is an inline run, so the
+      // element is written on one line; an <img> is not an inline tag, so the
+      // run has to become a block and the text moves onto a line of its own.
+      // Read back, the newline and indent on either side of that text are a
+      // rendered space, so the node's value is now ' Made carefully. ' where
+      // the model still says 'Made carefully.' -- and the write path REFUSED
+      // ITS OWN CORRECT SPLICE over it and reprinted the whole document, in
+      // two spaces, with every quote changed and every frontmatter comment
+      // torn off its import. Nothing else here reaches that: <footer> holds an
+      // element, the inline Card holds a <strong>, and every other target is
+      // already a block.
+      //
+      // The delta is the whole reshape of this one element, named exactly, so
+      // the reprint cannot hide inside it.
+      name: 'append_child into an element holding only text',
+      target: 'fine',
+      call: (ref) => ['append_child', { ref, node: IMG }],
+      mark: `${eol}${ind}${ind}${IMG_TEXT}${eol}${ind}</p>`,
+      forward: (before) =>
+        removeOnce(before, `${ind}<p class=${q}fine-print${q}>Made carefully.</p>`) === null
+          ? null
+          : before.replace(
+              `${ind}<p class=${q}fine-print${q}>Made carefully.</p>`,
+              `${ind}<p class=${q}fine-print${q}>${eol}` +
+                `${ind}${ind}Made carefully.${eol}` +
+                `${ind}${ind}${IMG_TEXT}${eol}` +
+                `${ind}</p>`
+            ),
     },
     {
       // <footer> holds one <small>, which this serializer writes on a single
@@ -605,6 +665,60 @@ function importInsert() {
       /\/\/ Component imports\r?\nimport Hero/.test(after) && /\/\/ Page data\r?\nimport site/.test(after),
       short(frontmatterOf(after))
     );
+
+    // AND THE SAME COMPONENT INTO AN ELEMENT THAT HELD ONLY TEXT, which is the
+    // dogfood's call verbatim: `append_child` of a component needing a new
+    // import, onto an `<h3>` holding one word. The two halves are innocent
+    // apart -- the operation list above appends an <img> into this same <p>
+    // with no import in sight, and a <Badge> into the <section> above brings
+    // an import without reshaping anything -- and together they reprinted the
+    // file: 82 lines rewritten to add one, TAB 575 to 316, three comments
+    // stacked below the import block. Measured here as the two things that
+    // may change and nothing else.
+    const m2 = structuredClone(parsed.model);
+    const p2 = m2.nodes[0].children.find((n) => n.name === 'p');
+    if (!check(`[${f.id}] the fixture has its text-only <p>`, !!p2, short(m2.nodes[0].children.map((n) => n.name)))) continue;
+    p2.children.push({
+      id: 'inserted',
+      kind: 'component',
+      name: 'Badge',
+      props: { label: { type: 'string', value: 'New' } },
+      children: [],
+    });
+    m2.imports.push({ name: 'Badge', path: '../components/Badge.astro' });
+    const both = anchoredSerialize(f.source, m2);
+    const reshaped = f.source.replace(
+      `${f.ind}<p class=${f.q}fine-print${f.q}>Made carefully.</p>`,
+      `${f.ind}<p class=${f.q}fine-print${f.q}>${f.eol}` +
+        `${f.ind}${f.ind}Made carefully.${f.eol}` +
+        `${f.ind}${f.ind}<Badge label="New"></Badge>${f.eol}` +
+        `${f.ind}</p>`
+    );
+    check(
+      `[${f.id}] a component needing an import, appended to an element holding only text`,
+      removeOnce(both, line) === reshaped,
+      short({ span: changedSpan(reshaped, removeOnce(both, line) ?? '') })
+    );
+    // Said again in the terms the dogfood measured it in, because "the bytes
+    // are equal" is the strongest check and the least readable one: when it
+    // goes red, these say which way.
+    const census = (t) => ({
+      tabs: (t.match(/\t/g) || []).length,
+      single: (t.match(/'/g) || []).length,
+      attached: /\/\/ Component imports\r?\nimport Hero/.test(t),
+    });
+    check(
+      `[${f.id}]   with the file's tabs, quotes and comment attachment untouched`,
+      // The <p> gains three indented lines, so a tab-indented file gains five
+      // tabs and no others; the import line the model asked for carries the
+      // two single quotes around its path, and no attribute anywhere in the
+      // file trades a quote for a double one. Reprinted, this page came back
+      // with ZERO tabs and every `'` in the body rewritten.
+      census(both).tabs === census(f.source).tabs + (f.ind === '\t' ? 5 : 0) &&
+        census(both).single === census(f.source).single + 2 &&
+        census(both).attached === true,
+      short({ before: census(f.source), after: census(both) })
+    );
   }
 }
 
@@ -774,10 +888,16 @@ function tabsAgainstSpaces() {
   // `    <Card` followed by `\t\t\ttitle='Wide'`, tabs inside a space-indented
   // element, and every indentation this suite knows how to look at is still
   // one character wide.
+  //
+  // The AUTHOR'S QUOTE survives the reprint. Giving up a layout that cannot be
+  // shifted is not licence to rewrite the attribute as well: `title="Wide"`
+  // here was a second change to a line the move never named, and it is the
+  // same change a `move` used to make to the destination parent it landed in
+  // and to the source parent it left.
   const want =
     `---\nimport Base from '../layouts/Base.astro';\n---\n<Base>\n` +
     `\t<div>\n\t</div>\n` +
-    `  <section>\n    <p>x</p>\n    <Card title="Wide" />\n  </section>\n</Base>\n`;
+    `  <section>\n    <p>x</p>\n    <Card title='Wide' />\n  </section>\n</Base>\n`;
   check('a tab-indented block moved into a space-indented parent is reprinted, not guessed at', after === want, short({ span: changedSpan(want, after) }));
   const inSection = after.slice(after.indexOf('<section>'), after.indexOf('</section>'));
   check(
@@ -850,6 +970,132 @@ function trailingImportComment() {
   );
 }
 
+// --- OUT AND BACK IS THE FILE THAT WAS THERE ---------------------------------
+//
+// `move` is the one operation whose bytes genuinely travel, and every check
+// above measures one move against the file it started from. That misses what a
+// move does to the two elements it is not aimed at. A ROUND TRIP CANNOT: carry
+// a node out of one parent and back into it, and the only right answer is the
+// file, to the byte.
+//
+// Measured through an MCP host against a packaged build, on a CRLF page indented
+// with tabs and quoted with `'`, moving a `<pre id='keepme'>` into a `<footer>`
+// and back: bytes 637 -> 630, CRLF 25 -> 23, TAB 13 -> 10, `'` 18 -> 14, `"` 0
+// -> 4. Total size barely moved -- a size check would have called that clean.
+// Counting the QUOTE CHARACTERS is what exposed it, so they are counted here.
+//
+// Three separate wrongs, none of them named by the call:
+//   * the moved node came back re-quoted, `id='keepme'` as `id="keepme"`;
+//   * the DESTINATION parent was re-quoted, and it was never the target;
+//   * the SOURCE parent collapsed from three lines to one, its remaining
+//     `<span>` reflowed onto the footer's own line -- and moving the <pre> back
+//     could not put them apart again, so the loss was permanent.
+//
+// The <pre> is deliberate on top of that: its leading spaces are content, so
+// this also asks whether the bytes a browser renders survive a return trip.
+
+function moveRoundTrip() {
+  const eol = '\r\n';
+  const body = `  two leading spaces${eol}    four leading spaces${eol}\tone leading tab`;
+  const source = [
+    '---',
+    "import Base from '../layouts/Base.astro';",
+    '---',
+    '<Base>',
+    `\t<section class='fidelity-body'>`,
+    `\t\t<pre id='keepme'>${body}</pre>`,
+    '\t</section>',
+    `\t<footer class='fidelity-foot'>`,
+    '\t\t<span>destination</span>',
+    '\t</footer>',
+    '</Base>',
+    '',
+  ].join(eol);
+  const census = (t) => ({
+    bytes: Buffer.byteLength(t),
+    crlf: (t.match(/\r\n/g) || []).length,
+    tab: (t.match(/\t/g) || []).length,
+    single: (t.match(/'/g) || []).length,
+    double: (t.match(/"/g) || []).length,
+  });
+
+  const parsed = parsePage(source);
+  if (!check('the CRLF/tab/single-quote page parses', parsed.editable === true, short(parsed.reason))) return;
+
+  // Out: the <pre> leaves the <section> and joins the <footer>.
+  const out = structuredClone(parsed.model);
+  {
+    const root = out.nodes[0];
+    const section = root.children.find((n) => n.name === 'section');
+    const footer = root.children.find((n) => n.name === 'footer');
+    const pre = section?.children?.find((n) => n.name === 'pre');
+    if (!check('  and holds a <pre>, a <section> and a <footer>', !!pre && !!footer, short({ pre: !!pre, footer: !!footer }))) return;
+    section.children = section.children.filter((n) => n !== pre);
+    footer.children.push(pre);
+  }
+  const moved = anchoredSerialize(source, out);
+
+  // POSITIVE CONTROL: it really left. Without this every check below is
+  // satisfied by a write that did nothing at all -- which is the one way a
+  // round trip is trivially byte-identical.
+  if (
+    !check(
+      'the <pre> really moves into the <footer>',
+      /<section[^>]*>\r\n\t<\/section>/.test(moved) && /<footer[^>]*>[\s\S]*<pre/.test(moved),
+      short(changedSpan(source, moved))
+    )
+  ) {
+    return;
+  }
+  // The destination parent was never named by this call, and neither was the
+  // node's own spelling.
+  check(
+    "  and neither it nor the parent it lands in is re-quoted",
+    moved.includes(`<pre id='keepme'>`) && moved.includes(`<footer class='fidelity-foot'>`),
+    short({ census: census(moved), span: changedSpan(source, moved) })
+  );
+
+  const there = parsePage(moved);
+  if (!check('  and the moved file parses', there.editable === true, short(there.reason))) return;
+
+  // Back: the same node returns to the <section> it came from.
+  const home = structuredClone(there.model);
+  {
+    const root = home.nodes[0];
+    const section = root.children.find((n) => n.name === 'section');
+    const footer = root.children.find((n) => n.name === 'footer');
+    const pre = footer?.children?.find((n) => n.name === 'pre');
+    if (!check('  and the <pre> is in the <footer> to be moved back', !!pre, short(footer?.children?.map((n) => n.name)))) return;
+    footer.children = footer.children.filter((n) => n !== pre);
+    section.children.push(pre);
+  }
+  const back = anchoredSerialize(moved, home);
+
+  check(
+    'a move out and back leaves the file it started as, byte for byte',
+    back === source,
+    short({ before: census(source), after: census(back), span: changedSpan(source, back) })
+  );
+  // The census the dogfood took, said as five numbers, because byte equality
+  // is the strongest verdict and the least readable one.
+  const a = census(source);
+  const z = census(back);
+  check(
+    '  with every CRLF, tab and quote character accounted for',
+    z.bytes === a.bytes && z.crlf === a.crlf && z.tab === a.tab && z.single === a.single && z.double === a.double,
+    short({ before: a, after: z })
+  );
+  // And the spaces the browser shows inside the <pre>, which no tree comparison
+  // can see: `parsePage` collapses them into `value` and parks the bytes in an
+  // as-written field.
+  const held = /<pre\b[^>]*>([\s\S]*?)<\/pre>/.exec(back);
+  check(
+    '  and the <pre> holds the same leading spaces it started with',
+    !!held && held[1] === body,
+    short({ want: body, got: held ? held[1] : null })
+  );
+}
+
 // --- TWO SPLICES THAT WOULD CLOBBER EACH OTHER -------------------------------
 //
 // `applySplices` writes back to front and refuses a list whose spans overlap,
@@ -892,6 +1138,7 @@ function overlappingSplices() {
   stepFromTheTree();
   tabsAgainstSpaces();
   trailingImportComment();
+  moveRoundTrip();
   overlappingSplices();
 
   if (failures.length) {
@@ -899,7 +1146,7 @@ function overlappingSplices() {
     process.exit(1);
   }
   console.log(
-    `source-fidelity-matrix: ${checked} passed  [every operation changes only the bytes it means to, in four differently-written files]`
+    `source-fidelity-matrix: ${checked} passed  [every operation changes only the bytes it means to, in five differently-written files]`
   );
 })().catch((err) => {
   console.error('source-fidelity-matrix: threw\n', err?.stack || err);

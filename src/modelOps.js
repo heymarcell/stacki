@@ -856,7 +856,13 @@ export function insertNode(model, { nodeId, position = 'after', node: spec }, ct
   const { target, error } = placeFor(model, nodeId, position);
   if (error) return error;
   insertIntoModel(model, built.node, target);
-  pruneImports(model);
+  // NOT pruneImports. An insert only ever ADDS a reference, so nothing it does
+  // can make an import unused -- which means every import this could remove was
+  // already unused before the call, and belongs to whoever wrote the file. An
+  // append that silently deleted somebody's import was found doing exactly that,
+  // and it also turned a one-line splice into a whole-frontmatter rewrite,
+  // because one import gone and one added in the same write is not a splice.
+  // remove and set_tag DO make a reference disappear, and prune there.
   return done({ selectId: built.node.id, notes: built.notes || [] });
 }
 

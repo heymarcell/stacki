@@ -43,7 +43,13 @@ const makeId = () => `n${nextId++}`;
 // character — and it is written back WITHOUT its braces, turning
 // `<Foo {...rest} />` into `<Foo ...rest />`, which does not compile. Spreads
 // are everywhere in Astro, so this corrupts real components.
-function parseAttrs(attrString) {
+// `quotes`, when passed, collects name -> "'" for every value the file wrote
+// between single quotes. It is out here rather than on the value because it
+// says how the attribute was SPELLED, not what it says, and the model's
+// comparison skips a node's as-written fields by name: on the value it would
+// be meaning, and a `set_prop` building a plain {type,value} would read back
+// as a different page and reprint the file.
+function parseAttrs(attrString, quotes) {
   const props = {};
   // The spread body takes one level of nested braces, the same depth the
   // value form below allows — `{...cond ? { href } : { type: "button" }}` is
@@ -62,7 +68,10 @@ function parseAttrs(attrString) {
     }
     const name = m[2];
     if (m[3] !== undefined) props[name] = { type: 'string', value: m[3] };
-    else if (m[4] !== undefined) props[name] = { type: 'string', value: m[4] };
+    else if (m[4] !== undefined) {
+      props[name] = { type: 'string', value: m[4] };
+      if (quotes) quotes[name] = "'";
+    }
     else if (m[5] !== undefined) props[name] = { type: 'expr', value: m[5].trim() };
     else props[name] = { type: 'bare' };
   }
@@ -74,10 +83,23 @@ function parseAttrs(attrString) {
 // out, so the question asked is "do these say the same thing", not "were they
 // laid out the same way". Editing one attribute reflows the tag onto a line,
 // which is the same bargain struck everywhere else here.
-function attrsAsWritten(node) {
+// `indent` is where the node is being written NOW, which need not be where it
+// was written before: an attribute block carries its own absolute indentation
+// on every line but the first, so a Card grafted from a tab-indented <div> into
+// a space-indented <section> arrived as `    <Card` over `\t\t\ttitle='Wide'`
+// -- two kinds of leading whitespace inside one element. The block is shifted
+// to the indentation it is landing at, and when that is not a shift but a guess
+// the file's layout is given up rather than guessed at: the caller writes the
+// attributes on one line instead, which is what this returned before quotes
+// were kept and a single-quoted block started matching at all.
+function attrsAsWritten(node, indent) {
   if (!node.attrSource) return null;
   const flat = (t) => t.replace(/\s+/g, ' ').trim();
-  return flat(node.attrSource) === flat(serializeAttrs(node.props)) ? node.attrSource : null;
+  if (flat(node.attrSource) !== flat(serializeAttrs(node.props, node.attrQuotes))) return null;
+  const lines = node.attrSource.split('\n');
+  const base = lines[lines.length - 1];
+  if (lines.length < 2 || typeof indent !== 'string' || !/^[ \t]*$/.test(base)) return node.attrSource;
+  return base === indent ? node.attrSource : shiftTail(lines, base, indent);
 }
 
 /**
@@ -100,15 +122,30 @@ function attrText(name, v, quote = '"') {
   return `${name}="${text.replace(/"/g, '&quot;')}"`;
 }
 
-function serializeAttrs(props) {
+// `quotes` is the node's `attrQuotes` -- whichever quote the file used for each
+// attribute. Without it every path that PRINTS a node rather than splicing it
+// rewrote `class='x'` as `class="x"`: a move re-quoted the node it carried and
+// the parent it landed in, and moving it back re-quoted the parent it left. Six
+// characters changed on lines the edit never named, and the round trip was no
+// longer the file it started as.
+function serializeAttrs(props, quotes) {
   const parts = [];
-  for (const [name, v] of Object.entries(props || {})) parts.push(attrText(name, v));
+  for (const [name, v] of Object.entries(props || {})) parts.push(attrText(name, v, quotes?.[name]));
   return parts.length ? ' ' + parts.join(' ') : '';
 }
 
 // ---------------------------------------------------------------------------
 // Template parsing
 // ---------------------------------------------------------------------------
+
+// A tag's attributes, plus the record of which of them the file single-quoted.
+// `attrQuotes` is only there when the file used a single quote somewhere, so
+// the ordinary double-quoted page carries no extra field at all.
+function propsOf(attrString) {
+  const quotes = {};
+  const props = parseAttrs(attrString, quotes);
+  return Object.keys(quotes).length ? { props, attrQuotes: quotes } : { props };
+}
 
 const TAG_RE = /<([A-Za-z][\w.-]*)((?:[^>"'{]|"[^"]*"|'[^']*'|\{(?:[^{}]|\{[^{}]*\})*\})*?)(\/?)>/y;
 
@@ -740,7 +777,7 @@ function parseTemplate(str, base = null) {
         id: makeId(),
         kind,
         name,
-        props: parseAttrs(attrs),
+        ...propsOf(attrs),
         ...(attrs && attrs.includes('\n') ? { attrSource: attrs } : {}),
         // `<x/>` and `<x />` mean the same thing and are not the same text.
         ...(selfClose === '/' && !/\s\/>$/.test(full) ? { tightClose: true } : {}),
@@ -759,7 +796,7 @@ function parseTemplate(str, base = null) {
         id: makeId(),
         kind: 'raw',
         name,
-        props: parseAttrs(attrs),
+        ...propsOf(attrs),
         ...(attrs && attrs.includes('\n') ? { attrSource: attrs } : {}),
         inner: str.slice(afterOpen, close),
       }, lt, closeEnd + 1));
@@ -793,7 +830,7 @@ function parseTemplate(str, base = null) {
       name,
       ...(source === undefined ? {} : { source }),
       ...(blankAfter ? { blankAfter } : {}),
-      props: parseAttrs(attrs),
+      ...propsOf(attrs),
       ...(attrs && attrs.includes('\n') ? { attrSource: attrs } : {}),
       ...(closeText.includes('\n') ? { closeSource: closeText } : {}),
       children: innerResult.nodes,
@@ -1287,11 +1324,15 @@ function frontmatterText(model) {
 const headOf = (node) => ({ ...node, children: Array.isArray(node.children) ? [] : node.children });
 
 // The fields that describe how a node was WRITTEN rather than what it says: a
-// parse-local id, source offsets, and the four verbatim caches the serializer
-// consults to keep a file's own layout. Everything not named here is compared,
+// parse-local id, source offsets, and the verbatim caches the serializer
+// consults to keep a file's own layout -- `attrQuotes` among them, because
+// `class='x'` and `class="x"` are one attribute spelled two ways and a model
+// built by the editor spells neither. Everything not named here is compared,
 // so a field this list has never heard of makes two nodes differ and the write
 // falls back -- which is the safe direction.
-const AS_WRITTEN = new Set(['id', 'start', 'end', 'source', 'attrSource', 'headSource', 'closeSource']);
+const AS_WRITTEN = new Set([
+  'id', 'start', 'end', 'source', 'attrSource', 'attrQuotes', 'headSource', 'closeSource',
+]);
 
 /**
  * Do these two models say the same thing?
@@ -1583,6 +1624,23 @@ function printNode(node, indent, ctx) {
   return withEol(nodeText(node, indent, ctx.step), ctx.eol);
 }
 
+/**
+ * Did the FILE give every one of this element's children a line of its own?
+ *
+ * `isInlineRun` answers a question about the children -- would this serializer
+ * write them on one line -- and that is not the same question as how the file
+ * in front of us is laid out. A `<footer>` holding one `<span>` on its own line
+ * is an inline run written as a block, and the block splices below work on it
+ * exactly as they work on any other block.
+ */
+function laidOutAsBlock(base, source) {
+  const kids = base.children;
+  if (!Array.isArray(kids) || !kids.length) return false;
+  return kids.every(
+    (kid) => typeof kid.start === 'number' && lineIndentOf(source, kid.start) !== null
+  );
+}
+
 /** How this element's children are written, or null when they cannot be reached separately. */
 function childContext(base, next, ctx) {
   if (base.kind !== next.kind) return null;
@@ -1590,9 +1648,18 @@ function childContext(base, next, ctx) {
     if (base.chunkFile || base.chunkAggregate) return null;
     const baseInline = base.children.length > 0 && isInlineRun(base.children);
     const nextInline = next.children.length > 0 && isInlineRun(next.children);
-    // The element stops (or starts) being written on one line, so the bytes
-    // around every child move too. That is the whole node's business.
-    if (baseInline !== nextInline) return null;
+    // The element stops (or starts) being an inline run. If it is written on
+    // one line that is the whole node's business -- the bytes around every
+    // child move. But when the file already gave each child its own line, the
+    // element does not have to be rewritten to hold one more or one fewer:
+    // measured, a `<pre>` moved out of a `<footer>` left the `<span>` beside it
+    // reflowed onto the footer's own line, three lines becoming one, on an edit
+    // that named neither of them -- and moving the `<pre>` back could not put
+    // them apart again, so the round trip lost bytes it was never asked for.
+    if (baseInline !== nextInline) {
+      if (!laidOutAsBlock(base, ctx.source)) return null;
+      return { ...ctx, inline: false, structural: true };
+    }
     return { ...ctx, inline: baseInline, structural: true };
   }
   // A loop, a condition and a branch keep the file's own block verbatim and
@@ -1900,6 +1967,57 @@ function applySplices(source, edits) {
 }
 
 /**
+ * The tree with the single space a text node carries at either end taken off.
+ *
+ * That space is not something an author wrote. `collapseText` puts it there
+ * when the source has whitespace on that side, because a newline-and-indent is
+ * what a browser renders as one space -- so it is a fact about LAYOUT, and it
+ * flips the moment an element stops or starts fitting on one line. NO WRITER
+ * CAN CARRY IT ACROSS THAT CHANGE, `serializePage` included: the same model
+ * printed as a block and printed on one line read back with different text
+ * values, and neither printing is wrong.
+ */
+function edgeTrimmed(list) {
+  return (list || []).map((node) => {
+    const out = Array.isArray(node.children) ? { ...node, children: edgeTrimmed(node.children) } : node;
+    if (out.kind !== 'text' || typeof out.value !== 'string') return out;
+    return { ...out, value: out.value.replace(/^ /, '').replace(/ $/, '') };
+  });
+}
+
+/**
+ * Does the spliced file, read back, say what `model` said?
+ *
+ * The model first, exactly, which is what nearly every edit satisfies. Then the
+ * same question with the layout spaces above taken off both sides -- because
+ * holding the splice to a standard NO file meets is how a surgical write got
+ * thrown away for being correct, and the answer to a refusal here is to reprint
+ * the whole document.
+ *
+ * Measured, twice. `<h3>Heading</h3>` holds one text node, value 'Heading'.
+ * Append anything that is not an inline tag and the run has to become a block,
+ * so the word moves onto a line of its own and reads back as ' Heading ' -- and
+ * the correct splice, tabs and quotes and frontmatter comments all intact, was
+ * thrown out over that one space. On the dogfood's own page the same gate fired
+ * on a `<Pill><Icon … /> Developer</Pill>` NOBODY HAD TOUCHED: written on one
+ * line its text is ' Developer', and `serializePage` -- which has no rule for
+ * putting a component on an inline line -- prints it as a block, where it reads
+ * back ' Developer '. The reprint that followed cost 82 lines, TAB 575 to 316,
+ * and three comments torn off the imports they annotate, to add one component.
+ *
+ * Nothing else is relaxed. A splice that lost a word, an attribute, a child or
+ * an import disagrees on a field this does not touch, and is refused here as it
+ * was before.
+ */
+function saysWhatTheModelSaid(readBack, model) {
+  if (frontmatterText(readBack) !== frontmatterText(model)) return false;
+  return (
+    sameMeaning(readBack.nodes, model.nodes) ||
+    sameMeaning(edgeTrimmed(readBack.nodes), edgeTrimmed(model.nodes))
+  );
+}
+
+/**
  * The bytes to write for `model`, keeping everything `source` already said.
  *
  * Falls back to a full serialization whenever the change cannot be placed
@@ -1967,8 +2085,7 @@ function anchoredSerialize(source, model) {
     return canonical;
   }
   if (!check?.editable || !check.model) return canonical;
-  if (!sameMeaning(check.model.nodes, model.nodes)) return canonical;
-  if (frontmatterText(check.model) !== frontmatterText(model)) return canonical;
+  if (!saysWhatTheModelSaid(check.model, model)) return canonical;
 
   // AND THE WHITESPACE THE PAGE RENDERS, WHICH THE TREE DOES NOT CARRY.
   //
@@ -2029,13 +2146,13 @@ function inlineString(nodes) {
     if (n.kind === 'text') out += textOut(n);
     else if (n.kind === 'expr') out += n.value;
     else if (n.children === null) {
-      out += n.name === 'br' ? '<br />' : `<${n.name}${serializeAttrs(n.props)} />`;
+      out += n.name === 'br' ? '<br />' : `<${n.name}${serializeAttrs(n.props, n.attrQuotes)} />`;
     } else if (n.children.length === 0) {
       // Written as a pair with nothing between them. Closing it as `<span />`
       // says the same thing to a browser and a different thing to a diff.
-      out += `<${n.name}${serializeAttrs(n.props)}></${n.name}>`;
+      out += `<${n.name}${serializeAttrs(n.props, n.attrQuotes)}></${n.name}>`;
     } else {
-      out += `<${n.name}${serializeAttrs(n.props)}>${inlineString(n.children)}</${n.name}>`;
+      out += `<${n.name}${serializeAttrs(n.props, n.attrQuotes)}>${inlineString(n.children)}</${n.name}>`;
     }
   }
   return out;
@@ -2097,17 +2214,32 @@ function reindentRun(source, indent) {
   const lines = source.split('\n');
   const base = lines[lines.length - 1];
   if (lines.length < 2 || !/^[ \t]*$/.test(base) || base === indent) return source;
+  // Tabs against spaces is no shift that isn't a guess, and for a run the
+  // answer to that is to leave the bytes alone.
+  return shiftTail(lines, base, indent) ?? source;
+}
+
+/**
+ * A block's inner lines moved from indentation `from` to indentation `to`, its
+ * last line -- the one the closing bracket or tag sits on -- set to `to`, and
+ * its first left alone because whatever wrote it has already placed it.
+ *
+ * Null when neither indentation is a prefix of the other. That is tabs against
+ * spaces, and there is no shift for it, only a guess: guessing is how a block
+ * came to be written with four spaces followed by a tab.
+ */
+function shiftTail(lines, from, to) {
   let shift;
-  if (indent.startsWith(base)) {
-    const add = indent.slice(base.length);
+  if (to.startsWith(from)) {
+    const add = to.slice(from.length);
     shift = (line) => (line.trim() ? add + line : line);
-  } else if (base.startsWith(indent)) {
-    const drop = base.slice(indent.length);
+  } else if (from.startsWith(to)) {
+    const drop = from.slice(to.length);
     shift = (line) => (line.startsWith(drop) ? line.slice(drop.length) : line);
   } else {
-    return source; // tabs against spaces — no shift that isn't a guess
+    return null;
   }
-  return [lines[0], ...lines.slice(1, -1).map(shift), indent].join('\n');
+  return [lines[0], ...lines.slice(1, -1).map(shift), to].join('\n');
 }
 
 const flatten = (t) => t.replace(/\s+/g, ' ').trim();
@@ -2208,7 +2340,7 @@ function serializeNode(node, indent, lines, step = '  ') {
   // The gap the author left in front of this node.
   for (let i = 0; i < (node.blankBefore || 0); i++) lines.push('');
   if (node.chunkFile || node.chunkAggregate) {
-    lines.push(`${indent}<${node.name}${serializeAttrs(node.props)} />`);
+    lines.push(`${indent}<${node.name}${serializeAttrs(node.props, node.attrQuotes)} />`);
     return;
   }
   switch (node.kind) {
@@ -2322,7 +2454,7 @@ function serializeNode(node, indent, lines, step = '  ') {
       lines.push(indent + node.value);
       return;
     case 'raw': {
-      const open = `${indent}<${node.name}${serializeAttrs(node.props)}>`;
+      const open = `${indent}<${node.name}${serializeAttrs(node.props, node.attrQuotes)}>`;
       // Keep raw inner verbatim. Only the line break that ends the last line
       // goes, since the closing tag supplies its own — trimming all trailing
       // whitespace also took away a blank line the author left in the CSS.
@@ -2342,8 +2474,8 @@ function serializeNode(node, indent, lines, step = '  ') {
       return;
     }
     default: {
-      const kept = attrsAsWritten(node);
-      const attrs = kept === null ? serializeAttrs(node.props) : kept;
+      const kept = attrsAsWritten(node, indent);
+      const attrs = kept === null ? serializeAttrs(node.props, node.attrQuotes) : kept;
       // The closing tag as written, when it was written across lines. Only
       // trusted while it still names this element: renaming the tag rebuilds
       // it the ordinary way.
@@ -2549,7 +2681,7 @@ function serializeNodeMarked(node, indent, lines, path, inSlot = false, atRoot =
     // spacing (each marker's surrounding newlines render as a space).
     !(node.children.length > 0 && isInlineRun(node.children))
   ) {
-    const attrs = serializeAttrs(markedProps);
+    const attrs = serializeAttrs(markedProps, node.attrQuotes);
     lines.push(`${indent}<${node.name}${attrs}>`);
     node.children.forEach((child, i) =>
       serializeNodeMarked(child, indent + '  ', lines, `${path}.${i}`, node.kind === 'component')
