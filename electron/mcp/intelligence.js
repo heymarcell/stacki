@@ -41,6 +41,27 @@ const { buildProfile, MAX_PROFILE_BYTES } = require('./projectProfile');
 
 const PROFILE_URI = 'stacki://project/profile';
 
+// A GUIDE IS THE SAME BYTES ON EVERY MACHINE RUNNING THIS BUILD.
+//
+// The comment below has said since the day these were written that a client
+// caching them is doing the right thing; until the 2026-07-28 revision there
+// was no way to tell it so, and the SDK's conservative default said the exact
+// opposite on the wire (`ttlMs: 0, cacheScope: 'private'`).
+//
+// These bodies come out of ./guide.js, which is a frozen table compiled into
+// the app: no project is read to produce one, no permission level changes one,
+// and there is no state that could make two reads differ. `public` is
+// therefore safe in the strong sense — a shared cache holding a guide holds
+// nothing about anybody.
+//
+// The project profile pointedly does NOT get one. It is assembled out of
+// api.run() calls against the open project, gated on the level the person
+// granted, and it inherits the operation-level `{ttlMs: 0, cacheScope:
+// 'private'}` set in electron/mcp/server.js. That asymmetry is the point: a
+// resource has to say out loud that it is shareable, and only the five that
+// are do.
+const GUIDE_CACHE_HINT = Object.freeze({ ttlMs: 5 * 60 * 1000, cacheScope: 'public' });
+
 /** A resource body, as the SDK wants it. */
 const textContents = (uri, text, mimeType = 'text/markdown') => ({
   contents: [{ uri, mimeType, text }],
@@ -64,8 +85,10 @@ function registerResources(server, { api = null } = {}) {
         description: t.description,
         mimeType: 'text/markdown',
         // Static product documentation: it cannot change between two reads on the
-        // same version, so a client that caches it is doing the right thing.
+        // same version, so a client that caches it is doing the right thing —
+        // and now it is told so rather than left to guess.
         annotations: { audience: ['assistant'] },
+        cacheHint: GUIDE_CACHE_HINT,
       },
       async (uri) => textContents(uri.href, t.body)
     );
@@ -245,4 +268,4 @@ function registerPrompts(server) {
   }
 }
 
-module.exports = { registerResources, registerPrompts, PROFILE_URI, PROMPTS };
+module.exports = { registerResources, registerPrompts, PROFILE_URI, PROMPTS, GUIDE_CACHE_HINT };

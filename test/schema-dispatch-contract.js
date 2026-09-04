@@ -511,6 +511,87 @@ function productToolNames() {
         check('capture’s own meta validates against the schema capture publishes', meta.valid === true, `${meta.errorMessage || ''}\n    ${short(shot?.meta)}`);
       }
     }
+
+    // ── AN ARGUMENT THAT BELONGS TO ANOTHER ACTION ───────────────────────────
+    //
+    // Every branch of every domain schema is closed. It used not to be, and a
+    // `z.object()` STRIPS a key it does not know — which on a surface where
+    // most arguments are optional and several operations fall back to a
+    // sensible default for the one you left out is not tidiness but a silent
+    // retarget.
+    //
+    // These four were measured at ac57c20 being accepted with `ok: true` and
+    // doing something other than what was asked. Two are `high` risk and one
+    // is destructive. They are written out by name rather than generated,
+    // because the point is these specific misdirections and not the general
+    // property — and each asserts that the operation did NOT run, which is the
+    // half that matters: a refusal that arrives after the work is not a
+    // refusal.
+    //
+    // `visual` refuses all of them at the gate anyway, which is exactly why
+    // the code matters: `bad_arguments` proves the SCHEMA stopped it, while
+    // `permission_denied` would prove only that this rig is at the lowest
+    // level.
+    {
+      const retargets = [
+        ['git', 'restore_file', { path: 'src/pages/index.astro', rev: 'abc123' }, 'rev', 'restores from HEAD instead of the named revision'],
+        ['git', 'push', { branchName: 'feature-x' }, 'branchName', 'pushes the CURRENT branch instead of the named one'],
+        ['target', 'remove', { target: 'refrefrefrefrefref' }, 'target', "removes the person's live SELECTION instead of the ref"],
+        ['project', 'probe', { route: '/pricing' }, 'route', 'probes the preview root instead of the named route'],
+      ];
+      for (const [tool, action, args, key, wouldHave] of retargets) {
+        const { envelope: env } = await rig.call(tool, action, args);
+        check(
+          `${tool}.${action} with a mistyped \`${key}\` is refused`,
+          env?.ok === false,
+          short(env)
+        );
+        check(
+          `  as bad_arguments — the schema stopped it, not the gate (else it ${wouldHave})`,
+          env?.code === 'bad_arguments',
+          short({ code: env?.code, message: env?.message })
+        );
+        check(`  and the message names ${key}`, String(env?.message || '').includes(key), short(env?.message));
+      }
+
+      // AND THE SAME ONE LEVEL DOWN. `edit` takes a batch of operations, each
+      // its own discriminated union on `type`; closing the outer schema and
+      // leaving the inner one open would refuse the easy case and keep the
+      // hard one.
+      const { envelope: nested } = await rig.call('target', 'edit', {
+        ref: 'refrefrefrefrefref',
+        operations: [{ type: 'add_class', className: 'x', value: 'belongs to set_text' }],
+      });
+      check('a foreign key inside one operation of an edit batch is refused', nested?.ok === false, short(nested));
+      check('  as bad_arguments', nested?.code === 'bad_arguments', short({ code: nested?.code }));
+      check(
+        '  naming the operation it was in',
+        /operations\.0/.test(String(nested?.message || '')),
+        short(nested?.message)
+      );
+
+      // POSITIVE CONTROLS. Without these, a surface that refused every call
+      // would satisfy everything above. Both use the right spelling of the
+      // same argument, and both must get past the schema — at `visual` they
+      // are then refused by the GATE, which is a different code and is the
+      // proof that the schema let them through.
+      const { envelope: spelled } = await rig.call('git', 'restore_file', { path: 'src/pages/index.astro', ref: 'abc123' });
+      check(
+        'the same call with `ref` spelled right gets past the schema',
+        spelled?.code !== 'bad_arguments',
+        short({ code: spelled?.code, message: spelled?.message })
+      );
+      const { envelope: batch } = await rig.call('target', 'edit', {
+        ref: 'refrefrefrefrefref',
+        operations: [{ type: 'add_class', className: 'x' }],
+      });
+      check(
+        'and a well-formed edit batch gets past it too',
+        batch?.code !== 'bad_arguments',
+        short({ code: batch?.code, message: batch?.message })
+      );
+    }
+
   } finally {
     const said = await rig.stop();
     problems.push(...(said?.problems || []));

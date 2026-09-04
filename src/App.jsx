@@ -1077,12 +1077,22 @@ export default function App() {
     const entry = h.past.pop();
     if (entry.kind === 'cmd') {
       h.future.push(entry);
+      // AN INVERSE THAT THREW IS NOT AN UNDO, AND USED TO REPORT AS ONE.
+      //
+      // The toast tells the person, and a person can see the file did not
+      // change. An agent cannot: `project.undo` measured success by whether the
+      // history stack got shorter, and it got shorter at `pop()` above whatever
+      // the inverse did -- so a failed undo answered `ok: true, undone: true`.
+      // The failure is carried back on the result instead, where the caller can
+      // read it, and the toast is unchanged.
+      let failed = null;
       try {
         await entry.undo();
       } catch (err) {
-        showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${cleanError(err)}`, 'error');
+        failed = cleanError(err);
+        showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${failed}`, 'error');
       }
-      return { kind: 'cmd', files: entry.files || [] };
+      return { kind: 'cmd', files: entry.files || [], ...(failed ? { failed } : {}) };
     }
     const state = pageStateRef.current.pageState;
     if (!state) return null; // its page is gone — nothing to restore onto
@@ -1100,12 +1110,16 @@ export default function App() {
     const entry = h.future.pop();
     if (entry.kind === 'cmd') {
       h.past.push(entry);
+      // The same rule as `undo` above: a redo whose command threw did not
+      // happen, and the caller has to be able to find that out.
+      let failed = null;
       try {
         await entry.redo();
       } catch (err) {
-        showToast(`Couldn’t redo${entry.label ? ` ${entry.label}` : ''}: ${cleanError(err)}`, 'error');
+        failed = cleanError(err);
+        showToast(`Couldn’t redo${entry.label ? ` ${entry.label}` : ''}: ${failed}`, 'error');
       }
-      return { kind: 'cmd', files: entry.files || [] };
+      return { kind: 'cmd', files: entry.files || [], ...(failed ? { failed } : {}) };
     }
     const state = pageStateRef.current.pageState;
     if (!state) return null;
@@ -4769,13 +4783,24 @@ export default function App() {
     // the app holds it, which is absolute; a recorded command names its files
     // the way main handed them over, which is not. `relOf` leaves a relative
     // path alone, so one pass settles both.
+    // AND `failed`, WHICH THIS USED TO DROP ON THE FLOOR.
+    //
+    // The whitelist was `{kind, files}`. `undo()` above reports a command whose
+    // inverse threw as `failed`, and this rebuilt the object without it — so
+    // `project.undo`'s `undo_failed` branch was unreachable code and the
+    // envelope still said `ok: true, undone: true` for an undo that had not
+    // happened. The whole point of carrying the failure was this hop.
     undo: async () => {
       const put = await undo();
-      return put ? { kind: put.kind, files: [...new Set((put.files || []).map(relOf).filter(Boolean))] } : null;
+      if (!put) return null;
+      const files = [...new Set((put.files || []).map(relOf).filter(Boolean))];
+      return { kind: put.kind, files, ...(put.failed ? { failed: put.failed } : {}) };
     },
     redo: async () => {
       const put = await redo();
-      return put ? { kind: put.kind, files: [...new Set((put.files || []).map(relOf).filter(Boolean))] } : null;
+      if (!put) return null;
+      const files = [...new Set((put.files || []).map(relOf).filter(Boolean))];
+      return { kind: put.kind, files, ...(put.failed ? { failed: put.failed } : {}) };
     },
     select: (id, occurrence) => {
       setSelectedId(id);

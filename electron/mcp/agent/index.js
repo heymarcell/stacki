@@ -27,7 +27,7 @@ const path = require('node:path');
 const registry = require('./registry');
 const permissions = require('./permissions');
 const refs = require('./refs');
-const { runMain, resolveContentEntry } = require('./domains');
+const { runMain, resolveContentEntry, withoutHostPaths } = require('./domains');
 const { patchBetween } = require('./patch');
 const { relativeTo } = require('./paths');
 const { digestOf } = require('./digest');
@@ -469,6 +469,22 @@ function createAgentApi({
         'not_ready',
         'The Stacki window did not answer in time. It may be starting a preview or opening a page — try again.'
       );
+    }
+    // NOBODY'S HOME DIRECTORY, WHICHEVER SIDE THE SENTENCE WAS WRITTEN ON.
+    //
+    // `thrownFailure` strips absolute paths out of anything that THREW in the
+    // main process, and every refusal built there goes through it. A message
+    // composed in the RENDERER does not: it is returned, not thrown, so it
+    // arrived here exactly as written. `project.undo`'s new `undo_failed`
+    // interpolates a renderer `cleanError`, which strips ANSI and Electron's
+    // IPC prefix and knows nothing about paths — so a failing inverse could
+    // put this machine's directory layout on the wire.
+    //
+    // Applied to the whole class rather than to that one message, because the
+    // next renderer-built refusal would have the same hole and no reason to
+    // remember it.
+    if (answer && typeof answer === 'object' && answer.ok === false && typeof answer.message === 'string') {
+      return { ...answer, message: withoutHostPaths(answer.message, context().root) };
     }
     return answer;
   }

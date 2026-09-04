@@ -326,7 +326,7 @@ async function startMcp({
     getComments,
     comment,
     api,
-    audit: (args) => auditEngine.run(args),
+    audit: (args, opts) => auditEngine.run(args, opts),
     onError: (err) => console.warn('[stacki] MCP:', err?.message || err),
   });
   try {

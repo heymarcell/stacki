@@ -56,12 +56,12 @@ handler, all proven by raw HTTP in `test/mcp.js`:
 
 | Surface | v1 | Cost |
 | --- | --- | --- |
-| Server instructions | 1,838 bytes, capped at 2,000 by `test/mcp.js` | every connection |
-| Tools | **14** | `tools/list` is **140,885 bytes** |
+| Server instructions | 1,826 bytes, capped by `test/host-limits.js` against a host limit of 2,048 characters | every connection |
+| Tools | **14** | `tools/list` is **165,135 bytes** (17,783 gzipped) |
 | Agent operations | **<!--count:total-->111<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->110<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
 | Permission answers | **<!--count:permAnswers-->444<!--/-->** (<!--count:total-->111<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
-| Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,229 bytes; a read costs only when asked |
-| Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,131 bytes |
+| Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,233 bytes; a read costs only when asked |
+| Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,135 bytes |
 
 ### The connection preamble, measured on a real host
 
@@ -70,11 +70,23 @@ across eleven sessions:
 
 | | bytes |
 | --- | --- |
-| `server/discover` | 2,205 |
-| `tools/list` | 140,885 |
-| `resources/list` | 2,229 |
-| `prompts/list` | 1,131 |
-| **total, before the model has seen the task** | **146,450** |
+| `server/discover` | 2,188 |
+| `tools/list` | 165,135 |
+| `resources/list` | 2,233 |
+| `prompts/list` | 1,135 |
+| **total, before the model has seen the task** | **170,691** |
+
+Those are HTTP bytes, and HTTP bytes are not model context. Claude Code has MCP
+tool search on by default: it is handed the catalogue and gives the model tool
+NAMES, fetching a schema when one becomes relevant. So the number above is what
+the transport carries, not what the model is charged — see
+`docs/mcp-compatibility.md` for the measured difference.
+
+The figures moved from the ones this table used to carry (140,885 for
+`tools/list`), which were measured before later work and were never pinned by a
+test. They are pinned now, in the sense that matters: `test/host-limits.js`
+fails if any description or the instructions cross what a real host will
+carry.
 
 `tools/list` is 96% of it. Of that, the shared `Envelope` output schema is 4,621
 bytes and is serialised once per domain tool — **41,589 bytes, 30% of the whole
@@ -92,21 +104,55 @@ it.**
 roots, elicitation, and the tasks/apps extensions. None are declared and none are
 served. A host should not probe for them.
 
-### `listChanged` — declared, and never emitted
+### `listChanged` — now declared false, because it is false
 
 The SDK sets `listChanged: true` on tools, resources and prompts the first time
-one is registered. **Nothing in Stacki has ever sent a list-changed
-notification**, and the surface genuinely does change: a server built without the
-Agent API serves 4 tools instead of 14, and opening a different project rotates
-every ref an agent is holding.
+one is registered, unless the server said otherwise at construction. Stacki said
+nothing, so for a long time `server/discover` advertised three times over that
+this server would tell a client when its lists changed. **Nothing in Stacki has
+ever sent a list-changed notification.**
 
-Observed rather than assumed: across eleven real Claude Code sessions the client
-**never opened a `subscriptions/listen` stream**, so the predicted cost — a
-held-open SSE connection that never carries an event — did not occur in headless
-use. It may still occur in an interactive host.
+Stacki now declares `listChanged: false` on all three, which is the truth: a
+fresh `McpServer` is built per request, every registration happens before it
+answers anything, and one POST per request leaves no channel to push a
+notification down afterwards. A modern client reads these bits to decide which
+notification types to ask for on its listen filter, so a false one buys a
+listener that can never fire.
 
-**v1 does not claim `listChanged`.** Treat the flag as unbacked: do not wait for a
-notification, and re-list after anything that could have changed the surface.
+The lists a SERVER INSTANCE serves are fixed for its life. What varies between
+instances — a server built without the Agent API serves 5 tools instead of 14 —
+is decided before it answers, and a client that reconnects is answered by a new
+instance. Re-list after anything that could have changed the surface; nothing
+will be pushed to you.
+
+The right way to make these `true` is to emit the notifications. Asserted in
+`test/mcp-cache-hints.js`.
+
+### Cache hints — what a client may keep
+
+The 2026-07-28 revision requires `ttlMs` and `cacheScope` on six results
+(SEP-2549). The SDK fills them with the conservative `{ttlMs: 0, cacheScope:
+'private'}` when nothing says otherwise, and for five of them that was a wrong
+description of what Stacki serves.
+
+| result | `ttlMs` | `cacheScope` | why |
+| --- | --- | --- | --- |
+| `server/discover` | 300,000 | `public` | built from registrations decided before the server answers; identical on every machine running this build |
+| `tools/list` | 300,000 | `public` | same |
+| `prompts/list` | 300,000 | `public` | same |
+| `resources/list` | 300,000 | `public` | same — the catalogue is deliberately constant at every permission level |
+| `resources/read` of `stacki://guide/*` | 300,000 | `public` | a frozen table compiled into the app; no project is read to produce one |
+| `resources/read` of `stacki://project/profile` | 0 | `private` | this person's project, gated on the level they granted |
+
+Five minutes is a staleness budget rather than a guess: the catalogue can only
+change when a different build answers on this port, which needs Stacki to be
+restarted.
+
+The boundary is asserted by RULE rather than by listing today's URIs — every
+`stacki://guide/*` resource must be publicly cacheable and every other resource
+must not be — so a project resource added later inherits `private`, and a guide
+that stopped being static fails the suite rather than reaching a shared cache.
+Responses to 2025-era requests carry no cache fields at all.
 
 ---
 
@@ -149,7 +195,23 @@ Refusals an agent must expect and can act on:
 | `stale_target` | the file moved under you; carries `observed` and `current` |
 | `wrong_project` | the ref belongs to a project this Stacki no longer has open |
 | `no_project` | nothing is open; ask the person to open one |
-| `no_preview` | there is no dev server; `project.dev_start` |
+| `no_preview` | there is no dev server; `project.dev_start`. Also what `page.dynamic_paths` answers rather than reporting zero routes it could not ask about |
+| `bad_arguments` | names the key that was wrong AND what that action does accept |
+| `bad_action` | no such action on this tool; lists the ones there are |
+| `merge_conflict` | the branches disagree; the merge was unwound, the clashing hunks travel, the whole files do not |
+| `working_tree_blocked` | uncommitted work is in the way of a switch or a merge; nothing was changed |
+| `bad_choices` | a `resolve_merge` choice could not be understood; nothing was written, and the message states the vocabulary |
+| `cancelled` | the caller went away mid-audit; says how many viewports had been measured and discarded |
+| `undo_failed` / `redo_failed` | the recorded inverse threw. The stack moved, the file did not |
+
+This table is the ones worth knowing rather than all of them; the surface has
+more, and `get_capabilities` lists every operation it can refuse.
+
+Four of these are new in this revision, and each replaced something worse: three
+git causes that arrived as `failed` (the code this codebase's own comment calls
+"the code that means nobody knows"), and one answer that was not a refusal at
+all — `page.dynamic_paths` reported a dynamic route as standing for no paths
+whenever it had no dev server to ask.
 
 **Every refusal reaches the wire with `isError: true`** as well as `ok: false`, on
 every tool. A host that keys off `isError` and a host that reads the envelope both
@@ -292,10 +354,37 @@ Summary of what v1 claims:
 | `audit`, default | 3 viewports × one real page load each, plus axe |
 
 An `audit` in flight **runs to completion even if the client disconnects.**
-Stacki reads no cancellation signal and emits no progress notifications. Bound
+An audit reads the request's `AbortSignal` and stops at the next viewport
+boundary; nothing else here is cancellable, and no progress notifications are
+emitted. Bound
 your own timeouts accordingly.
 
 ---
+
+## 7b. The extensions, and why none of them is adopted
+
+Extensions became a formal mechanism (SEP-2133, merged January 2026) and there
+are three official families. Each was evaluated against what Stacki actually is
+and what its measured hosts actually do, rather than against how modern it would
+look to support them.
+
+| extension | status today | decision | why |
+| --- | --- | --- | --- |
+| **Tasks** | Final spec, Stable schema | **not applicable** | Zero tracked host support — the project's own cross-client matrix has no row for it — and no runtime in `@modelcontextprotocol/server` 2.0.0, which is current. SEP-2663 forbids returning a `CreateTaskResult` to a client that did not declare the capability, so an implementation nothing speaks to is dead code by construction. And the problem it solves is not one Stacki has: the audit runs in tens of seconds, inside Claude Code's 60 s request timer, its 2-minute auto-background threshold and its 5-minute idle window. |
+| **Apps (UI)** | Final, real multi-vendor adoption | **not applicable** | It renders an iframe inside somebody else's chat transcript. Stacki already *is* the UI — the audit's findings and screenshots render in its own windows — and the app would be sandboxed away from them anyway, round-tripping every action back through `tools/call`. Claude Code, the host this is measured against, renders nothing. This would be a new product surface (a Stacki panel inside a chat client), not an improvement to this one. |
+| **Skills over MCP** | draft PR, "not official" banner | **prepare a seam, do not adopt** | Two wire-breaking realignments in three months, one prerelease client, and install-scope only. Stacki is well placed if it lands — `stacki://guide/<topic>` already serves exactly the artefact the SEP standardises, static machine-invariant markdown in the progressive-disclosure shape — so adopting later costs a URI scheme and two methods. Adopting now would mean tracking a moving draft in shipped code. |
+
+The rule this follows: an extension is worth adopting when a host Stacki
+actually runs against consumes it and it solves a problem Stacki actually has.
+None of the three currently clears both bars, and a count of supported
+extensions is not a measure of anything.
+
+**One residual this evaluation surfaced**, recorded rather than dismissed: an
+audit that ever exceeded five minutes would be aborted by Claude Code's HTTP
+idle timeout, because Stacki sends no progress notifications. The audit's p95
+wall time across the widest viewport set has not been measured. The
+proportionate answer if it ever matters is a progress notification, which is
+core protocol — not the Tasks extension.
 
 ## 8. What may still change
 
@@ -312,6 +401,22 @@ byte sizes above, which axe rules run as axe-core is updated, the finding caps,
 and the set of resources and prompts. New tools, operations, resources, prompts
 and finding kinds may be added; a client must tolerate fields it does not know.
 
-**Explicitly not promised:** `listChanged` notifications, cancellation, progress,
-resource cache hints, a stable client-identity label across protocol eras, and
+**Now promised, and not before:** cache hints on the six cacheable results
+(§2), and cancellation of an audit whose caller has gone away — the run stops at
+the next viewport boundary, destroys the window it owns, resets its session and
+answers `code: 'cancelled'`, and an audit queued behind an abandoned one is
+never started.
+
+**Explicitly not promised:** `listChanged` notifications (declared `false`,
+because they are not sent), progress notifications, a stable client-identity
+label across protocol eras, cancellation of anything other than an audit, and
 compatibility with revisions older than 2025-11-25.
+
+**Known residual, stated rather than left to be found:** whitespace a page
+renders because of a rule in a STYLESHEET — `.card { white-space: pre }` — is
+not detected when a node is moved or duplicated. The guard covers the tags whose
+inner whitespace is always content (`pre`, `textarea`, `script`, `style`) and,
+since this revision, a `white-space` declaration written ON the element as an
+inline style or a whitespace utility class. Detecting it through the cascade
+would mean resolving CSS in the parser, which is a second CSS engine and is not
+something this surface is willing to become.

@@ -432,6 +432,24 @@ export function createAgentCommands(getApp) {
     if (action === 'undo') {
       const before = a.historyDepth();
       const restored = await a.undo();
+      // `undone` USED TO MEAN "THE STACK GOT SHORTER", WHICH IT ALWAYS DOES.
+      //
+      // The entry is popped before its inverse runs, so a command whose inverse
+      // threw shortened the stack exactly like one that worked, and this
+      // answered `ok: true, undone: true` for an undo that had not happened.
+      // The renderer now says so on the result; an undo that failed is a
+      // refusal, with the reason, rather than a success nobody can check.
+      if (restored && restored.failed) {
+        return {
+          ok: false,
+          code: 'undo_failed',
+          message: `That change could not be undone: ${restored.failed}`,
+          undone: false,
+          restored,
+          history: a.historyDepth(),
+          document: documentOf(a),
+        };
+      }
       return {
         ok: true,
         undone: a.historyDepth().past < before.past,
@@ -443,6 +461,18 @@ export function createAgentCommands(getApp) {
     if (action === 'redo') {
       const before = a.historyDepth();
       const restored = await a.redo();
+      // Same as undo: the stack shortens whatever the command did.
+      if (restored && restored.failed) {
+        return {
+          ok: false,
+          code: 'redo_failed',
+          message: `That change could not be redone: ${restored.failed}`,
+          redone: false,
+          restored,
+          history: a.historyDepth(),
+          document: documentOf(a),
+        };
+      }
       return {
         ok: true,
         redone: a.historyDepth().future < before.future,

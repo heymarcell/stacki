@@ -79,6 +79,45 @@ async function resolveMerge(git, { projectPath, branch, choices }) {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
+  // WHAT A CHOICE IS ALLOWED TO SAY, CHECKED BEFORE ANYTHING IS WRITTEN.
+  //
+  // The loop below took `choice === 'theirs'` as the only way to ask for the
+  // incoming side, and anything else — an object, the reconciled file text, a
+  // capitalised "THEIRS", a shape somebody guessed at — fell through to
+  // `--ours` and was then COMMITTED. The envelope said `{ok: true, changed:
+  // true, resolved: N}`, with `undoable: false`, so the other branch's work was
+  // discarded silently and Stacki's own undo could not bring it back.
+  //
+  // A MISSING choice still keeps this branch's work: that is the deliberate
+  // default the comment below describes, and the panel relies on it. A choice
+  // that was GIVEN and cannot be understood is a different thing entirely, and
+  // is now refused with nothing changed rather than guessed at.
+  const WHOLE_FILE = new Set(['ours', 'theirs']);
+  const PER_HUNK = new Set(['ours', 'theirs', 'both', 'merged']);
+  const unusable = [];
+  for (const file of left) {
+    const choice = choices?.[file];
+    if (choice === undefined || choice === null) continue;
+    if (typeof choice === 'string') {
+      if (!WHOLE_FILE.has(choice)) unusable.push({ path: file, given: choice, expected: [...WHOLE_FILE] });
+      continue;
+    }
+    if (Array.isArray(choice)) {
+      const bad = choice.find((pick) => !PER_HUNK.has(pick));
+      if (bad !== undefined) unusable.push({ path: file, given: bad, expected: [...PER_HUNK] });
+      continue;
+    }
+    unusable.push({ path: file, given: typeof choice, expected: [...WHOLE_FILE] });
+  }
+  if (unusable.length) {
+    try {
+      await git(projectPath, ['merge', '--abort']);
+    } catch {
+      /* already unwound */
+    }
+    return { ok: false, badChoices: unusable, from: into, branch };
+  }
+
   try {
     for (const file of left) {
       const choice = choices?.[file];

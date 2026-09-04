@@ -10,7 +10,12 @@
 // written down in the first place.
 //
 // As with the other content tests, the project is copied before anything is
-// written.
+// written — and the project is the one test/support/contentFixture.js builds,
+// where an author is pointed at from three collections at once and a post's
+// hero image is a relative path that has to follow it up a folder. It used to
+// default to a personal folder under ~/Downloads, so on every machine but one,
+// and on every CI runner, this printed "skipped" and asserted nothing. A path
+// given as argv[2] or STACKI_CONTENT_FIXTURE still wins.
 
 const fs = require('fs');
 const path = require('path');
@@ -21,8 +26,7 @@ const { planRename, applyRename, rewriteRelative } = require('../electron/conten
 const frontmatter = require('../electron/formats/frontmatter.js');
 const jsonFormat = require('../electron/formats/json.js');
 
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const source = path.resolve(process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -32,10 +36,19 @@ const check = (what, condition, detail) => {
 };
 
 (async () => {
-  if (!fs.existsSync(path.join(source, 'src', 'content.config.ts'))) {
-    console.log(`content-refs: skipped (no project at ${source})`);
+  let fixture;
+  try {
+    fixture = contentFixture('content-refs', { log: (m) => console.log(`content-refs: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const source = fixture.source;
+
   const config = await readContentConfig(source, { force: true });
   if (config.error) {
     console.error(`content-refs: could not read the config — ${config.error}`);

@@ -172,7 +172,105 @@ const MoveTarget = z
 
 // One operation inside a batch. The same vocabulary as the single-operation
 // actions, so learning one teaches the other.
-const Operation = z.discriminatedUnion('type', [
+/**
+ * The same union, with every branch closed.
+ *
+ * `z.object()` STRIPS a key it does not know, and a stripped key is an argument
+ * the caller wrote and nobody ran. On a surface where most arguments are
+ * optional and several operations have a server-side fallback for the one you
+ * left out, that is not a tidy-up: it is a silent retarget. Measured at the
+ * baseline commit, every one of these was accepted with `ok: true` and did
+ * something other than what was asked:
+ *
+ *   git   {action:'restore_file', path, rev:'abc'}   -> `rev` dropped; restored from HEAD
+ *   git   {action:'push', branchName:'feature-x'}    -> dropped; pushed the CURRENT branch
+ *   target{action:'remove', target:'<a ref>'}        -> dropped; removed the person's SELECTION
+ *   project{action:'probe', route:'/pricing'}        -> dropped; probed the preview root
+ *
+ * Two of those are `high` risk and one is destructive. The mistyped name is the
+ * likeliest agent error of all — the top-level `properties` block that
+ * `summarised()` publishes lists every branch's argument names side by side,
+ * with nothing structural to say which action each belongs to — so the surface
+ * has to answer it rather than absorb it.
+ *
+ * Closing the branch turns all four into `bad_arguments`, naming the key. It
+ * also makes the ADVERTISED schema say so: `z.toJSONSchema` emits
+ * `additionalProperties: false` per branch, so a validating client refuses the
+ * call before it is sent, and this file's header stops being aspirational.
+ *
+ * Rebuilt rather than declared branch by branch, so a branch added tomorrow is
+ * closed without its author having to remember to close it.
+ */
+function closed(union) {
+  const key = union.def?.discriminator || 'action';
+  return z.discriminatedUnion(
+    key,
+    union.options.map((branch) => {
+      const rebuilt = closeShape(branch.shape);
+      // A BRANCH CAN CARRY A DESCRIPTION, AND REBUILDING IT DROPPED ONE.
+      //
+      // `z.strictObject(shape)` keeps every FIELD's `.describe()` and none of
+      // the object's own, so two operations lost the sentence published beside
+      // them in `tools/list` — retrieval metadata deleted by a change that was
+      // about validation.
+      return branch.description ? rebuilt.describe(branch.description) : rebuilt;
+    })
+  );
+}
+
+/**
+ * Close an object shape, and everything object-shaped inside it.
+ *
+ * Closing only the top level left the same silent strip one level down: the
+ * arguments that are themselves objects — a node spec, a move target, a
+ * declaration identity — went on dropping keys nobody typed correctly. A
+ * mistyped field inside `node` is exactly as invisible as a mistyped field
+ * beside it, and rather more likely, because those are the shapes an agent has
+ * to construct rather than copy.
+ *
+ * Wrappers are unwrapped and put back: `.optional()`, `.nullable()`,
+ * `.default()` and arrays all hold an inner type that may itself be an object.
+ * Anything this does not recognise is returned untouched — a rebuilt schema
+ * that dropped a refinement would be worse than an open one.
+ */
+function closeShape(shape) {
+  const out = {};
+  for (const [name, field] of Object.entries(shape)) out[name] = closeField(field);
+  return z.strictObject(out);
+}
+
+function closeField(field) {
+  const def = field?.def;
+  if (!def) return field;
+  if (def.type === 'object') {
+    const rebuilt = closeShape(field.shape);
+    return field.description ? rebuilt.describe(field.description) : rebuilt;
+  }
+  // A UNION OF SHAPES IS STILL SHAPES. `audit`'s `viewports` takes either a
+  // named string or a `{width, height}` object, and the object half was the
+  // last place on the surface still dropping a key silently.
+  if (def.type === 'union' && Array.isArray(def.options)) {
+    const rebuilt = def.options.map(closeField);
+    if (rebuilt.every((o, i) => o === def.options[i])) return field;
+    return withDescription(z.union(rebuilt), field);
+  }
+  // One inner type, held under a name that differs by wrapper.
+  const innerKey = def.type === 'array' ? 'element' : 'innerType';
+  const inner = def[innerKey];
+  if (!inner || typeof inner !== 'object' || !inner.def) return field;
+  const closedInner = closeField(inner);
+  if (closedInner === inner) return field;
+  if (def.type === 'array') return withDescription(z.array(closedInner), field);
+  if (def.type === 'optional') return withDescription(closedInner.optional(), field);
+  if (def.type === 'nullable') return withDescription(closedInner.nullable(), field);
+  if (def.type === 'default') return withDescription(closedInner.default(def.defaultValue), field);
+  return field;
+}
+
+const withDescription = (rebuilt, original) =>
+  original.description ? rebuilt.describe(original.description) : rebuilt;
+
+const Operation = closed(z.discriminatedUnion('type', [
   // `value` is this form's name and stays the declared one; `text` is accepted
   // because the single-action form calls it that. See the note on
   // `action: "set_text"` below.
@@ -194,7 +292,7 @@ const Operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('duplicate') }),
   z.object({ type: z.literal('move'), to: MoveTarget }),
   z.object({ type: z.literal('set_tag'), tag: z.string().max(64) }),
-]);
+]));
 
 // --- target ------------------------------------------------------------------
 
@@ -208,7 +306,7 @@ const guard = {
   expectedDigest: z.string().max(64).optional().describe('The document digest your read reported.'),
 };
 
-const TargetInput = z.discriminatedUnion('action', [
+const TargetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ...withTarget({
@@ -290,7 +388,7 @@ const TargetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('duplicate'), ...withTarget(guard) }),
   z.object({ action: z.literal('move'), ...withTarget({ ...guard, to: MoveTarget }) }),
   z.object({ action: z.literal('set_tag'), ...withTarget({ ...guard, tag: z.string().max(64) }) }),
-]);
+]));
 
 // --- style -------------------------------------------------------------------
 
@@ -308,7 +406,7 @@ const DeclarationIdentity = z
   })
   .describe('A declaration, named the way style.read reported it. Pass the whole object back unchanged.');
 
-const StyleInput = z.discriminatedUnion('action', [
+const StyleInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ref: Ref.optional(),
@@ -413,11 +511,11 @@ const StyleInput = z.discriminatedUnion('action', [
     action: z.literal('move_heading'),
     edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
-]);
+]));
 
 // --- source ------------------------------------------------------------------
 
-const SourceInput = z.discriminatedUnion('action', [
+const SourceInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     path: RelPath,
@@ -464,11 +562,11 @@ const SourceInput = z.discriminatedUnion('action', [
         'declarationLine into source.read’s startLine and endLine.'
     ),
   z.object({ action: z.literal('resolve_path'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- page --------------------------------------------------------------------
 
-const PageInput = z.discriminatedUnion('action', [
+const PageInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }),
   z.object({ action: z.literal('read'), path: RelPath }),
   z.object({ action: z.literal('create'), name: z.string().max(300), layout: z.string().max(120).optional() }),
@@ -498,11 +596,11 @@ const PageInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('injected_routes') }),
   z.object({ action: z.literal('import_path'), fromFile: RelPath, targetFile: RelPath }),
   z.object({ action: z.literal('rebase_import'), fromPage: RelPath, toPage: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- content -----------------------------------------------------------------
 
-const ContentInput = z.discriminatedUnion('action', [
+const ContentInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('cms_list') }),
   z.object({ action: z.literal('cms_read'), path: RelPath }),
   z.object({ action: z.literal('cms_write'), path: RelPath, data: z.unknown(), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
@@ -569,11 +667,11 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('rename'), collection: z.string().max(200), from: z.string().max(300), to: z.string().max(300) }),
   z.object({ action: z.literal('sample_entry'), collection: z.string().max(200), id: z.string().max(300).optional() }),
   z.object({ action: z.literal('resolve_import'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- asset -------------------------------------------------------------------
 
-const AssetInput = z.discriminatedUnion('action', [
+const AssetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('list'),
     under: z.string().max(1024).optional().describe('Only what is inside this folder, e.g. "public/images".'),
@@ -586,11 +684,11 @@ const AssetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('move'), path: RelPath, toFolder: z.string().max(1024) }),
   z.object({ action: z.literal('rename'), path: RelPath, name: z.string().max(200) }),
   z.object({ action: z.literal('delete'), path: RelPath }),
-]);
+]));
 
 // --- project -----------------------------------------------------------------
 
-const ProjectInput = z.discriminatedUnion('action', [
+const ProjectInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('scan') }),
   z.object({ action: z.literal('classes'), limit: z.number().int().min(1).max(2000).optional() }),
@@ -612,11 +710,11 @@ const ProjectInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('dev_stop') }),
   z.object({ action: z.literal('undo') }),
   z.object({ action: z.literal('redo') }),
-]);
+]));
 
 // --- git ---------------------------------------------------------------------
 
-const GitInput = z.discriminatedUnion('action', [
+const GitInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('gh_status') }),
   z.object({ action: z.literal('status'), limit: z.number().int().min(1).max(400).optional() }),
@@ -629,7 +727,18 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('commit'), message: z.string().min(1).max(4000), paths: z.array(z.string().max(1024)).max(500).optional() }),
   z.object({ action: z.literal('checkout'), branch: z.string().max(300), create: z.boolean().optional(), parkFirst: z.boolean().optional() }),
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
-  z.object({ action: z.literal('resolve_merge'), branch: z.string().max(300), choices: z.record(z.string(), z.unknown()) }),
+  z.object({
+    action: z.literal('resolve_merge'),
+    branch: z.string().max(300),
+    choices: z
+      .record(z.string(), z.unknown())
+      .describe(
+        'How to settle each conflicting file, keyed by its project-relative path. A value is either "ours" or ' +
+          '"theirs" for the whole file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per ' +
+          'conflicting hunk, in the order git reports them, which is the order git.merge listed them in. A file ' +
+          'you leave out keeps this branch\'s version. Anything else is refused with nothing changed.'
+      ),
+  }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
   z.object({ action: z.literal('restore_file'), ref: z.string().max(200).optional().describe('The revision to come back to. Defaults to HEAD — the last commit.'), path: RelPath }),
   z.object({ action: z.literal('restore_project'), ref: z.string().max(200) }),
@@ -637,7 +746,7 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('unpark') }),
   z.object({ action: z.literal('push'), branch: z.string().max(300).optional().describe('The branch to push. Defaults to the branch the project is on.') }),
   z.object({ action: z.literal('publish'), repoName: z.string().max(200), private: z.boolean().optional() }),
-]);
+]));
 
 // --- descriptions ------------------------------------------------------------
 //
@@ -645,13 +754,20 @@ const GitInput = z.discriminatedUnion('action', [
 // — the schema already says the fields, and a description that repeats them is
 // paid for in every client's context on every call.
 
+// The eight domain schemas by name, so a refusal can say what the action it
+// named actually accepts without a second table to go stale.
+const DOMAIN_SCHEMAS = {};
+
 const DESCRIPTIONS = {
   target:
     'Inspect and edit the source-backed element behind what is on screen. read returns everything Stacki knows ' +
     'about it — file and lines, the component chain, props, classes, children, where its words come from and how ' +
     'many copies of it the page is rendering — so you do not have to search the repository for any of that. ' +
-    'The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo stack, and ' +
-    'save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
+    'It EDITS as well as reads, and the structural verbs are here rather than in source: set_text, set_prop, ' +
+    'set_classes, add_class, set_tag, insert_before, insert_after, append_child, duplicate, move and remove — so ' +
+    '"put this inside that", "delete this" and "add a card here" are one call on the object Stacki already ' +
+    'identified. The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo ' +
+    'stack, and save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
     'to act on what the user has selected right now. A ref carries the document as your read found it, so an ' +
     'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
     'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
@@ -665,15 +781,60 @@ const DESCRIPTIONS = {
     'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
     'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
   source:
-    'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
-    'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
-    '.astro markup: it keeps undo, the preview and the editor in step. Paths are project-relative. Replacing a ' +
+    'Project files as text, and the LAST resort rather than the first. It is the fallback for code Stacki cannot ' +
+    'model as a tree — a .ts or .js module, a config, a framework component — and the honest route when target ' +
+    'reports a file unrepresentable. It is NOT the way to answer a question about the project: use project or ' +
+    'page for structure, target for .astro markup, style for CSS and content for collection entries. Those keep ' +
+    'undo, the preview and the editor in step, and they answer from what Stacki has already parsed; reading the ' +
+    'files to work the same thing out costs more calls and can be wrong. Paths are project-relative. Replacing a ' +
     'file that already exists needs the ref your read gave you (or its digest); creating one does not.',
-  page: 'Pages, page folders and components as project objects: list, read, create, move, delete, and where a component is used.',
-  content: 'The CMS data files and the content collections: list, read, write, create, delete, validate, rename, and the entries themselves.',
-  asset: 'Files already inside the project, under public/ and src/: list, measure, read and write text ones, make folders, move, rename, delete.',
-  project: 'The open project itself: what is in it, which classes it uses, whether the preview is up, why it is not — and Stacki’s own undo and redo.',
-  git: 'The repository, through Stacki’s own git operations. Reading is always available; committing, switching, restoring, merging and pushing need full control.',
+  // THESE FIVE WERE ONE-LINE CATALOGUE LABELS, AND A CATALOGUE LABEL IS NOT
+  // RETRIEVAL METADATA.
+  //
+  // With tool search on — the default on the host this is measured against — a
+  // description is what a tool is FOUND by, and these listed their verbs
+  // without ever saying which question they answer. Measured over sixteen
+  // held-out sessions: `source` took 30 of 80 calls, and not one of them was on
+  // the single file in the fixture that `source`'s own description names as the
+  // case it exists for. Asked "which component renders the header?", the model
+  // read four files by hand rather than call `page.component_usage`, which is
+  // the operation for exactly that.
+  //
+  // So each now leads with the question a person actually types, in their
+  // words rather than the API's. They are still far shorter than `capture` and
+  // `get_comments`, and `test/host-limits.js` holds the ceiling.
+  page:
+    'Pages, folders and components as project objects, and the fast answer to "which component renders this?", ' +
+    '"what routes does this project have?" and "where is this component used?". list gives every route with its ' +
+    'file; component_usage names every page an component appears on; dynamic_paths asks the running dev server ' +
+    'what a [slug] route really stands for. Reach for this BEFORE reading files: it answers structure questions ' +
+    'from what Stacki has already parsed, and reading the pages by hand to work the same thing out is the long ' +
+    'way round. Also create, move, rename and delete.',
+  content:
+    'Content collections and CMS data — the answer to "rename that blog post", "what collections does this ' +
+    'project have?" and "change the title of this entry". Reads the real Astro content config, so it knows each ' +
+    'collection\u2019s schema and validates an entry against it before writing. Entries are objects with fields, ' +
+    'not files to be text-edited: editing frontmatter through source instead loses the schema check and the ' +
+    'references between entries. Also create, delete, rename and validate.',
+  asset:
+    'Images, fonts, downloads and data files already in the project, under public/ and src/ — the answer to ' +
+    '"what images does this use?", "how big is that?" and "move this into a folder". list and measure without ' +
+    'reading the bytes; read and write the text ones; make folders, move, rename, delete. Renaming or moving ' +
+    'updates what refers to it. This is for files that exist; it does not download or generate anything.',
+  project:
+    'The open project as a whole, and the first thing to ask when you do not know what you are looking at: ' +
+    'info and scan give the routes, components, layouts and stylesheets in one call; classes gives every class ' +
+    'name in use. Also whether the preview is running, why it is not, and how to start it — and Stacki\u2019s own ' +
+    'undo and redo, which is what "undo that" means here, not git. probe fetches a page from the project\u2019s own ' +
+    'dev server and nothing else. If a resource-capable client is available, stacki://project/profile is the ' +
+    'same picture in one read.',
+  git:
+    'The repository, through Stacki\u2019s own git operations — "commit what we changed", "what has changed?", ' +
+    '"put that file back", "make a branch". status and info and history and diffs are readable at any level; ' +
+    'committing, switching, restoring, merging and pushing need full control. A refusal names its cause — a ' +
+    'merge conflict, uncommitted work in the way, a branch that is not there — rather than saying it failed. ' +
+    'publish creates a repository on GitHub under the person\u2019s own account, which is the one thing here that ' +
+    'reaches outside this machine.',
 };
 
 // --- registration ------------------------------------------------------------
@@ -726,8 +887,11 @@ function registerAgentTools(server, { api }) {
     }
   );
 
-  const domain = (name, inputSchema, annotations) =>
-    server.registerTool(
+  const domain = (name, inputSchema, annotations) => {
+    // Kept by name so a refusal can say what the action it named accepts,
+    // without a second table that would go stale.
+    DOMAIN_SCHEMAS[name] = inputSchema;
+    return server.registerTool(
       name,
       {
         title: `Stacki ${name}`,
@@ -760,6 +924,7 @@ function registerAgentTools(server, { api }) {
         return answer(await api.run(name, action, shaped));
       }
     );
+  };
 
   domain('target', TargetInput, annotationsFor('target'));
   domain('style', StyleInput, annotationsFor('style'));
@@ -923,6 +1088,26 @@ function issuesOf(error) {
 }
 
 /**
+ * The same object, with unknown keys refused rather than dropped.
+ *
+ * Only touches a plain object schema. Anything else — a union, something with
+ * a refinement wrapped round it, a schema that is already strict — is handed
+ * back untouched, because rebuilding one from `.shape` would lose whatever the
+ * wrapper was there to add.
+ */
+function closedObject(schema) {
+  const shape = schema && typeof schema === 'object' ? schema.shape : null;
+  if (!shape || typeof shape !== 'object') return schema;
+  if (schema.def?.catchall && schema.def.catchall.def?.type === 'never') return schema;
+  // `closeShape`, not `z.strictObject`, so a nested argument is closed here for
+  // the same reason it is inside a domain branch: `audit`'s `viewports` takes
+  // objects, and a key added beside `width` and `height` was dropped without a
+  // word. What stays open is what should — a record's VALUES, where arbitrary
+  // keys are the point.
+  return closeShape(shape);
+}
+
+/**
  * The same refusal for a tool that is not a domain.
  *
  * The fix below was applied to the eight domain tools and stopped there, so
@@ -962,7 +1147,22 @@ function badToolArguments(tool, error) {
  * back as an output-validation crash instead of an answer.
  */
 function publishChecked(server, name, config, handler) {
-  const schema = config.inputSchema;
+  // CLOSED HERE TOO, AND FOR THE SAME REASON.
+  //
+  // `closed()` was applied to the eight domain unions and stopped there, which
+  // left the six tools that are not domains — get_context, capture,
+  // get_comments, comment, get_capabilities and audit — still stripping a key
+  // they did not recognise. That is the same silent retarget, on tools where it
+  // is just as consequential: `audit({ rout: '/pricing' })` dropped the typo
+  // and audited the site root instead, reporting findings about a page nobody
+  // asked about; `get_comments({ scop: 'selection' })` widened a read of one
+  // element's reviews to the whole project.
+  //
+  // Applied at the composition point rather than at six registration sites, so
+  // a tool added beside them tomorrow is closed without its author knowing to
+  // ask — which is the same argument the `checked` facade in tools.js already
+  // makes for the refusal shape.
+  const schema = closedObject(config.inputSchema);
   return server.registerTool(name, { ...config, inputSchema: advertised(schema) }, async (args, extra) => {
     const parsed = schema.safeParse(args || {});
     if (!parsed.success) return answer(badToolArguments(name, parsed.error));
@@ -992,15 +1192,34 @@ function badArguments(domain, action, error) {
     };
   }
   const issues = issuesOf(error);
+  // AND WHAT IT WOULD HAVE TAKEN.
+  //
+  // Naming the key the caller got wrong is half an answer: "Unrecognized key:
+  // \"rout\"" tells an agent to stop guessing but not what to guess next, and
+  // the top-level `properties` block the schema publishes lists every branch's
+  // arguments side by side, which is what invited the mistake. The accepted
+  // set is right here in the schema, so it travels with the refusal — as a
+  // field a client can read, and in the sentence for one that only shows text.
+  const accepts = acceptedBy(domain, action);
   return {
     ok: false,
     code: 'bad_arguments',
     operation: `${domain}.${action}`,
     issues,
-    message: `${domain}.${action} could not run — ${issues
-      .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
-      .join('; ')}`,
+    accepts,
+    message:
+      `${domain}.${action} could not run — ${issues
+        .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
+        .join('; ')}` + (accepts.length ? `. ${domain}.${action} takes: ${accepts.join(', ')}.` : ''),
   };
+}
+
+/** The argument names one action actually declares, read from its own branch. */
+function acceptedBy(domain, action) {
+  const schema = DOMAIN_SCHEMAS[domain];
+  const branch = schema?.options?.find((o) => o.shape?.action?.def?.values?.[0] === action || o.shape?.action?.def?.value === action);
+  if (!branch?.shape) return [];
+  return Object.keys(branch.shape).filter((k) => k !== 'action');
 }
 
 /**

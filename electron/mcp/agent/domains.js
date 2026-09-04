@@ -139,6 +139,13 @@ const putText = (ctx, rel, text) =>
 // small enough that no single call can fill a context window.
 const MAX_LIST = 400;
 const MAX_TEXT_BYTES = 120_000;
+// Per conflicting file, for the hunks that describe it. Well under MAX_TEXT_BYTES
+// because a merge answers about MANY files at once and the budget is the whole
+// envelope, not one entry in it.
+const MAX_CONFLICT_BYTES = 8_000;
+// And across all of them. See the merge mapper: a cap that only ever asks
+// "is this ONE file small enough" is not a cap on the answer.
+const MAX_CONFLICT_ENVELOPE_BYTES = 24_000;
 const MAX_SNIPPET_LINES = 400;
 
 // --- source ------------------------------------------------------------------
@@ -227,7 +234,17 @@ const source = {
       value: {
         path: at.rel,
         beforeDigest: before,
-        afterDigest: digestOf(input.text),
+        // THE DIGEST OF WHAT IS ON DISK, not of what the caller asked for --
+        // the same rule asset.write_text already carries a comment about.
+        //
+        // It matters most here, because these bytes genuinely can differ: a
+        // write to the OPEN document is routed through the renderer
+        // (agent/index.js `write_open_source`), which parses the text into a
+        // model and lets the normal save write the SERIALIZER's bytes. Hashing
+        // the input meant a client storing `afterDigest` for optimistic
+        // concurrency held a digest no file had, and its next guarded write was
+        // refused as `stale_target` against a file nobody had touched.
+        afterDigest: digestOfFile(at.abs),
         bytes: Buffer.byteLength(input.text, 'utf8'),
         ...wrote.through,
       },
@@ -533,7 +550,17 @@ const page = {
     // `{ paths: [], problem: null }` — indistinguishable from a page with no
     // dynamic routes, and from a dev server that had answered 500. The scenario
     // accepted "no paths, or a problem", which this satisfied both ways.
-    result: (raw) => ({ paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null }),
+    result: (raw) => {
+      // "I could not ask" is a refusal, not an empty list. See the handler.
+      if (raw && raw.asked === false) {
+        return problem(
+          'no_preview',
+          'Stacki is not serving this project, so the routes this page stands for cannot be enumerated — ' +
+            'only the dev server can run its getStaticPaths. Start the preview with project.dev_start and ask again.'
+        ).error;
+      }
+      return { paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null };
+    },
   },
 
   injected_routes: {
@@ -1174,7 +1201,13 @@ const style = {
       if (typeof input.css !== 'string') return problem('bad_request', 'css is required.');
       return { filePath: at.abs, css: input.css };
     },
-    result: (_raw, input) => ({ path: input.path, afterDigest: digestOf(input.css) }),
+    // Read back rather than re-hashed: see source.write above for why the
+    // caller's own text is the wrong thing to hash.
+    result: (_raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'stylesheet path');
+      if (at.error) return at;
+      return { path: at.rel, afterDigest: digestOfFile(at.abs) };
+    },
   },
   variables: {
     channel: 'css:variables',
@@ -1424,9 +1457,149 @@ const git = {
   checkout: {
     channel: 'git:checkout',
     args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, create: !!input.create, parkFirst: input.parkFirst !== false }),
+    // `{ ok:false, blocked:true }` is the shape runMain spreads into an envelope,
+    // so this arrived as `code: 'failed'` — the code that means nobody knows —
+    // for the commonest refusal a branch switch has. It is not a failure at all:
+    // git moved nothing, the work is still there, and the caller has to commit,
+    // park or discard it. That is an answer, and it needs a name to be one.
+    result: (raw, input) => {
+      if (raw?.ok === false && raw.blocked) {
+        return {
+          ...problem(
+            'working_tree_blocked',
+            `Switching to "${input.branch}" would overwrite work that has not been committed. ` +
+              'Commit it, park it, or discard it first — nothing was changed.'
+          ).error,
+          branch: input.branch,
+          from: raw.from ?? null,
+          files: take(raw.files, MAX_LIST),
+        };
+      }
+      return raw;
+    },
   },
-  merge: { channel: 'git:merge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
-  resolve_merge: { channel: 'git:resolveMerge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }) },
+  merge: {
+    channel: 'git:merge',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }),
+    // TWO NAMED CAUSES, AND A PAYLOAD THAT FITS.
+    //
+    // `conflicted` and `dirty` both reached the wire as `failed`, and the
+    // conflicted one arrived with no message at all — the handler writes none,
+    // so the envelope fell through to its own "That operation was refused."
+    // An agent cannot tell "your branches disagree, go and reconcile them" from
+    // "git broke" without reading English, and will retry the thing that cannot
+    // work.
+    //
+    // AND THE SIZE. The handler hands back, per conflicting file, BOTH COMPLETE
+    // VERSIONS of it (`ours` and `theirs`, each a whole `git show :N:file`) for
+    // the conflict UI in the app, which needs them. Nothing bounded that on the
+    // way out here: this was the one list in the surface with no cap, and the
+    // largest thing the git domain can say. Two conflicting thousand-line pages
+    // is a payload no host will deliver — so the agent was told `failed`, at
+    // length, and could not find out why.
+    //
+    // What travels instead is what an agent acts on: which files clash, and the
+    // conflicting HUNKS (`parts`) rather than the files they came from, both
+    // bounded and both saying so when they bite. The whole versions stay
+    // available to the panel over IPC, which is where they were needed.
+    result: (raw, input) => {
+      if (raw?.ok === false && raw.conflicted) {
+        const all = Array.isArray(raw.files) ? raw.files : [];
+        // A PER-FILE CAP IS NOT A BUDGET. Twenty conflicting files each just
+        // under the per-file limit is twenty times the limit, and this refusal
+        // is one envelope. So the per-file clip stays and a running total sits
+        // over it: once the budget is spent, later files keep their path and
+        // lose their hunks, and say so. `Buffer.byteLength`, not `.length` —
+        // the clip below measures characters, and a conflict in a CJK or
+        // emoji-carrying file is up to four bytes for each of them.
+        let spent = 0;
+        const files = take(all, MAX_LIST).map((f) => {
+          // ONLY THE REGIONS THAT ACTUALLY CLASH.
+          //
+          // `parts` is the whole file cut into runs, and the runs both sides
+          // AGREE on are almost all of it — which is the bulk this refusal must
+          // not carry twice. A conflict in one line of a three-hundred-line page
+          // is one clash and three hundred lines of settled text; the settled
+          // text is already on disk, unchanged, because the merge was unwound.
+          const clashes = Array.isArray(f?.parts) ? f.parts.filter((part) => part && part.kind === 'clash') : null;
+          const encoded = JSON.stringify(clashes ?? null);
+          const bytes = Buffer.byteLength(encoded, 'utf8');
+          const fits = bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES;
+          if (fits) spent += bytes;
+          return {
+            path: f?.path ?? null,
+            hunks: fits ? clashes : null,
+            hunksOmitted: !fits,
+          };
+        });
+        return {
+          ...problem(
+            'merge_conflict',
+            `Merging "${input.branch}" stopped on ${all.length} conflicting ${all.length === 1 ? 'file' : 'files'}. ` +
+              'The merge was unwound, so the project is exactly as it was. Reconcile the files named here and ' +
+              'apply the result with git.resolve_merge, whose `choices` takes "ours" or "theirs" per file, or an ' +
+              'array of "ours" | "theirs" | "both" | "merged" \u2014 one per hunk, in the order they are listed here.'
+          ).error,
+          branch: input.branch,
+          into: raw.from ?? null,
+          conflictCount: all.length,
+          files,
+          filesOmitted: Math.max(0, all.length - files.length),
+          // Said out loud rather than left to be discovered: the panel gets the
+          // whole of both sides, and this does not.
+          note:
+            'Each side\'s complete file is not included here. Read the conflicting hunks above, or the files ' +
+            'themselves with source.read — the merge was unwound, so they hold the pre-merge bytes.',
+        };
+      }
+      if (raw?.ok === false && raw.dirty) {
+        return {
+          ...problem(
+            'working_tree_blocked',
+            `Merging "${input.branch}" needs to write files that have uncommitted changes. ` +
+              'Commit them, park them, or discard them first — nothing was changed.'
+          ).error,
+          branch: input.branch,
+          // `from`, matching checkout's. Both refusals mean "the work in your
+          // tree is in the way"; naming the branch you are on two different
+          // things across two operations of one domain is a distinction a
+          // caller has to learn for nothing.
+          from: raw.from ?? null,
+          files: take(raw.files, MAX_LIST),
+        };
+      }
+      return raw;
+    },
+  },
+  resolve_merge: {
+    channel: 'git:resolveMerge',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }),
+    // A CHOICE THAT WAS NOT UNDERSTOOD IS NOT A RESOLUTION.
+    //
+    // The handler used to treat anything that was not the string 'theirs' as
+    // "keep ours" and then commit it, so a wrong shape discarded the other
+    // branch's work and answered `ok: true, changed: true` with
+    // `undoable: false`. It now refuses; this gives that refusal a code and
+    // states the vocabulary an agent should have been told in the first place.
+    result: (raw, input) => {
+      if (raw?.ok === false && Array.isArray(raw.badChoices)) {
+        const first = raw.badChoices[0] || {};
+        return {
+          ...problem(
+            'bad_choices',
+            `Nothing was merged: ${raw.badChoices.length} of the choices could not be understood, starting with ` +
+              `${first.path}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
+              '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk, in the order git reports ' +
+              "them. A file you leave out keeps this branch's version."
+          ).error,
+          branch: input.branch,
+          into: raw.from ?? null,
+          badChoices: take(raw.badChoices, MAX_LIST),
+        };
+      }
+      return raw;
+    },
+  },
   delete_branch: {
     channel: 'git:deleteBranch',
     args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }),
@@ -1650,6 +1823,24 @@ const GIT_CAUSES = [
     () => 'There is nothing to commit — no file in the project has changed since the last commit.',
   ],
   [/pathspec .* did not match/i, 'no_file', null],
+  // THE TWO COMMONEST GIT REFUSALS OF ALL, WHICH ARRIVED AS `failed`.
+  //
+  // The in-band shapes are named by the `merge` and `checkout` result mappers
+  // above; these catch the same two causes when git's text reaches here as a
+  // throw instead — a caller that reaches `git:merge` by another route, an
+  // operation that shells out and lets the error rise, or a git that words the
+  // refusal in a way the handler's own test above did not match. The codes are
+  // deliberately the same in both routes: one cause, one name, however it
+  // travelled.
+  //
+  // Both sentences are git's own, because git names the branch and the files it
+  // is talking about better than a rewrite here could.
+  [/CONFLICT \(|Automatic merge failed|fix conflicts and then commit/i, 'merge_conflict', null],
+  [
+    /would be overwritten by (checkout|merge)|Your local changes to the following files would be overwritten|Please commit your changes or stash them/i,
+    'working_tree_blocked',
+    null,
+  ],
   // BEFORE the ref rule, and deliberately: `fatal: invalid reference: x` is
   // what `git switch x` says, and the argument the caller got wrong there is a
   // branch. An operation that takes a `branch` answering `no_ref` while its
@@ -1735,6 +1926,10 @@ function refusal(raw) {
 
 module.exports = {
   runMain,
+  // Exported so the renderer's own answers get the same treatment. A message
+  // built in the renderer never passed through `thrownFailure`, so an absolute
+  // path in one reached the wire intact.
+  withoutHostPaths,
   // Exported for test/git-envelopes.js, which calls it with the error shapes
   // that reach it — including the ones no fixture can provoke end to end, like
   // a package manager's stderr with somebody's home directory in it.

@@ -28,6 +28,73 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
+const os = require('node:os');
+const { makeFakeGh, shadowedPath } = require(path.join(__dirname, '..', '..', '..', 'test/support/fakeGh.js'));
+
+// WHAT A TRIAL'S CHILD IS NOT ALLOWED TO INHERIT.
+//
+// This harness spawns a real, autonomous agent host. It used to hand it
+// `{ ...process.env }`, which on a developer's machine means a real
+// `GITHUB_MCP_PAT` and a real `gh` on PATH — a live GitHub credential and a
+// working client for it, handed to a process whose entire job is to act on its
+// own initiative. That is not a hypothetical: the variable is set on the
+// machine this was written on, and an earlier campaign in this repository
+// created a real GitHub repository by exactly this route.
+//
+// So a trial gets neither. The credentials are removed by name, `gh` is
+// shadowed by the fail-closed fake from test/support/fakeGh.js, and
+// `GH_CONFIG_DIR` points at an empty directory the trial owns so a stored
+// login cannot stand in for the stripped variable.
+const CREDENTIAL_VARS = [
+  'GITHUB_MCP_PAT',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITHUB_ENTERPRISE_TOKEN',
+  'GH_ENTERPRISE_TOKEN',
+];
+
+/**
+ * The environment a trial's child actually gets, and the proof that it is safe.
+ *
+ * Returns `{ env, fake, assertions }`. `assertions` is what was CHECKED rather
+ * than what was intended — a caller records it, so a run that somehow reached
+ * the real thing is visible in the results file rather than only in a comment.
+ */
+function containedEnv(extra = {}) {
+  const fake = makeFakeGh();
+  const ghConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-trial-ghconfig-'));
+  const env = { ...process.env, CI: '1', ...extra };
+  for (const name of CREDENTIAL_VARS) delete env[name];
+  env.GH_CONFIG_DIR = ghConfigDir;
+  // Throws unless `command -v gh` under THIS env resolves to the fake.
+  env.PATH = shadowedPath(fake.dir, env.PATH);
+
+  const leaked = CREDENTIAL_VARS.filter((name) => env[name] !== undefined);
+  if (leaked.length) throw new Error(`refusing to launch: ${leaked.join(', ')} survived the strip`);
+  if (fake.calls().length) throw new Error('refusing to launch: the fake gh log was not empty before the trial started');
+
+  return {
+    env,
+    fake,
+    ghConfigDir,
+    assertions: {
+      credentialsStripped: CREDENTIAL_VARS.slice(),
+      // The names only. A test that printed the values it removed would be the
+      // leak it exists to prevent.
+      credentialsPresentAfter: leaked,
+      ghResolvesTo: fake.bin,
+      ghConfigDir,
+      fakeGhLogEmptyAtStart: true,
+    },
+    cleanup: () => {
+      const calls = fake.calls();
+      fake.cleanup();
+      fs.rmSync(ghConfigDir, { recursive: true, force: true });
+      return calls;
+    },
+  };
+}
+
 
 /** Where the `claude` binary is, or null. Never installed by this file. */
 function claudeBinary() {
@@ -71,19 +138,54 @@ function writeConfig(workspace, { url, token, name = 'stacki' }) {
 // the MCP-only mode must include these two: they are MCP access, not filesystem
 // access, and excluding them would measure a Stacki whose entire Phase-B
 // resource surface had been switched off.
-const MCP_ACCESS_TOOLS = ['ListMcpResourcesTool', 'ReadMcpResourceTool'];
+// EVERY DOOR THE HOST OFFERS TO AN MCP RESOURCE, not the two that were
+// remembered. Claude Code exposes several spellings — the singular
+// `ReadMcpResourceTool`, the plural `ReadMcpResourcesTool`, and a directory
+// variant — and this list decides two things at once: what the `mcp-only` mode
+// is allowed to use, and what counts as escaping it.
+//
+// Missing one is a false alarm in the isolation oracle rather than a hole in
+// it. A held-out trial did exactly that: the model read `stacki://project/profile`
+// through `ReadMcpResourcesTool`, which is an MCP read and nothing else, and
+// the trial was recorded as `isolationHeld: false` — a purity violation that
+// never happened. An oracle that cries wolf is spent as surely as one that
+// stays quiet.
+const MCP_ACCESS_TOOLS = [
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'ReadMcpResourcesTool',
+  'ReadMcpResourceDirTool',
+];
+
+// AND THE ONE THAT MAKES THE CATALOGUE DEFERRABLE.
+//
+// `ToolSearch` is a built-in, so leaving it out of `--tools` does not merely
+// omit a tool — it turns MCP tool search off, because there is nothing to
+// search with. That is the DEFAULT regime for every real Claude Code user, and
+// a purity mode that silently disables it measures a Stacki nobody has.
+//
+// Measured, on the real host: first-turn context was 14,836 tokens without it
+// and 5,311 with it, and `ENABLE_TOOL_SEARCH=true|false|auto:0` made no
+// difference at all in the first case (14,832 / 14,848 / 14,836) because there
+// was no searcher to enable. So every context number this harness produced in
+// `mcp-only` was of the fully-inlined catalogue — about fifteen times the
+// marginal cost a real session pays.
+//
+// It reads and writes nothing, so it is not an escape from the sandbox; the
+// purity claim is unchanged and is still checked from the transcript.
+const TOOL_SEARCH = 'ToolSearch';
 
 // Structured answers come back through a tool as well. It writes nothing and
 // reads nothing; counting it as an escape from the sandbox would fail every
 // trial that was asked for a structured answer.
-const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, 'StructuredOutput']);
+const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, TOOL_SEARCH, 'StructuredOutput']);
 
 /** The built-in tools a host may use, per mode. */
 const TOOLSET = {
   // Everything Stacki can be asked, and nothing else: no Bash, no Read, no
   // Write, no Glob, no Grep, no web. Whether that held is checked from the
   // transcript rather than trusted.
-  'mcp-only': MCP_ACCESS_TOOLS.join(','),
+  'mcp-only': [...MCP_ACCESS_TOOLS, TOOL_SEARCH].join(','),
   integrated: 'default',
 };
 
@@ -132,8 +234,8 @@ function runHost({
     tools,
     '--allowedTools',
     mode === 'mcp-only'
-      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')}`
-      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},Bash,Read,Write,Edit,Glob,Grep`,
+      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH}`
+      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH},Bash,Read,Write,Edit,Glob,Grep`,
     '--permission-mode',
     'dontAsk',
     // No user, project or local settings file joins the run, so a hook or a
@@ -154,10 +256,12 @@ function runHost({
 
   return new Promise((resolve) => {
     const began = Date.now();
+    // A trial must not inherit an interactive terminal's idea of anything, and
+    // must not inherit its credentials at all. See `containedEnv` above.
+    const contained = containedEnv(env);
     const child = spawn('claude', args, {
       cwd: workspace,
-      // A trial must not inherit an interactive terminal's idea of anything.
-      env: { ...process.env, CI: '1', ...env },
+      env: contained.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -219,7 +323,14 @@ function runHost({
       // nor the structured-answer tool, is the model reaching outside Stacki.
       const escaped = Object.fromEntries(Object.entries(used).filter(([n]) => !n.startsWith('mcp__') && !NOT_AN_ESCAPE.has(n)));
 
+      // TORN DOWN HERE, and what it saw is part of the result. A trial that
+      // reached the boundary — anything at all in the fake gh's log — is a
+      // finding, not a footnote, so it travels with the run rather than being
+      // discarded with the directory.
+      const ghCalls = contained.cleanup();
+
       resolve({
+        containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
         ok: code === 0 && !!result && result.is_error !== true,
         exitCode: code,
         timedOut: Date.now() - began >= timeoutMs,

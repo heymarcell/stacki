@@ -32,6 +32,7 @@ const H = require('../agent-harness.js');
 const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
 const { ensureAstro, astroCached, CACHE } = require('../agent-canvas-fixture.js');
 const { createStackiMcpServer } = require('../../electron/mcp/server.js');
+const { createContextStore } = require('../../electron/mcp/contextStore.js');
 const { connectMcp } = require('./mcpWire.js');
 const net = require('node:net');
 
@@ -245,6 +246,10 @@ async function startWireRig({
   let token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
   let url = `http://127.0.0.1:${port}/mcp`;
 
+  // The same normaliser the app uses, fed by the same trail resolver, so the
+  // snapshot this rig serves is the shape the schema declares.
+  const contextStore = createContextStore({ resolveTrail: (keys) => harness.resolveTrail(keys) });
+
   const buildServer = (port, token) => createStackiMcpServer({
     port,
     token,
@@ -253,7 +258,26 @@ async function startWireRig({
     // The four core tools still have to exist for the endpoint to build. The
     // context one is answered from the App's own published payload, so
     // get_context over the wire is the App's real snapshot.
-    getContext: async () => harness.payload(),
+    //
+    // THROUGH THE STORE, THE WAY THE SHIPPED SERVER DOES IT.
+    //
+    // This handed back `harness.payload()` — the RAW renderer payload — while
+    // electron/mcp/index.js feeds that through `createContextStore` and answers
+    // `store.read()`. The raw payload has no `revision`, no `timestamp`, no
+    // `selection.status`, no `selection.source` and no `selection.sourceTrail`,
+    // so every `get_context` over this rig failed its own declared output
+    // schema and came back a refusal — while the comment above claimed it was
+    // the App's real snapshot.
+    //
+    // It was invisible because nothing in the coverage set reads context over
+    // the wire and then uses it. A held-out evaluation did, and paid for it:
+    // the same ten prompts took 59 calls against 46, and 2.04M model tokens
+    // against 1.48M, because the agent kept re-deriving what a working
+    // get_context would have told it once.
+    getContext: async () => {
+      contextStore.publish(harness.payload());
+      return contextStore.read();
+    },
     capture: async (args) => ({
       image: null,
       mimeType: null,
