@@ -1368,6 +1368,45 @@ function sameMeaning(a, b) {
   return true;
 }
 
+// The parse-local half of AS_WRITTEN: the three fields that describe where a
+// node sat in ONE parse rather than how its author spelled it. Ids are handed
+// out by a counter that keeps counting across parses, so the same node parsed
+// twice is `n2` and then `n9`; offsets move whenever anything earlier in the
+// file changes length. Neither is a handle, and both were measured behaving
+// exactly that way before this comment was written.
+const PARSE_LOCAL = new Set(['id', 'start', 'end']);
+
+/**
+ * Do these two nodes say the same thing AND read the same way?
+ *
+ * `sameMeaning` skips every AS_WRITTEN field, which is right for asking whether
+ * an edit changed anything. It is too coarse for asking WHICH of several
+ * equal-meaning nodes a set of bytes belongs to, because the fields it skips --
+ * `source`, `attrSource`, `attrQuotes`, `headSource`, `closeSource` -- are
+ * precisely the record of how this one was written down.
+ *
+ * So this is the same walk with a smaller skip list: only the two things that
+ * genuinely cannot survive a re-parse. A node that means the same and spells
+ * the same is the same node, as closely as this parser can say so.
+ */
+function sameSpelling(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return a === b;
+  if (typeof a !== 'object' || typeof b !== 'object') return a === b;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => sameSpelling(v, b[i]));
+  }
+  const isNode = typeof a.kind === 'string' || typeof b.kind === 'string';
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)].filter((k) => !(isNode && PARSE_LOCAL.has(k))));
+  for (const k of keys) {
+    if (a[k] === undefined && b[k] === undefined) continue;
+    if (!sameSpelling(a[k], b[k])) return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // WHERE THE CHANGE IS, AS A LIST OF SPLICES
 // ---------------------------------------------------------------------------
@@ -1457,6 +1496,50 @@ function indentStepOf(source, nodes) {
 // other rule in this file treats leading whitespace as layout it is free to
 // shift, and inside these it is not.
 const HOLDS_RENDERED_SPACE = /<(pre|textarea|script|style)[\s>]/i;
+
+// AND THE SAME PROPERTY, ASKED FOR IN CSS RATHER THAN SPELLED AS A TAG.
+//
+// `white-space: pre` on an ordinary `<div>` makes its leading spaces content
+// exactly as a `<pre>` does, and the tag-shaped guard above cannot see it: a
+// move of `<div class="whitespace-pre">alpha\n  beta</div>` used to come back
+// as `alpha\nbeta`, two spaces of rendered text deleted by a reindent, with
+// `ok: true` and nothing downstream noticing -- the readback in
+// `anchoredSerialize` compares `<pre>`/`<textarea>` runs, so it could not see it
+// either.
+//
+// WHAT THIS COVERS, said plainly because the gap matters: the declaration has to
+// be ON the element, as an inline `style` or as one of the whitespace utility
+// classes. Whitespace preserved by a rule in a stylesheet -- `.card { white-space: pre }` --
+// is NOT detected here, because this parser has no cascade and inventing one
+// would be a second CSS engine. That residual is written down in
+// docs/mcp-v1.md rather than left to be discovered.
+//
+// Refusing is always the safe direction: the block travels as its author wrote
+// it and sits at its old inner indentation, which is cosmetic. The alternative
+// is silent data loss.
+const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(pre|pre-wrap|pre-line|break-spaces)/i;
+const PRESERVES_SPACE_CLASS = /(^|\s)(whitespace-pre(-wrap|-line)?|whitespace-break-spaces)(\s|$)/i;
+
+/** Does this node, or anything inside it, ask for its own whitespace to be kept? */
+function declaresRenderedSpace(node) {
+  if (!node || typeof node !== 'object') return false;
+  const props = node.props;
+  if (props && typeof props === 'object') {
+    const valueOf = (name) => {
+      const p = props[name];
+      if (p == null) return null;
+      // A prop is `{type, value}`; a bound expression has no literal to read and
+      // is deliberately not guessed at.
+      const v = typeof p === 'object' ? p.value : p;
+      return typeof v === 'string' ? v : null;
+    };
+    const style = valueOf('style');
+    if (style && PRESERVES_SPACE.test(style)) return true;
+    const cls = valueOf('class') || valueOf('className');
+    if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+  }
+  return Array.isArray(node.children) && node.children.some(declaresRenderedSpace);
+}
 
 /**
  * The inner bytes of every `<pre>` and `<textarea>`, in document order.
@@ -1593,9 +1676,40 @@ function alignChildren(baseNodes, nextNodes) {
  * test/source-fidelity-matrix.js is `<h4><Card /> Developer</h4>` -- a component
  * and a word on one line, which the serializer writes as three.
  *
- * `sameMeaning` skips the as-written caches, so the twin is the first node that
- * means the same and not necessarily the one that reads the same; where those
- * differ inside a `<pre>` the readback in `anchoredSerialize` catches it.
+ * `sameMeaning` skips the as-written caches, so a search BY MEANING answers with
+ * the first node that means the same and not necessarily the one that reads the
+ * same. That is the right answer for a node the file does not hold yet, and the
+ * wrong one for a node it does: two siblings can mean the same and be spelled
+ * differently, and then a move of the second one arrives wearing the first
+ * one's bytes.
+ *
+ * THAT IS NOT HYPOTHETICAL AND IT IS NOT ONLY ABOUT `<pre>`. Two `<img>` tags
+ * with the same attributes, one written on a line and one with its attribute
+ * block hand-wrapped over four, are one meaning and two spellings. Moving the
+ * wrapped one used to reprint it as the flat one -- a reformat of somebody's
+ * markup that no operation asked for, that `sameMeaning` cannot see because the
+ * trees agree, and that the `renderedWhitespace` readback in
+ * `anchoredSerialize` cannot see either because none of those bytes is
+ * whitespace a browser renders. It shipped silently. It is
+ * `theTwinWhoseBytesAreItsOwn` in test/source-fidelity-matrix.js.
+ *
+ * There is no handle to look it up by. A model handed out by `parsePage` carries
+ * no offsets -- those live only on the base parse this finder is built from --
+ * and `id` is worse than useless across parses: the counter keeps counting, so
+ * the same node is `n2` in the caller's model and `n9` in the base. Both were
+ * tried and both were measured failing before this comment was written.
+ *
+ * What the node DOES carry is how it was written down: `source`, `attrSource`,
+ * `attrQuotes`, `headSource`, `closeSource` -- the very fields `sameMeaning`
+ * skips. So the tie is broken by asking the question `sameMeaning` refuses to:
+ * among the nodes that mean the same, prefer one that also READS the same.
+ *
+ * That is strictly narrowing. Where the file holds exactly one node of this
+ * meaning, the answer is what it always was. Where it holds several, the one
+ * whose spelling matches is the one the bytes belong to, and if none matches --
+ * a node that was just edited, or one an insert created -- the answer falls
+ * back to the first, exactly as before. Nothing that used to find a twin stops
+ * finding one.
  */
 function twinFinder(baseNodes) {
   let flat = null;
@@ -1610,7 +1724,20 @@ function twinFinder(baseNodes) {
       };
       walk(baseNodes);
     }
-    return flat.find((b) => sameMeaning(b, node)) || null;
+    // THE ONE THAT READS THE SAME, IF THE FILE HOLDS ONE.
+    //
+    // One pass, and it returns early on the first candidate that also spells
+    // the same -- which for a node with no equal-meaning sibling is the first
+    // candidate there is, so the common case costs what the old `.find` cost.
+    // Only a node whose first meaning-match spells DIFFERENTLY pays for the
+    // rest of the walk, and that is exactly the ambiguous case worth paying for.
+    let first = null;
+    for (const b of flat) {
+      if (!sameMeaning(b, node)) continue;
+      if (sameSpelling(b, node)) return b;
+      if (first === null) first = b;
+    }
+    return first;
   };
 }
 
@@ -1635,7 +1762,7 @@ function printNode(node, indent, ctx) {
     // reprinting the DOCUMENT, which keeps a `<pre>` perfectly well and tears
     // the frontmatter comments off the imports they annotate. Asking only about
     // the `<pre>` is how this line came to be deletable with nine suites green.
-    if (HOLDS_RENDERED_SPACE.test(held)) return held;
+    if (HOLDS_RENDERED_SPACE.test(held) || declaresRenderedSpace(twin)) return held;
     const copied = reindentBlock(held, lineIndentOf(ctx.source, twin.start), indent);
     if (copied !== null) return copied;
   }

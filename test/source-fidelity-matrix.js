@@ -914,6 +914,88 @@ function whitespaceThePageRenders() {
 // fired 0, and deleting it changed nothing anyone could measure. Here it fires,
 // the write falls back, and the file the author gets is the one they wrote.
 
+// TWO SIBLINGS THAT MEAN THE SAME AND ARE NOT WRITTEN THE SAME.
+//
+// `theTwinThatIsNotTheSameBytes` below is the `<pre>` version of this, and it
+// passes for a reason that does not generalise: the damage it produces is
+// whitespace a browser renders, so `anchoredSerialize`'s readback sees it, the
+// splice is refused and the write falls back to reprinting the document. The
+// author gets the right file by way of a fallback rather than by the twin being
+// right.
+//
+// Take the rendered whitespace away and nothing is left to notice. Two `<img>`
+// tags with identical attributes — one written on a line, one with its attribute
+// block hand-wrapped over four — are one meaning and two spellings. `sameMeaning`
+// skips `attrSource`, so the trees agree; none of those bytes is whitespace a
+// browser renders, so the readback agrees too. Measured at ac57c20, moving the
+// WRAPPED one produced the FLAT one's bytes at the new location: somebody's
+// hand-formatted markup silently reformatted by an operation that was asked to
+// move it, `ok: true`, nine suites green.
+//
+// `twinFinder` now breaks the tie by asking the question `sameMeaning` refuses
+// to — among the nodes that mean the same, which one also READS the same — so
+// the bytes that travel are the bytes of the node that was moved.
+function theTwinWhoseBytesAreItsOwn() {
+  const source = commentedPage(
+    `  <div class='wrap'>\n    <img src="a.png" alt="Logo">\n    <img\n      src="a.png"\n      alt="Logo"\n    >\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check('a page with two identical <img> tags spelled differently parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const div = root.children.find((n) => n.name === 'div');
+  const imgs = (div?.children || []).filter((n) => n.name === 'img');
+  if (!check('  and both are where a move can reach them', imgs.length === 2, short(div?.children?.map((n) => n.name)))) return;
+  // THE PREMISE, asserted rather than assumed: same meaning, different spelling.
+  // If the parser ever stops recording the layout, this stops being the fixture
+  // and says so here rather than passing for the wrong reason.
+  if (
+    !check(
+      '  and only the second one carries a hand-wrapped attribute block',
+      imgs[0].attrSource === undefined && typeof imgs[1].attrSource === 'string' && imgs[1].attrSource.includes('\n'),
+      short({ a: imgs[0].attrSource, b: imgs[1].attrSource })
+    )
+  ) {
+    return;
+  }
+  if (
+    !check(
+      '  and nothing here is whitespace a browser renders',
+      !/<(pre|textarea|script|style)[\s>]/i.test(source),
+      'the point of this fixture is that the readback cannot see the damage'
+    )
+  ) {
+    return;
+  }
+
+  div.children = div.children.filter((n) => n !== imgs[1]);
+  root.children.splice(root.children.indexOf(div) + 1, 0, imgs[1]);
+  const after = anchoredSerialize(source, model);
+
+  const moved = /<\/div>\s*\n([\s\S]*?)\n  <footer/.exec(after);
+  check(
+    'the <img> that moved keeps ITS bytes, not the bytes of the one that means the same',
+    !!moved && /\n\s+src="a\.png"/.test(moved[1]) && /\n\s+alt="Logo"/.test(moved[1]),
+    short({ got: moved ? moved[1] : null, span: changedSpan(source, after) })
+  );
+  check(
+    '  and it is still one <img>, not two',
+    (after.match(/<img/g) || []).length === 2,
+    short((after.match(/<img[^>]*>/g) || []).join(' | '))
+  );
+  check(
+    '  and the one that stayed is still inside the div',
+    /<div class='wrap'>[\s\S]*?<img[\s\S]*?<\/div>/.test(after),
+    short(changedSpan(source, after))
+  );
+  check(
+    '  and the footer nobody touched is untouched',
+    after.includes(`  <footer class='end'>end</footer>`),
+    short(changedSpan(source, after))
+  );
+}
+
 function theTwinThatIsNotTheSameBytes() {
   const source = commentedPage(
     `  <div class='wrap'>\n    <pre>alpha beta</pre>\n    <pre>alpha\n  beta</pre>\n  </div>\n` +
@@ -1350,6 +1432,7 @@ function overlappingSplices() {
   whitespaceThePageRenders();
   trailingSpacesOnTheLineItLeaves();
   theTwinThatIsNotTheSameBytes();
+  theTwinWhoseBytesAreItsOwn();
   wordsWithoutTheBoundaryBytes();
   stepFromTheTree();
   tabsAgainstSpaces();
