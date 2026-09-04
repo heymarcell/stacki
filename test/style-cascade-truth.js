@@ -95,6 +95,32 @@ const FIXTURE = {
 </style>
 `,
 
+  // IMPORTED BY NOTHING, and its scoped block escapes with `:global()`.
+  //
+  // Astro emits a component's CSS for the pages whose module graph contains it,
+  // so `outline: 9px solid magenta` does not paint anything on this page. The
+  // escaped-rule scan reads every .astro file in the PROJECT, which is how this
+  // rule came to be offered as one reaching the element — hedged with the same
+  // `reachedByOpenPage: 'unknown'` that Escaping.astro, which really does reach
+  // it, gets. Two different facts, one word.
+  'src/components/Orphan.astro': `<span class="orphan">orphan</span>
+<style>
+  :global(.pricing-grid) { outline: 9px solid magenta; }
+</style>
+`,
+
+  // A writable is:global block FIRST and a scoped one LAST. Creating a rule here
+  // used to be refused, because the destination was "the last region" rather
+  // than "the last region Stacki will write into".
+  'src/components/Mixed.astro': `<span class="mixed">mixed</span>
+<style is:global>
+  .mixed-global { color: green; }
+</style>
+<style>
+  .mixed { color: blue; }
+</style>
+`,
+
   // The false positive the Astro hash exists to prevent: a scoped rule for a
   // class this component does not render. It must never be offered.
   'src/components/Badge.astro': `<span class="badge">new</span>
@@ -120,12 +146,14 @@ import Base from '../layouts/Base.astro';
 import Nav from '../components/Nav.astro';
 import Badge from '../components/Badge.astro';
 import Escaping from '../components/Escaping.astro';
+import Mixed from '../components/Mixed.astro';
 import Card from '../components/Card.astro';
 ---
 <Base>
   <Nav />
   <Badge />
   <Escaping />
+  <Mixed />
   <div class="pricing-grid">
     <p class="many">many</p>
   </div>
@@ -369,6 +397,199 @@ const declsOf = (answer, prop) =>
     check('and a property nothing authored declares is not', out.unexplained.some((u) => u.property === 'display'), short(out.unexplained));
     check('so the answer does not claim to explain the computed style', out.explainsComputed === false);
     check('and with nothing computed it claims nothing either way', reconcileComputed(rules, null).explainsComputed === null);
+
+    // ── AND IT MAY NOT ACCUSE THE RESPONSE'S OWN CONTENTS ────────────────────
+    //
+    // "No authored declaration Stacki can see sets this property" is a sentence
+    // about the rules in the same answer. Said about a property one of those
+    // rules plainly sets, it is not a hedge — it is a false statement that sends
+    // an agent looking for a class that does not exist. Two ways it was being
+    // said: a declaration inside @media or :hover carries `winning: null`
+    // because nothing here resolves the condition, and `padding` is spelled
+    // `padding-top` in a computed style.
+    const conditional = [
+      {
+        selector: '.card',
+        declarations: [
+          { property: 'padding', value: '1rem', winning: true },
+          { property: 'color', value: 'teal', winning: null, appliesWhen: ['@media (min-width: 768px)'] },
+          { property: 'background', value: 'red', winning: null, appliesWhen: ['.card:hover'] },
+        ],
+      },
+    ];
+    const honest = reconcileComputed(conditional, {
+      padding: '16px',
+      'padding-top': '16px',
+      color: 'rgb(0, 128, 128)',
+      background: 'rgba(0, 0, 0, 0)',
+      'font-size': '16px',
+    });
+    check(
+      'a longhand is not called unexplained by an answer returning its shorthand',
+      !honest.unexplained.some((u) => u.property === 'padding-top'),
+      short(honest.unexplained)
+    );
+    check(
+      'and a property whose only declaration is an unresolved @media is not either',
+      !honest.unexplained.some((u) => u.property === 'color'),
+      short(honest.unexplained)
+    );
+    check(
+      '  nor one whose only declaration is an unresolved :hover',
+      !honest.unexplained.some((u) => u.property === 'background'),
+      short(honest.unexplained)
+    );
+    check(
+      'while a property genuinely nothing declares is still named',
+      honest.unexplained.length === 1 && honest.unexplained[0].property === 'font-size',
+      short(honest.unexplained)
+    );
+    // The shorthand table has to be a table and not a prefix test: `color` is
+    // not a shorthand for `color-scheme`, and treating it as one would silence
+    // a real gap.
+    const notAShorthand = reconcileComputed([{ declarations: [{ property: 'color', winning: true }] }], { 'color-scheme': 'dark' });
+    check(
+      'and a property that merely starts with a declared one is not silenced',
+      notAShorthand.unexplained.some((u) => u.property === 'color-scheme'),
+      short(notAShorthand.unexplained)
+    );
+
+    // ── THE RULES THE ANSWER DID NOT RETURN ──────────────────────────────────
+    //
+    // `unexplained` is computed over properties the AUTHORED rules named, so it
+    // is structurally unable to notice a rule the scan never saw. documentRules
+    // is the browser's own list, and a rule in it that no authored rule accounts
+    // for is the answer's own evidence against its own completeness.
+    const authoredOnly = [{ selector: '.card', matchedSelectors: ['.card'], declarations: [{ property: 'padding', winning: true }] }];
+    const withGenerated = reconcileComputed(authoredOnly, { padding: '16px' }, [
+      { selector: '.card', cssText: 'padding: 1rem;', stylesheet: 'inline <style>' },
+      { selector: '.text-red-500', cssText: 'color: rgb(239 68 68);', stylesheet: 'http://localhost:4321/_astro/index.css' },
+    ]);
+    check(
+      'a document rule the authored scan returned is accounted for',
+      !withGenerated.unaccountedRules.some((r) => r.selector === '.card'),
+      short(withGenerated.unaccountedRules)
+    );
+    check(
+      'and one it did not is named, with the properties it sets',
+      withGenerated.unaccountedRules.length === 1 &&
+        withGenerated.unaccountedRules[0].selector === '.text-red-500' &&
+        withGenerated.unaccountedRules[0].properties.join(',') === 'color',
+      short(withGenerated.unaccountedRules)
+    );
+    // Astro hashes a scoped selector on its way into the served document and a
+    // :global() wrapper never leaves the source, so the same rule has two
+    // spellings. Comparing them raw would report an unaccounted rule on every
+    // Astro page that has one scoped block.
+    const spellings = reconcileComputed(
+      [{ selector: ':global(.pricing-grid)', matchedSelectors: ['.pricing-grid'], declarations: [] }, { selector: '.link', matchedSelectors: ['.link'], declarations: [] }],
+      null,
+      [
+        { selector: '.pricing-grid', cssText: 'outline: 2px dashed blue;' },
+        { selector: '.link[data-astro-cid-jwdmkl2g]', cssText: 'color: var(--brand);' },
+      ]
+    );
+    check(
+      'the same rule spelled two ways is one rule, not an unaccounted one',
+      spellings.unaccountedRules.length === 0,
+      short(spellings.unaccountedRules)
+    );
+  });
+
+  // ── F16a3 · a component that is not on this page is not on this page ─────
+  //
+  // `escapedRegion` reads the `:global(...)` rules out of every scoped block in
+  // the PROJECT, because the file list it works from is a whole-project scan.
+  // Astro emits a component's CSS from the page's module graph, so a component
+  // nothing imports paints nothing — and offering its rule as one reaching the
+  // element is the same dishonesty the Astro hash prevents (F16a), one class of
+  // markup over. `reachedByOpenPage` is where that gets said, and it is the one
+  // place `false` can be proved rather than hedged.
+
+  await section(async () => {
+    const answer = await run('style', 'read', { ref: grid.ref });
+    const from = (name) => (answer.rules || []).filter((r) => r.source.file === `src/components/${name}.astro`);
+
+    const orphan = from('Orphan');
+    check('the orphaned component\'s escaped rule is not silently dropped', orphan.length === 1, short((answer.rules || []).map((r) => r.source.file)));
+    check(
+      'but the answer says the page does not load it, rather than hedging',
+      orphan.every((r) => r.source.reachedByOpenPage === false),
+      short(orphan.map((r) => ({ sel: r.selector, reached: r.source.reachedByOpenPage })))
+    );
+    check(
+      '  and it is the rule the reviewer\'s magenta outline came in on',
+      orphan[0] && orphan[0].declarations.some((d) => d.property === 'outline'),
+      short(orphan[0] && orphan[0].declarations)
+    );
+
+    // THE OTHER HALF, or the fix is just a blanket `false`. Escaping.astro is
+    // imported by this page and its `:global()` rule really does reach the
+    // element, and it must not be denied along with the orphan.
+    const escaping = from('Escaping');
+    check('a component the page DOES import is still reported as reaching it', escaping.length >= 1 && escaping.every((r) => r.source.reachedByOpenPage === true), short(escaping.map((r) => ({ sel: r.selector, reached: r.source.reachedByOpenPage }))));
+    check(
+      '  which is not the same word as before, so the two are now distinguishable',
+      new Set([...orphan, ...escaping].map((r) => String(r.source.reachedByOpenPage))).size === 2,
+      short([...orphan, ...escaping].map((r) => [r.source.file, r.source.reachedByOpenPage]))
+    );
+  });
+
+  // ── F16g2 · "Stacki could not parse X" about a file Stacki just parsed ────
+  //
+  // The create path had one refusal for three situations, and two of them it
+  // described falsely. A component's scoped `<style>` has `root: null` because
+  // Stacki deliberately leaves it verbatim, not because parsing failed — and
+  // taking the LAST region unconditionally refused a component that had a
+  // perfectly writable is:global block above a scoped one.
+
+  await section(async () => {
+    const scopedOnly = await run('style', 'set_property', {
+      ref: grid.ref,
+      source: 'astro:src/components/Escaping.astro',
+      selector: '.pricing-grid',
+      property: 'color',
+      value: 'red',
+    });
+    check('creating a rule in a scoped-only component is still refused', scopedOnly.ok === false, short(scopedOnly));
+    check(
+      '  but not by accusing Stacki of failing to parse a file it just read',
+      !/could not parse/i.test(String(scopedOnly.message)),
+      short(scopedOnly.message)
+    );
+    check(
+      '  and with the code that says what is actually true of it',
+      scopedOnly.code === 'read_only' && /scoped/i.test(String(scopedOnly.message)),
+      short({ code: scopedOnly.code, message: scopedOnly.message })
+    );
+    check(
+      '  the same component whose rules the same answer returns',
+      (await run('style', 'read', { ref: grid.ref })).rules.some((r) => r.source.file === 'src/components/Escaping.astro'),
+      'Escaping.astro contributed no rule, so this refusal is not about a parsed file'
+    );
+    check('and the component was not touched', /:global\(\.pricing-grid\)/.test(app.read('src/components/Escaping.astro')));
+
+    // AND THE ONE THAT SHOULD NEVER HAVE BEEN REFUSED: an is:global block first,
+    // a scoped block last. The destination is the last region Stacki can write,
+    // not the last region.
+    const mixed = await run('style', 'set_property', {
+      ref: grid.ref,
+      source: 'astro:src/components/Mixed.astro',
+      selector: '.pricing-grid',
+      property: 'color',
+      value: 'rebeccapurple',
+    });
+    check('a component whose LAST block is scoped can still take a new rule', mixed.ok === true, short(mixed));
+    check(
+      '  written into the is:global block, on disk',
+      /is:global[\s\S]*\.pricing-grid\s*\{[^}]*rebeccapurple/.test(app.read('src/components/Mixed.astro')),
+      short(app.read('src/components/Mixed.astro'))
+    );
+    check(
+      '  and the scoped block below it left exactly as the author wrote it',
+      /<style>\s*\n\s*\.mixed \{ color: blue; \}/.test(app.read('src/components/Mixed.astro')),
+      short(app.read('src/components/Mixed.astro'))
+    );
   });
 
   // ── F16f · the element style.read is talking about ───────────────────────
@@ -473,6 +694,168 @@ const declsOf = (answer, prop) =>
     check('with nothing to scan the answer says so rather than saying no CSS', blind.coverage?.sourcesScanned === 0 && blind.problems.some((p) => /no stylesheet/i.test(p)), short({ cov: blind.coverage, problems: blind.problems }));
   });
 
+  // ── F16b · the channel the generated CSS travels down, end to end ────────
+  //
+  // Everything above about generated CSS is either a direct call or a fixture.
+  // The channel itself — style.read asking for `rules`, the shipped preload
+  // collecting them, the reply coming back through canvasQuery, and `coverage`
+  // being computed from what arrived — had no test at all, and could be cut at
+  // either end with every suite in the repo staying green.
+  //
+  // So this section IS the preview. The frame is a stub, but what it answers
+  // with is the SHIPPED text of the preload's collector and of the line that
+  // decides whether to call it, evaluated against a jsdom document holding a
+  // stylesheet no authored file in this project contains.
+  //
+  // And it is where `coverage.complete === true` is exercised for the first
+  // time. Until now no test in the repo produced one, which is how a completely
+  // circular check survived: `wanted` is built from the authored rules,
+  // `computed` is asked only for those, so reconciling them asks whether the
+  // authored rules explain the authored rules and a rule the scan never saw
+  // could not possibly make the answer incomplete.
+
+  await section(async () => {
+    const mod = await styleModule();
+    if (typeof mod.setCanvasFrame !== 'function') throw new Skip('canvas bridge');
+    const { JSDOM } = require('jsdom');
+    const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    const collector = sliceFunction(preloadSource, 'matchedRulesIn');
+    // The line in the preload's query handler that decides whether the rules are
+    // collected at all. Sliced and run rather than read, so replacing it with
+    // `null` is a failing test and not a silent regression.
+    const producer = sliceProperty(preloadSource, 'documentRules');
+    const cap = Number((preloadSource.match(/const MAX_DOCUMENT_RULES = (\d+);/) || [])[1]);
+    check('the preload still ships the collector and the line that calls it', !!collector && !!producer && cap > 0, short({ collector: !!collector, producer, cap }));
+    if (!collector || !producer) throw new Skip('preload');
+    const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
+    const reply = new Function(
+      'd',
+      'els',
+      'document',
+      'matchedRulesIn',
+      'MAX_DOCUMENT_RULES',
+      `return ({ ${producer} });`
+    );
+
+    // A served document. `.pricing-grid` is authored in site.css and the answer
+    // will return it; `.text-red-500` and `.grid` are what a build step emits
+    // and exist in no project file at all.
+    const serve = (css) =>
+      new JSDOM(
+        `<!doctype html><html><head><style>${css}</style></head><body><div id="el" class="pricing-grid text-red-500 grid"></div></body></html>`
+      ).window.document;
+
+    // The engine's own values are canned here — jsdom has no cascade — and that
+    // is deliberate: every property named is one an authored rule declares, so
+    // the reconciliation over `computed` says "explained" for all of them and
+    // `complete` can only be false for the reason this section is about.
+    const CANNED = { display: 'grid', gap: '16px', outline: '2px dashed blue', color: 'rebeccapurple' };
+    const asked = [];
+    const previewServing = (doc) => ({
+      postMessage(message) {
+        asked.push(message);
+        const el = doc.getElementById('el');
+        const computedProps = {};
+        for (const prop of message.props || []) computedProps[prop] = CANNED[prop] ?? null;
+        setImmediate(() =>
+          mod.receiveCanvasReply({
+            type: 'avb:query-result',
+            id: message.id,
+            ready: true,
+            found: true,
+            identity: null,
+            matched: {},
+            computed: {},
+            computedProps,
+            ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+          })
+        );
+      },
+    });
+
+    const gridNode = { id: 'served', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid text-red-500 grid' } }, children: [] };
+    const hostFor = () => ({
+      projectPath: root,
+      nodes: [gridNode],
+      selectedId: 'served',
+      files: [],
+      astroFiles: [],
+      openFilePath: 'src/pages/index.astro',
+      renderedClasses: [],
+      pathOf: null,
+    });
+    const readServed = async (css) => {
+      mod.setHost(hostFor());
+      mod.setCanvasFrame(previewServing(serve(css)));
+      const out = await mod.readStyles(gridNode, { pathOf: () => 'src/pages/index.astro#0.0.3' });
+      mod.setCanvasFrame(null);
+      return out;
+    };
+
+    // 1. THE ELEMENT TWO-THIRDS PAINTED BY A BUILD STEP.
+    const generated = await readServed(
+      '.pricing-grid { display: grid; } .text-red-500 { color: rgb(239 68 68); } .grid { display: grid; }'
+    );
+    check('the read reaches the preview at all', mod.hasCanvas === undefined || asked.length > 0, short({ asked: asked.length }));
+    check(
+      'and the question it asks the preview asks for the document rules',
+      asked.length > 0 && asked[asked.length - 1].rules === true,
+      short(asked[asked.length - 1])
+    );
+    check(
+      'the preview answered with the rules the document says match',
+      Array.isArray(generated.documentRules) && generated.documentRules.some((r) => r.selector === '.text-red-500'),
+      short(generated.documentRules)
+    );
+    check(
+      '  and none of them is offered as something Stacki could write',
+      (generated.documentRules || []).every((r) => r.editable === false && r.origin === 'document' && !('file' in r) && !('identity' in r)),
+      short(generated.documentRules)
+    );
+    check(
+      '  so the runtime half of coverage says it was consulted',
+      generated.coverage?.runtime?.available === true && generated.coverage.runtime.matchedRules >= 3,
+      short(generated.coverage?.runtime)
+    );
+    check(
+      'and the answer does NOT claim complete coverage of an element a build step paints',
+      generated.coverage?.complete === false,
+      short({ complete: generated.coverage?.complete, explains: generated.explainsComputed, unexplained: generated.unexplained })
+    );
+    check(
+      '  naming the rules it cannot account for, rather than leaving the caller to diff',
+      (generated.coverage?.runtime?.unaccountedRules || []).map((r) => r.selector).sort().join(' ') === '.grid .text-red-500',
+      short(generated.coverage?.runtime?.unaccountedRules)
+    );
+    check(
+      '  with the properties each one sets, which is what makes it actionable',
+      (generated.coverage?.runtime?.unaccountedRules || []).some((r) => r.selector === '.text-red-500' && r.properties.includes('color')),
+      short(generated.coverage?.runtime?.unaccountedRules)
+    );
+    // The circularity, stated as an assertion: the old rule was
+    // `runtime.available && explainsComputed`, and both of those are TRUE here.
+    check(
+      '  and it is false for a reason the reconciliation could never have found',
+      generated.explainsComputed === true && generated.coverage.runtime.available === true,
+      short({ explains: generated.explainsComputed, available: generated.coverage.runtime.available })
+    );
+
+    // 2. THE POSITIVE CONTROL. Same element, same channel, a document that
+    //    serves nothing but the authored rule. Without this, `complete` could
+    //    be hard-wired to false and the check above would still pass.
+    const clean = await readServed('.pricing-grid { display: grid; }');
+    check(
+      'an element the served document holds no unaccounted rule for IS complete',
+      clean.coverage?.complete === true,
+      short({ complete: clean.coverage?.complete, unaccounted: clean.coverage?.runtime?.unaccountedRules, unexplained: clean.unexplained })
+    );
+    check(
+      '  with nothing left over to name',
+      (clean.coverage?.runtime?.unaccountedRules || []).length === 0 && clean.coverage.runtime.unaccountedRuleCount === 0,
+      short(clean.coverage?.runtime)
+    );
+  });
+
   app.stop();
   H.removeProject(root);
 
@@ -519,6 +902,22 @@ const declsOf = (answer, prop) =>
   process.exit(1);
 });
 
+/** The text of one `name: …,` property in an object literal, bracket-matched. */
+function sliceProperty(source, name) {
+  const at = source.indexOf(`${name}: `);
+  if (at === -1) return null;
+  let depth = 0;
+  for (let i = at; i < source.length; i++) {
+    const c = source[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return source.slice(at, i).trim().replace(/,$/, '');
+      depth--;
+    } else if (c === ',' && depth === 0) return source.slice(at, i).trim();
+  }
+  return null;
+}
+
 /** The text of one top-level `function name(…) { … }`, brace-matched. */
 function sliceFunction(source, name) {
   const at = source.indexOf(`function ${name}(`);
@@ -549,7 +948,12 @@ async function styleModule() {
   const outfile = path.join(dir, 'style-cascade-truth.bundle.js');
   await esbuild.build({
     stdin: {
-      contents: "export * from './src/agent/styleAgent.js'\nexport { setHost, getHost } from './src/style-panel/lib/host.ts'\n",
+      contents:
+        "export * from './src/agent/styleAgent.js'\n" +
+        "export { setHost, getHost } from './src/style-panel/lib/host.ts'\n" +
+        // The canvas bridge, so a test can BE the preview. Everything the
+        // generated-CSS channel is made of runs between these two functions.
+        "export { setCanvasFrame, receiveCanvasReply, hasCanvas } from './src/canvasQuery.js'\n",
       resolveDir: repo,
       loader: 'js',
     },

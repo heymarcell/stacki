@@ -24,10 +24,22 @@
 // product minted before the disambiguator existed.
 //
 // The in-page half is tested in a real DOM (jsdom), not by reading the source:
-// `axeScript` computes the occurrence index inside the audited page, and a
-// source grep cannot tell a working `indexOf` from a broken one.
+// `axeScript` and the geometry probe compute the occurrence index inside the
+// audited page, and a source grep cannot tell a working `indexOf` from a broken
+// one.
+//
+// AND THE FIXTURES ARE THE PAGE'S OWN OUTPUT, WHICH IS THE HARDER HALF.
+//
+// The first version of this file asserted uniqueness over a hand-written
+// `match: {index: i, of: 5}` sitting beside five UNIQUE selectors -- a pair
+// section 3 of this same file proves the page never emits. The assertion passed
+// over a shape that does not exist while the real one, five unique selectors and
+// one shared model path, still hashed to a single id. So every fixture below is
+// either the literal output of the shipped in-page script run in a real DOM, or
+// a hand-written copy of a shape one of those sections has just proved.
 
 const { createAudit, axeScript, liveWindowCount } = require('../electron/mcp/audit');
+const { OVERFLOW } = require('../electron/mcp/audit/probe.js');
 const { axeFinding, overflowFinding, findingId } = require('../electron/mcp/audit/findings.js');
 
 const failures = [];
@@ -64,12 +76,17 @@ const repeatedContrast = () => ({
         target: [`li:nth-child(${i + 1}) > time`],
         html: '<time class="faint">Jan 1</time>',
         failureSummary: 'Fix any of the following: Element has insufficient colour contrast',
-        refPath: { path: SHARED_MODEL_PATH, exact: true },
+        // WHAT THE PAGE ACTUALLY REPORTS, proved by section 3 running the
+        // shipped in-page source over exactly this markup. axe's own selector
+        // generator gives each row a selector that matches ONE element, so
+        // `match` carries no information whatsoever here -- one of one. The only
+        // fact that separates row two from row four is which of the elements
+        // carrying the identical `data-avb-p` it is, and that ordinal travels
+        // with the path it disambiguates.
+        refPath: { path: SHARED_MODEL_PATH, exact: true, match: { index: i, of: REPEATED } },
         tag: 'time',
         rect: { x: 12, y: 100 * (i + 1), width: 80, height: 18 },
-        // What the in-page `locate()` reports: which of the selector's matches
-        // this node is. Section 3 below proves the page really computes it.
-        match: { index: i, of: REPEATED },
+        match: { index: 0, of: 1 },
       })),
     },
   ],
@@ -82,7 +99,7 @@ const repeatedContrast = () => ({
 // the geometry half of the same collision. These already CARRY
 // `target.selectorMatch` in the payload today and still shared one id: the
 // disambiguator existed and was not fed into the hash.
-const NAV_REF = { path: 'src/layouts/Base.astro#0.0.1 src/components/Nav.astro#0.0.1', exact: true };
+const NAV_PATH = 'src/layouts/Base.astro#0.0.1 src/components/Nav.astro#0.0.1';
 const navCulprits = Array.from({ length: 3 }, (_, i) => ({
   selector: 'nav.site-nav > ul > li > a',
   match: { index: i, of: 3 },
@@ -91,8 +108,25 @@ const navCulprits = Array.from({ length: 3 }, (_, i) => ({
   overflowBy: 40 + i,
   edge: 'right',
   computed: { 'overflow-x': 'visible', width: '120px', 'min-width': 'auto', position: 'static' },
-  ref: NAV_REF,
+  ref: { path: NAV_PATH, exact: true, match: { index: i, of: 3 } },
   text: 'Archive',
+}));
+
+// AND THE OTHER BRANCH, which has to keep working for the elements a model path
+// never reaches: three cards drawn by a third-party widget, no `data-avb-p`
+// anywhere above them, one selector matching all three. Nothing but the
+// selector's own ordinal can tell these apart, so this is what fails if the
+// selector branch of `whereOf` is ever collapsed into the model-path one.
+const widgetCulprits = Array.from({ length: 3 }, (_, i) => ({
+  selector: 'div.widget > div.card',
+  match: { index: i, of: 3 },
+  tag: 'div',
+  rect: { x: 8, y: 400 + i * 60, width: 500, height: 50, top: 400 + i * 60, right: 508, bottom: 450 + i * 60, left: 8 },
+  overflowBy: 133 - i,
+  edge: 'right',
+  computed: { 'overflow-x': 'visible', width: '500px', 'min-width': 'auto', position: 'static' },
+  ref: null,
+  text: 'Sponsored',
 }));
 
 /** A window that answers the geometry probe and the engine with canned results. */
@@ -132,13 +166,14 @@ const cleanSession = {
 };
 
 const QUIET = { viewportWidth: 375, documentScrollWidth: 375, overflowBy: 0, overflows: false, culprits: [], culpritTotal: 0, truncated: false };
+const allCulprits = [...navCulprits, ...widgetCulprits];
 const OVERFLOWING = {
   viewportWidth: 375,
   documentScrollWidth: 460,
   overflowBy: 85,
   overflows: true,
-  culprits: navCulprits,
-  culpritTotal: navCulprits.length,
+  culprits: allCulprits,
+  culpritTotal: allCulprits.length,
   truncated: false,
 };
 
@@ -170,16 +205,33 @@ const run = (axe, geometry, args = {}) =>
       short(contrast.map((f) => f.target.modelPath))
     );
     check(
-      '  and each naming which occurrence it is',
-      contrast.every((f) => f.target.selectorMatch && f.target.selectorMatch.of === REPEATED) &&
-        new Set(contrast.map((f) => f.target.selectorMatch?.index)).size === REPEATED,
-      short(contrast.map((f) => f.target.selectorMatch))
+      '  and each naming which RENDER of that one source node it is',
+      contrast.every((f) => f.target.modelPathMatch && f.target.modelPathMatch.of === REPEATED) &&
+        new Set(contrast.map((f) => f.target.modelPathMatch?.index)).size === REPEATED,
+      short(contrast.map((f) => f.target.modelPathMatch))
+    );
+    // THE PAYLOAD AND THE ID CANNOT DISAGREE. Every selector here matches one
+    // element, so `selectorMatch` is correctly absent -- and if it were the
+    // thing being hashed, five findings would share one id again.
+    check(
+      '  with no selector ordinal published, because the selector is unambiguous',
+      contrast.every((f) => f.target.selectorMatch === undefined),
+      short(contrast.map((f) => f.target.selectorMatch ?? 'absent'))
+    );
+    check(
+      '  and the id is the published ordinal, not something else',
+      contrast.every(
+        (f) =>
+          f.id ===
+          findingId({ ruleId: 'color-contrast', viewport: 'phone', where: `${SHARED_MODEL_PATH}[${f.target.modelPathMatch.index}]` })
+      ),
+      short(contrast.map((f) => f.id))
     );
 
     // The geometry half: these carried selectorMatch before the fix and still
     // collided, so this is the assertion that the PAYLOAD's disambiguator and
     // the ID's disambiguator are the same fact.
-    const nav = (res.findings || []).filter((f) => f.ruleId === 'horizontal-overflow');
+    const nav = (res.findings || []).filter((f) => f.target.selector === 'nav.site-nav > ul > li > a');
     check('  three overflowing links are three findings', nav.length === 3, short(nav.length));
     check('    with three ids', new Set(nav.map((f) => f.id)).size === 3, short(nav.map((f) => f.id)));
     check(
@@ -187,6 +239,23 @@ const run = (axe, geometry, args = {}) =>
       nav.every((f) => f.target.selectorMatch && f.target.selectorMatch.of === 3) &&
         new Set(nav.map((f) => f.target.selectorMatch?.index)).size === 3,
       short(nav.map((f) => f.target.selectorMatch))
+    );
+
+    // THE NO-MODEL-PATH BRANCH. Three boxes a third-party widget drew, sharing
+    // one selector and carrying no marker at all. The selector's own ordinal is
+    // the only disambiguator there is, and it has to stay in the hash.
+    const widget = (res.findings || []).filter((f) => f.target.selector === 'div.widget > div.card');
+    check('  three unattributable boxes are three findings', widget.length === 3, short(widget.length));
+    check('    with three ids of their own', new Set(widget.map((f) => f.id)).size === 3, short(widget.map((f) => f.id)));
+    check(
+      '    hashed on the selector and its ordinal, because there is nothing else',
+      widget.every(
+        (f, i) =>
+          f.target.modelPath === null &&
+          f.target.modelPathMatch === undefined &&
+          f.id === findingId({ ruleId: 'horizontal-overflow', viewport: 'phone', where: `div.widget > div.card[${f.target.selectorMatch.index}]` })
+      ),
+      short(widget.map((f) => ({ id: f.id, m: f.target.selectorMatch })))
     );
 
     // --- STABILITY. Unique is worth nothing if it is unique per RUN.
@@ -277,8 +346,11 @@ const run = (axe, geometry, args = {}) =>
   // the DOM's own.
   {
     const { JSDOM } = require('jsdom');
+    // The five <time> elements carry the IDENTICAL marker, because the source
+    // has one node and the serializer stamps it on every iteration. That is the
+    // collision; everything below is whether the page can still tell them apart.
     const dom = new JSDOM(
-      `<!doctype html><html><body><nav id="nav"><a href="/a">a</a></nav><ul>${Array.from({ length: REPEATED }, (_, i) => `<li><time class="faint">day ${i}</time></li>`).join('')}</ul></body></html>`,
+      `<!doctype html><html><body><nav id="nav"><a href="/a">a</a></nav><ul>${Array.from({ length: REPEATED }, (_, i) => `<li><time class="faint" data-avb-p="${SHARED_MODEL_PATH}">day ${i}</time></li>`).join('')}</ul></body></html>`,
       { runScripts: 'outside-only' }
     );
     dom.window.axe = {
@@ -330,8 +402,43 @@ const run = (axe, geometry, args = {}) =>
     );
     check(
       '  and each resolving to the element axe named, not to the first one',
-      nodes.every((n, i) => n.refPath === null && n.tag === 'time') && nodes.length === REPEATED,
+      nodes.every((n, i) => n.tag === 'time') && nodes.length === REPEATED,
       short(nodes.map((n) => n.tag))
+    );
+    check(
+      '  all five reading back the one model path their source really has',
+      nodes.every((n) => n.refPath && n.refPath.path === SHARED_MODEL_PATH && n.refPath.exact === true),
+      short(nodes.map((n) => n.refPath && n.refPath.path))
+    );
+    // THE ORDINAL THAT ACTUALLY DISAMBIGUATES, counted in the page over the
+    // elements carrying that identical attribute. `match` above is one-of-one
+    // for every one of these, so if this is not computed there is nothing left.
+    check(
+      '  and each saying WHICH render of it it is',
+      nodes.every((n, i) => n.refPath.match && n.refPath.match.of === REPEATED && n.refPath.match.index === i),
+      short(nodes.map((n) => n.refPath && n.refPath.match))
+    );
+
+    // AND NOW THE STEP THE FIRST VERSION OF THIS FILE MISSED: build findings out
+    // of what the page just said, rather than out of a fixture. This is the
+    // assertion that section 1 cannot make on its own, because section 1 writes
+    // its own input.
+    const vp3 = { key: 'phone', width: 375, height: 812, device: 'phone', standard: null };
+    const rule3 = { id: 'color-contrast', impact: 'serious', help: 'h', helpUrl: 'u', tags: ['wcag2aa'] };
+    const fromPage = nodes.map((n) => axeFinding({ viewport: vp3, rule: rule3, node: n, bucket: 'violation' }));
+    check(
+      'five findings minted from the PAGE\'s own output have five ids',
+      new Set(fromPage.map((f) => f.id)).size === REPEATED,
+      short(fromPage.map((f) => f.id))
+    );
+    check(
+      '  and every one of them publishes the ordinal its id was hashed on',
+      fromPage.every(
+        (f) =>
+          f.target.modelPathMatch &&
+          f.id === findingId({ ruleId: 'color-contrast', viewport: 'phone', where: `${SHARED_MODEL_PATH}[${f.target.modelPathMatch.index}]` })
+      ),
+      short(fromPage.map((f) => f.target.modelPathMatch))
     );
     const single = out.violations[1].nodes[0];
     check(
@@ -367,7 +474,7 @@ const run = (axe, geometry, args = {}) =>
   {
     const { JSDOM } = require('jsdom');
     const dom = new JSDOM(
-      `<!doctype html><html><body><ul>${Array.from({ length: REPEATED }, () => '<li><time class="faint">x</time></li>').join('')}</ul></body></html>`,
+      `<!doctype html><html><body><ul>${Array.from({ length: REPEATED }, () => `<li><time class="faint" data-avb-p="${SHARED_MODEL_PATH}">x</time></li>`).join('')}</ul></body></html>`,
       { runScripts: 'outside-only' }
     );
     dom.window.axe = {
@@ -399,12 +506,94 @@ const run = (axe, geometry, args = {}) =>
       nodes.every((n) => n.match && n.match.of === REPEATED),
       short(nodes.map((n) => n.match))
     );
-    // HONEST LIMIT, ASSERTED SO IT CANNOT BE MISREAD AS A DEFECT: axe hands back
-    // a selector, not an element, so re-resolving one selector five times finds
-    // the first element five times. The occurrence index is real for the case
-    // that matters -- distinct selectors, which is what axe's own selector
-    // generator produces for repeated nodes -- and the `of` is real either way.
-    check('    reporting the occurrence it could actually resolve', nodes.every((n) => n.match && n.match.index === 0), short(nodes.map((n) => n.match)));
+    // THE K-TH MENTION IS THE K-TH MATCH, and that is an inference, said out
+    // loud. axe hands back a selector, not an element, so re-resolving one
+    // string five times used to find the FIRST element five times: five nodes
+    // with one rect, one model path and one id. axe walks the document in order
+    // and querySelectorAll answers in document order, so within one rule's node
+    // list the k-th repeat of a string is the k-th element it matches. The
+    // counter is per rule, because one element failing two rules is named twice
+    // and both mentions are that same first element.
+    check('    resolving the k-th mention to the k-th match', nodes.every((n, i) => n.match && n.match.index === i), short(nodes.map((n) => n.match)));
+    check(
+      '    so five nodes are five different elements, not the first one five times',
+      new Set(nodes.map((n) => n.refPath && n.refPath.match && n.refPath.match.index)).size === REPEATED,
+      short(nodes.map((n) => n.refPath && n.refPath.match))
+    );
+    const vp4 = { key: 'phone', width: 375, height: 812, device: 'phone', standard: null };
+    const rule4 = { id: 'color-contrast', impact: 'serious', help: 'h', helpUrl: 'u', tags: ['wcag2aa'] };
+    const ambiguous = nodes.map((n) => axeFinding({ viewport: vp4, rule: rule4, node: n, bucket: 'violation' }));
+    check(
+      '    and five findings out of them have five ids',
+      new Set(ambiguous.map((f) => f.id)).size === REPEATED,
+      short(ambiguous.map((f) => f.id))
+    );
+
+    // AND THE SAME RULE NAMED TWICE FOR ONE ELEMENT IS STILL THAT ELEMENT.
+    // The per-rule counter must not run on across rules, or an element that
+    // fails image-alt and link-name would be resolved to two different boxes.
+    const twice = await dom.window.eval(axeScript({ rules: null }));
+    check(
+      'a second run of the same page resolves the same five elements',
+      JSON.stringify(twice.violations[0].nodes.map((n) => n.refPath.match)) ===
+        JSON.stringify(nodes.map((n) => n.refPath.match)),
+      short(twice.violations[0].nodes.map((n) => n.refPath.match))
+    );
+  }
+
+  // --- 4b. THE GEOMETRY PROBE, RUN WHOLE, IN A REAL DOM.
+  //
+  // Section 1's overflow half is a fixture. This is the shipped `OVERFLOW`
+  // script -- helpers, walk, containment rules and all -- evaluated against a
+  // document laid out to overflow, and it is built on the shape the reviewer's
+  // probe found and no fixture had: five rows from a `.map()` whose loop key
+  // gives each one a UNIQUE id attribute. Every selector is therefore
+  // one-of-one, `selectorMatch` is absent from all five payloads, and the model
+  // path is shared by construction -- so if the ordinal is not counted over the
+  // marker, these five findings are one finding.
+  {
+    const { JSDOM } = require('jsdom');
+    const rows = Array.from(
+      { length: REPEATED },
+      (_, i) => `<li class="row" id="post-${i}" data-avb-p="${SHARED_MODEL_PATH}">row ${i}</li>`
+    ).join('');
+    const dom = new JSDOM(`<!doctype html><html><body><ul class="list">${rows}</ul></body></html>`, { runScripts: 'outside-only' });
+    const w = dom.window;
+    // jsdom has no layout and no CSS.escape. Only those two are stood in for;
+    // the walk, the selectors, the containment rules and the ordinals are the
+    // script's own.
+    w.CSS = w.CSS || { escape: (x) => String(x).replace(/([^\w-])/g, '\\$1') };
+    Object.defineProperty(w.HTMLHtmlElement.prototype, 'clientWidth', { configurable: true, get: () => 375 });
+    Object.defineProperty(w.HTMLHtmlElement.prototype, 'scrollWidth', { configurable: true, get: () => 460 });
+    w.Element.prototype.getBoundingClientRect = function rect() {
+      return this.classList && this.classList.contains('row')
+        ? { x: 0, y: 0, width: 460, height: 20, top: 0, right: 460, bottom: 20, left: 0 }
+        : { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+    };
+    const geo = w.eval(OVERFLOW);
+    check('the shipped overflow probe finds the five overflowing rows', geo.overflows === true && geo.culprits.length === REPEATED, short({ overflows: geo.overflows, n: geo.culprits.length }));
+    check(
+      '  each with a selector that matches exactly one element',
+      geo.culprits.every((c, i) => c.selector === `#post-${i}` && c.match.of === 1),
+      short(geo.culprits.map((c) => [c.selector, c.match]))
+    );
+    check(
+      '  and each knowing which render of the one shared model path it is',
+      geo.culprits.every((c, i) => c.ref && c.ref.path === SHARED_MODEL_PATH && c.ref.match && c.ref.match.of === REPEATED && c.ref.match.index === i),
+      short(geo.culprits.map((c) => c.ref && c.ref.match))
+    );
+    const vpG = { key: 'phone', width: 375, height: 812, device: 'phone', standard: null };
+    const geoFindings = geo.culprits.map((culprit) => overflowFinding({ viewport: vpG, culprit, documentOverflowBy: 85 }));
+    check(
+      'five overflowing renders of one component are five ids',
+      new Set(geoFindings.map((f) => f.id)).size === REPEATED,
+      short(geoFindings.map((f) => f.id))
+    );
+    check(
+      '  with nothing but the model-path ordinal available to separate them',
+      geoFindings.every((f) => f.target.selectorMatch === undefined && f.target.modelPathMatch && f.target.modelPathMatch.of === REPEATED),
+      short(geoFindings.map((f) => ({ sel: f.target.selectorMatch ?? 'absent', path: f.target.modelPathMatch })))
+    );
   }
 
   // --- 5. NO WINDOW SURVIVED.

@@ -254,6 +254,28 @@ const captureNote = (viewport) =>
   `Rendered offscreen at ${viewport.width}x${viewport.height} in the audit's own window: the page as a visitor ` +
   'sees it at that width, not the Stacki UI and not the breakpoint the person has open (get_context reports that).';
 
+// ONE ROW PER VIEWPORT A PICTURE WAS ASKED FOR, whether or not one arrived. The
+// tool description promises exactly that, and `included` is what carries the
+// difference -- so every branch that ends without an image ends here, with the
+// reason in its own note, rather than by pushing nothing and leaving a counter
+// in `dropped` as the only evidence.
+// `omittedBecause` is the machine-readable half of the note, and it exists
+// because the retry hint below is only true for one of these reasons: asking
+// again for one viewport at a time gets a picture past a byte budget, and does
+// nothing whatever about a window that painted an empty frame.
+const noPictureRow = (viewport, because, why) => ({
+  viewport: { key: viewport.key, width: viewport.width, height: viewport.height },
+  mimeType: null,
+  bytes: null,
+  width: null,
+  height: null,
+  sha256: null,
+  included: false,
+  omittedBecause: because,
+  renderedOffscreen: true,
+  note: why,
+});
+
 /**
  * A finding with its unbounded fields brought inside a cap, saying which.
  *
@@ -477,7 +499,20 @@ function axeScript({ rules }) {
     // node -- while the payload went on presenting incomplete as a first-class
     // bucket that a person has to look at.
     const res = await axe.run(document, { resultTypes: ['violations', 'incomplete'], runOnly: ${runOnly} });
-    const locate = (target) => {
+    // Built once for the whole run: locate() is called for every node of every
+    // rule, and the marked elements do not move between two of them.
+    let marked = null;
+    const markedByPath = () => {
+      if (marked) return marked;
+      marked = new Map();
+      for (const n of document.querySelectorAll('[data-avb-p]')) {
+        const p = n.getAttribute('data-avb-p');
+        if (!marked.has(p)) marked.set(p, []);
+        marked.get(p).push(n);
+      }
+      return marked;
+    };
+    const locate = (target, seen) => {
       // A SHADOW OR FRAME PATH IS NOT A SELECTOR.
       //
       // axe answers with an ARRAY when the node is inside a shadow root or an
@@ -490,9 +525,6 @@ function axeScript({ rules }) {
         return { refPath: null, rect: null, tag: null, crossBoundary: true };
       }
       const sel = Array.isArray(target) ? target[0] : target;
-      let el = null;
-      try { el = document.querySelector(sel); } catch {}
-      if (!el) return { refPath: null, rect: null, tag: null };
       // WHICH OF THE SELECTOR'S MATCHES THIS IS.
       //
       // The same pair the geometry probe computes (matchIndexOf in probe.js),
@@ -503,16 +535,46 @@ function axeScript({ rules }) {
       // where five <time> elements from one mapped component collapsed to one
       // hash. Backticks and dollar-braces are forbidden in here: this comment is
       // inside a template literal, and one stray backtick ends the script.
-      let match = { index: 0, of: 1 };
-      try {
-        const all = [...document.querySelectorAll(sel)];
-        const at = all.indexOf(el);
-        match = { index: at < 0 ? 0 : at, of: all.length || 1 };
-      } catch {}
+      //
+      // THE NTH TIME A RULE NAMES THE SAME SELECTOR IS THE NTH ELEMENT IT
+      // MATCHES. axe answers in selectors, not in element handles, so
+      // re-resolving one string five times used to find the FIRST element five
+      // times -- five nodes with one rect, one model path and one id, which is
+      // the collapse this whole locator exists to prevent. axe walks the
+      // document in order and querySelectorAll returns document order, so when
+      // a rule's node list repeats a string the k-th mention is the k-th match.
+      // The counter is per RULE, because one element legitimately appears under
+      // two different rules and both mentions are that same first element.
+      let all = [];
+      try { all = [...document.querySelectorAll(sel)]; } catch {}
+      const nth = seen ? (seen.get(sel) || 0) : 0;
+      if (seen) seen.set(sel, nth + 1);
+      const el = all[nth < all.length ? nth : 0] || null;
+      if (!el) return { refPath: null, rect: null, tag: null };
+      const at = all.indexOf(el);
+      const match = { index: at < 0 ? 0 : at, of: all.length || 1 };
+      // WHICH RENDER OF ONE SOURCE NODE, counted among the elements carrying the
+      // identical marker. A model path is a SOURCE position: a component drawn
+      // by a .map() stamps every row with the same attribute, so the path alone
+      // cannot tell row two from row four -- and the path is exactly what the
+      // finding id prefers over the selector when it is exact. Compared by
+      // attribute VALUE rather than through an attribute selector, because a
+      // model path carries quotes and backslashes as freely as any file name.
       let n = el, refPath = null;
       while (n && n.nodeType === 1) {
         const p = n.getAttribute && n.getAttribute('data-avb-p');
-        if (p) { refPath = { path: p, exact: n === el }; break; }
+        if (p) {
+          let pathMatch = null;
+          if (n === el) {
+            try {
+              const same = markedByPath().get(p) || [];
+              const k = same.indexOf(el);
+              pathMatch = { index: k < 0 ? 0 : k, of: same.length || 1 };
+            } catch {}
+          }
+          refPath = { path: p, exact: n === el, match: pathMatch };
+          break;
+        }
         n = n.parentElement;
       }
       const r = el.getBoundingClientRect();
@@ -527,12 +589,15 @@ function axeScript({ rules }) {
       id: rule.id, impact: rule.impact, help: rule.help, helpUrl: rule.helpUrl, tags: rule.tags,
       bucket,
       nodeTotal: rule.nodes.length,
-      nodes: rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
-        target: n.target,
-        html: String(n.html || '').slice(0, 240),
-        failureSummary: String(n.failureSummary || '').replace(/\\s+/g, ' ').slice(0, 240),
-        ...locate(n.target),
-      })),
+      nodes: (() => {
+        const seen = new Map();
+        return rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
+          target: n.target,
+          html: String(n.html || '').slice(0, 240),
+          failureSummary: String(n.failureSummary || '').replace(/\\s+/g, ' ').slice(0, 240),
+          ...locate(n.target, seen),
+        }));
+      })(),
     }));
     return {
       version: axe.version,
@@ -901,7 +966,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // Taken AFTER the measurements, from the same window, in the same
           // state, with nothing in between that could move the layout. The
           // caption and the picture are of one moment by construction.
-          if (capture && encodeImage) {
+          if (capture) {
             capturesWanted += 1;
             // A ROW FOR EVERY VIEWPORT THAT WAS ASKED FOR, INCLUDING THE ONES
             // WITH NO PICTURE. `included` is the whole contract: a metadata row
@@ -909,7 +974,15 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
             // this rewrite exists to make impossible, and a row that is absent
             // says nothing at all about a viewport the caller asked about.
             const taken = captures.filter((c) => c.included).length;
-            if (taken < MAX_CAPTURES) {
+            if (!encodeImage) {
+              // No encoder was wired into this audit, so a picture was never
+              // attempted. Production always wires one (electron/mcp/index.js),
+              // but a library consumer who does not must be told that rather
+              // than handed an empty `captures` that reads as "nothing to see".
+              captures.push(
+                noPictureRow(viewport, 'no_encoder', 'This audit was built without an image encoder, so no picture was attempted for any viewport.')
+              );
+            } else if (taken < MAX_CAPTURES) {
               const image = await win.webContents.capturePage();
               if (!image.isEmpty()) {
                 const { buffer, size } = encodeImage(image, 'jpeg');
@@ -931,21 +1004,35 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
                   // so the two cannot be paired up wrongly downstream.
                   data: buffer.toString('base64'),
                 });
+              } else {
+                // AN EMPTY FRAME IS STILL A VIEWPORT THAT WAS ASKED ABOUT.
+                //
+                // capturePage answers with an empty image when the compositor
+                // had nothing for it -- an offscreen window that never painted,
+                // a page that is genuinely blank. Pushing no row made the
+                // contract two lines above false ("one row per viewport asked
+                // about"), and left `dropped.capturesRequestedButNotTaken` as
+                // the only trace: a number a reader has to know to go looking
+                // for, on a response whose `captures` array says nothing.
+                captures.push(
+                  noPictureRow(
+                    viewport,
+                    'empty_frame',
+                    'The window returned an empty frame for this viewport, so there is no picture of it. The ' +
+                      'measurements above were still taken; an empty frame usually means the page painted nothing ' +
+                      'at this size.'
+                  )
+                );
               }
             } else {
-              captures.push({
-                viewport: { key: viewport.key, width: viewport.width, height: viewport.height },
-                mimeType: null,
-                bytes: null,
-                width: null,
-                height: null,
-                sha256: null,
-                included: false,
-                renderedOffscreen: true,
-                note:
+              captures.push(
+                noPictureRow(
+                  viewport,
+                  'budget',
                   'No picture was sent for this viewport: the answer carries as many images as its byte budget ' +
-                  'affords beside the findings. Ask for this viewport on its own.',
-              });
+                    'affords beside the findings. Ask for this viewport on its own.'
+                )
+              );
             }
           }
 
@@ -1110,10 +1197,15 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // cleanup message were both already caught making, so it is bounded like
     // them and counted like everything else.
     const omittedCaptures = captureRows.filter((c) => c.included === false);
-    const nextCall = omittedCaptures.length
-      ? `No picture was sent for ${omittedCaptures.map((c) => c.viewport.key).join(', ')}: an answer carries at ` +
+    // Only the ones a narrower call would actually fix. A blank frame comes back
+    // blank however few viewports are asked for, and telling a caller to re-run
+    // for it is advice that cannot terminate -- the same shape as the refusal
+    // sentences in styleAgent's locateIdentity.
+    const retryable = omittedCaptures.filter((c) => c.omittedBecause === 'budget');
+    const nextCall = retryable.length
+      ? `No picture was sent for ${retryable.map((c) => c.viewport.key).join(', ')}: an answer carries at ` +
         `most ${MAX_CAPTURES} images beside its findings. Re-run audit({route:"${String(safeRoute).slice(0, MAX_NAMED_LENGTH)}", ` +
-        `viewports:["${omittedCaptures[0].viewport.key}"], capture:true}) for one at a time.`
+        `viewports:["${retryable[0].viewport.key}"], capture:true}) for one at a time.`
       : null;
     const overhead =
       jsonBytes({

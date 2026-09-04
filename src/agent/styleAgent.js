@@ -44,6 +44,9 @@ import { getHost } from '../style-panel/lib/host.ts';
 // Enough to explain a layout without becoming a dump of the whole cascade.
 const MAX_RULES = 40;
 const MAX_DECLS_PER_RULE = 40;
+// Enough for a caller to see WHAT is unaccounted without paying for the whole
+// of a utility framework's output; the count beside it is never capped.
+const MAX_UNACCOUNTED = 12;
 const MAX_VALUE = 300;
 
 const clip = (value, max = MAX_VALUE) => {
@@ -211,27 +214,133 @@ async function askDocument(node, properties, pathOf) {
   };
 }
 
+// THE SHORTHANDS, AND WHY THEY ARE HERE.
+//
+// The reconciliation below compares property NAMES, and `padding: 1rem` sets
+// `padding-top`. Without this table an element whose padding is authored in one
+// line is told, in the same response that returns that line, that nothing
+// Stacki can see sets its padding-top. A false accusation costs more than the
+// silence it replaced: an agent goes and authors a duplicate declaration for a
+// property that was never unset.
+//
+// Only the families a stylesheet actually writes, and only where the longhand
+// is not simply the shorthand plus a dash — those are handled by prefix below,
+// which is why `border-radius` and `gap` need an entry and `margin` does not.
+const SHORTHAND_LONGHANDS = {
+  inset: ['top', 'right', 'bottom', 'left'],
+  gap: ['row-gap', 'column-gap'],
+  'border-radius': [
+    'border-top-left-radius',
+    'border-top-right-radius',
+    'border-bottom-right-radius',
+    'border-bottom-left-radius',
+  ],
+  font: ['line-height'],
+  'place-items': ['align-items', 'justify-items'],
+  'place-content': ['align-content', 'justify-content'],
+  'place-self': ['align-self', 'justify-self'],
+  'grid-area': ['grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end'],
+  'grid-row': ['grid-row-start', 'grid-row-end'],
+  'grid-column': ['grid-column-start', 'grid-column-end'],
+};
+// Shorthands whose longhands all begin with the shorthand's own name and a dash.
+// Kept as a list rather than as a bare prefix test, because `color` is not a
+// shorthand for `color-scheme` and the bare test cannot tell.
+const SHORTHAND_PREFIXES = [
+  'margin',
+  'padding',
+  'border',
+  'background',
+  'font',
+  'flex',
+  'grid',
+  'outline',
+  'overflow',
+  'transition',
+  'animation',
+  'text-decoration',
+  'text-emphasis',
+  'list-style',
+  'columns',
+  'mask',
+  'scroll-margin',
+  'scroll-padding',
+];
+
+/** Whether an authored declaration of `declared` says anything about `property`. */
+function covers(declared, property) {
+  if (declared === property) return true;
+  if ((SHORTHAND_LONGHANDS[declared] || []).includes(property)) return true;
+  return SHORTHAND_PREFIXES.includes(declared) && property.startsWith(`${declared}-`);
+}
+
+// A generated rule and the authored rule it came from are the same rule with
+// two spellings. Astro hashes a scoped selector on its way into the served
+// document, and a `:global(...)` wrapper exists only in the source — so both
+// come off before two selectors are compared, or every Astro page with one
+// scoped block reports rules nothing accounts for.
+const normalizeSelector = (sel) =>
+  String(sel || '')
+    .replace(/:global\(\s*([^)]*?)\s*\)/g, '$1')
+    .replace(/\[data-astro-cid-[^\]]*\]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*,\s*/g, ', ')
+    .trim();
+
+/** The property names a document rule's declaration block sets. */
+const propertiesIn = (cssText) =>
+  String(cssText || '')
+    .split(';')
+    .map((part) => part.slice(0, part.indexOf(':')).trim().toLowerCase())
+    .filter(Boolean);
+
 /**
- * Which computed properties no returned declaration can account for.
+ * Which computed properties no returned declaration can account for, and which
+ * rules the browser says reach this element that the authored scan did not.
  *
  * Deliberately not a value comparison: `var(--gap)` and `16px` are the same
  * declaration and normalising every property to find that out is a second CSS
  * engine. The decidable question is the one that matters here — is there any
- * winning authored declaration for this property at all — and it is exactly the
- * question a Tailwind element answers "no" to for everything it is styled with.
+ * authored declaration for this property at all — and it is exactly the question
+ * a Tailwind element answers "no" to for everything it is styled with.
+ *
+ * TWO WAYS TO GET THAT QUESTION WRONG, and both were being got wrong.
+ *
+ * A declaration inside `@media` or `:hover` carries `winning: null`, because
+ * nothing here knows the viewport or where the pointer is. Reading that as "does
+ * not exist" made the answer say `color` was unexplained three lines below
+ * returning the `@media` rule that sets it. Unresolved is not absent: it counts
+ * as an explanation the response is offering, and the caller can see the
+ * condition on the declaration itself.
+ *
+ * The other is `padding` and `padding-top`, handled by covers() above.
+ *
+ * AND THE THIRD THING, which is not about `computed` at all. `unexplained` can
+ * only ever name properties somebody asked the engine about, and those are the
+ * properties the AUTHORED rules named — so it cannot notice a rule it never
+ * returned. `documentRules` can: it is the browser's own list of what reaches
+ * this element, and a rule in it that no authored rule accounts for is the
+ * response's own evidence that its scan is incomplete.
  */
-export function reconcileComputed(rules, computed) {
-  const explained = new Set(
-    (rules || []).flatMap((rule) => (rule.declarations || []).filter((d) => d.winning === true).map((d) => d.property))
+export function reconcileComputed(rules, computed, documentRules = null) {
+  const declared = (rules || []).flatMap((rule) =>
+    (rule.declarations || []).filter((d) => d.winning !== false).map((d) => d.property)
   );
   const unexplained = Object.entries(computed || {})
-    .filter(([property, value]) => !explained.has(property) && value !== null && value !== '')
+    .filter(([property, value]) => value !== null && value !== '' && !declared.some((d) => covers(d, property)))
     .map(([property, value]) => ({
       property,
       computed: value,
       reason: 'no authored declaration Stacki can see sets this property on this element',
     }));
-  return { explainsComputed: computed ? unexplained.length === 0 : null, unexplained };
+
+  const authored = new Set((rules || []).map((rule) => normalizeSelector(rule.selector)));
+  for (const rule of rules || []) for (const sel of rule.matchedSelectors || []) authored.add(normalizeSelector(sel));
+  const unaccountedRules = (documentRules || [])
+    .filter((rule) => !authored.has(normalizeSelector(rule.selector)))
+    .map((rule) => ({ selector: rule.selector, stylesheet: rule.stylesheet || null, properties: propertiesIn(rule.cssText) }));
+
+  return { explainsComputed: computed ? unexplained.length === 0 : null, unexplained, unaccountedRules };
 }
 
 // What an authored-source scan cannot contain, said in the answer rather than
@@ -256,6 +365,103 @@ async function reachingFiles() {
     avb.stylesReaching({ projectPath: host.projectPath, file: host.openFilePath })
   ).catch(() => null);
   return Array.isArray(answer?.files) ? new Set(answer.files) : null;
+}
+
+// THE COMPONENTS THIS PAGE ACTUALLY RENDERS.
+//
+// A component's scoped `<style>` can still reach the page through `:global()`,
+// and the escaped-rule scan (webflow.ts) reads those out of EVERY .astro file in
+// the project — because `host.astroFiles` is a whole-project list, not a list of
+// what this page draws. So a `:global(.card)` sitting in a component nothing
+// imports was being offered as a rule reaching this element, hedged with the
+// same `reachedByOpenPage: 'unknown'` a genuinely-reaching component gets. That
+// is the false positive the Astro hash exists to prevent, one class of markup
+// over: an agent reads an `outline` it cannot see on screen and either deletes a
+// rule from an unrelated component or decides the preview is stale.
+//
+// Astro bundles a page's CSS from its MODULE GRAPH, so "does this page import
+// the component, directly or through another component" is exactly the right
+// question — and unlike "does the open file instantiate it", it does not report
+// a Nav rendered by a Layout as absent. The same walk main.js does for
+// stylesheets (listReachingStyles), done here for the .astro files it passes
+// through and does not report.
+// Built fresh per file rather than shared: a `g` regex carries `lastIndex`
+// between calls, and this walk is async — two reads in flight over one of these
+// would each resume the other's scan halfway through a file.
+const importSpecifiers = () => /\bimport\s+(?:[^'"]*?\bfrom\s*)?['"]([^'"]+)['"]/g;
+const REACH_DEPTH = 4;
+
+/** `base`'s directory joined with a relative specifier, as a posix project path. */
+function resolveRel(base, spec) {
+  const parts = base.split('/').slice(0, -1);
+  for (const piece of spec.split('/')) {
+    if (piece === '' || piece === '.') continue;
+    if (piece === '..') {
+      if (!parts.length) return null; // out of the project; nothing here can say anything about it
+      parts.pop();
+      continue;
+    }
+    parts.push(piece);
+  }
+  return parts.join('/');
+}
+
+/**
+ * Every .astro file the open page pulls in, transitively.
+ *
+ * Null — never an empty set — when the walk could not be done at all: no open
+ * file, no bridge, nothing read. "Not proved to reach" and "proved not to
+ * reach" are different claims and only the second may be published as `false`.
+ */
+async function reachingComponents() {
+  const host = getHost();
+  const avb = bridge();
+  if (!host.projectPath || !host.openFilePath || !avb?.readStyleFile) return null;
+  // The host record carries the open file as an ABSOLUTE path and reports rules
+  // against project-relative ones. Walk in relative paths, because that is what
+  // a comparison with `source.file` needs; read through absolute ones, because
+  // main.js resolves a relative argument against ITS OWN cwd and then refuses it
+  // for being outside the project.
+  const root = String(host.projectPath).replace(/\\/g, '/').replace(/\/$/, '');
+  const relative = (p) => {
+    const posix = String(p).replace(/\\/g, '/');
+    return posix.startsWith(`${root}/`) ? posix.slice(root.length + 1) : posix;
+  };
+  const start = relative(host.openFilePath);
+  const seen = new Set();
+  const components = new Set();
+  let read = 0;
+  const visit = async (rel, depth) => {
+    if (depth > REACH_DEPTH || !rel || seen.has(rel)) return;
+    seen.add(rel);
+    const answer = await Promise.resolve(avb.readStyleFile(`${root}/${rel}`)).catch(() => null);
+    const text = answer?.css;
+    if (typeof text !== 'string') return;
+    read += 1;
+    const pattern = importSpecifiers();
+    const next = [];
+    let match;
+    while ((match = pattern.exec(text))) {
+      const spec = match[1];
+      // Only a relative specifier resolves to a file in this project with
+      // certainty; a bare one goes through node_modules, which is not what this
+      // is measuring.
+      if (!spec.startsWith('.')) continue;
+      const target = resolveRel(rel, spec);
+      if (!target) continue;
+      if (/\.astro$/i.test(target)) {
+        components.add(target);
+        next.push(target);
+      } else if (/\.(jsx?|tsx?|svelte|vue)$/i.test(target)) {
+        next.push(target);
+      }
+    }
+    for (const child of next) await visit(child, depth + 1);
+  };
+  await visit(start, 0);
+  // The open file itself could not be read, so nothing was walked and nothing
+  // can be denied.
+  return read ? components : null;
 }
 
 /** The dependency whose output is missing from an authored-source scan. */
@@ -294,7 +500,7 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
   const { docs, model, rootSnapshot, errors, asked } = await readCascade(node);
   const all = [...model.base, ...model.conditional];
   const matched = all.slice(0, MAX_RULES);
-  const reaching = await reachingFiles();
+  const [reaching, renderedComponents] = await Promise.all([reachingFiles(), reachingComponents()]);
 
   const wanted = new Set(properties || []);
   const rules = matched.map((entry) => {
@@ -361,11 +567,23 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
         // open component renders.
         scope: doc?.source.scope || 'global',
         // True only where an import chain from the open page was actually
-        // followed to this file. Never false: an @import inside a package, a
-        // framework injection or astro.config can all load a stylesheet
-        // nothing here can see, so "not proved" is as far as this goes.
+        // followed to this file. For a STYLESHEET, never false: an @import
+        // inside a package, a framework injection or astro.config can all load
+        // one nothing here can see, so "not proved" is as far as that goes.
+        //
+        // A COMPONENT is different, and this is the one place `false` is
+        // honest. Astro emits a component's CSS for the pages whose module
+        // graph contains it, so a component the open page does not import —
+        // directly or through another component — cannot be painting this
+        // element, and the `:global()` rules read out of its scoped block must
+        // not be offered as though they were. Still 'unknown' when the walk
+        // could not be done at all.
         reachedByOpenPage:
-          rule.embedKey.startsWith('node:') || (reaching && file && reaching.has(file)) ? true : 'unknown',
+          rule.embedKey.startsWith('node:') || (reaching && file && reaching.has(file))
+            ? true
+            : rule.embedKey.startsWith('astro:') && renderedComponents && file
+              ? renderedComponents.has(file)
+              : 'unknown',
       },
       declarations,
       declarationsOmitted: Math.max(0, rule.declarations.length - MAX_DECLS_PER_RULE),
@@ -373,7 +591,7 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
   });
 
   const { computed, documentRules, runtime } = await askDocument(node, [...wanted].slice(0, 200), pathOf);
-  const { explainsComputed, unexplained } = reconcileComputed(rules, computed);
+  const { explainsComputed, unexplained, unaccountedRules } = reconcileComputed(rules, computed, documentRules);
   const kinds = { stylesheet: 0, component: 0, block: 0 };
   for (const doc of docs) {
     const key = doc.source.origin.kind;
@@ -424,11 +642,43 @@ export async function readStyles(node, { pathOf, properties = null } = {}) {
       sourcesScanned: docs.length,
       kinds,
       cascadeScope: CASCADE_SCOPE,
-      // Only ever true when the engine's own answer was obtained AND every
-      // property in it is accounted for by a rule above.
-      complete: runtime.available === true && explainsComputed === true,
+      // COMPLETE MEANS NOTHING ELSE REACHES THIS ELEMENT, and the response has
+      // to be able to lose that argument against its own contents.
+      //
+      // It used to be `runtime.available && explainsComputed`, which is
+      // circular: `wanted` is built from the properties the AUTHORED rules
+      // declare, `computed` is only ever asked for those, and reconciling them
+      // therefore asks whether the authored rules explain the authored rules. A
+      // rule the scan never saw sets a property nobody asked about, so it could
+      // not make the answer incomplete — and `complete: true` came back beside a
+      // `documentRules` list carrying two Tailwind utilities the same response
+      // could not account for.
+      //
+      // `unaccountedRules` closes it with evidence the answer is already
+      // carrying: the browser's own list of what matches, minus everything the
+      // authored scan returned. One entry in it and this is false.
+      complete: runtime.available === true && explainsComputed === true && unaccountedRules.length === 0,
       excludes: EXCLUDED_FROM_AUTHORED,
-      runtime,
+      runtime: {
+        ...runtime,
+        // Named, not counted: "which rule" is what tells a caller whether the
+        // gap is a utility framework or a stylesheet nothing in the project
+        // authors. Capped, because a Tailwind element can match dozens.
+        ...(runtime.available
+          ? {
+              unaccountedRules: unaccountedRules.slice(0, MAX_UNACCOUNTED),
+              unaccountedRuleCount: unaccountedRules.length,
+              ...(unaccountedRules.length
+                ? {
+                    unaccountedNote:
+                      'The served document says these rules match this element and no authored source Stacki scanned ' +
+                      'contains them — generated CSS, or a stylesheet outside the project. They are why ' +
+                      '`coverage.complete` is false; `documentRules` carries their declarations.',
+                  }
+                : {}),
+            }
+          : {}),
+      },
       ...(note ? { note } : {}),
     },
     explainsComputed,
@@ -598,8 +848,28 @@ export async function setProperty(node, { identity, source, selector, property, 
         : 'Name the source to write into — style.read lists them as writableSources.'
     );
   }
-  const region = doc.regions[doc.regions.length - 1];
-  if (!region?.root) return problem('unrepresentable', `Stacki could not parse ${doc.source.label}.`);
+  // WHICH BLOCK A NEW RULE GOES IN, AND THE THREE REASONS THERE MIGHT NOT BE ONE.
+  //
+  // This used to take the LAST region unconditionally and refuse a rootless one
+  // as "Stacki could not parse X" — one false sentence for three situations.
+  // Stacki parses a component's scoped <style> perfectly well; `root: null` is
+  // the deliberate decision not to edit it (see docForSource), not a failure. So
+  // the refusal sent a person hunting a syntax error that is not there — the
+  // same defect class locateIdentity was written to eliminate — and a component
+  // whose LAST block happened to be scoped was refused even with a writable
+  // is:global block above it.
+  const writableRegions = doc.regions.filter((r) => !!r.root);
+  const region = writableRegions[writableRegions.length - 1];
+  if (!region) {
+    const failed = doc.regions.find((r) => r.parseError);
+    if (failed) return problem('unrepresentable', `Stacki could not parse ${doc.source.label}: ${failed.parseError}`);
+    return problem(
+      'read_only',
+      `${doc.source.label} has no style block Stacki will write into. A component's scoped <style> is read verbatim ` +
+        'and never edited — only an is:global block or a stylesheet is a destination. Nothing was written; ' +
+        'style.read marks which sources are writable.'
+    );
+  }
   if (!createRuleAtRoot(region, target, prop, next, important)) {
     return problem('bad_request', `Stacki could not write ${prop}: ${next} for ${target}.`);
   }

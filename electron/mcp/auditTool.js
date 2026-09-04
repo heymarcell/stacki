@@ -123,6 +123,11 @@ const Capture = z.object({
   // own page loaded again at the requested width in a window of the audit's own.
   // It is not the Stacki UI and not the person's current breakpoint.
   renderedOffscreen: z.boolean(),
+  // Why there is no image, when there is none. 'budget' is the only one a
+  // narrower re-run fixes, which is why `next` is worded from this and not from
+  // `included` -- telling a caller to ask again for a viewport whose frame came
+  // back empty is advice that cannot terminate.
+  omittedBecause: z.enum(['budget', 'empty_frame', 'no_encoder']).optional(),
   note: z.string(),
 });
 
@@ -313,8 +318,9 @@ function registerAuditTool(server, { audit, api }) {
           .describe(
             'Return a screenshot per viewport, taken in the same state the findings were measured in. Off by ' +
               'default: findings are the useful part. The picture arrives as an IMAGE BLOCK in the response, not ' +
-              'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about, and ' +
-              '`included` says whether an image was actually sent for it. Each picture is the page rendered ' +
+              'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about — including ' +
+              'the ones no picture came back for — where `included` says whether an image was actually sent and ' +
+              '`omittedBecause` says why not when it was not. Each picture is the page rendered ' +
               'OFFSCREEN at the width you asked for, as a visitor sees it — not the Stacki UI and not the ' +
               'breakpoint the person has open. This, with viewports:[{width,height}] and rules:[], is how to see ' +
               'a route at a width of your own choosing; the `capture` tool cannot change the person\'s breakpoint ' +
