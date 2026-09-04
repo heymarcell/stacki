@@ -140,17 +140,35 @@ function writeConfig(workspace, { url, token, name = 'stacki' }) {
 // resource surface had been switched off.
 const MCP_ACCESS_TOOLS = ['ListMcpResourcesTool', 'ReadMcpResourceTool'];
 
+// AND THE ONE THAT MAKES THE CATALOGUE DEFERRABLE.
+//
+// `ToolSearch` is a built-in, so leaving it out of `--tools` does not merely
+// omit a tool — it turns MCP tool search off, because there is nothing to
+// search with. That is the DEFAULT regime for every real Claude Code user, and
+// a purity mode that silently disables it measures a Stacki nobody has.
+//
+// Measured, on the real host: first-turn context was 14,836 tokens without it
+// and 5,311 with it, and `ENABLE_TOOL_SEARCH=true|false|auto:0` made no
+// difference at all in the first case (14,832 / 14,848 / 14,836) because there
+// was no searcher to enable. So every context number this harness produced in
+// `mcp-only` was of the fully-inlined catalogue — about fifteen times the
+// marginal cost a real session pays.
+//
+// It reads and writes nothing, so it is not an escape from the sandbox; the
+// purity claim is unchanged and is still checked from the transcript.
+const TOOL_SEARCH = 'ToolSearch';
+
 // Structured answers come back through a tool as well. It writes nothing and
 // reads nothing; counting it as an escape from the sandbox would fail every
 // trial that was asked for a structured answer.
-const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, 'StructuredOutput']);
+const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, TOOL_SEARCH, 'StructuredOutput']);
 
 /** The built-in tools a host may use, per mode. */
 const TOOLSET = {
   // Everything Stacki can be asked, and nothing else: no Bash, no Read, no
   // Write, no Glob, no Grep, no web. Whether that held is checked from the
   // transcript rather than trusted.
-  'mcp-only': MCP_ACCESS_TOOLS.join(','),
+  'mcp-only': [...MCP_ACCESS_TOOLS, TOOL_SEARCH].join(','),
   integrated: 'default',
 };
 
@@ -199,8 +217,8 @@ function runHost({
     tools,
     '--allowedTools',
     mode === 'mcp-only'
-      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')}`
-      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},Bash,Read,Write,Edit,Glob,Grep`,
+      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH}`
+      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH},Bash,Read,Write,Edit,Glob,Grep`,
     '--permission-mode',
     'dontAsk',
     // No user, project or local settings file joins the run, so a hook or a
