@@ -93,13 +93,32 @@ const CACHE_HINTS = Object.freeze({
   'tools/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
   'prompts/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
   'resources/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
+  // Stacki registers no resource templates, so this list is empty and constant
+  // — the most cacheable answer on the surface, and the one left out of the
+  // first version of this table because nothing serves it.
+  'resources/templates/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
   'resources/read': { ttlMs: 0, cacheScope: 'private' },
 });
 
 const DEFAULT_PORT = 43821;
 const DEFAULT_HOST = '127.0.0.1';
 const ENDPOINT_PATH = '/mcp';
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
+// ABOVE THE LARGEST CALL THE SCHEMAS ACTUALLY ACCEPT, which is not the same as
+// "a round number that felt safe".
+//
+// The first version of this was 8 MB, reasoned from `style.write_source`'s
+// two-million-character cap. That was the wrong field and the wrong arithmetic.
+// Measured against the published schemas: a schema-legal `content.write_entry`
+// — 500 edits plus a one-million-character body — is 11,016,053 bytes, and
+// `content.cms_write.data`, `content.validate.data`, `content.cms_set_meta.fields`
+// and `git.resolve_merge.choices` carry no size bound at all. An 8 MB gate
+// would have refused calls this surface publishes as valid, at the transport,
+// where the refusal is an HTTP error rather than the structured code the rest
+// of this API answers with.
+//
+// So: comfortably above the largest measured schema-legal request, and still
+// nowhere near a size worth buffering by accident.
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /** Equal-length, constant-time string compare. */
 function tokenMatches(given, expected) {
@@ -116,6 +135,38 @@ function bearerOf(header) {
   if (typeof header !== 'string') return null;
   const m = /^Bearer[ ]+(.+)$/i.exec(header.trim());
   return m ? m[1].trim() : null;
+}
+
+/**
+ * Refuse a request whose body may still be arriving.
+ *
+ * A refusal written before the body has been read is the cheap kind, and it was
+ * also the kind that never got delivered. Answering and then calling
+ * `req.destroy()` resets the connection while the client is still writing: the
+ * official MCP client, in both eras, saw `fetch failed` / EPIPE and could not
+ * tell whether its write had landed. The refusal has to survive being right.
+ *
+ * The fix is to do LESS, not more. `res.end()` makes Node dump the rest of the
+ * request itself — read and discarded, never buffered — so the client finishes
+ * writing and then reads the answer. Two elaborations were tried and both
+ * broke it, which is why this function is one line:
+ *
+ *   draining by hand with a `data` listener puts the stream in flowing mode
+ *   and takes Node's own dumping away — it reset exactly the requests it was
+ *   written to rescue;
+ *
+ *   `Connection: close` makes Node destroy the socket once the response has
+ *   flushed, which on a body the client is still uploading is the same reset
+ *   by a politer route.
+ *
+ * Measured through `fetch` — the transport the official client and every host
+ * uses — at 32 MB and 36 MB over the cap: 413 delivered with its body intact.
+ *
+ * Every early refusal on this endpoint goes through here, because a client
+ * mid-upload is equally unable to read a 401 or a 404.
+ */
+function refuse(req, res, status, body) {
+  sendJson(res, status, body);
 }
 
 function sendJson(res, status, body, headers = {}) {
@@ -228,14 +279,18 @@ function createStackiMcpServer({
       return;
     }
 
+    const path = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
+    if (path !== ENDPOINT_PATH) {
+      refuse(req, res, 404, { error: 'not_found', message: `Stacki MCP is served at ${ENDPOINT_PATH}.` });
+      return;
+    }
+
     // HOW BIG AN ASK IS ALLOWED TO BE.
     //
     // There was no limit anywhere in the stack: a 64 MB POST was read into a
     // JavaScript string and answered. The endpoint is on loopback behind a
     // bearer, so this is not the first line of defence -- but "authenticated"
-    // and "unbounded" is still the wrong pair, and the four gates above cost
-    // nothing precisely because they refuse before any work happens. This
-    // refuses before the body is read at all.
+    // and "unbounded" is still the wrong pair.
     //
     // EIGHT MEGABYTES, from the largest thing the surface actually accepts: a
     // stylesheet through `style.write_source`, capped by its own schema at two
@@ -243,23 +298,41 @@ function createStackiMcpServer({
     // escaping and the envelope, and nowhere near a size worth buffering by
     // accident.
     //
-    // Declared length only. A body arriving without one is not refused -- every
-    // MCP client sends Content-Length for a JSON POST, and refusing the ones
-    // that might not would be trading a real client for a hypothetical
-    // attacker who is already holding the token.
+    // AFTER THE PATH CHECK, so a 40 MB POST to /nonsense is answered 404 for
+    // the reason it is actually wrong, rather than being told about a limit on
+    // a route that does not exist.
+    //
+    // AND WITHOUT `req.destroy()`, which is how the first version of this got
+    // it wrong. Resetting the socket while the client is still streaming its
+    // body means the carefully-worded 413 never arrives: the official client,
+    // in both eras, saw `fetch failed` / EPIPE and could not tell whether the
+    // write had landed. The response is sent, the rest of the body is drained
+    // and discarded rather than buffered, and the connection closes when the
+    // response has actually flushed.
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-      sendJson(res, 413, {
+      refuse(req, res, 413, {
         error: 'payload_too_large',
         message: `Stacki MCP accepts requests up to ${MAX_BODY_BYTES} bytes; this one declared ${declared}.`,
       });
-      req.destroy();
       return;
     }
-
-    const path = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
-    if (path !== ENDPOINT_PATH) {
-      sendJson(res, 404, { error: 'not_found', message: `Stacki MCP is served at ${ENDPOINT_PATH}.` });
+    // A BODY THAT WILL NOT SAY HOW LONG IT IS.
+    //
+    // The declared-length check above is worth nothing on its own: a
+    // `Transfer-Encoding: chunked` POST carries no Content-Length, and 32 MB
+    // went through the first version of this gate and came back 200 OK.
+    //
+    // A length is therefore required, which for this endpoint costs nothing
+    // real: it serves one JSON method on loopback, and every MCP client
+    // measured against it -- the official client in both eras, Claude Code,
+    // Codex and Gemini -- sends Content-Length for a JSON POST. 411 is the
+    // status HTTP defines for exactly this, and it says what to do.
+    if (!Number.isFinite(declared)) {
+      refuse(req, res, 411, {
+        error: 'length_required',
+        message: 'Stacki MCP needs a Content-Length. It serves one JSON method and does not accept a streamed body.',
+      });
       return;
     }
 
