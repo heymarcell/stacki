@@ -214,7 +214,21 @@ export function createAgentCommands(getApp) {
       if (!entered.ok) return entered;
       const inside = findNodeById(a.model()?.nodes || [], entered.id);
       if (!inside) return fail('not_ready', `Stacki opened <${node.name}> but its tree is not loaded yet. Try again.`);
-      return { ok: true, entered: node.name, ...readAt(a, inside), document: documentOf(a), keys: a.keysFor(entered.id) };
+      // CARRYING THE CAUTION IN, not resetting it at the door. `readAt` defaults
+      // to writable, and taking that default here meant an instance found by
+      // position alone — a ref target.edit refuses with not_editable — became a
+      // write handle for the component's root as soon as anybody entered it.
+      // The component this walked into is whichever one now occupies that slot,
+      // which is precisely what the ref could not vouch for.
+      return {
+        ok: true,
+        entered: node.name,
+        confidence,
+        writable,
+        ...readAt(a, inside, { confidence, writable }),
+        document: documentOf(a),
+        keys: a.keysFor(entered.id),
+      };
     }
     if (action === 'exit') {
       const left = await a.exit();
@@ -223,7 +237,9 @@ export function createAgentCommands(getApp) {
       return {
         ok: true,
         exited: true,
-        ...(inside ? readAt(a, inside) : {}),
+        confidence,
+        writable,
+        ...(inside ? readAt(a, inside, { confidence, writable }) : {}),
         document: documentOf(a),
         keys: a.keysFor(a.selectedId()),
       };
@@ -277,15 +293,28 @@ export function createAgentCommands(getApp) {
       const operations = [];
       for (const op of args.operations || []) {
         if (op?.type === 'move') {
-          const keys = op.to?.parentKeys || null;
+          // The whole destination anchor, not just its slot. Resolving on the
+          // index path alone is how a move landed in whatever had taken over
+          // that position; the fingerprint is the same evidence the node being
+          // moved is re-found by, and the rule below is the same rule.
+          const dest = op.to?.parent || null;
+          const keys = dest?.keys || op.to?.parentKeys || null;
           let parentId = null;
           if (keys && keys.length) {
             const leaf = leafOf({ keys });
             if (!leaf || leaf.file !== a.openFile()) {
               return fail('bad_request', 'A node can only be moved somewhere in the file it already lives in.');
             }
-            const found = resolveNode(model?.nodes || [], leaf.indexPath, null, { labelOf: a.crumbLabel });
+            const found = resolveNode(model?.nodes || [], leaf.indexPath, dest?.fingerprint || null, { labelOf: a.crumbLabel });
             if (!found.id) return fail('no_node', 'That move destination is not in the open file any more.');
+            if (dest && !a.writableFor(dest, found.confidence)) {
+              return fail(
+                'not_editable',
+                'Stacki found the move destination by position alone, on a tree that is not the one its ref was ' +
+                  'made for. That is good enough to look at and not good enough to move markup into. Read the ' +
+                  'destination again on this checkout, or select it in Stacki.'
+              );
+            }
             parentId = found.id;
           }
           operations.push({ nodeId: id, type: 'move', target: { parentId, index: op.to?.index ?? 0 } });

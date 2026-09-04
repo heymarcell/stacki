@@ -343,19 +343,81 @@ function createAgentApi({
   }
 
   /**
+   * The one observation a call with SEVERAL refs is checked against.
+   *
+   * A move has two writable refs on one call — the node and the parent it
+   * lands in — and they are refs for the same document, so either they agree
+   * about which version of it they saw or one of them was read before a change
+   * that has since landed. Which one is not knowable from here and does not
+   * need to be: the write is refused and the caller re-reads both.
+   *
+   * This is what makes a stale DESTINATION `stale_target` rather than a silent
+   * relocation. The source-side guard below cannot see it, because a fresh
+   * source ref agrees with the document perfectly while the destination it is
+   * being moved into names a slot that has since changed hands.
+   */
+  function witnessOf(list) {
+    let seen = null;
+    for (const parsed of list) {
+      const observed = parsed?.observed;
+      if (!observed || (observed.revision == null && observed.digest == null)) continue;
+      if (!seen) {
+        seen = parsed;
+        continue;
+      }
+      const first = seen.observed;
+      // Two refs for two DIFFERENT documents. The digests would disagree and
+      // this would come out as "read again", which is the wrong instruction:
+      // reading again will not make a node in one file a place in another.
+      if (first.file && observed.file && first.file !== observed.file) {
+        return {
+          error: no(
+            'wrong_target',
+            `Those refs are for different files — ${first.file} and ${observed.file}. A node can only be moved ` +
+              'somewhere in the file it already lives in. Nothing was changed.'
+          ),
+        };
+      }
+      const revisions = first.revision != null && observed.revision != null && first.revision !== observed.revision;
+      const digests = first.digest != null && observed.digest != null && first.digest !== observed.digest;
+      if (revisions || digests) {
+        return {
+          error: no(
+            'stale_target',
+            `Those refs saw different versions of ${observed.file || 'the document'} — one of them was read before ` +
+              'a change that has since landed, so where this would go is not where it was aimed. Nothing was ' +
+              'changed. Read the target and the destination again and use the refs those reads hand back.'
+          ),
+        };
+      }
+    }
+    return { seen };
+  }
+
+  /**
    * What a write must prove about the document, from the ref and the caller.
    *
-   * THE REF WINS. It used to be `args.expectedRevision ?? seen.observed.revision`,
-   * which put the CLIENT'S value first — so the same stale ref was refused
-   * with no arguments and accepted with two, and a guard a caller can switch
-   * off by naming any current number is not a guard. The file path has always
-   * done it the other way round (domains.js: `expected = fromRef.digest ?? expected`),
-   * and these are two halves of one surface.
+   * The hole this closes: `args.expectedRevision ?? seen.observed.revision` put
+   * the CLIENT's value first, so the same stale ref was refused with no
+   * arguments and accepted with two, and a guard a caller can switch off by
+   * naming any current number is not a guard.
+   *
+   * TWO MECHANISMS CLOSE IT AND EITHER ONE IS ENOUGH — said here because the
+   * ordering used to be credited with the protection on its own, and a reader
+   * debugging this should not trust a line that carries no weight by itself.
+   * Measured, each reverted alone with the other left in place: the disagreement
+   * refusal removed changes nothing (the ref's value is still the one that
+   * travels), and the ordering reverted to the client-first form changes nothing
+   * (the disagreement has already been refused). Removing BOTH lands the
+   * laundered write — test/ref-concurrency.js check 4 goes red on the file.
+   *
+   * They are kept together on purpose. The refusal is the one that tells a
+   * caller which of the two versions it got wrong, and the ordering is the way
+   * the file path has always done it (domains.js: `expected = fromRef.digest ??
+   * expected`) — two halves of one surface should not read differently.
    *
    * An explicit expectation is still honoured — it is the only expectation
-   * there is for a call with no ref, which acts on the live selection — and
-   * where a call carries both, a DISAGREEMENT is refused rather than silently
-   * resolved either way. That can only ever add a refusal.
+   * there is for a call with no ref, which acts on the live selection.
    */
   function expectationsFor(args, seen) {
     const observed = seen?.observed || null;
@@ -525,9 +587,18 @@ function createAgentApi({
       }
       // enter and exit both answer with a target, and it is a target inside a
       // different file — so it is given the same source trail, snippet and ref
-      // a read gets, and the evidence is `exact` because the app just walked
-      // there itself.
-      return withSource(answer, ctx, action === 'read' ? writable : true, { compact: args?.compact === true });
+      // a read gets.
+      //
+      // AND THE SAME PERMISSION. This was `action === 'read' ? writable : true`,
+      // which made entering a laundry: pass a ref the evidence rules had just
+      // refused a write through, enter, and the ref that came back was a
+      // working write handle one call later — measured, with the class in the
+      // component's file. A read-only ref means Stacki cannot vouch that this
+      // is the same node, and walking INTO something it cannot vouch for does
+      // not turn it into something it can; entering is free, so if it also
+      // promoted, the read-only distinction would not exist. The renderer's own
+      // judgement is on the answer and narrows this further.
+      return withSource(answer, ctx, writable && answer.writable !== false, { compact: args?.compact === true });
     }
 
     if (!SINGLE[action] && action !== 'edit') return no('bad_action', `target has no action "${action}".`);
@@ -552,18 +623,41 @@ function createAgentApi({
     }
     if (!operations.length) return no('bad_request', 'edit needs at least one operation.');
 
-    // A move names where it is going with a ref. The renderer works in node
-    // ids, and a ref is not one — so it is read here, where refs are read, and
-    // the keys it carries go across instead.
+    // A move names where it is going with a ref, AND THAT REF IS PART OF THE
+    // WRITE. The renderer works in node ids and a ref is not one, so it is read
+    // here where refs are read — but for a long time all that was taken off it
+    // was `keys`, which reduced the destination to a bare index path and threw
+    // away the three things every other ref on the surface is held to. Both
+    // halves of that were measured: a parentRef minted before an <aside> was
+    // inserted above the div it named moved a <footer> into the <aside>
+    // instead, ok:true and no note; and a ref the evidence rules had
+    // deliberately withheld write permission from was accepted as a parent and
+    // the markup landed inside it. The node being moved had all three checks
+    // and the place it lands had none, which is the same defect one branch
+    // over.
+    const destinations = [];
     for (const op of operations) {
       if (op?.type !== 'move' || !op.to) continue;
-      if (op.to.parentRef) {
-        const parsed = readRef(op.to.parentRef, 'node');
-        if (!parsed.ok) return { ...parsed, message: `The move destination: ${parsed.message}` };
-        op.to = { parentKeys: parsed.data.keys || [], index: op.to.index };
-      } else {
-        op.to = { parentKeys: null, index: op.to.index };
+      if (!op.to.parentRef) {
+        op.to = { parent: null, parentKeys: null, index: op.to.index };
+        continue;
       }
+      const parsed = readRef(op.to.parentRef, 'node');
+      if (!parsed.ok) return { ...parsed, message: `The move destination: ${parsed.message}` };
+      if (parsed.writable !== true) {
+        return no(
+          'not_editable',
+          'The move destination ref was issued for reading only — Stacki identified that parent by position on a ' +
+            'tree the ref was not made for. Read the destination again on this checkout, or have the person select it.'
+        );
+      }
+      const unobservedTo = requireObservation(parsed);
+      if (unobservedTo) return { ...unobservedTo, message: `The move destination: ${unobservedTo.message}` };
+      // The marks travel with the keys, so the renderer re-identifies the
+      // parent the way it re-identifies the node being moved rather than
+      // trusting whatever now sits at that index.
+      op.to = { parent: parsed.data, parentKeys: parsed.data.keys || [], index: op.to.index };
+      destinations.push(parsed);
     }
 
     // The ref's own observation is the guard, and it is not optional: it was
@@ -572,7 +666,9 @@ function createAgentApi({
     // by definition what is in front of the person right now — there is no
     // earlier observation for it to be stale against, and an explicit
     // expectation is then the only one there is.
-    const expected = expectationsFor(args, seen);
+    const witness = witnessOf([seen, ...destinations]);
+    if (witness.error) return witness.error;
+    const expected = expectationsFor(args, witness.seen);
     if (expected.error) return expected.error;
 
     const watching = filesOf(anchor || currentAnchor(ctx));

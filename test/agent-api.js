@@ -818,6 +818,50 @@ const PINNED_RISK = {
       check(`${name} has annotations`, !!tool.annotations);
     }
 
+    // EVERY ARGUMENT POSITION THAT TAKES A REF, and not merely every argument
+    // spelled `ref`.
+    //
+    // A move's destination is a ref called `parentRef`, nested two levels down
+    // inside an operations array, and it stayed unguarded for as long as it did
+    // because the guard was written for "the ref argument" — meaning the one at
+    // the top of the object. So the positions are enumerated off the wire
+    // instead of being remembered, by the shape `Ref`/`FileRef` emit (a string
+    // bounded 8..4000, which git's revision argument — a plain string capped at
+    // 200 — is not), and the answer is written down here.
+    //
+    // A new ref argument anywhere in any schema makes this fail, which is the
+    // point: the list is a decision that somebody has covered it in
+    // test/ref-concurrency.js, not a description of what happens to exist.
+    {
+      const positions = [];
+      const walk = (schema, at, tool) => {
+        if (!schema || typeof schema !== 'object') return;
+        if (schema.type === 'string' && schema.minLength === 8 && schema.maxLength === 4000) positions.push(`${tool}:${at}`);
+        if (schema.properties) for (const [key, value] of Object.entries(schema.properties)) walk(value, at ? `${at}.${key}` : key, tool);
+        if (schema.items) walk(schema.items, `${at}[]`, tool);
+        for (const branch of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(schema[branch])) schema[branch].forEach((one) => walk(one, at, tool));
+      };
+      for (const name of expected) walk(byName[name].inputSchema, '', name);
+      const found = [...new Set(positions)].sort();
+      const covered = [
+        'asset:ref',
+        'content:ref',
+        'page:ref',
+        'source:ref',
+        'style:ref',
+        'target:operations[].to.parentRef',
+        'target:ref',
+        'target:to.parentRef',
+      ];
+      check(
+        'every ref-typed argument position on the surface is one somebody has covered',
+        JSON.stringify(found) === JSON.stringify(covered),
+        `found ${JSON.stringify(found)}\n    covered ${JSON.stringify(covered)}`
+      );
+      check('and the destination of a move is one of them', found.includes('target:to.parentRef'), found.join(', '));
+      check('including the one inside an edit batch', found.includes('target:operations[].to.parentRef'), found.join(', '));
+    }
+
     // The descriptions are paid for in every client's context, every call.
     const total = expected.reduce((n, name) => n + byName[name].description.length, 0);
     check('the descriptions together stay readable', total < 9000, `${total} chars`);

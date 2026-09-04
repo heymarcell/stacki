@@ -144,14 +144,31 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
  * A path under the project becomes the project-relative one — which is what
  * every other consumer of that field already computes — and anything else
  * absolute is dropped, because a ref that names a place outside the project
- * has no business resolving here anyway. `route` is exempt: it is the site's
- * address, and "/" is not a filesystem path.
+ * has no business resolving here anyway.
+ *
+ * AND IT ONLY APPLIES TO FIELDS THAT ARE PATHS. A generic walk over every
+ * string cannot tell a path from a node's words, and a nav whose links read
+ * "/docs" and "/blog" is ordinary markup: every ref minted for one of those had
+ * its `fingerprint.text` replaced with null, which is not a formatting
+ * difference but the loss of the mark the resolver identifies the node BY.
+ * src/reviewAnchor.js reads a missing text as "nothing to check" — `atSays`
+ * becomes unconditionally true — so the "two cards swapped places" protection
+ * switches itself off and a position gets reported as `exact`. Same class of
+ * bug as the 120-character clip this file's neighbours just fixed, and
+ * reintroduced by the sanitiser rather than by a caller.
+ *
+ * So the exemption is by KEY, and it names the fields the resolver compares as
+ * CONTENT rather than resolving as a place: a node's words, the labels on its
+ * breadcrumb chain, a tag or component name, and `route` — the site's address,
+ * where "/" was never a filesystem path in the first place.
  */
+const CONTENT_KEYS = new Set(['route', 'text', 'label', 'breadcrumbs', 'tag', 'name']);
+
 function relativized(data, projectRoot) {
   const root = typeof projectRoot === 'string' && projectRoot ? projectRoot : null;
   const walk = (value, key) => {
     if (typeof value === 'string') {
-      if (key === 'route' || !path.isAbsolute(value)) return value;
+      if (CONTENT_KEYS.has(key) || !path.isAbsolute(value)) return value;
       if (root && (value === root || value.startsWith(`${root}${path.sep}`))) {
         return path.relative(root, value).split(path.sep).join('/');
       }
