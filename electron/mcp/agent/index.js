@@ -27,10 +27,40 @@ const path = require('node:path');
 const registry = require('./registry');
 const permissions = require('./permissions');
 const refs = require('./refs');
-const { runMain } = require('./domains');
+const { runMain, resolveContentEntry } = require('./domains');
 const { patchBetween } = require('./patch');
 const { relativeTo } = require('./paths');
 const { digestOf } = require('./digest');
+
+// What the editor's operations actually take.
+//
+// One normalizer, used by both doors. The single-operation actions are the
+// batch with one operation in it, and every one of them goes through here on
+// the way — a prop value written as `"3"` at the protocol and as
+// `{type:'string', value:'3'}` in the model is exactly the sort of thing that
+// is right on one path and `undefined` on the other.
+const propValue = (o) =>
+  o.value === undefined || o.value === null
+    ? undefined
+    : { type: o.valueType === 'expr' ? 'expr' : 'string', value: String(o.value) };
+
+const NORMALIZE = {
+  set_text: (o) => ({ type: 'set_text', value: String(o.value ?? ''), replaceBinding: !!o.replaceBinding }),
+  set_prop: (o) => ({ type: 'set_prop', name: o.name, value: propValue(o) }),
+  remove_prop: (o) => ({ type: 'remove_prop', name: o.name }),
+  set_classes: (o) => ({ type: 'set_classes', classes: o.classes }),
+  add_class: (o) => ({ type: 'add_class', className: o.className }),
+  remove_class: (o) => ({ type: 'remove_class', className: o.className }),
+  insert_before: (o) => ({ type: 'insert_before', node: o.node }),
+  insert_after: (o) => ({ type: 'insert_after', node: o.node }),
+  append_child: (o) => ({ type: 'append_child', node: o.node }),
+  remove: () => ({ type: 'remove' }),
+  duplicate: () => ({ type: 'duplicate' }),
+  // The destination is a ref here and a node id in the renderer; the keys it
+  // carries are what crosses, and they are read below.
+  move: (o) => ({ type: 'move', to: o.to }),
+  set_tag: (o) => ({ type: 'set_tag', tag: o.tag }),
+};
 
 // How long the renderer gets for an editor command. Longer than a style query,
 // because a target read may have to open a page, wait for the preview and walk
@@ -195,6 +225,20 @@ function createAgentApi({
   function nodeRef(anchor, { writable = true, observed = null } = {}) {
     const ctx = context();
     if (!ctx.root || !anchor) return null;
+    // AND A WRITE HANDLE HAS TO CARRY WHAT IT SAW.
+    //
+    // The guard that refuses a stale write compares the ref's observation
+    // against the document now, so a ref minted writable with no observation
+    // is not a weaker guard — it is no guard at all, and it read as ok:true
+    // through every write in the API. Two callers forgot (get_context's ref
+    // and a comment focus's), and a third never had one to forget.
+    //
+    // Degraded rather than thrown: read-only is a first-class, tested state,
+    // so a caller that forgets gets a ref that reads and refuses to write
+    // instead of an unguarded one. A ref for something with no version to be
+    // stale against — a file that does not exist yet — is a different kind and
+    // is minted elsewhere.
+    const versioned = !!(observed && (observed.revision != null || observed.digest != null));
     return refs.mint(
       'node',
       {
@@ -214,8 +258,37 @@ function createAgentApi({
       // What the read that produced this saw. A write through this ref is
       // checked against it, which is what makes concurrency protection
       // something a client cannot forget to ask for.
-      { projectRoot: ctx.root, writable, observed }
+      { projectRoot: ctx.root, writable: writable && versioned, observed }
     );
+  }
+
+  /**
+   * The document the app has last published about itself, as an observation.
+   *
+   * The two refs an agent is handed without asking for a read — the one
+   * get_context returns and the one a comment focus returns — are minted out
+   * here rather than out of a renderer answer, so this is where the version
+   * they saw has to come from. It is the same `document` a read answers with,
+   * carried on the payload the window publishes on every render.
+   *
+   * A payload that is a render behind names an OLDER revision than the truth,
+   * and the write through such a ref is refused rather than accepted. That is
+   * the direction a lag has to fail in, and it is why this is allowed to read
+   * a published fact rather than having to ask the window for a fresh one.
+   */
+  function publishedDocument() {
+    const doc = readPayload()?.document || null;
+    if (!doc || (doc.revision == null && doc.digest == null)) return null;
+    return doc;
+  }
+
+  /**
+   * A node ref for something the WINDOW is pointing at, not something a read
+   * returned. Same mint, same guard — the observation comes from the payload
+   * because there is no answer to take it from.
+   */
+  function publishedNodeRef(anchor, { writable = true } = {}) {
+    return nodeRef(anchor, { writable, observed: publishedDocument() });
   }
 
   /**
@@ -243,32 +316,137 @@ function createAgentApi({
   }
 
   /**
-   * Whether a ref's observation still holds.
+   * Whether a writable node ref may be used to write at all.
    *
-   * `null` when it does — or when the ref carried none, which is a ref about
-   * something that had no version to be stale against. Otherwise the refusal,
-   * with what is true now so a re-read is one call rather than a guess.
+   * The staleness comparison itself is the renderer's — it is the only place
+   * that knows what the document is right now — and it is reached by putting
+   * the ref's observation on the command. This is the step before that: a
+   * writable ref that carries NO observation would send `undefined`, and the
+   * renderer's guard is written `if (args.expectedRevision != null && ...)`,
+   * so an absent expectation skips the check in silence. That is the whole of
+   * how an unguarded write used to happen, and it is why this refuses rather
+   * than letting the absence mean "no objection".
+   *
+   * `null` when there is nothing to object to. There was a function of this
+   * name here before that was never called from anywhere; this is the same
+   * question, asked.
    */
-  function checkObservation(parsed, current, what) {
-    const seen = parsed?.observed;
-    if (!seen) return null;
-    if (seen.revision != null && current.revision != null && seen.revision !== current.revision) {
-      return no(
-        'stale_target',
-        `${what} has changed since you read it (revision ${seen.revision} → ${current.revision}). Nothing was changed. ` +
-          'Read the target again and re-apply your change to what is there now.',
-        { observed: seen, current }
-      );
+  function requireObservation(parsed) {
+    if (!parsed?.ok || parsed.kind !== 'node' || parsed.writable !== true) return null;
+    const seen = parsed.observed;
+    if (seen && (seen.revision != null || seen.digest != null)) return null;
+    return no(
+      'bad_ref',
+      'That ref was issued without a record of the version it saw, so a write through it could not be checked ' +
+        'against the document. Read the target again and use the ref that read hands back.'
+    );
+  }
+
+  /**
+   * The one observation a call with SEVERAL refs is checked against.
+   *
+   * A move has two writable refs on one call — the node and the parent it
+   * lands in — and they are refs for the same document, so either they agree
+   * about which version of it they saw or one of them was read before a change
+   * that has since landed. Which one is not knowable from here and does not
+   * need to be: the write is refused and the caller re-reads both.
+   *
+   * This is what makes a stale DESTINATION `stale_target` rather than a silent
+   * relocation. The source-side guard below cannot see it, because a fresh
+   * source ref agrees with the document perfectly while the destination it is
+   * being moved into names a slot that has since changed hands.
+   */
+  function witnessOf(list) {
+    let seen = null;
+    for (const parsed of list) {
+      const observed = parsed?.observed;
+      if (!observed || (observed.revision == null && observed.digest == null)) continue;
+      if (!seen) {
+        seen = parsed;
+        continue;
+      }
+      const first = seen.observed;
+      // Two refs for two DIFFERENT documents. The digests would disagree and
+      // this would come out as "read again", which is the wrong instruction:
+      // reading again will not make a node in one file a place in another.
+      if (first.file && observed.file && first.file !== observed.file) {
+        return {
+          error: no(
+            'wrong_target',
+            `Those refs are for different files — ${first.file} and ${observed.file}. A node can only be moved ` +
+              'somewhere in the file it already lives in. Nothing was changed.'
+          ),
+        };
+      }
+      const revisions = first.revision != null && observed.revision != null && first.revision !== observed.revision;
+      const digests = first.digest != null && observed.digest != null && first.digest !== observed.digest;
+      if (revisions || digests) {
+        return {
+          error: no(
+            'stale_target',
+            `Those refs saw different versions of ${observed.file || 'the document'} — one of them was read before ` +
+              'a change that has since landed, so where this would go is not where it was aimed. Nothing was ' +
+              'changed. Read the target and the destination again and use the refs those reads hand back.'
+          ),
+        };
+      }
     }
-    if (seen.digest != null && current.digest != null && seen.digest !== current.digest) {
-      return no(
-        'stale_target',
-        `${what} has changed since you read it — somebody or something else edited it. Nothing was changed. ` +
-          'Read it again and re-apply your change to what is there now.',
-        { observed: seen, current }
-      );
+    return { seen };
+  }
+
+  /**
+   * What a write must prove about the document, from the ref and the caller.
+   *
+   * The hole this closes: `args.expectedRevision ?? seen.observed.revision` put
+   * the CLIENT's value first, so the same stale ref was refused with no
+   * arguments and accepted with two, and a guard a caller can switch off by
+   * naming any current number is not a guard.
+   *
+   * TWO MECHANISMS CLOSE IT AND EITHER ONE IS ENOUGH — said here because the
+   * ordering used to be credited with the protection on its own, and a reader
+   * debugging this should not trust a line that carries no weight by itself.
+   * Measured, each reverted alone with the other left in place: the disagreement
+   * refusal removed changes nothing (the ref's value is still the one that
+   * travels), and the ordering reverted to the client-first form changes nothing
+   * (the disagreement has already been refused). Removing BOTH lands the
+   * laundered write — test/ref-concurrency.js check 4 goes red on the file.
+   *
+   * They are kept together on purpose. The refusal is the one that tells a
+   * caller which of the two versions it got wrong, and the ordering is the way
+   * the file path has always done it (domains.js: `expected = fromRef.digest ??
+   * expected`) — two halves of one surface should not read differently.
+   *
+   * An explicit expectation is still honoured — it is the only expectation
+   * there is for a call with no ref, which acts on the live selection.
+   */
+  function expectationsFor(args, seen) {
+    const observed = seen?.observed || null;
+    if (
+      args.expectedRevision != null &&
+      observed?.revision != null &&
+      args.expectedRevision !== observed.revision
+    ) {
+      return {
+        error: no(
+          'bad_request',
+          `That ref saw revision ${observed.revision} and you named ${args.expectedRevision}. ` +
+            'Drop the argument, or read the target again and use the ref that read hands back.'
+        ),
+      };
     }
-    return null;
+    if (args.expectedDigest != null && observed?.digest != null && args.expectedDigest !== observed.digest) {
+      return {
+        error: no(
+          'bad_request',
+          'That ref saw a different version of the document than the digest you named. ' +
+            'Drop the argument, or read the target again and use the ref that read hands back.'
+        ),
+      };
+    }
+    return {
+      expectedRevision: observed?.revision ?? args.expectedRevision,
+      expectedDigest: observed?.digest ?? args.expectedDigest,
+    };
   }
 
   function readRef(ref, kind) {
@@ -341,6 +519,34 @@ function createAgentApi({
     return before;
   };
 
+  /**
+   * `changedFiles` is ONE field with ONE shape, and it is this file's.
+   *
+   * Every write below stamps it with `changed()` — the array of
+   * `{file, beforeDigest, afterDigest, patch}` the tool's output schema
+   * declares. A main-process result mapper that answers a different KIND of
+   * thing on the same key does not merely disagree with the documentation: the
+   * MCP SDK validates a tool's structured output, so the whole call is
+   * rejected. `git.restore_project` answers with a COUNT — naming every file of
+   * a whole-tree restore is the one thing this API promises not to send — and
+   * it reached a real client as `Output validation error: … changedFiles:
+   * Invalid input: expected array, received number`, isError:true, no
+   * structuredContent, no envelope, WHILE THE WORKING TREE HAD IN FACT BEEN
+   * RESTORED. An agent told a destructive operation failed will run it again.
+   *
+   * The count is worth having, so it keeps a name that says which kind it is.
+   * Nothing but the array may sit on `changedFiles`, whatever a mapper meant by
+   * it — a value this cannot classify is dropped rather than passed on, because
+   * the alternative is an envelope no client can read at all.
+   */
+  function ownChangedFiles(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+    const value = result.changedFiles;
+    if (value == null || Array.isArray(value)) return result;
+    const { changedFiles: _wrongKind, ...rest } = result;
+    return typeof value === 'number' ? { ...rest, changedFileCount: value } : rest;
+  }
+
   /** The files a node ref's edit could land in: the document, and the page. */
   const filesOf = (anchor, extra = []) => {
     const keys = anchor?.keys || [];
@@ -349,37 +555,6 @@ function createAgentApi({
   };
 
   // --- target ----------------------------------------------------------------
-
-  // What the editor's operations actually take.
-  //
-  // One normalizer, used by both doors. The single-operation actions are the
-  // batch with one operation in it, and every one of them goes through here on
-  // the way — a prop value written as `"3"` at the protocol and as
-  // `{type:'string', value:'3'}` in the model is exactly the sort of thing that
-  // is right on one path and `undefined` on the other.
-  const propValue = (o) =>
-    o.value === undefined || o.value === null
-      ? undefined
-      : { type: o.valueType === 'expr' ? 'expr' : 'string', value: String(o.value) };
-
-  const NORMALIZE = {
-    set_text: (o) => ({ type: 'set_text', value: String(o.value ?? ''), replaceBinding: !!o.replaceBinding }),
-    set_prop: (o) => ({ type: 'set_prop', name: o.name, value: propValue(o) }),
-    remove_prop: (o) => ({ type: 'remove_prop', name: o.name }),
-    set_classes: (o) => ({ type: 'set_classes', classes: o.classes }),
-    add_class: (o) => ({ type: 'add_class', className: o.className }),
-    remove_class: (o) => ({ type: 'remove_class', className: o.className }),
-    insert_before: (o) => ({ type: 'insert_before', node: o.node }),
-    insert_after: (o) => ({ type: 'insert_after', node: o.node }),
-    append_child: (o) => ({ type: 'append_child', node: o.node }),
-    prepend_child: (o) => ({ type: 'prepend_child', node: o.node }),
-    remove: () => ({ type: 'remove' }),
-    duplicate: () => ({ type: 'duplicate' }),
-    // The destination is a ref here and a node id in the renderer; the keys it
-    // carries are what crosses, and they are read below.
-    move: (o) => ({ type: 'move', to: o.to }),
-    set_tag: (o) => ({ type: 'set_tag', tag: o.tag }),
-  };
 
   // The single-operation actions, in their own argument names.
   const SINGLE = {
@@ -422,14 +597,36 @@ function createAgentApi({
       if (action === 'select') {
         return {
           ...answer,
-          ref: nodeRef(anchorFromAnswer(answer, ctx), { writable: true, observed: answer.document || null }),
+          // WITH THE MARKS THE INCOMING REF CARRIED. Minted without them this
+          // was a bare index path plus an observation — safe only for as long
+          // as nothing moved, which is not what a ref is for.
+          //
+          // Writable on the renderer's judgement rather than on the caller's:
+          // selecting re-resolves the node in the tree that is actually open
+          // and re-derives the same evidence rule a pin is drawn under, so a
+          // node it could not vouch for does not become writable by being
+          // selected. Strictly narrower than the `writable: true` this used to
+          // pass unconditionally.
+          ref: nodeRef(anchorFromAnswer(answer, ctx, anchor), {
+            writable: answer.writable !== false,
+            observed: answer.document || null,
+          }),
         };
       }
       // enter and exit both answer with a target, and it is a target inside a
       // different file — so it is given the same source trail, snippet and ref
-      // a read gets, and the evidence is `exact` because the app just walked
-      // there itself.
-      return withSource(answer, ctx, action === 'read' ? writable : true);
+      // a read gets.
+      //
+      // AND THE SAME PERMISSION. This was `action === 'read' ? writable : true`,
+      // which made entering a laundry: pass a ref the evidence rules had just
+      // refused a write through, enter, and the ref that came back was a
+      // working write handle one call later — measured, with the class in the
+      // component's file. A read-only ref means Stacki cannot vouch that this
+      // is the same node, and walking INTO something it cannot vouch for does
+      // not turn it into something it can; entering is free, so if it also
+      // promoted, the read-only distinction would not exist. The renderer's own
+      // judgement is on the answer and narrows this further.
+      return withSource(answer, ctx, writable && answer.writable !== false, { compact: args?.compact === true });
     }
 
     if (!SINGLE[action] && action !== 'edit') return no('bad_action', `target has no action "${action}".`);
@@ -440,6 +637,8 @@ function createAgentApi({
           'was not made for. Read the target again on this checkout, or have the person select it.'
       );
     }
+    const unobserved = requireObservation(seen);
+    if (unobserved) return unobserved;
 
     let operations;
     if (action === 'edit') {
@@ -452,19 +651,53 @@ function createAgentApi({
     }
     if (!operations.length) return no('bad_request', 'edit needs at least one operation.');
 
-    // A move names where it is going with a ref. The renderer works in node
-    // ids, and a ref is not one — so it is read here, where refs are read, and
-    // the keys it carries go across instead.
+    // A move names where it is going with a ref, AND THAT REF IS PART OF THE
+    // WRITE. The renderer works in node ids and a ref is not one, so it is read
+    // here where refs are read — but for a long time all that was taken off it
+    // was `keys`, which reduced the destination to a bare index path and threw
+    // away the three things every other ref on the surface is held to. Both
+    // halves of that were measured: a parentRef minted before an <aside> was
+    // inserted above the div it named moved a <footer> into the <aside>
+    // instead, ok:true and no note; and a ref the evidence rules had
+    // deliberately withheld write permission from was accepted as a parent and
+    // the markup landed inside it. The node being moved had all three checks
+    // and the place it lands had none, which is the same defect one branch
+    // over.
+    const destinations = [];
     for (const op of operations) {
       if (op?.type !== 'move' || !op.to) continue;
-      if (op.to.parentRef) {
-        const parsed = readRef(op.to.parentRef, 'node');
-        if (!parsed.ok) return { ...parsed, message: `The move destination: ${parsed.message}` };
-        op.to = { parentKeys: parsed.data.keys || [], index: op.to.index };
-      } else {
-        op.to = { parentKeys: null, index: op.to.index };
+      if (!op.to.parentRef) {
+        op.to = { parent: null, parentKeys: null, index: op.to.index };
+        continue;
       }
+      const parsed = readRef(op.to.parentRef, 'node');
+      if (!parsed.ok) return { ...parsed, message: `The move destination: ${parsed.message}` };
+      if (parsed.writable !== true) {
+        return no(
+          'not_editable',
+          'The move destination ref was issued for reading only — Stacki identified that parent by position on a ' +
+            'tree the ref was not made for. Read the destination again on this checkout, or have the person select it.'
+        );
+      }
+      const unobservedTo = requireObservation(parsed);
+      if (unobservedTo) return { ...unobservedTo, message: `The move destination: ${unobservedTo.message}` };
+      // The marks travel with the keys, so the renderer re-identifies the
+      // parent the way it re-identifies the node being moved rather than
+      // trusting whatever now sits at that index.
+      op.to = { parent: parsed.data, parentKeys: parsed.data.keys || [], index: op.to.index };
+      destinations.push(parsed);
     }
+
+    // The ref's own observation is the guard, and it is not optional: it was
+    // baked in by the read that handed the ref over, and it wins over anything
+    // the caller names. A call with NO ref acts on the live selection, which is
+    // by definition what is in front of the person right now — there is no
+    // earlier observation for it to be stale against, and an explicit
+    // expectation is then the only one there is.
+    const witness = witnessOf([seen, ...destinations]);
+    if (witness.error) return witness.error;
+    const expected = expectationsFor(args, witness.seen);
+    if (expected.error) return expected.error;
 
     const watching = filesOf(anchor || currentAnchor(ctx));
     const before = snapshot(watching);
@@ -474,17 +707,8 @@ function createAgentApi({
         action: 'edit',
         anchor,
         operations,
-        // The ref's own observation is the guard, and it is not optional: it
-        // was baked in by the read that handed the ref over. An explicit
-        // expectedRevision/expectedDigest still works and is checked as well —
-        // a caller that wants to name what it believes may.
-        //
-        // A call with NO ref acts on the live selection, which is by definition
-        // what is in front of the person right now. There is no earlier
-        // observation for it to be stale against, and that is the honest way to
-        // say "whatever is there now" rather than an accidental escape hatch.
-        expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
-        expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
+        expectedRevision: expected.expectedRevision,
+        expectedDigest: expected.expectedDigest,
         label: action,
       },
       NAVIGATING_TIMEOUT_MS
@@ -501,7 +725,7 @@ function createAgentApi({
       gone: !!answer.gone,
       // Both sides of the change, so the next write can name this one without
       // a second read.
-      revisionBefore: answer.documentBefore?.revision ?? args.expectedRevision ?? null,
+      revisionBefore: answer.documentBefore?.revision ?? expected.expectedRevision ?? null,
       revisionAfter: answer.document?.revision ?? null,
       documentBefore: answer.documentBefore || null,
       document: answer.document || null,
@@ -525,7 +749,15 @@ function createAgentApi({
       // would find the node on position alone and say so — correct, and a
       // needless downgrade of something we can simply keep current.
       fingerprint: answer.fingerprint || (answer.target ? fingerprintOf(answer.target) : previous?.fingerprint || null),
-      page: answer.target?.page || previous?.page || { file: payload?.page?.file || null, route: payload?.page?.route || null },
+      // Project-relative, like every other reader of this field — `payload.page.file`
+      // is an on-disk path, and this arm was the one place it went into a ref
+      // as one. refs.mint now catches it as well; this is where it stops being
+      // wrong rather than merely being caught.
+      page: answer.target?.page ||
+        previous?.page || {
+          file: payload?.page?.file ? relativeTo(ctx.root, payload.page.file) : null,
+          route: payload?.page?.route || null,
+        },
       occurrence: answer.target?.occurrence?.index ?? previous?.occurrence ?? null,
       occurrenceCount: answer.target?.occurrence?.count ?? previous?.occurrenceCount ?? null,
       instanceOccurrence: previous?.instanceOccurrence ?? payload?.selection?.instanceOccurrence ?? null,
@@ -544,10 +776,36 @@ function createAgentApi({
   const fingerprintOf = (t) => ({
     nodeKind: t.kind || null,
     tag: t.tag || null,
-    text: t.text?.value || null,
+    // The words, but only when they are ALL the words. A clipped reading is a
+    // preview; the resolver compares a fingerprint's text against a node's full
+    // text, so recording a preview records something no node can equal. The
+    // breadcrumbs and the peer runs are what identify it in that case, and they
+    // are evidence rather than a string that cannot match.
+    text: t.text?.truncated ? null : t.text?.value || null,
     breadcrumbs: t.breadcrumbs || null,
     peers: t.peers || null,
   });
+
+  /**
+   * The marks for a component instance nobody read.
+   *
+   * A binding's instance lives in the document above this one, and this process
+   * is not holding that tree — so there is nothing to fingerprint it from
+   * except the key chain, which is enough for the one thing that matters. The
+   * chain is `[page#path, Component.astro#path, ...]`; the instance at
+   * `instanceKeys` is the door into the NEXT file in it, so the component it
+   * opens is that file's name. That is exactly what a review's drill step
+   * checks (`opens` in src/reviewFocus.js), spelled the same way, and it is
+   * what stops the index path resolving to whatever was inserted above it.
+   */
+  function instanceFingerprint(keys, instanceKeys) {
+    const chain = Array.isArray(keys) ? keys : [];
+    const depth = Array.isArray(instanceKeys) ? instanceKeys.length : 0;
+    const next = typeof chain[depth] === 'string' ? chain[depth] : null;
+    const file = next && next.includes('#') ? next.slice(0, next.indexOf('#')) : null;
+    const name = file ? (file.split('/').pop() || '').replace(/\.(astro|md|mdx)$/i, '') : null;
+    return name ? { nodeKind: 'component', tag: name } : null;
+  }
 
   const currentAnchor = (ctx) => ({
     keys: ctx.payload?.selection?.keys || [],
@@ -561,7 +819,7 @@ function createAgentApi({
    * of file:line pointers and the snippet of the markup itself are attached on
    * the way out, which is what makes a target read enough on its own.
    */
-  function withSource(answer, ctx, writable) {
+  function withSource(answer, ctx, writable, { compact = false } = {}) {
     const t = answer.target;
     if (!t) return answer;
     const trail = resolveTrail(t.keys) || [];
@@ -578,12 +836,17 @@ function createAgentApi({
               fingerprint: {
                 nodeKind: summary.kind || null,
                 tag: summary.tag || null,
-                text: summary.text || null,
-                // Without this the ref is only about the slot, and a sibling
+                // The preview only when it is the whole reading — see
+                // fingerprintOf. A child with more than a summary's worth of
+                // words and a same-tag sibling was unresolvable on the very
+                // next call because this stored the ellipsised version.
+                text: summary.textClipped ? null : summary.text || null,
+                // Without these the ref is only about the slot, and a sibling
                 // inserted above it turns "this node" into "whatever is here
                 // now" — which the resolver correctly refuses, leaving an
                 // agent with a dead ref for a node that plainly still exists.
                 breadcrumbs: summary.breadcrumbs || null,
+                peers: summary.peers || null,
               },
               page: t.page,
               branch: ctx.branch,
@@ -604,11 +867,33 @@ function createAgentApi({
           source: {
             ...source,
             instanceRef: nodeRef(
-              { keys: source.instanceKeys, fingerprint: null, page: t.page, branch: ctx.branch },
-              // The instance lives in the page, which is a different document
-              // from the one this read was of — so it carries no observation of
-              // its own and a write through it reads that document first.
-              { writable: true }
+              {
+                keys: source.instanceKeys,
+                // WHICH COMPONENT THAT SLOT IS EXPECTED TO OPEN.
+                //
+                // This was `null`, which made the ref a bare index path: with
+                // no kind and no tag src/reviewAnchor.js's sameSort matches
+                // anything, so inserting an <hr> above the <Hero> this named
+                // turned it into a ref for the <hr> — at confidence `exact`.
+                // Measured: it wrote a prop onto the <hr>.
+                //
+                // The key chain says which file the instance opens, and a
+                // component named by the file it opens is not a second idea of
+                // identity — it is the same check a review's drill step makes
+                // (src/reviewFocus.js's `opens`).
+                fingerprint: instanceFingerprint(t.keys, source.instanceKeys),
+                page: t.page,
+                branch: ctx.branch,
+              },
+              // The instance lives in the page, which is a DIFFERENT document
+              // from the one this read was of — there is no observation here to
+              // give it, so this is a pointer to GO THERE rather than a handle
+              // to write through. `target.select { ref }` navigates to the page,
+              // puts the instance in front of the person and hands back a ref
+              // with the marks, the observation and the permission a write
+              // needs; `target.read { ref }` follows it without changing what
+              // is selected, and inherits the caution.
+              { writable: false }
             ),
           },
         };
@@ -631,7 +916,14 @@ function createAgentApi({
         peers: answer.peers || null,
         source: leaf,
         sourceTrail: trail.length ? trail : null,
-        snippet: leaf ? snippetOf(ctx.root, leaf) : null,
+        // The markup around the target, unless the caller said not to. Walking a
+        // tree asks for a node's parent, then its parent, and each answer
+        // carries a snippet of the same region: six levels of one page measured
+        // 81KB with 17KB of it the same markup five times. `snippetOmitted`
+        // rather than a bare null, so "you did not ask" is distinguishable from
+        // "there is no source for this".
+        snippet: compact || !leaf ? null : snippetOf(ctx.root, leaf),
+        ...(compact && leaf ? { snippetOmitted: true } : {}),
         ref: nodeRef(
           {
             keys: t.keys,
@@ -693,22 +985,59 @@ function createAgentApi({
     // taken from disk again.
     if (op.via === 'main') return mainWithSync('style', action, args, ctx, op);
 
+    // THE SAME THREE THINGS TARGET TAKES OFF A REF, because a ref may only ever
+    // become more restrictive as it travels. This took `parsed.data` and dropped
+    // `writable` and `observed` on the floor, so a node ref the Visual Review
+    // evidence rules had deliberately withheld write permission from wrote
+    // `gap: 4rem` into a stylesheet. Measured; the identical ref was correctly
+    // refused by target one line of code away.
     let anchor = null;
+    let writable = true;
+    let seen = null;
     if (args.ref) {
       const parsed = readRef(args.ref, 'node');
       if (!parsed.ok) return parsed;
       anchor = parsed.data;
+      writable = parsed.writable;
+      seen = parsed;
     }
     if (action === 'read' || action === 'list_sources') {
       const answer = await command({ domain: 'style', action, anchor, properties: args.properties }, NAVIGATING_TIMEOUT_MS);
       if (!answer.ok) return answer;
       return withStyleRefs(answer, ctx);
     }
+    if (args.ref && !writable) {
+      return no(
+        'not_editable',
+        'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
+          'was not made for. Read the target again on this checkout, or have the person select it.'
+      );
+    }
+    const unobserved = requireObservation(seen);
+    if (unobserved) return unobserved;
+    // For an external stylesheet this observation is about the .astro file
+    // rather than the CSS, and styleAgent has its own source-digest guard for
+    // the declaration itself. It is the <style> block in the open document that
+    // this is the guard for — and the writable flag above matters in every case.
+    const expected = expectationsFor(args, seen);
+    if (expected.error) return expected.error;
+
     // A style write lands in a stylesheet or a <style> block; both are files
     // this process can read either side of the write.
     const watching = filesOf(anchor || currentAnchor(ctx), styleFilesOf(args));
     const before = snapshot(watching);
-    const answer = await command({ domain: 'style', action, anchor, ...args, ref: undefined }, NAVIGATING_TIMEOUT_MS);
+    const answer = await command(
+      {
+        domain: 'style',
+        action,
+        anchor,
+        ...args,
+        ref: undefined,
+        expectedRevision: expected.expectedRevision,
+        expectedDigest: expected.expectedDigest,
+      },
+      NAVIGATING_TIMEOUT_MS
+    );
     if (!answer.ok) return answer;
     const files = [...new Set([...watching, answer.source?.file || null].filter(Boolean))];
     return {
@@ -747,11 +1076,97 @@ function createAgentApi({
         sourceRef: rule.source?.file ? sourceRef(rule.source.file) : null,
         declarations: (rule.declarations || []).map((decl) => ({
           ...decl,
+          // A name, not a handle: no operation takes a cssvar ref, and minting
+          // it writable said otherwise.
           variableRefs: (decl.variables || []).map((name) =>
-            refs.mint('cssvar', { name }, { projectRoot: ctx.root })
+            refs.mint('cssvar', { name }, { projectRoot: ctx.root, writable: false })
           ),
         })),
       })),
+    };
+  }
+
+  /**
+   * The files an undo can put back, so an undo can be MEASURED rather than
+   * believed.
+   *
+   * `restored.files` is the history stack's account of itself, and the stack
+   * knows only what the code that pushed an entry chose to record. A page
+   * snapshot records its file. A recorded command records its inverse, and the
+   * two callers that push one do not agree: App.jsx's `recordUndo` — the door
+   * a main-process agent write comes through — derives the list from the bytes
+   * it is holding, while a stylesheet edit records its entry down in the style
+   * panel's own writer, which records the inverse and nothing else. So
+   * `style.set_property` on src/styles/global.css undid perfectly and answered
+   * `restored: {kind:'cmd', files: []}` beside a `document` naming
+   * src/pages/index.astro, the page that happened to be open. Bytes exactly
+   * right, evidence pointing at the wrong file. Measured by a real Claude Code
+   * against a packaged build.
+   *
+   * This is the set the editor's own undo can rewrite: the document on the
+   * canvas and the components it is inside, and every stylesheet in the project
+   * plus every component whose `<style>` reaches the page — which is exactly
+   * what `writeEmbedDoc` writes into. Both listings are the ones the style
+   * panel already runs on every project open, and an undo is a human-scale act,
+   * not a loop.
+   */
+  async function restorableFiles(ctx) {
+    const editing = filesOf(currentAnchor(ctx));
+    const listed = async (channel) => {
+      try {
+        return ((await ctx.callMain(channel, ctx.root))?.files || []).map((f) => f?.rel).filter(Boolean);
+      } catch {
+        // A listing that will not run leaves the stack's own claim standing,
+        // which is where this started; it must not take the undo down with it.
+        return [];
+      }
+    };
+    const styles = [...(await listed('style:listFiles')), ...(await listed('style:listAstroStyles'))];
+    return [...new Set([...editing, ...styles].filter(Boolean))];
+  }
+
+  /**
+   * An undo says which files it put back; this says which ones actually moved,
+   * and what is in them now.
+   *
+   * The renderer is the only thing that knows which entry came off the stack,
+   * and this process is the only thing that can read a file — so the two halves
+   * meet here. The digest is sha256 of the bytes, the same `digestOf` that
+   * stamps `changedFiles`, and it is deliberately a different KIND of thing
+   * from `document.modelDigest` beside it: content-addressed, so a caller can
+   * check a restore against a digest it took before the change.
+   *
+   * The before-image used to be called unknowable — which files an undo will
+   * touch is not knowable until it has touched them — and that was true only of
+   * a single file. It is knowable of a SET: read the files the editor's undo
+   * can reach either side of the command and the ones that moved are the ones
+   * it put back, whatever the entry remembered to say. So the answer is the
+   * union of what the stack claimed and what the disk shows, and `beforeDigest`
+   * is there for everything this watched.
+   */
+  function withRestoreEvidence(answer, watching = [], before = null) {
+    if (!answer?.ok || !answer.restored || typeof answer.restored !== 'object') return answer;
+    const claimed = Array.isArray(answer.restored.files) ? answer.restored.files.filter(Boolean) : [];
+    const moved = before ? watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel)) : [];
+    const files = [...new Set([...claimed, ...moved])];
+    if (!files.length) return answer;
+    return {
+      ...answer,
+      restored: {
+        ...answer.restored,
+        files: files.map((file) => {
+          const text = readFile(file);
+          const had = before && before.has(file) ? before.get(file) : undefined;
+          return {
+            file,
+            contentDigest: text === null ? null : digestOf(text),
+            // Only for the files this actually held a before-image of. A
+            // claimed file outside the watched set has no honest answer here,
+            // and `null` already means "there were no bytes".
+            ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
+          };
+        }),
+      },
     };
   }
 
@@ -770,7 +1185,7 @@ function createAgentApi({
    * outside editor, because that is what this is.
    */
   async function mainWithSync(domain, action, args, ctx, op) {
-    if (op.risk === 'read') return runMain(domain, action, args, ctx);
+    if (op.risk === 'read') return ownChangedFiles(await runMain(domain, action, args, ctx));
     const openFile = ctx.payload?.page?.file ? relativeTo(ctx.root, ctx.payload.page.file) : null;
     // Two different lists, for two different questions.
     //
@@ -783,11 +1198,14 @@ function createAgentApi({
     //   stylesheet edit that changed no open document still wants an undo, and
     //   reloading the editor for it would be pointless churn.
     const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
-    const named = [...new Set(touchedBy(domain, action, args, ctx).filter(Boolean))];
+    const named = [...new Set((await touchedBy(domain, action, args, ctx)).filter(Boolean))];
     const watching = [...new Set([...editing, ...named])];
     const before = snapshot(watching);
-    const result = await runMain(domain, action, args, ctx);
-    const undone = result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching);
+    // Normalised the moment it arrives, so the three returns below spread a
+    // result that cannot collide with the `changedFiles` they stamp.
+    const result = ownChangedFiles(await runMain(domain, action, args, ctx));
+    const undone =
+      result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching, result);
     const moved = watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel));
     const reloadNeeded = editing.some((rel) => moved.includes(rel));
     if (!moved.length) return { ...result, ...(op.undoable ? { undoable: undone } : {}) };
@@ -817,7 +1235,7 @@ function createAgentApi({
    * stylesheets, and reading the whole project before and after every write to
    * find out which would cost more than the write.
    */
-  function touchedBy(domain, action, args, ctx) {
+  async function touchedBy(domain, action, args, ctx) {
     if (domain === 'style') {
       if (action === 'write_source') return [args.path];
       // A variable edit reaches whichever stylesheets declare the names it
@@ -827,6 +1245,15 @@ function createAgentApi({
     if (domain === 'content' && action === 'cms_write') {
       const raw = String(args.path || '');
       return [raw.includes('#') ? raw.slice(0, raw.indexOf('#')) : raw];
+    }
+    // The file is not the caller's to name any more: write_entry resolves the
+    // entry itself from `collection` and `id` (see domains.js), and the undo
+    // stack has to snapshot the file the write will actually land in. The
+    // resolution is memoised on this context, so asking here does not walk the
+    // collection a second time.
+    if (domain === 'content' && action === 'write_entry') {
+      const found = await resolveContentEntry(args, ctx);
+      return found.error ? [] : [found.entry.file];
     }
     return [];
   }
@@ -854,26 +1281,44 @@ function createAgentApi({
    * is itself read backwards. Anything that does not fit one of those is not
    * recorded, because a half-inverse on an undo stack is worse than a gap in it.
    */
-  async function recordUndo(domain, action, args, ctx, op, before, watching) {
+  async function recordUndo(domain, action, args, ctx, op, before, watching, result) {
     if (!op.undoable) return false;
     let restore = null;
-    if (domain === 'asset' && action === 'rename') {
-      const dir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
-      const landed = dir ? `${dir}/${args.name}` : args.name;
-      restore = {
-        kind: 'asset_rename',
-        back: { rel: landed, name: String(args.path).slice(String(args.path).lastIndexOf('/') + 1) },
-        forward: { rel: args.path, name: args.name },
-      };
-    } else if (domain === 'asset' && action === 'move') {
-      const name = String(args.path).slice(String(args.path).lastIndexOf('/') + 1);
-      const fromDir = String(args.path).slice(0, String(args.path).lastIndexOf('/'));
-      const landed = args.toFolder ? `${args.toFolder}/${name}` : name;
-      restore = {
-        kind: 'asset_move',
-        back: { fromRel: landed, toDirRel: fromDir },
-        forward: { fromRel: args.path, toDirRel: args.toFolder },
-      };
+    if (domain === 'asset' && (action === 'rename' || action === 'move')) {
+      // THE PATH THE HANDLER REPORTS, never the one the arguments imply. Both
+      // handlers move the file somewhere the caller did not ask for:
+      // `assets:rename` strips `/` and `\\` out of the name, and `assets:move`
+      // renames around a collision. An inverse computed from `args` therefore
+      // names a path the file is not at — measured, it moved a DIFFERENT,
+      // pre-existing file back over the original, destroying one and stranding
+      // the other, and answered `{ok:true, undone:true}`.
+      const landed = typeof result?.path === 'string' && result.path ? result.path : null;
+      const was = String(args.path);
+      const nameOf = (rel) => rel.slice(rel.lastIndexOf('/') + 1);
+      const dirOf = (rel) => rel.slice(0, rel.lastIndexOf('/'));
+      // No landing path means no inverse. A half-inverse on the stack is worse
+      // than a gap in it, and `undoable: false` is the honest answer.
+      if (!landed) return false;
+      if (action === 'rename') {
+        restore = {
+          kind: 'asset_rename',
+          back: { rel: landed, name: nameOf(was) },
+          forward: { rel: was, name: nameOf(landed) },
+        };
+      } else {
+        // AND A MOVE THAT ALSO RENAMED CANNOT BE UNDONE IN ONE STEP. The undo
+        // vocabulary the panels share has a move and a rename and no way to say
+        // both at once, so a collision — logo.svg landing as logo-1.svg —
+        // has no inverse that puts the name back. Not recorded, and said out
+        // loud on the envelope as `undoable: false`, rather than recorded as a
+        // move that would leave the file under the collision's name.
+        if (nameOf(landed) !== nameOf(was)) return false;
+        restore = {
+          kind: 'asset_move',
+          back: { fromRel: landed, toDirRel: dirOf(was) },
+          forward: { fromRel: was, toDirRel: dirOf(landed) },
+        };
+      }
     } else {
       // A content change: the bytes, for every file that actually moved and
       // existed on both sides. A file that appeared or vanished is not a
@@ -1023,62 +1468,98 @@ function createAgentApi({
     }
 
     try {
-      if (domain === 'target') return await target(action, args);
-      if (domain === 'style') return await style(action, args);
-      if (domain === 'project' && action === 'info') return info();
-      if (op.via === 'renderer') {
-        // A ref becomes an anchor before it crosses, the same way target and
-        // style do it above. The window resolves anchors against its own live
-        // model; it has never been handed a raw `ref` string to make sense of,
-        // so an operation that took one silently saw nothing at all.
-        //
-        // AND IT CARRIES WHAT THE REF SAYS. The first version of this took
-        // `parsed.data` and dropped the rest, which quietly made a renderer
-        // write weaker than the identical target write beside it: a ref minted
-        // read-only would have been honoured for target.edit and ignored here,
-        // and a ref that had gone stale would have created a component file
-        // against a document it never saw. A ref may only ever become MORE
-        // restrictive as it travels.
-        let anchor = null;
-        let refWritable = true;
-        let seen = null;
-        if (args.ref) {
-          const parsed = readRef(args.ref, 'node');
-          if (!parsed.ok) return parsed;
-          anchor = parsed.data;
-          refWritable = parsed.writable;
-          seen = parsed;
-        }
-        // Refused HERE, before the window is asked to do anything, so a
-        // read-only ref cannot write a file and then be told off.
-        if (args.ref && !refWritable && op.risk !== 'read') {
-          return no(
-            'not_editable',
-            'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
-              'was not made for. Read the target again on this checkout, or have the person select it.'
-          );
-        }
-        const answer = await command(
-          {
-            domain,
-            action,
-            ...args,
-            anchor,
-            ref: undefined,
-            // The ref's own observation is the guard, exactly as it is for
-            // target.edit: it was baked in by the read that handed the ref over,
-            // and the caller does not have to repeat it.
-            expectedRevision: args.expectedRevision ?? seen?.observed?.revision,
-            expectedDigest: args.expectedDigest ?? seen?.observed?.digest,
-          },
-          action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
-        );
-        return answer;
-      }
-      return await mainWithSync(domain, action, args, ctx, op);
+      // EVERY WRITE ANSWERS THE UNDO QUESTION, on the way out and in one place.
+      return sayUndoable(op, await dispatch(domain, action, args, ctx, op));
     } catch (err) {
       return no('failed', String(err?.message || err));
     }
+  }
+
+  /**
+   * Whether Stacki's own undo reaches this write.
+   *
+   * The field used to be attached only where the registry said `undoable`, so
+   * 32 of the 63 write and high operations said nothing at all — while the
+   * field's own description reads "False is honest, not an omission" and the
+   * docs promise an agent is not left guessing. An absent boolean IS the
+   * guessing. A dispatcher that has already worked out whether an undo was
+   * really recorded keeps its answer; everything else gets the registry's.
+   */
+  const sayUndoable = (op, answer) => {
+    if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return answer;
+    if (op.risk === 'read' || answer.ok === false) return answer;
+    if (typeof answer.undoable === 'boolean') return answer;
+    return { ...answer, undoable: !!op.undoable };
+  };
+
+  /** Where an operation is actually carried out. */
+  async function dispatch(domain, action, args, ctx, op) {
+    if (domain === 'target') return await target(action, args);
+    if (domain === 'style') return await style(action, args);
+    if (domain === 'project' && action === 'info') return info();
+    if (op.via === 'renderer') {
+      // A ref becomes an anchor before it crosses, the same way target and
+      // style do it above. The window resolves anchors against its own live
+      // model; it has never been handed a raw `ref` string to make sense of,
+      // so an operation that took one silently saw nothing at all.
+      //
+      // AND IT CARRIES WHAT THE REF SAYS. The first version of this took
+      // `parsed.data` and dropped the rest, which quietly made a renderer
+      // write weaker than the identical target write beside it: a ref minted
+      // read-only would have been honoured for target.edit and ignored here,
+      // and a ref that had gone stale would have created a component file
+      // against a document it never saw. A ref may only ever become MORE
+      // restrictive as it travels.
+      let anchor = null;
+      let refWritable = true;
+      let seen = null;
+      if (args.ref) {
+        const parsed = readRef(args.ref, 'node');
+        if (!parsed.ok) return parsed;
+        anchor = parsed.data;
+        refWritable = parsed.writable;
+        seen = parsed;
+      }
+      // Refused HERE, before the window is asked to do anything, so a
+      // read-only ref cannot write a file and then be told off.
+      if (args.ref && !refWritable && op.risk !== 'read') {
+        return no(
+          'not_editable',
+          'That ref was issued for reading only — Stacki identified the element by position on a tree the ref ' +
+            'was not made for. Read the target again on this checkout, or have the person select it.'
+        );
+      }
+      let expected = { expectedRevision: args.expectedRevision, expectedDigest: args.expectedDigest };
+      if (op.risk !== 'read') {
+        const unobserved = requireObservation(seen);
+        if (unobserved) return unobserved;
+        // The ref's own observation is the guard, exactly as it is for
+        // target.edit: it was baked in by the read that handed the ref over,
+        // the caller does not have to repeat it, and naming a different one
+        // does not overrule it.
+        expected = expectationsFor(args, seen);
+        if (expected.error) return expected.error;
+      }
+      // The before-image, taken while the stack is still holding the entry —
+      // after the command there is nothing left to compare against.
+      const restoring = domain === 'project' && (action === 'undo' || action === 'redo');
+      const watching = restoring ? await restorableFiles(ctx) : [];
+      const beforeRestore = restoring ? snapshot(watching) : null;
+      const answer = await command(
+        {
+          domain,
+          action,
+          ...args,
+          anchor,
+          ref: undefined,
+          expectedRevision: expected.expectedRevision,
+          expectedDigest: expected.expectedDigest,
+        },
+        action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
+      );
+      return withRestoreEvidence(answer, watching, beforeRestore);
+    }
+    return await mainWithSync(domain, action, args, ctx, op);
   }
 
   return {
@@ -1086,6 +1567,8 @@ function createAgentApi({
     capabilities,
     info,
     nodeRef,
+    publishedNodeRef,
+    publishedDocument,
     sourceRef,
     readRef,
     // THE SAME GATE, FOR THE ONE CALLER THAT IS NOT AN OPERATION.
@@ -1106,4 +1589,9 @@ function createAgentApi({
   };
 }
 
-module.exports = { createAgentApi, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };
+// EXPORTED SO THE TABLE CAN BE COMPARED WITH THE OTHER TWO THAT DESCRIBE THE
+// SAME SET. `prepend_child` lived here for a while with no counterpart in the
+// batch `Operation` union or the registry — implemented, dispatched, and
+// reachable by no client. Nothing checked that the three agreed, so the
+// discrepancy was invisible; test/schema-dispatch-contract.js now does.
+module.exports = { createAgentApi, NORMALIZE, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };

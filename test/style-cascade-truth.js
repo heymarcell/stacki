@@ -1,0 +1,1365 @@
+// What style.read is allowed to claim.
+//
+//   node test/style-cascade-truth.js
+//
+// A cascade answer is not a list of rules. It is an assertion about a rendered
+// box — this declaration wins, that one is overridden, nothing else reaches
+// here — and every one of those is a statement an agent will act on without
+// looking. So the failures this file is about are not missing rules. They are
+// SENTENCES THAT ARE NOT TRUE:
+//
+//   two declarations of the same property both saying they win;
+//   a stylesheet the page never loads reported as the winner over one it does;
+//   `rules: [], rulesOmitted: 0` printed beside a populated `computed`, which
+//   says "nothing styles this" about an element the browser is plainly styling;
+//   "the stylesheet changed since you read it" about a rule that was never in
+//   it, and a stylesheet that was never read.
+//
+// Each section below names the sentence, and asserts the response cannot say
+// it. The harness (agent-harness.js) is the real main process, the real Astro
+// parser and the real Style-panel cascade — there is no canvas, so anything
+// this file says about the LIVE document is about how honestly its absence is
+// reported. The one thing that needs a real CSSOM is checked against the
+// shipped preload text itself, in a jsdom document, at the end.
+
+const fs = require('fs');
+const path = require('path');
+const H = require('./agent-harness.js');
+
+const failures = [];
+let checked = 0;
+const short = (x, n = 240) => JSON.stringify(x ?? null).slice(0, n);
+const check = (what, condition, detail) => {
+  checked++;
+  if (!condition) failures.push(`  ${what}${detail ? `\n    ${detail}` : ''}`);
+};
+
+// A stylesheet with more matching rules than style.read will ever print, so the
+// display cap is a fact the response has to account for rather than a silence.
+const MANY = Array.from({ length: 45 }, (_, i) => `.many { --n-${i}: ${i}; }`).join('\n');
+
+const FIXTURE = {
+  // Tailwind 4 is a Vite plugin, not an Astro integration: naming it is the
+  // only honest thing Stacki can say about the utilities it generates.
+  'package.json': JSON.stringify(
+    {
+      name: 'cascade-fixture',
+      type: 'module',
+      dependencies: { astro: '^5.0.0', tailwindcss: '^4.1.0', '@tailwindcss/vite': '^4.1.0' },
+    },
+    null,
+    2
+  ),
+
+  // The one stylesheet the layout actually imports.
+  'src/styles/site.css': `@import "tailwindcss";
+
+:root {
+  --gap: 1rem;
+  --brand: #3355ff;
+}
+
+.pricing-grid {
+  display: grid;
+  gap: var(--gap);
+}
+
+.card {
+  padding: 1rem;
+}
+
+@media (min-width: 768px) {
+  .pricing-grid {
+    gap: 2rem;
+  }
+}
+`,
+
+  // A SECOND stylesheet the layout imports, later in document order than
+  // site.css. It is what makes "overridden" a real case in this fixture: the
+  // thing that beats a declaration on the page has to be another declaration
+  // ON the page, and before this the only rule that beat one was the unimported
+  // file below.
+  'src/styles/theme.css': `.pricing-grid {
+  gap: 3rem;
+}
+`,
+
+  // Imported by nothing. listCssFiles walks the whole project, so it is LISTED
+  // anyway — the question is whether it is allowed to decide anything.
+  'src/styles/zz-unimported.css': `.pricing-grid {
+  gap: 99px;
+}
+`,
+
+  // Both stylesheets, so `reachedByOpenPage` has two files to say true about
+  // and the cascade between them is a cascade between two rules on the page.
+  'src/layouts/Base.astro': `---
+import '../styles/site.css';
+import '../styles/theme.css';
+---
+<html lang="en">
+  <head><title>Fixture</title></head>
+  <body>
+    <slot />
+  </body>
+</html>
+`,
+
+  'src/styles/many.css': `${MANY}\n`,
+
+  // A component's scoped block whose only escape hatch is `:global()`. Astro
+  // leaves those rules unhashed, so `display: inline-grid` genuinely reaches
+  // the page's `.pricing-grid`; `.escaping` beside it is hashed and does not.
+  'src/components/Escaping.astro': `<span class="escaping">esc</span>
+<style>
+  .escaping { color: blue; }
+  .pricing-grid { color: rebeccapurple; }
+  :global(.pricing-grid) { outline: 2px dashed blue; }
+</style>
+`,
+
+  // IMPORTED BY NOTHING, and its scoped block escapes with `:global()`.
+  //
+  // Astro emits a component's CSS for the pages whose module graph contains it,
+  // so `outline: 9px solid magenta` does not paint anything on this page. The
+  // escaped-rule scan reads every .astro file in the PROJECT, which is how this
+  // rule came to be offered as one reaching the element — hedged with the same
+  // `reachedByOpenPage: 'unknown'` that Escaping.astro, which really does reach
+  // it, gets. Two different facts, one word.
+  'src/components/Orphan.astro': `<span class="orphan">orphan</span>
+<style>
+  :global(.pricing-grid) { outline: 9px solid magenta; }
+</style>
+`,
+
+  // A writable is:global block FIRST and a scoped one LAST. Creating a rule here
+  // used to be refused, because the destination was "the last region" rather
+  // than "the last region Stacki will write into".
+  'src/components/Mixed.astro': `<span class="mixed">mixed</span>
+<style is:global>
+  .mixed-global { color: green; }
+</style>
+<style>
+  .mixed { color: blue; }
+</style>
+`,
+
+  // The false positive the Astro hash exists to prevent: a scoped rule for a
+  // class this component does not render. It must never be offered.
+  'src/components/Badge.astro': `<span class="badge">new</span>
+<style>
+  .badge { color: red; }
+  .pricing-grid { outline: 3px solid red; }
+</style>
+`,
+
+  // The dogfood's own case: a component's scoped rules for an element that
+  // component renders. Both of these DO apply, and the second one wins.
+  'src/components/Nav.astro': `<nav class="nav">
+  <a class="link" href="/" aria-current="page">Home</a>
+</nav>
+<style>
+  .link { color: var(--brand); }
+  .link[aria-current] { color: #fff; }
+</style>
+`,
+
+  'src/pages/index.astro': `---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Badge from '../components/Badge.astro';
+import Escaping from '../components/Escaping.astro';
+import Mixed from '../components/Mixed.astro';
+import Card from '../components/Card.astro';
+---
+<Base>
+  <Nav />
+  <Badge />
+  <Escaping />
+  <Mixed />
+  <div class="pricing-grid">
+    <p class="many">many</p>
+  </div>
+  <div class="grid h-screen place-items-center">utilities only</div>
+  <Card title="One" body="Two" />
+</Base>
+`,
+};
+
+// The stylesheet in the @layer section below, verbatim. It is loaded in the
+// browser Stacki ships and read with getComputedStyle before it is asserted
+// against here — six properties, six different ways layer order and the
+// cascade interact, and the measured answers are in the section's own comment.
+const LAYERS = `@layer utilities, base;
+
+.t { column-gap: 1rem; }
+@layer base { .t { column-gap: 99px; } }
+
+@layer alpha { .t { row-gap: 99px; } }
+.t { row-gap: 2rem; }
+
+@layer one { .t { letter-spacing: 1px; } }
+@layer two { .t { letter-spacing: 7px; } }
+
+.t { word-spacing: 3px; }
+@layer base { .t { word-spacing: 11px !important; } }
+
+@layer base { div.t.t { padding: 30px; } }
+.t { padding: 4px; }
+
+@layer base { .t { text-indent: 5px; } }
+@layer utilities { .t { text-indent: 40px; } }
+
+.t { opacity: 0.5 !important; }
+@layer base { .t { opacity: 0.25 !important; } }
+`;
+
+const LAYER_FIXTURE = {
+  'package.json': JSON.stringify({ name: 'layer-fixture', type: 'module', dependencies: { astro: '^5.0.0' } }, null, 2),
+  'src/styles/layers.css': LAYERS,
+  'src/layouts/Base.astro': `---
+import '../styles/layers.css';
+---
+<html lang="en"><head><title>Layers</title></head><body><slot /></body></html>
+`,
+  'src/pages/index.astro': `---
+import Base from '../layouts/Base.astro';
+---
+<Base>
+  <div class="t">t</div>
+</Base>
+`,
+};
+
+class Skip extends Error {}
+
+// A section whose subject does not exist yet must report every OTHER section's
+// verdict rather than taking the run down with it.
+const section = async (fn) => {
+  try {
+    await fn();
+  } catch (err) {
+    if (err instanceof Skip) return;
+    failures.push(`  a section threw before it could finish\n    ${err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err}`);
+  }
+};
+
+const declsOf = (answer, prop) =>
+  (answer.rules || []).flatMap((r) => (r.declarations || []).filter((d) => d.property === prop).map((d) => ({ ...d, rule: r })));
+
+(async () => {
+  const root = H.makeProject(FIXTURE);
+  const app = await H.start(root, { agentMode: 'full' });
+  const run = (domain, action, args = {}) => app.api.run(domain, action, args);
+  await H.settle(400);
+
+  const page = await run('target', 'read');
+  const kids = page.target.children;
+  const grid = kids.find((c) => c.label === 'pricing-grid');
+  const util = kids.find((c) => c.label === 'grid');
+  const navInstance = kids.find((c) => c.tag === 'Nav');
+  check('the fixture page has the elements this file is about', !!grid && !!util && !!navInstance, short(kids.map((c) => c.label || c.tag)));
+
+  const gridStyles = await run('style', 'read', { ref: grid.ref, properties: ['gap', 'display'] });
+  check('style.read answers about the grid', gridStyles.ok === true, short(gridStyles));
+
+  // ── F16c2 · one property, one winner — and NOBODY claims one nobody has ────
+  //
+  // `.pricing-grid { gap: var(--gap) }` and `@media (min-width: 768px) { …
+  // gap: 2rem }` are both in site.css. There is no canvas here, so nothing
+  // measured a viewport — and at 768 wide the media query IS the value the
+  // element has. Neither declaration may claim to be the winner: the media one
+  // because its condition is undecided, and the base one for exactly the same
+  // reason, which is the half this file used to assert the wrong way round.
+
+  await section(async () => {
+    const gaps = declsOf(gridStyles, 'gap');
+    check('every gap declaration reaching the grid is reported', gaps.length >= 3, short(gaps.map((d) => `${d.rule.selector}:${d.value}`)));
+    check(
+      'with no viewport measured, the answer says so rather than implying one',
+      gridStyles.viewport === null,
+      short(gridStyles.viewport)
+    );
+    const claimedWinners = gaps.filter((d) => d.winning === true);
+    check(
+      'and NOTHING claims to win a property an undecided @media also sets',
+      claimedWinners.length === 0,
+      short(gaps.map((d) => ({ sel: d.rule.selector, at: d.rule.atContext, value: d.value, winning: d.winning })))
+    );
+    const media = gaps.find((d) => (d.rule.atContext || []).length > 0);
+    check('a declaration inside @media does not claim to be the winner', media && media.winning === null, short(media && { winning: media.winning }));
+    check(
+      'and says the condition it is waiting for instead',
+      media && Array.isArray(media.appliesWhen) && /min-width: 768px/.test(media.appliesWhen.join(' ')),
+      short(media && media.appliesWhen)
+    );
+    // The one that would have said `winning: true` names what stopped it, so
+    // "undecided" is actionable rather than a shrug.
+    const contested = gaps.find((d) => Array.isArray(d.contestedBy) && d.contestedBy.length);
+    check('the declaration that would have won names what contests it', !!contested, short(gaps.map((d) => d.contestedBy || null)));
+    check(
+      '  by the query, not just by a selector it shares with its rival',
+      contested && /min-width: 768px/.test(String(contested.contestedBy[0].atContext || '')),
+      short(contested && contested.contestedBy)
+    );
+    check(
+      '  and by the file it was authored in',
+      contested && /^file:src\/styles\//.test(String(contested.contestedBy[0].source)),
+      short(contested && contested.contestedBy)
+    );
+  });
+
+  // ── F16c1 · a winner has an address ────────────────────────────────────────
+  //
+  // Three files in this fixture declare `gap` for `.pricing-grid`. A bare
+  // selector string cannot name which of them won, and one of them is a
+  // stylesheet nothing imports.
+
+  await section(async () => {
+    const gaps = declsOf(gridStyles, 'gap');
+    const loser = gaps.find((d) => d.winning === false);
+    check('an overridden declaration exists to be asked about', !!loser, short(gaps.map((d) => d.winning)));
+    check(
+      'and the thing overriding it is named by source, not only by selector',
+      loser && loser.overriddenBy && typeof loser.overriddenBy === 'object' && typeof loser.overriddenBy.source === 'string',
+      short(loser && loser.overriddenBy)
+    );
+    // Two rules with the same selector, one inside `@media`, is how a media
+    // query overrides a base declaration — so the winner's query travels with
+    // it, or the loser is told it lost to itself.
+    check(
+      'and by the query it is under, which here is none',
+      loser && Array.isArray(loser.overriddenBy.atContext) && loser.overriddenBy.atContext.length === 0,
+      short(loser && loser.overriddenBy)
+    );
+    check(
+      'so the winner can be found in the file it was authored in',
+      loser && /^file:src\/styles\//.test(loser.overriddenBy.source),
+      short(loser && loser.overriddenBy)
+    );
+
+    const fromSite = (gridStyles.rules || []).find((r) => r.source.file === 'src/styles/site.css' && r.selector === '.pricing-grid');
+    const fromNowhere = (gridStyles.rules || []).find((r) => r.source.file === 'src/styles/zz-unimported.css');
+    check('the imported stylesheet is reported as reaching this page', fromSite && fromSite.source.reachedByOpenPage === true, short(fromSite && fromSite.source));
+    check(
+      'and the one nothing imports is not claimed to reach it',
+      fromNowhere && fromNowhere.source.reachedByOpenPage === 'unknown',
+      short(fromNowhere && fromNowhere.source)
+    );
+    // Being LISTED is not being allowed to decide. Tolerating this file in the
+    // cascade "as long as it is labelled unknown" is what let `gap: 99px` come
+    // back as the winner over the stylesheet the page actually loads.
+    check(
+      '  so it is not allowed to claim the property either',
+      fromNowhere && fromNowhere.declarations.every((d) => d.winning !== true),
+      short(fromNowhere && fromNowhere.declarations.map((d) => ({ p: d.property, winning: d.winning })))
+    );
+    check(
+      '  and the walk that could not find it is named as the reason',
+      fromNowhere && fromNowhere.source.reachEvidence === 'unproven',
+      short(fromNowhere && fromNowhere.source)
+    );
+    check(
+      'and the answer says what set the cascade was decided over',
+      typeof gridStyles.coverage?.cascadeScope === 'string' && /whether or not/.test(gridStyles.coverage.cascadeScope),
+      short(gridStyles.coverage?.cascadeScope)
+    );
+  });
+
+  // ── F16a · a scoped block belongs to what it rendered, and to nothing else ─
+  //
+  // Badge.astro's `.pricing-grid { outline: 3px solid red }` is hashed to
+  // Badge's own elements and cannot reach the page's grid. Nav.astro's rules
+  // for the link Nav renders DO reach it. Both halves, or the fix is a
+  // regression in one direction or the other.
+
+  await section(async () => {
+    const badge = (gridStyles.rules || []).find((r) => /Badge/.test(r.source.label || '') && r.selector === '.pricing-grid');
+    check("another component's scoped rule is not offered for an element it did not render", !badge, short(badge && badge.source));
+
+    const inside = await run('target', 'enter', { ref: navInstance.ref });
+    const link = (inside.target.children || []).find((c) => c.tag === 'a');
+    const linkStyles = await run('style', 'read', { ref: link.ref, properties: ['color'] });
+    const colors = declsOf(linkStyles, 'color');
+    check("a component's own scoped rules reach the element it rendered", colors.length === 2, short(colors.map((d) => d.rule.selector)));
+    check(
+      'and the more specific one is reported as the winner',
+      colors.find((d) => d.winning === true)?.rule.selector === '.link[aria-current]',
+      short(colors.map((d) => ({ sel: d.rule.selector, winning: d.winning })))
+    );
+    check(
+      'and a scoped block is marked as scoped, not as page-wide CSS',
+      colors.every((d) => d.rule.source.scope === 'scoped'),
+      short(colors.map((d) => d.rule.source.scope))
+    );
+    await run('target', 'exit');
+  });
+
+  // ── F16a2 · `:global()` inside a scoped block escapes the component ────────
+
+  await section(async () => {
+    const escaped = (gridStyles.rules || []).find((r) => /Escaping/.test(r.source.label || ''));
+    check('a :global() rule in another component reaches the page and is reported', !!escaped, short((gridStyles.rules || []).map((r) => r.source.label)));
+    check('with the selector Astro leaves behind, not the :global() wrapper', escaped && escaped.selector === '.pricing-grid', short(escaped && escaped.selector));
+    check('and the declaration it carries', escaped && escaped.declarations.some((d) => d.property === 'outline'), short(escaped && escaped.declarations));
+    check('and it is marked as reaching the page globally', escaped && escaped.source.scope === 'global', short(escaped && escaped.source));
+    // The rule directly above it in the same block is NOT wrapped, so Astro
+    // hashes it to Escaping's own elements and it can never paint the page's
+    // grid — even though its selector matches the page's grid exactly. Offering
+    // it is the false positive the hash exists to prevent, and now that the file
+    // is scanned it is the pruning that has to prevent it.
+    const hashed = (gridStyles.rules || [])
+      .flatMap((r) => (r.declarations || []).map((d) => ({ selector: r.selector, source: r.source.label, value: d.value })))
+      .find((d) => d.value === 'rebeccapurple');
+    check('while the hashed rule beside it in the same block is not offered', !hashed, short(hashed));
+    check(
+      'and a rule Stacki must not write back says so',
+      escaped && escaped.editable === false,
+      short(escaped && { editable: escaped.editable })
+    );
+    // Being a source of rules is not the same as being somewhere to put one.
+    const asDestination = (gridStyles.writableSources || []).find((w) => /Escaping/.test(w.label));
+    check('and the component it came from is not offered as somewhere to write', asDestination && asDestination.writable === false, short(asDestination));
+    check('while a real stylesheet is', (gridStyles.writableSources || []).some((w) => w.label === 'src/styles/site.css' && w.writable === true), short(gridStyles.writableSources));
+
+    // Asked to write there anyway, it refuses with the reason rather than with
+    // a shrug — and the component file is untouched.
+    const before = app.read('src/components/Escaping.astro');
+    const refused = await run('style', 'set_property', {
+      ref: grid.ref,
+      identity: escaped.declarations[0].identity,
+      property: 'outline',
+      value: '9px solid black',
+    });
+    check('writing into a :global() rule is refused', refused.ok === false && refused.code === 'read_only', short(refused));
+    check('and says where the rule really lives', /scoped <style>/.test(String(refused.message)), short(refused.message));
+    check('and the component file is byte-for-byte what it was', app.read('src/components/Escaping.astro') === before);
+  });
+
+  // ── F16d · a count that names its own unit ────────────────────────────────
+
+  await section(async () => {
+    const many = (await run('target', 'read', { ref: grid.ref })).target.children.find((c) => c.label === 'many');
+    const manyStyles = await run('style', 'read', { ref: many.ref });
+    check('45 matching rules are matched', manyStyles.listCap?.matched === 45, short(manyStyles.listCap));
+    check('and 40 are returned', manyStyles.listCap?.returned === 40, short(manyStyles.listCap));
+    check('and the five that were not are attributed to the cap, by name', manyStyles.listCap?.omittedByCap === 5, short(manyStyles.listCap));
+    check('and the cap itself is stated', manyStyles.listCap?.max === 40, short(manyStyles.listCap));
+  });
+
+  // ── F16b, F16e · rules[] reconciled against computed ──────────────────────
+  //
+  // `class="grid h-screen place-items-center"` is Tailwind. Those utilities
+  // exist only in the dev server's generated stylesheet, so no amount of
+  // scanning authored files will find them. The response may not answer
+  // "nothing reaches this element, and nothing was left out".
+
+  await section(async () => {
+    const utilStyles = await run('style', 'read', { ref: util.ref, properties: ['display'] });
+    check('the utility element still reports its classes', (utilStyles.element?.classes || []).includes('h-screen'), short(utilStyles.element));
+    check('no authored rule is invented for it', (utilStyles.rules || []).length === 0, short((utilStyles.rules || []).map((r) => r.selector)));
+    check('and the cap did not bite', utilStyles.listCap?.omittedByCap === 0, short(utilStyles.listCap));
+    check('but the answer does not claim complete coverage', utilStyles.coverage?.complete === false, short(utilStyles.coverage));
+    check(
+      'it says generated CSS is outside what it read',
+      (utilStyles.coverage?.excludes || []).some((t) => /generated at build time/i.test(t)),
+      short(utilStyles.coverage?.excludes)
+    );
+    check(
+      'and names the dependency that generates it, from package.json',
+      /@tailwindcss\/vite@\^4\.1\.0/.test(String(utilStyles.coverage?.note || '')),
+      short(utilStyles.coverage?.note)
+    );
+    check(
+      'and does not guess which of the classes are utilities',
+      !/h-screen|place-items-center/.test(JSON.stringify(utilStyles.coverage || {})),
+      short(utilStyles.coverage)
+    );
+    check(
+      'the absence of a preview is reported as absence of a preview',
+      utilStyles.coverage?.runtime?.available === false && /preview|canvas/i.test(String(utilStyles.coverage.runtime.reason)),
+      short(utilStyles.coverage?.runtime)
+    );
+    check(
+      'and not as absence of rules',
+      utilStyles.documentRules === null,
+      short({ documentRules: utilStyles.documentRules })
+    );
+    check(
+      'with no canvas there is no computed value to reconcile against, and it says so',
+      utilStyles.explainsComputed === null && Array.isArray(utilStyles.unexplained) && utilStyles.unexplained.length === 0,
+      short({ explainsComputed: utilStyles.explainsComputed, unexplained: utilStyles.unexplained })
+    );
+  });
+
+  // The reconciliation itself, driven directly: a computed value no returned
+  // rule can account for must come back as unexplained. The harness has no
+  // canvas, so the rule is exercised through the module the canvas feeds.
+
+  await section(async () => {
+    const { reconcileComputed } = await styleModule();
+    check('the reconciliation is a thing that can be asked on its own', typeof reconcileComputed === 'function');
+    if (typeof reconcileComputed !== 'function') throw new Skip('reconcileComputed');
+    const rules = [{ declarations: [{ property: 'gap', winning: true }, { property: 'color', winning: false }] }];
+    const out = reconcileComputed(rules, { display: 'grid', gap: '16px', color: 'red' });
+    check('a property with a winning authored declaration is explained', !out.unexplained.some((u) => u.property === 'gap'), short(out.unexplained));
+    check('a property only a losing declaration mentions is not', out.unexplained.some((u) => u.property === 'color'), short(out.unexplained));
+    check('and a property nothing authored declares is not', out.unexplained.some((u) => u.property === 'display'), short(out.unexplained));
+    check('so the answer does not claim to explain the computed style', out.explainsComputed === false);
+    check('and with nothing computed it claims nothing either way', reconcileComputed(rules, null).explainsComputed === null);
+
+    // ── AND IT MAY NOT ACCUSE THE RESPONSE'S OWN CONTENTS ────────────────────
+    //
+    // "No authored declaration Stacki can see sets this property" is a sentence
+    // about the rules in the same answer. Said about a property one of those
+    // rules plainly sets, it is not a hedge — it is a false statement that sends
+    // an agent looking for a class that does not exist. Two ways it was being
+    // said: a declaration inside @media or :hover carries `winning: null`
+    // because nothing here resolves the condition, and `padding` is spelled
+    // `padding-top` in a computed style.
+    const conditional = [
+      {
+        selector: '.card',
+        declarations: [
+          { property: 'padding', value: '1rem', winning: true },
+          { property: 'color', value: 'teal', winning: null, appliesWhen: ['@media (min-width: 768px)'] },
+          { property: 'background', value: 'red', winning: null, appliesWhen: ['.card:hover'] },
+        ],
+      },
+    ];
+    const honest = reconcileComputed(conditional, {
+      padding: '16px',
+      'padding-top': '16px',
+      color: 'rgb(0, 128, 128)',
+      background: 'rgba(0, 0, 0, 0)',
+      'font-size': '16px',
+    });
+    check(
+      'a longhand is not called unexplained by an answer returning its shorthand',
+      !honest.unexplained.some((u) => u.property === 'padding-top'),
+      short(honest.unexplained)
+    );
+    check(
+      'and a property whose only declaration is an unresolved @media is not either',
+      !honest.unexplained.some((u) => u.property === 'color'),
+      short(honest.unexplained)
+    );
+    check(
+      '  nor one whose only declaration is an unresolved :hover',
+      !honest.unexplained.some((u) => u.property === 'background'),
+      short(honest.unexplained)
+    );
+    check(
+      'while a property genuinely nothing declares is still named',
+      honest.unexplained.length === 1 && honest.unexplained[0].property === 'font-size',
+      short(honest.unexplained)
+    );
+    // The shorthand table has to be a table and not a prefix test: `color` is
+    // not a shorthand for `color-scheme`, and treating it as one would silence
+    // a real gap.
+    const notAShorthand = reconcileComputed([{ declarations: [{ property: 'color', winning: true }] }], { 'color-scheme': 'dark' });
+    check(
+      'and a property that merely starts with a declared one is not silenced',
+      notAShorthand.unexplained.some((u) => u.property === 'color-scheme'),
+      short(notAShorthand.unexplained)
+    );
+
+    // ── THE RULES THE ANSWER DID NOT RETURN ──────────────────────────────────
+    //
+    // `unexplained` is computed over properties the AUTHORED rules named, so it
+    // is structurally unable to notice a rule the scan never saw. documentRules
+    // is the browser's own list, and a rule in it that no authored rule accounts
+    // for is the answer's own evidence against its own completeness.
+    const authoredOnly = [{ selector: '.card', matchedSelectors: ['.card'], declarations: [{ property: 'padding', winning: true }] }];
+    const withGenerated = reconcileComputed(authoredOnly, { padding: '16px' }, [
+      { selector: '.card', cssText: 'padding: 1rem;', stylesheet: 'inline <style>' },
+      { selector: '.text-red-500', cssText: 'color: rgb(239 68 68);', stylesheet: 'http://localhost:4321/_astro/index.css' },
+    ]);
+    check(
+      'a document rule the authored scan returned is accounted for',
+      !withGenerated.unaccountedRules.some((r) => r.selector === '.card'),
+      short(withGenerated.unaccountedRules)
+    );
+    check(
+      'and one it did not is named, with the properties it sets',
+      withGenerated.unaccountedRules.length === 1 &&
+        withGenerated.unaccountedRules[0].selector === '.text-red-500' &&
+        withGenerated.unaccountedRules[0].properties.join(',') === 'color',
+      short(withGenerated.unaccountedRules)
+    );
+    // Astro hashes a scoped selector on its way into the served document and a
+    // :global() wrapper never leaves the source, so the same rule has two
+    // spellings. Comparing them raw would report an unaccounted rule on every
+    // Astro page that has one scoped block.
+    const spellings = reconcileComputed(
+      [{ selector: ':global(.pricing-grid)', matchedSelectors: ['.pricing-grid'], declarations: [] }, { selector: '.link', matchedSelectors: ['.link'], declarations: [] }],
+      null,
+      [
+        { selector: '.pricing-grid', cssText: 'outline: 2px dashed blue;' },
+        { selector: '.link[data-astro-cid-jwdmkl2g]', cssText: 'color: var(--brand);' },
+      ]
+    );
+    check(
+      'the same rule spelled two ways is one rule, not an unaccounted one',
+      spellings.unaccountedRules.length === 0,
+      short(spellings.unaccountedRules)
+    );
+  });
+
+  // ── F16a3 · a component that is not on this page is not on this page ─────
+  //
+  // `escapedRegion` reads the `:global(...)` rules out of every scoped block in
+  // the PROJECT, because the file list it works from is a whole-project scan.
+  // Astro emits a component's CSS from the page's module graph, so a component
+  // nothing imports paints nothing — and offering its rule as one reaching the
+  // element is the same dishonesty the Astro hash prevents (F16a), one class of
+  // markup over. `reachedByOpenPage` is where that gets said, and it is the one
+  // place `false` can be proved rather than hedged.
+
+  await section(async () => {
+    const answer = await run('style', 'read', { ref: grid.ref });
+    const from = (name) => (answer.rules || []).filter((r) => r.source.file === `src/components/${name}.astro`);
+
+    const orphan = from('Orphan');
+    check('the orphaned component\'s escaped rule is not silently dropped', orphan.length === 1, short((answer.rules || []).map((r) => r.source.file)));
+    check(
+      'but the answer says the page does not load it, rather than hedging',
+      orphan.every((r) => r.source.reachedByOpenPage === false),
+      short(orphan.map((r) => ({ sel: r.selector, reached: r.source.reachedByOpenPage })))
+    );
+    check(
+      '  and it is the rule the reviewer\'s magenta outline came in on',
+      orphan[0] && orphan[0].declarations.some((d) => d.property === 'outline'),
+      short(orphan[0] && orphan[0].declarations)
+    );
+    // AND THE HALF THIS FILE USED TO LEAVE ALONE. `reachedByOpenPage: false`
+    // was being printed beside `winning: true` in the same object, because the
+    // label was pinned on after a cascade computed over every rule in the
+    // project. A response that says both is not hedged, it is contradictory —
+    // and the fuller account of the tiers is test/style-reachability.js.
+    check(
+      '  and it does not claim to win, having been said not to be here',
+      orphan[0] && orphan[0].declarations.every((d) => d.winning !== true),
+      short(orphan[0] && orphan[0].declarations.map((d) => ({ p: d.property, winning: d.winning })))
+    );
+    check(
+      '  nor to have lost, which would name a winner it never ran against',
+      orphan[0] && orphan[0].declarations.every((d) => d.winning === null && d.overriddenBy === null),
+      short(orphan[0] && orphan[0].declarations.map((d) => ({ p: d.property, winning: d.winning, by: d.overriddenBy })))
+    );
+    // Nothing on the page may be told it lost to a file that is not on it.
+    check(
+      'and no declaration anywhere is overridden by a source proved not to be here',
+      (answer.rules || []).every((r) =>
+        (r.declarations || []).every((d) => {
+          if (!d.overriddenBy) return true;
+          const winner = (answer.rules || []).find((other) => other.source.key === d.overriddenBy.source);
+          return !winner || winner.source.reachedByOpenPage !== false;
+        })
+      ),
+      short((answer.rules || []).flatMap((r) => r.declarations.map((d) => d.overriddenBy?.source || null)))
+    );
+
+    // THE OTHER HALF, or the fix is just a blanket `false`. Escaping.astro is
+    // imported by this page and its `:global()` rule really does reach the
+    // element, and it must not be denied along with the orphan.
+    const escaping = from('Escaping');
+    check('a component the page DOES import is still reported as reaching it', escaping.length >= 1 && escaping.every((r) => r.source.reachedByOpenPage === true), short(escaping.map((r) => ({ sel: r.selector, reached: r.source.reachedByOpenPage }))));
+    check(
+      '  which is not the same word as before, so the two are now distinguishable',
+      new Set([...orphan, ...escaping].map((r) => String(r.source.reachedByOpenPage))).size === 2,
+      short([...orphan, ...escaping].map((r) => [r.source.file, r.source.reachedByOpenPage]))
+    );
+  });
+
+  // ── F16g2 · "Stacki could not parse X" about a file Stacki just parsed ────
+  //
+  // The create path had one refusal for three situations, and two of them it
+  // described falsely. A component's scoped `<style>` has `root: null` because
+  // Stacki deliberately leaves it verbatim, not because parsing failed — and
+  // taking the LAST region unconditionally refused a component that had a
+  // perfectly writable is:global block above a scoped one.
+
+  await section(async () => {
+    const scopedOnly = await run('style', 'set_property', {
+      ref: grid.ref,
+      source: 'astro:src/components/Escaping.astro',
+      selector: '.pricing-grid',
+      property: 'color',
+      value: 'red',
+    });
+    check('creating a rule in a scoped-only component is still refused', scopedOnly.ok === false, short(scopedOnly));
+    check(
+      '  but not by accusing Stacki of failing to parse a file it just read',
+      !/could not parse/i.test(String(scopedOnly.message)),
+      short(scopedOnly.message)
+    );
+    check(
+      '  and with the code that says what is actually true of it',
+      scopedOnly.code === 'read_only' && /scoped/i.test(String(scopedOnly.message)),
+      short({ code: scopedOnly.code, message: scopedOnly.message })
+    );
+    check(
+      '  the same component whose rules the same answer returns',
+      (await run('style', 'read', { ref: grid.ref })).rules.some((r) => r.source.file === 'src/components/Escaping.astro'),
+      'Escaping.astro contributed no rule, so this refusal is not about a parsed file'
+    );
+    check('and the component was not touched', /:global\(\.pricing-grid\)/.test(app.read('src/components/Escaping.astro')));
+
+    // AND THE ONE THAT SHOULD NEVER HAVE BEEN REFUSED: an is:global block first,
+    // a scoped block last. The destination is the last region Stacki can write,
+    // not the last region.
+    const mixed = await run('style', 'set_property', {
+      ref: grid.ref,
+      source: 'astro:src/components/Mixed.astro',
+      selector: '.pricing-grid',
+      property: 'color',
+      value: 'rebeccapurple',
+    });
+    check('a component whose LAST block is scoped can still take a new rule', mixed.ok === true, short(mixed));
+    check(
+      '  written into the is:global block, on disk',
+      /is:global[\s\S]*\.pricing-grid\s*\{[^}]*rebeccapurple/.test(app.read('src/components/Mixed.astro')),
+      short(app.read('src/components/Mixed.astro'))
+    );
+    check(
+      '  and the scoped block below it left exactly as the author wrote it',
+      /<style>\s*\n\s*\.mixed \{ color: blue; \}/.test(app.read('src/components/Mixed.astro')),
+      short(app.read('src/components/Mixed.astro'))
+    );
+  });
+
+  // ── F16f · the element style.read is talking about ───────────────────────
+
+  await section(async () => {
+    const compStyles = await run('style', 'read', { ref: navInstance.ref });
+    check(
+      'a component instance says where its identity came from',
+      compStyles.element?.identitySource === 'model',
+      short(compStyles.element)
+    );
+    const gridEl = (await run('style', 'read', { ref: grid.ref })).element;
+    check('and a plain element does too', gridEl.identitySource === 'model' && gridEl.tag === 'div', short(gridEl));
+  });
+
+  // ── F16g · three refusals, three sentences ───────────────────────────────
+  //
+  // "The stylesheet changed since you read it" is advice: read it again. For a
+  // source that was never loaded, and for a rule that was never in the file,
+  // following that advice produces the identical failure for ever.
+
+  await section(async () => {
+    const notLoaded = await run('style', 'set_property', {
+      ref: grid.ref,
+      identity: { source: 'file:src/styles/generated.css', sourceLabel: 'generated.css', selector: '.pricing-grid', atContext: [], property: 'gap' },
+      property: 'gap',
+      value: '3rem',
+    });
+    check('a source that was never loaded is not called stale', notLoaded.code === 'no_source', short(notLoaded));
+    check(
+      'and the message does not blame a change that did not happen',
+      !/(?<!not )changed since you read it/.test(String(notLoaded.message)) && !/[Rr]ead the styles again/.test(String(notLoaded.message)),
+      short(notLoaded.message)
+    );
+
+    const neverThere = await run('style', 'set_property', {
+      ref: grid.ref,
+      identity: { source: 'file:src/styles/site.css', sourceLabel: 'src/styles/site.css', selector: '.never-authored', atContext: [], property: 'gap' },
+      property: 'gap',
+      value: '3rem',
+    });
+    check('a rule that was never in a real stylesheet gets its own code', neverThere.code === 'no_rule', short(neverThere));
+    check(
+      'and is not diagnosed as staleness, nor told to read again',
+      !/(?<!not )changed since you read it/.test(String(neverThere.message)) && !/[Rr]ead the styles again/.test(String(neverThere.message)),
+      short(neverThere.message)
+    );
+    check('and the stylesheet was not touched', /gap: var\(--gap\)/.test(app.read('src/styles/site.css')));
+
+    // And the real staleness path still fires, or the fix above traded one
+    // wrong answer for another.
+    const fresh = await run('style', 'read', { ref: grid.ref });
+    const gapDecl = declsOf(fresh, 'gap').find((d) => d.rule.source.file === 'src/styles/site.css' && !(d.rule.atContext || []).length);
+    app.write('src/styles/site.css', app.read('src/styles/site.css').replace('--brand: #3355ff;', '--brand: #3355ff; --extra: 1px;'));
+    await H.settle(200);
+    const stale = await run('style', 'set_property', { ref: grid.ref, identity: gapDecl.identity, property: 'gap', value: '3rem' });
+    check('a stylesheet that really did change is still refused as stale', stale.code === 'stale_target', short(stale));
+    check('and says so', /changed since you read it/.test(String(stale.message)), short(stale.message));
+  });
+
+  // ── F16h · zero rules from zero sources is not zero rules ────────────────
+  //
+  // The file list style.read reads from is loaded by the Style panel's own
+  // effects, and the panel mounts only when a person opens the Style tab. In an
+  // MCP-only session it may never have rendered — and an empty cascade then
+  // says nothing whatever about the element.
+
+  await section(async () => {
+    const answer = await run('style', 'read', { ref: grid.ref });
+    check('the answer says how many sources it read', Number.isInteger(answer.coverage?.sourcesScanned), short(answer.coverage));
+    check('and it read some', answer.coverage.sourcesScanned >= 3, short(answer.coverage));
+    check('and breaks them down by what kind they are', answer.coverage.kinds?.stylesheet >= 3, short(answer.coverage.kinds));
+
+    // The agent path with NO panel at all: a host record holding the page model
+    // and nothing else, which is what an MCP-only session leaves it as. The
+    // stylesheets have to be found from here, and found without writing the
+    // list back into the record the panel owns.
+    const mod = await styleModule();
+    mod.setHost({
+      projectPath: root,
+      nodes: [{ id: 'solo', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid' } }, children: [] }],
+      selectedId: 'solo',
+      files: [],
+      astroFiles: [],
+      openFilePath: null,
+      renderedClasses: [],
+      pathOf: null,
+    });
+    const solo = await mod.readStyles({ id: 'solo', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid' } } }, {});
+    check(
+      'style.read finds the project stylesheets itself when the panel never did',
+      solo.rules.some((r) => r.source.file === 'src/styles/site.css' && r.selector === '.pricing-grid'),
+      short({ scanned: solo.coverage?.sourcesScanned, rules: solo.rules.map((r) => r.source.key) })
+    );
+    check('and says it read them', solo.coverage?.sourcesScanned >= 3, short(solo.coverage));
+    check('and does not write the list into the record the panel owns', mod.getHost().files.length === 0, short(mod.getHost().files.length));
+
+    // The refusal that must survive it: with no project to ask, an empty
+    // cascade has to say it is empty for want of a source, not for want of CSS.
+    mod.setHost({ projectPath: null, files: [], astroFiles: [] });
+    const blind = await mod.readStyles({ id: 'solo', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid' } } }, {});
+    check('with nothing to scan the answer says so rather than saying no CSS', blind.coverage?.sourcesScanned === 0 && blind.problems.some((p) => /no stylesheet/i.test(p)), short({ cov: blind.coverage, problems: blind.problems }));
+  });
+
+  // ── F16b · the channel the generated CSS travels down, end to end ────────
+  //
+  // Everything above about generated CSS is either a direct call or a fixture.
+  // The channel itself — style.read asking for `rules`, the shipped preload
+  // collecting them, the reply coming back through canvasQuery, and `coverage`
+  // being computed from what arrived — had no test at all, and could be cut at
+  // either end with every suite in the repo staying green.
+  //
+  // So this section IS the preview. The frame is a stub, but what it answers
+  // with is the SHIPPED text of the preload's collector and of the line that
+  // decides whether to call it, evaluated against a jsdom document holding a
+  // stylesheet no authored file in this project contains.
+  //
+  // And it is where `coverage.complete === true` is exercised for the first
+  // time. Until now no test in the repo produced one, which is how a completely
+  // circular check survived: `wanted` is built from the authored rules,
+  // `computed` is asked only for those, so reconciling them asks whether the
+  // authored rules explain the authored rules and a rule the scan never saw
+  // could not possibly make the answer incomplete.
+
+  await section(async () => {
+    const mod = await styleModule();
+    if (typeof mod.setCanvasFrame !== 'function') throw new Skip('canvas bridge');
+    const { JSDOM } = require('jsdom');
+    const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    const collector = sliceFunction(preloadSource, 'matchedRulesIn');
+    // The line in the preload's query handler that decides whether the rules are
+    // collected at all. Sliced and run rather than read, so replacing it with
+    // `null` is a failing test and not a silent regression.
+    const producer = sliceProperty(preloadSource, 'documentRules');
+    const cap = Number((preloadSource.match(/const MAX_DOCUMENT_RULES = (\d+);/) || [])[1]);
+    check('the preload still ships the collector and the line that calls it', !!collector && !!producer && cap > 0, short({ collector: !!collector, producer, cap }));
+    if (!collector || !producer) throw new Skip('preload');
+    const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
+    const reply = new Function(
+      'd',
+      'els',
+      'document',
+      'matchedRulesIn',
+      'MAX_DOCUMENT_RULES',
+      `return ({ ${producer} });`
+    );
+
+    // A served document. `.pricing-grid` is authored in site.css and the answer
+    // will return it; `.text-red-500` and `.grid` are what a build step emits
+    // and exist in no project file at all.
+    const serve = (css) =>
+      new JSDOM(
+        `<!doctype html><html><head><style>${css}</style></head><body><div id="el" class="pricing-grid text-red-500 grid"></div></body></html>`
+      ).window.document;
+
+    // The engine's own values are canned here — jsdom has no cascade — and that
+    // is deliberate: every property named is one an authored rule declares, so
+    // the reconciliation over `computed` says "explained" for all of them and
+    // `complete` can only be false for the reason this section is about.
+    const CANNED = { display: 'grid', gap: '16px', outline: '2px dashed blue', color: 'rebeccapurple' };
+    const asked = [];
+    const previewServing = (doc) => ({
+      postMessage(message) {
+        asked.push(message);
+        const el = doc.getElementById('el');
+        const computedProps = {};
+        for (const prop of message.props || []) computedProps[prop] = CANNED[prop] ?? null;
+        setImmediate(() =>
+          mod.receiveCanvasReply({
+            type: 'avb:query-result',
+            id: message.id,
+            ready: true,
+            found: true,
+            identity: null,
+            matched: {},
+            computed: {},
+            computedProps,
+            ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+          })
+        );
+      },
+    });
+
+    const gridNode = { id: 'served', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid text-red-500 grid' } }, children: [] };
+    const hostFor = () => ({
+      projectPath: root,
+      nodes: [gridNode],
+      selectedId: 'served',
+      files: [],
+      astroFiles: [],
+      openFilePath: 'src/pages/index.astro',
+      renderedClasses: [],
+      pathOf: null,
+    });
+    const readServed = async (css) => {
+      mod.setHost(hostFor());
+      mod.setCanvasFrame(previewServing(serve(css)));
+      const out = await mod.readStyles(gridNode, { pathOf: () => 'src/pages/index.astro#0.0.3' });
+      mod.setCanvasFrame(null);
+      return out;
+    };
+
+    // 1. THE ELEMENT TWO-THIRDS PAINTED BY A BUILD STEP.
+    const generated = await readServed(
+      '.pricing-grid { display: grid; } .text-red-500 { color: rgb(239 68 68); } .grid { display: grid; }'
+    );
+    check('the read reaches the preview at all', mod.hasCanvas === undefined || asked.length > 0, short({ asked: asked.length }));
+    check(
+      'and the question it asks the preview asks for the document rules',
+      asked.length > 0 && asked[asked.length - 1].rules === true,
+      short(asked[asked.length - 1])
+    );
+    check(
+      'the preview answered with the rules the document says match',
+      Array.isArray(generated.documentRules) && generated.documentRules.some((r) => r.selector === '.text-red-500'),
+      short(generated.documentRules)
+    );
+    check(
+      '  and none of them is offered as something Stacki could write',
+      (generated.documentRules || []).every((r) => r.editable === false && r.origin === 'document' && !('file' in r) && !('identity' in r)),
+      short(generated.documentRules)
+    );
+    check(
+      '  so the runtime half of coverage says it was consulted',
+      generated.coverage?.runtime?.available === true && generated.coverage.runtime.matchedRules >= 3,
+      short(generated.coverage?.runtime)
+    );
+    check(
+      'and the answer does NOT claim complete coverage of an element a build step paints',
+      generated.coverage?.complete === false,
+      short({ complete: generated.coverage?.complete, explains: generated.explainsComputed, unexplained: generated.unexplained })
+    );
+    check(
+      '  naming the rules it cannot account for, rather than leaving the caller to diff',
+      (generated.coverage?.runtime?.unaccountedRules || []).map((r) => r.selector).sort().join(' ') === '.grid .text-red-500',
+      short(generated.coverage?.runtime?.unaccountedRules)
+    );
+    check(
+      '  with the properties each one sets, which is what makes it actionable',
+      (generated.coverage?.runtime?.unaccountedRules || []).some((r) => r.selector === '.text-red-500' && r.properties.includes('color')),
+      short(generated.coverage?.runtime?.unaccountedRules)
+    );
+    // The circularity, stated as an assertion: the old rule was
+    // `runtime.available && explainsComputed`, and both of those are TRUE here.
+    check(
+      '  and it is false for a reason the reconciliation could never have found',
+      generated.explainsComputed === true && generated.coverage.runtime.available === true,
+      short({ explains: generated.explainsComputed, available: generated.coverage.runtime.available })
+    );
+
+    // 2. THE POSITIVE CONTROL. Same element, same channel, a document that
+    //    serves nothing but the authored rule. Without this, `complete` could
+    //    be hard-wired to false and the check above would still pass.
+    const clean = await readServed('.pricing-grid { display: grid; }');
+    check(
+      'an element the served document holds no unaccounted rule for IS complete',
+      clean.coverage?.complete === true,
+      short({ complete: clean.coverage?.complete, unaccounted: clean.coverage?.runtime?.unaccountedRules, unexplained: clean.unexplained })
+    );
+    check(
+      '  with nothing left over to name',
+      (clean.coverage?.runtime?.unaccountedRules || []).length === 0 && clean.coverage.runtime.unaccountedRuleCount === 0,
+      short(clean.coverage?.runtime)
+    );
+  });
+
+  app.stop();
+  H.removeProject(root);
+
+  // ── D1 · the winner is the winner AT THE VIEWPORT ─────────────────────────
+  //
+  // A native agent read an `<h3>` on a running page and was told
+  // `font-size: var(--text-2xl)` (2.125rem) was `winning: true,
+  // overriddenBy: null` — beside a `computed` of 56px, which is 3.5rem, which
+  // is what `@media (min-width: 50em)` sets three lines further down the same
+  // file. Two answers to one question, in one payload.
+  //
+  // A media query is not an interaction state. At a viewport where it holds it
+  // IS the resting cascade, so the cascade is resolved there — and this is the
+  // real cascade module, over really parsed CSS, asked the same question at
+  // three viewports.
+
+  await section(async () => {
+    const esbuild = require('esbuild');
+    const buildDir = path.join(__dirname, '..', 'node_modules', '.stacki-test');
+    fs.mkdirSync(buildDir, { recursive: true });
+    const bundlePath = path.join(buildDir, 'cascade-viewport.bundle.js');
+    await esbuild.build({
+      stdin: {
+        contents:
+          "export { computeRuleModel, atContextApplies } from './lib/cascade';\n" +
+          "export { extractStyleRegions, parseRegion, collectRules } from './lib/css';\n",
+        resolveDir: path.join(__dirname, '..', 'src', 'style-panel'),
+        loader: 'ts',
+      },
+      outfile: bundlePath,
+      bundle: true,
+      format: 'cjs',
+      platform: 'node',
+      external: ['react'],
+      logLevel: 'silent',
+    });
+    const { computeRuleModel, atContextApplies, extractStyleRegions, parseRegion, collectRules } = require(bundlePath);
+
+    // The shape of the stylesheet it happened in: a base declaration, and the
+    // same selector inside a min-width query further down the file.
+    const CSS = `
+.section-header h3 { font-size: var(--text-2xl); }
+ul.grid { gap: 1rem; }
+@media (min-width: 50em) {
+  .section-header h3 { font-size: var(--text-4xl); }
+  ul.grid { gap: 4rem; }
+}
+@media print {
+  .section-header h3 { font-size: 12pt; }
+}
+@media (prefers-color-scheme: dark) {
+  .section-header h3 { color: white; }
+}
+@media (prefers-reduced-motion) {
+  .section-header h3:hover { font-size: 1px; }
+}
+`;
+    const region = extractStyleRegions(`<style>${CSS}</style>`)[0];
+    parseRegion(region);
+    const rules = collectRules(region, {
+      embedKey: 'file:/p/src/styles/global.css',
+      embedLabel: 'global.css',
+      fromComponent: false,
+      componentName: null,
+      regionIndex: 0,
+      idSeed: 'd1',
+      order: { n: 0 },
+    });
+    check('the fixture stylesheet parsed into the rules this section is about', rules.length === 7, short(rules.map((r) => `${r.atContext.join('|')} ${r.selectorText}`)));
+
+    // The element is an h3 the browser says both `.section-header h3` rules
+    // match — the same answer primeDomMatches gets from the canvas.
+    const target = {
+      rootKey: 'h3',
+      view: {},
+      domMatched: new Map([
+        ['.section-header h3', true],
+        // The canvas answers about the element, not about the pointer: a
+        // :hover selector matches it the same way.
+        ['.section-header h3:hover', true],
+        ['ul.grid', false],
+      ]),
+    };
+    const fontSize = (model) =>
+      [...model.base, ...model.conditional].flatMap((entry) =>
+        entry.rule.declarations
+          .filter((d) => d.prop === 'font-size')
+          .map((d) => ({ at: entry.rule.atContext, value: d.value, ...entry.declStatus[d.declId] }))
+      );
+
+    const wide = fontSize(await computeRuleModel(rules, target, { viewport: { width: 1200, height: 900 } }));
+    const narrow = fontSize(await computeRuleModel(rules, target, { viewport: { width: 375, height: 812 } }));
+    const unknown = fontSize(await computeRuleModel(rules, target));
+
+    const inQuery = (list) => list.find((d) => d.at.some((a) => /min-width/.test(a)));
+    const inBase = (list) => list.find((d) => !d.at.length);
+
+    // 50em is 800px: the query holds at 1200 and does not at 375.
+    check('at 1200px the media declaration is the one that wins', inQuery(wide)?.winning === true, short(inQuery(wide)));
+    check('  resolved, not hedged', inQuery(wide)?.resolved === true && inQuery(wide)?.applies === true, short(inQuery(wide)));
+    check('  and the base declaration is told it lost', inBase(wide)?.winning === false, short(inBase(wide)));
+    check(
+      '  naming the query that beat it, not just the selector it shares with it',
+      /min-width: 50em/.test(String(inBase(wide)?.overriddenByOrigin?.atContext || '')),
+      short(inBase(wide)?.overriddenByOrigin)
+    );
+    check('at 375px the base declaration wins', inBase(narrow)?.winning === true, short(inBase(narrow)));
+    check('  and the media one says it does not apply here', inQuery(narrow)?.applies === false && inQuery(narrow)?.resolved === false, short(inQuery(narrow)));
+    check('exactly one declaration wins at each viewport', [wide, narrow].every((list) => list.filter((d) => d.winning === true && d.resolved).length === 1), short([wide, narrow].map((l) => l.map((d) => d.winning))));
+    // With nothing measured the cascade cannot rule the query in or out, so the
+    // base declaration carries the rule that contests it — which is what
+    // style.read turns into `winning: null` (see F16c2 above).
+    check(
+      'with no viewport the base declaration is flagged contested, by exactly the query',
+      inBase(unknown)?.contestedBy?.length === 1 && /min-width: 50em/.test(String(inBase(unknown).contestedBy[0].atContext)),
+      short(inBase(unknown))
+    );
+    check('and at a viewport that settles it, nothing is left contested', !inBase(wide)?.contestedBy && !inBase(narrow)?.contestedBy?.length, short([inBase(wide)?.contestedBy, inBase(narrow)?.contestedBy]));
+    // `@media (prefers-reduced-motion) { …:hover }` sets font-size under a
+    // condition nothing can decide — and still contests nothing, because a
+    // :hover rule is not what the element has at rest whatever the width is.
+    check(
+      'an undecidable query on a :hover selector contests nothing',
+      inBase(unknown)?.contestedBy?.length === 1 && !inBase(wide)?.contestedBy,
+      short(inBase(unknown)?.contestedBy)
+    );
+
+    // The conditions that are not about a viewport stay undecided at every
+    // viewport — and the ones that are do not become undecided.
+    check('a print rule does not apply to a canvas', atContextApplies(['@media print'], { width: 1200 }) === false);
+    check('prefers-color-scheme is not a width question', atContextApplies(['@media (prefers-color-scheme: dark)'], { width: 1200 }) === null);
+    check('@supports is not one either', atContextApplies(['@supports (display: grid)'], { width: 1200 }) === null);
+    check('a min-width in em resolves against 16px', atContextApplies(['@media (min-width: 50em)'], { width: 800 }) === true && atContextApplies(['@media (min-width: 50em)'], { width: 799 }) === false);
+    check('a max-width is the other end of the same line', atContextApplies(['@media (max-width: 767px)'], { width: 767 }) === true && atContextApplies(['@media (max-width: 767px)'], { width: 768 }) === false);
+    check('range syntax says the same thing', atContextApplies(['@media (width >= 50em)'], { width: 800 }) === true && atContextApplies(['@media (800px <= width)'], { width: 799 }) === false);
+    check('a query list is any of them', atContextApplies(['@media print, (min-width: 40em)'], { width: 800 }) === true);
+    check('`not` inverts a decided answer and not an undecided one', atContextApplies(['@media not print'], { width: 800 }) === true && atContextApplies(['@media not (prefers-reduced-motion)'], { width: 800 }) === null);
+    check('every level of the nesting has to hold', atContextApplies(['@media (min-width: 50em)', '@supports (display: grid)'], { width: 1200 }) === null);
+    check('and nothing is decided without a viewport', atContextApplies(['@media (min-width: 50em)'], null) === null);
+  });
+
+  // ── @layer: THE ORDER THE PARSER CANNOT SEE ───────────────────────────────
+  //
+  // `@layer` is not a conditional group at-rule, so css.ts walks its block with
+  // the parent's at-context and the rule arrives at the cascade engine looking
+  // unlayered. Later in document order, it then won the tie-break — and CSS
+  // Cascade 5 says the exact reverse: layer order is compared BEFORE
+  // specificity, and a normal declaration outside every layer beats every
+  // layered one. `style.read` answered `gap: 99px winning: true` for a
+  // declaration the browser was not using, told the one it WAS using that it
+  // had lost, and named as the winner an `overriddenBy` whose source, selector
+  // and at-context were byte-identical to the loser's own.
+  //
+  // THE ORACLE IS THE SHIPPED CHROMIUM, not this file's model of the spec.
+  // Every value below was measured by loading LAYERS verbatim in the browser
+  // Stacki ships (Chrome/130.0.6723.191) and reading getComputedStyle:
+  //
+  //   column-gap  16px  the unlayered 1rem, not the layered 99px
+  //   row-gap     32px  the unlayered 2rem, though the layer is authored FIRST
+  //   letter-spacing 7px  no unlayered rule sets it, so the LATER layer wins
+  //   word-spacing  11px  !important in a layer beats an unlayered normal
+  //   padding      4px  a layered `div.t.t` does not out-specify an unlayered `.t`
+  //   text-indent   5px  `@layer utilities, base;` orders them, not the blocks
+  //   opacity      0.25 !important REVERSES it — the layered one beats the free one
+  //
+  // The last four are the positive controls: a blanket "a layered declaration
+  // never wins" passes the first two and fails every one of them.
+
+  await section(async () => {
+    const lroot = H.makeProject(LAYER_FIXTURE);
+    const lapp = await H.start(lroot, { agentMode: 'full' });
+    await H.settle(400);
+    try {
+      const lpage = await lapp.api.run('target', 'read', {});
+      const el = (lpage.target.children || []).find((c) => (c.label || '') === 't');
+      check('the layer fixture has the element this section is about', !!el, short((lpage.target.children || []).map((c) => c.label || c.tag)));
+      if (!el) throw new Skip('no element');
+      const answer = await lapp.api.run('style', 'read', { ref: el.ref });
+      check('style.read answers about it', answer.ok === true, short(answer));
+
+      const winnersOf = (prop) => declsOf(answer, prop).filter((d) => d.winning === true);
+      const winner = (prop) => winnersOf(prop)[0] || null;
+      for (const [prop, value, why] of [
+        ['column-gap', '1rem', 'an unlayered declaration beats a layered one'],
+        ['row-gap', '2rem', '  and does so whichever is authored first'],
+        ['letter-spacing', '7px', '  while between two layers the later one wins'],
+        ['word-spacing', '11px !important', '  and !important inside a layer beats an unlayered normal declaration'],
+        ['padding', '4px', '  and specificity does not rescue a layered rule'],
+        ['text-indent', '5px', '  and `@layer utilities, base;` orders the layers, not their blocks'],
+        ['opacity', '0.25 !important', '  and between two !important declarations the layer order runs the OTHER way'],
+      ]) {
+        const declared = `${winner(prop)?.value ?? null}${winner(prop)?.important ? ' !important' : ''}`;
+        check(
+          `${why} — ${prop} is ${value}, which is what the browser computes`,
+          winner(prop) && declared === value,
+          short({ winners: winnersOf(prop).map((d) => `${d.rule.atContext.join(' ')} ${d.value}`) })
+        );
+        check(
+          `  and exactly one declaration of ${prop} says it wins`,
+          winnersOf(prop).length === 1,
+          short(declsOf(answer, prop).map((d) => [d.rule.atContext, d.value, d.winning]))
+        );
+      }
+
+      // THE LOSER IS TOLD WHAT BEAT IT, AND IT IS NOT ITSELF. Both halves of the
+      // pair are `.t` in one file; without the layer in the at-context the
+      // sentence was ".t in layers.css was overridden by .t in layers.css".
+      const layered = declsOf(answer, 'column-gap').find((d) => (d.rule.atContext || []).some((at) => /^@layer /.test(at)));
+      check('the layered declaration is reported overridden', layered && layered.winning === false, short(layered && { at: layered.rule.atContext, winning: layered.winning }));
+      check('  and the layer it is in is in the at-context the answer publishes', layered && layered.rule.atContext.includes('@layer base'), short(layered && layered.rule.atContext));
+      check('  and it is told which rule beat it', layered && layered.overriddenBy && layered.overriddenBy.selector === '.t', short(layered && layered.overriddenBy));
+
+      // GLOBALLY, over every declaration in both answers this file reads: a
+      // rule cannot override itself. Same source, same at-context, same
+      // selector is not a cascade result, it is a rule that was compared
+      // against a copy of itself — which is what an erased at-rule produces.
+      for (const [what, payload] of [['the layer answer', answer], ['the fixture answer', gridStyles]]) {
+        const selfBeaten = (payload.rules || []).flatMap((r) =>
+          (r.declarations || [])
+            .filter(
+              (d) =>
+                d.overriddenBy &&
+                d.overriddenBy.source === r.source.key &&
+                (d.overriddenBy.atContext || []).join('|') === (r.atContext || []).join('|') &&
+                d.overriddenBy.selector === r.selector
+            )
+            .map((d) => ({ selector: r.selector, at: r.atContext, prop: d.property, by: d.overriddenBy }))
+        );
+        check(`nothing in ${what} is overridden by a rule identical to itself`, selfBeaten.length === 0, short(selfBeaten));
+      }
+      // AND THE IDENTITY THE ANSWER HANDS BACK STILL FINDS ITS OWN RULE.
+      // The at-context is what a write is matched on, so putting the layer into
+      // it moves the target: two `.t` rules in one file, one of them layered,
+      // were one address before and are two now. The oracle is the bytes.
+      const target = declsOf(answer, 'column-gap').find((d) => (d.rule.atContext || []).includes('@layer base'));
+      check('the layered declaration carries an identity to write through', !!target?.identity, short(target?.identity));
+      if (target) {
+        const wrote = await lapp.api.run('style', 'set_property', {
+          ref: el.ref,
+          identity: target.identity,
+          property: 'column-gap',
+          value: '77px',
+        });
+        check('  and writing through it is accepted', wrote.ok === true, short(wrote));
+        const onDisk = lapp.read('src/styles/layers.css');
+        check(
+          '  the layered rule is the one that changed on disk',
+          /@layer base \{ \.t \{ column-gap: 77px; \} \}/.test(onDisk),
+          short(onDisk.split('\n').filter((l) => /column-gap/.test(l)))
+        );
+        check(
+          '  and the unlayered rule of the same selector was left alone',
+          /\.t \{ column-gap: 1rem; \}/.test(onDisk),
+          short(onDisk.split('\n').filter((l) => /column-gap/.test(l)))
+        );
+      }
+    } finally {
+      lapp.stop();
+      H.removeProject(lroot);
+    }
+  });
+
+  // ── F16b, the half that needs a real CSSOM ────────────────────────────────
+  //
+  // Generated CSS exists only in the served document. The preload is what can
+  // see it, and it runs in an isolated world no test can require — so the
+  // SHIPPED TEXT of its collector is evaluated here, against a jsdom document
+  // holding a stylesheet no authored file in the project contains.
+
+  await section(async () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    const collector = sliceFunction(source, 'matchedRulesIn');
+    check('the preload still ships the collector this section is about', !!collector, 'function matchedRulesIn was not found in electron/preload.js');
+    if (collector) {
+      const { JSDOM } = require('jsdom');
+      const dom = new JSDOM(`<!doctype html><html><head><style>
+        .grid { display: grid; }
+        .h-screen { height: 100vh; }
+        @media (min-width: 900px) { .grid { gap: 2rem; } }
+        .nope { color: red; }
+      </style></head><body><div class="grid h-screen" id="el"></div></body></html>`);
+      const fn = new Function(`${collector}; return matchedRulesIn;`)();
+      const out = fn(dom.window.document, dom.window.document.getElementById('el'), 50);
+      const selectors = out.rules.map((r) => r.selector);
+      check('the collector finds the rules the document says match', selectors.includes('.grid') && selectors.includes('.h-screen'), short(selectors));
+      check('and not the ones it says do not', !selectors.includes('.nope'), short(selectors));
+      check('it carries the declarations, so the value is readable', /display/.test(out.rules.find((r) => r.selector === '.grid').cssText), short(out.rules[0]));
+      check('and marks every one of them as belonging to the document', out.rules.every((r) => r.origin === 'document' && r.editable === false), short(out.rules[0]));
+      check('and gives none of them a project file to edit', out.rules.every((r) => !('file' in r) && !('identity' in r)), short(out.rules[0]));
+      check('a conditional rule is reported with its condition, not as a plain match', out.rules.some((r) => /min-width: 900px/.test(String(r.atContext || ''))), short(out.rules.map((r) => r.atContext)));
+      check('and it counts the sheets it could not read', out.unreadable === 0, short(out));
+    }
+  });
+
+  console.log(`\nstyle-cascade-truth: ${checked} checks, ${failures.length} failed`);
+  if (failures.length) {
+    console.log(failures.join('\n'));
+    process.exit(1);
+  }
+  process.exit(0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+/** The text of one `name: …,` property in an object literal, bracket-matched. */
+function sliceProperty(source, name) {
+  const at = source.indexOf(`${name}: `);
+  if (at === -1) return null;
+  let depth = 0;
+  for (let i = at; i < source.length; i++) {
+    const c = source[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return source.slice(at, i).trim().replace(/,$/, '');
+      depth--;
+    } else if (c === ',' && depth === 0) return source.slice(at, i).trim();
+  }
+  return null;
+}
+
+/** The text of one top-level `function name(…) { … }`, brace-matched. */
+function sliceFunction(source, name) {
+  const at = source.indexOf(`function ${name}(`);
+  if (at === -1) return null;
+  let depth = 0;
+  for (let i = source.indexOf('{', at); i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(at, i + 1);
+    }
+  }
+  return null;
+}
+
+// The agent's own style modules, bundled the way the app bundles them (they
+// import TypeScript), so the host record can be put into the state an MCP-only
+// session leaves it in — a page model and no panel. A second module instance
+// with its own host is exactly what that needs: the app's copy keeps whatever
+// the panel gave it.
+let styleModuleCache = null;
+async function styleModule() {
+  if (styleModuleCache) return styleModuleCache;
+  const esbuild = require('esbuild');
+  const repo = path.join(__dirname, '..');
+  const dir = path.join(repo, 'node_modules', '.stacki-test');
+  fs.mkdirSync(dir, { recursive: true });
+  const outfile = path.join(dir, 'style-cascade-truth.bundle.js');
+  await esbuild.build({
+    stdin: {
+      contents:
+        "export * from './src/agent/styleAgent.js'\n" +
+        "export { setHost, getHost } from './src/style-panel/lib/host.ts'\n" +
+        // The canvas bridge, so a test can BE the preview. Everything the
+        // generated-CSS channel is made of runs between these two functions.
+        "export { setCanvasFrame, receiveCanvasReply, hasCanvas } from './src/canvasQuery.js'\n",
+      resolveDir: repo,
+      loader: 'js',
+    },
+    outfile,
+    bundle: true,
+    format: 'cjs',
+    platform: 'node',
+    logLevel: 'silent',
+  });
+  styleModuleCache = require(outfile);
+  return styleModuleCache;
+}

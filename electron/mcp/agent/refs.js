@@ -43,6 +43,7 @@
 // refs exist.
 
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 const VERSION = 1;
 const PREFIX = 'stacki';
@@ -120,7 +121,7 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
     s: session,
     t: now(),
     x: now() + ttlMs,
-    d: data && typeof data === 'object' ? data : {},
+    d: relativized(data && typeof data === 'object' ? data : {}, projectRoot),
   };
   if (!writable) payload.w = false;
   // What the read that produced this ref saw. Absent for a ref minted about
@@ -129,6 +130,59 @@ function mint(kind, data, { projectRoot, ttlMs = DEFAULT_TTL_MS, writable = true
   if (observed && typeof observed === 'object' && Object.keys(observed).length) payload.o = observed;
   const body = b64(JSON.stringify(payload));
   return `${PREFIX}:${body}.${sign(body)}`;
+}
+
+/**
+ * The rule above, enforced here rather than asserted in a comment.
+ *
+ * "Nothing absolute" was a sentence one caller did not obey: the anchor a
+ * `target.select` minted from carried the project's real path in `page.file`
+ * while the observation beside it stayed relative, so a token clients are told
+ * to log opaquely had somebody's home directory base64'd inside it. Fixing the
+ * caller fixes that caller; doing it at the mint is what stops the next one.
+ *
+ * A path under the project becomes the project-relative one — which is what
+ * every other consumer of that field already computes — and anything else
+ * absolute is dropped, because a ref that names a place outside the project
+ * has no business resolving here anyway.
+ *
+ * AND IT ONLY APPLIES TO FIELDS THAT ARE PATHS. A generic walk over every
+ * string cannot tell a path from a node's words, and a nav whose links read
+ * "/docs" and "/blog" is ordinary markup: every ref minted for one of those had
+ * its `fingerprint.text` replaced with null, which is not a formatting
+ * difference but the loss of the mark the resolver identifies the node BY.
+ * src/reviewAnchor.js reads a missing text as "nothing to check" — `atSays`
+ * becomes unconditionally true — so the "two cards swapped places" protection
+ * switches itself off and a position gets reported as `exact`. Same class of
+ * bug as the 120-character clip this file's neighbours just fixed, and
+ * reintroduced by the sanitiser rather than by a caller.
+ *
+ * So the exemption is by KEY, and it names the fields the resolver compares as
+ * CONTENT rather than resolving as a place: a node's words, the labels on its
+ * breadcrumb chain, a tag or component name, and `route` — the site's address,
+ * where "/" was never a filesystem path in the first place.
+ */
+const CONTENT_KEYS = new Set(['route', 'text', 'label', 'breadcrumbs', 'tag', 'name']);
+
+function relativized(data, projectRoot) {
+  const root = typeof projectRoot === 'string' && projectRoot ? projectRoot : null;
+  const walk = (value, key) => {
+    if (typeof value === 'string') {
+      if (CONTENT_KEYS.has(key) || !path.isAbsolute(value)) return value;
+      if (root && (value === root || value.startsWith(`${root}${path.sep}`))) {
+        return path.relative(root, value).split(path.sep).join('/');
+      }
+      return null;
+    }
+    if (Array.isArray(value)) return value.map((item) => walk(item, key));
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = walk(v, k);
+      return out;
+    }
+    return value;
+  };
+  return walk(data, null);
 }
 
 /**

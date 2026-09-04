@@ -70,12 +70,59 @@ function rel(ctx, value, what = 'path') {
   return found;
 }
 
+/**
+ * A path the page handlers spell relative to src/pages, resolved like any other.
+ *
+ * `page.move`'s `to` and the folder actions' `dir`/`from`/`to` are relative to
+ * the pages directory rather than to the project, and that is why they were the
+ * only path arguments in this surface that never reached rel(). What fenced
+ * them instead was the handler's own `path.resolve` + `startsWith`, which is a
+ * check on the SPELLING — and a symlink under src/pages is spelled like
+ * everything else in there. Measured: `to: 'out/MOVED.astro'` through such a
+ * link moved a page OUT of the project on `edit`, `dir: 'out/newdir'` created a
+ * directory outside it, and `folder_delete` ran fs.rmSync(recursive, force) on
+ * one, while asset.write_text and source.write refused the identical route with
+ * outside_project in the same run.
+ *
+ * So they go through the same resolver as the rest, realpath step included, and
+ * the handler is handed the absolute path it would have computed itself — its
+ * own fence still holds, this one is simply the half that survives a link.
+ */
+function pagesRel(ctx, value, what = 'page folder') {
+  const raw = String(value ?? '').trim().replace(/^\/+/, '');
+  if (!raw) return { error: { ok: false, code: 'bad_path', message: `A ${what} inside src/pages is required, relative to it.` } };
+  return rel(ctx, `src/pages/${raw}`, what);
+}
+
 const clip = (text, max) => {
   const s = String(text ?? '');
   return s.length > max ? { text: s.slice(0, max), truncated: true } : { text: s, truncated: false };
 };
 
 const take = (list, limit) => (Array.isArray(list) ? list.slice(0, limit) : []);
+
+/**
+ * Where each line of a file begins, 1-based line N at `starts[N - 1]`.
+ *
+ * A `split` sees an empty segment after the file's final newline and calling
+ * that a line is how a read of a ten-line file came back saying eleven. The
+ * terminator ENDS the last line; it does not begin another one. So the count
+ * this yields is the count a person gets from their editor's gutter, and
+ * slicing by it gives back whole lines with their own line endings attached —
+ * which is what makes a range read and a range replacement the same bytes.
+ */
+function lineStarts(text) {
+  if (text === '') return [];
+  const starts = [0];
+  const re = /\r\n|\n/g;
+  let m;
+  while ((m = re.exec(text))) starts.push(m.index + m[0].length);
+  if (starts[starts.length - 1] === text.length) starts.pop();
+  return starts;
+}
+
+/** Lines `from`..`to` inclusive, terminators included, as they sit in the file. */
+const sliceLines = (text, starts, from, to) => text.slice(starts[from - 1], to < starts.length ? starts[to] : text.length);
 
 // The two things the API layer supplies, with the behaviour to fall back on
 // when it has not — so `runMain` stays a function of its context and can be
@@ -111,11 +158,36 @@ const source = {
     } catch (err) {
       return problem('no_file', `Stacki could not read ${at.rel}: ${err.code === 'ENOENT' ? 'there is no such file' : err.message}.`);
     }
-    const lines = text.split('\n');
-    const from = Math.max(1, input.startLine || 1);
-    const to = Math.min(lines.length, input.endLine || Math.min(lines.length, from + MAX_SNIPPET_LINES - 1));
-    const slice = input.startLine || input.endLine ? lines.slice(from - 1, to).join('\n') : text;
-    const body = clip(slice, MAX_TEXT_BYTES);
+    const starts = lineStarts(text);
+    const total = starts.length;
+    const asked = input.startLine != null || input.endLine != null;
+    const from = asked ? Number(input.startLine ?? 1) : 1;
+    const wantedEnd = input.endLine != null ? Number(input.endLine) : null;
+    // A RANGE THAT CANNOT EXIST IS NOT A SUCCESSFUL EMPTY READ. Clamping the
+    // high end while leaving the low one alone manufactured pairs like
+    // 9000–250, echoed back as though they described what came out; and
+    // `slice(8999, 250)` is legitimately [], so an impossible request answered
+    // ok with nothing in it. `source.replace_range` has always refused the same
+    // input precisely, and this is the same refusal in the same words.
+    if (asked) {
+      if (!Number.isInteger(from) || from < 1) {
+        return problem('bad_range', `startLine must be a whole line number of at least 1; ${JSON.stringify(input.startLine)} is not.`);
+      }
+      if (from > total) {
+        return problem('bad_range', `${at.rel} has ${total} lines; line ${from} is not in it.`);
+      }
+      if (wantedEnd != null && (!Number.isInteger(wantedEnd) || wantedEnd < 1)) {
+        return problem('bad_range', `endLine must be a whole line number of at least 1; ${JSON.stringify(input.endLine)} is not.`);
+      }
+      if (wantedEnd != null && wantedEnd < from) {
+        return problem('bad_range', `${at.rel}: ${from}–${wantedEnd} is not a range — endLine must be at least startLine.`);
+      }
+    }
+    // An endLine PAST the end stays a read: "lines 200 to 400" of a 250-line
+    // file is a reasonable thing to ask. It says so, so a short answer can be
+    // told from a coincidence.
+    const to = Math.min(total, wantedEnd ?? from + MAX_SNIPPET_LINES - 1);
+    const body = clip(asked ? sliceLines(text, starts, from, to) : text, MAX_TEXT_BYTES);
     return {
       value: {
         path: at.rel,
@@ -124,14 +196,17 @@ const source = {
         // passing it back — with nothing for a caller to copy or forget.
         ref: refFor(ctx, at.rel),
         // The digest is of the WHOLE file however much of it was read, because
-        // that is what a write will be checked against.
+        // that is what a write will be checked against. `wholeFileBytes` is its
+        // companion, and `bytes` is neither of them: it is the payload.
         digest: digestOf(text),
-        lines: lines.length,
-        startLine: input.startLine || input.endLine ? from : 1,
-        endLine: input.startLine || input.endLine ? to : lines.length,
+        lines: total,
+        startLine: asked ? from : Math.min(1, total),
+        endLine: asked ? to : total,
         text: body.text,
         truncated: body.truncated,
-        bytes: Buffer.byteLength(text, 'utf8'),
+        bytes: Buffer.byteLength(body.text, 'utf8'),
+        wholeFileBytes: Buffer.byteLength(text, 'utf8'),
+        ...(wantedEnd != null && wantedEnd > total ? { clampedEnd: true } : {}),
       },
     };
   },
@@ -172,13 +247,32 @@ const source = {
     const before = digestOf(current);
     const guard = guardWrite(ctx, at, input, at.rel);
     if (guard.error) return guard;
-    const lines = current.split('\n');
+    // The file's own line ending, and lines with no \r riding along on them.
+    // Splicing \n-joined segments into a CRLF file left one bare LF in the
+    // middle of it, which is a change nobody asked for in a file nobody was
+    // editing by hand.
+    const eol = /\r\n/.test(current) ? '\r\n' : '\n';
+    const lines = current.split(/\r?\n/);
+    // The last segment of a terminated file is the empty string after its final
+    // newline. It is not a line — it is the position AFTER the last one, and
+    // `startLine === lines.length` is how an agent appends at the end.
+    const appendPos = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
     const from = Number(input.startLine);
     const to = Number(input.endLine ?? input.startLine);
     if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from || from > lines.length) {
-      return problem('bad_request', `${at.rel} has ${lines.length} lines; ${from}–${to} is not a range in it.`);
+      // `appendPos`, not `lines.length`: the empty segment after a terminated
+      // file's final newline is a position, not a line, and counting it told an
+      // agent a three-line file had four — a number it would then use.
+      return problem('bad_request', `${at.rel} has ${appendPos} lines; ${from}–${to} is not a range in it.`);
     }
-    const next = [...lines.slice(0, from - 1), ...String(input.text).split('\n'), ...lines.slice(Math.min(to, lines.length))].join('\n');
+    // THE CONTRACT: `text` is a sequence of whole lines. Exactly one trailing
+    // newline terminates the last of them and is consumed — every other one is
+    // a blank line the caller meant — and `text: ''` deletes the range rather
+    // than blanking it. Splicing `text.split('\n')` straight in made all three
+    // wrong at once: 'A\n' became A plus an empty line, '' became one empty
+    // line, and there was no way to say "delete this".
+    const body = input.text === '' ? [] : String(input.text).replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n');
+    const next = [...lines.slice(0, from - 1), ...body, ...lines.slice(Math.min(to, appendPos))].join(eol);
     const wrote = await putText(ctx, at.rel, next);
     if (wrote.error) return wrote;
     return {
@@ -210,15 +304,37 @@ const source = {
     // makes an error envelope when the mapper reports one or the call throws —
     // so an unresolvable specifier, or a file too large to read, arrived as
     // ok:true with every field null.
-    result: (raw, input) =>
-      raw?.ok === false
-        ? problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`)
-        : {
-            file: raw?.rel ? toPosix(raw.rel) : null,
-            name: input?.name ?? null,
-            text: clip(raw?.text ?? '', MAX_TEXT_BYTES).text,
-            line: Number.isInteger(raw?.line) ? raw.line : null,
-          },
+    // AND IT IS THE WHOLE FILE. Stacki has no JavaScript parser in the main
+    // process — the only symbol machinery is one regex that finds where a
+    // declaration STARTS, with nothing that could find where it ends — so
+    // there is no honest way to cut `money` out of a module. What comes back
+    // is the file the symbol is declared in, and the payload says so rather
+    // than letting the operation's name imply a span it did not compute. An
+    // agent that wants the span composes: `declarationLine` into
+    // `source.read {startLine, endLine}`.
+    result: (raw, input) => {
+      if (raw?.ok === false) {
+        return problem('not_found', `${input?.spec} could not be read${raw.reason ? `: ${raw.reason}` : ''}.`);
+      }
+      const text = String(raw?.text ?? '');
+      const body = clip(text, MAX_TEXT_BYTES);
+      // Null, not zero. `declarationLine` answered 0 for "no such declaration"
+      // and 0 is not a line, so a miss arrived looking like a position.
+      const at = Number.isInteger(raw?.declarationLine) && raw.declarationLine > 0 ? raw.declarationLine : null;
+      return {
+        file: raw?.rel ? toPosix(raw.rel) : null,
+        name: input?.name ?? null,
+        text: body.text,
+        wholeFile: true,
+        lines: lineStarts(text).length,
+        truncated: body.truncated,
+        declarationLine: at,
+        // The name this field had before it said what it meant. Kept so a
+        // client reading `line` today does not break; `declarationLine` is the
+        // one to read.
+        line: at,
+      };
+    },
   },
 
   resolve_path: {
@@ -356,18 +472,37 @@ const page = {
     args: (input, ctx) => {
       const from = rel(ctx, input.from, 'page path');
       if (from.error) return from;
-      const to = String(input.to || '').replace(/^\/+/, '');
-      if (!to || path.isAbsolute(to) || to.includes('\0')) {
-        return problem('bad_path', 'to must be a path inside src/pages, relative to it.');
-      }
-      return { projectPath: ctx.root, from: from.abs, to };
+      const to = pagesRel(ctx, input.to, 'page path');
+      if (to.error) return to;
+      return { projectPath: ctx.root, from: from.abs, to: to.abs };
     },
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.newPath || '') }),
   },
 
-  folder_create: { channel: 'pagefolder:create', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
-  folder_rename: { channel: 'pagefolder:rename', args: (input, ctx) => ({ projectPath: ctx.root, from: input.from, to: input.to }) },
-  folder_delete: { channel: 'pagefolder:delete', args: (input, ctx) => ({ projectPath: ctx.root, dir: input.dir }) },
+  folder_create: {
+    channel: 'pagefolder:create',
+    args: (input, ctx) => {
+      const dir = pagesRel(ctx, input.dir);
+      return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
+    },
+  },
+  folder_rename: {
+    channel: 'pagefolder:rename',
+    args: (input, ctx) => {
+      const from = pagesRel(ctx, input.from);
+      if (from.error) return from;
+      const to = pagesRel(ctx, input.to);
+      if (to.error) return to;
+      return { projectPath: ctx.root, from: from.abs, to: to.abs };
+    },
+  },
+  folder_delete: {
+    channel: 'pagefolder:delete',
+    args: (input, ctx) => {
+      const dir = pagesRel(ctx, input.dir);
+      return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
+    },
+  },
 
 
   component_usage: {
@@ -468,6 +603,162 @@ function cmsRel(ctx, value) {
 
 /** And back: what a caller sees is always project-relative. */
 const cmsPublic = (r) => `${CMS_PREFIX}${r}`;
+
+// The digest content.entries hands back for one entry.
+//
+// A client passes it straight back as the guard on its write, so both sides
+// have to mint it from the same bytes — which is why it is a function rather
+// than an expression copied into two places that could drift by one field.
+const entryDigest = (e) =>
+  e && (e.body != null || e.data != null) ? digestOf(JSON.stringify({ data: e.data ?? null, body: e.body ?? null })) : null;
+
+const entryFile = (e) => e?.rel ?? e?.file ?? null;
+
+/** One collection's entries, or the refusal that says why there are none. */
+async function listCollection(name, ctx) {
+  try {
+    return { ok: true, raw: await ctx.callMain('content:entries', { projectPath: ctx.root, name }) };
+  } catch (err) {
+    return { error: problem('no_collection', String(err?.message || err)).error };
+  }
+}
+
+/**
+ * The entry a write is about, resolved HERE rather than taken from the caller.
+ *
+ * `content.write_entry` used to accept an `entry` object and hand its `file` to
+ * `path.resolve`, which accepts `..` segments and returns an absolute argument
+ * unchanged. That made it the one write in this API outside the fence every
+ * other one is inside — `source.write` refuses `../x.md` with `outside_project`
+ * and this wrote the file. The same trust broke file-backed collections the
+ * other way: `content.entries` did not report `locator`, so an entry handed
+ * back carried no record address, and the write landed on the TOP of the data
+ * file — a two-record array grew a third element that was a bare string, and
+ * the envelope said ok.
+ *
+ * Both are one mistake: believing a client string about where an entry lives.
+ * So the collection is listed again, and what is written is the entry
+ * `listEntries` produced — `file` and `locator` both computed from the open
+ * project root. No client string becomes a filesystem path on THIS operation;
+ * the one other place in the domain where one did is `rename`, whose `to` is a
+ * filename for a glob collection and is fenced by `renameTarget` below.
+ *
+ * `entry` is still accepted for one release, as a SELECTOR into that listing
+ * and nothing else: it may choose which entry, never where one lives. A hint
+ * that selects nothing is refused rather than followed.
+ */
+async function findContentEntry(input, ctx) {
+  const hint = input.entry && typeof input.entry === 'object' ? input.entry : null;
+  const wantedId = typeof input.id === 'string' && input.id ? input.id : typeof hint?.id === 'string' ? hint.id : null;
+  const wantedFile = typeof hint?.file === 'string' ? hint.file : null;
+  if (!wantedId && !wantedFile) {
+    return problem('bad_request', 'id is required — the id of the entry, exactly as content.entries reported it.');
+  }
+
+  const named = typeof input.collection === 'string' && input.collection.trim() ? input.collection.trim() : null;
+  // WITHOUT A COLLECTION NAME, the collections are searched for the entry the
+  // hint describes. That is the deprecated shape kept working for one release,
+  // and it is still a server-side resolution: the hint says which entry, the
+  // project says where it is.
+  let names = named ? [named] : null;
+  if (!names) {
+    let all;
+    try {
+      all = await ctx.callMain('content:collections', ctx.root);
+    } catch (err) {
+      return problem('failed', String(err?.message || err));
+    }
+    names = (all?.collections || []).map((c) => c.name).filter(Boolean);
+  }
+
+  const matches = [];
+  let readOnly = null;
+  for (const name of names) {
+    const listed = await listCollection(name, ctx);
+    if (listed.error) {
+      if (named) return { error: listed.error };
+      continue;
+    }
+    if (listed.raw?.readOnly) {
+      if (named) return problem('read_only', listed.raw.reason || `${name} cannot be written through Stacki.`);
+      readOnly = readOnly || { name, reason: listed.raw.reason };
+      continue;
+    }
+    for (const e of listed.raw?.entries || []) {
+      // Where the hint carries both, both have to agree: an id can repeat
+      // across collections and the file is what says which one this is.
+      if (wantedId && e.id !== wantedId) continue;
+      if (wantedFile && entryFile(e) !== wantedFile) continue;
+      matches.push({ collection: name, entry: e });
+    }
+  }
+
+  if (!matches.length) {
+    if (readOnly) return problem('read_only', readOnly.reason || `${readOnly.name} cannot be written through Stacki.`);
+    return problem(
+      'no_entry',
+      named
+        ? `${named} has no entry ${wantedId ?? wantedFile}. content.entries lists the ones it has.`
+        : `Stacki found no entry ${wantedId ?? wantedFile} in any collection. Send \`collection\` and \`id\` — content.entries reports both.`
+    );
+  }
+  if (matches.length > 1) {
+    return problem(
+      'bad_request',
+      `${wantedId ?? wantedFile} is an entry in ${matches.map((m) => m.collection).join(' and ')}. Send \`collection\` to say which.`
+    );
+  }
+
+  const [{ collection, entry }] = matches;
+  // Belt and braces. The file came from `listEntries`, which built it from the
+  // project root — this says so rather than assuming it, because the assumption
+  // is exactly what failed before.
+  const at = rel(ctx, entryFile(entry), 'entry file');
+  if (at.error) return at;
+  return { collection, entry: { ...entry, file: at.rel }, abs: at.abs };
+}
+
+/**
+ * One resolution per call.
+ *
+ * `mainWithSync` needs the entry's file BEFORE the write, to snapshot it for
+ * the undo stack; the args mapper needs the whole entry to dispatch. Resolving
+ * twice would walk every file in the collection twice and leave a window in
+ * which the two answers could disagree — so the promise is memoised on the
+ * context object, which `run()` makes fresh for every call.
+ */
+function resolveContentEntry(input, ctx) {
+  const cache = (ctx.__contentEntry ||= new Map());
+  const key = JSON.stringify([input.collection ?? null, input.id ?? null, input.entry?.id ?? null, input.entry?.file ?? null]);
+  if (!cache.has(key)) cache.set(key, findContentEntry(input, ctx));
+  return cache.get(key);
+}
+
+/**
+ * The id a rename is moving TO, before it becomes a filename.
+ *
+ * `write_entry` was closed by never letting a client string say where an entry
+ * lives; the table entry two below it still did. For a glob collection the id
+ * IS the filename — `planRename` builds `dirname(entry.file)/<to><ext>` and
+ * `applyRename` hands that to `mkdirSync` and `renameSync` — so a `to` of
+ * '../../../../elsewhere/x' moved a project file out of the project and
+ * replaced whatever already sat there, silently, on {ok:true}. Same domain,
+ * same `write` risk, same Edit level as the hole that was fixed: the fix was
+ * applied to an instance rather than to the class.
+ *
+ * A nested id stays legal — a glob collection's ids carry the path under its
+ * base, so 'drafts/second' is an ordinary id and renaming to one has to keep
+ * working. What an id may not do is climb out, be absolute, or carry a NUL,
+ * which is exactly `resolveInProject` against the project ROOT. Checking there
+ * rather than against the entry's own directory is deliberate and is not a
+ * weaker test: the destination directory is always at or below the root, so a
+ * `to` whose net climb keeps it inside the root keeps it inside every directory
+ * deeper than the root as well.
+ */
+function renameTarget(ctx, to) {
+  const at = rel(ctx, to, 'new id');
+  return at.error ? at : null;
+}
 
 const content = {
   cms_list: {
@@ -586,11 +877,20 @@ const content = {
         entries: take(list, limit).map((e) => ({
           id: e.id ?? null,
           slug: e.slug ?? null,
-          file: e.rel ?? e.file ?? null,
+          file: entryFile(e),
+          // WHERE THE RECORD IS INSIDE THAT FILE, and it is the only thing that
+          // makes an entry writable. A file-backed collection keeps every entry
+          // in one data file; without the locator an entry written back
+          // addressed the top of the file rather than its own record, so a
+          // two-record array grew a third element that was a bare string while
+          // the record the caller meant stayed as it was.
+          locator: Array.isArray(e.locator) ? e.locator : [],
+          format: e.format ?? null,
+          keyed: !!e.keyed,
           data: e.data ?? null,
           // A whole markdown body per entry turns a listing into a book.
           body: e.body == null ? null : clip(e.body, 2000).text,
-          digest: e.body != null || e.data != null ? digestOf(JSON.stringify({ data: e.data ?? null, body: e.body ?? null })) : null,
+          digest: entryDigest(e),
         })),
         truncated: list.length > limit,
       };
@@ -598,31 +898,83 @@ const content = {
   },
   write_entry: {
     channel: 'content:writeEntry',
-    args: (input, ctx) => {
-      if (!input.entry || typeof input.entry !== 'object') {
-        return problem('bad_request', 'entry is required — pass the entry object content.entries reported.');
-      }
+    args: async (input, ctx) => {
       if (input.edits !== undefined && !Array.isArray(input.edits)) {
         return problem('bad_request', 'edits is a list of { path, value } — one per field to change.');
       }
-      // `[]`, not `{}`. The implementation maps over this; an object arrived at
-      // `.map` and took the operation down for every caller, including the ones
-      // that sent no edits at all and only wanted to rewrite the body.
-      return { projectPath: ctx.root, entry: input.entry, edits: input.edits || [], body: input.body };
+      const found = await resolveContentEntry(input, ctx);
+      if (found.error) return found;
+      // THE VERSION GUARD, WITH NOTHING TO REMEMBER. content.entries already
+      // mints a digest per entry and the client hands it straight back inside
+      // the entry object, so the common case is guarded without a caller asking
+      // for it — and a caller that names no version at all is refused, exactly
+      // as content.cms_write refuses one. Same function, same envelopes.
+      const stale = checkDigest({
+        expected: typeof input.expectedDigest === 'string' ? input.expectedDigest : input.entry?.digest,
+        actual: entryDigest(found.entry),
+        what: `${found.collection}/${found.entry.id}`,
+        requireForExisting: true,
+      });
+      if (stale) return { error: stale };
+      return {
+        projectPath: ctx.root,
+        collection: found.collection,
+        entry: found.entry,
+        // The agent path opts INTO the schema check the CMS panel deliberately
+        // does not want; `allowInvalid` still checks and still reports, it just
+        // writes anyway — so an override is a decision on the record.
+        validate: true,
+        allowInvalid: input.allowInvalid === true,
+        // `[]`, not `{}`. The implementation maps over this; an object arrived
+        // at `.map` and took the operation down for every caller, including the
+        // ones that sent no edits at all and only wanted to rewrite the body.
+        edits: input.edits || [],
+        body: input.body,
+      };
     },
   },
   validate: {
     channel: 'content:validate',
-    args: (input, ctx) => ({ projectPath: ctx.root, collection: input.collection, data: input.data }),
+    args: (input, ctx) => {
+      if (input.data === undefined) {
+        return problem('bad_request', 'data is required — the entry data to check, as an object of fields.');
+      }
+      return { projectPath: ctx.root, collection: input.collection, data: input.data };
+    },
+    // AN EMPTY `issues` LIST MEANS TWO THINGS AND THEY ARE NOT THE SAME. It
+    // meant "the schema is satisfied" and "there was no schema to satisfy", and
+    // an unknown collection landed in the second — so a misspelled name came
+    // back as an all-clear. `checked` is the field that separates them, and an
+    // unknown collection is now the refusal content.entries already gives.
+    result: (raw, input) => {
+      if (raw?.unknownCollection) {
+        return problem('no_collection', raw.message || `${input.collection} is not a collection in this project.`);
+      }
+      const unchecked = !!raw?.unchecked || !!raw?.error;
+      return {
+        collection: input.collection,
+        issues: raw?.issues || [],
+        checked: !unchecked,
+        ...(unchecked ? { unchecked: true, reason: raw?.reason ?? raw?.error ?? null } : {}),
+      };
+    },
   },
   targets: { channel: 'content:targets', args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection }) },
   rename_plan: {
     channel: 'content:renamePlan',
-    args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection, from: input.from, to: input.to }),
+    args: (input, ctx) => {
+      const fenced = renameTarget(ctx, input.to);
+      if (fenced) return fenced;
+      return { projectPath: ctx.root, name: input.collection, from: input.from, to: input.to };
+    },
   },
   rename: {
     channel: 'content:rename',
-    args: (input, ctx) => ({ projectPath: ctx.root, name: input.collection, from: input.from, to: input.to }),
+    args: (input, ctx) => {
+      const fenced = renameTarget(ctx, input.to);
+      if (fenced) return fenced;
+      return { projectPath: ctx.root, name: input.collection, from: input.from, to: input.to };
+    },
   },
   sample_entry: {
     channel: 'content:sampleEntry',
@@ -674,14 +1026,23 @@ const asset = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel };
     },
+    // THE RESOLVED PATH, in the answer and in the ref. Both were the client's
+    // own string, and every other minter in this file puts the resolved one
+    // there — so a read of 'public/./robots.txt' handed back a ref that
+    // `refObservation` then refused as `wrong_target` against the normalised
+    // path the write resolves to, accusing the caller of naming a different
+    // file with a ref the read had just given it. Fail-closed, and still the
+    // opposite of what a ref is for: nothing to remember and nothing to spell
+    // twice.
     result: (raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'asset path');
       const body = clip(raw?.text ?? '', MAX_TEXT_BYTES);
       return {
-        path: input.path,
-        ref: refFor(ctx, input.path),
+        path: at.error ? input.path : at.rel,
+        ref: refFor(ctx, at.error ? input.path : at.rel),
         text: body.text,
         truncated: body.truncated,
-        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+        digest: digestOfFile(at.error ? path.resolve(ctx.root, input.path) : at.abs),
       };
     },
   },
@@ -722,6 +1083,18 @@ const asset = {
       if (to.error) return to;
       return { projectPath: ctx.root, fromRel: from.rel, toDirRel: to.rel };
     },
+    // WHERE THE FILE LANDED, from the handler rather than from the request.
+    // `assets:move` renames around a collision (`uniqueDest`), so an agent told
+    // only `{ok:true}` had no way to find the file it had just moved — and the
+    // undo record derived the same wrong path from the same arguments and moved
+    // somebody else's file back over the original.
+    //
+    // AND THE HANDLER'S OWN `ok:false` SURVIVES THE MAPPER. A mapper that only
+    // shapes the success turns an in-band refusal into an `{ok:true}` with an
+    // empty answer, which is worse than the generic code it was added to
+    // improve on; handed back whole, runMain refuses it with the handler's own
+    // code and sentence.
+    result: (raw, input) => (raw?.ok === false ? raw : { from: input.path, path: raw?.rel ?? null }),
   },
   rename: {
     channel: 'assets:rename',
@@ -730,6 +1103,10 @@ const asset = {
       if (at.error) return at;
       return { projectPath: ctx.root, rel: at.rel, newName: input.name };
     },
+    // Same reason: the handler strips `/` and `\\` from the name, so the file
+    // is not at `dirname(path)/name` and the caller is the last one to find
+    // out — and an in-band refusal is passed through rather than shaped away.
+    result: (raw, input) => (raw?.ok === false ? raw : { from: input.path, path: raw?.rel ?? null }),
   },
   delete: {
     channel: 'assets:delete',
@@ -772,14 +1149,18 @@ const style = {
       if (at.error) return at;
       return at.abs;
     },
+    // Resolved, for the reason asset.read_text is: the ref a read hands out has
+    // to name the file the write will resolve to, or it is a ref that cannot be
+    // used to write the file it was made by reading.
     result: (raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'stylesheet path');
       const body = clip(raw?.css ?? raw?.text ?? '', MAX_TEXT_BYTES);
       return {
-        path: input.path,
-        ref: refFor(ctx, input.path),
+        path: at.error ? input.path : at.rel,
+        ref: refFor(ctx, at.error ? input.path : at.rel),
         css: body.text,
         truncated: body.truncated,
-        digest: digestOfFile(path.resolve(ctx.root, input.path)),
+        digest: digestOfFile(at.error ? path.resolve(ctx.root, input.path) : at.abs),
       };
     },
   },
@@ -798,23 +1179,61 @@ const style = {
   variables: {
     channel: 'css:variables',
     args: (_i, ctx) => ctx.root,
+    // `limit` IS ABOUT THE VARIABLES, which is the only unit a caller could
+    // have meant: it capped the FILE array, and `values` — a flat name→value
+    // map of the whole project, and the bulk of the bytes — went past it
+    // untouched. An agent asking for five tokens got seventy-one in fourteen
+    // kilobytes, with `truncated: false` to say nothing had been left out.
+    // So the walk below keeps CELLS until the limit is reached, drops the rows,
+    // blocks, groups and files left empty behind it, and reports what it did.
     result: (raw, input) => {
       const files = raw?.files || [];
       const limit = Math.min(input.limit || 200, MAX_LIST);
+      let kept = 0;
+      let total = 0;
+      const names = new Set();
+      const trimmed = [];
+      for (const f of files) {
+        const groups = [];
+        for (const g of take(f.groups, 60)) {
+          const blocks = [];
+          for (const b of g.blocks || []) {
+            const rows = [];
+            for (const r of b.rows || []) {
+              const cells = [];
+              for (const c of r.cells || []) {
+                total += 1;
+                if (kept >= limit) continue;
+                kept += 1;
+                if (c?.name) names.add(c.name);
+                cells.push(c);
+              }
+              if (cells.length) rows.push({ ...r, cells });
+            }
+            if (rows.length) blocks.push({ ...b, rows });
+          }
+          if (blocks.length) groups.push({ ...g, blocks });
+        }
+        // A file whose variables all fell past the limit is not part of the
+        // answer; one that reported an error is, because that IS its answer.
+        if (groups.length || f.error) {
+          trimmed.push({ path: f.rel, name: f.name, error: f.error || null, count: f.count ?? null, groups });
+        }
+      }
+      const values = raw?.values || {};
       return {
         // One entry per stylesheet that declares custom properties, with the
-        // sections the Variables panel shows. `values` is every name in the
-        // project resolved to its value, which is what a caller actually wants
-        // when it is chasing a var() it found in a declaration.
-        files: take(files, limit).map((f) => ({
-          path: f.rel,
-          name: f.name,
-          error: f.error || null,
-          count: f.count ?? null,
-          groups: take(f.groups, 60),
-        })),
-        values: raw?.values || {},
-        truncated: files.length > limit,
+        // sections the Variables panel shows. `values` is every name resolved
+        // to its value, which is what a caller actually wants when it is
+        // chasing a var() it found in a declaration — narrowed to what came
+        // back when the walk left something out, and whole when it did not.
+        files: trimmed,
+        filesTotal: files.length,
+        values: kept < total ? Object.fromEntries(Object.entries(values).filter(([name]) => names.has(name))) : values,
+        valuesTotal: Object.keys(values).length,
+        returned: kept,
+        total,
+        truncated: kept < total,
         error: raw?.error || null,
       };
     },
@@ -856,12 +1275,22 @@ const project = {
     // The panel shows the path to the node binary because a person may need to
     // go and look at it. Nothing an agent can do with it is worth telling it
     // where somebody's home directory is.
+    // `kind` IS FOUR VALUES AND THE HEALTHY ONE WAS CALLED 'unknown'. It is the
+    // dev-server verdict — not, as it was read, a statement about the package
+    // manager — and 'unknown' meant node is here, the dependencies are here and
+    // the version satisfies Astro: nothing is wrong. A value nobody can act on,
+    // for the case where everything is fine. Translated here rather than in the
+    // handler, because the preview's error panel reads the handler's own answer
+    // and switches on 'unknown'.
     result: (raw) => ({
-      kind: raw?.kind ?? 'unknown',
+      kind: raw?.kind === 'unknown' || raw?.kind == null ? 'ready' : raw.kind,
       nodeFound: !!raw?.nodePath,
       nodeVersion: raw?.nodeVersion ?? null,
       astroVersion: raw?.astroVersion ?? null,
       requires: raw?.requires ?? null,
+      // Which one to run, and what said so. 'default' in `from` means no
+      // lockfile was found and npm is the fallback, not a detection.
+      packageManager: raw?.packageManager ?? null,
     }),
   },
   // PROBE THE PROJECT'S PREVIEW, not an arbitrary address.
@@ -972,6 +1401,25 @@ const git = {
       if (!String(input.message || '').trim()) return problem('bad_request', 'A commit message is required.');
       return { projectPath: ctx.root, message: input.message, paths: input.paths || null };
     },
+    // THE COMMIT THAT WAS MADE, not the fact that one was. The handler answers
+    // `{ ok: true, files: null }` — a count or a null, never a sha and never a
+    // branch — because it was written for a panel that re-reads the repository
+    // itself. An agent has no panel, so the only way to learn what it had just
+    // done was to ask git in a second call. Both answers below come from
+    // handlers that already exist and are already bounded.
+    result: async (raw, _input, ctx) => {
+      const info = await ctx.callMain('git:info', ctx.root);
+      const at = info?.head || null;
+      const changed = at ? await ctx.callMain('git:commitFiles', { projectPath: ctx.root, ref: at }) : null;
+      return {
+        head: at,
+        branch: info?.branch || null,
+        files: take(changed?.files || changed, MAX_LIST),
+        // What the handler said about the pathspec: null for "everything",
+        // otherwise how many paths were picked.
+        picked: raw?.files ?? null,
+      };
+    },
   },
   checkout: {
     channel: 'git:checkout',
@@ -979,16 +1427,54 @@ const git = {
   },
   merge: { channel: 'git:merge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
   resolve_merge: { channel: 'git:resolveMerge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }) },
-  delete_branch: { channel: 'git:deleteBranch', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }) },
+  delete_branch: {
+    channel: 'git:deleteBranch',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }),
+    // A REFUSAL WITH NO CODE IS A REFUSAL AN AGENT HAS TO READ ENGLISH TO
+    // CLASSIFY. `{ ok: false, unmerged: true }` is exactly the shape runMain
+    // spreads into an envelope, so `code` came out undefined while every other
+    // refusal in the surface has one. The handler's own sentence is good and is
+    // kept; only the code is added.
+    result: async (raw, input, ctx) => {
+      if (raw?.ok === false && raw.unmerged) return problem('unmerged_branch', String(raw.message || `"${input.branch}" has commits that are not on any other branch.`));
+      const info = await ctx.callMain('git:info', ctx.root);
+      return { deleted: input.branch, branches: take(info?.branches, MAX_LIST), branch: info?.branch || null };
+    },
+  },
   restore_file: {
     channel: 'git:restoreFile',
     args: (input, ctx) => {
       const at = gitPath(input, ctx);
       if (at.error) return at;
-      return { projectPath: ctx.root, ref: input.ref, path: at };
+      // "PUT THIS FILE BACK" means "back to the last commit" unless it says
+      // otherwise, which is what the panel's own restore does.
+      return { projectPath: ctx.root, ref: input.ref || 'HEAD', path: at };
+    },
+    // The same two things: a code on the in-band refusal, and evidence on the
+    // success. The digest is of what is on disk NOW — the whole point of the
+    // operation is that those bytes changed, and a caller that has to re-read
+    // the file to find out what it got has not been told anything.
+    result: (raw, input, ctx) => {
+      const at = gitPath(input, ctx);
+      if (at.error) return at;
+      if (raw?.ok === false && raw.missing) return problem('missing_at_ref', String(raw.message || `That version does not have ${at}.`));
+      return { file: at, ref: input.ref || 'HEAD', afterDigest: digestOfFile(path.resolve(ctx.root, at)) };
     },
   },
-  restore_project: { channel: 'git:restoreProject', args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }) },
+  restore_project: {
+    channel: 'git:restoreProject',
+    args: (input, ctx) => ({ projectPath: ctx.root, ref: input.ref }),
+    // Counts rather than a list: going back can touch the whole tree, and an
+    // answer that named every file would be the one thing this API promises not
+    // to send. `parked` stays — it is how the caller knows the work it had is
+    // recoverable.
+    result: async (raw, input, ctx) => {
+      const status = await ctx.callMain('git:status', { projectPath: ctx.root });
+      const info = await ctx.callMain('git:info', ctx.root);
+      const list = status?.files || status || [];
+      return { parked: raw?.parked ?? false, ref: input.ref, head: info?.head || null, branch: info?.branch || null, changedFiles: Array.isArray(list) ? list.length : null };
+    },
+  },
   park: { channel: 'git:park', args: (_i, ctx) => ({ projectPath: ctx.root }) },
   unpark: {
     channel: 'git:unpark',
@@ -1000,10 +1486,40 @@ const git = {
         ? problem('failed', String(raw.error))
         : { restored: raw?.restored !== false, ...(raw?.error ? { note: String(raw.error) } : {}) },
   },
-  push: { channel: 'git:push', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
+  push: {
+    channel: 'git:push',
+    // A push with no branch named pushes the branch the person is looking at.
+    // `git push -u origin <branch>` sets the upstream either way, so this is the
+    // ordinary intent rather than a guess. The window publishes the branch it is
+    // showing; where it has not published one yet, git is asked, which is the
+    // same answer one moment fresher. Only when neither knows is `branch`
+    // required — and then it says so rather than picking one.
+    args: async (input, ctx) => {
+      let branch = input.branch || ctx.branch;
+      if (!branch) branch = (await ctx.callMain('git:info', ctx.root))?.branch || null;
+      if (!branch) {
+        return problem('bad_request', 'Stacki could not work out which branch to push, so `branch` is required.');
+      }
+      return { projectPath: ctx.root, branch };
+    },
+    // What is now true of the remote, read from git rather than assumed from
+    // the absence of an exception. `ahead` is the load-bearing one: it is zero
+    // exactly when the push landed everything, and a caller can tell a
+    // successful push from a successful no-op without another call.
+    result: async (raw, input, ctx) => {
+      const info = await ctx.callMain('git:info', ctx.root);
+      return { branch: info?.branch || input.branch || null, remote: info?.remote || null, head: info?.head || null, ahead: info?.ahead ?? null, hasUpstream: info?.hasUpstream ?? null };
+    },
+  },
   publish: {
     channel: 'git:publish',
     args: (input, ctx) => ({ projectPath: ctx.root, repoName: input.repoName, isPrivate: input.private !== false }),
+    // Three different things used to be one `code: 'failed'`: gh not installed,
+    // gh installed and signed out, and GitHub itself refusing. The handler now
+    // tells them apart and says which — returned rather than thrown, so the
+    // code survives the generic catch — and this turns that into the refusal
+    // shape the rest of the surface uses.
+    result: (raw) => (raw?.ok === false ? problem(String(raw.code || 'failed'), String(raw.message || 'The publish did not happen.')) : raw),
   },
 };
 
@@ -1020,9 +1536,20 @@ async function runMain(domain, action, input, ctx) {
   const entry = DOMAINS[domain]?.[action];
   if (!entry) return { ok: false, code: 'bad_action', message: `${domain} has no main-process action "${action}".` };
   if (typeof entry === 'function') {
-    const out = await entry(input, ctx);
-    if (out?.error) return out.error;
-    return { ok: true, ...(out?.value || {}) };
+    // THE SAME CATCH AS THE CHANNEL BRANCH BELOW. It did not have one: the
+    // source domain writes files itself rather than through a handler, and a
+    // write into a directory that is not there left `fs.writeFileSync`'s throw
+    // to whatever caught it last — which spelled Node's own ENOENT sentence,
+    // absolute path and all, out to the client under `code: 'failed'`. The
+    // domain a failure came from is not a reason for it to be reported
+    // differently.
+    try {
+      const out = await entry(input, ctx);
+      if (out?.error) return out.error;
+      return { ok: true, ...(out?.value || {}) };
+    } catch (err) {
+      return thrownFailure(err, ctx);
+    }
   }
   const built = await entry.args(input, ctx);
   if (built?.error) return built.error;
@@ -1030,16 +1557,12 @@ async function runMain(domain, action, input, ctx) {
   try {
     raw = await ctx.callMain(entry.channel, built);
   } catch (err) {
-    const message = String(err?.message || err);
-    // A project that was never `git init`ed is a normal state, not a failure —
-    // and an agent told "fatal: not a git repository" will go looking for a
-    // bug rather than reading it as "there is no history here".
-    if (/not a git repository/i.test(message)) {
-      return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
-    }
-    return { ok: false, code: 'failed', message };
+    return thrownFailure(err, ctx);
   }
-  const shaped = entry.result ? entry.result(raw, input, ctx) : raw;
+  // Awaited, because a result mapper may need to ASK: a commit that answers
+  // with the sha it made has to read the sha, and reading it is what makes
+  // the field evidence rather than a claim.
+  const shaped = entry.result ? await entry.result(raw, input, ctx) : raw;
   // A RESULT MAPPER MAY REFUSE, the same way an args mapper may — `problem()`
   // in either place means the same thing. Several handlers signal failure in
   // band (`{ ok: false, reason }`) rather than by throwing, and without this
@@ -1052,7 +1575,174 @@ async function runMain(domain, action, input, ctx) {
   // the refusal itself replaced the whole envelope with that string, which
   // arrives at a client spread into numbered characters.
   if (shaped?.error && typeof shaped.error === 'object' && shaped.error.ok === false) return shaped.error;
+  // AND A HANDLER'S OWN `ok:false` IS A REFUSAL TOO. The spread below carried
+  // one through word for word, so `css:setVariable` refusing a stale offset
+  // reached an agent as `{ok:false, stale:true, error:"This file changed since
+  // the panel read it."}` — no `code` to branch on, and the sentence under
+  // `error` where every other refusal in this surface says `message`. That is
+  // the one answer a client cannot act on, and it was the LAST guard before a
+  // write at a byte offset, so the agent that hit it had no way to tell "your
+  // offsets are stale, read again" from any other failure.
+  if (shaped && typeof shaped === 'object' && shaped.ok === false) return refusal(shaped);
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 
-module.exports = { runMain, DOMAINS, outlineOf, summarizeScan, MAX_LIST, MAX_TEXT_BYTES };
+// An absolute path, as it appears inside a sentence: at the start, or after a
+// space, a quote, an opening bracket or an `=`. Not after a colon, which is
+// what keeps `http://localhost:4321/x` out of it.
+const ABSOLUTE_IN_TEXT = /(^|[\s'"`([=,])((?:\/|[A-Za-z]:\\)[^\s'"`)\],]+)/g;
+
+/**
+ * A message with this machine taken out of it.
+ *
+ * The handlers that know they are answering an agent already speak in
+ * project-relative paths. The ones that simply let an fs error out do not, and
+ * an fs error carries the absolute path inside its message: `content.cms_read`
+ * on a missing file reached a real client as `ENOENT: no such file or
+ * directory, open '/Users/…/src/data/nope.json'`, somebody's home directory in
+ * an answer an agent is free to quote back, log, or paste into a commit.
+ *
+ * That was fixed at one handler and it is not a property of one handler. This
+ * is the last place a thrown message becomes wire text, so it is where the
+ * rule belongs: inside the project, a path is said the only way that means
+ * anything off this machine — relative to the project root. Outside it,
+ * nothing is said at all, because nothing outside the project is any of the
+ * client's business.
+ */
+function withoutHostPaths(message, root) {
+  return String(message).replace(ABSOLUTE_IN_TEXT, (whole, lead, abs) => {
+    const rel = relativeTo(root, abs.replace(/[.,;:]+$/, ''));
+    return rel ? `${lead}${rel}` : `${lead}a path outside this project`;
+  });
+}
+
+// What an fs errno means, in the vocabulary the rest of this surface refuses
+// in. A raw fs throw is the commonest way a known cause reaches the wire as
+// `failed`: every one of asset.read_text, asset.write_text, asset.rename,
+// page.read, page.delete, page.move and source.write answered a missing file
+// with `code: 'failed'` and Node's own ENOENT sentence, which is the one code
+// a client cannot branch on and the one sentence it cannot show anybody.
+const ERRNO_CODES = {
+  ENOENT: 'no_file',
+  ENOTDIR: 'no_file',
+  EACCES: 'permission_denied',
+  EPERM: 'permission_denied',
+  EROFS: 'permission_denied',
+  EISDIR: 'bad_path',
+  EEXIST: 'exists',
+  EMFILE: 'failed',
+};
+
+/**
+ * What git says, and what it means.
+ *
+ * Ordered, and matched against the whole of git's message — its first line is
+ * `fatal: ambiguous argument 'x'` and the part that says WHY is on the next
+ * one. `nothing to commit` is given a sentence of Stacki's own because git's is
+ * a status report about a branch rather than an answer to "commit this"; the
+ * others keep git's, which already names the ref or the pathspec the caller
+ * got wrong.
+ */
+const GIT_CAUSES = [
+  [
+    /nothing to commit|no changes added to commit|nothing added to commit/i,
+    'nothing_to_commit',
+    () => 'There is nothing to commit — no file in the project has changed since the last commit.',
+  ],
+  [/pathspec .* did not match/i, 'no_file', null],
+  // BEFORE the ref rule, and deliberately: `fatal: invalid reference: x` is
+  // what `git switch x` says, and the argument the caller got wrong there is a
+  // branch. An operation that takes a `branch` answering `no_ref` while its
+  // neighbour answers `no_branch` for the same mistake is a distinction the
+  // caller has to know git to make.
+  [/branch .* not found|not something we can merge|couldn't find remote ref|no such branch|invalid reference/i, 'no_branch', null],
+  [/unknown revision or path not in the working tree|invalid object name|not a valid object name|bad revision|unknown revision/i, 'no_ref', null],
+];
+
+/**
+ * A handler that threw, in the envelope's own vocabulary.
+ *
+ * `runMain`'s catch is the only thing between a throw and the wire, and it
+ * used to answer `{code: 'failed'}` for everything but one git special case —
+ * so a cause the handler knew exactly (there is no such file; that is not a
+ * collection; something is already there) arrived as the code that means
+ * "something went wrong and nobody knows what".
+ *
+ * THE HANDLERS STILL THROW. They are called by the CMS panel and the Pages
+ * panel over IPC as well as by this API, and turning a throw into an in-band
+ * `{ok:false}` would change what every one of those callers sees. So the cause
+ * rides on the Error instead, as `refusalCode` (electron/main.js's `refuse`),
+ * which Electron's IPC serializer drops on the way to a panel — the panel
+ * still catches the same throw with the same message — and which arrives
+ * intact here, because the Agent API calls the handler function directly.
+ */
+function thrownFailure(err, ctx) {
+  const message = withoutHostPaths(err?.message || err, ctx?.root);
+  // What the handler said this is, when it knew.
+  const named = typeof err?.refusalCode === 'string' && err.refusalCode ? err.refusalCode : null;
+  if (named) return { ok: false, code: named, message };
+  // A project that was never `git init`ed is a normal state, not a failure —
+  // and an agent told "fatal: not a git repository" will go looking for a
+  // bug rather than reading it as "there is no history here".
+  if (/not a git repository/i.test(message)) {
+    return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
+  }
+  // AND THE REST OF GIT'S OWN VOCABULARY. git names these causes exactly and
+  // then says them in its own words — several lines of them, with the
+  // `Use '--' to separate paths from revisions` help block attached — and every
+  // one of them reached the wire as `failed`, the code that means nobody knows.
+  // `nothing to commit` is the commonest refusal in the whole domain and was
+  // indistinguishable from a commit that genuinely broke. The neighbours were
+  // done one at a time (`unmerged_branch`, `missing_at_ref`); this is the table
+  // that closes the rest, and it classifies without inventing: git's sentence
+  // is kept, because git is describing its own repository better than a
+  // rewrite here could.
+  const cause = GIT_CAUSES.find(([pattern]) => pattern.test(message));
+  if (cause) return { ok: false, code: cause[1], message: cause[2] ? cause[2](message) : message };
+  // An fs error names its own cause and its own path, and says both in Node's
+  // words. Both are rewritten: the errno becomes a code a client can branch
+  // on, and the sentence becomes one about the file the caller asked for.
+  const errno = typeof err?.code === 'string' ? ERRNO_CODES[err.code] : null;
+  if (errno) {
+    const rel = relativeTo(ctx?.root, err.path) || relativeTo(ctx?.root, err.dest);
+    const what = rel ? rel : 'that path';
+    const said =
+      errno === 'no_file'
+        ? `${what} is not in this project.`
+        : errno === 'exists'
+          ? `${what} already exists.`
+          : errno === 'permission_denied'
+            ? `Stacki is not allowed to use ${what} (${err.code}).`
+            : `${what} could not be used (${err.code}).`;
+    return { ok: false, code: errno, message: rel ? said : message };
+  }
+  return { ok: false, code: 'failed', message };
+}
+
+/** A main-process `{ok:false, …}` said in the envelope's own vocabulary. */
+function refusal(raw) {
+  const { ok, code, message, error, reason, ...rest } = raw;
+  return {
+    ...rest,
+    ok: false,
+    // `stale` is a handler's own word for the guard that fired: the file moved
+    // under the offsets it was handed, which is `stale_target` everywhere else
+    // in this surface. Anything else it did not name is `failed`, as before.
+    code: typeof code === 'string' && code ? code : raw.stale ? 'stale_target' : 'failed',
+    message: String(message || error || reason || 'That operation was refused.'),
+  };
+}
+
+module.exports = {
+  runMain,
+  // Exported for test/git-envelopes.js, which calls it with the error shapes
+  // that reach it — including the ones no fixture can provoke end to end, like
+  // a package manager's stderr with somebody's home directory in it.
+  thrownFailure,
+  resolveContentEntry,
+  DOMAINS,
+  outlineOf,
+  summarizeScan,
+  MAX_LIST,
+  MAX_TEXT_BYTES,
+};

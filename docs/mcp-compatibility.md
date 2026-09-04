@@ -35,7 +35,7 @@ only the first while sounding like the second.
 | Negotiated legacy version asserted | — | — | **BEST EFFORT** | no test asserts the version returned |
 | Server instructions reach the model | ✅ quoted back verbatim | n/a | **TESTED** | a session asked to quote them, with no tool calls, returned all 1,838 bytes |
 | `tools/list` | ✅ 11/11 | ✅ | **TESTED** | 140,885 bytes each time |
-| `tools/call` | ✅ 83 calls | ✅ | **TESTED** | all 14 tools registered; `test/mcp-wire-coverage.js` covers all 111 operations |
+| `tools/call` | ✅ 83 calls | ✅ | **TESTED** | all 14 tools registered; `test/mcp-wire-coverage.js` covers all <!--count:total-->111<!--/--> operations |
 | Structured output validated against the delivered schema | — | ✅ | **TESTED** | `test/mcp-modern.js` |
 | `resources/list` | ✅ 11/11 | ✅ | **TESTED** | 2,229 bytes each time |
 | `resources/read` | ✅ 5 reads | ✅ | **TESTED** | only via the host's built-in resource tools — see below |

@@ -120,7 +120,7 @@ function selectionRef() {
   if (!api || !latestPayload) return null;
   const built = anchorFrom(latestPayload);
   if (!built.ok) return null;
-  return api.nodeRef({ ...built.anchor, branch: latestPayload.project?.branch || null }, { writable: true });
+  return api.publishedNodeRef({ ...built.anchor, branch: latestPayload.project?.branch || null }, { writable: true });
 }
 
 // The last payload, at module scope so `selectionRef` can reach it. `startMcp`
@@ -261,7 +261,12 @@ async function startMcp({
     // back with a ref. Withheld — or issued read-only — exactly where the pin
     // is withheld: the renderer answers with how it identified the node, and
     // the same rule decides both. See src/reviewCheckout.js.
-    mintRef: (anchor, { writable }) => api?.nodeRef(anchor, { writable }) || null,
+    // Through the same minter get_context uses, and for the same reason: this
+    // ref is handed over without a read behind it, so the version it saw has
+    // to come from the payload the window publishes rather than from an answer
+    // nobody here has. Passing `writable` alone was how a focus ref came back
+    // as an unguarded write handle.
+    mintRef: (anchor, opts) => api?.publishedNodeRef(anchor, opts || {}) || null,
   });
 
   async function getComments({ status, scope, detail, limit }) {

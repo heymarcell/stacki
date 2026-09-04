@@ -42,6 +42,54 @@ const short = (v) => JSON.stringify(v ?? null).slice(0, 220);
 
 process.env.STACKI_NO_DIALOGS = '1';
 
+// WHAT THE CLIENT WOULD HAVE REFUSED.
+//
+// This suite speaks raw JSON-RPC, so nothing here ever checked `structuredContent`
+// against the schema the tool publishes -- and a real MCP client does exactly
+// that, and hard-fails the call. Three fields were added to the audit answer
+// (engine.unknownRules, truncation.omittedCaptureCount, truncation.totalByteCap)
+// and not to AuditOutput, and every check in this file stayed green while the
+// packaged app, driven by the official client, could not run an audit at all.
+// So every audit answer is now validated the way the SDK validates it: the
+// published JSON Schema, additionalProperties and all.
+//
+// AND THAT WAS NOT ENOUGH, WHICH IS WHY THE WALKER NOW LIVES NEXT DOOR. The
+// check above went in and the class shipped again: `findings[].target.
+// modelPathMatch`, emitted for every repeated node, undeclared, and therefore
+// enough to make one alt-less <img> inside a `.map()` destroy the whole answer
+// for a conformant client. This file stayed green because no fixture it audited
+// rendered a repeated node that produced a finding -- so the walk never saw the
+// field. /repeat below is that fixture, and test/audit-schema-conformance.js
+// owns the walker and drives the engine down every branch it has without
+// waiting for a live payload to happen to contain one.
+//
+// Deliberately dependency-free, for two reasons that have not changed: the ajv
+// in node_modules is a transitive v6 that cannot read the draft zod emits, and
+// ANY throw at require-time in an Electron test is a modal crash dialog on
+// somebody's screen rather than a red line in a terminal. The module derives the
+// schema inside a try/catch for exactly that reason.
+const { publishedSchema, schemaViolations, keyPathsIn } = require('./audit-schema-conformance.js');
+
+const auditSchemaJson = publishedSchema();
+// Every field path any audit answer in this run actually carried, so the run can
+// be asked at the end whether the shape that broke it was among them.
+const auditFieldsSeen = new Set();
+
+// The oracle has to be satisfiable before a clean run means anything. These are
+// the whole reason the real defect was invisible: the schema must actually have
+// been derived, and the walk must actually reject a payload no client would take.
+check('the audit output schema could be derived', !!auditSchemaJson?.properties, String(auditSchemaJson && Object.keys(auditSchemaJson)));
+check(
+  'and an undeclared field is detected when one is present',
+  schemaViolations({ ok: true, engine: { accessibility: null, error: null, notADeclaredField: 1 } }, auditSchemaJson).length === 1,
+  short(schemaViolations({ ok: true, engine: { accessibility: null, error: null, notADeclaredField: 1 } }, auditSchemaJson))
+);
+check(
+  'and so is a declared field of the wrong type',
+  schemaViolations({ ok: true, findingCount: 'seven' }, auditSchemaJson).length === 1,
+  short(schemaViolations({ ok: true, findingCount: 'seven' }, auditSchemaJson))
+);
+
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
@@ -88,6 +136,45 @@ for (const [rel, body] of Object.entries(auditFixture({ broken: true }))) {
     'utf8'
   );
 }
+
+// ONE SOURCE NODE, FOUR RENDERED COPIES, AND A DEFECT ON ALL OF THEM.
+//
+// The shape every real site has and no fixture in this suite had. `data-avb-p`
+// is a SOURCE path, so the four `<img>` the `.map()` draws carry the identical
+// marker and every finding on them carries `target.modelPathMatch` -- the field
+// the tool's own schema did not declare, which was enough for a conformant
+// client to discard the entire audit of any page with a repeated defect. The
+// pages this suite already audits write every element out literally, so each
+// gets a distinct path, and the schema check added after the FIRST instance of
+// this class validated every answer in this suite without ever meeting the field.
+//
+// The control sits inside the same loop, in the same <li>: a second image, drawn
+// the same four times, with a real alternative. `image-alt` must report four and
+// not eight, so a rule that fires on "an img in a loop" fails here.
+const REPEAT_COUNT = 4;
+const REPEAT_PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+fs.writeFileSync(
+  path.join(root, 'src/pages/repeat.astro'),
+  `---
+import Base from '../layouts/AuditBase.astro';
+const projects = ${JSON.stringify(Array.from({ length: REPEAT_COUNT }, (_, i) => `Project ${i + 1}`))};
+---
+<Base>
+  <h1>Repeated</h1>
+  <ul class="repeat-list">
+    {projects.map((name, i) => (
+      <li id={\`repeat-row-\${i}\`}>
+        <img class="repeat-broken" src="${REPEAT_PIXEL}" width="24" height="24" />
+        <img class="repeat-control" src="${REPEAT_PIXEL}" width="24" height="24" alt="A described thumbnail" />
+        <span>{name}</span>
+      </li>
+    ))}
+  </ul>
+  <div id="end"></div>
+</Base>
+`,
+  'utf8'
+);
 
 const userData = ownedTempDir('stacki-canvas-user-', { harness: 'mcp-audit' });
 app.setPath('userData', userData);
@@ -209,7 +296,28 @@ let stopPreview = null;
     // A handler that threw comes back as content with no structuredContent. Say
     // what it said rather than reporting the absence -- "no_content" is a
     // symptom, and the stack that caused it is right there in the payload.
-    if (body.result?.structuredContent) return body.result.structuredContent;
+    if (body.result?.structuredContent) {
+      // Every audit answer, on the way past. A real client validates here and
+      // refuses the whole call if it does not fit, so a green suite that skipped
+      // this was measuring a payload nobody could receive.
+      if (name === 'audit') {
+        let bad = [];
+        try {
+          keyPathsIn(body.result.structuredContent, '', auditFieldsSeen);
+          bad = schemaViolations(body.result.structuredContent, auditSchemaJson);
+        } catch (e) {
+          bad = [`checker threw: ${e && e.message}`];
+        }
+        if (bad.length) {
+          check(
+            `a client could receive this audit answer (${JSON.stringify(args).slice(0, 50)})`,
+            false,
+            [...new Set(bad)].join(', ').slice(0, 500)
+          );
+        }
+      }
+      return body.result.structuredContent;
+    }
     const said = (body.result?.content || []).map((c) => c.text || '').join(' ').slice(0, 400);
     return { ok: false, code: 'no_content', message: said || JSON.stringify(body.result).slice(0, 400) };
   };
@@ -330,6 +438,68 @@ let stopPreview = null;
     const b = new Set((again.findings || []).map((f) => f.id));
     const same = a.size === b.size && [...a].every((id) => b.has(id));
     check('and every finding id is identical', same, `first ${a.size}, second ${b.size}`);
+    // STABLE IS HALF THE CLAIM. Comparing two SETS cannot see an N-way collapse:
+    // when one model node rendered five times shared one id, both sets held that
+    // id once and this check was green. The count is what says they are distinct.
+    check(
+      'and every finding has an id of its own',
+      findings.length === a.size,
+      `${findings.length} findings, ${a.size} ids`
+    );
+    check(
+      '  on the second run too',
+      (again.findings || []).length === b.size,
+      `${(again.findings || []).length} findings, ${b.size} ids`
+    );
+  }
+
+  // --- ONE SOURCE NODE RENDERED FOUR TIMES, WHICH IS THE ANSWER THAT COULD NOT
+  //     BE DELIVERED.
+  //
+  // This is the dogfood's own call, on the dogfood's own shape: one alt-less
+  // <img> inside a `.map()`. Through raw HTTP it always answered correctly;
+  // through a schema-validating client it answered nothing at all, because every
+  // one of these four findings carries `target.modelPathMatch` and the tool did
+  // not declare it. `call` walks every audit answer against the published schema
+  // on the way past, so the delivery half of this is asserted there -- what is
+  // asserted here is that the four findings really are the repeated-node shape,
+  // which is what makes that walk mean something.
+  {
+    const repeat = await call('audit', { route: '/repeat', viewports: ['desktop'], rules: ['image-alt'] });
+    check('the repeated-node route audits', repeat.ok === true, short(repeat));
+    const repeatedFindings = (repeat.findings || []).filter((f) => f.ruleId === 'image-alt');
+    check(
+      'one alt-less image inside a .map() is four findings, one per render',
+      repeatedFindings.length === REPEAT_COUNT,
+      short({ found: repeatedFindings.length, all: (repeat.findings || []).map((f) => `${f.ruleId}:${f.target?.selector}`) })
+    );
+    // The control is in the same loop, drawn the same number of times, and has
+    // an alternative. A rule that fired on "an img in a loop" would report eight.
+    check(
+      '  and the described image beside it, in the same loop, is never reported',
+      repeatedFindings.every((f) => !/repeat-control/.test(f.target?.selector || '')),
+      short(repeatedFindings.map((f) => f.target?.selector))
+    );
+    check(
+      '  they are four distinct ids, so fixing one row is distinguishable from fixing none',
+      new Set(repeatedFindings.map((f) => f.id)).size === REPEAT_COUNT,
+      short(repeatedFindings.map((f) => f.id))
+    );
+    // The whole point: one source path, four renders. If the page ever stops
+    // marking mapped children with the identical path, this stops being the
+    // fixture the schema check needs and says so here rather than going quiet.
+    const paths = new Set(repeatedFindings.map((f) => f.target?.modelPath));
+    check(
+      '  all four sharing ONE model path, because a .map() is one node in the source',
+      paths.size === 1 && typeof [...paths][0] === 'string',
+      short([...paths])
+    );
+    check(
+      '  and each saying which render it is -- the field that was not declared',
+      repeatedFindings.every((f) => f.target?.modelPathMatch?.of === REPEAT_COUNT) &&
+        new Set(repeatedFindings.map((f) => f.target?.modelPathMatch?.index)).size === REPEAT_COUNT,
+      short(repeatedFindings.map((f) => f.target?.modelPathMatch))
+    );
   }
 
   // --- the clean control route, in the SAME project, reports nothing
@@ -753,9 +923,13 @@ let stopPreview = null;
       const after = (shotAfterFix.captures || [])[0];
       check('a capture after the fix comes back', !!after, short(shotAfterFix.captures?.length));
       if (after) {
+        // The bytes ride in the response's image blocks now, not in the capture
+        // ROW, so the row carries a digest of them instead. Comparing digests is
+        // the same claim and a better one: two 150 KB base64 strings compared for
+        // inequality would also have passed if both were undefined.
         check(
           'and it is not the picture taken before the fix',
-          after.data !== shotBeforeFix.data,
+          !!after.sha256 && after.sha256 !== shotBeforeFix.sha256,
           `${shotBeforeFix.bytes} -> ${after.bytes} bytes`
         );
       }
@@ -832,6 +1006,26 @@ let stopPreview = null;
     await call('audit', { route: '/definitely-not-a-route-here' });
     check('and still wrote nothing', diffBytes(settled, projectBytes(root)).length === 0);
   }
+
+  // ------------------------------------------- and the schema walk was not empty
+  //
+  // THE CHECK THAT MAKES THE OTHER CHECK MEAN SOMETHING. Every audit answer in
+  // this run went past `schemaViolations` on the way through `call`, and a walk
+  // over payloads that never carry the field cannot fail on it -- which is
+  // exactly what happened after the first instance of this class was fixed. So
+  // the run is asked, at the end, whether the shape that broke it was actually
+  // among what it validated. If /repeat ever stops producing repeated-node
+  // findings, this fails here instead of the schema check silently going hollow.
+  check(
+    'the schema walk actually saw a repeated-node target this run',
+    auditFieldsSeen.has('/findings[]/target/modelPathMatch'),
+    short([...auditFieldsSeen].filter((p) => p.startsWith('/findings[]/target')))
+  );
+  check(
+    '  and a selector-ambiguous one, which is the other ordinal',
+    auditFieldsSeen.has('/findings[]/target/selectorMatch'),
+    short([...auditFieldsSeen].filter((p) => p.startsWith('/findings[]/target')))
+  );
 
   return finish();
 })()

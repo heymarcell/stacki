@@ -32,6 +32,8 @@
 // put the same bytes in the same file, which is the only thing that makes an
 // alias real rather than declared.
 
+const { execFileSync } = require('node:child_process');
+
 const { startWireRig } = require('./support/mcpWireRig.js');
 
 const failures = [];
@@ -141,6 +143,101 @@ const flatten = (node) => (node ? [node, ...(node.children || []).flatMap(flatte
       check('  with a code a client can branch on', said.envelope?.code === 'bad_arguments', short(said.envelope?.code));
       check('  and a sentence that names both spellings', /`text`/.test(String(said.envelope?.message)) && /`value`/.test(String(said.envelope?.message)), short(said.envelope?.message));
       check('  and nothing was written', after === before, 'the component changed on a refused call');
+    }
+
+    // --- AND EVERY OTHER ARGUMENT MISTAKE, on every tool.
+    //
+    // `set_text` above is refused by Stacki because its schema had to make the
+    // field optional to accept two names for it. Every OTHER missing argument
+    // was refused by the SDK instead — `tools/call` validates against the tool's
+    // input schema before the handler runs, and a failure there is a protocol
+    // error: a bare English sentence, `isError`, and no structuredContent at
+    // all. Measured against a real client:
+    //
+    //   git {action:'push'}
+    //     -> "Input validation error: Invalid arguments for tool git:
+    //         branch: Invalid input: expected string, received undefined"
+    //
+    // That is the one shape in this surface an agent cannot branch on, and it
+    // was the DEFAULT for the 73 operations that declare a required argument —
+    // not a handful of cases. So the strict schema is still advertised and
+    // Stacki validates it itself, inside the handler, where a failure becomes
+    // the same `{ok:false, code, operation, issues}` everything else answers.
+    const BAD = [
+      ['target', { action: 'set_prop', ref: 'x'.repeat(20) }, 'name'],
+      ['style', { action: 'set_property' }, 'property'],
+      ['source', { action: 'resolve_path', path: 'src/pages/index.astro' }, 'fromFile'],
+      ['page', { action: 'create' }, 'name'],
+      ['content', { action: 'validate', collection: 'notes' }, 'data'],
+      ['asset', { action: 'write_text', path: 'public/robots.txt' }, 'text'],
+      // `project` has no action with a required argument, so its argument
+      // failure is a BOUND being broken rather than a field being absent —
+      // which the same refusal has to cover.
+      ['project', { action: 'classes', limit: 9999 }, 'limit'],
+      ['git', { action: 'commit' }, 'message'],
+    ];
+    for (const [tool, args, field] of BAD) {
+      const res = await rig.client.callTool({ name: tool, arguments: args });
+      const text = res?.content?.[0]?.text;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(String(text));
+      } catch {
+        /* a raw sentence does not parse, which is the whole complaint */
+      }
+      check(`${tool}.${args.action} with no ${field} answers in Stacki's own shape`, !!res?.structuredContent, short(text));
+      check('  with the same payload in the text block', !!parsed && parsed.ok === false, short(text));
+      check('  a code a client can branch on', parsed?.code === 'bad_arguments', short(parsed?.code));
+      check('  the operation it was about', parsed?.operation === `${tool}.${args.action}`, short(parsed?.operation));
+      check(
+        `  and an issue naming ${field}`,
+        (parsed?.issues || []).some((i) => Array.isArray(i.path) && i.path[0] === field),
+        short(parsed?.issues)
+      );
+    }
+
+    // An action the tool does not have is a bad ACTION, not a bad argument —
+    // the same answer the dispatcher gives, rather than zod's "Invalid
+    // discriminator value".
+    {
+      const res = await rig.client.callTool({ name: 'target', arguments: { action: 'nope' } });
+      let parsed = null;
+      try {
+        parsed = JSON.parse(String(res?.content?.[0]?.text));
+      } catch {
+        /* see above */
+      }
+      check('an action that does not exist is refused as one', parsed?.code === 'bad_action', short(res?.content?.[0]?.text));
+      check('  and is told what the tool does have', Array.isArray(parsed?.actions) && parsed.actions.includes('set_text'), short(parsed?.actions));
+    }
+
+    // --- WHERE AN OMISSION CAN SAFELY DEFAULT, IT DOES. Two of the failures
+    //     above were not argument mistakes at all: "put this file back" means
+    //     "back to the last commit", and "push" means "push what I am on".
+    //
+    // The mode is raised through the HARNESS, never through MCP — git is `high`
+    // risk and there is no agent-facing operation that raises its own level.
+    {
+      rig.harness.setMode('full');
+      await rig.call('git', 'init', {});
+      await rig.call('git', 'commit', { message: 'a commit for restore_file to come back to' });
+      const head = execFileSync('git', ['show', `HEAD:${HERO}`], { cwd: rig.root, encoding: 'utf8' });
+      rig.harness.write(HERO, '<p>vandalised</p>\n');
+      const before = rig.harness.read(HERO);
+      const said = await rig.call('git', 'restore_file', { path: HERO });
+      check('git.restore_file with no ref restores from HEAD', said.envelope?.ok === true, short(said.envelope));
+      // The oracle is the bytes: HEAD's copy of the file, out of git itself.
+      check('  and the file really is HEAD’s copy', rig.harness.read(HERO) === head, 'the restored bytes are not HEAD’s');
+      check('  which is not what was there a moment ago', before !== head, 'nothing was vandalised, so this proved nothing');
+    }
+    {
+      // `push` has nowhere to go in a fixture and must not be given one — what
+      // is asserted is that the MISSING BRANCH stopped being the reason. It
+      // reaches git, and git says there is no remote.
+      const said = await rig.call('git', 'push', {});
+      check('git.push with no branch is not an argument failure', said.envelope?.code !== 'bad_arguments', short(said.envelope));
+      check('  it got as far as git, which has no remote to push to', /origin|remote|upstream/i.test(String(said.envelope?.message || '')), short(said.envelope?.message));
+      rig.harness.setMode('edit');
     }
   } finally {
     const said = await rig.stop();

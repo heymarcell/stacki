@@ -39,8 +39,8 @@ says so.
 
 | Action | Needs | Where | Undo | Reuses | What it does |
 | --- | --- | --- | --- | --- | --- |
-| `read` | Inspect | renderer | — | src/style-panel/lib (css, cascade, resolved, selectors) | Every declaration reaching a target, with its selector, source ref, authored and computed value. |
-| `list_sources` | Inspect | renderer | — | src/style-panel/lib/webflow.ts styleSources | The stylesheets and <style> blocks that style this page. |
+| `read` | Inspect | renderer | — | src/style-panel/lib (css, cascade, resolved, selectors) | Every AUTHORED declaration Stacki can see reaching a target, with its selector, source, authored and computed value — and a coverage block saying what that scan could not contain. |
+| `list_sources` | Inspect | renderer | — | src/style-panel/lib/webflow.ts styleSources | Every stylesheet in the project and the <style> blocks in play, whether or not this page imports them — style.read says which were proved to reach it. |
 | `set_property` | Edit project | renderer | ⌘Z | src/style-panel/lib/css.ts + writeEmbedDoc | Set one CSS property in an authored rule, or in a rule chosen for it. |
 | `remove_property` | Edit project | renderer | ⌘Z | src/style-panel/lib/css.ts removeDeclaration | Remove one authored declaration. |
 | `set_declarations` | Edit project | renderer | ⌘Z | src/style-panel/lib/css.ts | Set several properties on one rule in a single step. |
@@ -100,7 +100,7 @@ says so.
 | `config` | Inspect | main | — | electron/contentConfig.js | The project's content collection configuration. |
 | `collections` | Inspect | main | — | electron/contentConfig.js | Content collections and their schemas. |
 | `entries` | Inspect | main | — | electron/contentEntries.js | The entries in a collection. |
-| `write_entry` | Edit project | main | — | electron/contentEntries.js | Write fields and body of an entry. |
+| `write_entry` | Edit project | main | ⌘Z | electron/contentEntries.js | Write fields and body of an entry. |
 | `validate` | Inspect | main | — | electron/contentConfig.js | Check data against a collection schema. |
 | `targets` | Inspect | main | — | electron/contentEntries.js | Where a collection may be written. |
 | `rename_plan` | Inspect | main | — | electron/contentRefs.js | What renaming an entry would touch. |
@@ -192,12 +192,12 @@ says so.
 | `reviews:list`<br>`reviews:act` | exposed elsewhere | These ARE get_comments and comment, which existed before this feature and are unchanged by it. |
 | `selection:copy` | redundant | Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data. |
 | `page:write`<br>`page:writeRaw`<br>`page:parseSource` | exposed elsewhere | The model and raw writers, and the parse that turns text into a model without touching disk. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow. |
-| `style:listFiles`<br>`style:listAstroStyles` | exposed elsewhere | The stylesheet scan the Style panel runs. style.read and style.list_sources answer from it, with the rules already matched against the element. |
+| `style:listFiles`<br>`style:listAstroStyles`<br>`style:reachingFiles`<br>`style:generators` | exposed elsewhere | The stylesheet scan the Style panel runs, the import chain that says which of those files this page was proved to load, and the dependency whose generated CSS is in no project file. style.read answers from all four — the rules already matched against the element, and the coverage stated rather than assumed. |
 | `mcp:publish`<br>`mcp:reply`<br>`mcp:status` | redundant | The wiring between this server and its own window. Nothing about the project is in any of it. |
 
 ## Totals
 
 - 8 domains, 111 operations.
 - 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
-- 31 land on Stacki's own undo stack.
-- 55 capabilities deliberately kept out.
+- 32 land on Stacki's own undo stack.
+- 57 capabilities deliberately kept out.

@@ -940,14 +940,20 @@ export default function App() {
   // shortfall -- a UI typing burst pushes history for a model whose bytes have
   // genuinely never been on disk, and there is nothing to record. Pairing that
   // model with the last saved file would restore bytes that never held it.
+  //
+  // AND IT NAMES ITS FILE. An undo has to be able to say what it put back, and
+  // `project.undo` used to answer with whatever document the editor had open —
+  // which for a stylesheet undo was a page the undo never touched. The entry is
+  // the only thing that knows.
   const snapshotOf = (state) =>
     state.editable
       ? {
           kind: 'model',
+          file: state.file || null,
           model: structuredClone(state.model),
           source: state.dirty ? null : state.savedSource ?? state.source ?? null,
         }
-      : { kind: 'source', source: state.source };
+      : { kind: 'source', file: state.file || null, source: state.source };
 
   // Records the state *before* a mutation. Consecutive edits with the same
   // coalesceKey within 800 ms collapse into one undo step (typing bursts,
@@ -987,6 +993,10 @@ export default function App() {
     if (coalesce) {
       prev.redo = cmd.redo;
       prev.label = cmd.label ?? prev.label;
+      // One ⌘Z, so one list of what it puts back — and a burst of variable
+      // writes can reach a different stylesheet on its second call than on its
+      // first.
+      prev.files = [...new Set([...(prev.files || []), ...(cmd.files || [])])];
     } else {
       h.past.push({ kind: 'cmd', ...cmd });
       if (h.past.length > 100) h.past.shift();
@@ -1061,7 +1071,7 @@ export default function App() {
   const undo = useCallback(async () => {
     setHistoryTick((n) => n + 1);
     const h = historyRef.current;
-    if (!h.past.length) return;
+    if (!h.past.length) return null;
     h.lastKey = null;
     h.lastPush = 0;
     const entry = h.past.pop();
@@ -1072,18 +1082,19 @@ export default function App() {
       } catch (err) {
         showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${cleanError(err)}`, 'error');
       }
-      return;
+      return { kind: 'cmd', files: entry.files || [] };
     }
     const state = pageStateRef.current.pageState;
-    if (!state) return; // its page is gone — nothing to restore onto
+    if (!state) return null; // its page is gone — nothing to restore onto
     h.future.push(snapshotOf(state));
     await applySnapshot(entry);
+    return { kind: entry.kind, files: [entry.file || state.file].filter(Boolean) };
   }, [applySnapshot, showToast]);
 
   const redo = useCallback(async () => {
     setHistoryTick((n) => n + 1);
     const h = historyRef.current;
-    if (!h.future.length) return;
+    if (!h.future.length) return null;
     h.lastKey = null;
     h.lastPush = 0;
     const entry = h.future.pop();
@@ -1094,12 +1105,13 @@ export default function App() {
       } catch (err) {
         showToast(`Couldn’t redo${entry.label ? ` ${entry.label}` : ''}: ${cleanError(err)}`, 'error');
       }
-      return;
+      return { kind: 'cmd', files: entry.files || [] };
     }
     const state = pageStateRef.current.pageState;
-    if (!state) return;
+    if (!state) return null;
     h.past.push(snapshotOf(state));
     await applySnapshot(entry);
+    return { kind: entry.kind, files: [entry.file || state.file].filter(Boolean) };
   }, [applySnapshot, showToast]);
 
   // Discrete edits (dropdown, checkbox, drag, delete) save immediately;
@@ -1226,6 +1238,21 @@ export default function App() {
         nextSelected = null;
       }
     }
+    // A RELOAD THAT FOUND NOTHING NEW IS NOT A NEW DOCUMENT.
+    //
+    // This is reached after ANY main-process undo, because the file that undo
+    // rewrote may be the one on screen. Usually it is not: undoing a stylesheet
+    // edit re-read a page that had not moved a byte, bumped the revision and
+    // reparsed it into fresh node ids — so every ref anybody held into an
+    // untouched page went stale, with a message saying the page had changed
+    // when its bytes were identical. Measured, three times, on a real project.
+    //
+    // The guard itself is right and stays: node ids are in the digest on
+    // purpose. What is wrong is inventing a version that nothing produced.
+    // `savedSource` is what this file held last time Stacki knew; equal bytes
+    // mean there is nothing here to catch up with. A page with unsaved edits
+    // has already returned above.
+    if (result.source != null && result.source === (state?.savedSource ?? state?.source)) return true;
     // A document that came from somewhere other than this model is a new
     // document as far as anything holding a revision is concerned.
     docRevRef.current += 1;
@@ -1254,6 +1281,37 @@ export default function App() {
       projectPath: projectRef.current?.path,
     });
   }, []);
+
+  // The import each component in a batch of operations would need, asked for
+  // before the model is touched.
+  //
+  // An agent's insert is one synchronous applyOperations, and the specifier
+  // takes a round trip to main — so a component placed this way used to land
+  // in a page that never imported it, markup Astro cannot build, reported as
+  // ok. This is the Insert panel's own resolveImportPath, over the names the
+  // batch is about, which is why an agent's import is spelled exactly the way
+  // a person's is. A name that cannot be answered for is left out, and
+  // buildNode refuses the insert rather than writing markup without it.
+  const importPathsForInserts = useCallback(
+    async (operations) => {
+      const out = {};
+      for (const op of operations || []) {
+        if (op?.node?.kind !== 'component') continue;
+        const name = String(op.node.name || '').trim();
+        if (!name || name in out) continue;
+        const comp = insertables.find((c) => c.name === name);
+        if (!comp?.path) continue;
+        try {
+          const paths = await resolveImportPath(comp.path);
+          if (paths?.relative) out[name] = paths;
+        } catch {
+          /* main could not answer; the insert refuses rather than guessing */
+        }
+      }
+      return out;
+    },
+    [insertables, resolveImportPath]
+  );
 
   // target: {parentId: string|null, index: number} | null (append at end)
   const addComponent = useCallback(
@@ -3726,6 +3784,23 @@ export default function App() {
     devUrl,
     canvas: canvasReport,
   });
+  // WHICH VERSION OF THE DOCUMENT THIS IS ABOUT.
+  //
+  // Two refs are handed to an agent without a read behind them — the one
+  // get_context returns and the one a comment focus returns — and both are
+  // minted in the main process out of this payload. With nothing here to
+  // observe they came out writable and unguarded, so a write through either
+  // one took whatever it found; measured, both of them.
+  //
+  // The same three fields a read answers with, from the same two functions the
+  // Agent API's own `documentOf` calls, so the number a ref carries and the
+  // number a write is checked against cannot be two different things. Set here
+  // rather than in buildMcpPayload because the snapshot normalizer builds from
+  // named fields and this is not one of them: it is for the ref, not for
+  // get_context's answer.
+  mcpPayloadRef.current.document = openRel
+    ? { file: openRel, revision: docRevRef.current, digest: digestOfModel(pageState?.editable ? model : pageState?.source) }
+    : null;
   // Every render, deduped on what was last sent — the alternative is an IPC
   // call per keystroke.
   const mcpSentRef = useRef(null);
@@ -4480,6 +4555,11 @@ export default function App() {
       anchorState: state,
       transient: state !== 'attached' && TRANSIENT.has(reason),
       restored,
+      // WHY, as data. The sentence says it; the sentence is for a person. The
+      // other exit of the caller that reads this (src/agent/commands.js locate)
+      // has always forwarded a reason and this one had none to forward, so the
+      // same function answered two different shapes.
+      reason: state === 'attached' ? null : reason || null,
       keys: state === 'attached' ? resolvedKeys : null,
       // HOW the node was identified, not merely whether it was. `positional`
       // means the slot held and nothing corroborated it — enough to look at,
@@ -4492,6 +4572,11 @@ export default function App() {
         anchorState: state,
         plan,
         reason,
+        // The same walk serves a comment and a ref, and only one of them has a
+        // review to point at. Told rather than guessed: `threadId` is what
+        // separates them and it is already in scope for exactly this reason
+        // two lines below.
+        forReview: !!threadId,
         // What the canvas says the loop is now, so a copy that shifted under a
         // resized collection is reported rather than assumed.
         liveOccurrenceCount: canvasReportRef.current?.occurrenceCount ?? null,
@@ -4506,12 +4591,14 @@ export default function App() {
     } else if (!modelOf(plan.page.file)) {
       return done('orphaned', 'not_open');
     }
-    restored.page = true;
+    // Only when there was a page to go to. `true` here for a page that was
+    // already open said Stacki had restored something it had not touched.
+    restored.page = !!plan.page.needed;
 
     // 2 — the breakpoint, before anything is measured. "Wrong on mobile" is a
     // different sentence at 375 and at 1440.
     if (plan.device.needed) setDevice(plan.device.key);
-    restored.breakpoint = !plan.device.key || plan.device.restorable;
+    restored.breakpoint = !!plan.device.needed && (!plan.device.key || plan.device.restorable);
 
     // 3 — down through the components, each one resolved in the model that is
     // actually loaded rather than in one read from disk: a fresh parse invents
@@ -4540,7 +4627,10 @@ export default function App() {
       );
       if (!opened) return done('orphaned', 'not_open');
     }
-    restored.component = true;
+    // Only when there was a way down to walk. This ran whether or not
+    // `plan.drills` had anything in it, so every page-level node reported a
+    // component put back that nothing had ever gone into.
+    restored.component = plan.drills.length > 0;
 
     // 4 — the node itself.
     if (!plan.leaf) return done('orphaned', 'no_path');
@@ -4675,8 +4765,18 @@ export default function App() {
       return { ok: true, status: 'off', url: null };
     },
     historyDepth: () => ({ past: historyRef.current.past.length, future: historyRef.current.future.length }),
-    undo,
-    redo,
+    // Project-relative on the way out. A page snapshot names its file the way
+    // the app holds it, which is absolute; a recorded command names its files
+    // the way main handed them over, which is not. `relOf` leaves a relative
+    // path alone, so one pass settles both.
+    undo: async () => {
+      const put = await undo();
+      return put ? { kind: put.kind, files: [...new Set((put.files || []).map(relOf).filter(Boolean))] } : null;
+    },
+    redo: async () => {
+      const put = await redo();
+      return put ? { kind: put.kind, files: [...new Set((put.files || []).map(relOf).filter(Boolean))] } : null;
+    },
     select: (id, occurrence) => {
       setSelectedId(id);
       if (Number.isInteger(occurrence)) {
@@ -4723,9 +4823,22 @@ export default function App() {
         setRefreshKey((k) => k + 1);
         await reloadOpenPageRef.current?.();
       };
+      // WHAT THIS PUTS BACK. Already in hand at every branch of `put` above,
+      // and the only place it is known: a command entry carries its inverse and
+      // nothing else, so `project.undo` had no way to name the file it had just
+      // rewritten and named the open document instead.
+      const files =
+        restore.kind === 'files'
+          ? Object.keys(restore.files || {})
+          : restore.kind === 'asset_rename'
+            ? [restore.back?.rel, restore.forward?.rel]
+            : restore.kind === 'asset_move'
+              ? [restore.back?.fromRel, restore.forward?.fromRel]
+              : [];
       pushCommand({
         label: label || 'that change',
         coalesceKey: coalesceKey ?? null,
+        files: [...new Set(files.filter(Boolean))],
         undo: () => put('before'),
         redo: () => put('after'),
       });
@@ -4863,9 +4976,14 @@ export default function App() {
      * answers so whoever asked can read the file that resulted.
      */
     commit: async (operations, { label } = {}) => {
+      // Resolved BEFORE the mutation, because the mutation cannot await: this
+      // is the one place a component an agent places can be given the import
+      // it needs, and an insert that cannot have one is refused here rather
+      // than written half-done.
+      const importPaths = await importPathsForInserts(operations);
       let outcome = null;
       mutateModel((m) => {
-        const run = applyOperations(m, operations, { insertables });
+        const run = applyOperations(m, operations, { insertables, importPaths });
         outcome = run;
         return run.ok ? run.model : m;
       }, true);

@@ -93,8 +93,9 @@ const { createStarter } = require('./starter');
 const { openingBounds } = require('./windowBounds');
 const { componentFile } = require('./componentFile');
 const { componentUsage, instancesIn } = require('./componentUsage');
-const { listEntries, writeEntry, countEntries, coveredPaths } = require('./contentEntries');
+const { listEntries, planEntryWrite, countEntries, coveredPaths } = require('./contentEntries');
 const { planRename, applyRename } = require('./contentRefs');
+const { resolveInProject } = require('./mcp/agent/paths');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
 const { probeUrl } = require('./devProbe')
 const { trustedPreviewUrl } = require('./projectOrigin.js');
@@ -439,6 +440,31 @@ function callMainOp(channel, payload) {
   const fn = mainOps.get(channel);
   if (!fn) throw new Error(`Stacki has no ${channel} handler.`);
   return fn(null, payload);
+}
+
+/**
+ * A refusal a handler knows the reason for, thrown.
+ *
+ * A handler here has two callers with two different needs. A panel calls it
+ * over `ipcRenderer.invoke` and wants a rejected promise it can catch and show
+ * — that is what every CMS and Pages panel is written against, and changing it
+ * would mean changing them. The Agent API calls the same function directly
+ * (see callMainOp) and needs a CODE: `{code:'failed'}` is the one answer a
+ * client cannot branch on, and it was what every cause below arrived as.
+ *
+ * So the reason rides on the Error. Electron's IPC serializer carries only the
+ * message across a channel, so a panel sees exactly what it saw before; the
+ * direct call gets the whole object, and electron/mcp/agent/domains.js reads
+ * `refusalCode` off it. One throw, both callers served, no handler rewritten.
+ *
+ * `code` is deliberately NOT the property name: fs errors already use that for
+ * an errno, and a reader that could not tell 'ENOENT' from 'no_file' would put
+ * an errno on the wire as though Stacki had chosen it.
+ */
+function refuse(code, message) {
+  const err = new Error(message);
+  err.refusalCode = code;
+  return err;
 }
 
 // THE ONE NON-INTERACTIVE WAY TO OPEN A PROJECT, AND ITS FENCE.
@@ -1318,7 +1344,28 @@ function run(cmd, args, cwd, opts = {}) {
 }
 
 async function git(projectPath, args, opts = {}) {
-  return run('git', args, projectPath, opts);
+  try {
+    return await run('git', args, projectPath, opts);
+  } catch (err) {
+    // WHAT GIT SAID, NOT WHAT IT WAS ASKED. execFile rejects with
+    // `Command failed: <the whole argv>` — a commit message, a branch name, a
+    // pathspec, whatever the caller passed — and only an Error's `message`
+    // survives the IPC boundary, so that argv was the thing every refusal
+    // arrived carrying. git's own words are on stderr, or on stdout (a commit
+    // with nothing to commit says so there), and those are what a caller can
+    // act on.
+    const said = [err.stderr, err.stdout]
+      .map((text) => String(text || '').trim())
+      .filter(Boolean)
+      .join('\n');
+    const next = new Error(said || `git ${args?.[0] || 'command'} did not succeed.`);
+    // The handlers that classify their own failures read these — gitBranches
+    // looks for "not fully merged" in stderr — so they travel with the message.
+    next.stdout = err.stdout;
+    next.stderr = err.stderr;
+    next.code = err.code;
+    throw next;
+  }
 }
 
 function findFreePort(start) {
@@ -1750,18 +1797,24 @@ handle('project:newDialog', async () => {
   return { canceled: false, projectPath: dir };
 });
 
-// Detects the project's package manager from its lockfile.
+// Which package manager this project uses, AND WHAT SAYS SO. `npm` is the
+// fallback rather than a detection, and reporting the two the same way would be
+// the overclaim: a project with no lockfile has not told anybody anything. So
+// `from` names the file the answer was read out of, or 'default'.
 function detectPackageManager(dir) {
-  if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
-  if (fs.existsSync(path.join(dir, 'yarn.lock'))) return 'yarn';
-  if (fs.existsSync(path.join(dir, 'bun.lockb')) || fs.existsSync(path.join(dir, 'bun.lock')))
-    return 'bun';
-  return 'npm';
+  const found = [
+    ['pnpm-lock.yaml', 'pnpm'],
+    ['yarn.lock', 'yarn'],
+    ['bun.lockb', 'bun'],
+    ['bun.lock', 'bun'],
+    ['package-lock.json', 'npm'],
+  ].find(([file]) => fs.existsSync(path.join(dir, file)));
+  return found ? { name: found[1], from: found[0] } : { name: 'npm', from: 'default' };
 }
 
 async function installDependencies(dir) {
   ensureToolPath(); // npm/pnpm/yarn are Node shims — same PATH problem as astro
-  const pm = detectPackageManager(dir);
+  const { name: pm } = detectPackageManager(dir);
   send('progress', { message: `Installing dependencies (${pm} install)…` });
   const args = pm === 'npm' ? ['install', '--no-audit', '--no-fund'] : ['install'];
   try {
@@ -2396,7 +2449,7 @@ const rootOfRel = (rel) => String(rel || '').split('/')[0];
 function assetAbs(projectPath, rel) {
   const clean = String(rel || '').replace(/^\/+/, '');
   const root = rootOfRel(clean);
-  if (!ASSET_ROOTS.includes(root)) throw new Error('Invalid asset path');
+  if (!ASSET_ROOTS.includes(root)) throw refuse('bad_path', 'Invalid asset path');
   const rootAbs = path.resolve(projectPath, root);
   const abs = path.resolve(projectPath, clean);
   if (abs !== rootAbs && !abs.startsWith(rootAbs + path.sep)) {
@@ -2521,16 +2574,25 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   // it would have to be rewritten in place. Until that rewrite exists, refuse
   // — moving the file alone would leave the site pointing at nothing, quietly.
   if (rootOfRel(fromRel) !== rootOfRel(toDirRel)) {
-    throw new Error(
+    // Named, not bare. This is a refusal the handler decided on and can explain
+    // in a paragraph, and a bare Error reaches the Agent API as `code: 'failed'`
+    // — the one code a client cannot branch on — for the one cause in this
+    // handler that is not a mistake but a deliberate limit.
+    throw refuse(
+      'unsupported',
       'Moving between public/ and src/ changes how the file is referenced ' +
         '(URL vs import), so it needs the references updated too. Not supported yet — ' +
         'move it outside the app and fix the references by hand.'
     );
   }
-  if (!fs.existsSync(from)) return { ok: false };
+  // Refused in band WITH A NAME, the way assets:delete below is: the Assets
+  // panel branches on `ok` and does not read the rest, and without the code and
+  // the sentence this reached the Agent API as `failed` / "That operation was
+  // refused." — the generic answer for a cause this line knows exactly.
+  if (!fs.existsSync(from)) return { ok: false, code: 'no_file', message: `${fromRel} is not in this project.` };
   // Refuse moving a folder into itself/its own subtree.
   if (fs.statSync(from).isDirectory() && (toDir === from || toDir.startsWith(from + path.sep))) {
-    throw new Error('Cannot move a folder into itself.');
+    throw refuse('bad_path', 'Cannot move a folder into itself.');
   }
   const dest = uniqueDest(toDir, path.basename(from));
   markSelfWrite(from);
@@ -2538,21 +2600,30 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   fs.mkdirSync(toDir, { recursive: true });
   fs.renameSync(from, dest);
   send('assets:changed', {});
-  return { ok: true };
+  // WHERE THE FILE ACTUALLY WENT. `uniqueDest` renames around a collision, so
+  // the landing path is not `toDirRel/basename(fromRel)` and only this line
+  // knows it. Whoever asked has to be told: the Agent API builds its undo
+  // inverse from this, and an inverse built from the request instead moved a
+  // DIFFERENT, pre-existing file back over the original path.
+  return { ok: true, rel: toPosix(path.relative(projectPath, dest)) };
 });
 
 handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   const clean = String(newName).trim().replace(/[/\\]/g, '');
-  if (!clean) throw new Error('Invalid name');
+  if (!clean) throw refuse('bad_request', 'Invalid name');
   const from = assetAbs(projectPath, rel);
   const dest = path.join(path.dirname(from), clean);
-  if (dest === from) return { ok: true };
-  if (fs.existsSync(dest)) throw new Error('Something with that name already exists.');
+  const landed = () => toPosix(path.relative(projectPath, dest));
+  if (dest === from) return { ok: true, rel: landed() };
+  if (fs.existsSync(dest)) throw refuse('exists', 'Something with that name already exists.');
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
   send('assets:changed', {});
-  return { ok: true };
+  // The name the file is under, which is not the name that was asked for: `/`
+  // and `\\` are stripped above, so 'sub/KEEP.svg' lands as 'subKEEP.svg'. The
+  // caller that undoes this has to name the file that exists.
+  return { ok: true, rel: landed() };
 });
 
 // To the system's bin, not to nothing. An asset is somebody's photograph as
@@ -2561,7 +2632,12 @@ handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
 // can get it back from without us.
 handle('assets:delete', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
-  if (!fs.existsSync(abs)) return { ok: false };
+  // Refused in band rather than thrown — the Assets panel branches on `ok`
+  // and writes its own sentence, and it still does. The code and the sentence
+  // are additions: without them the Agent API's envelope said `failed` and
+  // "That operation was refused.", which is the generic answer for a cause
+  // this line knows exactly.
+  if (!fs.existsSync(abs)) return { ok: false, code: 'no_file', message: `${rel} is not in this project.` };
   markSelfWrite(abs);
   await shell.trashItem(abs);
   send('assets:changed', {});
@@ -2575,7 +2651,7 @@ handle('assets:readText', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
   const stat = fs.statSync(abs);
   if (stat.size > MAX_EDITABLE_BYTES) {
-    throw new Error('That file is too large to edit in the app (over 5 MB).');
+    throw refuse('too_large', 'That file is too large to edit in the app (over 5 MB).');
   }
   return { text: fs.readFileSync(abs, 'utf8') };
 });
@@ -2589,7 +2665,7 @@ handle('assets:writeText', async (_e, { projectPath, rel, text }) => {
 
 handle('assets:mkdir', async (_e, { projectPath, parentRel, name }) => {
   const clean = String(name).trim().replace(/[/\\]/g, '');
-  if (!clean) throw new Error('Invalid folder name');
+  if (!clean) throw refuse('bad_request', 'Invalid folder name');
   const dir = path.join(assetAbs(projectPath, parentRel), clean);
   markSelfWrite(dir);
   fs.mkdirSync(dir, { recursive: true });
@@ -2641,7 +2717,7 @@ function splitCmsRel(rel) {
 function cmsAbs(projectPath, rel) {
   const root = path.resolve(projectPath, 'src');
   const abs = path.resolve(root, rel || '');
-  if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error('Invalid data path');
+  if (abs !== root && !abs.startsWith(root + path.sep)) throw refuse('outside_project', 'Invalid data path');
   return abs;
 }
 
@@ -2764,31 +2840,78 @@ handle('cms:list', async (_e, projectPath) => {
   return { files };
 });
 
+// A READ THAT FAILS MUST NOT ANSWER IN THE HOST'S OWN WORDS.
+//
+// `JSON.parse(fs.readFileSync(abs))` throws whatever Node throws, and both of
+// its throws travelled all the way out to a client. A data path that is not
+// there came back as `ENOENT: no such file or directory, open
+// '/Users/…/src/data/nope.json'` — somebody's home directory, in an answer an
+// agent is free to quote — and a markdown entry or an .astro page, whose first
+// line is `---`, came back as `No number after minus sign in JSON at position 1
+// (line 1 column 2)`: a sentence that names neither the file nor the thing that
+// was actually wrong with the request. Measured over MCP against a packaged
+// build, on `content.cms_read`.
+//
+// So the reads go through these. They name the path THE CALLER used — `src/`
+// relative, the only spelling of it that exists off this machine — and they say
+// what the CMS panel's own listing says about the same file (see cms:list),
+// which is the same complaint in the same words. A failed read reports the
+// errno and never the message: an fs error carries the absolute path inside it.
+const DATA_FILE_SHAPE =
+  'Stacki reads a .json file, or one exported array of a source file named as "path#export" — content.cms_list offers both.';
+
+function readDataFile(abs, fileRel) {
+  try {
+    return fs.readFileSync(abs, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') throw refuse('no_file', `src/${fileRel} is not in this project.`);
+    throw refuse(
+      err?.code === 'EACCES' || err?.code === 'EPERM' ? 'permission_denied' : 'unreadable',
+      `src/${fileRel} could not be read (${err?.code || 'unreadable'}).`
+    );
+  }
+}
+
+function parseDataFile(abs, fileRel) {
+  if (!/\.json$/i.test(fileRel)) {
+    throw refuse('wrong_kind', `src/${fileRel} is not a JSON data file. ${DATA_FILE_SHAPE}`);
+  }
+  const text = readDataFile(abs, fileRel);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    // The same trim cms:list uses, for the same reason: "in JSON at position 1
+    // (line 1 column 2)" is about a buffer nobody but the parser can see.
+    throw refuse('invalid_json', `src/${fileRel} is not valid JSON — ${String(err?.message || err).replace(/\s+in JSON.*$/, '')}.`);
+  }
+}
+
 handle('cms:read', async (_e, { projectPath, rel }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   const abs = cmsAbs(projectPath, fileRel);
-  if (!exportName) return { data: JSON.parse(fs.readFileSync(abs, 'utf8')) };
-  const file = fs.readFileSync(abs, 'utf8');
+  if (!exportName) return { data: parseDataFile(abs, fileRel) };
+  const file = readDataFile(abs, fileRel);
   // A page's data lives in its frontmatter; everything below it is markup the
   // scanners must never see.
   const page = isAstroRel(fileRel);
   const source = page ? frontmatterOf(file) : file;
-  if (source == null) throw new Error(`src/${fileRel} has no frontmatter.`);
+  if (source == null) throw refuse('wrong_kind', `src/${fileRel} has no frontmatter.`);
   const scan = page ? PAGE_SCAN : undefined;
   if (exportName === GENERAL) {
     const general = readGeneral(source, scan);
-    if (!general) throw new Error(`src/${fileRel} has no single values left to edit.`);
+    if (!general) throw refuse('no_export', `src/${fileRel} has no single values left to edit.`);
     return { data: general };
   }
   const col = findCollections(source, scan).find((c) => c.name === exportName);
   if (!col) {
-    throw new Error(
+    throw refuse(
+      'no_export',
       page
         ? `${exportName} is no longer declared in src/${fileRel}.`
         : `${exportName} is no longer exported from src/${fileRel}.`
     );
   }
-  if (!col.data) throw new Error(`${exportName} isn't plain data — ${col.reason}.`);
+  if (!col.data) throw refuse('wrong_kind', `${exportName} isn't plain data — ${col.reason}.`);
   return { data: col.data };
 });
 
@@ -2798,22 +2921,25 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   if (exportName) {
     const abs = cmsAbs(projectPath, fileRel);
-    if (!fs.existsSync(abs)) throw new Error(`src/${fileRel} no longer exists.`);
+    if (!fs.existsSync(abs)) throw refuse('no_file', `src/${fileRel} no longer exists.`);
     // Only the edited span is rewritten — imports, comments and the file's
     // other exports are left exactly as they were.
-    const file = fs.readFileSync(abs, 'utf8');
+    // Through the same reader as cms:read: the existence check above is not the
+    // whole of it — a permission error, or the file going between the two
+    // calls, still throws, and that throw carries the absolute path.
+    const file = readDataFile(abs, fileRel);
     // Only the frontmatter is handed to the writer for a page, and only its
     // span is spliced back — the markup below is never re-serialized.
     const page = isAstroRel(fileRel);
     const span = page ? frontmatterSpan(file) : null;
-    if (page && !span) throw new Error(`src/${fileRel} has no frontmatter.`);
+    if (page && !span) throw refuse('wrong_kind', `src/${fileRel} has no frontmatter.`);
     const source = page ? file.slice(span.start, span.end) : file;
     const scan = page ? PAGE_SCAN : undefined;
     const written =
       exportName === GENERAL
         ? writeGeneral(source, data && typeof data === 'object' && !Array.isArray(data) ? data : {}, scan)
         : replaceCollection(source, exportName, data, scan);
-    if (written == null) throw new Error(`Couldn't write ${exportName} back into src/${fileRel}.`);
+    if (written == null) throw refuse('write_failed', `Couldn't write ${exportName} back into src/${fileRel}.`);
     const next = page ? file.slice(0, span.start) + written + file.slice(span.end) : written;
     markSelfWrite(abs);
     fs.writeFileSync(abs, next, 'utf8');
@@ -2826,10 +2952,10 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
   const abs = cmsAbs(projectPath, rel);
   // A save still in flight when the collection is deleted must not recreate
   // the file — the editor closes a moment after the delete lands.
-  if (!fs.existsSync(abs)) throw new Error(`src/${rel} no longer exists.`);
+  if (!fs.existsSync(abs)) throw refuse('no_file', `src/${rel} no longer exists.`);
   let indent = 2;
   let trailingNewline = true;
-  const before = fs.readFileSync(abs, 'utf8');
+  const before = readDataFile(abs, rel);
   const match = before.match(/\n([ \t]+)\S/);
   if (match) indent = match[1] === '\t' ? '\t' : match[1].length;
   trailingNewline = /\n$/.test(before);
@@ -2842,10 +2968,10 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
 // that isn't a content collection.
 handle('cms:create', async (_e, { projectPath, name }) => {
   const slug = String(name).trim().toLowerCase().replace(/\.json$/i, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  if (!slug) throw new Error('Give the collection a name.');
+  if (!slug) throw refuse('bad_request', 'Give the collection a name.');
   const rel = `data/${slug}.json`;
   const abs = cmsAbs(projectPath, rel);
-  if (fs.existsSync(abs)) throw new Error(`src/${rel} already exists.`);
+  if (fs.existsSync(abs)) throw refuse('exists', `src/${rel} already exists.`);
   markSelfWrite(abs);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, '[]\n', 'utf8');
@@ -2882,7 +3008,7 @@ handle('content:config', async (_e, { projectPath, force } = {}) =>
 const collectionOf = async (projectPath, name) => {
   const config = await readContentConfig(projectPath);
   const collection = (config.collections || []).find((c) => c.name === name);
-  if (!collection) throw new Error(`${name} is not a collection in this project.`);
+  if (!collection) throw refuse('no_collection', `${name} is not a collection in this project.`);
   return { config, collection };
 };
 
@@ -2999,16 +3125,112 @@ handle('content:entries', async (_e, { projectPath, name }) => {
 
 // A save is a list of edits against one entry, not a new copy of the file: see
 // contentEntries.js and ./formats for what that protects.
-handle('content:writeEntry', async (_e, { projectPath, entry, edits, body }) => {
-  const result = writeEntry(projectPath, entry, edits || [], { body });
+handle('content:writeEntry', async (_e, { projectPath, entry, edits, body, collection = null, validate = false, allowInvalid = false }) => {
+  const plan = planEntryWrite(projectPath, entry, edits || [], { body });
+  // WHO ASKS TO BE CHECKED, AND WHY IT IS NOT EVERYBODY.
+  //
+  // The CMS panel writes on a 400ms debounce and validates on a separate one,
+  // painting the issues into the form as somebody types. That is right for a
+  // person watching a form and wrong for an agent, which reads {ok:true} and
+  // moves on — so the agent path asks for the check and the panel keeps the
+  // behaviour it has always had.
+  const status = validate
+    ? await entryValidation(projectPath, collection, plan)
+    : { validation: 'unchecked', validationReason: 'The caller did not ask for this entry to be checked.', issues: [] };
+  const issues = status.issues || [];
+  const said = {
+    collection,
+    id: entry.id ?? null,
+    file: entry.file,
+    validation: status.validation,
+    validationReason: status.validationReason ?? null,
+    ...(issues.length ? { issues } : {}),
+  };
+  // REFUSED BEFORE ANYTHING IS WRITTEN, not rolled back afterwards. The plan
+  // exists so that the bytes can be judged while they are still only a plan.
+  if (issues.length && !allowInvalid) {
+    return {
+      ok: false,
+      code: 'invalid_entry',
+      changed: false,
+      ...said,
+      message:
+        `That entry does not satisfy ${collection}'s schema, so nothing was written. ` +
+        'Fix the fields named in `issues`, or pass allowInvalid: true to write it anyway.',
+    };
+  }
+  if (plan.changed) fs.writeFileSync(plan.abs, plan.next, 'utf8');
   markSelfWrite(path.resolve(projectPath, entry.file));
   send('cms:changed', {});
-  return result;
+  // WHICH ENTRY THIS WAS. The agent path no longer sends a file — it sends a
+  // collection and an id and Stacki resolves the rest — so the answer has to
+  // say what it acted on, or an agent has only its own guess about it.
+  return { ok: true, changed: plan.changed, ...said };
 });
+
+/**
+ * Whether the bytes a write would land can be checked against a schema, and
+ * what came back.
+ *
+ * Four answers and there is no fifth: no content config, a config that would
+ * not read, a collection that declares no schema, and a real check. The one
+ * thing this must never do is report `checked` for a collection whose schema it
+ * never had — an agent acting on false confidence is worse off than one told
+ * the limitation by name.
+ */
+async function entryValidation(projectPath, name, plan) {
+  if (plan.readBackError) {
+    return { validation: 'unavailable', validationReason: `The edited file could not be read back — ${plan.readBackError}`, issues: [] };
+  }
+  if (!name) {
+    return { validation: 'unavailable', validationReason: 'Stacki was not told which collection this entry belongs to.', issues: [] };
+  }
+  const config = await readContentConfig(projectPath);
+  if (config.missing) {
+    return { validation: 'unavailable', validationReason: 'This project has no content config, so there is no schema to check against.', issues: [] };
+  }
+  if (config.error) return { validation: 'unavailable', validationReason: config.error, issues: [] };
+  const collection = (config.collections || []).find((c) => c.name === name);
+  if (!collection) {
+    return { validation: 'unavailable', validationReason: `${name} is not a collection in this project.`, issues: [] };
+  }
+  if (collection.error) return { validation: 'unchecked', validationReason: collection.error, issues: [] };
+  if (collection.freeform || collection.schema == null) {
+    return { validation: 'unchecked', validationReason: `${name} declares no schema, so any shape of entry is allowed.`, issues: [] };
+  }
+  const said = await validateEntry(projectPath, { collection: name, data: plan.data });
+  if (said?.error) return { validation: 'unavailable', validationReason: said.error, issues: [] };
+  if (said?.unknownCollection) {
+    return { validation: 'unavailable', validationReason: said.message || `${name} is not a collection in this project.`, issues: [] };
+  }
+  if (said?.unchecked) {
+    return { validation: 'unchecked', validationReason: said.reason || `${name} declares no schema.`, issues: [] };
+  }
+  return { validation: 'checked', validationReason: null, issues: said?.issues || [] };
+}
 
 handle('content:validate', async (_e, { projectPath, collection, data }) =>
   validateEntry(projectPath, { collection, data })
 );
+
+/**
+ * Where the file would actually land, checked before it lands there.
+ *
+ * A glob collection's id IS its filename, so `to` is a path fragment and
+ * `applyRename` resolves it, creates directories for it and `renameSync`s onto
+ * it — which for an id like '../../../elsewhere/x' means moving the entry out
+ * of the project and replacing whatever was already at the destination. The
+ * agent surface fences its own `to` (see `renameTarget` in mcp/agent/domains.js
+ * for why the root is the right thing to fence against), and this is the fence
+ * the CMS panel crosses as well. It is on the destination the plan computed
+ * rather than on the argument, so a collection whose base is a symlink out of
+ * the project is caught here too.
+ */
+function guardRenameDestination(projectPath, plan) {
+  if (plan?.move?.kind !== 'file') return;
+  const at = resolveInProject(projectPath, plan.move.to, { what: 'new id' });
+  if (!at.ok) throw new Error(at.message);
+}
 
 // What renaming an entry's id would change, and then changing it. Two calls,
 // because an id is what every reference to the entry holds: the plan is shown
@@ -3017,6 +3239,7 @@ handle('content:validate', async (_e, { projectPath, collection, data }) =>
 handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  guardRenameDestination(projectPath, plan);
   // The entry data itself is big and the renderer only needs the shape of the
   // change.
   return { ...plan, entry: { id: plan.entry.id, file: plan.entry.file } };
@@ -3025,6 +3248,7 @@ handle('content:renamePlan', async (_e, { projectPath, name, from, to }) => {
 handle('content:rename', async (_e, { projectPath, name, from, to }) => {
   const config = await readContentConfig(projectPath);
   const plan = planRename(projectPath, config.collections || [], { collection: name, from, to });
+  guardRenameDestination(projectPath, plan);
   const result = applyRename(projectPath, plan);
   for (const file of result.files) markSelfWrite(path.resolve(projectPath, file));
   send('cms:changed', {});
@@ -3070,7 +3294,7 @@ handle('cms:delete', async (_e, { projectPath, rel }) => {
   // An export shares its file with other code, so there's no file to trash and
   // removing the statement is a code edit, not a content one.
   if (splitCmsRel(rel).exportName) {
-    throw new Error('This collection is an export inside a source file — remove it in code.');
+    throw refuse('wrong_kind', 'This collection is an export inside a source file — remove it in code.');
   }
   const abs = cmsAbs(projectPath, rel);
   const hits = importersOf(projectPath, abs);
@@ -3230,9 +3454,9 @@ handle('page:create', async (_e, { projectPath, name, layout }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   let fileName = name.trim().replace(/\.astro$/i, '');
   fileName = fileName.replace(/[^a-zA-Z0-9/_-]+/g, '-');
-  if (!fileName) throw new Error('Invalid page name');
+  if (!fileName) throw refuse('bad_request', 'Invalid page name');
   const pagePath = path.join(pagesDir, fileName + '.astro');
-  if (fs.existsSync(pagePath)) throw new Error('A page with that name already exists.');
+  if (fs.existsSync(pagePath)) throw refuse('exists', 'A page with that name already exists.');
   fs.mkdirSync(path.dirname(pagePath), { recursive: true });
 
   const model = { imports: [], extraFrontmatter: '', nodes: [] };
@@ -3258,9 +3482,10 @@ handle('page:delete', async (_e, pagePath) => {
 handle('page:move', async (_e, { projectPath, from, to }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const dest = path.resolve(pagesDir, to);
-  if (!dest.startsWith(pagesDir + path.sep)) throw new Error('Invalid destination.');
+  if (!dest.startsWith(pagesDir + path.sep)) throw refuse('outside_project', 'Invalid destination.');
+  if (!reallyUnder(pagesDir, dest)) throw refuse('outside_project', 'Invalid destination.');
   if (path.resolve(from) === dest) return { newPath: dest };
-  if (fs.existsSync(dest)) throw new Error('A page with that name already exists there.');
+  if (fs.existsSync(dest)) throw refuse('exists', 'A page with that name already exists there.');
   fs.mkdirSync(path.dirname(dest), { recursive: true });
 
   let source = fs.readFileSync(from, 'utf8');
@@ -3290,10 +3515,45 @@ const resolvePagesDir = (projectPath, rel) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const full = path.resolve(pagesDir, rel);
   if (full !== pagesDir && !full.startsWith(pagesDir + path.sep)) {
-    throw new Error('Invalid folder.');
+    throw refuse('outside_project', 'Invalid folder.');
   }
+  if (!reallyUnder(pagesDir, full)) throw refuse('outside_project', 'Invalid folder.');
   return full;
 };
+
+/**
+ * Whether `target` is really under `dir`, links followed.
+ *
+ * `startsWith` compares SPELLINGS, and a symlink under src/pages is spelled
+ * like every other path in there — so the lexical fence above let mkdirSync and
+ * fs.rmSync(recursive, force) run outside the project altogether, and page:move
+ * carry a page out of it. Checked from the nearest parent that exists, because
+ * the folder being created does not exist yet and that parent is where it would
+ * actually land. The Agent API resolves these arguments too (domains.js
+ * `pagesRel`); this is the same fence for the Pages panel, which calls these
+ * handlers over IPC and never goes near that resolver.
+ */
+function reallyUnder(dir, target) {
+  const real = realpathOfNearest(target);
+  const realDir = realpathOfNearest(dir);
+  if (!real || !realDir) return false;
+  return real === realDir || real.startsWith(realDir + path.sep);
+}
+
+/** The real path of `abs`, or of the closest ancestor that exists. */
+function realpathOfNearest(abs) {
+  let at = abs;
+  for (let i = 0; i < 64; i++) {
+    try {
+      return fs.realpathSync(at);
+    } catch {
+      const up = path.dirname(at);
+      if (up === at) return null;
+      at = up;
+    }
+  }
+  return null;
+}
 
 handle('pagefolder:create', async (_e, { projectPath, dir }) => {
   fs.mkdirSync(resolvePagesDir(projectPath, dir), { recursive: true });
@@ -3303,7 +3563,7 @@ handle('pagefolder:create', async (_e, { projectPath, dir }) => {
 handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   const a = resolvePagesDir(projectPath, from);
   const b = resolvePagesDir(projectPath, to);
-  if (fs.existsSync(b)) throw new Error('A folder with that name already exists.');
+  if (fs.existsSync(b)) throw refuse('exists', 'A folder with that name already exists.');
   fs.renameSync(a, b);
   return { ok: true };
 });
@@ -4867,11 +5127,31 @@ handle('style:listFiles', async (_e, projectPath) => {
 // A component's `<style is:global>` is page CSS. Astro leaves those rules
 // unhashed, so they style whatever the page renders — including elements that
 // live in a different file from the one being edited, which is exactly the case
-// the style panel used to be blind to. Scoped `<style>` blocks are deliberately
-// left out: Astro hashes them to their own component's elements, so their rules
-// can't reach a selection made from another file.
-const ASTRO_GLOBAL_STYLE = /<style\b[^>]*\bis:global\b[^>]*>/i;
+// the style panel used to be blind to. A scoped `<style>` is hashed to its own
+// component's elements, so its rules can't reach a selection made from another
+// file — with one exception, and it is the reason this scan is not a single
+// regex: `:global(.thing)` inside a scoped block is left UNHASHED by Astro and
+// does reach the page. A component whose only page-wide CSS is written that way
+// used to be invisible here, and the rule it contributes went missing from
+// every cascade the panel and the agent computed. Both kinds are offered now;
+// which rules of a file are actually taken is decided in webflow.ts, where the
+// text is parsed rather than pattern-matched.
+const ASTRO_STYLE_BLOCK = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
 const ASTRO_SCAN_LIMIT = 512 * 1024; // a .astro file this big isn't a component
+
+/** Whether any `<style>` in this component contributes CSS to the whole page. */
+function astroStyleReachesPage(text) {
+  ASTRO_STYLE_BLOCK.lastIndex = 0;
+  let match;
+  while ((match = ASTRO_STYLE_BLOCK.exec(text))) {
+    if (/\bis:global\b/i.test(match[1])) return true;
+    // Only a selector that is ENTIRELY `:global(...)` escapes the component;
+    // `:global(.a) .b` still hashes `.b`. The parser applies that rule exactly,
+    // so this only has to be cheap enough to skip the files that cannot match.
+    if (/:global\s*\(/.test(match[2])) return true;
+  }
+  return false;
+}
 
 function listAstroStyleFiles(root) {
   const out = [];
@@ -4895,7 +5175,7 @@ function listAstroStyleFiles(root) {
       try {
         const { size } = fs.statSync(full);
         if (size > ASTRO_SCAN_LIMIT) continue;
-        if (!ASTRO_GLOBAL_STYLE.test(fs.readFileSync(full, 'utf8'))) continue;
+        if (!astroStyleReachesPage(fs.readFileSync(full, 'utf8'))) continue;
         out.push({ rel: toPosix(relPath), name: entry.name, path: full, size });
       } catch {
         /* unreadable — nothing to offer for it */
@@ -4911,6 +5191,100 @@ function listAstroStyleFiles(root) {
 handle('style:listAstroStyles', async (_e, projectPath) => {
   if (!projectPath) return { files: [] };
   return { files: listAstroStyleFiles(projectPath) };
+});
+
+// Which stylesheets this page actually pulls in.
+//
+// listCssFiles above walks the WHOLE project, because the panel's "add custom
+// styles in:" picker should offer every stylesheet somebody might want to write
+// into. As an input to a CASCADE that is wrong in a way that produces confident
+// nonsense: a stylesheet no page imports was reported as overriding one every
+// page loads. Nothing here can prove a file is unreachable — an `@import` deep
+// in a package, a framework's own injection, `astro.config` — so this answers
+// only the positive half: the files reached by following imports from the open
+// page, through the layouts and components it imports, and through `@import`
+// inside the stylesheets themselves. Everything else stays UNKNOWN rather than
+// being called unreachable.
+const IMPORT_SPECIFIER = /\bimport\s+(?:[^'"]*?\bfrom\s*)?['"]([^'"]+)['"]/g;
+const CSS_AT_IMPORT = /@import\s+(?:url\()?\s*['"]([^'"]+)['"]/g;
+const REACH_DEPTH = 4;
+
+function listReachingStyles(root, fromRel) {
+  const seen = new Set();
+  const css = new Set();
+  const visit = (rel, depth) => {
+    if (depth > REACH_DEPTH || !rel || seen.has(rel)) return;
+    seen.add(rel);
+    let text;
+    try {
+      text = fs.readFileSync(path.join(root, rel), 'utf8');
+    } catch {
+      return; // a file that cannot be read tells us nothing either way
+    }
+    const isCss = /\.(css|scss|sass|less)$/i.test(rel);
+    const pattern = isCss ? CSS_AT_IMPORT : IMPORT_SPECIFIER;
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text))) {
+      const spec = match[1];
+      // Only a relative specifier can be resolved to a file in this project
+      // with certainty. A bare one ("tailwindcss", "@fontsource/inter/400.css")
+      // resolves through node_modules, which is not what this is measuring.
+      if (!spec.startsWith('.')) continue;
+      const target = toPosix(path.relative(root, path.resolve(path.dirname(path.join(root, rel)), spec)));
+      if (!target || target.startsWith('..')) continue;
+      if (/\.(css|scss|sass|less)$/i.test(target)) {
+        css.add(target);
+        visit(target, depth + 1);
+      } else if (/\.(astro|jsx?|tsx?|svelte|vue)$/i.test(target)) {
+        visit(target, depth + 1);
+      }
+    }
+  };
+  visit(toPosix(String(fromRel || '')), 0);
+  return [...css].sort();
+}
+
+handle('style:reachingFiles', async (_e, { projectPath, file } = {}) => {
+  if (!projectPath || !file) return { files: [], from: null };
+  const abs = path.resolve(String(projectPath));
+  const rel = toPosix(path.isAbsolute(String(file)) ? path.relative(abs, String(file)) : String(file));
+  if (!rel || rel.startsWith('..')) return { files: [], from: null };
+  return { files: listReachingStyles(abs, rel), from: rel };
+});
+
+// The dependency that generates CSS this project does not author.
+//
+// Tailwind 4 is a Vite plugin, not an Astro integration, so the framework's own
+// integration list cannot see it — and its utilities exist only in what the dev
+// server serves. The name and the version as package.json spells them is the
+// one exact thing that can be said about them. No class-name sniffing: `grid`
+// and `pricing-grid` sit side by side in every project's class list, and a
+// name-shape guess would mislabel the author's own classes.
+const CSS_GENERATOR_DEPS = [
+  'tailwindcss',
+  '@tailwindcss/vite',
+  '@tailwindcss/postcss',
+  '@astrojs/tailwind',
+  'unocss',
+  '@unocss/astro',
+  '@unocss/vite',
+];
+
+function cssGeneratorPackages(root) {
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  } catch {
+    return null; // no package.json read — which is not the same as no framework
+  }
+  const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  return CSS_GENERATOR_DEPS.filter((name) => deps[name]).map((name) => ({ name, version: String(deps[name]) }));
+}
+
+handle('style:generators', async (_e, projectPath) => {
+  if (!projectPath) return { packages: null };
+  return { packages: cssGeneratorPackages(path.resolve(String(projectPath))) };
 });
 
 handle('style:readFile', async (_e, filePath) => {
@@ -4993,9 +5367,12 @@ function resolveImportPath(projectPath, fromFile, spec) {
   return null;
 }
 
-// 1-based line of `name`'s top-level declaration, so the editor can open on it.
+// 1-based line of `name`'s top-level declaration, so the editor can open on it,
+// or null when there is none to open on. It answered 0 for both "no name was
+// asked about" and "no declaration found", and 0 is not a line — so a caller
+// could not tell a miss from the top of the file.
 function declarationLine(text, name) {
-  if (!name) return 0;
+  if (!name) return null;
   const re = new RegExp(
     // `[ \t]*`, not `\s*`: with the m flag `\s` eats the newlines before the
     // declaration, and the match would start on a blank line above it.
@@ -5003,7 +5380,7 @@ function declarationLine(text, name) {
     'm'
   );
   const m = re.exec(text);
-  if (!m) return 0;
+  if (!m) return null;
   return text.slice(0, m.index).split('\n').length;
 }
 
@@ -5017,11 +5394,16 @@ handle('src:readSymbol', async (_e, { projectPath, fromFile, spec, name }) => {
   const stat = fs.statSync(abs);
   if (stat.size > MAX_EDITABLE_BYTES) return { ok: false, reason: 'too-large' };
   const text = fs.readFileSync(abs, 'utf8');
+  const declaredAt = declarationLine(text, name);
   return {
     ok: true,
     rel: path.relative(projectPath, abs),
     text,
-    line: declarationLine(text, name),
+    // `line` is the editor's revealLine and wants a number it can scroll to,
+    // so a miss stays 0 there. `declarationLine` is the same answer with "there
+    // is no declaration" spelled as null, which is what the Agent API reports.
+    line: declaredAt ?? 0,
+    declarationLine: declaredAt,
   };
 });
 
@@ -5252,7 +5634,28 @@ handle('dev:diagnose', async (_e, projectPath) => {
   else if (!hasDeps || !astroVersion) kind = 'no-deps';
   else if (!nodeOk) kind = 'node-too-old';
 
-  return { kind, nodePath, nodeVersion, astroVersion, requires, launchedFromGui: !process.env.SHELL };
+  // WHICH PACKAGE MANAGER, because this is the operation somebody calls when a
+  // build will not start, and "run the install" is the commonest thing they are
+  // about to be told. Stacki has detected this from lockfiles since the install
+  // button existed and exposed it nowhere; `declared` is package.json's corepack
+  // field, which is a different fact and can disagree.
+  let declared = null;
+  try {
+    declared = JSON.parse(fs.readFileSync(path.join(projectPath, 'package.json'), 'utf8')).packageManager || null;
+  } catch {
+    /* no package.json, or not readable — `detected` still stands on its own */
+  }
+  const pm = detectPackageManager(projectPath);
+
+  return {
+    kind,
+    nodePath,
+    nodeVersion,
+    astroVersion,
+    requires,
+    packageManager: { detected: pm.name, from: pm.from, declared },
+    launchedFromGui: !process.env.SHELL,
+  };
 });
 
 // ---------------------------------------------------------------------------
@@ -5377,7 +5780,7 @@ handle('git:info', async (_e, projectPath) => {
 // Is the GitHub CLI usable? Checked when the publish dialog opens so a
 // missing or logged-out `gh` is stated up front, instead of surfacing as a
 // failure after the user has filled the form in.
-handle('git:ghStatus', async (_e, projectPath) => {
+async function ghStatus(projectPath) {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
@@ -5392,7 +5795,9 @@ handle('git:ghStatus', async (_e, projectPath) => {
   } catch {
     return { installed: true, authed: false };
   }
-});
+}
+
+handle('git:ghStatus', async (_e, projectPath) => ghStatus(projectPath));
 
 handle('git:init', async (_e, projectPath) => {
   await git(projectPath, ['init', '-b', 'main']);
@@ -5748,11 +6153,41 @@ handle('git:push', async (_e, { projectPath, branch }) => {
   return { ok: true };
 });
 
+/** What gh said went wrong, without the command line or the caller's own name for it. */
+function ghComplaint(err, repoName) {
+  const said = String(err?.stderr || err?.message || '')
+    .replace(/^Command failed:[^\n]*\n?/, '')
+    .split('\n')
+    // gh's sign-in advice belongs to the branch above; the GH_TOKEN line names
+    // an environment variable and is not a fact about this repository.
+    .filter((line) => line.trim() && !/gh auth login|GH_TOKEN/i.test(line))
+    .join(' ')
+    .trim();
+  const safe = repoName ? said.split(String(repoName)).join('that name') : said;
+  return safe.slice(-400) || 'it did not say why.';
+}
+
+// WHY THIS CAN FAIL IS THREE DIFFERENT ANSWERS, and they used to be one.
+// `gh` missing, `gh` signed out and GitHub refusing all arrived as the generic
+// `code: 'failed'` with execFile's `Command failed: <the whole argv>` echoed
+// back — the repository name the caller chose, every flag, and gh's own stderr
+// including its GH_TOKEN hint. Two of those three are detectable and one of
+// them is already detected one call away, by `ghStatus`.
+//
+// The sign-in check is made AFTER `repo create` has refused rather than before
+// it, deliberately: an unauthenticated gh cannot create anything, so nothing is
+// risked by letting it say so itself, and the successful path stays exactly the
+// two gh invocations the boundary test in test/support/fakeGh.js pins. A probe
+// on the way in would be a third.
 handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
   try {
     await run('gh', ['--version'], projectPath);
   } catch {
-    throw new Error('GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.');
+    return {
+      ok: false,
+      code: 'gh_missing',
+      message: 'The GitHub CLI (gh) is not installed. Install it from https://cli.github.com, then run `gh auth login`. Nothing was created.',
+    };
   }
   const args = [
     'repo',
@@ -5765,7 +6200,23 @@ handle('git:publish', async (_e, { projectPath, repoName, isPrivate }) => {
     'origin',
     '--push',
   ];
-  const result = await run('gh', args, projectPath, { timeout: 180000 });
+  let result;
+  try {
+    result = await run('gh', args, projectPath, { timeout: 180000 });
+  } catch (err) {
+    const status = await ghStatus(projectPath);
+    if (!status.authed) {
+      return {
+        ok: false,
+        code: 'gh_auth_required',
+        message: 'The GitHub CLI is installed but not signed in. Sign in with `gh auth login` and try again. Nothing was created.',
+      };
+    }
+    // gh's own words about what GitHub said, and nothing else: the command line
+    // is Stacki's, the repository name is the caller's, and the environment
+    // hints in gh's stderr are not for an agent to read.
+    return { ok: false, code: 'publish_failed', message: `GitHub would not create the repository: ${ghComplaint(err, repoName)}` };
+  }
   const output = result.stdout + result.stderr;
   // gh prints the new repo's URL; fall back to the remote it just set.
   let url = (output.match(/https:\/\/github\.com\/[^\s"']+/) || [])[0] || null;

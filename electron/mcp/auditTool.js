@@ -42,7 +42,25 @@ const { NAMES: VIEWPORT_NAMES, MAX_VIEWPORTS } = require('./viewports');
 // Code does -- recorded a refused audit as a call that worked. At the default
 // permission level `audit` is ALWAYS refused, so this was the common case rather
 // than the edge one.
-const { answer } = require('./agentTools');
+//
+// AND ONE ARGUMENT CHECK, FOR THE SAME REASON.
+//
+// The SDK validates `tools/call` arguments against a tool's input schema BEFORE
+// the handler runs, and a failure there is a protocol error: `isError`, one
+// English sentence, no structuredContent, nothing to branch on. Every other
+// tool in this surface was moved off that shape -- the eight domains through
+// `domain()`, the five non-domain ones through the facade in tools.js -- and
+// this one, registered from its own file straight onto the server, was missed.
+// So `audit {viewports: "phone"}`, the single likeliest mistake given that the
+// schema publishes viewport NAMES, came back as
+//
+//   "Input validation error: Invalid arguments for tool audit:
+//    viewports: Invalid input: expected array, received string"
+//
+// while the byte-identical mistake on any other tool came back as
+// `{ok:false, code:'bad_arguments', issues:[…]}`. `publishChecked` is the same
+// door the other thirteen go through, not a second one that resembles it.
+const { answer, publishChecked } = require('./agentTools');
 
 // The permission subject. Named like a registry operation so that a reader
 // grepping for what needs `inspect` finds it in the same shape as the rest.
@@ -62,6 +80,15 @@ const Target = z.object({
   // Only when the selector matches more than one element, so a reader can tell
   // which of several identical boxes this is.
   selectorMatch: z.object({ index: z.number().int(), of: z.number().int() }).optional(),
+  // THE OTHER ORDINAL, AND THE ONE A REAL PAGE PRODUCES MOST. A model path is a
+  // SOURCE position, so a component drawn by a `.map()` stamps every row with the
+  // identical one; this says which render this is. findings.js has emitted it for
+  // every repeated node since ids stopped colliding, and it was missing here --
+  // `additionalProperties: false` then made ONE alt-less <img> inside a loop
+  // enough for a schema-validating client to discard the whole answer. A field
+  // the engine emits and this object does not declare is not a documentation
+  // gap; it is the audit returning nothing.
+  modelPathMatch: z.object({ index: z.number().int(), of: z.number().int() }).optional(),
   // The Stacki model path, when the audited element actually carried a marker.
   // Null is a real answer and appears often: a runtime-generated node or a
   // third-party embed has no source Stacki can prove.
@@ -96,13 +123,39 @@ const Finding = z.object({
   truncatedFields: z.array(z.string()).optional(),
 });
 
+// A CAPTURE ROW DESCRIBES A PICTURE. IT IS NOT THE PICTURE.
+//
+// `data` used to be here, and a single base64 string was 98.8% of a real
+// response: one viewport, one rule, zero findings, 127,029 characters, and the
+// host replaced the whole result with a file pointer. The bytes now travel as
+// MCP `image` content blocks, in the order the rows with `included: true`
+// appear, which is where the protocol puts images and where Stacki's own
+// `capture` tool has always put them.
+//
+// `included` is required and there is no `data` field to be half-present: a row
+// can say "no image was sent for this viewport", and it cannot imply one that is
+// not there. The sizes are nullable for exactly that row.
 const Capture = z.object({
   viewport: z.object({ key: z.string(), width: z.number().int(), height: z.number().int() }),
-  mimeType: z.string(),
-  bytes: z.number().int(),
-  width: z.number().int(),
-  height: z.number().int(),
-  data: z.string(),
+  // True when an image block for this viewport is in the response.
+  included: z.boolean(),
+  mimeType: z.string().nullable(),
+  bytes: z.number().int().nullable(),
+  width: z.number().int().nullable(),
+  height: z.number().int().nullable(),
+  // The identity of the picture, so a before and an after can be compared
+  // without either being sent twice.
+  sha256: z.string().nullable(),
+  // Always true, and said rather than assumed: an audit capture is the project's
+  // own page loaded again at the requested width in a window of the audit's own.
+  // It is not the Stacki UI and not the person's current breakpoint.
+  renderedOffscreen: z.boolean(),
+  // Why there is no image, when there is none. 'budget' is the only one a
+  // narrower re-run fixes, which is why `next` is worded from this and not from
+  // `included` -- telling a caller to ask again for a viewport whose frame came
+  // back empty is advice that cannot terminate.
+  omittedBecause: z.enum(['budget', 'empty_frame', 'no_encoder']).optional(),
+  note: z.string(),
 });
 
 const AuditOutput = z.object({
@@ -118,6 +171,24 @@ const AuditOutput = z.object({
   risk: z.string().optional(),
   mode: z.string().optional(),
   requires: z.string().optional(),
+  // And the argument refusal's own half. `audit` checks its arguments here
+  // rather than letting the host reject them, which is what stopped it
+  // answering a mistyped viewport with a raw protocol sentence -- but the
+  // envelope that fix returns carries `issues`, and a field this schema does
+  // not declare makes a conformant client discard the whole answer. That is the
+  // third time this class has shipped on this branch, and the second time the
+  // fix for one defect introduced it; test/audit-schema-conformance.js is what
+  // caught it, which is the point of that suite.
+  issues: z
+    .array(
+      z.object({
+        path: z.array(z.union([z.string(), z.number()])),
+        message: z.string(),
+        code: z.string().optional(),
+      })
+    )
+    .optional()
+    .describe('Field-level argument complaints, in the {path, message, code} vocabulary the domain tools use.'),
   // The HTTP status, when the route answered with an error page. A 404 renders
   // and could be measured; reporting it under the requested route would describe
   // an error page as if it were the project.
@@ -143,6 +214,10 @@ const AuditOutput = z.object({
     .object({
       accessibility: z.string().nullable(),
       error: z.string().nullable(),
+      // Rule ids the caller named that this engine does not have: `[]` when all
+      // were known, `null` when none were named. A typo used to be accepted in
+      // silence and look exactly like a rule that found nothing.
+      unknownRules: z.array(z.string()).nullable().optional(),
       // Whether this run actually began from a wiped audit session.
       sessionIsolated: z.boolean().optional(),
     })
@@ -158,6 +233,10 @@ const AuditOutput = z.object({
   truncation: z
     .object({
       detected: z.number().int(),
+      // What the page handed Stacki, after the two in-page caps and before
+      // either response cap. `counts` below breaks THIS number down by kind.
+      // Optional so a payload minted before it existed still validates.
+      scored: z.number().int().optional(),
       returned: z.number().int(),
       omitted: z.number().int(),
       omittedBeforeScoring: z.object({ geometryCulprits: z.number().int(), axeNodes: z.number().int() }),
@@ -169,12 +248,22 @@ const AuditOutput = z.object({
       // Findings returned whole but with one of their own fields shortened.
       // `truncated` is about the list; this is the other kind of loss.
       findingsWithShortenedFields: z.number().int(),
+      // Captures whose image was not sent because the whole envelope would not
+      // have fitted. The metadata row stays, saying included:false, so a caller
+      // is never told a picture is present when it is not.
+      omittedCaptureCount: z.number().int().optional(),
       responseCap: z.number().int(),
       responseByteCap: z.number().int(),
+      // The budget over the WHOLE serialized answer, images included, as
+      // distinct from responseByteCap which governs the findings alone.
+      totalByteCap: z.number().int().optional(),
       fieldCaps: z.record(z.string(), z.number().int()),
       incompleteReserved: z.number().int(),
     })
     .optional(),
+  // BY KIND, OVER THE SCORED SET -- `truncation.scored`, which is what the page
+  // handed Stacki. These sum to that and to neither `findingCount` (which counts
+  // what the page capped too) nor `returnedFindingCount` (what fitted).
   counts: z.object({
     mechanical: z.number().int(),
     standard: z.number().int(),
@@ -182,6 +271,9 @@ const AuditOutput = z.object({
     incomplete: z.number().int(),
   }).optional(),
   captures: z.array(Capture).optional(),
+  // What to do about a picture, or a route, the answer could not carry whole.
+  // Present only when there is something to do.
+  next: z.string().optional(),
   dropped: z
     .object({
       culpritsTruncatedAtViewports: z.array(z.string()),
@@ -193,6 +285,61 @@ const AuditOutput = z.object({
   limits: z.string().optional(),
 });
 
+// THE SHAPE OF A CALL, as its own const so the same zod object is both what
+// the tool publishes and what the handler checks -- a second copy of it is how
+// a published schema and an enforced one drift apart.
+const AuditInput = z.object({
+  route: z
+    .string()
+    .optional()
+    .describe(
+      'Route to audit, e.g. "/" or "/about". Defaults to the site root — NOT to the page Stacki has open; ' +
+        'call get_context first if you mean the page the person is looking at. Must resolve inside this project.'
+    ),
+  viewports: z
+    // z.string(), not z.enum(VIEWPORT_NAMES): an enum is refused by the SDK
+    // with "viewports.0: Invalid input", which does not say what the valid
+    // ones are. A plain string reaches resolveViewports(), which answers
+    // with the list. The COUNT stays in the schema, where a refusal needs
+    // no context to be useful.
+    .array(z.union([z.string(), z.object({ width: z.number().int(), height: z.number().int() })]))
+    .max(MAX_VIEWPORTS)
+    .optional()
+    .describe(
+      `Up to ${MAX_VIEWPORTS} viewports, by name (${VIEWPORT_NAMES.join(', ')}) or as {width,height}. ` +
+        'Defaults to phone, tablet and desktop. Each one is a real page load. `reflow` is 320px, the width ' +
+        'WCAG 2.2 SC 1.4.10 names — overflow found there names that criterion in `relatedStandard`, but stays a ' +
+        'MEASUREMENT: the criterion exempts content needing a two-dimensional layout, and geometry cannot tell an ' +
+        'exempt data table from a layout that failed to reflow.'
+    ),
+  rules: z
+    .array(z.string())
+    .max(40)
+    .optional()
+    .describe(
+      'Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix. ' +
+        'This scopes the ACCESSIBILITY engine and only that: the geometry probe is not a rule in this list ' +
+        'and always runs. A rule id the engine does not have comes back in `engine.unknownRules` rather ' +
+        'than being accepted in silence. An EMPTY list means no accessibility pass at all — no engine, no ' +
+        'run, `engine.accessibility: null` — which is how you get geometry and a picture without paying ' +
+        'for a full WCAG run.'
+    ),
+  capture: z
+    .boolean()
+    .optional()
+    .describe(
+      'Return a screenshot per viewport, taken in the same state the findings were measured in. Off by ' +
+        'default: findings are the useful part. The picture arrives as an IMAGE BLOCK in the response, not ' +
+        'as base64 in the payload; `captures[]` is metadata, one row per viewport asked about — including ' +
+        'the ones no picture came back for — where `included` says whether an image was actually sent and ' +
+        '`omittedBecause` says why not when it was not. Each picture is the page rendered ' +
+        'OFFSCREEN at the width you asked for, as a visitor sees it — not the Stacki UI and not the ' +
+        'breakpoint the person has open. This, with viewports:[{width,height}] and rules:[], is how to see ' +
+        'a route at a width of your own choosing; the `capture` tool cannot change the person\'s breakpoint ' +
+        'and will not resize their window.'
+    ),
+});
+
 const DESCRIPTION = [
   'Render the real page in a real browser at real viewport widths and MEASURE it. Returns structured findings:',
   'page-level horizontal overflow from geometry, and accessibility violations from axe-core, each with the',
@@ -202,10 +349,16 @@ const DESCRIPTION = [
   'a person has to look at. No violations does NOT mean accessible or WCAG compliant, and nothing here produces',
   'a design or quality score. The audit never writes to the project, never clicks or submits anything, and runs',
   'in a window of its own — it does not touch what the person is looking at, and it starts from a wiped browser',
-  'session so one audit never inherits another\'s cookies or storage. `findingCount` is the TRUE number detected;',
+  'session so one audit never inherits another\'s cookies or storage. It will not NAVIGATE off the project\'s',
+  'origin: an absolute route, a redirect, a frame navigation are refused before the request leaves the process.',
+  'It is not a network fence — the page renders as a visitor renders it, so its own subresources are fetched and',
+  'its scripts run, because a page stripped of its stylesheet is not the page whose layout you asked about.',
+  '`findingCount` is the TRUE number detected;',
   '`returnedFindingCount` is how many came back, and `truncation` says where the rest went — including',
   '`omittedByByteBudget`, findings dropped because the answer would not have fitted through the host. A finding',
-  'whose own fields were shortened to fit names them in `truncatedFields`. Needs `inspect`.',
+  'whose own fields were shortened to fit names them in `truncatedFields`. `truncation.scored` is what the page ' +
+  'handed Stacki after its own caps, and `counts` breaks THAT number down by kind — not `findingCount` and not ' +
+  '`returnedFindingCount`. Needs `inspect`.',
 ].join(' ');
 
 /**
@@ -218,45 +371,13 @@ const DESCRIPTION = [
 function registerAuditTool(server, { audit, api }) {
   if (!audit || !api) return false;
 
-  server.registerTool(
+  publishChecked(
+    server,
     'audit',
     {
       title: 'Measure the running page',
       description: DESCRIPTION,
-      inputSchema: z.object({
-        route: z
-          .string()
-          .optional()
-          .describe(
-            'Route to audit, e.g. "/" or "/about". Defaults to the site root — NOT to the page Stacki has open; ' +
-              'call get_context first if you mean the page the person is looking at. Must resolve inside this project.'
-          ),
-        viewports: z
-          // z.string(), not z.enum(VIEWPORT_NAMES): an enum is refused by the SDK
-          // with "viewports.0: Invalid input", which does not say what the valid
-          // ones are. A plain string reaches resolveViewports(), which answers
-          // with the list. The COUNT stays in the schema, where a refusal needs
-          // no context to be useful.
-          .array(z.union([z.string(), z.object({ width: z.number().int(), height: z.number().int() })]))
-          .max(MAX_VIEWPORTS)
-          .optional()
-          .describe(
-            `Up to ${MAX_VIEWPORTS} viewports, by name (${VIEWPORT_NAMES.join(', ')}) or as {width,height}. ` +
-              'Defaults to phone, tablet and desktop. Each one is a real page load. `reflow` is 320px, the width ' +
-              'WCAG 2.2 SC 1.4.10 names — overflow found there names that criterion in `relatedStandard`, but stays a ' +
-              'MEASUREMENT: the criterion exempts content needing a two-dimensional layout, and geometry cannot tell an ' +
-              'exempt data table from a layout that failed to reflow.'
-          ),
-        rules: z
-          .array(z.string())
-          .max(40)
-          .optional()
-          .describe('Specific accessibility rule ids to run instead of the WCAG A/AA set. Use when re-checking one fix.'),
-        capture: z
-          .boolean()
-          .optional()
-          .describe('Return a screenshot per viewport, taken in the same state the findings were measured in. Off by default: findings are the useful part and images are large.'),
-      }),
+      inputSchema: AuditInput,
       outputSchema: AuditOutput,
       // ANNOTATIONS, MEASURED AGAINST WHAT THE SPEC ACTUALLY SAYS.
       //
@@ -296,16 +417,29 @@ function registerAuditTool(server, { audit, api }) {
         openWorldHint: true,
       },
     },
+    // `args` is `AuditInput`'s own parse RESULT, not what arrived: the check
+    // that used to be the host's is made by `publishChecked` a moment earlier,
+    // with this same schema, so a mistyped argument is refused as
+    // `bad_arguments` before the gate is asked and the engine never sees a
+    // shape it did not declare.
     async (args = {}) => {
       // THE SAME DOOR. See the note at the top of this file.
       const denied = api.checkAccess(AUDIT_OPERATION, AUDIT_RISK);
       // Compact, exactly as this tool has always answered: the text block is a
       // second copy of the findings and indenting it is bytes for nothing.
       if (denied) return answer(denied, { spaces: 0 });
-      return answer(await audit(args), { spaces: 0 });
+      // THE PICTURES RIDE BESIDE THE PAYLOAD, NOT INSIDE IT.
+      //
+      // `images` is the engine's second channel and is destructured off here so
+      // it cannot reach `structuredContent`: base64 in the JSON is what made a
+      // captured audit undeliverable. `answer` puts the blocks first, exactly as
+      // electron/mcp/tools.js orders the capture tool's, so a host that shows
+      // only the first block shows the picture.
+      const { images = [], ...body } = await audit(args);
+      return answer(body, { spaces: 0, images });
     }
   );
   return true;
 }
 
-module.exports = { registerAuditTool, AUDIT_OPERATION, AUDIT_RISK, AuditOutput, DESCRIPTION };
+module.exports = { registerAuditTool, AUDIT_OPERATION, AUDIT_RISK, AuditInput, AuditOutput, DESCRIPTION };

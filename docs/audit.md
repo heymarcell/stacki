@@ -79,6 +79,11 @@ finds; the rest need a person. Deque, who publish the engine, say so themselves.
 Nothing here produces a design score, a quality percentage, a professionalism
 rating or a compliance badge, because no honest measurement supports one.
 
+**It does not report content a page clips.** The overflow check measures whether
+the *document* scrolls sideways, so a page that clips its own overflow is
+correctly silent. That blind spot is real, it is not fixable by a heuristic, and
+the measurement is under Coverage below.
+
 ## Coverage
 
 **Responsive / geometry.** Page-level horizontal overflow, written here rather
@@ -102,10 +107,44 @@ page's accessibility features at the top of its own audit. The honest limit is
 that a right-to-left document scrolls the other way and this looks in the wrong
 direction; RTL overflow is not detected.
 
+**And it measures whether the document scrolls, not whether a page clips.** When
+the root *and* the body both clip horizontally, or the wide content sits inside a
+clipping wrapper, the document does not scroll and `overflows` is `false` —
+correctly, because it is not true. That is a real blind spot, and it is not
+fixable by a heuristic. Measured: a "this box clips its own content" rule
+(computed `overflow-x` in `hidden|clip` and `scrollWidth - clientWidth >= 2`) run
+over a page built from ordinary idioms — a rounded card, a
+`text-overflow: ellipsis` heading, an `overflow-x: auto` carousel, a decorative
+panel and a marquee — fired **three times on a page with no defect at all**, and
+on the same page *with* a real 2000px defect it fired four times and did not rank
+the real one first: a deliberate marquee clipping 2246px outranked the actual
+1625px overflow. Three false positives, zero true positives, and no separation by
+magnitude. So it is not shipped, and this paragraph is here so that measurement
+does not have to be repeated to reach the same answer.
+
+Note also that `overflow: hidden` **is a scroll container**. Setting `scrollLeft`
+on such an element in a real browser moves it; clipped content is still reachable
+by keyboard focus and by programmatic scroll, and is in the accessibility tree. So
+"clipped" and "unreachable" are different claims, and only `overflow-x: clip`
+supports the second. If you suspect a page is hiding a reflow bug behind
+`html, body { overflow-x: hidden }`, remove that rule and audit again — that is
+the measurement, and it is one line.
+
 **Accessibility.** axe-core 4.13.0, run in the real page against the
 WCAG 2 A/AA, 2.1 A/AA and 2.2 A/AA rule sets. Contrast in particular has to come
 from a real browser: it is computed from composited colours, and no DOM
 simulation can produce it.
+
+`rules` scopes **this engine and only this engine**. The geometry probe is not a
+rule in any list and always runs, so `rules: ['color-contrast']` still measures
+overflow. A rule id the engine does not have is named back in
+`engine.unknownRules` rather than accepted in silence — silence is
+indistinguishable from "that rule found nothing", which is the answer a typo
+produces and the answer a caller will believe. And `rules: []` means **no
+accessibility pass at all**: no 580 KB engine injection, no run, no scoring, with
+`engine.accessibility: null` and `engine.error: null` saying so. It used to be
+indistinguishable from omitting the field, which made "geometry and a picture at
+a width" cost a full WCAG pass.
 
 **Source correlation.** When the audited element carried a Stacki marker, the
 finding carries the real model path. When the nearest marker was on an *ancestor*,
@@ -126,7 +165,15 @@ in it.
   inspected by activating it.
 - It does not touch the person's editor: not the viewport, not the scroll
   position, not the selection, not the open route.
-- It requires no network access and sends nothing anywhere.
+- **The fence is on NAVIGATION, not on the network.** The audit will not follow a
+  document off the project's origin — an absolute route, a redirect, a frame
+  navigation are all refused before the request leaves the process. But a project
+  page renders as a visitor's browser renders it, which means its own subresources
+  are fetched, including any it points at off-origin, and its JavaScript runs. That
+  is deliberate: blocking a page's stylesheet or webfont would corrupt the layout
+  and contrast the audit exists to measure, so the audit would be reporting on a
+  page nobody has. Stacki adds no requests of its own and needs no network access
+  to run an audit; what leaves the machine is what the page under test asked for.
 - **It does not inherit web state from a previous audit.** The audit session is
   wiped — cookies, DOM storage, cache, auth cache — at every run boundary,
   including the paths that threw. A partition that is merely not `persist:` is
@@ -175,9 +222,19 @@ characters, in the default configuration, on the plainest possible call — whil
 So the result is bounded in **bytes**, measured on the serialized payload rather
 than estimated from the list. Bytes and not tokens on purpose: Stacki does not
 know the host's tokenizer, its version or its limit, and a budget tuned to one
-client breaks on the next. The envelope also sends the payload twice — once as
-`structuredContent` and once as a JSON string in a text block — so the wire cost
-is about twice the number below.
+client breaks on the next.
+
+What the host counts, read out of the shipped binary rather than assumed: Claude
+Code 2.1.251 **discards the text blocks when `structuredContent` is present** and
+counts `JSON.stringify(structuredContent)` alone. (This page used to say the
+opposite — that the host counts the text block — which arrives at the same number
+by the wrong mechanism.) The limit it enforces is 25,000 **tokens**, overridable
+by `MAX_MCP_OUTPUT_TOKENS`, with a cheap pre-gate that accepts anything
+estimating at 12,500 or under without ever running the tokenizer. That is why the
+budget below keeps a wide margin rather than sitting just under a measured
+refusal: JSON tokenizes at roughly two characters per token, and Stacki does not
+ship the tokenizer. The envelope still sends the payload twice, so the wire cost
+is about twice the number below even though only one copy is counted.
 
 Individual fields are capped too, because the count cap is not a bound while one
 field is unbounded: three findings carrying a 20 KB selector serialize to half a
@@ -192,11 +249,27 @@ will not match.
 | `returnedFindingCount` | how many are in `findings` |
 | `omittedFindingCount` | the difference |
 | `truncated` | true if anything was dropped at **any** layer |
+| `truncation.scored` | what reached Stacki after the two in-page caps: the denominator `counts` breaks down |
 | `truncation.omittedBeforeScoring` | dropped inside the page, before Stacki saw them |
 | `truncation.omittedByResponseBudget` | dropped by the finding-**count** cap, and only that layer |
 | `truncation.omittedByByteBudget` | dropped because the answer would not have fitted through the host |
-| `truncation.responseCap` · `responseByteCap` | the two budgets, named |
+| `truncation.omittedCaptureCount` | pictures the answer could not carry; the rows for them say `included: false` |
+| `truncation.responseCap` · `responseByteCap` | the two budgets, named. `responseByteCap` is the budget **in force**, which is lower when pictures are riding along |
+| `truncation.totalByteCap` | the whole envelope's budget, findings and images together |
+| `counts` | the scored findings by kind. Sums to `truncation.scored` — never to `findingCount`, never to `returnedFindingCount` |
 | `findings[].truncatedFields` | fields on this finding that were shortened; absent when none were |
+
+Two identities hold in every answer, and the audit's own suites assert them:
+
+```
+detected − omittedBeforeScoring                        = scored
+scored   − omittedByResponseBudget − omittedByByteBudget = returned
+```
+
+`counts` is scoped to the middle one. It was the only number in the payload with
+no name for its denominator: a dogfood read `counts: {standard: 24, incomplete:
+12}` beside `findingCount: 96` and `returnedFindingCount: 29`, and 36 equalled
+neither.
 
 A caller reading 12 no longer has to wonder whether that means "there were 12" or
 "there may have been 500". A quarter of each budget is reserved for `incomplete`,
@@ -210,8 +283,58 @@ it would be the silent discard this whole section exists to prevent. A caller
 seeing `omittedByByteBudget` knows to narrow the route or the viewports rather
 than to conclude the page has sixty problems.
 
-Captures are off by default, capped in number, and encoded through the same
-bounded encoder `capture` uses.
+### Pictures
+
+Captures are off by default, and when they are asked for **the image is an image,
+not a string in the payload**. `audit(capture: true)` used to base64 the frame
+straight into `structuredContent`: one viewport, one rule, zero findings came to
+127,029 characters of which 125,540 — 98.8% — was the image, and the host
+replaced the whole result with a file pointer. Shrinking it does not rescue it; a
+231×500 thumbnail at quality 60 is still 18,804 characters at best and 46,292 at
+worst, for a picture too small to verify a layout.
+
+So the bytes ride as MCP `image` content blocks — which is where the protocol
+puts images and where Stacki's own `capture` tool has always put them — in the
+order the `captures[]` rows with `included: true` appear. Measured end to end:
+
+| call | before | after |
+| --- | --- | --- |
+| `capture:false`, 3 viewports | 1,954 chars · ~489 tokens | unchanged |
+| `capture:true`, 1 viewport | 153,758 chars · ~38,440 tokens | 1,832 chars · ~2,058 tokens |
+| `capture:true`, 3 viewports | 458,920 chars · ~114,730 tokens | 3,142 chars · ~5,586 tokens |
+
+(The host charges an image block a flat 1,600 tokens whatever it weighs, which is
+what the "after" figures include and what one picture costs against the budget.)
+
+`captures[]` is therefore **metadata**, one row per viewport a picture was asked
+for, and every row says `included: true` or `included: false`. A row never
+implies an image that was not sent: there is no `data` field to be half-present,
+and a dropped row carries `bytes: null`, `mimeType: null` and `sha256: null` with
+a note saying so. `sha256` is how a before and an after are told apart without
+either being sent twice. When pictures are dropped, `truncation.omittedCaptureCount`
+counts them and `next` gives the narrower call to make.
+
+Every row also carries `renderedOffscreen: true` and a note naming the width,
+because that is the thing about an audit capture somebody will misread: it is the
+project's page loaded again in the audit's own window at the width the caller
+asked for, without the editor's markers. It is **not** the Stacki UI, and **not**
+the person's current breakpoint — `get_context` reports that.
+
+### Seeing a route at a width you choose
+
+There is no operation that sets the person's breakpoint, and there should not be:
+resizing somebody's editor to take a screenshot is not something this server
+does. The `capture` tool photographs the person's window at the breakpoint they
+have chosen, and has no viewport argument.
+
+The audit is the way. `audit({route: '/pricing', viewports: [{width: 900,
+height: 700}], rules: [], capture: true})` renders that route offscreen at exactly
+900px in a window of its own, photographs it, and touches nothing the person is
+looking at. Any width from 240 to 3840 and any height from 320 to 4320 is
+accepted, and a custom size is reported under its own key (`custom-900x700`).
+`rules: []` keeps it cheap — geometry and a picture, with no accessibility pass
+paid for. It needs `inspect`, because an audit does: seeing a route at a width you
+chose is an audit.
 
 ## The fix loop
 
@@ -223,9 +346,19 @@ bounded encoder `capture` uses.
    `target.set_classes`. There is no special audit-fix operation, and there
    should not be.
 5. Re-audit the same route. Finding ids are stable across runs — a hash of the
-   rule, the viewport and where the problem is, not of its current measurement —
-   so a fix can be *proven* by an id disappearing rather than inferred from a
-   shorter array.
+   rule, the viewport and *which rendered node* the problem is on: the model path
+   when the page carried a marker, the selector otherwise, plus which of that
+   selector's matches this is when it matches more than one. So a fix can be
+   *proven* by an id disappearing rather than inferred from a shorter array.
+
+   The occurrence is part of the identity because a model path is a **source**
+   position: a `.map()` has exactly one however many rows it draws, so five
+   renders of one component used to hash to one id, and fixing one of the five
+   was indistinguishable from fixing none. The cost of the fix, said plainly: an
+   id moves when an element's ordinal among its selector's matches changes —
+   deleting the second of five rows renumbers the three below it. When an
+   occurrence is part of an id, `target.selectorMatch` says so in the payload;
+   when it is not, that field is absent, and the two always agree.
 6. Report what is fixed, what remains, and what is `incomplete` and needs a
    person.
 

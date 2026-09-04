@@ -104,6 +104,43 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
   check('reopening a project invalidates every ref about the last one', afterReopen.code === 'stale_ref', afterReopen.code);
   check('and a ref minted after it works again', refs.parse(refs.mint('node', anchor, { projectRoot: ROOT }), { projectRoot: ROOT }).ok);
 
+  // NOTHING ABSOLUTE, enforced rather than asserted in a comment. One minter
+  // read the payload's page path raw, so a ref clients are told to log opaquely
+  // carried somebody's home directory base64'd inside it while the observation
+  // beside it stayed relative. The choke point is what stops the next one.
+  const decode = (r) => {
+    const rest = String(r).slice('stacki:'.length);
+    return JSON.parse(Buffer.from(rest.slice(0, rest.lastIndexOf('.')), 'base64url').toString('utf8'));
+  };
+  const leaky = decode(
+    refs.mint(
+      'node',
+      { keys: ['src/pages/index.astro#0'], page: { file: path.join(ROOT, 'src/pages/index.astro'), route: '/' } },
+      { projectRoot: ROOT }
+    )
+  );
+  check('a path under the project goes into a ref project-relative', leaky.d.page.file === 'src/pages/index.astro', short(leaky.d.page));
+  check('and the route, which is not a path, is left alone', leaky.d.page.route === '/', short(leaky.d.page));
+  const foreign = decode(refs.mint('node', { page: { file: '/etc/passwd' } }, { projectRoot: ROOT }));
+  check('a path outside the project does not go in at all', foreign.d.page.file === null, short(foreign.d.page));
+
+  // A WRITE HANDLE CARRIES WHAT IT SAW. The guard that refuses a stale write
+  // compares against the ref's observation, so a writable ref without one is
+  // not a weaker guard — it is none, and it read as ok:true through every write
+  // in the API. Minting degrades rather than throwing: read-only is a
+  // first-class state and a caller that forgets gets one.
+  {
+    const seen = { file: 'src/pages/index.astro', revision: 3, digest: 'abc-1' };
+    const nodeApi = createAgentApi({ getProjectRoot: () => ROOT, getAgentMode: () => 'full' });
+    const bare = refs.parse(nodeApi.nodeRef(anchor, { writable: true }), { projectRoot: ROOT });
+    check('a node ref asked for writable with nothing observed is issued read-only', bare.ok && bare.writable === false, short(bare));
+    const observed = refs.parse(nodeApi.nodeRef(anchor, { writable: true, observed: seen }), { projectRoot: ROOT });
+    check('and one that names what it saw is writable', observed.ok && observed.writable === true, short(observed));
+    check('and carries the revision it saw', observed.observed?.revision === 3, short(observed.observed));
+    const withheld = refs.parse(nodeApi.nodeRef(anchor, { writable: false, observed: seen }), { projectRoot: ROOT });
+    check('and an observation does not make a withheld ref writable', withheld.ok && withheld.writable === false, short(withheld));
+  }
+
   check('every kind a ref can name is declared', refs.KINDS.includes('node') && refs.KINDS.includes('source'));
   let threw = false;
   try {
@@ -704,7 +741,9 @@ const PINNED_RISK = {
     check('a range replace replaces the range', range.ok && fs.readFileSync(path.join(ROOT, file), 'utf8') === 'a\nB\nd\n', range.message);
     const badRange = await runMain('source', 'replace_range', { path: file, startLine: 99, text: 'x', expectedDigest: digestOf('a\nB\nd\n') }, ctx);
     check('a range that is not in the file is a bad request', badRange.code === 'bad_request', badRange.code);
-    check('and says how long the file actually is', /\b4 lines\b/.test(badRange.message), badRange.message);
+    // 'a\nB\nd\n' is THREE lines. It used to be reported as four, because the
+    // empty string after the final newline was counted as one.
+    check('and says how long the file actually is', /\b3 lines\b/.test(badRange.message), badRange.message);
 
     for (const bad of ['/etc/passwd', '../../../etc/passwd', 'src/../../escape.txt']) {
       const answer = await runMain('source', 'read', { path: bad }, ctx);
@@ -777,6 +816,50 @@ const PINNED_RISK = {
       check(`${name} has an input schema`, !!tool.inputSchema && tool.inputSchema.type === 'object');
       check(`${name} declares its output`, !!tool.outputSchema);
       check(`${name} has annotations`, !!tool.annotations);
+    }
+
+    // EVERY ARGUMENT POSITION THAT TAKES A REF, and not merely every argument
+    // spelled `ref`.
+    //
+    // A move's destination is a ref called `parentRef`, nested two levels down
+    // inside an operations array, and it stayed unguarded for as long as it did
+    // because the guard was written for "the ref argument" — meaning the one at
+    // the top of the object. So the positions are enumerated off the wire
+    // instead of being remembered, by the shape `Ref`/`FileRef` emit (a string
+    // bounded 8..4000, which git's revision argument — a plain string capped at
+    // 200 — is not), and the answer is written down here.
+    //
+    // A new ref argument anywhere in any schema makes this fail, which is the
+    // point: the list is a decision that somebody has covered it in
+    // test/ref-concurrency.js, not a description of what happens to exist.
+    {
+      const positions = [];
+      const walk = (schema, at, tool) => {
+        if (!schema || typeof schema !== 'object') return;
+        if (schema.type === 'string' && schema.minLength === 8 && schema.maxLength === 4000) positions.push(`${tool}:${at}`);
+        if (schema.properties) for (const [key, value] of Object.entries(schema.properties)) walk(value, at ? `${at}.${key}` : key, tool);
+        if (schema.items) walk(schema.items, `${at}[]`, tool);
+        for (const branch of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(schema[branch])) schema[branch].forEach((one) => walk(one, at, tool));
+      };
+      for (const name of expected) walk(byName[name].inputSchema, '', name);
+      const found = [...new Set(positions)].sort();
+      const covered = [
+        'asset:ref',
+        'content:ref',
+        'page:ref',
+        'source:ref',
+        'style:ref',
+        'target:operations[].to.parentRef',
+        'target:ref',
+        'target:to.parentRef',
+      ];
+      check(
+        'every ref-typed argument position on the surface is one somebody has covered',
+        JSON.stringify(found) === JSON.stringify(covered),
+        `found ${JSON.stringify(found)}\n    covered ${JSON.stringify(covered)}`
+      );
+      check('and the destination of a move is one of them', found.includes('target:to.parentRef'), found.join(', '));
+      check('including the one inside an edit batch', found.includes('target:operations[].to.parentRef'), found.join(', '));
     }
 
     // The descriptions are paid for in every client's context, every call.

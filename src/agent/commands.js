@@ -62,8 +62,13 @@ async function locate(app, anchor, { navigate = true } = {}) {
 
   const moved = await app.focusAnchor(anchor);
   if (!moved || moved.anchorState !== 'attached') {
+    // The note is the focus walk's own sentence, written for whichever caller
+    // this is — a ref, not a review, so it does not talk about a review's
+    // creationContext. The reason is the machine-readable half of the same
+    // fact, and the sibling exit above has always carried one.
     return fail(moved?.transient ? 'not_ready' : 'no_node', moved?.note || 'Stacki could not get to that element.', {
       restored: moved?.restored || null,
+      reason: moved?.reason ?? null,
     });
   }
   const found = resolveNode(app.model()?.nodes || [], leafOf({ ...anchor, keys: moved.keys })?.indexPath, anchor?.fingerprint, {
@@ -95,6 +100,9 @@ function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
       crumbLabel: a.crumbLabel,
       keysFor: a.keysFor,
       crumbsFor: a.crumbsFor,
+      // For any node, not just the selection: a child's ref carries its sibling
+      // run for the same reason the target's own ref does.
+      peersFor: a.peersFor,
       canvas: id === a.selectedId() ? a.canvas() : null,
       renderedClasses: id === a.selectedId() ? a.renderedClasses() : null,
       componentChain: a.componentChain(),
@@ -108,9 +116,28 @@ function readAt(a, node, { confidence = 'exact', writable = true } = {}) {
   };
 }
 
-/** The document's identity right now — what a write names to prove it is current. */
+/**
+ * The document's identity right now — what a write names to prove it is current.
+ *
+ * TWO THINGS ARE CALLED `digest` IN THIS API AND THEY ARE NOT THE SAME KIND.
+ *
+ *   modelDigest   this one. An identity for the PARSE the editor is holding,
+ *                 node ids and all (src/agent/digest.js says why they are left
+ *                 in). It is not a hash of the file: re-reading a byte-identical
+ *                 file produces a different one, and that is the point — a ref
+ *                 minted against the old parse should stop being trusted.
+ *
+ *   contentDigest sha256 of a file's bytes, on `changedFiles` and on what an
+ *                 undo says it restored. Content-stable: identical bytes always
+ *                 give the identical digest.
+ *
+ * `digest` stays as the name the wire has always used — it is what
+ * `expectedDigest` is compared against and what a ref bakes in — and
+ * `modelDigest` is the same value under a name that says which kind it is.
+ */
 function documentOf(app) {
-  return { file: app.openFile(), revision: app.revision(), digest: app.digest() };
+  const parse = app.digest();
+  return { file: app.openFile(), revision: app.revision(), digest: parse, modelDigest: parse };
 }
 
 /**
@@ -164,7 +191,12 @@ export function createAgentCommands(getApp) {
 
     if (action === 'select') {
       a.select(id, args.occurrence);
-      return { ok: true, selected: true, navigated, note, document: documentOf(a), keys: a.keysFor(id) };
+      // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process
+      // mints the ref for what is now selected, and without this it had nothing
+      // but the caller's word: a node recovered on position alone across a
+      // branch came back as a write handle, which is the one thing the evidence
+      // rules exist to withhold.
+      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys: a.keysFor(id) };
     }
 
     // Going inside a component instance, and coming back out — the two
@@ -182,7 +214,21 @@ export function createAgentCommands(getApp) {
       if (!entered.ok) return entered;
       const inside = findNodeById(a.model()?.nodes || [], entered.id);
       if (!inside) return fail('not_ready', `Stacki opened <${node.name}> but its tree is not loaded yet. Try again.`);
-      return { ok: true, entered: node.name, ...readAt(a, inside), document: documentOf(a), keys: a.keysFor(entered.id) };
+      // CARRYING THE CAUTION IN, not resetting it at the door. `readAt` defaults
+      // to writable, and taking that default here meant an instance found by
+      // position alone — a ref target.edit refuses with not_editable — became a
+      // write handle for the component's root as soon as anybody entered it.
+      // The component this walked into is whichever one now occupies that slot,
+      // which is precisely what the ref could not vouch for.
+      return {
+        ok: true,
+        entered: node.name,
+        confidence,
+        writable,
+        ...readAt(a, inside, { confidence, writable }),
+        document: documentOf(a),
+        keys: a.keysFor(entered.id),
+      };
     }
     if (action === 'exit') {
       const left = await a.exit();
@@ -191,7 +237,9 @@ export function createAgentCommands(getApp) {
       return {
         ok: true,
         exited: true,
-        ...(inside ? readAt(a, inside) : {}),
+        confidence,
+        writable,
+        ...(inside ? readAt(a, inside, { confidence, writable }) : {}),
         document: documentOf(a),
         keys: a.keysFor(a.selectedId()),
       };
@@ -245,15 +293,28 @@ export function createAgentCommands(getApp) {
       const operations = [];
       for (const op of args.operations || []) {
         if (op?.type === 'move') {
-          const keys = op.to?.parentKeys || null;
+          // The whole destination anchor, not just its slot. Resolving on the
+          // index path alone is how a move landed in whatever had taken over
+          // that position; the fingerprint is the same evidence the node being
+          // moved is re-found by, and the rule below is the same rule.
+          const dest = op.to?.parent || null;
+          const keys = dest?.keys || op.to?.parentKeys || null;
           let parentId = null;
           if (keys && keys.length) {
             const leaf = leafOf({ keys });
             if (!leaf || leaf.file !== a.openFile()) {
               return fail('bad_request', 'A node can only be moved somewhere in the file it already lives in.');
             }
-            const found = resolveNode(model?.nodes || [], leaf.indexPath, null, { labelOf: a.crumbLabel });
+            const found = resolveNode(model?.nodes || [], leaf.indexPath, dest?.fingerprint || null, { labelOf: a.crumbLabel });
             if (!found.id) return fail('no_node', 'That move destination is not in the open file any more.');
+            if (dest && !a.writableFor(dest, found.confidence)) {
+              return fail(
+                'not_editable',
+                'Stacki found the move destination by position alone, on a tree that is not the one its ref was ' +
+                  'made for. That is good enough to look at and not good enough to move markup into. Read the ' +
+                  'destination again on this checkout, or select it in Stacki.'
+              );
+            }
             parentId = found.id;
           }
           operations.push({ nodeId: id, type: 'move', target: { parentId, index: op.to?.index ?? 0 } });
@@ -324,7 +385,20 @@ export function createAgentCommands(getApp) {
 
     try {
       if (action === 'read') {
-        const styles = await styleAgent.readStyles(node, { pathOf: a.pathFor, properties: args.properties || null });
+        // THE VIEWPORT THE ANSWER IS ABOUT, which the app has been measuring
+        // all along and nothing was handing over. PreviewPane reports the
+        // iframe's own client box, App keeps it as `canvasReport`, and it
+        // already travels in the MCP payload as `page.viewportWidth` — but
+        // style.read was reaching the cascade without it, so a live read of an
+        // element inside `@media (min-width: 50em)` came back `viewport: null`
+        // and hedged `winning: null` about a query the app could see holds.
+        // Null when nothing has measured one, which readStyles answers as null
+        // rather than as a guessed width.
+        const styles = await styleAgent.readStyles(node, {
+          pathOf: a.pathFor,
+          properties: args.properties || null,
+          viewport: a.canvas?.() || null,
+        });
         return { ok: true, ...styles, document: documentOf(a) };
       }
       if (action === 'set_property') {
@@ -347,15 +421,35 @@ export function createAgentCommands(getApp) {
 
   async function project(action, args = {}) {
     const a = app();
+    // WHAT CAME OFF THE STACK, not what the editor has open.
+    //
+    // This answered with `document: documentOf(a)` alone, which is the document
+    // on the canvas and has nothing to do with which entry was undone: undoing
+    // a change to src/styles/site.css reported src/pages/index.astro, three
+    // times in a row, with the stylesheet named nowhere in the envelope. The
+    // open document is still worth reporting — a model undo IS about it — so it
+    // stays, beside a `restored` that says what was actually put back.
     if (action === 'undo') {
       const before = a.historyDepth();
-      await a.undo();
-      return { ok: true, undone: a.historyDepth().past < before.past, history: a.historyDepth(), document: documentOf(a) };
+      const restored = await a.undo();
+      return {
+        ok: true,
+        undone: a.historyDepth().past < before.past,
+        restored: restored || null,
+        history: a.historyDepth(),
+        document: documentOf(a),
+      };
     }
     if (action === 'redo') {
       const before = a.historyDepth();
-      await a.redo();
-      return { ok: true, redone: a.historyDepth().future < before.future, history: a.historyDepth(), document: documentOf(a) };
+      const restored = await a.redo();
+      return {
+        ok: true,
+        redone: a.historyDepth().future < before.future,
+        restored: restored || null,
+        history: a.historyDepth(),
+        document: documentOf(a),
+      };
     }
     if (action === 'dev_status') {
       return { ok: true, ...a.preview() };
@@ -483,6 +577,23 @@ export function createAgentCommands(getApp) {
       return fail('bad_domain', `Stacki's window answers for target, style, project and page — not \"${domain}\".`);
     } catch (err) {
       // A command that throws must not look like a command that timed out.
+      //
+      // AND `command_failed` IS THE HONEST CODE HERE, not a gap where a named
+      // one should be. This used to read `err.refusalCode` — the field
+      // electron/main.js's `refuse()` puts on an Error so `runMain` can lift a
+      // known cause into the envelope — on the theory that the renderer's
+      // throws should be named the same way. Nothing under src/ sets it, and
+      // nothing can usefully: every cause this file knows the name of is
+      // already RETURNED as `fail(code, …)` a few lines up rather than thrown,
+      // so what reaches this catch is an exception nobody planned. And a named
+      // cause could not arrive from the other side either — main.js says it at
+      // `refuse()`: "Electron's IPC serializer carries only the message across
+      // a channel", which is why the Agent API reads `refusalCode` in the main
+      // process, off the direct call, and not out here.
+      //
+      // A read with no writer is worse than no read: it reports a mechanism
+      // that is not running, and in the jsdom harness — one process, no
+      // serializer — a test written for it would go green on the harness.
       return fail('command_failed', String(err?.message || err));
     }
   };

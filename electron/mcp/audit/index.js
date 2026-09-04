@@ -31,6 +31,7 @@
 // assert none survived. A hidden window that leaks is invisible by construction,
 // which is exactly why it has to be counted rather than trusted.
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -66,20 +67,43 @@ const MAX_FINDINGS = 60;
 // finding list. The number is chosen well under the smallest result this host
 // was measured to refuse, so the margin absorbs whatever the tokenizer does.
 //
-// The envelope sends this payload TWICE -- `structuredContent` and a JSON copy
-// in a text block (agentTools.js `answer`) -- so the wire cost is about twice
-// this. The host counts the text block, which is what this bounds.
-//
-// WHAT IT BOUNDS IS THE FINDINGS PAYLOAD. `captures` is deliberately outside
-// it, and is not counted in the overhead either, so asking for a picture does
-// not quietly cost findings. That is not the same as saying a capture is small:
-// one is up to MAX_BYTES from capture.js before base64, and three of them would
-// exceed any host's limit on their own. Captures are off by default, they were
-// off for every oversize result the dogfood measured, and bounding them here
-// would mean returning none at all -- which is a decision about whether an
-// image belongs in an MCP response, not about audit budgeting. Recorded as a
-// separate question rather than answered by the side effect of this one.
+// The envelope sends this payload twice -- `structuredContent` and a JSON copy
+// in a text block (agentTools.js `answer`). WHAT THE HOST COUNTS, read out of
+// the shipped binary rather than inferred: Claude Code 2.1.251 DISCARDS the text
+// blocks when `structuredContent` is present and counts
+// `JSON.stringify(structuredContent)` alone -- so this bounds the number the
+// host actually reads, and the second copy is wire cost rather than budget. The
+// limit it enforces is 25,000 TOKENS (env MAX_MCP_OUTPUT_TOKENS overrides), with
+// a cheap pre-gate that accepts anything estimating at 12,500 or under without
+// ever calling the tokenizer. Which is why this is a wide margin and not a
+// number tuned to sit just under a measured refusal: JSON tokenizes at about two
+// characters per token, and Stacki does not ship the tokenizer.
 const MAX_RESPONSE_BYTES = 30000;
+// AND THE PICTURES, WHICH USED TO BE GOVERNED BY NOTHING AT ALL.
+//
+// `captures` was deliberately outside the findings budget, with the open
+// question recorded here rather than answered: whether an image belongs in an
+// MCP response. Measured, it does not belong in the JSON. One capture of one
+// route at one viewport is 80-234 KB of jpeg and 107,000-312,000 characters of
+// base64; the dogfood's `audit(capture:true)` at ONE viewport with ONE rule and
+// ZERO findings was 127,029 characters of which 125,540 were the image, and the
+// host replaced the whole result with a file pointer. Shrinking the picture does
+// not rescue it -- a 231x500 thumbnail at quality 60 is still 18,804 characters
+// at best and 46,292 at worst, for a picture too small to verify a layout.
+//
+// So the image leaves the payload and rides as an MCP `image` content block,
+// which is what electron/mcp/tools.js has always done for the `capture` tool.
+// The host charges an image block a FLAT 1,600 tokens however many bytes it
+// carries, so that is what one costs against this budget, in the same currency
+// as everything else: 1,600 tokens x the host's own 4 characters per token.
+// Measured end to end: structuredContent 153,406 characters -> 1,496, and the
+// host's own estimate 38,352 tokens -> 1,974.
+const MAX_TOTAL_RESPONSE_BYTES = 40000;
+const IMAGE_BLOCK_BUDGET_BYTES = 6400;
+// What a captured audit must still be able to say. An audit that returns three
+// pictures and no findings is not an audit, so the pictures are what gets
+// dropped when the two cannot both fit -- and the drop is counted and named.
+const CAPTURED_FINDINGS_FLOOR = 20000;
 // A quarter of the byte budget is held for `incomplete`, for exactly the reason
 // a quarter of the count budget is: they sort last, so a straight walk down the
 // list spends the whole budget on violations and empties the one bucket whose
@@ -118,7 +142,12 @@ const FIELD_CAPS = {
   // should depend on remembering to clip the next field somebody adds.
   evidence: 300,
 };
-const MAX_CAPTURES = 3;
+// DERIVED, NOT DECLARED. Three used to be a number somebody chose, described in
+// docs/audit.md as "capped in number" -- which reads as bounded and was three
+// times up to 234 KB. It is now whatever the total budget can afford beside a
+// findings answer worth having, so raising the cap without paying for it is not
+// a thing that can be done by editing one constant.
+const MAX_CAPTURES = Math.floor((MAX_TOTAL_RESPONSE_BYTES - CAPTURED_FINDINGS_FLOOR) / IMAGE_BLOCK_BUDGET_BYTES);
 // axe can return hundreds of nodes for one rule on a big page. Twelve is enough
 // to act on and the number is reported rather than assumed.
 const AXE_NODES_PER_RULE = 12;
@@ -211,6 +240,41 @@ const LIMITS_SENTENCE =
 
 /** The serialized size of a value, in the bytes a host counts. */
 const jsonBytes = (v) => Buffer.byteLength(JSON.stringify(v ?? null), 'utf8');
+
+/**
+ * What the picture is a picture OF, on the row that describes it.
+ *
+ * An audit capture is not a screenshot of Stacki and not a screenshot of the
+ * person's screen: it is the project's own page, loaded again in a window of the
+ * audit's own at a width the CALLER chose, without the editor's markers. That is
+ * the useful thing about it and it is also the thing somebody will misread, so
+ * it is said on every row rather than in documentation nobody has open.
+ */
+const captureNote = (viewport) =>
+  `Rendered offscreen at ${viewport.width}x${viewport.height} in the audit's own window: the page as a visitor ` +
+  'sees it at that width, not the Stacki UI and not the breakpoint the person has open (get_context reports that).';
+
+// ONE ROW PER VIEWPORT A PICTURE WAS ASKED FOR, whether or not one arrived. The
+// tool description promises exactly that, and `included` is what carries the
+// difference -- so every branch that ends without an image ends here, with the
+// reason in its own note, rather than by pushing nothing and leaving a counter
+// in `dropped` as the only evidence.
+// `omittedBecause` is the machine-readable half of the note, and it exists
+// because the retry hint below is only true for one of these reasons: asking
+// again for one viewport at a time gets a picture past a byte budget, and does
+// nothing whatever about a window that painted an empty frame.
+const noPictureRow = (viewport, because, why) => ({
+  viewport: { key: viewport.key, width: viewport.width, height: viewport.height },
+  mimeType: null,
+  bytes: null,
+  width: null,
+  height: null,
+  sha256: null,
+  included: false,
+  omittedBecause: because,
+  renderedOffscreen: true,
+  note: why,
+});
 
 /**
  * A finding with its unbounded fields brought inside a cap, saying which.
@@ -424,7 +488,8 @@ function makeAuditWindow(BrowserWindow, { width, height, partition, isProjectOri
  * truthful Stacki path, or honestly acquires none.
  */
 function axeScript({ rules }) {
-  const runOnly = rules && rules.length
+  const named = Array.isArray(rules) && rules.length > 0;
+  const runOnly = named
     ? `{ type: 'rule', values: ${JSON.stringify(rules)} }`
     : `{ type: 'tag', values: ['wcag2a','wcag2aa','wcag21a','wcag21aa','wcag22a','wcag22aa'] }`;
   return `(async () => {
@@ -434,7 +499,20 @@ function axeScript({ rules }) {
     // node -- while the payload went on presenting incomplete as a first-class
     // bucket that a person has to look at.
     const res = await axe.run(document, { resultTypes: ['violations', 'incomplete'], runOnly: ${runOnly} });
-    const locate = (target) => {
+    // Built once for the whole run: locate() is called for every node of every
+    // rule, and the marked elements do not move between two of them.
+    let marked = null;
+    const markedByPath = () => {
+      if (marked) return marked;
+      marked = new Map();
+      for (const n of document.querySelectorAll('[data-avb-p]')) {
+        const p = n.getAttribute('data-avb-p');
+        if (!marked.has(p)) marked.set(p, []);
+        marked.get(p).push(n);
+      }
+      return marked;
+    };
+    const locate = (target, seen) => {
       // A SHADOW OR FRAME PATH IS NOT A SELECTOR.
       //
       // axe answers with an ARRAY when the node is inside a shadow root or an
@@ -446,17 +524,61 @@ function axeScript({ rules }) {
       if (Array.isArray(target) && target.length > 1) {
         return { refPath: null, rect: null, tag: null, crossBoundary: true };
       }
-      let el = null;
-      try { el = document.querySelector(Array.isArray(target) ? target[0] : target); } catch {}
+      const sel = Array.isArray(target) ? target[0] : target;
+      // WHICH OF THE SELECTOR'S MATCHES THIS IS.
+      //
+      // The same pair the geometry probe computes (matchIndexOf in probe.js),
+      // written out here because axeScript does not carry probe.js's helpers.
+      // Without it an accessibility finding has nothing that distinguishes one
+      // render of a component from another -- not in the payload, where a
+      // reader could not tell five identical boxes apart, and not in the id,
+      // where five <time> elements from one mapped component collapsed to one
+      // hash. Backticks and dollar-braces are forbidden in here: this comment is
+      // inside a template literal, and one stray backtick ends the script.
+      //
+      // THE NTH TIME A RULE NAMES THE SAME SELECTOR IS THE NTH ELEMENT IT
+      // MATCHES. axe answers in selectors, not in element handles, so
+      // re-resolving one string five times used to find the FIRST element five
+      // times -- five nodes with one rect, one model path and one id, which is
+      // the collapse this whole locator exists to prevent. axe walks the
+      // document in order and querySelectorAll returns document order, so when
+      // a rule's node list repeats a string the k-th mention is the k-th match.
+      // The counter is per RULE, because one element legitimately appears under
+      // two different rules and both mentions are that same first element.
+      let all = [];
+      try { all = [...document.querySelectorAll(sel)]; } catch {}
+      const nth = seen ? (seen.get(sel) || 0) : 0;
+      if (seen) seen.set(sel, nth + 1);
+      const el = all[nth < all.length ? nth : 0] || null;
       if (!el) return { refPath: null, rect: null, tag: null };
+      const at = all.indexOf(el);
+      const match = { index: at < 0 ? 0 : at, of: all.length || 1 };
+      // WHICH RENDER OF ONE SOURCE NODE, counted among the elements carrying the
+      // identical marker. A model path is a SOURCE position: a component drawn
+      // by a .map() stamps every row with the same attribute, so the path alone
+      // cannot tell row two from row four -- and the path is exactly what the
+      // finding id prefers over the selector when it is exact. Compared by
+      // attribute VALUE rather than through an attribute selector, because a
+      // model path carries quotes and backslashes as freely as any file name.
       let n = el, refPath = null;
       while (n && n.nodeType === 1) {
         const p = n.getAttribute && n.getAttribute('data-avb-p');
-        if (p) { refPath = { path: p, exact: n === el }; break; }
+        if (p) {
+          let pathMatch = null;
+          if (n === el) {
+            try {
+              const same = markedByPath().get(p) || [];
+              const k = same.indexOf(el);
+              pathMatch = { index: k < 0 ? 0 : k, of: same.length || 1 };
+            } catch {}
+          }
+          refPath = { path: p, exact: n === el, match: pathMatch };
+          break;
+        }
         n = n.parentElement;
       }
       const r = el.getBoundingClientRect();
-      return { refPath, tag: el.tagName.toLowerCase(),
+      return { refPath, match, tag: el.tagName.toLowerCase(),
                rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) } };
     };
     // nodeTotal is the number axe ACTUALLY found for this rule, carried out
@@ -467,15 +589,24 @@ function axeScript({ rules }) {
       id: rule.id, impact: rule.impact, help: rule.help, helpUrl: rule.helpUrl, tags: rule.tags,
       bucket,
       nodeTotal: rule.nodes.length,
-      nodes: rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
-        target: n.target,
-        html: String(n.html || '').slice(0, 240),
-        failureSummary: String(n.failureSummary || '').replace(/\\s+/g, ' ').slice(0, 240),
-        ...locate(n.target),
-      })),
+      nodes: (() => {
+        const seen = new Map();
+        return rule.nodes.slice(0, ${AXE_NODES_PER_RULE}).map((n) => ({
+          target: n.target,
+          html: String(n.html || '').slice(0, 240),
+          failureSummary: String(n.failureSummary || '').replace(/\\s+/g, ' ').slice(0, 240),
+          ...locate(n.target, seen),
+        }));
+      })(),
     }));
     return {
       version: axe.version,
+      // WHICH RULE IDS THIS ENGINE ACTUALLY HAS. Fetched only when the caller
+      // named some, because it is a kilobyte the answer does not otherwise need,
+      // and compared to what was asked for on the Stacki side rather than here:
+      // a typo in a rule id used to be accepted in silence, and silence is
+      // indistinguishable from "that rule found nothing".
+      knownRuleIds: ${named ? '(axe.getRules() || []).map((r) => r.ruleId)' : 'null'},
       violations: pack(res.violations, 'violation'),
       incomplete: pack(res.incomplete, 'incomplete'),
       passCount: (res.passes || []).length,
@@ -514,6 +645,9 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
   }
 
   async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}) {
+    // An empty list is a request for NO accessibility pass. See the engine block
+    // below; `null` and `undefined` still mean the WCAG A/AA default.
+    const skipAxe = Array.isArray(rules) && rules.length === 0;
     const chosen = resolveViewports(wanted);
     if (!chosen.ok) return chosen;
 
@@ -551,7 +685,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         code: 'route_outside_project',
         message:
           `${route} resolves to ${resolved.origin}, which is not the project Stacki is serving. ` +
-          'The audit only ever renders this project.',
+          'The audit only ever NAVIGATES to this project.',
       };
     }
     // The hash is dropped rather than refused: it changes nothing a visitor sees
@@ -577,6 +711,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     let capturesWanted = 0;
     const perViewport = [];
     let axeVersion = null;
+    let axeUnknownRules = null;
     let engineError = null;
     let sessionReset = null;
     let cleanupReset = null;
@@ -700,7 +835,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
               code: 'route_outside_project',
               message:
                 `${safeRoute} tried to ${blocked.kind === 'redirect' ? 'redirect' : 'navigate'} to another origin, ` +
-                'which the audit refused. Nothing outside this project is measured, and nothing from that page is ' +
+                'which the audit refused. The document stayed on this project and nothing from that page is ' +
                 'reported. Only the origin is named here — a page Stacki declined to load is not quoted.',
               blockedOrigin: originOf(blocked.target),
               route: safeRoute,
@@ -785,24 +920,45 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           }
 
           // --- accessibility
+          //
+          // WHAT `rules` SCOPES: this engine, and only this engine. The geometry
+          // above is not a rule in any list and always runs.
+          //
+          // AND WHAT AN EMPTY LIST MEANS. `rules: []` used to be indistinguishable
+          // from omitting the field -- `rules && rules.length` is falsy for both,
+          // so an empty array quietly asked for the whole WCAG A/AA set. It is
+          // the only spelling available for "no accessibility pass", it was a
+          // no-op spelling, and a caller who wants geometry and a picture at a
+          // width should not pay for a 580 KB engine injection and a full run to
+          // get them. The answer says what ran: `engine.accessibility` is null
+          // and `engine.error` is null, which is "not attempted", not "failed".
           let axeResult = null;
-          try {
-            await win.webContents.executeJavaScript(axeSource(), true);
-            axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine');
-            axeVersion = axeResult.version;
-            for (const bucket of ['violation', 'incomplete']) {
-              const rules = bucket === 'violation' ? axeResult.violations : axeResult.incomplete;
-              for (const rule of rules) {
-                const total = typeof rule.nodeTotal === 'number' ? rule.nodeTotal : rule.nodes.length;
-                detectedTotal += total;
-                omittedBefore.axeNodes += Math.max(0, total - rule.nodes.length);
-                for (const node of rule.nodes) findings.push(axeFinding({ viewport, rule, node, bucket }));
+          if (!skipAxe) {
+            try {
+              await win.webContents.executeJavaScript(axeSource(), true);
+              axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine');
+              axeVersion = axeResult.version;
+              // Named back rather than dropped. `rules` are the caller's
+              // strings; `knownRuleIds` is the engine's own list, read from the
+              // engine rather than from a table here that would go stale.
+              if (Array.isArray(rules) && rules.length && Array.isArray(axeResult.knownRuleIds)) {
+                const known = new Set(axeResult.knownRuleIds);
+                axeUnknownRules = rules.filter((id) => !known.has(id));
               }
+              for (const bucket of ['violation', 'incomplete']) {
+                const found = bucket === 'violation' ? axeResult.violations : axeResult.incomplete;
+                for (const rule of found) {
+                  const total = typeof rule.nodeTotal === 'number' ? rule.nodeTotal : rule.nodes.length;
+                  detectedTotal += total;
+                  omittedBefore.axeNodes += Math.max(0, total - rule.nodes.length);
+                  for (const node of rule.nodes) findings.push(axeFinding({ viewport, rule, node, bucket }));
+                }
+              }
+            } catch (err) {
+              // A page that breaks the engine must not silently become a clean
+              // page. The audit reports what it could not do.
+              engineError = String(err?.message || err).slice(0, 200);
             }
-          } catch (err) {
-            // A page that breaks the engine must not silently become a clean
-            // page. The audit reports what it could not do.
-            engineError = String(err?.message || err).slice(0, 200);
           }
 
           // --- evidence
@@ -810,19 +966,73 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // Taken AFTER the measurements, from the same window, in the same
           // state, with nothing in between that could move the layout. The
           // caption and the picture are of one moment by construction.
-          if (capture && encodeImage) capturesWanted += 1;
-          if (capture && captures.length < MAX_CAPTURES && encodeImage) {
-            const image = await win.webContents.capturePage();
-            if (!image.isEmpty()) {
-              const { buffer, size } = encodeImage(image, 'jpeg');
-              captures.push({
-                viewport: { key: viewport.key, width: viewport.width, height: viewport.height },
-                mimeType: 'image/jpeg',
-                bytes: buffer.length,
-                width: size.width,
-                height: size.height,
-                data: buffer.toString('base64'),
-              });
+          if (capture) {
+            capturesWanted += 1;
+            // A ROW FOR EVERY VIEWPORT THAT WAS ASKED FOR, INCLUDING THE ONES
+            // WITH NO PICTURE. `included` is the whole contract: a metadata row
+            // that implies an image when none was sent is the one dishonesty
+            // this rewrite exists to make impossible, and a row that is absent
+            // says nothing at all about a viewport the caller asked about.
+            const taken = captures.filter((c) => c.included).length;
+            if (!encodeImage) {
+              // No encoder was wired into this audit, so a picture was never
+              // attempted. Production always wires one (electron/mcp/index.js),
+              // but a library consumer who does not must be told that rather
+              // than handed an empty `captures` that reads as "nothing to see".
+              captures.push(
+                noPictureRow(viewport, 'no_encoder', 'This audit was built without an image encoder, so no picture was attempted for any viewport.')
+              );
+            } else if (taken < MAX_CAPTURES) {
+              const image = await win.webContents.capturePage();
+              if (!image.isEmpty()) {
+                const { buffer, size } = encodeImage(image, 'jpeg');
+                captures.push({
+                  viewport: { key: viewport.key, width: viewport.width, height: viewport.height },
+                  mimeType: 'image/jpeg',
+                  bytes: buffer.length,
+                  width: size.width,
+                  height: size.height,
+                  // The identity of the picture, so a before and an after can be
+                  // compared without sending either of them twice. Same
+                  // construction as electron/mcp/agent/digest.js.
+                  sha256: crypto.createHash('sha256').update(buffer).digest('base64url').slice(0, 22),
+                  included: true,
+                  renderedOffscreen: true,
+                  note: captureNote(viewport),
+                  // Stripped from the payload by the tool and sent as an MCP
+                  // image block instead. It is here, next to its own metadata,
+                  // so the two cannot be paired up wrongly downstream.
+                  data: buffer.toString('base64'),
+                });
+              } else {
+                // AN EMPTY FRAME IS STILL A VIEWPORT THAT WAS ASKED ABOUT.
+                //
+                // capturePage answers with an empty image when the compositor
+                // had nothing for it -- an offscreen window that never painted,
+                // a page that is genuinely blank. Pushing no row made the
+                // contract two lines above false ("one row per viewport asked
+                // about"), and left `dropped.capturesRequestedButNotTaken` as
+                // the only trace: a number a reader has to know to go looking
+                // for, on a response whose `captures` array says nothing.
+                captures.push(
+                  noPictureRow(
+                    viewport,
+                    'empty_frame',
+                    'The window returned an empty frame for this viewport, so there is no picture of it. The ' +
+                      'measurements above were still taken; an empty frame usually means the page painted nothing ' +
+                      'at this size.'
+                  )
+                );
+              }
+            } else {
+              captures.push(
+                noPictureRow(
+                  viewport,
+                  'budget',
+                  'No picture was sent for this viewport: the answer carries as many images as its byte budget ' +
+                    'affords beside the findings. Ask for this viewport on its own.'
+                )
+              );
             }
           }
 
@@ -841,7 +1051,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
               code: 'route_outside_project',
               message:
                 `${safeRoute} tried to ${blocked.kind === 'redirect' ? 'redirect' : 'navigate'} to another origin ` +
-                'while it was being measured, which the audit refused. Nothing outside this project is measured, and ' +
+                'while it was being measured, which the audit refused. The document stayed on this project, and ' +
                 'the findings from this run are discarded because the page did not stay still. Only the origin is ' +
                 'named here — a page Stacki declined to load is not quoted.',
               blockedOrigin: originOf(blocked.target),
@@ -962,6 +1172,41 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // and the budget spent on a string the page wrote.
     const routes = [...finalRoutes].slice(0, MAX_NAMED_ROUTES).map((r) => String(r).slice(0, MAX_NAMED_LENGTH));
     const subframes = [...blockedSubframes].slice(0, MAX_NAMED_ROUTES).map((o) => String(o).slice(0, MAX_NAMED_LENGTH));
+
+    // THE PICTURES LEAVE THE PAYLOAD HERE, AND THE ROWS STAY.
+    //
+    // `images` is not part of the result a client validates: the tool takes it
+    // off and sends each entry as an MCP `image` content block, in this order.
+    // What remains under `captures` is metadata, one row per viewport that was
+    // asked about, each saying whether an image was actually sent for it.
+    const images = captures
+      .filter((c) => c.included && typeof c.data === 'string' && c.data)
+      .map((c) => ({ viewport: c.viewport.key, mimeType: c.mimeType, data: c.data }));
+    const captureRows = captures.map(({ data, ...row }) => row);
+    // AND THE FINDINGS PAY FOR THEM, IN THE SAME CURRENCY.
+    //
+    // An image block costs the host a flat 1,600 tokens, so a captured audit
+    // spends part of one budget on pictures and the rest on findings, rather
+    // than spending a findings budget and then adding pictures outside it --
+    // which is precisely how a 1.8 KB answer became a 153 KB one. With no
+    // captures this is MAX_RESPONSE_BYTES and nothing about a plain audit moves.
+    const findingsBudget = Math.min(MAX_RESPONSE_BYTES, MAX_TOTAL_RESPONSE_BYTES - images.length * IMAGE_BLOCK_BUDGET_BYTES);
+    // THE NARROWER CALL, WORDED SO IT CAN BE MADE -- and built HERE, before the
+    // budget is spent, because it quotes the route. A caller-chosen string added
+    // to the answer after the measurement is the mistake `finalRoutes` and the
+    // cleanup message were both already caught making, so it is bounded like
+    // them and counted like everything else.
+    const omittedCaptures = captureRows.filter((c) => c.included === false);
+    // Only the ones a narrower call would actually fix. A blank frame comes back
+    // blank however few viewports are asked for, and telling a caller to re-run
+    // for it is advice that cannot terminate -- the same shape as the refusal
+    // sentences in styleAgent's locateIdentity.
+    const retryable = omittedCaptures.filter((c) => c.omittedBecause === 'budget');
+    const nextCall = retryable.length
+      ? `No picture was sent for ${retryable.map((c) => c.viewport.key).join(', ')}: an answer carries at ` +
+        `most ${MAX_CAPTURES} images beside its findings. Re-run audit({route:"${String(safeRoute).slice(0, MAX_NAMED_LENGTH)}", ` +
+        `viewports:["${retryable[0].viewport.key}"], capture:true}) for one at a time.`
+      : null;
     const overhead =
       jsonBytes({
         ok: true,
@@ -970,11 +1215,16 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         ...(routes.length ? { finalRoutes: routes } : {}),
         url,
         ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
-        engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true },
+        engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true, unknownRules: axeUnknownRules },
         viewports: perViewport,
+        // Counted, not assumed: a row carries a sentence about what the picture
+        // is of, and three of those are 600 bytes the findings must not be
+        // charged for twice.
+        ...(captureRows.length ? { captures: captureRows } : {}),
+        ...(nextCall ? { next: nextCall } : {}),
         limits: LIMITS_SENTENCE,
       }) + OVERHEAD_SLACK;
-    const kept = fitToBytes(clipped, overhead);
+    const kept = fitToBytes(clipped, overhead, findingsBudget);
     const omittedByBytes = clipped.length - kept.length;
 
     // ONE RESULT, BUILT ONCE.
@@ -1001,6 +1251,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       engine: {
         accessibility: axeVersion ? `axe-core ${axeVersion}` : null,
         error: engineError,
+        // Rule ids the caller asked for that this engine does not have. `[]`
+        // when every one was known, `null` when none were named. A typo used to
+        // be accepted in silence and look exactly like a rule that found
+        // nothing.
+        unknownRules: axeUnknownRules,
         // Whether the audit actually started from a wiped session AND left one,
         // rather than whether the code meant to. Both halves: a run that cannot
         // clear up after itself has not isolated the next audit from this one.
@@ -1025,6 +1280,18 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // WHERE it was dropped, layer by layer, so the number above is checkable.
       truncation: {
         detected: detectedTotal,
+        // THE STAGE BETWEEN THEM, WHICH HAD NO NAME.
+        //
+        // What the page actually handed Stacki, after the two in-page caps above
+        // and before either response cap. `counts` below is a breakdown of THIS
+        // number -- not of `detected`, which includes nodes the page never sent,
+        // and not of `returned`, which is what fitted. A dogfood read
+        // `counts: {standard:24, incomplete:12}` beside `findingCount: 96` and
+        // `returnedFindingCount: 29` and had no field in the payload that
+        // equalled 36. Naming it also makes this whole block self-checking:
+        //   detected - omittedBeforeScoring          === scored
+        //   scored - omittedByResponseBudget - omittedByByteBudget === returned
+        scored: sorted.length,
         returned: kept.length,
         omitted: Math.max(0, detectedTotal - kept.length),
         // Discarded inside the page, before Stacki ever saw them.
@@ -1044,8 +1311,16 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         // about that; this is the other kind of loss, and a reader who is not
         // told cannot know that the selector they were handed will not match.
         findingsWithShortenedFields: kept.filter((f) => Array.isArray(f.truncatedFields) && f.truncatedFields.length).length,
+        // Captures the answer did not carry, kept apart from the findings that
+        // did not fit: they are different losses and they lead a caller to do
+        // different things. `next` below says what the other thing is.
+        omittedCaptureCount: omittedCaptures.length,
         responseCap: MAX_FINDINGS,
-        responseByteCap: MAX_RESPONSE_BYTES,
+        // THE BUDGET ACTUALLY IN FORCE, which is lower when pictures are riding
+        // along -- not the constant. A caller comparing this with the bytes it
+        // received is entitled to the number that was spent.
+        responseByteCap: findingsBudget,
+        totalByteCap: MAX_TOTAL_RESPONSE_BYTES,
         fieldCaps: FIELD_CAPS,
         incompleteReserved: INCOMPLETE_SHARE,
       },
@@ -1053,21 +1328,44 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         culpritsTruncatedAtViewports: perViewport.filter((v) => v.culpritsTruncated).map((v) => v.viewport.key),
         axeNodesPerRuleCap: AXE_NODES_PER_RULE,
         captureCap: MAX_CAPTURES,
-        capturesRequestedButNotTaken: capturesWanted > captures.length ? capturesWanted - captures.length : 0,
+        // Asked for and not photographed at all -- a blank frame, or a viewport
+        // past what the budget affords. The rows for the second kind are in
+        // `captures` with `included: false`; there is no row for the first,
+        // because there is nothing to describe.
+        capturesRequestedButNotTaken: Math.max(0, capturesWanted - images.length),
       },
       // Never a silent truncation. If there were more, the count is the true one
       // and the flag says the list is not.
       truncated: detectedTotal > kept.length,
+      // BY KIND, OVER THE SCORED SET. These sum to `truncation.scored`, never to
+      // `findingCount` (which includes what the page capped before Stacki saw
+      // it) and never to `returnedFindingCount` (which is what fitted through
+      // the host). A reader who assumes either is reading a number that means
+      // something else, which is why the denominator is now a field of its own.
       counts: {
         mechanical: sorted.filter((f) => f.kind === 'mechanical').length,
         standard: sorted.filter((f) => f.kind === 'standard').length,
         advisory: sorted.filter((f) => f.kind === 'advisory').length,
         incomplete: sorted.filter((f) => f.kind === 'incomplete').length,
       },
-      captures,
+      // METADATA ONLY. One row per viewport a picture was asked for, and
+      // `included` says whether one was actually sent. The bytes are in the
+      // response's `image` content blocks, in the order the included rows
+      // appear -- never in this array, whatever the host does with them.
+      captures: captureRows,
+      // What to do about the pictures that were not sent. A caller told only that
+      // something was dropped has to guess; one viewport with a picture is
+      // inside the budget by construction, so that is what this says.
+      ...(nextCall ? { next: nextCall } : {}),
       // Said in the payload, not only in the documentation, because this is the
       // sentence somebody will quote out of context.
       limits: LIMITS_SENTENCE,
+      // NOT PART OF THE ANSWER A CLIENT VALIDATES. electron/mcp/auditTool.js
+      // takes this off and sends each entry as an MCP image content block; it is
+      // never serialized into `structuredContent`, which is the whole point of
+      // the exercise. A caller of createAudit() that ignores it gets metadata
+      // and no pictures, which is a smaller lie than base64 nobody can render.
+      images,
     };
 
     // AN AUDIT THAT COULD NOT CLEAN UP IS NOT AN ISOLATED AUDIT.
@@ -1109,10 +1407,21 @@ module.exports = {
   liveWindowCount,
   liveWindows,
   axeSource,
+  // Exported so the OCCURRENCE INDEX can be measured in a real DOM rather than
+  // read off the source. This string is the only place an accessibility
+  // finding's identity is decided, and a grep cannot tell a working `indexOf`
+  // from a broken one. See test/audit-identity.js.
+  axeScript,
   MAX_FINDINGS,
   // Exported for the same reason MAX_FINDINGS is: a budget a test can only
   // guess at is a budget that can be raised to make a failing test pass.
   MAX_RESPONSE_BYTES,
+  // The whole envelope's budget, and what one picture costs against it. Exported
+  // for the same reason the others are: a test that guesses at a budget is a
+  // test that can be made to pass by raising it.
+  MAX_TOTAL_RESPONSE_BYTES,
+  IMAGE_BLOCK_BUDGET_BYTES,
+  CAPTURED_FINDINGS_FLOOR,
   FIELD_CAPS,
   MAX_CAPTURES,
   SETTLE_MS,

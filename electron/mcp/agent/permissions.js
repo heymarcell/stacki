@@ -11,7 +11,11 @@
 //
 //   visual    Exactly what the server did before the Agent API existed: the
 //             selection, a picture of it, the review threads, and moving the
-//             view. No project source, no data, no history, no writes.
+//             view. No file may be opened, listed or written. It is not
+//             file-blind, though, and the blurb says so: get_context is not a
+//             registry operation and is not gated, so this level still hands
+//             back the project's path on disk, the file and lines the
+//             selection came from, and that node's own text and classes.
 //
 //   inspect   Everything about the project, READ. The source of the file a
 //             target is in, the CMS and content collections, the asset text,
@@ -108,7 +112,8 @@ const LABEL = {
 const BLURB = {
   visual:
     'See what you have selected and take a picture of it, and read and reply to your comments. ' +
-    'It cannot read your project’s files.',
+    'It can see where the project is on disk, which file and lines the selection came from, and ' +
+    'that element’s own text and classes — but it cannot open, list or change any file.',
   inspect:
     'Also READ the project: the source of any file, your content and data, asset text, and the git ' +
     'history. Nothing changes, and everything in the repository becomes visible to the agent.',

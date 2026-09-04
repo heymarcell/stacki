@@ -8,8 +8,11 @@
 //
 // The schemas are discriminated unions on `action`, so the arguments an action
 // needs are required and the ones it does not are not merely optional but
-// absent. A call that names `set_prop` and forgets the prop is refused by the
-// protocol rather than by a sentence from us.
+// absent. That is what a client is shown, and it has not changed — but the
+// CHECK is run here rather than by the host. It used to be the host's, and a
+// call that named `set_prop` and forgot the prop got a bare English sentence
+// with no structuredContent, which is the one answer in this surface an agent
+// cannot branch on. See `advertised()` and `badArguments()` below.
 //
 // The annotations are honest and they are NOT the gate. `destructiveHint` says
 // what an operation is; `electron/mcp/agent/permissions.js` says whether it
@@ -210,6 +213,15 @@ const TargetInput = z.discriminatedUnion('action', [
     action: z.literal('read'),
     ...withTarget({
       navigate: z.boolean().optional().describe('Whether Stacki may open the page and drill into the components to reach it. Default true.'),
+      compact: z
+        .boolean()
+        .optional()
+        .describe(
+          'Leave out `snippet`, the markup around the target, and set `snippetOmitted` instead. ' +
+            'Walking down a tree returns overlapping snippets of the same region once per level — ' +
+            'six levels of one page measured 81KB, of which 17KB was the same markup five times. ' +
+            'Use it while navigating and read the source once at the end. Default false.'
+        ),
     }),
   }),
   z.object({
@@ -218,9 +230,15 @@ const TargetInput = z.discriminatedUnion('action', [
   }),
   z.object({
     action: z.literal('enter'),
-    ...withTarget({ occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of the instance to open — the third card, not the first.') }),
+    ...withTarget({
+      occurrence: z.number().int().min(0).max(1000).optional().describe('Which rendered copy of the instance to open — the third card, not the first.'),
+      compact: z.boolean().optional().describe('Leave out `snippet` and set `snippetOmitted` instead. See target.read.'),
+    }),
   }),
-  z.object({ action: z.literal('exit') }),
+  z.object({
+    action: z.literal('exit'),
+    compact: z.boolean().optional().describe('Leave out `snippet` and set `snippetOmitted` instead. See target.read.'),
+  }),
   z.object({
     action: z.literal('edit'),
     ...withTarget({ ...guard, operations: z.array(Operation).min(1).max(30), label: z.string().max(80).optional() }),
@@ -321,7 +339,16 @@ const StyleInput = z.discriminatedUnion('action', [
   }),
   z.object({ action: z.literal('read_source'), path: RelPath }),
   z.object({ action: z.literal('write_source'), path: RelPath, css: z.string().max(2_000_000), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
-  z.object({ action: z.literal('variables'), limit: z.number().int().min(1).max(400).optional() }),
+  z.object({
+    action: z.literal('variables'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(400)
+      .optional()
+      .describe('How many CSS custom properties to return — variables, not files. Default 200. The answer reports returned, total and truncated.'),
+  }),
   z.object({
     action: z.literal('set_variable'),
     // The offsets are the ones `variables` reported for that cell. They are
@@ -394,8 +421,18 @@ const SourceInput = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     path: RelPath,
-    startLine: z.number().int().min(1).optional(),
-    endLine: z.number().int().min(1).optional(),
+    startLine: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe('First line to return, 1-based. Past the end of the file is refused with bad_range rather than answered with nothing.'),
+    endLine: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe('Last line to return, inclusive. Past the end is clamped and the answer says clampedEnd; below startLine is refused. Lines come back whole, with their own line endings, so the text can go straight back to replace_range.'),
   }),
   z.object({
     action: z.literal('write'),
@@ -407,13 +444,25 @@ const SourceInput = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('replace_range'),
     path: RelPath,
-    startLine: z.number().int().min(1),
-    endLine: z.number().int().min(1).optional(),
-    text: z.string().max(2_000_000),
+    startLine: z.number().int().min(1).describe('First line to replace, 1-based. One past the last line appends at the end of the file.'),
+    endLine: z.number().int().min(1).optional().describe('Last line to replace, inclusive. Defaults to startLine.'),
+    text: z
+      .string()
+      .max(2_000_000)
+      .describe(
+        'The replacement, as whole lines. One trailing newline terminates the last of them and is consumed; a second one is a blank ' +
+          'line you meant. An empty string DELETES the range. The lines are written with the file’s own line endings.'
+      ),
     ref: FileRef.optional(),
     expectedDigest: Digest.optional(),
   }),
-  z.object({ action: z.literal('read_symbol'), fromFile: RelPath, spec: z.string().max(1024), name: z.string().max(200) }),
+  z
+    .object({ action: z.literal('read_symbol'), fromFile: RelPath, spec: z.string().max(1024), name: z.string().max(200) })
+    .describe(
+      'The WHOLE FILE the symbol is declared in, with declarationLine pointing at its declaration (null when there is none to point ' +
+        'at). Stacki has no JavaScript parser and cannot cut a symbol out of a module; to read just the declaration, put ' +
+        'declarationLine into source.read’s startLine and endLine.'
+    ),
   z.object({ action: z.literal('resolve_path'), fromFile: RelPath, spec: z.string().max(1024) }),
 ]);
 
@@ -467,7 +516,24 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('entries'), collection: z.string().max(200), limit: z.number().int().min(1).max(400).optional() }),
   z.object({
     action: z.literal('write_entry'),
-    entry: z.record(z.string(), z.unknown()).describe('The entry object content.entries reported — it carries where the entry lives.'),
+    // WHICH ENTRY, NEVER WHERE IT LIVES.
+    //
+    // This used to take the whole `entry` object a read handed back and use its
+    // `file` as the path to write. `path.resolve` accepts `..` segments and
+    // returns an absolute argument unchanged, so that was the one write in this
+    // surface outside the project fence — and an entry that had lost its
+    // `locator` on the way through addressed the top of a file-backed
+    // collection instead of its own record. Stacki resolves the entry itself
+    // now, through the same listing `content.entries` answers from.
+    collection: z.string().max(200).optional().describe('The collection the entry belongs to. Required unless `entry` identifies one on its own.'),
+    id: z.string().max(300).optional().describe('The entry, by the id content.entries reported. Required unless `entry` carries one.'),
+    entry: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        'Deprecated, and accepted for one release as a SELECTOR only: Stacki reads its id and file to pick the ' +
+          'entry out of the collection and takes nothing else from it. Send `collection` and `id` instead.'
+      ),
     // A LIST, because that is what the implementation applies: contentEntries.js
     // `writeEntry` calls `edits.map(...)` over `{ path, value }` locators. This
     // was declared as an object of fields, which no client could make work —
@@ -486,6 +552,16 @@ const ContentInput = z.discriminatedUnion('action', [
       .optional()
       .describe('The fields to change, each addressed by a path into the entry data.'),
     body: z.string().max(1_000_000).optional().describe('The markdown body, when the entry has one.'),
+    expectedDigest: Digest.optional().describe(
+      'The digest content.entries reported for this entry. Not needed when you pass `entry` back, which carries it.'
+    ),
+    allowInvalid: z
+      .boolean()
+      .optional()
+      .describe(
+        'The entry is checked against the collection schema and a write that breaks it is refused with field-level ' +
+          'issues. Say true to write it anyway — the issues are still reported, so the override is on the record.'
+      ),
   }),
   z.object({ action: z.literal('validate'), collection: z.string().max(200), data: z.unknown() }),
   z.object({ action: z.literal('targets'), collection: z.string().max(200) }),
@@ -520,7 +596,16 @@ const ProjectInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('classes'), limit: z.number().int().min(1).max(2000).optional() }),
   z.object({ action: z.literal('dependencies') }),
   z.object({ action: z.literal('install') }),
-  z.object({ action: z.literal('diagnose') }),
+  z
+    .object({ action: z.literal('diagnose') })
+    .describe(
+      'Why the dev server will or will not start. `kind` is one of: ready (node is here, the dependencies are installed and the ' +
+        'version satisfies Astro — nothing is wrong), no-node (no node binary could be found), no-deps (node_modules or astro is ' +
+        'missing — install them), node-too-old (the node found does not satisfy Astro’s engines range). Also reports ' +
+        'packageManager as {detected, from, declared}: which one to run, which lockfile said so — `from: "default"` means no ' +
+        'lockfile was found and npm is the fallback rather than a detection — and package.json’s own packageManager field, which ' +
+        'can disagree with the lockfile.'
+    ),
   z.object({ action: z.literal('probe'), url: z.string().max(2048).optional() }),
   z.object({ action: z.literal('dev_status') }),
   z.object({ action: z.literal('dev_start') }),
@@ -546,11 +631,11 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
   z.object({ action: z.literal('resolve_merge'), branch: z.string().max(300), choices: z.record(z.string(), z.unknown()) }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
-  z.object({ action: z.literal('restore_file'), ref: z.string().max(200), path: RelPath }),
+  z.object({ action: z.literal('restore_file'), ref: z.string().max(200).optional().describe('The revision to come back to. Defaults to HEAD — the last commit.'), path: RelPath }),
   z.object({ action: z.literal('restore_project'), ref: z.string().max(200) }),
   z.object({ action: z.literal('park') }),
   z.object({ action: z.literal('unpark') }),
-  z.object({ action: z.literal('push'), branch: z.string().max(300) }),
+  z.object({ action: z.literal('push'), branch: z.string().max(300).optional().describe('The branch to push. Defaults to the branch the project is on.') }),
   z.object({ action: z.literal('publish'), repoName: z.string().max(200), private: z.boolean().optional() }),
 ]);
 
@@ -571,10 +656,14 @@ const DESCRIPTIONS = {
     'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
     'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
   style:
-    'Why an element looks the way it does, and how to change it. read lists every declaration reaching it, in ' +
-    'cascade order, with the selector, the file it was authored in, whether it wins, what overrides it, and any ' +
-    'CSS variables it reads — so "make the gap larger" needs no grep for a class name. Writes go through the ' +
-    'Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
+    'Why an element looks the way it does, and how to change it. read lists every AUTHORED declaration Stacki ' +
+    'can see reaching it, in cascade order, with the selector, the file it was authored in, whether it wins, ' +
+    'what overrides it, and any CSS variables it reads — so "make the gap larger" needs no grep for a class ' +
+    'name. CSS a build step generates (Tailwind, UnoCSS) is in no project file, so it cannot be in that scan: ' +
+    '`coverage` says what the scan could not contain, `documentRules` is what the SERVED PAGE reports matching ' +
+    'the element, and `coverage.complete` is true only when nothing reaching it is unaccounted for. A rule from ' +
+    'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
+    'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
   source:
     'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
     'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
@@ -597,7 +686,8 @@ const DESCRIPTIONS = {
  * describes the surface and nothing else.
  */
 function registerAgentTools(server, { api }) {
-  server.registerTool(
+  publishChecked(
+    server,
     'get_capabilities',
     {
       title: 'What Stacki can do here',
@@ -642,12 +732,18 @@ function registerAgentTools(server, { api }) {
       {
         title: `Stacki ${name}`,
         description: DESCRIPTIONS[name],
-        inputSchema,
+        inputSchema: advertised(inputSchema),
         outputSchema: Envelope,
         annotations,
       },
       async (args) => {
-        const { action, ...rest } = args || {};
+        // THE CHECK THE HOST NO LONGER DOES, one step later and in the one
+        // place that can shape a refusal. Same schema, same zod — and
+        // `parsed.data`, not `args`, so every default and coercion the schema
+        // declares is still applied exactly where it was.
+        const parsed = inputSchema.safeParse(args || {});
+        if (!parsed.success) return answer(badArguments(name, args?.action, parsed.error));
+        const { action, ...rest } = parsed.data;
         const shaped = normalise(name, action, rest);
         // Declaring `text` optional is what lets `value` be accepted; the cost
         // is that a call with NEITHER now reaches here instead of being refused
@@ -673,6 +769,238 @@ function registerAgentTools(server, { api }) {
   domain('asset', AssetInput, annotationsFor('asset'));
   domain('project', ProjectInput, annotationsFor('project'));
   domain('git', GitInput, annotationsFor('git', { remote: true }));
+}
+
+/** `{a, b, c?}` — the fields of one object argument, required ones first-class. */
+function fieldsOf(spec) {
+  if (!spec || typeof spec !== 'object') return null;
+  if (spec.type === 'array' && spec.items?.type === 'object') {
+    const inner = fieldsOf(spec.items);
+    return inner ? `[${inner}]` : '[{…}]';
+  }
+  if (spec.type !== 'object' || !spec.properties) return null;
+  const required = new Set(spec.required || []);
+  const names = Object.keys(spec.properties).map((name) => (required.has(name) ? name : `${name}?`));
+  return names.length ? `{${names.join(', ')}}` : null;
+}
+
+/**
+ * The argument shapes, where a host will actually show them.
+ *
+ * A discriminated union converts to `{type:'object', oneOf:[…]}` with no
+ * top-level `properties`, and a client that renders `properties` — which is
+ * most of them, and was the one a real agent drove this API with — therefore
+ * renders NOTHING. Four `style` operations were unusable because of it: an
+ * agent that could not see `edit` sent the fields at the top level, got back
+ * "edit is required", and had to guess what belonged inside it one refusal at
+ * a time. `remove_section` and `move_heading` were never reached at all.
+ *
+ * So every argument any branch takes is named at the top level too, with what
+ * each action wants of it. The shapes are READ OUT of the branches rather than
+ * written down again, so they cannot drift from the schema the handler checks;
+ * the branches are still published underneath, unchanged, and remain the exact
+ * contract. Nothing here narrows anything — a top-level entry describes, the
+ * `oneOf` decides.
+ */
+function summarised(json) {
+  const branches = Array.isArray(json?.oneOf) ? json.oneOf : Array.isArray(json?.anyOf) ? json.anyOf : null;
+  if (!branches || !branches.length || json.properties) return json;
+
+  const actions = [];
+  const seen = new Map(); // property -> { types, shapes: [`action: {…}`], actions }
+  for (const branch of branches) {
+    const action = branch?.properties?.action?.const ?? branch?.properties?.action?.enum?.[0];
+    if (typeof action !== 'string') return json; // not the action union this is for
+    actions.push(action);
+    const required = new Set(branch.required || []);
+    for (const [name, spec] of Object.entries(branch.properties || {})) {
+      if (name === 'action') continue;
+      if (!seen.has(name)) seen.set(name, { types: new Set(), shapes: [], actions: [] });
+      const entry = seen.get(name);
+      if (typeof spec?.type === 'string') entry.types.add(spec.type);
+      entry.actions.push(required.has(name) ? action : `${action} (optional)`);
+      const shape = fieldsOf(spec);
+      if (shape) entry.shapes.push(`${action}: ${shape}`);
+    }
+  }
+
+  const properties = {
+    action: {
+      type: 'string',
+      enum: actions,
+      description: 'Which operation to run. The other arguments are the ones that action takes.',
+    },
+  };
+  for (const [name, entry] of seen) {
+    const type = entry.types.size === 1 ? [...entry.types][0] : null;
+    properties[name] = {
+      ...(type ? { type } : {}),
+      description: entry.shapes.length
+        ? `${entry.shapes.join('; ')}. Used by: ${entry.actions.join(', ')}.`
+        : `Used by: ${entry.actions.join(', ')}.`,
+    };
+  }
+  return { ...json, properties, required: ['action'] };
+}
+
+/**
+ * The strict schema, advertised — and checked by Stacki rather than by the host.
+ *
+ * The SDK validates `tools/call` arguments against a tool's input schema BEFORE
+ * the handler runs, and a failure there is a protocol error: a bare English
+ * sentence, `isError`, and no structuredContent at all. Measured against a real
+ * client, that is what every argument mistake on all eight domain tools came
+ * back as —
+ *
+ *   git {action:'push'}
+ *     -> "Input validation error: Invalid arguments for tool git:
+ *         branch: Invalid input: expected string, received undefined"
+ *
+ * — the one shape in this surface an agent cannot branch on, and the DEFAULT
+ * for the 73 operations that declare a required argument rather than a handful
+ * of cases.
+ *
+ * A tool schema only has to be a Standard Schema: `tools/list` converts it with
+ * `~standard.jsonSchema[io]()` and `tools/call` checks it with
+ * `~standard.validate`. So the conversion is delegated to the real schema, and
+ * the check is made a pass-through, so the identical zod schema can run inside
+ * the handler where a failure becomes Stacki's own refusal.
+ *
+ * The strictness is NOT relaxed: nothing here loosens a type, and every branch
+ * the real schema converts to is published unchanged. `summarised()` adds a
+ * top-level description of the same branches — see above for the client that
+ * could not read them.
+ */
+function advertised(schema) {
+  const std = schema['~standard'];
+  const convert = std.jsonSchema || {
+    input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
+    output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+  };
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'stacki',
+      jsonSchema: {
+        input: (o) => summarised(convert.input(o)),
+        output: (o) => convert.output(o),
+      },
+      // Deliberately accepts everything. The handler runs the same schema a
+      // moment later; validating twice would only mean the host's copy won.
+      validate: (value) => ({ value }),
+    },
+    // AND THE REAL CHECK, STILL REACHABLE BY NAME.
+    //
+    // The SDK only ever looks at `~standard`, but this object is also what a
+    // caller reading a registration back is handed, and the one thing such a
+    // caller wants to ask is "would the tool accept this?" — test/contract-wording.js
+    // puts the sentences a guide tells an agent to send to the schema itself
+    // rather than to a reading of it. Delegated to the real schema, so the
+    // answer is the one the handler will give, not a second implementation of
+    // it; a shim that quietly answered "yes" to everything here would turn that
+    // suite green by making its question meaningless.
+    safeParse: (value) => schema.safeParse(value),
+    parse: (value) => schema.parse(value),
+  };
+}
+
+/** Zod's complaints, in the `{path, message, code}` vocabulary this API uses. */
+function issuesOf(error) {
+  return (error?.issues || []).map((issue) => {
+    const at = (issue.path || []).map((p) => (p && typeof p === 'object' ? p.key : typeof p === 'symbol' ? String(p) : p));
+    // Zod's sentence for a value that simply is not there reads "Invalid input:
+    // expected nonoptional, received undefined" on an unknown-typed field,
+    // which names nothing an agent can act on. A missing value gets Stacki's
+    // sentence; every other issue keeps zod's, which is more precise than
+    // anything written here would be.
+    const absent = /received undefined/.test(String(issue.message || ''));
+    return {
+      path: at,
+      message: absent ? `${at.join('.') || 'This argument'} is required.` : issue.message,
+      code: issue.code,
+    };
+  });
+}
+
+/**
+ * The same refusal for a tool that is not a domain.
+ *
+ * The fix below was applied to the eight domain tools and stopped there, so
+ * five of the thirteen published tools — get_context, capture, get_comments,
+ * comment and get_capabilities — still answered a mistyped argument with the
+ * raw host sentence this whole mechanism exists to remove. `capture` and
+ * `comment` are the two tools the `visual` level exists for, which made the raw
+ * shape the FIRST thing an agent at that level could hit.
+ *
+ * They have no `action` to be wrong about, so there is no bad_action half; the
+ * envelope is otherwise the domain one, down to the `issues` vocabulary.
+ */
+function badToolArguments(tool, error) {
+  const issues = issuesOf(error);
+  return {
+    ok: false,
+    code: 'bad_arguments',
+    operation: tool,
+    issues,
+    message: `${tool} could not run — ${issues.map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`).join('; ')}`,
+  };
+}
+
+/**
+ * Register a tool whose arguments Stacki checks rather than the host.
+ *
+ * Same trick as `domain()` above and for the same reason — `advertised()`
+ * publishes the real schema and lets everything through, and the handler runs
+ * the identical zod a moment later so a failure becomes an envelope. Exported
+ * because three of the five non-domain tools are registered from other files;
+ * a second copy of this in each of them is how the eight and the five drifted
+ * apart in the first place.
+ *
+ * A refusal carries `isError`, which is what stops the SDK validating it
+ * against a tool's payload output schema: a refusal is not a payload, and
+ * `get_context` declaring its snapshot shape must not mean a bad argument comes
+ * back as an output-validation crash instead of an answer.
+ */
+function publishChecked(server, name, config, handler) {
+  const schema = config.inputSchema;
+  return server.registerTool(name, { ...config, inputSchema: advertised(schema) }, async (args, extra) => {
+    const parsed = schema.safeParse(args || {});
+    if (!parsed.success) return answer(badToolArguments(name, parsed.error));
+    return handler(parsed.data, extra);
+  });
+}
+
+/**
+ * An argument failure, in Stacki's own shape.
+ *
+ * `issues` is the same `{path, message, code}` vocabulary content.validate
+ * answers with, so "a field is wrong" has one shape across this API whether the
+ * field is in a content entry or in a tool call.
+ */
+function badArguments(domain, action, error) {
+  const known = actionsOf(domain);
+  // An action the tool does not have is a bad ACTION, not a bad argument — the
+  // same envelope the dispatcher produces, rather than zod's "Invalid
+  // discriminator value" followed by the list in prose.
+  if (typeof action !== 'string' || !known.includes(action)) {
+    return {
+      ok: false,
+      code: 'bad_action',
+      operation: `${domain}.${typeof action === 'string' ? action : ''}`,
+      message: `Stacki has no ${domain}.${typeof action === 'string' ? action : '(no action)'}. Call get_capabilities for what it does have.`,
+      actions: known,
+    };
+  }
+  const issues = issuesOf(error);
+  return {
+    ok: false,
+    code: 'bad_arguments',
+    operation: `${domain}.${action}`,
+    issues,
+    message: `${domain}.${action} could not run — ${issues
+      .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
+      .join('; ')}`,
+  };
 }
 
 /**
@@ -712,15 +1040,26 @@ function normalise(domain, action, args) {
  * so a client that reads only that still knows, but the sentence is the part
  * an agent can act on.
  */
-function answer(result, { spaces = 2 } = {}) {
+function answer(result, { spaces = 2, images = [] } = {}) {
   const body = result && typeof result === 'object' ? result : { ok: false, code: 'failed', message: 'Stacki gave no answer.' };
+  // A SECOND CHANNEL, FOR THE ANSWERS THAT ARE PARTLY A PICTURE.
+  //
+  // An envelope is JSON and always will be, but some answers are worth more
+  // with the pixels beside them — and a client can only see an image if it
+  // arrives as an image block, not as base64 inside a string. Blocks first,
+  // exactly as electron/mcp/tools.js orders the capture tool's, so a host that
+  // shows only the first block shows the picture. Nothing is dropped silently:
+  // an entry with no data is not sent rather than sent empty.
+  const pictures = (Array.isArray(images) ? images : [images])
+    .filter((i) => i && typeof i.data === 'string' && i.data)
+    .map((i) => ({ type: 'image', data: i.data, mimeType: i.mimeType || 'image/png' }));
   return {
     // `spaces` exists for one caller and one reason: the text block is a second
     // copy of the same payload, and an audit's payload is findings. Indenting it
     // costs a third again in bytes on the largest answer this endpoint sends, on
     // a wire where the catalogue already costs 140 KB a session. The envelope
     // answers stay indented, because they are small and a person reads them.
-    content: [{ type: 'text', text: JSON.stringify(body, null, spaces) }],
+    content: [...pictures, { type: 'text', text: JSON.stringify(body, null, spaces) }],
     structuredContent: body,
     ...(body.ok === false ? { isError: true } : {}),
   };
@@ -731,6 +1070,11 @@ module.exports = {
   // Exported so the two tools that live outside this file can refuse in exactly
   // the same shape rather than in one that resembles it. See auditTool.js.
   answer,
+  // And so the non-domain tools refuse a bad argument in it too, rather than
+  // leaving five of the thirteen answering with a raw host sentence. See
+  // electron/mcp/tools.js, which composes the whole surface.
+  publishChecked,
+  badToolArguments,
   DESCRIPTIONS,
   Envelope,
   TargetInput,

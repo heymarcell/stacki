@@ -51,6 +51,63 @@ function findingId({ ruleId, viewport, where }) {
 }
 
 /**
+ * WHERE, MEANING WHICH RENDERED NODE -- not which node in the source.
+ *
+ * A model path is a SOURCE position, and a `.map()` has exactly one of those
+ * however many rows it draws: the serializer emits the identical `data-avb-p`
+ * on every iteration, by construction. So "the most stable locator available"
+ * used to resolve five different `<time>` elements to one string, and a native
+ * dogfood measured the result -- `f_4Sjf8vrN_o4ea-Kn` five times over, 22
+ * findings sharing 6 ids. An id that cannot tell five rows apart cannot say a
+ * row was fixed: it survives until the LAST instance is fixed, and the loop this
+ * whole file exists to support silently stops working on the one page shape
+ * every real site has.
+ *
+ * THE DISAMBIGUATOR HAS TO BELONG TO WHATEVER `where` IS. The first attempt at
+ * this appended `target.selectorMatch` -- the occurrence among the SELECTOR's
+ * matches -- and that is the wrong ordinal for the branch that collapses. When
+ * the page gives a mapped row a unique selector (`li:nth-child(3) > time`, or an
+ * `id` from the loop key) the selector is "one of one", nothing is appended, and
+ * the SHARED model path is used bare: five renders, five different selectors in
+ * the payload, one id. The fix did not reach the case it was written for, and
+ * the fixture that said otherwise hand-wrote a `match` the page cannot produce
+ * for those selectors.
+ *
+ * So there are two ordinals and each one guards its own locator: `pathMatch`,
+ * the occurrence among the elements carrying the identical `data-avb-p`, goes
+ * with the model path; `match`, the occurrence among the selector's matches,
+ * goes with the selector. Whichever string becomes `where` carries the ordinal
+ * that actually disambiguates it -- and `targetOf` publishes exactly the one the
+ * hash used, so a reader who trusts the payload and a reader who trusts the id
+ * can never disagree.
+ *
+ * WHAT IT COSTS, said plainly: an id now moves when an element's ORDINAL among
+ * its siblings changes -- deleting the second of five rows renumbers the three
+ * below it. That is the trade the selector branch already made, and it is
+ * strictly better than an id that cannot distinguish "one of five fixed" from
+ * "none of five fixed".
+ *
+ * One spelling changed with the unification, deliberately: the overflow builder
+ * used to append `[0]` to its selector fallback unconditionally while the
+ * accessibility builder appended nothing. Every id where the disambiguator is
+ * absent from the payload is otherwise byte-identical to the one minted before
+ * this existed, which test/audit-identity.js pins to literal constants.
+ */
+function whereOf({ modelPath, exact, pathMatch, selector, match }) {
+  if (modelPath && exact) {
+    // pathMatch first, because it is the ordinal for the string being used. The
+    // selector ordinal is kept as a fallback for a producer that computes no
+    // pathMatch at all -- an ordinal that disambiguates by luck still beats a
+    // model path used bare -- but never when pathMatch exists and says the path
+    // is unique, since appending an ordinal to an already-unique locator only
+    // buys churn when an unrelated sibling is deleted.
+    if (pathMatch) return `${modelPath}${pathMatch.of > 1 ? `[${pathMatch.index}]` : ''}`;
+    return `${modelPath}${match && match.of > 1 ? `[${match.index}]` : ''}`;
+  }
+  return `${selector || 'document'}${match && match.of > 1 ? `[${match.index}]` : ''}`;
+}
+
+/**
  * A source location, only when Stacki can actually prove one.
  *
  * THE RULE THIS ENFORCES: a StackiRef is never minted from a CSS selector. If
@@ -65,12 +122,17 @@ function findingId({ ruleId, viewport, where }) {
  * is more useful than one with a confident lie in it.
  */
 function targetOf({ selector, refPath, tag, crossBoundary = false, match = null }) {
+  // Present only when the locator it belongs to is ambiguous, so a reader knows
+  // which of several identical boxes this is -- and so that whatever the id
+  // hashed is visible on the finding. `modelPathMatch` is the one that matters
+  // for a mapped component: the selector can be perfectly unique while the model
+  // path is shared by every row.
+  const pathMatch = refPath && refPath.exact ? refPath.match : null;
   const base = {
     selector: selector || null,
     tag: tag || null,
-    // Present only when the selector is ambiguous, so a reader knows which of
-    // several identical boxes this is.
     ...(match && match.of > 1 ? { selectorMatch: { index: match.index, of: match.of } } : {}),
+    ...(pathMatch && pathMatch.of > 1 ? { modelPathMatch: { index: pathMatch.index, of: pathMatch.of } } : {}),
   };
   if (crossBoundary) {
     return {
@@ -130,10 +192,15 @@ function overflowFinding({ viewport, culprit, documentOverflowBy, measured = nul
   // Four levels of tag.class matches every card in a row, so two real defects on
   // two different cards used to hash to ONE id -- and fixing either made both
   // look fixed. The match index disambiguates without making `selector` invalid.
-  const where =
-    target.modelPath && target.exact
-      ? target.modelPath
-      : `${culprit.selector}[${culprit.match?.index ?? 0}]`;
+  // It used to be applied only on the fallback branch, which left the GOOD case
+  // -- an element with a real model path -- colliding. See whereOf().
+  const where = whereOf({
+    modelPath: target.modelPath,
+    exact: target.exact,
+    pathMatch: culprit.ref && culprit.ref.exact ? culprit.ref.match : null,
+    selector: culprit.selector,
+    match: culprit.match,
+  });
   // AT 320 THIS IS STILL A MEASUREMENT. See reflowNote() below.
   const isReflow = viewport.standard != null;
   return {
@@ -232,8 +299,20 @@ function axeFinding({ viewport, rule, node, bucket }) {
   const selector = Array.isArray(node.target)
     ? node.target.join(node.target.length > 1 ? ' >>> ' : ' ')
     : String(node.target || '');
-  const target = targetOf({ selector, refPath, tag: node.tag, crossBoundary: !!node.crossBoundary });
-  const where = target.modelPath && target.exact ? target.modelPath : selector;
+  // `match` comes from the page, where axeScript's locate() resolves the
+  // selector and asks which of its matches this node is. Passing it does two
+  // things at once: it puts `selectorMatch` on an accessibility finding for the
+  // first time -- until now nothing in the payload could tell five identical
+  // boxes apart even by hand -- and it makes the id the identity of a RENDERED
+  // node rather than of a source position.
+  const target = targetOf({ selector, refPath, tag: node.tag, crossBoundary: !!node.crossBoundary, match: node.match });
+  const where = whereOf({
+    modelPath: target.modelPath,
+    exact: target.exact,
+    pathMatch: refPath && refPath.exact ? refPath.match : null,
+    selector,
+    match: node.match,
+  });
   const wcag = (rule.tags || []).filter((t) => /^wcag\d/.test(t));
   return {
     id: findingId({ ruleId: rule.id, viewport: viewport.key, where }),
@@ -279,6 +358,7 @@ module.exports = {
   SEVERITIES,
   findingId,
   targetOf,
+  whereOf,
   overflowFinding,
   unattributedOverflowFinding,
   axeFinding,

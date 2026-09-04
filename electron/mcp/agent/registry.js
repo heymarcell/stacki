@@ -86,10 +86,10 @@ const OPERATIONS = {
     read: {
       risk: 'read',
       via: 'renderer',
-      summary: 'Every declaration reaching a target, with its selector, source ref, authored and computed value.',
+      summary: 'Every AUTHORED declaration Stacki can see reaching a target, with its selector, source, authored and computed value — and a coverage block saying what that scan could not contain.',
       reuses: 'src/style-panel/lib (css, cascade, resolved, selectors)',
     },
-    list_sources: { risk: 'read', via: 'renderer', summary: 'The stylesheets and <style> blocks that style this page.', reuses: 'src/style-panel/lib/webflow.ts styleSources' },
+    list_sources: { risk: 'read', via: 'renderer', summary: 'Every stylesheet in the project and the <style> blocks in play, whether or not this page imports them — style.read says which were proved to reach it.', reuses: 'src/style-panel/lib/webflow.ts styleSources' },
     set_property: { risk: 'write', via: 'renderer', undoable: true, summary: 'Set one CSS property in an authored rule, or in a rule chosen for it.', reuses: 'src/style-panel/lib/css.ts + writeEmbedDoc' },
     remove_property: { risk: 'write', via: 'renderer', undoable: true, summary: 'Remove one authored declaration.', reuses: 'src/style-panel/lib/css.ts removeDeclaration' },
     set_declarations: { risk: 'write', via: 'renderer', undoable: true, summary: 'Set several properties on one rule in a single step.', reuses: 'src/style-panel/lib/css.ts' },
@@ -154,7 +154,7 @@ const OPERATIONS = {
     config: { risk: 'read', via: 'main', channel: 'content:config', summary: "The project's content collection configuration.", reuses: 'electron/contentConfig.js' },
     collections: { risk: 'read', via: 'main', channel: 'content:collections', summary: 'Content collections and their schemas.', reuses: 'electron/contentConfig.js' },
     entries: { risk: 'read', via: 'main', channel: 'content:entries', summary: 'The entries in a collection.', reuses: 'electron/contentEntries.js' },
-    write_entry: { risk: 'write', via: 'main', channel: 'content:writeEntry', summary: 'Write fields and body of an entry.', reuses: 'electron/contentEntries.js' },
+    write_entry: { risk: 'write', via: 'main', channel: 'content:writeEntry', undoable: true, summary: 'Write fields and body of an entry.', reuses: 'electron/contentEntries.js' },
     validate: { risk: 'read', via: 'main', channel: 'content:validate', summary: 'Check data against a collection schema.', reuses: 'electron/contentConfig.js' },
     targets: { risk: 'read', via: 'main', channel: 'content:targets', summary: 'Where a collection may be written.', reuses: 'electron/contentEntries.js' },
     rename_plan: { risk: 'read', via: 'main', channel: 'content:renamePlan', summary: 'What renaming an entry would touch.', reuses: 'electron/contentRefs.js' },
@@ -280,7 +280,7 @@ const EXCLUDED = [
   // Served through something else.
   { channels: ['selection:copy'], why: 'redundant', reason: 'Puts the selection trail on the clipboard for pasting into a chat. get_context and target.read return the same trail as data.' },
   { channels: ['page:write', 'page:writeRaw', 'page:parseSource'], why: 'exposed elsewhere', reason: 'The model and raw writers, and the parse that turns text into a model without touching disk. Reached through target edits and source writes, which go through the editor so undo, the canvas and the preview all follow.' },
-  { channels: ['style:listFiles', 'style:listAstroStyles'], why: 'exposed elsewhere', reason: 'The stylesheet scan the Style panel runs. style.read and style.list_sources answer from it, with the rules already matched against the element.' },
+  { channels: ['style:listFiles', 'style:listAstroStyles', 'style:reachingFiles', 'style:generators'], why: 'exposed elsewhere', reason: 'The stylesheet scan the Style panel runs, the import chain that says which of those files this page was proved to load, and the dependency whose generated CSS is in no project file. style.read answers from all four — the rules already matched against the element, and the coverage stated rather than assumed.' },
   { channels: ['mcp:publish', 'mcp:reply', 'mcp:status'], why: 'redundant', reason: 'The wiring between this server and its own window. Nothing about the project is in any of it.' },
 ];
 

@@ -240,7 +240,18 @@ function fileEntries(projectPath, collection) {
     }
     text = fs.readFileSync(abs, 'utf8');
   } catch (err) {
-    return { entries: [], readOnly: true, reason: `Could not read ${rel} — ${err.message}` };
+    // THE ERRNO, NEVER THE MESSAGE. An fs error spells the ABSOLUTE path out
+    // inside its own text — `ENOENT: no such file or directory, open
+    // '/Users/…/src/data/team.json'` — and this reason is published: it is what
+    // `content.entries` hands an agent as `reason`, so the whole of somebody's
+    // home directory travelled out of the process for a collection whose data
+    // file had been moved. `rel` beside it already names the file, in the
+    // project-relative spelling every other answer uses.
+    return {
+      entries: [],
+      readOnly: true,
+      reason: err?.code === 'ENOENT' ? `${rel} is not in this project.` : `Could not read ${rel} (${err?.code || 'unreadable'}).`,
+    };
   }
 
   let data;
@@ -276,15 +287,34 @@ function fileEntries(projectPath, collection) {
 }
 
 /**
- * Applies edits to one entry. `edits` are { path, value } against the entry's
- * own data — the locator that puts it inside its file is added here — plus an
- * optional `body` for the formats that have one.
+ * What writing an entry WOULD do, without doing it.
+ *
+ * The write is split here so that something can look at the bytes before they
+ * land. `data` is the record read back OUT of those bytes at the entry's own
+ * locator — not a JavaScript re-application of the edits — so a caller that
+ * checks it against a schema is checking exactly what the file will hold. A
+ * second implementation of the edits would be the one thing this module exists
+ * to avoid; ./formats patches the file, and only the file knows what that made.
  */
-function writeEntry(projectPath, entry, edits, { body } = {}) {
+function planEntryWrite(projectPath, entry, edits, { body } = {}) {
   const abs = path.resolve(projectPath, entry.file);
   const format = formatFor(entry.file);
   if (!format) throw new Error(`Stacki cannot write ${path.extname(entry.file)} files.`);
-  const text = fs.readFileSync(abs, 'utf8');
+  // The same rule as fileEntries above, and it matters more here: this throw is
+  // not caught anywhere between the write and the wire, so an entry whose file
+  // has since been deleted or renamed — a stale entry handed straight back from
+  // an earlier `content.entries` — refused `content.write_entry` with Node's
+  // own `ENOENT: … open '<absolute path>'` as the whole of the message.
+  let text;
+  try {
+    text = fs.readFileSync(abs, 'utf8');
+  } catch (err) {
+    throw new Error(
+      err?.code === 'ENOENT'
+        ? `${entry.file} is not in this project any more. Read the collection again — nothing was written.`
+        : `${entry.file} could not be read (${err?.code || 'unreadable'}). Nothing was written.`
+    );
+  }
 
   const locator = entry.locator || [];
   const prefixed = edits.map((edit) =>
@@ -299,8 +329,26 @@ function writeEntry(projectPath, entry, edits, { body } = {}) {
     format === frontmatter
       ? frontmatter.applyEdits(text, prefixed, { body })
       : format.applyEdits(text, prefixed);
-  if (next === text) return { ok: true, changed: false };
-  fs.writeFileSync(abs, next, 'utf8');
+
+  const plan = { abs, format, text, next, changed: next !== text, data: undefined, readBackError: null };
+  try {
+    const parsed = format === frontmatter ? frontmatter.parse(next).data || {} : format.parseData(next);
+    plan.data = locator.reduce((node, key) => (node == null ? undefined : node[key]), parsed);
+  } catch (err) {
+    plan.readBackError = String(err?.message || err);
+  }
+  return plan;
+}
+
+/**
+ * Applies edits to one entry. `edits` are { path, value } against the entry's
+ * own data — the locator that puts it inside its file is added here — plus an
+ * optional `body` for the formats that have one.
+ */
+function writeEntry(projectPath, entry, edits, { body } = {}) {
+  const plan = planEntryWrite(projectPath, entry, edits, { body });
+  if (!plan.changed) return { ok: true, changed: false };
+  fs.writeFileSync(plan.abs, plan.next, 'utf8');
   return { ok: true, changed: true };
 }
 
@@ -344,6 +392,7 @@ function coveredPaths(collections) {
 
 module.exports = {
   listEntries,
+  planEntryWrite,
   writeEntry,
   countEntries,
   coveredPaths,

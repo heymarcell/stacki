@@ -955,7 +955,17 @@ const rawPost = (hostHeader, body) =>
 
   const badDetail = await readBody(await post({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'get_context', arguments: { styleDetail: 'everything' } } }));
   check('an argument outside the enum is rejected', badDetail.result?.isError === true, JSON.stringify(badDetail).slice(0, 200));
-  check('the rejection says what was wrong', /validation/i.test(badDetail.result?.content?.[0]?.text || ''), badDetail.result?.content?.[0]?.text);
+  // It used to say "validation", because the SDK refused before Stacki's
+  // handler ran and the client got a bare English sentence with no
+  // structuredContent -- the one answer in this surface an agent cannot branch
+  // on. It now answers Stacki's own envelope, so the assertion is on the code
+  // and the field, not on a word from somebody else's error text.
+  check(
+    'the rejection says what was wrong',
+    /"code":\s*"bad_arguments"/.test(badDetail.result?.content?.[0]?.text || '') &&
+      /styleDetail/.test(badDetail.result?.content?.[0]?.text || ''),
+    badDetail.result?.content?.[0]?.text
+  );
 
   // --- capture ---
   const shot = await readBody(await post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'capture', arguments: {} } }));

@@ -34,6 +34,9 @@ import { resolveBinding } from './bindingSource.js';
 // Caps. One enormous class attribute, a page of copy or a section with two
 // hundred children must not be able to fill a response on its own.
 const MAX_TEXT = 600;
+// The words shown in a child or parent summary. A preview, not an identity:
+// see `summarize`.
+const PREVIEW_TEXT = 120;
 const MAX_PROPS = 40;
 const MAX_PROP_VALUE = 300;
 const MAX_CLASSES = 60;
@@ -88,13 +91,27 @@ function labelOf(node, crumbLabel) {
   return clip(node.name || node.kind, MAX_LABEL);
 }
 
-function summarize(node, crumbLabel, keysFor, crumbsFor = null) {
+function summarize(node, crumbLabel, keysFor, crumbsFor = null, peersFor = null) {
   if (!node) return null;
+  const words = textOf(node).join(' ').trim();
   return {
     kind: node.kind || null,
     tag: tagOf(node),
     label: labelOf(node, crumbLabel),
-    text: clip(textOf(node).join(' '), 120),
+    text: clip(words, PREVIEW_TEXT),
+    // WHETHER THOSE WORDS ARE THE WHOLE OF THEM.
+    //
+    // The caller mints a ref from this summary, and src/reviewAnchor.js matches
+    // a fingerprint's text against the node's FULL words — so a preview with an
+    // ellipsis on the end can never equal anything, and the ref was dead on
+    // arrival for any child with more than a hundred and twenty characters and
+    // a same-tag sibling. Measured: the ref failed on the very next call, with
+    // no edit and no revision movement, and answered `ambiguous`.
+    //
+    // A truncated preview is presentation, not identity. Saying so here lets
+    // the ref carry the sibling run instead, which is evidence rather than a
+    // string that cannot match.
+    textClipped: words.length > PREVIEW_TEXT,
     childCount: Array.isArray(node.children) ? node.children.length : null,
     // Enough for the caller to mint a ref for this one, so walking the tree is
     // reading the answer rather than making another round trip per node.
@@ -106,6 +123,11 @@ function summarize(node, crumbLabel, keysFor, crumbsFor = null) {
     // node itself, one rung further down — the same evidence a review anchor
     // carries, spelled the same way, so it reads them the same.
     breadcrumbs: typeof crumbsFor === 'function' ? crumbsFor(node.id) : null,
+    // The sibling run at every level down to this node — what tells "nothing
+    // moved" apart from "something was inserted above me". The node's own ref
+    // has carried this from the start (it is why it survives the same
+    // truncation); a child's ref had only the slot.
+    peers: typeof peersFor === 'function' ? peersFor(node.id) : null,
     kindOfThing: node.kind === 'component' && !node.dynamicTag ? 'component_instance' : null,
   };
 }
@@ -204,6 +226,21 @@ function bindingsOf(node, { model, ancestors, keys }) {
  * instead.
  */
 function occurrenceOf(node, { canvas, bindings, ancestors }) {
+  // WHAT THIS NUMBER IS. Not renders — PLACES THE CANVAS MEASURED. It reaches
+  // here from `rectsForPath` in electron/preload.js by way of the canvas
+  // report, and that returns one entry per marker RUN, or, where no marker pair
+  // survived the compile, one per outermost tagged element. One rendering
+  // measures as several places whenever it puts several elements on the page
+  // under a single name: a component with two root elements (both roots carry
+  // the caller's name for the instance), or a paragraph a line-splitter
+  // rebuilt as one clone per line. test/target-occurrence.js measures both
+  // through the real preload, and both come out 2 — the same 2 a genuine
+  // two-item loop gives. So the number cannot be read as a count of renders,
+  // and `repeated` below must not be decided by it.
+  //
+  // It stays in the answer because it is the right number for the question it
+  // does answer: which measured box `target select occurrence` and a review pin
+  // are addressing.
   const count = Number.isInteger(canvas?.occurrenceCount) ? canvas.occurrenceCount : null;
   const index = Number.isInteger(canvas?.occurrence) ? canvas.occurrence : null;
   // The loop itself is not one of its own copies. Saying "editing this changes
@@ -221,11 +258,23 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
       list,
     };
   }
-  const inLoop = (ancestors || []).some((a) => a?.kind === 'map');
-  const repeated = inLoop || (count != null && count > 1);
+  // THE SOURCE DECIDES THIS, and only the source can. A node is rendered once
+  // per item exactly when a `map` is above it; anywhere else the document
+  // renders it once, however many boxes it happens to occupy. Letting `count`
+  // decide instead put the warning on a <p> beside an <h3> in a plain
+  // `header.section-header` — nothing repeated, two measured places — and an
+  // agent that believes "editing this changes every copy" stops editing the
+  // node it was asked to edit and goes hunting for a data item that does not
+  // exist.
+  const repeated = (ancestors || []).some((a) => a?.kind === 'map');
   // The list behind the repetition, when a binding names one. That ref is the
   // difference between changing one card and changing the template.
   const item = bindings.find((b) => b.source?.kind === 'loop_item')?.source || null;
+  // How many copies, in the only two forms that are true. A measured count is
+  // worth quoting once repetition is established — but it is the number of
+  // places, so it may be 1 for a one-item list, and "rendered 1 times" is both
+  // ungrammatical and a contradiction of the sentence after it.
+  const many = count != null && count > 1 ? `${count} times` : 'once for every item in the list it sits in';
   return {
     index,
     count,
@@ -235,7 +284,7 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
       ? 'shared_template'
       : 'single',
     note: repeated
-      ? `This is one source node rendered ${count == null ? 'more than once' : `${count} times`}. ` +
+      ? `This is one source node rendered ${many}. ` +
         'Editing it here changes every copy. To change one copy, change the data item behind it — ' +
         (item ? `follow perOccurrence.` : 'Stacki could not resolve which list it comes from, so say so rather than editing one and hoping.')
       : null,
@@ -260,6 +309,7 @@ export function readTarget({
   crumbLabel = null,
   keysFor = null,
   crumbsFor = null,
+  peersFor = null,
   canvas = null,
   renderedClasses = null,
   componentChain = null,
@@ -272,8 +322,10 @@ export function readTarget({
   if (!node) return null;
   const ancestors = ancestorChain(model?.nodes || [], node.id) || [];
   const keysOf = typeof keysFor === 'function' ? keysFor : null;
+  const peersOf = typeof peersFor === 'function' ? peersFor : null;
   const parent = findParentNode(model?.nodes || [], node.id);
   const nature = textNature(node);
+  const ownWords = textOf(node).join(' ').trim();
   const bindings = bindingsOf(node, { model, ancestors, keys });
   const authored = [
     ...new Set([
@@ -297,7 +349,11 @@ export function readTarget({
       nature: nature.kind,
       // What the node reads as, however deep the words are — the same reading
       // get_context reports and a review fingerprints against.
-      value: clip(textOf(node).join(' '), MAX_TEXT),
+      value: clip(ownWords, MAX_TEXT),
+      // And whether that reading is the whole of it. Same reason as
+      // `summarize`'s `textClipped`: a clipped value is a preview, and a
+      // fingerprint built from one names words no node will ever have.
+      truncated: ownWords.length > MAX_TEXT,
       // And what set_text would actually replace, which is only ever this
       // node's own text. The two differ for anything with children, and an
       // agent that took the first for the second would type a section's whole
@@ -323,11 +379,11 @@ export function readTarget({
     bound: isDataBound(node),
     bindings,
     occurrence: occurrenceOf(node, { canvas, bindings, ancestors }),
-    parent: summarize(parent, crumbLabel, keysOf, crumbsFor),
+    parent: summarize(parent, crumbLabel, keysOf, crumbsFor, peersOf),
     children: Array.isArray(node.children)
       ? node.children
           .slice(0, MAX_CHILDREN)
-          .map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf, crumbsFor) }))
+          .map((child, index) => ({ index, ...summarize(child, crumbLabel, keysOf, crumbsFor, peersOf) }))
       : null,
     childrenOmitted: Array.isArray(node.children) ? Math.max(0, node.children.length - MAX_CHILDREN) : 0,
     hidden: !!hidden,

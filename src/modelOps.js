@@ -856,12 +856,32 @@ export function insertNode(model, { nodeId, position = 'after', node: spec }, ct
   const { target, error } = placeFor(model, nodeId, position);
   if (error) return error;
   insertIntoModel(model, built.node, target);
-  pruneImports(model);
+  // NOT pruneImports. An insert only ever ADDS a reference, so nothing it does
+  // can make an import unused -- which means every import this could remove was
+  // already unused before the call, and belongs to whoever wrote the file. An
+  // append that silently deleted somebody's import was found doing exactly that,
+  // and it also turned a one-line splice into a whole-frontmatter rewrite,
+  // because one import gone and one added in the same write is not a splice.
+  // remove and set_tag DO make a reference disappear, and prune there.
   return done({ selectId: built.node.id, notes: built.notes || [] });
 }
 
-/** A node from a spec, or the reason there isn't one. */
-export function buildNode(spec, model, { insertables = [] } = {}) {
+/**
+ * A node from a spec, or the reason there isn't one.
+ *
+ * `importPaths` is how a placed component gets the import it cannot build
+ * without. Working out how one file should import another is a round trip to
+ * the main process (`page:importPathFor`) and this runs inside a synchronous
+ * mutation, so the caller that writes resolves it first and hands the answer
+ * in — the same answer, from the same handler, the Insert panel awaits before
+ * it mutates. It is AUTHORITATIVE when present: a component missing from it
+ * cannot be imported, and markup for a component the page does not import is a
+ * page that does not build, so the insert refuses instead. A caller that
+ * passes none is rehearsing (src/agent/commands.js dry-runs a batch to report
+ * what would fail, and has no way to await) — it neither imports nor refuses,
+ * and the write that follows decides.
+ */
+export function buildNode(spec, model, { insertables = [], importPaths = null } = {}) {
   const kind = spec?.kind;
   const id = newId();
   if (kind === 'element') {
@@ -903,8 +923,14 @@ export function buildNode(spec, model, { insertables = [] } = {}) {
       model.imports.push({ name, imported: name, path: ASTRO_ASSETS_MODULE, named: true });
     }
     if (!asset && !(model.imports || []).some((i) => i.name === name)) {
-      const found = insertables.find((c) => c.name === name);
-      if (found?.importPath) model.imports.push({ name, path: found.importPath });
+      const paths = importPaths ? importPaths[name] : null;
+      if (paths) model.imports.push({ name, path: chooseImportPath(model, paths) });
+      else if (importPaths) {
+        return fail(
+          'unresolved_import',
+          `Stacki could not work out how this page should import <${name}>, and will not place markup the page has no import for. Nothing was changed.`
+        );
+      }
     }
     return done({
       ok: true,

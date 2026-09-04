@@ -48,11 +48,46 @@ const HELPERS = `
   // <template> markers outside design mode because :nth-child counts them; the
   // data-avb-p attribute and the comment markers survive, and they are the only
   // honest bridge from a rendered box back to a thing in a file.
+  //
+  // WHICH RENDER OF THAT SOURCE NODE THIS IS, carried WITH the path it belongs
+  // to rather than beside it, so the two cannot be paired up wrongly. A .map()
+  // is one node in the source and N boxes on the page, all stamped with the
+  // identical attribute by construction -- so the path alone identifies a source
+  // position, never a rendered node. Counting how many elements carry this exact
+  // attribute value, and which one this is, is the only fact that tells the
+  // renders apart, and it is computed by comparing attribute VALUES rather than
+  // by building an attribute selector: a model path contains quotes and
+  // backslashes as often as any other file name does. No backtick and no
+  // dollar-brace in here: these helpers live inside a template literal.
+  //
+  // Only when the marker is on the element ITSELF. When it came off an ancestor
+  // the path is not this node's identity at all, and an ordinal among the
+  // ancestors that carry it would be an ordinal for a different element.
+  //
+  // Built once. The walk asks this for up to forty culprits and the marked
+  // elements do not move between them, so scanning the document per culprit is
+  // the same answer forty times over on a page that can hold thousands of them.
+  let markedByPath = null;
+  const pathMatchOf = (el, path) => {
+    if (!markedByPath) {
+      markedByPath = new Map();
+      try {
+        for (const n of document.querySelectorAll('[data-avb-p]')) {
+          const p = n.getAttribute('data-avb-p');
+          if (!markedByPath.has(p)) markedByPath.set(p, []);
+          markedByPath.get(p).push(n);
+        }
+      } catch { return null; }
+    }
+    const all = markedByPath.get(path) || [];
+    const at = all.indexOf(el);
+    return { index: at < 0 ? 0 : at, of: all.length || 1 };
+  };
   const refPathOf = (el) => {
     let n = el;
     while (n && n.nodeType === 1) {
       const p = n.getAttribute && n.getAttribute('data-avb-p');
-      if (p) return { path: p, exact: n === el };
+      if (p) return { path: p, exact: n === el, match: n === el ? pathMatchOf(el, p) : null };
       n = n.parentElement;
     }
     return null;
@@ -163,6 +198,28 @@ const OVERFLOW = `(() => {
 
       // And so does any ancestor between it and the root. If one of those
       // contains it, this is a scroll container's content, not a page defect.
+      //
+      // AND THE OTHER HALF OF THIS, WHICH IS NOT MEASURED HERE AND WILL NOT BE.
+      //
+      // The obvious complaint is that a page which CLIPS its overflow produces
+      // no finding at all: with html and body both clipping, or the wide content
+      // inside a clipping wrapper, the document does not scroll and this whole
+      // block never runs. That silence is correct -- the document really does not
+      // scroll -- and the tempting fix is a "this box clips its own content"
+      // rule. It was measured before being rejected. Over a page built from
+      // ordinary idioms (a rounded card, a text-overflow:ellipsis heading, an
+      // overflow-x:auto carousel, a decorative panel, a marquee) the naive rule
+      // fired THREE times with no defect present; adding a real 2000px defect
+      // made it four, and the deliberate marquee's 2246px outranked the real
+      // 1625px. Three false positives, zero true positives, no separation by
+      // magnitude. Same class of mistake as blaming a skip link at left:-9999px,
+      // which the comment above already records.
+      //
+      // Worth knowing while reading it: overflow:hidden IS a scroll container --
+      // setting scrollLeft on one moves it, so clipped content stays reachable
+      // by focus and by script. Only overflow-x:clip is genuinely unscrollable,
+      // so "clipped" and "unreachable" are different claims. Said in
+      // docs/audit.md as a known limit rather than papered over here.
       let contained = false;
       let containedBy = null;
       let p = el.parentElement;

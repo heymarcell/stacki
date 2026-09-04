@@ -29,7 +29,7 @@ const z = require('zod');
 const { registerReviewTools } = require('./reviewTools');
 const { registerResources, registerPrompts } = require('./intelligence');
 const { registerAuditTool } = require('./auditTool');
-const { registerAgentTools } = require('./agentTools');
+const { registerAgentTools, publishChecked } = require('./agentTools');
 
 const INSTRUCTIONS = [
   'Stacki is the Astro project open in the Stacki desktop app: this server reports its live visual state and',
@@ -178,7 +178,8 @@ const MAX_PADDING = 256;
  * describes the surface and nothing else.
  */
 function registerTools(server, { getContext, capture, getComments, comment, api = null, audit = null, clientName = null }) {
-  server.registerTool(
+  publishChecked(
+    server,
     'get_context',
     {
       title: 'Stacki visual context',
@@ -209,14 +210,21 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
     }
   );
 
-  server.registerTool(
+  publishChecked(
+    server,
     'capture',
     {
       title: 'Stacki screenshot',
       description:
         'A picture of what Stacki is rendering right now, at the current breakpoint: the selected element ' +
         '(the selected occurrence of a repeated node, scrolled into view, with the editor overlays hidden) ' +
-        'or the whole preview viewport. Returns the image plus the same source reference get_context gives.',
+        'or the whole preview viewport. Returns the image plus the same source reference get_context gives. ' +
+        'It photographs the person\'s window at the breakpoint THEY have chosen, and there is no way to change ' +
+        'that from here — resizing somebody\'s editor to take a screenshot is not something this server does. ' +
+        'To see a route at a width of your own, use audit({route, viewports:[{width,height}], rules:[], ' +
+        'capture:true}): it renders the page offscreen in a window of its own, at exactly that width, and never ' +
+        'touches what the person is looking at. `rules:[]` skips the accessibility pass, so that costs a page ' +
+        'load and a photograph and nothing else. It needs `inspect`, because it is an audit.',
       inputSchema: z.object({
         target: z
           .enum(['selection', 'viewport'])
@@ -253,7 +261,20 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
     }
   );
 
-  registerReviewTools(server, { getComments, comment, clientName });
+  // THE SAME ARGUMENT CHECK, ON THE TOOLS REGISTERED FROM OTHER FILES.
+  //
+  // `comment` and `get_comments` answered a mistyped argument with the raw host
+  // sentence long after the eight domain tools had stopped — and they are the
+  // two tools the `visual` level exists for, so that shape was the first thing
+  // an agent at the lowest level could hit. The property is one of the SURFACE
+  // rather than of any one registration site, so it is applied here, where the
+  // surface is composed: a file added beside reviewTools.js tomorrow gets it
+  // without knowing to ask. `registerTool` is the only thing reviewTools.js
+  // asks of the server, so the facade offers exactly that and nothing else: a
+  // file that grows a second need fails loudly here rather than quietly losing
+  // a method off a spread class instance.
+  const checked = { registerTool: (name, config, handler) => publishChecked(server, name, config, handler) };
+  registerReviewTools(checked, { getComments, comment, clientName });
   // The editor half. Absent only in a test that builds the endpoint without an
   // app behind it.
   if (api) registerAgentTools(server, { api });
