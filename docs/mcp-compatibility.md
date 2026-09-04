@@ -141,6 +141,42 @@ compresses to 18 KB, and is not what the model is charged. The number worth
 optimising is the one a host actually puts in front of a model, and on both
 hosts measured that is a list of names.
 
+## Retrieval, re-measured after the descriptions were rewritten — and it did not move
+
+Five domain tools carried one-line catalogue labels, and a measurement over
+sixteen held-out sessions found `source` taking 30 of 80 calls with **not one**
+on the file `source`'s own description names as its reason to exist. The
+descriptions were rewritten to lead with the question a person actually types.
+
+**Re-measured afterwards, on the same rig, the share did not move: 7 of 20
+calls, 35.0%, against 37.5% before.** A rewrite motivated by a measurement is
+worth nothing if the measurement is not repeated, so it is repeated here and
+the result is recorded as it came out.
+
+Two things the re-run establishes that the first measurement did not.
+
+**Part of that share was never a description failure.** Asked to move the footer
+inside the pricing grid, the model used `source.replace_range` and said why:
+*"Without a preview there's no node ref to hand `target.move`."* That is
+correct. The wire rig has no browser, so it has no rendered nodes and no refs,
+and `source` is the honest route in that state. The original 37.5% figure
+attributed to description quality some calls that were a rational response to
+an environment with no canvas.
+
+**And one clear miss survives.** Asked *"which component renders the header?"*,
+the model still read five files by hand instead of calling
+`page.component_usage`, which is the operation for exactly that question — and
+`page`'s description now contains that sentence almost verbatim. It reached the
+right answer by the long road. So the defect is real, it is not fixed, and it is
+not a wording problem: a tool description that states the question does not
+outrank a generic file-reader in retrieval.
+
+The honest status: the descriptions are better than the labels they replaced,
+nothing regressed, and the retrieval behaviour they were meant to change is
+unchanged. What would settle it is a measurement against a rig WITH a canvas,
+where refs exist and `source` has no legitimate claim on most of these tasks —
+which is the packaged dogfood, and which grades task outcomes rather than route.
+
 ## Resources are reachable only through the host's own tools
 
 Claude Code does not hand MCP resources to the model. It reaches them through two
