@@ -2792,11 +2792,54 @@ handle('cms:list', async (_e, projectPath) => {
   return { files };
 });
 
+// A READ THAT FAILS MUST NOT ANSWER IN THE HOST'S OWN WORDS.
+//
+// `JSON.parse(fs.readFileSync(abs))` throws whatever Node throws, and both of
+// its throws travelled all the way out to a client. A data path that is not
+// there came back as `ENOENT: no such file or directory, open
+// '/Users/…/src/data/nope.json'` — somebody's home directory, in an answer an
+// agent is free to quote — and a markdown entry or an .astro page, whose first
+// line is `---`, came back as `No number after minus sign in JSON at position 1
+// (line 1 column 2)`: a sentence that names neither the file nor the thing that
+// was actually wrong with the request. Measured over MCP against a packaged
+// build, on `content.cms_read`.
+//
+// So the reads go through these. They name the path THE CALLER used — `src/`
+// relative, the only spelling of it that exists off this machine — and they say
+// what the CMS panel's own listing says about the same file (see cms:list),
+// which is the same complaint in the same words. A failed read reports the
+// errno and never the message: an fs error carries the absolute path inside it.
+const DATA_FILE_SHAPE =
+  'Stacki reads a .json file, or one exported array of a source file named as "path#export" — content.cms_list offers both.';
+
+function readDataFile(abs, fileRel) {
+  try {
+    return fs.readFileSync(abs, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') throw new Error(`src/${fileRel} is not in this project.`);
+    throw new Error(`src/${fileRel} could not be read (${err?.code || 'unreadable'}).`);
+  }
+}
+
+function parseDataFile(abs, fileRel) {
+  if (!/\.json$/i.test(fileRel)) {
+    throw new Error(`src/${fileRel} is not a JSON data file. ${DATA_FILE_SHAPE}`);
+  }
+  const text = readDataFile(abs, fileRel);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    // The same trim cms:list uses, for the same reason: "in JSON at position 1
+    // (line 1 column 2)" is about a buffer nobody but the parser can see.
+    throw new Error(`src/${fileRel} is not valid JSON — ${String(err?.message || err).replace(/\s+in JSON.*$/, '')}.`);
+  }
+}
+
 handle('cms:read', async (_e, { projectPath, rel }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   const abs = cmsAbs(projectPath, fileRel);
-  if (!exportName) return { data: JSON.parse(fs.readFileSync(abs, 'utf8')) };
-  const file = fs.readFileSync(abs, 'utf8');
+  if (!exportName) return { data: parseDataFile(abs, fileRel) };
+  const file = readDataFile(abs, fileRel);
   // A page's data lives in its frontmatter; everything below it is markup the
   // scanners must never see.
   const page = isAstroRel(fileRel);
@@ -2829,7 +2872,10 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
     if (!fs.existsSync(abs)) throw new Error(`src/${fileRel} no longer exists.`);
     // Only the edited span is rewritten — imports, comments and the file's
     // other exports are left exactly as they were.
-    const file = fs.readFileSync(abs, 'utf8');
+    // Through the same reader as cms:read: the existence check above is not the
+    // whole of it — a permission error, or the file going between the two
+    // calls, still throws, and that throw carries the absolute path.
+    const file = readDataFile(abs, fileRel);
     // Only the frontmatter is handed to the writer for a page, and only its
     // span is spliced back — the markup below is never re-serialized.
     const page = isAstroRel(fileRel);
@@ -2857,7 +2903,7 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
   if (!fs.existsSync(abs)) throw new Error(`src/${rel} no longer exists.`);
   let indent = 2;
   let trailingNewline = true;
-  const before = fs.readFileSync(abs, 'utf8');
+  const before = readDataFile(abs, rel);
   const match = before.match(/\n([ \t]+)\S/);
   if (match) indent = match[1] === '\t' ? '\t' : match[1].length;
   trailingNewline = /\n$/.test(before);

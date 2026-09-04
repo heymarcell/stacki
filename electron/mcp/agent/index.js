@@ -519,6 +519,34 @@ function createAgentApi({
     return before;
   };
 
+  /**
+   * `changedFiles` is ONE field with ONE shape, and it is this file's.
+   *
+   * Every write below stamps it with `changed()` — the array of
+   * `{file, beforeDigest, afterDigest, patch}` the tool's output schema
+   * declares. A main-process result mapper that answers a different KIND of
+   * thing on the same key does not merely disagree with the documentation: the
+   * MCP SDK validates a tool's structured output, so the whole call is
+   * rejected. `git.restore_project` answers with a COUNT — naming every file of
+   * a whole-tree restore is the one thing this API promises not to send — and
+   * it reached a real client as `Output validation error: … changedFiles:
+   * Invalid input: expected array, received number`, isError:true, no
+   * structuredContent, no envelope, WHILE THE WORKING TREE HAD IN FACT BEEN
+   * RESTORED. An agent told a destructive operation failed will run it again.
+   *
+   * The count is worth having, so it keeps a name that says which kind it is.
+   * Nothing but the array may sit on `changedFiles`, whatever a mapper meant by
+   * it — a value this cannot classify is dropped rather than passed on, because
+   * the alternative is an envelope no client can read at all.
+   */
+  function ownChangedFiles(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+    const value = result.changedFiles;
+    if (value == null || Array.isArray(value)) return result;
+    const { changedFiles: _wrongKind, ...rest } = result;
+    return typeof value === 'number' ? { ...rest, changedFileCount: value } : rest;
+  }
+
   /** The files a node ref's edit could land in: the document, and the page. */
   const filesOf = (anchor, extra = []) => {
     const keys = anchor?.keys || [];
@@ -1059,7 +1087,47 @@ function createAgentApi({
   }
 
   /**
-   * An undo says which files it put back; this says what is in them now.
+   * The files an undo can put back, so an undo can be MEASURED rather than
+   * believed.
+   *
+   * `restored.files` is the history stack's account of itself, and the stack
+   * knows only what the code that pushed an entry chose to record. A page
+   * snapshot records its file. A recorded command records its inverse, and the
+   * two callers that push one do not agree: App.jsx's `recordUndo` — the door
+   * a main-process agent write comes through — derives the list from the bytes
+   * it is holding, while a stylesheet edit records its entry down in the style
+   * panel's own writer, which records the inverse and nothing else. So
+   * `style.set_property` on src/styles/global.css undid perfectly and answered
+   * `restored: {kind:'cmd', files: []}` beside a `document` naming
+   * src/pages/index.astro, the page that happened to be open. Bytes exactly
+   * right, evidence pointing at the wrong file. Measured by a real Claude Code
+   * against a packaged build.
+   *
+   * This is the set the editor's own undo can rewrite: the document on the
+   * canvas and the components it is inside, and every stylesheet in the project
+   * plus every component whose `<style>` reaches the page — which is exactly
+   * what `writeEmbedDoc` writes into. Both listings are the ones the style
+   * panel already runs on every project open, and an undo is a human-scale act,
+   * not a loop.
+   */
+  async function restorableFiles(ctx) {
+    const editing = filesOf(currentAnchor(ctx));
+    const listed = async (channel) => {
+      try {
+        return ((await ctx.callMain(channel, ctx.root))?.files || []).map((f) => f?.rel).filter(Boolean);
+      } catch {
+        // A listing that will not run leaves the stack's own claim standing,
+        // which is where this started; it must not take the undo down with it.
+        return [];
+      }
+    };
+    const styles = [...(await listed('style:listFiles')), ...(await listed('style:listAstroStyles'))];
+    return [...new Set([...editing, ...styles].filter(Boolean))];
+  }
+
+  /**
+   * An undo says which files it put back; this says which ones actually moved,
+   * and what is in them now.
    *
    * The renderer is the only thing that knows which entry came off the stack,
    * and this process is the only thing that can read a file — so the two halves
@@ -1068,21 +1136,35 @@ function createAgentApi({
    * from `document.modelDigest` beside it: content-addressed, so a caller can
    * check a restore against a digest it took before the change.
    *
-   * There is no `beforeDigest` here and it is not missing by accident: which
-   * files an undo will touch is not knowable until it has touched them, so a
-   * before-image would have to be a guess. What this proves is what the files
-   * hold now, which is what a restore is a claim about.
+   * The before-image used to be called unknowable — which files an undo will
+   * touch is not knowable until it has touched them — and that was true only of
+   * a single file. It is knowable of a SET: read the files the editor's undo
+   * can reach either side of the command and the ones that moved are the ones
+   * it put back, whatever the entry remembered to say. So the answer is the
+   * union of what the stack claimed and what the disk shows, and `beforeDigest`
+   * is there for everything this watched.
    */
-  function withRestoreEvidence(answer) {
-    const files = answer?.restored?.files;
-    if (!answer?.ok || !Array.isArray(files) || !files.length) return answer;
+  function withRestoreEvidence(answer, watching = [], before = null) {
+    if (!answer?.ok || !answer.restored || typeof answer.restored !== 'object') return answer;
+    const claimed = Array.isArray(answer.restored.files) ? answer.restored.files.filter(Boolean) : [];
+    const moved = before ? watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel)) : [];
+    const files = [...new Set([...claimed, ...moved])];
+    if (!files.length) return answer;
     return {
       ...answer,
       restored: {
         ...answer.restored,
         files: files.map((file) => {
           const text = readFile(file);
-          return { file, contentDigest: text === null ? null : digestOf(text) };
+          const had = before && before.has(file) ? before.get(file) : undefined;
+          return {
+            file,
+            contentDigest: text === null ? null : digestOf(text),
+            // Only for the files this actually held a before-image of. A
+            // claimed file outside the watched set has no honest answer here,
+            // and `null` already means "there were no bytes".
+            ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
+          };
         }),
       },
     };
@@ -1103,7 +1185,7 @@ function createAgentApi({
    * outside editor, because that is what this is.
    */
   async function mainWithSync(domain, action, args, ctx, op) {
-    if (op.risk === 'read') return runMain(domain, action, args, ctx);
+    if (op.risk === 'read') return ownChangedFiles(await runMain(domain, action, args, ctx));
     const openFile = ctx.payload?.page?.file ? relativeTo(ctx.root, ctx.payload.page.file) : null;
     // Two different lists, for two different questions.
     //
@@ -1119,7 +1201,9 @@ function createAgentApi({
     const named = [...new Set((await touchedBy(domain, action, args, ctx)).filter(Boolean))];
     const watching = [...new Set([...editing, ...named])];
     const before = snapshot(watching);
-    const result = await runMain(domain, action, args, ctx);
+    // Normalised the moment it arrives, so the three returns below spread a
+    // result that cannot collide with the `changedFiles` they stamp.
+    const result = ownChangedFiles(await runMain(domain, action, args, ctx));
     const undone = result.ok === false ? false : await recordUndo(domain, action, args, ctx, op, before, named.length ? named : watching);
     const moved = watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel));
     const reloadNeeded = editing.some((rel) => moved.includes(rel));
@@ -1437,6 +1521,11 @@ function createAgentApi({
         expected = expectationsFor(args, seen);
         if (expected.error) return expected.error;
       }
+      // The before-image, taken while the stack is still holding the entry —
+      // after the command there is nothing left to compare against.
+      const restoring = domain === 'project' && (action === 'undo' || action === 'redo');
+      const watching = restoring ? await restorableFiles(ctx) : [];
+      const beforeRestore = restoring ? snapshot(watching) : null;
       const answer = await command(
         {
           domain,
@@ -1449,7 +1538,7 @@ function createAgentApi({
         },
         action === 'dev_start' ? DEV_START_TIMEOUT_MS : action === 'dev_stop' ? DEV_STOP_TIMEOUT_MS : NAVIGATING_TIMEOUT_MS
       );
-      return withRestoreEvidence(answer);
+      return withRestoreEvidence(answer, watching, beforeRestore);
     }
     return await mainWithSync(domain, action, args, ctx, op);
   }

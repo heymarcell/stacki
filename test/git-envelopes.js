@@ -25,9 +25,27 @@
 // this file can create a repository — the fake has no network and every
 // `repo create` it is given exits non-zero.
 //
+// AND WHETHER THE CLIENT CAN READ THE ENVELOPE AT ALL. An answer that is right
+// and does not validate is not an answer: the MCP SDK checks a tool's
+// structured output against the schema the tool published, and rejects the
+// whole call when it does not fit. `git.restore_project` restored the working
+// tree and reached a real Claude Code as `Output validation error: …
+// changedFiles: Invalid input: expected array, received number` with
+// isError:true and no envelope — a destructive operation that succeeded,
+// reported as a failure, which is an invitation to run it again. So the
+// restore_project case below parses its envelope with the SAME schema the
+// server publishes, `Envelope` from agentTools.js, rather than reading fields
+// off it and hoping.
+//
 // Also here, because it is the same complaint: `project.diagnose` reports a
 // four-valued dev-server verdict whose healthy answer was the word 'unknown',
 // and Stacki knows which package manager a project uses and told nobody.
+//
+// And the content domain's version of the refusal complaint, at the end. A git
+// refusal that echoed `Command failed: <argv>` and a content refusal that
+// echoed `ENOENT: no such file or directory, open '/Users/…'` are one defect
+// wearing two coats: the host's own runtime text, with the host's own absolute
+// paths in it, sent to a client as though it were Stacki speaking.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -35,6 +53,8 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const H = require('./agent-harness.js');
 const { digestOf } = require('../electron/mcp/agent/digest.js');
+const { Envelope } = require('../electron/mcp/agentTools.js');
+const { listEntries, writeEntry } = require('../electron/contentEntries.js');
 
 const failures = [];
 let checked = 0;
@@ -187,6 +207,52 @@ exit 64
       check('  and the file is untouched', read('src/pages/later.astro') === '---\n---\n<p>added after</p>\n');
     }
 
+    // ── restore_project: the tree really goes back, and the answer parses ────
+    //
+    // The order of the checks is the point. The world first — the bytes, and
+    // what git says HEAD is — because a restore that reported beautifully and
+    // restored nothing would pass a test written the other way round. Then the
+    // envelope, against the published schema, because that is the difference
+    // between an answer and an `isError` with nothing in it.
+    {
+      if (git(root, 'status', '--porcelain')) {
+        git(root, 'add', '-A');
+        git(root, 'commit', '-q', '-m', 'clean before restore_project');
+      }
+      const at = git(root, 'rev-parse', 'HEAD');
+      // A file the editor does NOT have open, which is the case that produced
+      // the defect: the count survives into the envelope precisely when no
+      // watched file moved, so dirtying the open page would have hidden it.
+      const CSS = 'src/styles/site.css';
+      const committed = read(CSS);
+      write(CSS, `${committed}\n.wrecked-by-a-test { color: red; }\n`);
+      check('a stylesheet is dirty before the restore', read(CSS) !== committed);
+
+      const env = await run('git', 'restore_project', { ref: at });
+
+      check('restoring the project puts the stylesheet back byte for byte', read(CSS) === committed, short({ now: read(CSS).slice(-80) }));
+      check('  and git says the tree is at that revision', git(root, 'rev-parse', 'HEAD') === at, short({ head: git(root, 'rev-parse', 'HEAD'), at }));
+      check('  with nothing of the edit left in the working tree', !git(root, 'status', '--porcelain').includes('site.css'), short(git(root, 'status', '--porcelain')));
+
+      check('  and it reports that it happened', env.ok === true, short(env));
+      const parsed = Envelope.safeParse(env);
+      check(
+        '  in an envelope the tool’s own published output schema accepts',
+        parsed.success,
+        short(parsed.success ? null : parsed.error.issues)
+      );
+      // The oracle above must be able to fail, or it proves nothing: this is
+      // the exact value the shipped build sent, run through the same schema.
+      check(
+        '  which is a check that can fail — a count on changedFiles is rejected',
+        Envelope.safeParse({ ...env, changedFiles: 0 }).success === false,
+        'the output schema accepts a number where it declares an array'
+      );
+      check('  nothing but the declared array ever sits on changedFiles', env.changedFiles === undefined || Array.isArray(env.changedFiles), short({ changedFiles: env.changedFiles }));
+      check('  and the count it does answer with is kept, under a name that says it is a count', typeof env.changedFileCount === 'number', short({ changedFileCount: env.changedFileCount }));
+      check('  the ref it was asked for comes back', env.ref === at, short({ ref: env.ref, at }));
+    }
+
     // ── delete_branch ────────────────────────────────────────────────────────
     {
       git(root, 'branch', 'spare');
@@ -306,6 +372,83 @@ exit 64
       check('  and not the word that means nothing is wrong by not being any of the others', ready.kind !== 'unknown', short({ kind: ready.kind }));
       check('  and still reports what it found', ready.nodeFound === true && ready.astroVersion === '5.0.0', short(ready));
       fs.rmSync(path.join(root, 'node_modules'), { recursive: true, force: true });
+    }
+
+    // ── the same complaint one domain over: a content refusal in Stacki's
+    //    words, not the host's ────────────────────────────────────────────────
+    //
+    // The git refusals above stopped echoing `Command failed: <argv>`. The
+    // content ones were still echoing Node: `content.cms_read` on a path that
+    // is not there answered with the whole of
+    // `ENOENT: no such file or directory, open '/Users/…/src/data/nope.json'`,
+    // and on a markdown entry or an .astro page — a file whose first line is
+    // `---` — with `No number after minus sign in JSON at position 1
+    // (line 1 column 2)`, the parser talking about a buffer nobody can see.
+    // Both measured over MCP against a packaged build.
+    //
+    // TWO THINGS ARE ASSERTED OF EVERY REFUSAL HERE and they are different: it
+    // must say which file, in the spelling the caller used, and it must contain
+    // no absolute path from this machine. The second is the leak; the first is
+    // what makes the answer worth reading.
+    {
+      const hostPath = (text) => String(text).includes(root) || /(^|[\s'"(])\/(Users|private|var|home)\//.test(String(text));
+
+      const missing = await run('content', 'cms_read', { path: 'src/data/nope.json' });
+      check('reading a data file that is not there is refused', missing.ok === false, short(missing));
+      check('  naming the path the caller used', String(missing.message).includes('src/data/nope.json'), short(missing.message));
+      check('  with no absolute path from this machine anywhere in the answer', !hostPath(JSON.stringify(missing)), short(missing.message));
+      check('  and not in Node’s words', !/ENOENT|no such file or directory/.test(JSON.stringify(missing)), short(missing.message));
+
+      const markdown = await run('content', 'cms_read', { path: 'src/content/notes/first.md' });
+      check('reading a markdown entry as a data file is refused', markdown.ok === false, short(markdown));
+      check('  naming the file', String(markdown.message).includes('src/content/notes/first.md'), short(markdown.message));
+      check('  and saying what the operation does take instead', /cms_list|#export/.test(String(markdown.message)), short(markdown.message));
+      check('  not in the JSON parser’s words', !/minus sign|in JSON at position/.test(JSON.stringify(markdown)), short(markdown.message));
+
+      const page = await run('content', 'cms_read', { path: 'src/pages/index.astro' });
+      check('an .astro page read without naming an export is refused the same way', page.ok === false, short(page));
+      check('  naming the page', String(page.message).includes('src/pages/index.astro'), short(page.message));
+      check('  not in the JSON parser’s words either', !/minus sign|in JSON at position/.test(JSON.stringify(page)), short(page.message));
+
+      // A file that really is JSON and really is broken: the one case where the
+      // parser has something to say, said about a named file and trimmed of the
+      // offsets that are about its own buffer.
+      fs.mkdirSync(path.join(root, 'src', 'data'), { recursive: true });
+      write('src/data/broken.json', '{ "a": 1,,, }\n');
+      const broken = await run('content', 'cms_read', { path: 'src/data/broken.json' });
+      check('a data file that is not valid JSON is refused', broken.ok === false, short(broken));
+      check('  naming the file and saying that is what is wrong', /src\/data\/broken\.json/.test(String(broken.message)) && /valid JSON/.test(String(broken.message)), short(broken.message));
+      check('  without the parser’s character offsets', !/at position \d|line \d+ column \d+/.test(String(broken.message)), short(broken.message));
+      check('  and with no absolute path', !hostPath(JSON.stringify(broken)), short(broken.message));
+      fs.unlinkSync(path.join(root, 'src/data/broken.json'));
+
+      // THE SIBLINGS, called directly. `content.entries` and
+      // `content.write_entry` read files through electron/contentEntries.js,
+      // and both of those reads spelled an fs error straight out — one into a
+      // published `reason`, one into a thrown message that nothing catches
+      // between the write and the wire. They are exercised here rather than
+      // through the API because a content collection needs the project's
+      // dependencies installed to resolve at all, and the leak does not.
+      const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-envelopes-content-'));
+      try {
+        const listed = listEntries(empty, { name: 'team', loader: { kind: 'file', file: './src/data/team.json' } });
+        check('a collection whose data file is gone says so', /src\/data\/team\.json/.test(String(listed.reason)), short(listed.reason));
+        check('  without spelling out where the project is on this machine', !hostPath(String(listed.reason)), short(listed.reason));
+        check('  and without Node’s errno sentence', !/no such file or directory/.test(String(listed.reason)), short(listed.reason));
+
+        let thrown = '';
+        try {
+          writeEntry(empty, { id: 'a', file: 'src/data/gone.json', locator: [], format: 'json' }, [{ path: ['x'], value: 1 }]);
+        } catch (err) {
+          thrown = String(err?.message || err);
+        }
+        check('writing an entry whose file has gone is refused', thrown.length > 0, thrown);
+        check('  naming the entry’s own file', thrown.includes('src/data/gone.json'), thrown);
+        check('  saying nothing was written', /nothing was written/i.test(thrown), thrown);
+        check('  and with no absolute path in it', !hostPath(thrown), thrown);
+      } finally {
+        fs.rmSync(empty, { recursive: true, force: true });
+      }
     }
   } finally {
     await app.stop?.();

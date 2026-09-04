@@ -513,6 +513,74 @@ async function open(extra = {}) {
     check('undoing it names the page', (undoPage.restored?.files || []).map((f) => f.file).includes('src/pages/index.astro'), short(undoPage.restored));
     check('and the class is gone from the file', !app.read('src/pages/index.astro').includes('about-to-be-undone'));
 
+    // THE THIRD WAY A STYLESHEET GETS WRITTEN, and the one the answer was blind
+    // to. `style.write_source` above goes through the main process, which
+    // records its own undo entry and derives the file list from the bytes it is
+    // holding. `style.set_property` does not: it goes through the style panel's
+    // own writer, which records the inverse and nothing else — so the entry
+    // that came off the stack had no files on it and `project.undo` answered
+    // `restored: {kind:'cmd', files: []}` beside a `document` naming the open
+    // page. Bytes exactly right, three times running, evidence pointing at a
+    // file that had not been touched. Measured by a real Claude Code against a
+    // packaged build; the section above passed throughout, because it never
+    // exercised this writer.
+    //
+    // Both kinds are checked here on purpose, and each is checked for the
+    // OTHER'S file as well: an answer that named every file it could think of
+    // would be as useless as one that named none.
+    await H.settle(200);
+    {
+      const page = await run('target', 'read');
+      const grid = page.target.children.find((c) => c.label === 'pricing-grid');
+      // Taken now, off the same read. A style write SELECTS what it wrote for,
+      // so a later `target.read` with no ref answers about the grid rather than
+      // about the page — and the page has not moved, which is what makes a ref
+      // minted here still good after the undo.
+      const hero = page.target.children.find((c) => c.tag === 'Hero');
+      const styles = await run('style', 'read', { ref: grid.ref });
+      const rule = (styles.rules || []).find((r) => r.selector === '.pricing-grid');
+      const gap = rule?.declarations.find((d) => d.property === 'gap');
+      check('the declaration to write through is there', !!gap, short(styles.rules?.map((r) => r.selector)));
+
+      const cssWas = app.read('src/styles/site.css');
+      const pageWas = app.read('src/pages/index.astro');
+      const cssDigestWas = digestOf(cssWas);
+      const set = await run('style', 'set_property', { ref: grid.ref, identity: gap.identity, property: 'gap', value: '4.25rem' });
+      check('a property written through the panel’s own writer lands', set.ok === true, short(set));
+      await H.settle(300);
+      check('and the stylesheet really moved', app.read('src/styles/site.css').includes('4.25rem'), short(app.read('src/styles/site.css').slice(0, 120)));
+
+      const undone = await run('project', 'undo');
+      await H.settle(400);
+      const named = (undone.restored?.files || []).map((f) => f.file);
+      check('undoing it puts the stylesheet back byte for byte', app.read('src/styles/site.css') === cssWas, short(app.read('src/styles/site.css').slice(0, 160)));
+      check('  and the answer names the stylesheet, not the open page', named.includes('src/styles/site.css'), short(undone.restored));
+      check('  and does not name the page it did not touch', !named.includes('src/pages/index.astro'), short(undone.restored));
+      check('  which the open page on disk agrees with', app.read('src/pages/index.astro') === pageWas);
+      const restoredCss = (undone.restored?.files || []).find((f) => f.file === 'src/styles/site.css');
+      check('  with the content digest of what is on disk now', restoredCss?.contentDigest === cssDigestWas, short({ said: restoredCss, real: cssDigestWas }));
+      check('  and the digest of what it replaced, which is not the same', typeof restoredCss?.beforeDigest === 'string' && restoredCss.beforeDigest !== cssDigestWas, short(restoredCss));
+
+      // The model kind, immediately afterwards and on the same stack, so the
+      // two are told apart by what they name rather than by which test ran.
+      const edited = await run('target', 'add_class', { ref: hero.ref, className: 'undo-kind-control' });
+      check('a page edit lands too', edited.ok === true, short(edited));
+      await H.settle(250);
+      const undonePage = await run('project', 'undo');
+      await H.settle(350);
+      const namedPage = (undonePage.restored?.files || []).map((f) => f.file);
+      check('undoing THAT names the page', namedPage.includes('src/pages/index.astro'), short(undonePage.restored));
+      check('  and not the stylesheet it never touched', !namedPage.includes('src/styles/site.css'), short(undonePage.restored));
+      check('  and the class is gone from the file', !app.read('src/pages/index.astro').includes('undo-kind-control'));
+
+      // Put the selection back where this block found it. A style write selects
+      // what it wrote for, and the checks after this one read the LIVE
+      // selection rather than naming a ref — leaving the grid selected would
+      // make them ask about the wrong element.
+      await run('target', 'select', { ref: page.target.ref });
+      await H.settle(200);
+    }
+
     // A rename is two paths, and an undo of one has to name both.
     await H.settle(200);
     const renamed = await run('asset', 'rename', { path: 'public/robots.txt', name: 'robots-renamed.txt' });

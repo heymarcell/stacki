@@ -240,7 +240,18 @@ function fileEntries(projectPath, collection) {
     }
     text = fs.readFileSync(abs, 'utf8');
   } catch (err) {
-    return { entries: [], readOnly: true, reason: `Could not read ${rel} — ${err.message}` };
+    // THE ERRNO, NEVER THE MESSAGE. An fs error spells the ABSOLUTE path out
+    // inside its own text — `ENOENT: no such file or directory, open
+    // '/Users/…/src/data/team.json'` — and this reason is published: it is what
+    // `content.entries` hands an agent as `reason`, so the whole of somebody's
+    // home directory travelled out of the process for a collection whose data
+    // file had been moved. `rel` beside it already names the file, in the
+    // project-relative spelling every other answer uses.
+    return {
+      entries: [],
+      readOnly: true,
+      reason: err?.code === 'ENOENT' ? `${rel} is not in this project.` : `Could not read ${rel} (${err?.code || 'unreadable'}).`,
+    };
   }
 
   let data;
@@ -289,7 +300,21 @@ function planEntryWrite(projectPath, entry, edits, { body } = {}) {
   const abs = path.resolve(projectPath, entry.file);
   const format = formatFor(entry.file);
   if (!format) throw new Error(`Stacki cannot write ${path.extname(entry.file)} files.`);
-  const text = fs.readFileSync(abs, 'utf8');
+  // The same rule as fileEntries above, and it matters more here: this throw is
+  // not caught anywhere between the write and the wire, so an entry whose file
+  // has since been deleted or renamed — a stale entry handed straight back from
+  // an earlier `content.entries` — refused `content.write_entry` with Node's
+  // own `ENOENT: … open '<absolute path>'` as the whole of the message.
+  let text;
+  try {
+    text = fs.readFileSync(abs, 'utf8');
+  } catch (err) {
+    throw new Error(
+      err?.code === 'ENOENT'
+        ? `${entry.file} is not in this project any more. Read the collection again — nothing was written.`
+        : `${entry.file} could not be read (${err?.code || 'unreadable'}). Nothing was written.`
+    );
+  }
 
   const locator = entry.locator || [];
   const prefixed = edits.map((edit) =>
