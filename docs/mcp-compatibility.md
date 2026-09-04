@@ -57,6 +57,55 @@ only the first while sounding like the second.
 | Transport gates (Host, Origin, bearer, single path, no CORS) | — | raw HTTP | **TESTED** | `test/mcp.js` |
 | Request size limit | — | ✅ | **TESTED** | 32 MB, above the largest schema-legal request (a `content.write_entry` measures 11 MB); a body with no `Content-Length` is 411, and the refusal is delivered rather than reset — asserted through `fetch` with the body actually sent, in `test/mcp.js` |
 
+## The official conformance suite
+
+`@modelcontextprotocol/conformance` is the project's own server test framework.
+The version on npm `latest` (0.1.16) knows nothing about 2026-07-28; only the
+alpha does, so **0.2.0-alpha.11** was run with `--requirements 2026-07-28`
+against a real `createStackiMcpServer`. The CLI has no flag for an
+`Authorization` header and Stacki refuses to serve without one, so a proxy in
+front supplied the bearer and forwarded everything else unchanged. The bearer
+gate itself is graded separately, in `test/mcp.js`.
+
+The raw total is **106 passed, 65 failed**, and the raw total is misleading.
+Every failure is one of three things, none of them a conformance defect:
+
+- **A fixture the reference server has and Stacki does not.** The `tools-call-*`,
+  `prompts-get-*` and `resources-read-*` scenarios call tools and read URIs by
+  name — `test_logging_tool`, `test_missing_capability` — that only the
+  everything-server provides. Stacki correctly answers "not found".
+- **A feature Stacki does not implement and does not declare**: the Tasks
+  extension (10 scenarios), MRTR elicitation/sampling/roots, completions,
+  logging, resource templates.
+- **Checks the suite marks `"untestable": true` itself** — twelve of them.
+
+Scenarios Stacki actually implements:
+
+| scenario | result |
+| --- | --- |
+| `server-stateless` | **24 passed**, 4 untestable, 2 skipped |
+| `caching` | **8 passed, 0 failed** |
+| `http-header-validation` | **14 passed, 0 failed** |
+| `tools/list`, `resources/list`, `prompts/list` | **7 passed, 0 failed** |
+| `dns-rebinding-protection` | **2 passed, 0 failed** |
+| `sep-2164-resource-not-found` | **4 passed, 0 failed** |
+
+Two things in that table are worth saying out loud.
+
+**`caching` passes 8/8**, which is the independent check on the cache hints this
+revision added — not Stacki's own test agreeing with Stacki.
+
+**And the two skipped checks in `server-stateless` are the capability fix,
+validated by the suite.** They are
+`ServerSendsToolsListChangedOnSubscription` and its prompts twin, and the
+suite's own note says why each was skipped:
+
+> Server did not declare tools.listChanged capability in server/discover
+
+Before this revision Stacki declared exactly that capability and emitted
+nothing, so those two checks would have RUN — and failed. Declaring the truth is
+what turned them from failures into scenarios that correctly do not apply.
+
 ## What the catalogue actually costs
 
 `tools/list` is 165,135 bytes. That number has been quoted as a context cost,
