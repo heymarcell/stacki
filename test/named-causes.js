@@ -259,6 +259,45 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
         short({ now: git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'), was: before.branches }));
     }
 
+    // ── AND ONE THAT WAS NOT A REFUSAL AT ALL ────────────────────────────────
+    //
+    // Everything above is a refusal that carried the wrong CODE.
+    // `page.dynamic_paths` is worse than that: with no preview running it was
+    // not a refusal at all. Only the dev server can run `getStaticPaths`, so
+    // with nothing to ask it answered `{ok: true, paths: [], problem: null}` —
+    // byte for byte what a page with genuinely no dynamic routes returns.
+    //
+    // This harness has a project and no dev server, which is exactly that
+    // state. A real headless session in this state wrote a confident sentence
+    // about a project it had not measured: "getStaticPaths returned an empty
+    // list (no error reported), so /notes/* builds nothing at the moment",
+    // about a page declaring two routes. An agent cannot be blamed for
+    // believing an `ok: true`.
+    {
+      const dynamicPage = 'src/pages/notes/[slug].astro';
+      fs.mkdirSync(path.join(root, 'src/pages/notes'), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, dynamicPage),
+        '---\nexport function getStaticPaths() {\n  return [{ params: { slug: \'first\' } }, { params: { slug: \'second\' } }];\n}\n---\n<h1>note</h1>\n',
+        'utf8'
+      );
+      const asleep = await run('page', 'dynamic_paths', { path: dynamicPage });
+      check('with no preview, a dynamic route is not reported as standing for nothing', asleep.ok === false, short(asleep));
+      check('  it refuses as no_preview', asleep.code === 'no_preview', short({ code: asleep.code, message: asleep.message }));
+      check('  and says how to get a real answer', /dev_start/.test(String(asleep.message || '')), short(asleep.message));
+      check('  without claiming an empty list of paths', asleep.paths === undefined, short(asleep));
+
+      // POSITIVE CONTROL, and the distinction the fix turns on: a STATIC page
+      // really does stand for no dynamic routes, and that is an answer rather
+      // than a refusal. A change that refused both would pass every check
+      // above.
+      const staticPage = await run('page', 'dynamic_paths', { path: 'src/pages/about.astro' });
+      check('but a STATIC page still answers, because there is nothing to ask about', staticPage.ok === true, short(staticPage));
+      check('  with an empty list and no problem', Array.isArray(staticPage.paths) && staticPage.paths.length === 0 && staticPage.problem === null, short(staticPage));
+
+      fs.rmSync(path.join(root, 'src/pages/notes'), { recursive: true, force: true });
+    }
+
     // ── THE ONE NON-GIT GENERIC ──────────────────────────────────────────────
     //
     // Moving an asset between public/ and src/ is refused because the file's

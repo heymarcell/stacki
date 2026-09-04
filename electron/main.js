@@ -3627,7 +3627,24 @@ async function fetchFromPreview(devUrl, pathAndQuery) {
 // page that can't answer is previewed at its own pattern, exactly as before.
 handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
   const pattern = routeForPage(projectPath, pagePath);
-  if (!pattern.includes('[') || !devUrl) return { entries: [] };
+  // A STATIC PAGE HAS NO DYNAMIC ROUTES. That is an answer.
+  if (!pattern.includes('[')) return { entries: [] };
+  // NOT BEING ABLE TO ASK IS NOT AN ANSWER, and it used to be the same one.
+  //
+  // Only the dev server can run `getStaticPaths`, so with no preview there is
+  // nothing to ask. Both cases returned a bare `{ entries: [] }`, and the MCP
+  // envelope faithfully reported `{ ok: true, paths: [], problem: null }` for
+  // both — so a dynamic route whose preview happened to be off read as a route
+  // that stands for nothing. A real headless session turned exactly that into a
+  // confident sentence about the project: "getStaticPaths returned an empty
+  // list (no error reported), so /notes/* builds nothing at the moment", about
+  // a page that declares two.
+  //
+  // `asked` rather than `error`, deliberately: the Pages panel puts `error` in
+  // front of the person as a dynamic-route failure, and "the preview is off" is
+  // not one. The panel ignores a field it does not read; the agent envelope
+  // turns it into a refusal it can act on.
+  if (!devUrl) return { entries: [], asked: false };
   const rel = toPosix(path.relative(projectPath, pagePath));
   try {
     const res = await fetchFromPreview(devUrl, `/__avb/paths?p=${encodeURIComponent(rel)}`);

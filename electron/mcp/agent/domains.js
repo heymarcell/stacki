@@ -547,7 +547,17 @@ const page = {
     // `{ paths: [], problem: null }` — indistinguishable from a page with no
     // dynamic routes, and from a dev server that had answered 500. The scenario
     // accepted "no paths, or a problem", which this satisfied both ways.
-    result: (raw) => ({ paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null }),
+    result: (raw) => {
+      // "I could not ask" is a refusal, not an empty list. See the handler.
+      if (raw && raw.asked === false) {
+        return problem(
+          'no_preview',
+          'Stacki is not serving this project, so the routes this page stands for cannot be enumerated — ' +
+            'only the dev server can run its getStaticPaths. Start the preview with project.dev_start and ask again.'
+        ).error;
+      }
+      return { paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null };
+    },
   },
 
   injected_routes: {
