@@ -146,6 +146,11 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
     recorder = null;
 
     result.host = {
+      // WHAT THE CHILD WAS AND WAS NOT GIVEN, carried into the results file
+      // rather than left in a comment. `ghCallsDuringTrial` is the one that
+      // matters: a trial that reached the GitHub boundary at all is a finding,
+      // and this is where a reader will look for it.
+      containment: host.containment,
       ok: host.ok,
       turns: host.turns,
       elapsedMs: host.elapsedMs,
