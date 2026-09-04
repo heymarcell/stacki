@@ -171,6 +171,24 @@ const AuditOutput = z.object({
   risk: z.string().optional(),
   mode: z.string().optional(),
   requires: z.string().optional(),
+  // And the argument refusal's own half. `audit` checks its arguments here
+  // rather than letting the host reject them, which is what stopped it
+  // answering a mistyped viewport with a raw protocol sentence -- but the
+  // envelope that fix returns carries `issues`, and a field this schema does
+  // not declare makes a conformant client discard the whole answer. That is the
+  // third time this class has shipped on this branch, and the second time the
+  // fix for one defect introduced it; test/audit-schema-conformance.js is what
+  // caught it, which is the point of that suite.
+  issues: z
+    .array(
+      z.object({
+        path: z.array(z.union([z.string(), z.number()])),
+        message: z.string(),
+        code: z.string().optional(),
+      })
+    )
+    .optional()
+    .describe('Field-level argument complaints, in the {path, message, code} vocabulary the domain tools use.'),
   // The HTTP status, when the route answered with an error page. A 404 renders
   // and could be measured; reporting it under the requested route would describe
   // an error page as if it were the project.

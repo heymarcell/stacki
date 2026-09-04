@@ -508,6 +508,43 @@ const auditWith = ({ axe = axeAnswer(), geometry = quietGeometry, session = clea
     emitted.has('/findings[]/target/selectorMatch') && emitted.has('/findings[]/target/modelPathMatch'),
     short([...emitted].filter((p) => p.startsWith('/findings[]/target')))
   );
+  // THE ARGUMENT REFUSAL, which is a shape the ENGINE never produces and the
+  // TOOL always can. `audit` checks its own arguments rather than letting the
+  // host reject them -- that is what stopped it answering a mistyped viewport
+  // with a raw protocol sentence -- and the envelope that returns carries
+  // `issues`. A field the schema does not declare makes a conformant client
+  // throw away the whole answer, so it is walked here like any other branch,
+  // and it needs no browser to produce.
+  {
+    const { registerAuditTool } = require('../electron/mcp/auditTool.js');
+    // publishChecked passes the handler as registerTool's THIRD argument, and
+    // wraps it in the argument check — so this is the same door a client knocks
+    // on, refusal and all, rather than a re-implementation of it.
+    let call = null;
+    registerAuditTool(
+      { registerTool: (_name, _config, handler) => { call = handler; } },
+      // `checkAccess` answers null for "allowed", and `audit` is called
+      // directly — both are what the positive control below needs to get past
+      // the gate and reach a real run rather than stopping at the refusal.
+      { audit: async () => ({ ok: true, route: '/audit', findings: [] }), api: { gate: {}, checkAccess: () => null } }
+    );
+    check('the audit tool registered a handler to refuse with', typeof call === 'function', typeof call);
+    if (call) {
+      const answer = await call({ route: '/audit', viewports: [{ width: 'wide' }] });
+      const wire = onTheWire(answer?.structuredContent || answer);
+      keyPathsIn(wire, '', emitted);
+      const bad = schemaViolations(wire, published);
+      check('a client could receive the argument refusal', bad.length === 0, short([...new Set(bad)], 400));
+      check('  and it is the refusal, not a run', wire.ok === false && wire.code === 'bad_arguments', short(wire).slice(0, 200));
+      check('  naming the field that was wrong', Array.isArray(wire.issues) && wire.issues.some((i) => (i.path || []).includes('viewports')), short(wire.issues));
+      // Positive control: the same door must still accept a well-formed call,
+      // or "it refuses" would be true of everything.
+      const fine = await call({ route: '/audit', viewports: ['phone'] });
+      const okWire = onTheWire(fine?.structuredContent || fine);
+      check('  while a well-formed call is not refused as bad_arguments', okWire.code !== 'bad_arguments', short(okWire).slice(0, 160));
+    }
+  }
+
   const findingProps = Object.keys(published.properties.findings.items.properties);
   const unexercisedFinding = findingProps.filter((k) => !emitted.has(`/findings[]/${k}`));
   check(
@@ -523,7 +560,10 @@ const auditWith = ({ axe = axeAnswer(), geometry = quietGeometry, session = clea
   // here produces lands in this list and fails the check, which is the forcing
   // function: declare a field, exercise it, or say here why it cannot be.
   const ONLY_OUTSIDE_THIS_SUITE = {
-    operation: 'permission refusal, written by auditTool.js from the gate',
+    // `operation` and `issues` used to be here. The argument refusal above
+    // produces both, so they are exercised rather than excused -- which is the
+    // list working as intended: a field leaves it by being driven, not by being
+    // argued about.
     risk: 'permission refusal',
     mode: 'permission refusal',
     requires: 'permission refusal',
