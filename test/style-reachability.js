@@ -169,6 +169,50 @@ import Base from '../layouts/Base.astro';
 `,
 };
 
+// The alias project (section F). One page, four components: one reached through
+// a tsconfig `paths` alias, one relatively, one nothing imports at all, and one
+// only a dynamic import names.
+const ALIAS_FIXTURE = {
+  'package.json': JSON.stringify({ name: 'alias-fixture', type: 'module', dependencies: { astro: '^5.0.0' } }, null, 2),
+  'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@components/*': ['src/components/*'] } } }, null, 2),
+  'src/styles/site.css': `.pricing-grid {\n  display: grid;\n  gap: 1rem;\n}\n`,
+  'src/layouts/Base.astro': BASE_LAYOUT,
+  'src/components/Aliased.astro': `<span class="aliased">a</span>\n<style>\n  :global(.pricing-grid) { gap: 4rem; }\n</style>\n`,
+  'src/components/Relative.astro': `<span class="rel">r</span>\n<style>\n  :global(.pricing-grid) { letter-spacing: 2px; }\n</style>\n`,
+  'src/components/Orphan.astro': `<span class="orph">o</span>\n<style>\n  :global(.pricing-grid) { word-spacing: 9px; }\n</style>\n`,
+  'src/components/Lazy.astro': `<span class="lazy">l</span>\n<style>\n  :global(.pricing-grid) { text-indent: 9px; }\n</style>\n`,
+  'src/pages/index.astro': `---
+import Base from '../layouts/Base.astro';
+import Aliased from '@components/Aliased.astro';
+import Relative from '../components/Relative.astro';
+import { fade } from 'astro:transitions';
+---
+<Base>
+  <Aliased />
+  <Relative />
+  <div class="pricing-grid">grid</div>
+</Base>
+`,
+};
+
+// The narrowing project (section G). One stylesheet the page loads, one whose
+// only rule for this element is a state rule, one whose rule is testable and
+// simply is not there.
+const NARROW_FIXTURE = {
+  'package.json': JSON.stringify({ name: 'narrow-fixture', type: 'module', dependencies: { astro: '^5.0.0' } }, null, 2),
+  'src/styles/site.css': `.pricing-grid {\n  display: grid;\n  gap: 1rem;\n}\n`,
+  'src/styles/zz-states.css': `.pricing-grid:hover {\n  text-decoration: underline;\n}\n`,
+  'src/styles/zz-ghost.css': `div.pricing-grid {\n  word-spacing: 7px;\n}\n`,
+  'src/layouts/Base.astro': BASE_LAYOUT,
+  'src/pages/index.astro': `---
+import Base from '../layouts/Base.astro';
+---
+<Base>
+  <div class="pricing-grid card-x">grid</div>
+</Base>
+`,
+};
+
 const declsOf = (answer, prop) =>
   (answer.rules || []).flatMap((r) =>
     (r.declarations || []).filter((d) => d.property === prop).map((d) => ({ ...d, rule: r }))
@@ -678,6 +722,254 @@ const declFrom = (answer, file, prop) =>
     } finally {
       eapp.stop();
       H.removeProject(eroot);
+    }
+  });
+
+  // ── F · A DENIAL IS ONLY WORTH THE WALK THAT EARNED IT ────────────────────
+  //
+  // Section B publishes `not-loaded` for a component, and it is the one place
+  // in this whole area where `false` is said out loud. It is earned by an
+  // import walk — and the walk followed RELATIVE specifiers only, then
+  // published the negative half of the result as fact. A page that does
+  // `import Aliased from '@components/Aliased.astro'` — a tsconfig `paths`
+  // alias, which Astro's own docs prescribe — renders that component, Astro
+  // emits its CSS for this page, and its `:global()` rule really does paint the
+  // element. Every sentence in the payload said otherwise, and because the tier
+  // is decided BEFORE the winner, the declaration was cut out of the cascade
+  // and the stylesheet it beats came back `winning: true` for a value the
+  // browser is not using. A false denial is the same defect as a false winner.
+  //
+  // So the project's own aliases are followed, and where the walk still cannot
+  // see — an alias nothing here reads, a dynamic import, the depth cut-off — it
+  // stops publishing negatives at all, which is the choice electron/main.js
+  // already made for the same walk. The controls below are the point: the
+  // orphan must STILL be denied in the ordinary case, or "stop denying" would
+  // pass every check in this section and section B with it.
+
+  await section(async () => {
+    // One project per variant rather than one project rewritten: the walk reads
+    // tsconfig and the page through the app, and re-reading a file the app has
+    // already loaded is a question about the watcher, not about the walk.
+    const readIn = async (overrides) => {
+      const vroot = H.makeProject({ ...ALIAS_FIXTURE, ...overrides });
+      const vapp = await H.start(vroot, { agentMode: 'full' });
+      await H.settle(400);
+      try {
+        const target = await vapp.api.run('target', 'read', {});
+        const el = (target.target.children || []).find((c) => (c.label || '').includes('pricing-grid'));
+        if (!el) throw new Skip('no element');
+        const answer = await vapp.api.run('style', 'read', { ref: el.ref, properties: ['gap'] });
+        const found = {};
+        for (const rule of answer.rules || []) found[rule.source.file] = rule;
+        return found;
+      } finally {
+        vapp.stop();
+        H.removeProject(vroot);
+      }
+    };
+
+    const plain = await readIn({});
+    check(
+      'a component imported through a tsconfig path alias is not denied',
+      plain['src/components/Aliased.astro']?.source.reachedByOpenPage === true &&
+        plain['src/components/Aliased.astro']?.source.reachEvidence === 'loaded',
+      short(plain['src/components/Aliased.astro']?.source)
+    );
+    check(
+      '  so its rule is in the cascade rather than cut out of it',
+      plain['src/components/Aliased.astro'] &&
+        !plain['src/components/Aliased.astro'].declarations.some((d) => d.notInCascade),
+      short(plain['src/components/Aliased.astro']?.declarations)
+    );
+    check(
+      '  and the stylesheet its `gap` overrides is not reported the winner',
+      plain['src/styles/site.css']?.declarations.find((d) => d.property === 'gap')?.winning !== true,
+      short(plain['src/styles/site.css']?.declarations)
+    );
+    // CONTROL ONE: the relative spelling of the same thing, which was always
+    // right. If this goes red the walk has stopped walking.
+    check(
+      'the same component imported relatively is loaded too',
+      plain['src/components/Relative.astro']?.source.reachEvidence === 'loaded',
+      short(plain['src/components/Relative.astro']?.source)
+    );
+    // CONTROL TWO: a component nothing imports is STILL denied — and the page
+    // imports a bare `astro:transitions` alongside, which resolves through
+    // nothing in this project and must not be mistaken for a hole.
+    check(
+      'a component nothing imports is still denied, bare specifiers and all',
+      plain['src/components/Orphan.astro']?.source.reachedByOpenPage === false &&
+        plain['src/components/Orphan.astro']?.source.reachEvidence === 'not-loaded',
+      short(plain['src/components/Orphan.astro']?.source)
+    );
+
+    // AND WHERE THE WALK CANNOT SEE, IT STOPS SAYING `false` AT ALL. Take the
+    // alias away and `@components/Aliased.astro` resolves through nothing here,
+    // so the walk is short by an unknown component and everything it did not
+    // reach goes back to being unproven — the component it names first.
+    const blind = await readIn({ 'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.' } }, null, 2) });
+    check(
+      'with the alias unreadable the component it names is not denied either',
+      blind['src/components/Aliased.astro']?.source.reachedByOpenPage !== false,
+      short(blind['src/components/Aliased.astro']?.source)
+    );
+    check(
+      '  and neither is the orphan, because the walk that would deny it is short',
+      blind['src/components/Orphan.astro']?.source.reachEvidence === 'unproven',
+      short(blind['src/components/Orphan.astro']?.source)
+    );
+
+    // The same, for an import no specifier regex will ever follow.
+    const lazy = await readIn({
+      'src/pages/index.astro': ALIAS_FIXTURE['src/pages/index.astro'].replace(
+        '---\n<Base>',
+        "const Lazy = (await import('../components/Lazy.astro')).default;\n---\n<Base>"
+      ),
+    });
+    check(
+      'a dynamic import() in the page stops the walk denying anything',
+      lazy['src/components/Orphan.astro']?.source.reachEvidence === 'unproven',
+      short(lazy['src/components/Orphan.astro']?.source)
+    );
+  });
+
+  // ── G · WHAT "NOT IN THE BROWSER'S LIST" ACTUALLY PROVES ──────────────────
+  //
+  // Section E narrows `unproven` to `not-loaded` on the served document, and it
+  // is right to: absence from a trustworthy list of the rules that match this
+  // element IS evidence a source is not here. But the list is what
+  // `el.matches(selector)` said about the document AT REST, and two different
+  // facts were being read off it as one.
+  //
+  //   A SELECTOR THAT COULD NOT HAVE APPEARED. `.pricing-grid:hover` matches
+  //   nothing until the pointer is over the element, so it is missing from the
+  //   list of every page that serves it. A stylesheet whose only rule for this
+  //   element is a state rule was told, in the payload, that no import chain
+  //   reaches it — about a sheet the same payload's document was serving.
+  //
+  //   A LIST THAT IS NOT WHOLE. `unreadable === 0` says every sheet was
+  //   readable, not that every rule was read: the collector walks past a rule's
+  //   own declarations when it has nested ones, and past an `@import`ed sheet
+  //   entirely, counting neither. So the list is calibrated against the sources
+  //   this page is already known to load before anything is denied by it.
+  //
+  // Every refusal below has its narrowing control in the same run: the ghost
+  // stylesheet must still be narrowed to `not-loaded` wherever the evidence
+  // really does say so, or "never narrow" would pass this whole section.
+
+  await section(async () => {
+    const mod = await styleModule();
+    if (typeof mod.setCanvasFrame !== 'function') throw new Skip('canvas bridge');
+    const { JSDOM } = require('jsdom');
+    const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    const collector = sliceFunction(preloadSource, 'matchedRulesIn');
+    const producer = sliceProperty(preloadSource, 'documentRules');
+    const cap = Number((preloadSource.match(/const MAX_DOCUMENT_RULES = (\d+);/) || [])[1]);
+    if (!collector || !producer) throw new Skip('preload');
+    const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
+    const reply = new Function('d', 'els', 'document', 'matchedRulesIn', 'MAX_DOCUMENT_RULES', `return ({ ${producer} });`);
+
+    const groot = H.makeProject(NARROW_FIXTURE);
+    const gapp = await H.start(groot, { agentMode: 'full' });
+    await H.settle(300);
+    try {
+      const node = { id: 'served', kind: 'element', name: 'div', props: { class: { type: 'string', value: 'pricing-grid card-x' } }, children: [] };
+      const read = async (css) => {
+        const doc = new JSDOM(
+          `<!doctype html><html><head><style>${css}</style></head><body><div id="el" class="pricing-grid card-x"></div></body></html>`
+        ).window.document;
+        mod.setHost({
+          projectPath: groot, nodes: [node], selectedId: 'served', files: [], astroFiles: [],
+          openFilePath: `${groot}/src/pages/index.astro`, renderedClasses: [], pathOf: null,
+        });
+        mod.setCanvasFrame({
+          postMessage(message) {
+            const el = doc.getElementById('el');
+            const computedProps = {};
+            for (const prop of message.props || []) computedProps[prop] = null;
+            setImmediate(() =>
+              mod.receiveCanvasReply({
+                type: 'avb:query-result', id: message.id, ready: true, found: true,
+                identity: null, matched: {}, computed: {}, computedProps,
+                ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+              })
+            );
+          },
+        });
+        const out = await mod.readStyles(node, { pathOf: () => 'src/pages/index.astro#0.0.0' });
+        mod.setCanvasFrame(null);
+        const found = {};
+        for (const rule of out.rules || []) found[rule.source.file] = rule;
+        return { out, found };
+      };
+
+      // THE DOCUMENT REALLY SERVES BOTH SHEETS — the state rule is in it,
+      // verbatim, and `el.matches` will still never report it.
+      const WHOLE = '.pricing-grid { display: grid; gap: 1rem; } .pricing-grid:hover { text-decoration: underline; }';
+      const whole = await read(WHOLE);
+      check(
+        'the browser reported the at-rest rule and not the state rule',
+        (whole.out.documentRules || []).some((r) => r.selector === '.pricing-grid') &&
+          !(whole.out.documentRules || []).some((r) => /:hover/.test(r.selector)),
+        short(whole.out.documentRules)
+      );
+      check(
+        'a source whose only rule here is a state rule is not denied by an at-rest list',
+        whole.found['src/styles/zz-states.css']?.source.reachEvidence === 'unproven',
+        short(whole.found['src/styles/zz-states.css']?.source)
+      );
+      check(
+        '  so its declaration is not told it is out of the cascade',
+        whole.found['src/styles/zz-states.css'] &&
+          !whole.found['src/styles/zz-states.css'].declarations.some((d) => d.notInCascade),
+        short(whole.found['src/styles/zz-states.css']?.declarations)
+      );
+      // THE CONTROL, in the same answer: a source with a testable selector the
+      // document never reports IS narrowed. Without this the section passes on
+      // a narrowing that never happens.
+      check(
+        'while a testable selector the document never reports still is denied',
+        whole.found['src/styles/zz-ghost.css']?.source.reachEvidence === 'not-loaded' &&
+          whole.found['src/styles/zz-ghost.css']?.source.reachedByOpenPage === false,
+        short(whole.found['src/styles/zz-ghost.css']?.source)
+      );
+
+      // A LIST THAT IS DEMONSTRABLY SHORT. site.css is proved to be on this
+      // page and its `.pricing-grid` is as testable as a selector gets — a list
+      // without it is a list that lost rules for reasons nothing here can see,
+      // which is what the collector's own nesting and @import holes look like
+      // from this side. Nothing may be narrowed by it.
+      const short_ = await read('.card-x { text-indent: 9px; }');
+      check(
+        'a list missing a rule of a stylesheet the page is KNOWN to load narrows nothing',
+        short_.found['src/styles/zz-ghost.css']?.source.reachEvidence === 'unproven',
+        short(short_.found['src/styles/zz-ghost.css']?.source)
+      );
+
+      // AND AN `@import` ANYWHERE IN THIS PAGE'S CSS. It pulls a whole
+      // stylesheet in through a rule with no selector and no `cssRules`, so the
+      // collector walks past it without counting it unreadable — the list is
+      // short by an unknown number of rules and cannot deny anything.
+      gapp.write('src/styles/site.css', `@import "a-package/base.css";\n${NARROW_FIXTURE['src/styles/site.css']}`);
+      await H.settle(250);
+      const imported = await read(WHOLE);
+      check(
+        'an @import in the page\'s own CSS puts the narrowing back to unproven',
+        imported.found['src/styles/zz-ghost.css']?.source.reachEvidence === 'unproven',
+        short(imported.found['src/styles/zz-ghost.css']?.source)
+      );
+      // CONTROL: take it away and the same document narrows the same file again.
+      gapp.write('src/styles/site.css', NARROW_FIXTURE['src/styles/site.css']);
+      await H.settle(250);
+      const back = await read(WHOLE);
+      check(
+        '  and taking it away lets the same document narrow the same file again',
+        back.found['src/styles/zz-ghost.css']?.source.reachEvidence === 'not-loaded',
+        short(back.found['src/styles/zz-ghost.css']?.source)
+      );
+    } finally {
+      gapp.stop();
+      H.removeProject(groot);
     }
   });
 

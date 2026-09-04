@@ -92,6 +92,90 @@ export function variablesIn(value) {
   return [...new Set([...String(value ?? '').matchAll(/var\(\s*(--[\w-]+)/g)].map((m) => m[1]))];
 }
 
+// ─────────────────── @layer, WHICH THE PARSER LEAVES OUT ────────────────────
+//
+// `@layer` is not a conditional group at-rule — a layer always applies — so
+// css.ts walks its block with the PARENT's at-context and the rule arrives at
+// computeRuleModel indistinguishable from an unlayered one. Being later in
+// document order it then WINS compareCascade's tie-break. CSS Cascade 5 says
+// the reverse: layer order is compared BEFORE specificity, and a normal
+// declaration outside every layer beats every layered one.
+//
+// Measured against the shipped Chromium, `.pricing-grid { gap: 1rem }` followed
+// by `@layer base { .pricing-grid { gap: 99px } }` computes to 16px. Stacki
+// reported the 99px `winning: true` and told the 1rem, by file and by selector,
+// that it had lost — to an `overriddenBy` whose source, at-context and selector
+// were byte-identical to its own, because the layer that distinguished them had
+// been erased upstream.
+//
+// The parser is not changed for it. css.ts is the Style panel's parser and the
+// panel is not what is being fixed; what a layer needs is not a different parse
+// but a different ORDER, and the order is decided here — over the same engine,
+// run on partitioned inputs, which is the shape the reachability tiers already
+// use. The layer is read back off the postcss node's own ancestry, which is
+// still in the rule the parser handed over.
+const AT_CONTEXT_NAMES = new Set(['media', 'supports', 'container', 'layer']);
+
+// `@layer { }` is a layer with no name, and two of them are two layers, so the
+// block itself has to be the identity. Keyed off the node so the same block
+// answers the same way in every pass of a read.
+const anonymousLayers = new WeakMap();
+let anonymousLayerCount = 0;
+function layerNameOf(node) {
+  const params = String(node.params || '').trim();
+  if (params) return params;
+  if (!anonymousLayers.has(node)) anonymousLayers.set(node, `anonymous-layer #${++anonymousLayerCount}`);
+  return anonymousLayers.get(node);
+}
+
+/** The `@layer` blocks a node sits inside, outermost first, as dotted names. */
+function layerPathOf(node) {
+  const parts = [];
+  for (let at = node; at && at.type !== 'root'; at = at.parent) {
+    if (at.type !== 'atrule' || String(at.name || '').toLowerCase() !== 'layer') continue;
+    parts.unshift(layerNameOf(at));
+  }
+  return parts;
+}
+
+const contexts = new WeakMap();
+
+/**
+ * The at-rules a rule is written inside, outermost first, LAYERS INCLUDED —
+ * and, separately, the layer it belongs to.
+ *
+ * Rebuilt from the postcss node's own ancestry rather than read off
+ * `rule.atContext`, which css.ts fills with conditional group at-rules only.
+ * Where no layer is involved the two have to agree EXACTLY: an identity is
+ * matched on this list (findRule), so a context that drifted by one string
+ * would refuse every write into a query. So the rebuilt chain is checked
+ * against the parser's own answer, and where they disagree the parser's is
+ * kept and no layer is claimed — a rule whose ancestry cannot be walked is
+ * decided exactly as it was before any of this.
+ */
+function contextOf(rule) {
+  if (!rule) return { atContext: [], layer: null };
+  const cached = contexts.get(rule);
+  if (cached) return cached;
+  const authored = rule.atContext || [];
+  const chain = [];
+  // Starts at the node, not at its parent: css.ts binds a query's own bare
+  // declarations to the at-rule itself, and that rule is inside it.
+  for (let node = rule.node; node && node.type !== 'root'; node = node.parent) {
+    if (node.type !== 'atrule') continue;
+    const name = String(node.name || '').toLowerCase();
+    if (AT_CONTEXT_NAMES.has(name)) chain.unshift(`@${node.name} ${node.params}`.trim());
+  }
+  const conditions = chain.filter((at) => !/^@layer\b/.test(at));
+  const layers = layerPathOf(rule.node);
+  const answer =
+    conditions.join('|') === authored.join('|')
+      ? { atContext: chain, layer: layers.length ? layers.join('.') : null }
+      : { atContext: authored, layer: null };
+  contexts.set(rule, answer);
+  return answer;
+}
+
 /**
  * Where a declaration lives, as something that can be found again.
  *
@@ -103,7 +187,10 @@ export function variablesIn(value) {
 export const declarationIdentity = (rule, prop, sourceDigest = null) => ({
   source: publicKey(rule.embedKey),
   sourceLabel: rule.embedLabel,
-  atContext: rule.atContext || [],
+  // The layer is part of WHERE, not decoration: two rules with one selector in
+  // one file, one of them layered, are two different rules to write into, and
+  // an identity that cannot tell them apart writes into whichever comes first.
+  atContext: contextOf(rule).atContext,
   selector: rule.selectorText,
   property: prop,
   // What the source was when this was read. A rule can still be found in a
@@ -455,12 +542,75 @@ function resolveRel(base, spec) {
   return parts.join('/');
 }
 
+// WHAT A SPECIFIER THAT IS NOT RELATIVE CAN STILL BE.
+//
+// `import Aliased from '@components/Aliased.astro'` is a tsconfig `paths` alias,
+// which Astro's own docs prescribe, and it renders that component: Astro emits
+// its CSS for this page and its `:global()` rule really does paint the element.
+// Skipping the specifier and then publishing the NEGATIVE half of the walk said
+// the opposite of all three, and deleted the declaration from the cascade
+// BEFORE the winner was computed — so the rule the browser was not using came
+// back `winning: true`. A false denial is the same defect as a false winner,
+// one direction over.
+//
+// So the aliases the project declares are read and followed, and where the walk
+// still cannot see — an alias only astro.config knows, a `import()` a regex
+// cannot follow, the depth cut-off — it stops publishing negatives at all,
+// which is the choice main.js already made for the same walk: "Nothing here can
+// prove a file is unreachable … so this answers only the positive half".
+// A bare package name is NOT one of those cases: node_modules holds no project
+// .astro file, so nothing in `rules` can come from one.
+const DYNAMIC_IMPORTS = /\bimport\s*\(|\bAstro\.glob\s*\(|\bimport\.meta\.glob\s*\(/;
+const ALIAS_SHAPES = /^[~#/]/;
+// Extensions that import nothing this walk is looking for. A stylesheet, an
+// image or a JSON blob cannot re-export a component, so passing one by is not
+// a hole; a specifier with no extension at all is.
+const TERMINAL_IMPORT = /\.(css|scss|sass|less|styl|json|svg|png|jpe?g|gif|webp|avif|woff2?|ttf|otf|txt|wasm)(\?[^/]*)?$/i;
+
+/** tsconfig/jsconfig `paths` as [prefix, targets], the trailing `*` stripped. */
+async function projectAliases(root, read) {
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const text = await read(`${root}/${name}`);
+    if (typeof text !== 'string') continue;
+    try {
+      // Config files allow comments and trailing commas; strip both rather than
+      // pull in a JSON5 parser for one field. Same treatment main.js gives them.
+      const paths = JSON.parse(
+        text
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          .replace(/(^|[^:])\/\/.*$/gm, '$1')
+          .replace(/,(\s*[}\]])/g, '$1')
+      )?.compilerOptions?.paths;
+      if (!paths) continue;
+      return Object.entries(paths).map(([prefix, targets]) => [
+        prefix.replace(/\*$/, ''),
+        (Array.isArray(targets) ? targets : [targets]).map((t) => String(t).replace(/^\.\//, '').replace(/\*$/, '')),
+      ]);
+    } catch {
+      // A malformed config means no aliases, not a walk that may be trusted —
+      // the caller treats an unresolved specifier as a hole either way.
+    }
+  }
+  return [];
+}
+
+/** Whether astro.config declares aliases of its own, which nothing here reads. */
+async function hasConfigAliases(root, read) {
+  for (const name of ['astro.config.mjs', 'astro.config.js', 'astro.config.ts', 'astro.config.mts', 'vite.config.ts', 'vite.config.js']) {
+    const text = await read(`${root}/${name}`);
+    if (typeof text === 'string' && /\balias\s*:/.test(text)) return true;
+  }
+  return false;
+}
+
 /**
- * Every .astro file the open page pulls in, transitively.
+ * Every .astro file the open page pulls in, transitively, and whether the walk
+ * that found them was COMPLETE.
  *
  * Null — never an empty set — when the walk could not be done at all: no open
  * file, no bridge, nothing read. "Not proved to reach" and "proved not to
- * reach" are different claims and only the second may be published as `false`.
+ * reach" are different claims and only the second may be published as `false`;
+ * `complete: false` says this walk earned neither.
  */
 async function reachingComponents() {
   const host = getHost();
@@ -476,33 +626,67 @@ async function reachingComponents() {
     const posix = String(p).replace(/\\/g, '/');
     return posix.startsWith(`${root}/`) ? posix.slice(root.length + 1) : posix;
   };
+  const readFile = async (abs) => {
+    const answer = await Promise.resolve(avb.readStyleFile(abs)).catch(() => null);
+    return typeof answer?.css === 'string' ? answer.css : null;
+  };
   const start = relative(host.openFilePath);
+  const aliases = await projectAliases(root, readFile);
+  const configAliases = await hasConfigAliases(root, readFile);
   const seen = new Set();
   const components = new Set();
   let read = 0;
+  // Every place this walk could have missed a component, in one flag: past it,
+  // the set is still the components that DO reach the page, and no longer
+  // evidence about any file outside it.
+  let complete = true;
+  // A Markdown or MDX page names its layout in frontmatter rather than with an
+  // import, and everything that layout renders is reached through it.
+  if (!/\.astro$/i.test(start)) complete = false;
   const visit = async (rel, depth) => {
-    if (depth > REACH_DEPTH || !rel || seen.has(rel)) return;
+    if (!rel || seen.has(rel)) return;
+    if (depth > REACH_DEPTH) {
+      complete = false; // a component deeper than this is reached and unseen
+      return;
+    }
     seen.add(rel);
-    const answer = await Promise.resolve(avb.readStyleFile(`${root}/${rel}`)).catch(() => null);
-    const text = answer?.css;
-    if (typeof text !== 'string') return;
+    const text = await readFile(`${root}/${rel}`);
+    if (typeof text !== 'string') {
+      // main.js's walk shrugs this off because it publishes nothing negative.
+      // Here it is exactly the hole that makes a denial unsound.
+      complete = false;
+      return;
+    }
     read += 1;
+    // `import('./Card.astro')`, `Astro.glob('../components/*.astro')`: real
+    // imports of real components that no specifier regex will ever see.
+    if (DYNAMIC_IMPORTS.test(text)) complete = false;
     const pattern = importSpecifiers();
     const next = [];
     let match;
     while ((match = pattern.exec(text))) {
       const spec = match[1];
-      // Only a relative specifier resolves to a file in this project with
-      // certainty; a bare one goes through node_modules, which is not what this
-      // is measuring.
-      if (!spec.startsWith('.')) continue;
-      const target = resolveRel(rel, spec);
-      if (!target) continue;
+      const target = spec.startsWith('.') ? resolveRel(rel, spec) : resolveAlias(aliases, spec);
+      if (typeof target !== 'string' || !target) {
+        // A bare package name resolves through node_modules, which holds no
+        // file `rules` can name, so skipping it costs nothing. Anything else
+        // that did not resolve — an alias prefix whose target could not be
+        // followed (`false` above), an alias shape, an aliased `.astro`, or any
+        // bare specifier at all in a project that aliases in a config nothing
+        // here reads — could have been a component, and is a hole.
+        if (target === false || ALIAS_SHAPES.test(spec) || /\.astro$/i.test(spec) || (configAliases && !spec.startsWith('.')))
+          complete = false;
+        continue;
+      }
       if (/\.astro$/i.test(target)) {
         components.add(target);
         next.push(target);
       } else if (/\.(jsx?|tsx?|svelte|vue)$/i.test(target)) {
         next.push(target);
+      } else if (!TERMINAL_IMPORT.test(target)) {
+        // No extension, or one this does not know: a barrel file re-exporting a
+        // component resolves through it and is never seen.
+        complete = false;
       }
     }
     for (const child of next) await visit(child, depth + 1);
@@ -510,7 +694,30 @@ async function reachingComponents() {
   await visit(start, 0);
   // The open file itself could not be read, so nothing was walked and nothing
   // can be denied.
-  return read ? components : null;
+  return read ? { components, complete } : null;
+}
+
+/**
+ * A non-relative specifier through the project's own aliases.
+ *
+ * A path when it resolved; `false` when an alias prefix DID match and the
+ * target could not be followed — a hole, not a package; null when no alias
+ * applies, which is what a package name looks like.
+ */
+function resolveAlias(aliases, spec) {
+  let matched = false;
+  for (const [prefix, targets] of aliases) {
+    if (!prefix || !spec.startsWith(prefix)) continue;
+    matched = true;
+    for (const target of targets) {
+      const joined = `${target}${spec.slice(prefix.length)}`.replace(/^\/+/, '');
+      // Only an explicit extension is followed. Guessing one ('' → .astro →
+      // /index.astro, the way a bundler resolves) would take a miss for a
+      // finding, and this walk's negatives are what a miss becomes.
+      if (/\.(astro|jsx?|tsx?|svelte|vue)$/i.test(joined)) return joined;
+    }
+  }
+  return matched ? false : null;
 }
 
 // ─────────────── WHICH RULES THE CASCADE IS ALLOWED TO BE DECIDED OVER ───────
@@ -538,9 +745,13 @@ async function reachingComponents() {
 //
 //   loaded     an import chain from the open page was followed to this source,
 //              or it is a <style> block of the open file itself.
-//   not-loaded the walk RAN and this component is not in the page's module
-//              graph. Astro emits a component's CSS for the pages that import
-//              it, so its `:global()` rules paint nothing here.
+//   not-loaded the walk ran, FOLLOWED EVERY SPECIFIER IT FOUND, and this
+//              component is not in the page's module graph. Astro emits a
+//              component's CSS for the pages that import it, so its `:global()`
+//              rules paint nothing here. A walk with a hole in it — an alias it
+//              could not resolve, a dynamic import, the depth cut-off — says
+//              `unproven` about everything it did not reach instead, because
+//              what it did not reach is then not the same set as what is absent.
 //   unproven   the walk ran and did not arrive here. Not `false` — an @import
 //              inside a package, a Vite plugin or astro.config can load a
 //              stylesheet nothing here can follow — but it is evidence, and a
@@ -593,9 +804,13 @@ function rootedAtPage() {
  */
 async function reachabilityByKey(rules) {
   const page = rootedAtPage();
-  const [reaching, renderedComponents] = page
+  const [reaching, walk] = page
     ? await Promise.all([reachingFiles(), reachingComponents()])
     : [null, null];
+  const renderedComponents = walk ? walk.components : null;
+  // A walk that could have missed a component still proves the ones it found
+  // ARE here; it no longer says anything about the ones it did not.
+  const denies = !!walk?.complete;
   const tiers = new Map();
   for (const rule of rules) {
     const key = rule.embedKey;
@@ -605,7 +820,10 @@ async function reachabilityByKey(rules) {
     if (String(key).startsWith('node:')) tiers.set(key, TIER.loaded);
     else if (reaching && file && reaching.has(file)) tiers.set(key, TIER.loaded);
     else if (String(key).startsWith('astro:') && file && renderedComponents) {
-      tiers.set(key, renderedComponents.has(file) ? TIER.loaded : TIER.absent);
+      tiers.set(
+        key,
+        renderedComponents.has(file) ? TIER.loaded : denies ? TIER.absent : TIER.unproven
+      );
     } else if (reaching || renderedComponents) tiers.set(key, TIER.unproven);
     else tiers.set(key, TIER.unchecked);
   }
@@ -640,27 +858,77 @@ const REACHED_BY_OPEN_PAGE = {
  * Values are not compared, deliberately: the CSSOM hands back `#3355ff` as
  * `rgb(51, 85, 255)`, so a value that does not match is as likely to be the
  * same declaration renormalised as a different one.
+ *
+ * AND "NOT IN THE LIST" IS NOT THE SAME FACT AS "NOT ON THE PAGE". The list is
+ * what `el.matches(selector)` said about the document AT REST, so a rule that
+ * matches nothing at rest is missing from it while being very much on the page:
+ * `.pricing-grid:hover`, `.card::before`, a print sheet. A source whose only
+ * rules for this element are those was being told, in the payload, that no
+ * import chain reaches it. So a selector that could never have appeared is not
+ * read as absent, and a source with no testable selector at all is not judged.
+ *
+ * The other half is that the list itself has to be shown to be complete before
+ * absence from it means anything, and `unreadable === 0` does not show that —
+ * the collector walks past a rule's own declarations when it has nested ones,
+ * and past an `@import`ed sheet entirely, without counting either. So the list
+ * is CALIBRATED first, against the sources this page is already known to load:
+ * every testable rule of a plain stylesheet the walk reached must be in it. One
+ * that is missing means the browser's list is incomplete for reasons this
+ * cannot see, and nothing is narrowed by it.
  */
-function narrowByDocument(tiers, listed, documentRules, unreadable) {
+function narrowByDocument(tiers, listed, documentRules, unreadable, docs) {
   if (!Array.isArray(documentRules) || !documentRules.length) return tiers;
   // A truncated list is not a complete list, and absence in it proves nothing.
   if (unreadable !== 0 || documentRules.length >= MAX_DOCUMENT_RULES) return tiers;
+  // `@import` pulls a whole stylesheet in through a rule that carries no
+  // selector and no `cssRules`, so the collector walks past it without counting
+  // it unreadable. One anywhere in this page's own CSS and the list is missing
+  // an unknown number of rules — which is exactly the case `unproven` is for.
+  if ((docs || []).some((doc) => /@import\b/.test(String(doc.code || '')))) return tiers;
+
   const served = new Set(documentRules.map((r) => normalizeSelector(r.selector)));
+  const inList = (entry) =>
+    served.has(normalizeSelector(entry.rule.selectorText)) ||
+    entry.matchedSelectors.some((sel) => served.has(normalizeSelector(sel.text)));
+  // A rule the browser could have reported: something about it matches this
+  // element with the document as it stands, no pointer and no pseudo-element.
+  const testable = (entry) =>
+    !UNTESTABLE_AT_REST.test(entry.rule.selectorText) ||
+    entry.matchedSelectors.some((sel) => !UNTESTABLE_AT_REST.test(sel.text));
+
+  // CALIBRATION. Astro rewrites a component's scoped selectors on the way into
+  // the document and a <style> block is scoped the same way, so neither is a
+  // fair control; a plain stylesheet is served with its selectors intact.
+  for (const entry of listed) {
+    if (tiers.get(entry.rule.embedKey) !== TIER.loaded) continue;
+    if (!String(entry.rule.embedKey).startsWith('file:')) continue;
+    if (testable(entry) && !inList(entry)) return tiers;
+  }
+
   // Every selector this source aims at this element, so one rule that IS served
-  // keeps the whole source.
+  // keeps the whole source — and a source with nothing testable is not judged.
   const seen = new Map();
   for (const entry of listed) {
     const key = entry.rule.embedKey;
     if (tiers.get(key) !== TIER.unproven) continue;
-    const hit =
-      served.has(normalizeSelector(entry.rule.selectorText)) ||
-      entry.matchedSelectors.some((sel) => served.has(normalizeSelector(sel.text)));
-    seen.set(key, (seen.get(key) ?? false) || hit);
+    if (!testable(entry)) continue;
+    seen.set(key, (seen.get(key) ?? false) || inList(entry));
   }
   const narrowed = new Map(tiers);
   for (const [key, hit] of seen) if (!hit) narrowed.set(key, TIER.absent);
   return narrowed;
 }
+
+// Selectors whose match depends on something other than the document at rest —
+// where the pointer is, what has focus, what the user typed — plus every
+// pseudo-element, which matches no element at all. `el.matches` answers these
+// against the moment it is asked, so their absence from the browser's list is a
+// fact about that moment and not about which stylesheets the page loaded.
+// Structural pseudo-classes (`:first-child`, `:not()`, `:nth-child()`) are
+// deliberately NOT here: they are decided by the document as it stands, so the
+// browser's answer for them is as good as for a class.
+const UNTESTABLE_AT_REST =
+  /::|:(?:hover|focus|focus-visible|focus-within|active|target|target-within|visited|link|any-link|checked|indeterminate|placeholder-shown|autofill|user-invalid|user-valid|open|popover-open|modal|fullscreen|picture-in-picture|playing|paused|seeking|buffering|stalled|muted|volume-locked|current|past|future)\b/i;
 
 // The preload's own cap on how many matching rules the served document reports
 // (electron/preload.js, MAX_DOCUMENT_RULES). Mirrored rather than imported —
@@ -686,16 +954,201 @@ async function cascadeTiers(rules, target, viewport, tiers, listing) {
   const tierOf = (rule) => tiers.get(rule.embedKey) || TIER.unchecked;
   const anyAbsent = rules.some((rule) => tierOf(rule) === TIER.absent);
   const anyUnproven = rules.some((rule) => tierOf(rule) === TIER.unproven);
-  // Nothing was held back, so the listing pass already IS both answers. The
-  // ordinary project — every stylesheet imported, no orphaned component —
-  // takes this path and pays for one pass, as it always did.
-  const open = anyAbsent
-    ? await computeRuleModel(rules.filter((rule) => tierOf(rule) !== TIER.absent), target, { viewport })
-    : listing;
-  const confident = anyUnproven
-    ? await computeRuleModel(rules.filter((rule) => tierOf(rule) !== TIER.absent && tierOf(rule) !== TIER.unproven), target, { viewport })
-    : open;
-  return { open: statusIndex(open), confident: statusIndex(confident) };
+  const present = (rule) => tierOf(rule) !== TIER.absent;
+  const proved = (rule) => present(rule) && tierOf(rule) !== TIER.unproven;
+
+  // A project with no `@layer` anywhere is decided exactly as it was, over one
+  // engine pass per answer — which is every project the panel has ever seen.
+  if (!rules.some((rule) => contextOf(rule).layer !== null)) {
+    // Nothing was held back, so the listing pass already IS both answers. The
+    // ordinary project — every stylesheet imported, no orphaned component —
+    // takes this path and pays for one pass, as it always did.
+    const open = anyAbsent ? await computeRuleModel(rules.filter(present), target, { viewport }) : listing;
+    const confident = anyUnproven ? await computeRuleModel(rules.filter(proved), target, { viewport }) : open;
+    return { open: statusIndex(open), confident: statusIndex(confident) };
+  }
+
+  // Layer order is a fact about the stylesheets, not about the subset of them a
+  // given answer is decided over, so it is taken once over all of them and both
+  // passes sort against the same table.
+  const ranks = layerRanks(rules);
+  const open = await layeredStatus(rules.filter(present), target, viewport, ranks);
+  const confident = anyUnproven ? await layeredStatus(rules.filter(proved), target, viewport, ranks) : open;
+  return { open, confident };
+}
+
+/**
+ * The order the layers were declared in, earliest first.
+ *
+ * A layer's position is where its NAME first appears, and that can be a block
+ * or a bare `@layer a, b;` statement — the form Tailwind and most design
+ * systems open with, and the one css.ts drops entirely because it declares no
+ * rules. `rule.order` is the panel's own document sequence, the same number
+ * compareCascade already breaks its ties on, so nothing new is assumed here
+ * about which stylesheet comes first.
+ */
+function layerRanks(rules) {
+  const ranks = new Map();
+  const roots = new Set();
+  const note = (name) => {
+    if (name && !ranks.has(name)) ranks.set(name, ranks.size);
+  };
+  for (const rule of [...rules].sort((a, b) => a.order - b.order)) {
+    const root = typeof rule.node?.root === 'function' ? rule.node.root() : null;
+    if (root && !roots.has(root)) {
+      roots.add(root);
+      root.walkAtRules('layer', (at) => {
+        if (at.nodes) return; // a block; its own rules place it below
+        const enclosing = layerPathOf(at.parent);
+        for (const part of String(at.params || '').split(',')) {
+          const name = part.trim();
+          if (name) note([...enclosing, name].join('.'));
+        }
+      });
+    }
+    note(contextOf(rule).layer);
+  }
+  return ranks;
+}
+
+/**
+ * The cascade over one set of rules, decided across its layers.
+ *
+ * The engine is run once per layer — over that layer's rules and nothing else,
+ * so within a partition it is deciding exactly what it was built to decide, by
+ * importance then specificity then document order. What it cannot see is the
+ * comparison that comes BEFORE specificity, and that is the only thing added
+ * here: among the winners its passes produced, which layer's wins.
+ */
+async function layeredStatus(rules, target, viewport, ranks) {
+  const partitions = new Map();
+  for (const rule of rules) {
+    const layer = contextOf(rule).layer;
+    if (!partitions.has(layer)) partitions.set(layer, []);
+    partitions.get(layer).push(rule);
+  }
+  const models = [];
+  for (const [layer, list] of partitions) {
+    models.push({
+      layer,
+      rank: layer === null ? null : (ranks.get(layer) ?? ranks.size),
+      model: await computeRuleModel(list, target, { viewport }),
+    });
+  }
+  return composeLayers(models);
+}
+
+/**
+ * Which of two would-be winners CSS Cascade 5 puts first. Negative: `a` wins.
+ *
+ * Importance outranks everything. Then the layer, in the two directions the
+ * spec gives it: a NORMAL declaration outside every layer beats every layered
+ * one and a later layer beats an earlier one, while `!important` reverses both
+ * — an important declaration in the FIRST layer beats every other author rule
+ * on the page. Specificity and document order never appear here; the engine
+ * settled those inside each partition before this is asked.
+ */
+function strongerCandidate(a, b) {
+  if (a.important !== b.important) return a.important ? -1 : 1;
+  const aFree = a.layer === null;
+  const bFree = b.layer === null;
+  if (aFree !== bFree) return (a.important ? bFree : aFree) ? -1 : 1;
+  if (a.rank === b.rank) return 0;
+  return a.important ? a.rank - b.rank : b.rank - a.rank;
+}
+
+/** The `overriddenBy` shape for a rule, before publicKey — the engine's own. */
+const originFrom = (rule) => ({
+  selector: rule.selectorText,
+  atContext: contextOf(rule).atContext,
+  source: rule.embedKey,
+  sourceLabel: rule.embedLabel,
+});
+
+const rawOriginKey = (o) => `${o.source}|${(o.atContext || []).join('|')}|${o.selector}`;
+
+/**
+ * One status index over several layer partitions.
+ *
+ * Each partition's own statuses are kept — resolved/applies/appliesWhen are
+ * facts about a rule and its query, and no layer changes them — and only the
+ * cascade verdict is decided again across them. A declaration that won its own
+ * partition but not the page is told so by name: `overriddenBy` is the rule
+ * that actually paints the property, which is the sentence that was untrue.
+ */
+function composeLayers(models) {
+  const held = new Map(); // declId → { status, prop, part }
+  const champions = new Map(); // prop → candidate
+  const contests = new Map(); // prop → Map(originKey → origin)
+  const undecidable = [];
+  const contest = (prop, origin) => {
+    if (!contests.has(prop)) contests.set(prop, new Map());
+    contests.get(prop).set(rawOriginKey(origin), origin);
+  };
+
+  for (const part of models) {
+    for (const entry of [...part.model.base, ...part.model.conditional]) {
+      for (const decl of entry.rule.declarations) {
+        const status = entry.declStatus?.[decl.declId];
+        if (!status) continue;
+        held.set(decl.declId, { status, prop: decl.prop, part });
+        for (const by of status.contestedBy || []) contest(decl.prop, by);
+        const candidate = {
+          declId: decl.declId,
+          important: !!decl.important,
+          layer: part.layer,
+          rank: part.rank,
+          rule: entry.rule,
+        };
+        if (status.resolved && status.winning) {
+          const standing = champions.get(decl.prop);
+          if (!standing || strongerCandidate(candidate, standing) < 0) champions.set(decl.prop, candidate);
+        } else if (
+          !status.resolved &&
+          status.applies === null &&
+          entry.kind === 'at-rule' &&
+          entry.matchedSelectors.some((sel) => !UNTESTABLE_AT_REST.test(sel.text))
+        ) {
+          undecidable.push({ ...candidate, prop: decl.prop, entry });
+        }
+      }
+    }
+  }
+
+  // A query nobody could decide contests the winner, and the engine already
+  // says so WITHIN a partition. Across one it cannot: an undecidable `@media`
+  // in a layer that would outrank the winner is the same uncertainty, and the
+  // pass that found it had no winner of its own to hang it on.
+  for (const rule of undecidable) {
+    const champion = champions.get(rule.prop);
+    if (!champion || champion.layer === rule.layer) continue;
+    if (strongerCandidate(rule, champion) > 0) continue; // it could not win even if it applied
+    contest(rule.prop, originFrom(rule.rule));
+  }
+
+  const index = new Map();
+  for (const [declId, { status, prop }] of held) {
+    const champion = champions.get(prop);
+    if (!status.resolved || !champion) {
+      index.set(declId, status);
+      continue;
+    }
+    if (champion.declId === declId) {
+      const rivals = [...(contests.get(prop) || new Map()).values()].filter(
+        (origin) => rawOriginKey(origin) !== rawOriginKey(originFrom(champion.rule))
+      );
+      index.set(declId, { ...status, winning: true, overriddenBy: null, overriddenByOrigin: null, contestedBy: rivals.length ? rivals : null });
+      continue;
+    }
+    index.set(declId, {
+      ...status,
+      winning: false,
+      overriddenBy: champion.rule.selectorText,
+      overriddenByOrigin: originFrom(champion.rule),
+      contestedBy: null,
+    });
+  }
+  return index;
 }
 
 /** Declaration id → its status in one model. declIds are seeded per source, so
@@ -882,7 +1335,8 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
     await reachabilityByKey(parsed),
     all,
     documentRules,
-    runtime.available === true ? runtime.unreadableStyleSheets : null
+    runtime.available === true ? runtime.unreadableStyleSheets : null,
+    docs
   );
   const { open, confident } = await cascadeTiers(parsed, target, viewport, tiers, model);
 
@@ -930,7 +1384,10 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
       label: entry.label,
       kind: entry.kind,
       conditional: !!entry.conditional,
-      atContext: rule.atContext || [],
+      // Layers included — see contextOf. `conditional` above stays the engine's
+      // answer, which is the right one: a layer is not a condition, it always
+      // applies, and only the ORDER it applies in is different.
+      atContext: contextOf(rule).atContext,
       nested: rule.nestedDisplay || null,
       // A `:global()` rule read out of a scoped block is offered for reading
       // and cannot be written back through the component (see webflow.ts), so
@@ -1127,7 +1584,9 @@ function findRule(rules, identity) {
       (rule) =>
         rule.embedKey === want &&
         rule.selectorText.trim() === String(identity.selector || '').trim() &&
-        (rule.atContext || []).join(' › ') === wantContext
+        // The same list declarationIdentity published, layer included — the two
+        // must be read through one function or a write lands in the wrong rule.
+        contextOf(rule).atContext.join(' › ') === wantContext
     ) || null
   );
 }

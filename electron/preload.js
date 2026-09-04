@@ -1670,14 +1670,31 @@ if (!process.isMainFrame) {
         continue;
       }
       const where = (sheets[i].href && String(sheets[i].href)) || 'inline <style>';
+      // The at-rule's own kind, from the interface the engine gave it. A
+      // grouping rule Stacki does not know is named by whatever it carries
+      // rather than guessed at.
+      const groupLabel = (rule) => {
+        const kind = rule.constructor && rule.constructor.name;
+        if (kind === 'CSSMediaRule') return `@media ${(rule.media && rule.media.mediaText) || ''}`.trim();
+        if (kind === 'CSSSupportsRule') return `@supports ${rule.conditionText || ''}`.trim();
+        if (kind === 'CSSContainerRule') return `@container ${rule.conditionText || ''}`.trim();
+        if (kind === 'CSSLayerBlockRule') return `@layer ${rule.name || ''}`.trim();
+        if (kind === 'CSSScopeRule') return `@scope ${rule.conditionText || ''}`.trim();
+        return rule.conditionText ? `@${rule.name || ''} ${rule.conditionText}`.trim() : '';
+      };
       const walk = (list, atContext) => {
         for (let j = 0; j < list.length && out.length < limit; j++) {
           const rule = list[j];
           const nested = rule.cssRules;
           if (nested && nested.length) {
-            const condition =
-              rule.conditionText || (rule.media && rule.media.mediaText) || '';
-            walk(nested, condition ? atContext.concat(`@${rule.name || 'media'} ${condition}`) : atContext);
+            // NAMED BY ITS OWN TYPE, not by whether it happens to carry `.name`.
+            // Only CSSLayerBlockRule and CSSKeyframesRule have one, so
+            // `@${rule.name || 'media'}` published every @supports and every
+            // @container to an agent as `@media` — a condition it would then
+            // reason about as a width, and a query it could not find in the
+            // file it was told to edit.
+            const label = groupLabel(rule);
+            walk(nested, label ? atContext.concat(label) : atContext);
             continue;
           }
           const selector = rule.selectorText;

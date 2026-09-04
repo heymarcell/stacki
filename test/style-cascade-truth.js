@@ -187,6 +187,51 @@ import Card from '../components/Card.astro';
 `,
 };
 
+// The stylesheet in the @layer section below, verbatim. It is loaded in the
+// browser Stacki ships and read with getComputedStyle before it is asserted
+// against here — six properties, six different ways layer order and the
+// cascade interact, and the measured answers are in the section's own comment.
+const LAYERS = `@layer utilities, base;
+
+.t { column-gap: 1rem; }
+@layer base { .t { column-gap: 99px; } }
+
+@layer alpha { .t { row-gap: 99px; } }
+.t { row-gap: 2rem; }
+
+@layer one { .t { letter-spacing: 1px; } }
+@layer two { .t { letter-spacing: 7px; } }
+
+.t { word-spacing: 3px; }
+@layer base { .t { word-spacing: 11px !important; } }
+
+@layer base { div.t.t { padding: 30px; } }
+.t { padding: 4px; }
+
+@layer base { .t { text-indent: 5px; } }
+@layer utilities { .t { text-indent: 40px; } }
+
+.t { opacity: 0.5 !important; }
+@layer base { .t { opacity: 0.25 !important; } }
+`;
+
+const LAYER_FIXTURE = {
+  'package.json': JSON.stringify({ name: 'layer-fixture', type: 'module', dependencies: { astro: '^5.0.0' } }, null, 2),
+  'src/styles/layers.css': LAYERS,
+  'src/layouts/Base.astro': `---
+import '../styles/layers.css';
+---
+<html lang="en"><head><title>Layers</title></head><body><slot /></body></html>
+`,
+  'src/pages/index.astro': `---
+import Base from '../layouts/Base.astro';
+---
+<Base>
+  <div class="t">t</div>
+</Base>
+`,
+};
+
 class Skip extends Error {}
 
 // A section whose subject does not exist yet must report every OTHER section's
@@ -1088,6 +1133,127 @@ ul.grid { gap: 1rem; }
     check('`not` inverts a decided answer and not an undecided one', atContextApplies(['@media not print'], { width: 800 }) === true && atContextApplies(['@media not (prefers-reduced-motion)'], { width: 800 }) === null);
     check('every level of the nesting has to hold', atContextApplies(['@media (min-width: 50em)', '@supports (display: grid)'], { width: 1200 }) === null);
     check('and nothing is decided without a viewport', atContextApplies(['@media (min-width: 50em)'], null) === null);
+  });
+
+  // ── @layer: THE ORDER THE PARSER CANNOT SEE ───────────────────────────────
+  //
+  // `@layer` is not a conditional group at-rule, so css.ts walks its block with
+  // the parent's at-context and the rule arrives at the cascade engine looking
+  // unlayered. Later in document order, it then won the tie-break — and CSS
+  // Cascade 5 says the exact reverse: layer order is compared BEFORE
+  // specificity, and a normal declaration outside every layer beats every
+  // layered one. `style.read` answered `gap: 99px winning: true` for a
+  // declaration the browser was not using, told the one it WAS using that it
+  // had lost, and named as the winner an `overriddenBy` whose source, selector
+  // and at-context were byte-identical to the loser's own.
+  //
+  // THE ORACLE IS THE SHIPPED CHROMIUM, not this file's model of the spec.
+  // Every value below was measured by loading LAYERS verbatim in the browser
+  // Stacki ships (Chrome/130.0.6723.191) and reading getComputedStyle:
+  //
+  //   column-gap  16px  the unlayered 1rem, not the layered 99px
+  //   row-gap     32px  the unlayered 2rem, though the layer is authored FIRST
+  //   letter-spacing 7px  no unlayered rule sets it, so the LATER layer wins
+  //   word-spacing  11px  !important in a layer beats an unlayered normal
+  //   padding      4px  a layered `div.t.t` does not out-specify an unlayered `.t`
+  //   text-indent   5px  `@layer utilities, base;` orders them, not the blocks
+  //   opacity      0.25 !important REVERSES it — the layered one beats the free one
+  //
+  // The last four are the positive controls: a blanket "a layered declaration
+  // never wins" passes the first two and fails every one of them.
+
+  await section(async () => {
+    const lroot = H.makeProject(LAYER_FIXTURE);
+    const lapp = await H.start(lroot, { agentMode: 'full' });
+    await H.settle(400);
+    try {
+      const lpage = await lapp.api.run('target', 'read', {});
+      const el = (lpage.target.children || []).find((c) => (c.label || '') === 't');
+      check('the layer fixture has the element this section is about', !!el, short((lpage.target.children || []).map((c) => c.label || c.tag)));
+      if (!el) throw new Skip('no element');
+      const answer = await lapp.api.run('style', 'read', { ref: el.ref });
+      check('style.read answers about it', answer.ok === true, short(answer));
+
+      const winnersOf = (prop) => declsOf(answer, prop).filter((d) => d.winning === true);
+      const winner = (prop) => winnersOf(prop)[0] || null;
+      for (const [prop, value, why] of [
+        ['column-gap', '1rem', 'an unlayered declaration beats a layered one'],
+        ['row-gap', '2rem', '  and does so whichever is authored first'],
+        ['letter-spacing', '7px', '  while between two layers the later one wins'],
+        ['word-spacing', '11px !important', '  and !important inside a layer beats an unlayered normal declaration'],
+        ['padding', '4px', '  and specificity does not rescue a layered rule'],
+        ['text-indent', '5px', '  and `@layer utilities, base;` orders the layers, not their blocks'],
+        ['opacity', '0.25 !important', '  and between two !important declarations the layer order runs the OTHER way'],
+      ]) {
+        const declared = `${winner(prop)?.value ?? null}${winner(prop)?.important ? ' !important' : ''}`;
+        check(
+          `${why} — ${prop} is ${value}, which is what the browser computes`,
+          winner(prop) && declared === value,
+          short({ winners: winnersOf(prop).map((d) => `${d.rule.atContext.join(' ')} ${d.value}`) })
+        );
+        check(
+          `  and exactly one declaration of ${prop} says it wins`,
+          winnersOf(prop).length === 1,
+          short(declsOf(answer, prop).map((d) => [d.rule.atContext, d.value, d.winning]))
+        );
+      }
+
+      // THE LOSER IS TOLD WHAT BEAT IT, AND IT IS NOT ITSELF. Both halves of the
+      // pair are `.t` in one file; without the layer in the at-context the
+      // sentence was ".t in layers.css was overridden by .t in layers.css".
+      const layered = declsOf(answer, 'column-gap').find((d) => (d.rule.atContext || []).some((at) => /^@layer /.test(at)));
+      check('the layered declaration is reported overridden', layered && layered.winning === false, short(layered && { at: layered.rule.atContext, winning: layered.winning }));
+      check('  and the layer it is in is in the at-context the answer publishes', layered && layered.rule.atContext.includes('@layer base'), short(layered && layered.rule.atContext));
+      check('  and it is told which rule beat it', layered && layered.overriddenBy && layered.overriddenBy.selector === '.t', short(layered && layered.overriddenBy));
+
+      // GLOBALLY, over every declaration in both answers this file reads: a
+      // rule cannot override itself. Same source, same at-context, same
+      // selector is not a cascade result, it is a rule that was compared
+      // against a copy of itself — which is what an erased at-rule produces.
+      for (const [what, payload] of [['the layer answer', answer], ['the fixture answer', gridStyles]]) {
+        const selfBeaten = (payload.rules || []).flatMap((r) =>
+          (r.declarations || [])
+            .filter(
+              (d) =>
+                d.overriddenBy &&
+                d.overriddenBy.source === r.source.key &&
+                (d.overriddenBy.atContext || []).join('|') === (r.atContext || []).join('|') &&
+                d.overriddenBy.selector === r.selector
+            )
+            .map((d) => ({ selector: r.selector, at: r.atContext, prop: d.property, by: d.overriddenBy }))
+        );
+        check(`nothing in ${what} is overridden by a rule identical to itself`, selfBeaten.length === 0, short(selfBeaten));
+      }
+      // AND THE IDENTITY THE ANSWER HANDS BACK STILL FINDS ITS OWN RULE.
+      // The at-context is what a write is matched on, so putting the layer into
+      // it moves the target: two `.t` rules in one file, one of them layered,
+      // were one address before and are two now. The oracle is the bytes.
+      const target = declsOf(answer, 'column-gap').find((d) => (d.rule.atContext || []).includes('@layer base'));
+      check('the layered declaration carries an identity to write through', !!target?.identity, short(target?.identity));
+      if (target) {
+        const wrote = await lapp.api.run('style', 'set_property', {
+          ref: el.ref,
+          identity: target.identity,
+          property: 'column-gap',
+          value: '77px',
+        });
+        check('  and writing through it is accepted', wrote.ok === true, short(wrote));
+        const onDisk = lapp.read('src/styles/layers.css');
+        check(
+          '  the layered rule is the one that changed on disk',
+          /@layer base \{ \.t \{ column-gap: 77px; \} \}/.test(onDisk),
+          short(onDisk.split('\n').filter((l) => /column-gap/.test(l)))
+        );
+        check(
+          '  and the unlayered rule of the same selector was left alone',
+          /\.t \{ column-gap: 1rem; \}/.test(onDisk),
+          short(onDisk.split('\n').filter((l) => /column-gap/.test(l)))
+        );
+      }
+    } finally {
+      lapp.stop();
+      H.removeProject(lroot);
+    }
   });
 
   // ── F16b, the half that needs a real CSSOM ────────────────────────────────
