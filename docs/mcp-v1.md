@@ -345,6 +345,31 @@ your own timeouts accordingly.
 
 ---
 
+## 7b. The extensions, and why none of them is adopted
+
+Extensions became a formal mechanism (SEP-2133, merged January 2026) and there
+are three official families. Each was evaluated against what Stacki actually is
+and what its measured hosts actually do, rather than against how modern it would
+look to support them.
+
+| extension | status today | decision | why |
+| --- | --- | --- | --- |
+| **Tasks** | Final spec, Stable schema | **not applicable** | Zero tracked host support — the project's own cross-client matrix has no row for it — and no runtime in `@modelcontextprotocol/server` 2.0.0, which is current. SEP-2663 forbids returning a `CreateTaskResult` to a client that did not declare the capability, so an implementation nothing speaks to is dead code by construction. And the problem it solves is not one Stacki has: the audit runs in tens of seconds, inside Claude Code's 60 s request timer, its 2-minute auto-background threshold and its 5-minute idle window. |
+| **Apps (UI)** | Final, real multi-vendor adoption | **not applicable** | It renders an iframe inside somebody else's chat transcript. Stacki already *is* the UI — the audit's findings and screenshots render in its own windows — and the app would be sandboxed away from them anyway, round-tripping every action back through `tools/call`. Claude Code, the host this is measured against, renders nothing. This would be a new product surface (a Stacki panel inside a chat client), not an improvement to this one. |
+| **Skills over MCP** | draft PR, "not official" banner | **prepare a seam, do not adopt** | Two wire-breaking realignments in three months, one prerelease client, and install-scope only. Stacki is well placed if it lands — `stacki://guide/<topic>` already serves exactly the artefact the SEP standardises, static machine-invariant markdown in the progressive-disclosure shape — so adopting later costs a URI scheme and two methods. Adopting now would mean tracking a moving draft in shipped code. |
+
+The rule this follows: an extension is worth adopting when a host Stacki
+actually runs against consumes it and it solves a problem Stacki actually has.
+None of the three currently clears both bars, and a count of supported
+extensions is not a measure of anything.
+
+**One residual this evaluation surfaced**, recorded rather than dismissed: an
+audit that ever exceeded five minutes would be aborted by Claude Code's HTTP
+idle timeout, because Stacki sends no progress notifications. The audit's p95
+wall time across the widest viewport set has not been measured. The
+proportionate answer if it ever matters is a progress notification, which is
+core protocol — not the Tasks extension.
+
 ## 8. What may still change
 
 v1 is a promise about behaviour, not a freeze.
