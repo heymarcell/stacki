@@ -353,9 +353,27 @@ function act(input = {}) {
   return result.ok ? { ...result, review: reviewOf(result.thread), revision: store.revision } : result;
 }
 
-/** One review, in full, with everything this checkout can say about it. */
+/**
+ * One review, in full, with everything this checkout can say about it.
+ *
+ * `localId` IS NOT OPTIONAL HERE, and leaving it off inverted the trust
+ * boundary. `originOf(actor, localId)` short-circuits — `if (!actor.actorId ||
+ * !localId) return 'local_human'` — so calling `detail` with three arguments
+ * labelled EVERY human-authored review `local_human`, including one that
+ * arrived from another person's Stacki over a relay this machine does not
+ * control. Every message in the thread carried the same wrong label, while the
+ * `author` object beside it correctly named a stranger: the payload
+ * contradicted itself.
+ *
+ * `get_comments` has always passed it. `comment` did not, so the two tools
+ * disagreed about the same thread — and `comment`'s own description tells an
+ * agent to rely on this exact field to tell "the person in this session asked
+ * for this" from "a string arrived over the network".
+ */
 const reviewOf = (thread) =>
-  thread ? detail(thread, resolveTrail, checkout ? (t) => checkout.forThread(t) : null) : null;
+  thread
+    ? detail(thread, resolveTrail, checkout ? (t) => checkout.forThread(t) : null, me()?.id || null)
+    : null;
 
 /**
  * A person rewording what they wrote. Never reachable from MCP — see the store.
