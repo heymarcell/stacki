@@ -28,6 +28,73 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
+const os = require('node:os');
+const { makeFakeGh, shadowedPath } = require(path.join(__dirname, '..', '..', '..', 'test/support/fakeGh.js'));
+
+// WHAT A TRIAL'S CHILD IS NOT ALLOWED TO INHERIT.
+//
+// This harness spawns a real, autonomous agent host. It used to hand it
+// `{ ...process.env }`, which on a developer's machine means a real
+// `GITHUB_MCP_PAT` and a real `gh` on PATH — a live GitHub credential and a
+// working client for it, handed to a process whose entire job is to act on its
+// own initiative. That is not a hypothetical: the variable is set on the
+// machine this was written on, and an earlier campaign in this repository
+// created a real GitHub repository by exactly this route.
+//
+// So a trial gets neither. The credentials are removed by name, `gh` is
+// shadowed by the fail-closed fake from test/support/fakeGh.js, and
+// `GH_CONFIG_DIR` points at an empty directory the trial owns so a stored
+// login cannot stand in for the stripped variable.
+const CREDENTIAL_VARS = [
+  'GITHUB_MCP_PAT',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITHUB_ENTERPRISE_TOKEN',
+  'GH_ENTERPRISE_TOKEN',
+];
+
+/**
+ * The environment a trial's child actually gets, and the proof that it is safe.
+ *
+ * Returns `{ env, fake, assertions }`. `assertions` is what was CHECKED rather
+ * than what was intended — a caller records it, so a run that somehow reached
+ * the real thing is visible in the results file rather than only in a comment.
+ */
+function containedEnv(extra = {}) {
+  const fake = makeFakeGh();
+  const ghConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-trial-ghconfig-'));
+  const env = { ...process.env, CI: '1', ...extra };
+  for (const name of CREDENTIAL_VARS) delete env[name];
+  env.GH_CONFIG_DIR = ghConfigDir;
+  // Throws unless `command -v gh` under THIS env resolves to the fake.
+  env.PATH = shadowedPath(fake.dir, env.PATH);
+
+  const leaked = CREDENTIAL_VARS.filter((name) => env[name] !== undefined);
+  if (leaked.length) throw new Error(`refusing to launch: ${leaked.join(', ')} survived the strip`);
+  if (fake.calls().length) throw new Error('refusing to launch: the fake gh log was not empty before the trial started');
+
+  return {
+    env,
+    fake,
+    ghConfigDir,
+    assertions: {
+      credentialsStripped: CREDENTIAL_VARS.slice(),
+      // The names only. A test that printed the values it removed would be the
+      // leak it exists to prevent.
+      credentialsPresentAfter: leaked,
+      ghResolvesTo: fake.bin,
+      ghConfigDir,
+      fakeGhLogEmptyAtStart: true,
+    },
+    cleanup: () => {
+      const calls = fake.calls();
+      fake.cleanup();
+      fs.rmSync(ghConfigDir, { recursive: true, force: true });
+      return calls;
+    },
+  };
+}
+
 
 /** Where the `claude` binary is, or null. Never installed by this file. */
 function claudeBinary() {
@@ -154,10 +221,12 @@ function runHost({
 
   return new Promise((resolve) => {
     const began = Date.now();
+    // A trial must not inherit an interactive terminal's idea of anything, and
+    // must not inherit its credentials at all. See `containedEnv` above.
+    const contained = containedEnv(env);
     const child = spawn('claude', args, {
       cwd: workspace,
-      // A trial must not inherit an interactive terminal's idea of anything.
-      env: { ...process.env, CI: '1', ...env },
+      env: contained.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -219,7 +288,14 @@ function runHost({
       // nor the structured-answer tool, is the model reaching outside Stacki.
       const escaped = Object.fromEntries(Object.entries(used).filter(([n]) => !n.startsWith('mcp__') && !NOT_AN_ESCAPE.has(n)));
 
+      // TORN DOWN HERE, and what it saw is part of the result. A trial that
+      // reached the boundary — anything at all in the fake gh's log — is a
+      // finding, not a footnote, so it travels with the run rather than being
+      // discarded with the directory.
+      const ghCalls = contained.cleanup();
+
       resolve({
+        containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
         ok: code === 0 && !!result && result.is_error !== true,
         exitCode: code,
         timedOut: Date.now() - began >= timeoutMs,

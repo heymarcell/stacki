@@ -36,7 +36,16 @@ const { execFileSync } = require('node:child_process');
  * Hands the body a `calls()` reader so a test can assert what intent reached
  * the boundary — which repo name, private or public, which flags.
  */
-async function withFakeGh(body) {
+/**
+ * Write a fake `gh` into a directory of its own, and hand back how to read it.
+ *
+ * Split out of `withFakeGh` because there are two shapes of the same need. A
+ * test shadows `gh` for ITSELF, by editing `process.env.PATH`. A harness that
+ * spawns somebody else's process — a real agent host — must shadow it for THAT
+ * CHILD, without touching its own environment, and must be able to prove the
+ * shadow took inside the child's PATH rather than its own. Both start here.
+ */
+function makeFakeGh() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-fake-gh-'));
   const log = path.join(dir, 'invocations.jsonl');
   const bin = path.join(dir, 'gh');
@@ -61,23 +70,6 @@ exit 64
     { mode: 0o755 }
   );
 
-  const realPath = process.env.PATH;
-  process.env.PATH = `${dir}${path.delimiter}${realPath}`;
-
-  // Prove the shadow took before anything is allowed to run. `command -v`
-  // asks the same question the child process will.
-  let resolved = null;
-  try {
-    resolved = execFileSync('/bin/sh', ['-c', 'command -v gh'], { encoding: 'utf8' }).trim();
-  } catch {
-    resolved = null;
-  }
-  if (resolved !== bin) {
-    process.env.PATH = realPath;
-    fs.rmSync(dir, { recursive: true, force: true });
-    throw new Error(`fake gh did not take: PATH resolves gh to ${resolved || '(nothing)'}, not ${bin}. Refusing to run — the real gh must never be reachable from a test.`);
-  }
-
   const calls = () =>
     fs.existsSync(log)
       ? fs
@@ -94,15 +86,60 @@ exit 64
           .filter(Boolean)
       : [];
 
-  try {
-    return await body({ calls, bin, dir });
-  } finally {
-    process.env.PATH = realPath;
+  const cleanup = () => {
     // Owned, so removal is not optional: a leftover fake `gh` on PATH would be
     // a worse problem than the one this file solves.
     fs.rmSync(dir, { recursive: true, force: true });
     if (fs.existsSync(dir)) throw new Error(`the fake gh directory would not go: ${dir}`);
+  };
+
+  return { dir, bin, log, calls, cleanup };
+}
+
+/**
+ * PATH with the fake first, and the proof that it took.
+ *
+ * Asks the question the CHILD will ask — `command -v gh` under the environment
+ * the child is about to be given — rather than the question this process would
+ * ask about its own PATH. Those are different questions whenever the child's
+ * environment is not this one's, which is exactly the case this exists for.
+ */
+function shadowedPath(dir, basePath = process.env.PATH) {
+  const shadowed = `${dir}${path.delimiter}${basePath}`;
+  let resolved = null;
+  try {
+    resolved = execFileSync('/bin/sh', ['-c', 'command -v gh'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: shadowed },
+    }).trim();
+  } catch {
+    resolved = null;
+  }
+  const bin = path.join(dir, 'gh');
+  if (resolved !== bin) {
+    throw new Error(
+      `fake gh did not take: PATH resolves gh to ${resolved || '(nothing)'}, not ${bin}. ` +
+        'Refusing to run — the real gh must never be reachable.'
+    );
+  }
+  return shadowed;
+}
+
+async function withFakeGh(body) {
+  const fake = makeFakeGh();
+  const realPath = process.env.PATH;
+  try {
+    process.env.PATH = shadowedPath(fake.dir, realPath);
+  } catch (err) {
+    fake.cleanup();
+    throw err;
+  }
+  try {
+    return await body({ calls: fake.calls, bin: fake.bin, dir: fake.dir });
+  } finally {
+    process.env.PATH = realPath;
+    fake.cleanup();
   }
 }
 
-module.exports = { withFakeGh };
+module.exports = { withFakeGh, makeFakeGh, shadowedPath };
