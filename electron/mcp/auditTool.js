@@ -62,6 +62,15 @@ const Target = z.object({
   // Only when the selector matches more than one element, so a reader can tell
   // which of several identical boxes this is.
   selectorMatch: z.object({ index: z.number().int(), of: z.number().int() }).optional(),
+  // THE OTHER ORDINAL, AND THE ONE A REAL PAGE PRODUCES MOST. A model path is a
+  // SOURCE position, so a component drawn by a `.map()` stamps every row with the
+  // identical one; this says which render this is. findings.js has emitted it for
+  // every repeated node since ids stopped colliding, and it was missing here --
+  // `additionalProperties: false` then made ONE alt-less <img> inside a loop
+  // enough for a schema-validating client to discard the whole answer. A field
+  // the engine emits and this object does not declare is not a documentation
+  // gap; it is the audit returning nothing.
+  modelPathMatch: z.object({ index: z.number().int(), of: z.number().int() }).optional(),
   // The Stacki model path, when the audited element actually carried a marker.
   // Null is a real answer and appears often: a runtime-generated node or a
   // third-party embed has no source Stacki can prove.

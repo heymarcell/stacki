@@ -41,6 +41,16 @@
 const { createAudit, axeScript, liveWindowCount } = require('../electron/mcp/audit');
 const { OVERFLOW } = require('../electron/mcp/audit/probe.js');
 const { axeFinding, overflowFinding, findingId } = require('../electron/mcp/audit/findings.js');
+// A FINDING NOBODY CAN RECEIVE IS NOT A FINDING.
+//
+// Everything below asserted `target.modelPathMatch` -- correctly, and for
+// months -- while the tool's own published outputSchema did not declare it and
+// `additionalProperties: false` made every one of these payloads a hard refusal
+// at a conformant MCP client. The ordinal assertions and the deliverability of
+// the answer carrying them are the same claim, so they are made in the same
+// place. test/audit-schema-conformance.js owns the walker and sweeps every
+// branch; this is the one shape that shipped broken.
+const { publishedSchema, schemaViolations, onTheWire } = require('./audit-schema-conformance.js');
 
 const failures = [];
 let checked = 0;
@@ -209,6 +219,12 @@ const run = (axe, geometry, args = {}) =>
       contrast.every((f) => f.target.modelPathMatch && f.target.modelPathMatch.of === REPEATED) &&
         new Set(contrast.map((f) => f.target.modelPathMatch?.index)).size === REPEATED,
       short(contrast.map((f) => f.target.modelPathMatch))
+    );
+    const undeliverable = schemaViolations(onTheWire(res), publishedSchema());
+    check(
+      '  and a client validating against the published schema would accept the answer',
+      !!publishedSchema()?.properties && undeliverable.length === 0,
+      short([...new Set(undeliverable)], 400)
     );
     // THE PAYLOAD AND THE ID CANNOT DISAGREE. Every selector here matches one
     // element, so `selectorMatch` is correctly absent -- and if it were the
