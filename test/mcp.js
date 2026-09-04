@@ -429,11 +429,31 @@ const fakeTrail = (keys) =>
 // starts to, this file stops being able to test what it claims to.
 
 {
+  // RECURSIVELY, which it was not. `readdirSync` returns one level and the
+  // `.js` filter then dropped `agent/` and `audit/` silently -- so the two
+  // subtrees holding most of the surface were never read, and a
+  // `require('electron')` added under either passed this guard while breaking
+  // the property it names. The review tree's sibling checks below already walk;
+  // this now walks the same way.
   const dir = path.join(__dirname, '..', 'electron', 'mcp');
-  const needsElectron = fs
-    .readdirSync(dir)
-    .filter((n) => n.endsWith('.js'))
-    .filter((n) => /require\(\s*'electron'\s*\)/.test(fs.readFileSync(path.join(dir, n), 'utf8')));
+  const jsUnder = (from, prefix = '') => {
+    const out = [];
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) out.push(...jsUnder(path.join(from, entry.name), rel));
+      else if (entry.name.endsWith('.js')) out.push(rel);
+    }
+    return out;
+  };
+  const allJs = jsUnder(dir);
+  const needsElectron = allJs.filter((rel) => /require\(\s*'electron'\s*\)/.test(fs.readFileSync(path.join(dir, rel), 'utf8')));
+  // The walk has to actually reach the subtrees, or the check above is being
+  // satisfied by not looking.
+  check(
+    'the scan reaches every file under electron/mcp',
+    allJs.some((rel) => rel.startsWith('agent/')) && allJs.some((rel) => rel.startsWith('audit/')),
+    allJs.join(', ')
+  );
   check(
     'only the wiring file needs Electron',
     needsElectron.length === 1 && needsElectron[0] === 'index.js',

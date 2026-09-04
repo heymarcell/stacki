@@ -533,12 +533,26 @@ const PINNED_RISK = {
   // of it. `..` can be spotted in a string; this cannot.
   const outside = path.join(OTHER, 'secret.txt');
   fs.writeFileSync(outside, 'not yours', 'utf8');
+  // THE ASSERTION IS OUTSIDE THE TRY, AND IT USED NOT TO BE.
+  //
+  // `resolveInProject` was called inside a `try` whose `catch` asserted
+  // `check(..., true)`. So a regression in the path fence that made the
+  // resolver THROW -- which is exactly what a broken fence does -- was caught
+  // and converted into a pass, on the only test of the one escape that string
+  // normalisation cannot catch. Making the link is allowed to fail on a
+  // filesystem that has no symlinks; deciding what the resolver said about it
+  // is not.
+  let made = null;
   try {
     fs.symlinkSync(outside, path.join(ROOT, 'escape.txt'));
+    made = true;
+  } catch (err) {
+    made = String(err?.code || err?.message || err);
+  }
+  check('this filesystem can make the symlink the fence has to survive', made === true, String(made));
+  if (made === true) {
     const linked = resolveInProject(ROOT, 'escape.txt');
     check('a symlink out of the project is refused', linked.ok === false && linked.code === 'outside_project', linked.code);
-  } catch {
-    check('a symlink out of the project is refused', true, 'symlinks not available here — skipped');
   }
 
   check('a path that does not exist yet is allowed', resolveInProject(ROOT, 'src/pages/new.astro').ok);
