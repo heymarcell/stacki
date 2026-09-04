@@ -28,9 +28,78 @@ const { toNodeHandler, localhostHostValidation, localhostOriginValidation } = re
 
 const { registerTools, INSTRUCTIONS } = require('./tools');
 
+// WHAT THIS SERVER ACTUALLY DOES, RATHER THAN WHAT THE SDK ASSUMES IT DOES.
+//
+// `McpServer` sets `listChanged: true` for tools, resources and prompts the
+// moment the first one of each is registered, unless the server was built
+// having already said otherwise:
+//
+//   registerCapabilities({ tools: { listChanged:
+//     this.server.getCapabilities().tools?.listChanged ?? true } })
+//
+// and `server/discover` then advertises those bits verbatim. Stacki emitted no
+// list-changed notification anywhere — there is no such call in this
+// repository — so for as long as nothing said otherwise, every client was told
+// three times that it would be kept up to date, by a server with no way to tell
+// it anything.
+//
+// That is not cosmetic. A modern client reads these bits to decide which
+// notification types to ask for on its `subscriptions/listen` filter, so a
+// false one buys a listener that can never fire. And the lists genuinely cannot
+// change: a fresh `McpServer` is built per request, its registrations all
+// happen before it answers anything, and the transport is one POST per request
+// with no channel to push a notification down afterwards. Static is the truth,
+// so static is what is declared.
+//
+// The right way to make these `true` is to emit the notifications — not to
+// leave the flag standing and hope nobody listens.
+const CAPABILITIES = Object.freeze({
+  tools: { listChanged: false },
+  resources: { listChanged: false },
+  prompts: { listChanged: false },
+});
+
+// HOW LONG AN ANSWER STAYS TRUE, AND WHO MAY HOLD IT.
+//
+// The 2026-07-28 revision requires `ttlMs`/`cacheScope` on six results
+// (SEP-2549). The SDK fills them with `{ttlMs: 0, cacheScope: 'private'}` when
+// nothing says otherwise, which is the correct conservative default and was
+// also, until now, a measurably wrong description of five of them.
+//
+//   server/discover, tools/list, prompts/list, resources/list
+//     Built from registrations that are decided before the server answers and
+//     are identical on every machine running this build: two fresh connections
+//     return byte-identical catalogues (asserted in test/mcp-cache-hints.js).
+//     No project data is in any of them, so a shared cache holding one cannot
+//     leak anything: `public`.
+//
+//   resources/read
+//     Deliberately NOT public here. `stacki://project/profile` is this
+//     person's project, gated on their permission level, and a per-operation
+//     hint applies to every resource — so the operation keeps the conservative
+//     default and the five static guides opt IN individually, in
+//     electron/mcp/intelligence.js. A hint added to a new project resource by
+//     accident is then a hint that says `private`, which is the safe way round.
+//
+// FIVE MINUTES, and the number is a staleness budget rather than a guess. The
+// catalogue can only change when a different build of the app answers on this
+// port, which needs Stacki to be restarted; five minutes bounds how long a
+// client that reconnects across that restart can keep describing the old one,
+// while still covering the reconnect storms that are the actual cost — a
+// session that connects repeatedly pays for one catalogue rather than ten.
+const CATALOGUE_TTL_MS = 5 * 60 * 1000;
+const CACHE_HINTS = Object.freeze({
+  'server/discover': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
+  'tools/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
+  'prompts/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
+  'resources/list': { ttlMs: CATALOGUE_TTL_MS, cacheScope: 'public' },
+  'resources/read': { ttlMs: 0, cacheScope: 'private' },
+});
+
 const DEFAULT_PORT = 43821;
 const DEFAULT_HOST = '127.0.0.1';
 const ENDPOINT_PATH = '/mcp';
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 /** Equal-length, constant-time string compare. */
 function tokenMatches(given, expected) {
@@ -110,7 +179,10 @@ function createStackiMcpServer({
   // A fresh instance per request: nothing is carried between callers, so two
   // clients can hold this endpoint at once without sharing anything.
   const handler = createMcpHandler(() => {
-    const server = new McpServer({ name, version }, { instructions });
+    const server = new McpServer(
+      { name, version },
+      { instructions, capabilities: CAPABILITIES, cacheHints: CACHE_HINTS }
+    );
     registerTools(server, {
       getContext,
       capture,
@@ -153,6 +225,35 @@ function createStackiMcpServer({
         // fail to fetch turns a typo into a login loop.
         { 'www-authenticate': 'Bearer' }
       );
+      return;
+    }
+
+    // HOW BIG AN ASK IS ALLOWED TO BE.
+    //
+    // There was no limit anywhere in the stack: a 64 MB POST was read into a
+    // JavaScript string and answered. The endpoint is on loopback behind a
+    // bearer, so this is not the first line of defence -- but "authenticated"
+    // and "unbounded" is still the wrong pair, and the four gates above cost
+    // nothing precisely because they refuse before any work happens. This
+    // refuses before the body is read at all.
+    //
+    // EIGHT MEGABYTES, from the largest thing the surface actually accepts: a
+    // stylesheet through `style.write_source`, capped by its own schema at two
+    // million characters. Eight is comfortably clear of that after JSON
+    // escaping and the envelope, and nowhere near a size worth buffering by
+    // accident.
+    //
+    // Declared length only. A body arriving without one is not refused -- every
+    // MCP client sends Content-Length for a JSON POST, and refusing the ones
+    // that might not would be trading a real client for a hypothetical
+    // attacker who is already holding the token.
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      sendJson(res, 413, {
+        error: 'payload_too_large',
+        message: `Stacki MCP accepts requests up to ${MAX_BODY_BYTES} bytes; this one declared ${declared}.`,
+      });
+      req.destroy();
       return;
     }
 
@@ -239,4 +340,15 @@ function createStackiMcpServer({
   };
 }
 
-module.exports = { createStackiMcpServer, tokenMatches, bearerOf, DEFAULT_PORT, DEFAULT_HOST, ENDPOINT_PATH };
+module.exports = {
+  createStackiMcpServer,
+  tokenMatches,
+  bearerOf,
+  DEFAULT_PORT,
+  DEFAULT_HOST,
+  ENDPOINT_PATH,
+  MAX_BODY_BYTES,
+  CAPABILITIES,
+  CACHE_HINTS,
+  CATALOGUE_TTL_MS,
+};
