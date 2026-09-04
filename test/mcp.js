@@ -956,6 +956,15 @@ const rawPost = (hostHeader, body) =>
     check('an oversize body with no bearer is still a 401', unauthorized.status === 401, String(unauthorized.status));
     check('  and that one reaches the client as well', (await unauthorized.json().catch(() => null))?.error === 'unauthorized');
 
+    // THE METHODS THAT CARRY NO BODY, which nothing asserted until the length
+    // requirement above was added and silently turned all of them into 411.
+    // A GET has no body; telling it to supply a Content-Length is nonsense, and
+    // this endpoint's answer to a GET has always been 405.
+    for (const method of ['GET', 'DELETE', 'OPTIONS']) {
+      const r = await fetch(`${BASE}/mcp`, { method, headers: { authorization: `Bearer ${TOKEN}` } });
+      check(`a ${method} is answered 405, not asked for a length`, r.status === 405, String(r.status));
+    }
+
     // POSITIVE CONTROL. Every assertion above is a refusal, and a transport
     // that refused everything would satisfy all of them.
     const ordinary = await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' });

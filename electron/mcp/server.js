@@ -309,8 +309,13 @@ function createStackiMcpServer({
     // write had landed. The response is sent, the rest of the body is drained
     // and discarded rather than buffered, and the connection closes when the
     // response has actually flushed.
+    // ONLY WHAT CARRIES A BODY. A GET has none, and telling it to supply a
+    // Content-Length is nonsense — this endpoint's answer to a GET is 405, and
+    // an earlier version of this gate turned that into 411 for every method
+    // that is not POST. Nothing asserted the 405, which is why it went quiet.
+    const carriesBody = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
     const declared = Number(req.headers['content-length']);
-    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    if (carriesBody && Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
       refuse(req, res, 413, {
         error: 'payload_too_large',
         message: `Stacki MCP accepts requests up to ${MAX_BODY_BYTES} bytes; this one declared ${declared}.`,
@@ -328,7 +333,7 @@ function createStackiMcpServer({
     // measured against it -- the official client in both eras, Claude Code,
     // Codex and Gemini -- sends Content-Length for a JSON POST. 411 is the
     // status HTTP defines for exactly this, and it says what to do.
-    if (!Number.isFinite(declared)) {
+    if (carriesBody && !Number.isFinite(declared)) {
       refuse(req, res, 411, {
         error: 'length_required',
         message: 'Stacki MCP needs a Content-Length. It serves one JSON method and does not accept a streamed body.',
