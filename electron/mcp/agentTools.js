@@ -172,7 +172,44 @@ const MoveTarget = z
 
 // One operation inside a batch. The same vocabulary as the single-operation
 // actions, so learning one teaches the other.
-const Operation = z.discriminatedUnion('type', [
+/**
+ * The same union, with every branch closed.
+ *
+ * `z.object()` STRIPS a key it does not know, and a stripped key is an argument
+ * the caller wrote and nobody ran. On a surface where most arguments are
+ * optional and several operations have a server-side fallback for the one you
+ * left out, that is not a tidy-up: it is a silent retarget. Measured at the
+ * baseline commit, every one of these was accepted with `ok: true` and did
+ * something other than what was asked:
+ *
+ *   git   {action:'restore_file', path, rev:'abc'}   -> `rev` dropped; restored from HEAD
+ *   git   {action:'push', branchName:'feature-x'}    -> dropped; pushed the CURRENT branch
+ *   target{action:'remove', target:'<a ref>'}        -> dropped; removed the person's SELECTION
+ *   project{action:'probe', route:'/pricing'}        -> dropped; probed the preview root
+ *
+ * Two of those are `high` risk and one is destructive. The mistyped name is the
+ * likeliest agent error of all — the top-level `properties` block that
+ * `summarised()` publishes lists every branch's argument names side by side,
+ * with nothing structural to say which action each belongs to — so the surface
+ * has to answer it rather than absorb it.
+ *
+ * Closing the branch turns all four into `bad_arguments`, naming the key. It
+ * also makes the ADVERTISED schema say so: `z.toJSONSchema` emits
+ * `additionalProperties: false` per branch, so a validating client refuses the
+ * call before it is sent, and this file's header stops being aspirational.
+ *
+ * Rebuilt rather than declared branch by branch, so a branch added tomorrow is
+ * closed without its author having to remember to close it.
+ */
+function closed(union) {
+  const key = union.def?.discriminator || 'action';
+  return z.discriminatedUnion(
+    key,
+    union.options.map((branch) => z.strictObject(branch.shape))
+  );
+}
+
+const Operation = closed(z.discriminatedUnion('type', [
   // `value` is this form's name and stays the declared one; `text` is accepted
   // because the single-action form calls it that. See the note on
   // `action: "set_text"` below.
@@ -194,7 +231,7 @@ const Operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('duplicate') }),
   z.object({ type: z.literal('move'), to: MoveTarget }),
   z.object({ type: z.literal('set_tag'), tag: z.string().max(64) }),
-]);
+]));
 
 // --- target ------------------------------------------------------------------
 
@@ -208,7 +245,7 @@ const guard = {
   expectedDigest: z.string().max(64).optional().describe('The document digest your read reported.'),
 };
 
-const TargetInput = z.discriminatedUnion('action', [
+const TargetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ...withTarget({
@@ -290,7 +327,7 @@ const TargetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('duplicate'), ...withTarget(guard) }),
   z.object({ action: z.literal('move'), ...withTarget({ ...guard, to: MoveTarget }) }),
   z.object({ action: z.literal('set_tag'), ...withTarget({ ...guard, tag: z.string().max(64) }) }),
-]);
+]));
 
 // --- style -------------------------------------------------------------------
 
@@ -308,7 +345,7 @@ const DeclarationIdentity = z
   })
   .describe('A declaration, named the way style.read reported it. Pass the whole object back unchanged.');
 
-const StyleInput = z.discriminatedUnion('action', [
+const StyleInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ref: Ref.optional(),
@@ -413,11 +450,11 @@ const StyleInput = z.discriminatedUnion('action', [
     action: z.literal('move_heading'),
     edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
-]);
+]));
 
 // --- source ------------------------------------------------------------------
 
-const SourceInput = z.discriminatedUnion('action', [
+const SourceInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     path: RelPath,
@@ -464,11 +501,11 @@ const SourceInput = z.discriminatedUnion('action', [
         'declarationLine into source.read’s startLine and endLine.'
     ),
   z.object({ action: z.literal('resolve_path'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- page --------------------------------------------------------------------
 
-const PageInput = z.discriminatedUnion('action', [
+const PageInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }),
   z.object({ action: z.literal('read'), path: RelPath }),
   z.object({ action: z.literal('create'), name: z.string().max(300), layout: z.string().max(120).optional() }),
@@ -498,11 +535,11 @@ const PageInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('injected_routes') }),
   z.object({ action: z.literal('import_path'), fromFile: RelPath, targetFile: RelPath }),
   z.object({ action: z.literal('rebase_import'), fromPage: RelPath, toPage: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- content -----------------------------------------------------------------
 
-const ContentInput = z.discriminatedUnion('action', [
+const ContentInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('cms_list') }),
   z.object({ action: z.literal('cms_read'), path: RelPath }),
   z.object({ action: z.literal('cms_write'), path: RelPath, data: z.unknown(), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
@@ -569,11 +606,11 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('rename'), collection: z.string().max(200), from: z.string().max(300), to: z.string().max(300) }),
   z.object({ action: z.literal('sample_entry'), collection: z.string().max(200), id: z.string().max(300).optional() }),
   z.object({ action: z.literal('resolve_import'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- asset -------------------------------------------------------------------
 
-const AssetInput = z.discriminatedUnion('action', [
+const AssetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('list'),
     under: z.string().max(1024).optional().describe('Only what is inside this folder, e.g. "public/images".'),
@@ -586,11 +623,11 @@ const AssetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('move'), path: RelPath, toFolder: z.string().max(1024) }),
   z.object({ action: z.literal('rename'), path: RelPath, name: z.string().max(200) }),
   z.object({ action: z.literal('delete'), path: RelPath }),
-]);
+]));
 
 // --- project -----------------------------------------------------------------
 
-const ProjectInput = z.discriminatedUnion('action', [
+const ProjectInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('scan') }),
   z.object({ action: z.literal('classes'), limit: z.number().int().min(1).max(2000).optional() }),
@@ -612,11 +649,11 @@ const ProjectInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('dev_stop') }),
   z.object({ action: z.literal('undo') }),
   z.object({ action: z.literal('redo') }),
-]);
+]));
 
 // --- git ---------------------------------------------------------------------
 
-const GitInput = z.discriminatedUnion('action', [
+const GitInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('gh_status') }),
   z.object({ action: z.literal('status'), limit: z.number().int().min(1).max(400).optional() }),
@@ -637,7 +674,7 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('unpark') }),
   z.object({ action: z.literal('push'), branch: z.string().max(300).optional().describe('The branch to push. Defaults to the branch the project is on.') }),
   z.object({ action: z.literal('publish'), repoName: z.string().max(200), private: z.boolean().optional() }),
-]);
+]));
 
 // --- descriptions ------------------------------------------------------------
 //
