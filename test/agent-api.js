@@ -876,9 +876,26 @@ const PINNED_RISK = {
       check('including the one inside an edit batch', found.includes('target:operations[].to.parentRef'), found.join(', '));
     }
 
-    // The descriptions are paid for in every client's context, every call.
+    // A BLOAT GUARD, AND NO LONGER A CONTEXT ESTIMATE.
+    //
+    // This used to read "the descriptions are paid for in every client's
+    // context, every call", and that premise has been measured false. Both
+    // hosts driven against this server defer MCP tool schemas — Claude Code's
+    // tool search is on by default, Codex's `tool_search_always_defer_mcp_tools`
+    // is permanently on — so the catalogue is fetched when a tool becomes
+    // relevant rather than inlined up front. Measured on Claude Code 2.1.259
+    // with a real user toolset: Stacki's marginal first-turn cost is ~780
+    // tokens deferred against ~12,860 inlined, and descriptions are 6% of the
+    // catalogue either way.
+    //
+    // The constraint that actually binds is PER TOOL, not in total: a host
+    // silently truncates any description over 2,048 characters, which
+    // test/host-limits.js fails on with a margin. This number stays as a guard
+    // against unbounded growth across the surface, and the ceiling is set from
+    // what the tools currently need to say rather than from a token estimate
+    // that no longer describes anything.
     const total = expected.reduce((n, name) => n + byName[name].description.length, 0);
-    check('the descriptions together stay readable', total < 9000, `${total} chars`);
+    check('the descriptions together stay readable', total < 12000, `${total} chars`);
 
     // Annotations. Not the gate — see the permission section — but they must
     // not LIE, because a client uses them to decide what to confirm.

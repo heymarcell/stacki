@@ -641,10 +641,15 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
    * of cancelling is the windows that were not opened and the audit behind this
    * one that starts now.
    */
-  const cancelled = (when) => ({
+  const cancelled = (when, measured = 0) => ({
     ok: false,
     code: 'cancelled',
-    message: `The audit was cancelled ${when}. Nothing was measured and the project was not touched.`,
+    message:
+      `The audit was cancelled ${when}. ` +
+      (measured
+        ? `${measured} viewport${measured === 1 ? '' : 's'} had been measured and ${measured === 1 ? 'its result is' : 'those results are'} discarded; `
+        : 'Nothing was measured; ') +
+      'the project was not touched.',
   });
   /**
    * @param {object} opts
@@ -767,6 +772,9 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           runId,
         };
       }
+      // How many viewports actually finished. Used by the refusal, which used to
+      // claim "nothing was measured" on a cancel that had measured half a page.
+      let measured = 0;
       for (const viewport of chosen.viewports) {
         // BETWEEN VIEWPORTS, WHICH IS WHERE THE WORK IS.
         //
@@ -775,7 +783,7 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         // rather than only at the top because the caller usually goes away part
         // way through, and the outer `finally` still resets the session on the
         // way out.
-        if (signal?.aborted) return cancelled(`after ${findings.length ? 'measuring part of the page' : 'starting'}`);
+        if (signal?.aborted) return cancelled('part way through', measured);
         const started = Date.now();
         let win = null;
         try {
@@ -1129,6 +1137,15 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
               : null,
             ms: Date.now() - started,
           });
+          measured += 1;
+          // AND AFTER, not only before. With one viewport the check at the top
+          // of the loop runs once, before any work, so an audit abandoned WHILE
+          // its only page was loading ran to completion and answered as though
+          // nobody had left. The window for this viewport is destroyed by the
+          // `finally` below either way; what this adds is not starting the next
+          // one, and not spending the response budget on an answer nobody is
+          // waiting for.
+          if (signal?.aborted) return cancelled('part way through', measured);
         } finally {
           // DELETE ONLY IF IT ACTUALLY WENT. Removing the entry first and then
           // destroying meant a destroy that threw left a live window that the

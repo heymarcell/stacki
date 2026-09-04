@@ -183,6 +183,26 @@ const engineWith = (log, opts = {}) =>
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
   }
 
+  // ---- ONE VIEWPORT ---------------------------------------------------------
+  //
+  // With a single viewport the between-viewports check runs once, before any
+  // work. An audit abandoned while its only page was loading therefore ran to
+  // completion and answered as though nobody had gone.
+  {
+    const log = { opened: 0, destroyed: 0 };
+    const ac = new AbortController();
+    const engine = createAudit({
+      BrowserWindow: countingWindows(log, { onOpen: () => ac.abort() }),
+      getPreviewUrl: () => 'http://127.0.0.1:4321',
+      session: cleanSession,
+    });
+    const res = await engine.run({ route: '/', viewports: [{ width: 375, height: 700 }], rules: [] }, { signal: ac.signal });
+    check('a one-viewport audit can be cancelled too', res?.ok === false && res.code === 'cancelled', short(res));
+    check('  and says what it had measured rather than claiming nothing', /viewport/.test(String(res?.message || '')), short(res?.message));
+    check('  with its window destroyed', log.destroyed === log.opened && log.opened === 1, short(log));
+    check('  and none live', liveWindowCount() === 0, String(liveWindowCount()));
+  }
+
   // ---- TOO LATE -------------------------------------------------------------
   {
     const log = { opened: 0, destroyed: 0 };

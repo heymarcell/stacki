@@ -31,6 +31,7 @@
 // The 2025 era is checked too: cache fields are a modern-only concept and a
 // legacy response must carry none.
 
+const fs = require('node:fs');
 const path = require('node:path');
 
 const { createStackiMcpServer, CAPABILITIES, CACHE_HINTS } = require('../electron/mcp/server.js');
@@ -130,14 +131,35 @@ const readResource = (port, uri) => modern(port, 'resources/read', { uri }, { 'm
         short(caps?.[family])
       );
     }
-    // THE REASON IT IS FALSE, asserted rather than assumed: if a future change
-    // starts emitting these, this test should be the thing that says the
-    // declaration may now be true.
-    const emitters = ['sendToolListChanged', 'sendResourceListChanged', 'sendPromptListChanged'];
+    // THE REASON IT IS FALSE, and this used to check the wrong thing entirely:
+    // it asked whether the CAPABILITIES constant mentioned the emitter names,
+    // which it never would and which says nothing about the surface. The
+    // question is whether any code in the shipped surface sends one, so the
+    // shipped surface is what gets read.
+    //
+    // A provenance check rather than a behavioural one, deliberately, and it is
+    // the strongest available: this transport is one POST per request with a
+    // fresh server each time, so there is no channel a notification could be
+    // observed arriving on. If a future change adds an emitter, this fails and
+    // the declaration above can be reconsidered — which is the point.
+    const EMITTERS = /\.(sendToolListChanged|sendResourceListChanged|sendPromptListChanged)\s*\(|notifications\/(tools|resources|prompts)\/list_changed/;
+    const sourceFiles = [];
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === 'node_modules') continue;
+        const at = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(at);
+        else if (entry.name.endsWith('.js') || entry.name.endsWith('.jsx')) sourceFiles.push(at);
+      }
+    };
+    walk(path.join(__dirname, '..', 'electron'));
+    walk(path.join(__dirname, '..', 'src'));
+    const emitting = sourceFiles.filter((f) => EMITTERS.test(fs.readFileSync(f, 'utf8')));
+    check('the scan actually read the surface', sourceFiles.length > 50, `${sourceFiles.length} files`);
     check(
-      'and nothing in the surface emits a list-changed notification',
-      emitters.every((fn) => !JSON.stringify(CAPABILITIES).includes(fn)),
-      'CAPABILITIES must stay a plain declaration'
+      'and nothing in it emits a list-changed notification',
+      emitting.length === 0,
+      emitting.map((f) => path.relative(path.join(__dirname, '..'), f)).join(', ')
     );
     check(
       'the declaration is frozen, so nothing can flip it at runtime',
@@ -248,6 +270,19 @@ const readResource = (port, uri) => modern(port, 'resources/read', { uri }, { 'm
       const { client, close } = await connectMcp({ url: urlFor(LEGACY_PORT), token: TOKEN, era: 'legacy' });
       const listed = await client.listTools();
       check('a legacy client still lists the tools', (listed.tools || []).length > 0, String((listed.tools || []).length));
+      // THE 2025 ADVERTISEMENT CHANGED TOO, and nothing asserted it. The same
+      // declaration reaches a legacy client through `initialize`'s capabilities
+      // rather than through `server/discover`, and a server that told the truth
+      // to one era and not the other would be worse than one that told neither.
+      const legacyCaps = client.getServerCapabilities?.() || null;
+      check('the legacy handshake advertises capabilities at all', !!legacyCaps, short(legacyCaps));
+      for (const family of ['tools', 'resources', 'prompts']) {
+        check(
+          `  and ${family}.listChanged is false there too`,
+          legacyCaps?.[family]?.listChanged === false,
+          short(legacyCaps?.[family])
+        );
+      }
       check(
         'and its result carries no cache fields',
         listed.ttlMs === undefined && listed.cacheScope === undefined,
