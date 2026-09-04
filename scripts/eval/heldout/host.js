@@ -138,7 +138,24 @@ function writeConfig(workspace, { url, token, name = 'stacki' }) {
 // the MCP-only mode must include these two: they are MCP access, not filesystem
 // access, and excluding them would measure a Stacki whose entire Phase-B
 // resource surface had been switched off.
-const MCP_ACCESS_TOOLS = ['ListMcpResourcesTool', 'ReadMcpResourceTool'];
+// EVERY DOOR THE HOST OFFERS TO AN MCP RESOURCE, not the two that were
+// remembered. Claude Code exposes several spellings — the singular
+// `ReadMcpResourceTool`, the plural `ReadMcpResourcesTool`, and a directory
+// variant — and this list decides two things at once: what the `mcp-only` mode
+// is allowed to use, and what counts as escaping it.
+//
+// Missing one is a false alarm in the isolation oracle rather than a hole in
+// it. A held-out trial did exactly that: the model read `stacki://project/profile`
+// through `ReadMcpResourcesTool`, which is an MCP read and nothing else, and
+// the trial was recorded as `isolationHeld: false` — a purity violation that
+// never happened. An oracle that cries wolf is spent as surely as one that
+// stays quiet.
+const MCP_ACCESS_TOOLS = [
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'ReadMcpResourcesTool',
+  'ReadMcpResourceDirTool',
+];
 
 // AND THE ONE THAT MAKES THE CATALOGUE DEFERRABLE.
 //
