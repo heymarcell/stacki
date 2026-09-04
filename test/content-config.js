@@ -25,19 +25,18 @@
 //   recursion      z.lazy() must come back as a $ref rather than blowing up.
 //   loose objects  a field nobody declared still has to survive a save.
 //
-// No fixture is checked in: the reader needs a project with its dependencies
-// installed, because it runs the project's own esbuild and zod. Point it at
-// one, or it skips.
+// The reader needs a project with its dependencies installed, because it runs
+// the project's own esbuild and its own zod. So the fixture is one this suite
+// builds: a real Astro project in a temp directory, node_modules copied from
+// the shared cache (see test/support/contentFixture.js). It used to default to
+// a personal folder under ~/Downloads, so on every machine but one — and on
+// every CI runner — this printed "skipped" and asserted nothing at all. A path
+// given as argv[2] or STACKI_CONTENT_FIXTURE still wins, for pointing it at a
+// real project.
 
-const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { readContentConfig, stopAllServices } = require('../electron/contentConfig.js');
-
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const projectPath = path.resolve(
-  process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE
-);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -64,10 +63,18 @@ function propAt(schema, dotted) {
 const defOf = (root, ref) => root?.$defs?.[String(ref).split('/').pop()] || null;
 
 (async () => {
-  if (!fs.existsSync(path.join(projectPath, 'src', 'content.config.ts'))) {
-    console.log(`content-config: skipped (no project at ${projectPath})`);
+  let fixture;
+  try {
+    fixture = contentFixture('content-config', { log: (m) => console.log(`content-config: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const projectPath = fixture.source;
 
   const result = await readContentConfig(projectPath, { force: true });
   if (result.error) {

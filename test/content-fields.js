@@ -12,16 +12,18 @@
 // project builds, so every entry is valid, so every field it holds must come
 // back clean. Anything that does not is this file's reading of the schema being
 // wrong, not the content.
+//
+// The project is the one test/support/contentFixture.js builds, and it is built
+// to reach every control the form knows how to draw. It used to default to a
+// personal folder under ~/Downloads, so on every machine but one, and on every
+// CI runner, this printed "skipped" and asserted nothing. A path given as
+// argv[2] or STACKI_CONTENT_FIXTURE still wins.
 
-const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { pathToFileURL } = require('url');
 const { readContentConfig, stopAllServices, validateEntry } = require('../electron/contentConfig.js');
 const { listEntries } = require('../electron/contentEntries.js');
-
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const source = path.resolve(process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -33,10 +35,19 @@ const check = (what, condition, detail) => {
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
 (async () => {
-  if (!fs.existsSync(path.join(source, 'src', 'content.config.ts'))) {
-    console.log(`content-fields: skipped (no project at ${source})`);
+  let fixture;
+  try {
+    fixture = contentFixture('content-fields', { log: (m) => console.log(`content-fields: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const source = fixture.source;
+
   // The renderer's module, loaded the way the renderer loads it.
   const { collectionFields, describeField, fieldIssue, editsBetween, memberFor, hintFor } = await import(
     pathToFileURL(path.join(__dirname, '..', 'src', 'contentSchema.js')).href

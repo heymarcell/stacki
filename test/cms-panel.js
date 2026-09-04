@@ -7,16 +7,20 @@
 // that asking both at once made either one's failure look like an empty
 // project. A panel that shows nothing is indistinguishable from a project with
 // nothing in it, which is the worst thing it could do.
+//
+// The project is the one test/support/contentFixture.js builds: 26 collections,
+// and every JSON file under src/ owned by one of them, so the panel has both a
+// number to show and a chance to show a data file twice. It used to default to
+// a personal folder under ~/Downloads, so on every machine but one, and on
+// every CI runner, this printed "skipped" and asserted nothing. A path given as
+// argv[2] or STACKI_CONTENT_FIXTURE still wins.
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 
 const { readContentConfig, stopAllServices } = require('../electron/contentConfig.js');
 const { listEntries, countEntries, coveredPaths } = require('../electron/contentEntries.js');
-
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const source = path.resolve(process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -55,10 +59,19 @@ function listCms(root) {
 }
 
 (async () => {
-  if (!fs.existsSync(path.join(source, 'src', 'content.config.ts'))) {
-    console.log(`cms-panel: skipped (no project at ${source})`);
+  let fixture;
+  try {
+    fixture = contentFixture('cms-panel', { log: (m) => console.log(`cms-panel: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const source = fixture.source;
+
   const config = await readContentConfig(source, { force: true });
   if (config.error) {
     console.error(`cms-panel: could not read the config — ${config.error}`);
