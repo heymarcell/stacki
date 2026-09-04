@@ -186,7 +186,16 @@ function measuredViewport(given) {
   return { width, height: Number.isFinite(height) && height > 0 ? height : null };
 }
 
-/** Everything the page's CSS is, parsed once. */
+/**
+ * Everything the page's CSS is, parsed once — and matched once.
+ *
+ * `model` here is the LISTING: which of the project's rules target this
+ * element at all, in document order, with their labels. It is not the verdict.
+ * The verdict is a second question — which of them the page actually loads —
+ * and readStyles asks the same engine again over the answer to that (see
+ * `cascadeTiers` below). `target` comes back so it can, with its snapshot cache
+ * and its primed DOM matches already warm.
+ */
 async function readCascade(node, given) {
   const scan = await scanPage(await ownStyleFiles());
   const { docs, errors } = await loadEmbedDocs(scan.pageEmbeds);
@@ -196,7 +205,7 @@ async function readCascade(node, given) {
   await primeDomMatches(target, rules, asked);
   const viewport = measuredViewport(given);
   const model = await computeRuleModel(rules, target, { viewport });
-  return { docs, rules, model, rootSnapshot, errors, asked, viewport };
+  return { docs, rules, model, target, rootSnapshot, errors, asked, viewport };
 }
 
 /** What the engine says the element's properties actually resolve to, and the
@@ -352,7 +361,17 @@ const propertiesIn = (cssText) =>
  * response's own evidence that its scan is incomplete.
  */
 export function reconcileComputed(rules, computed, documentRules = null) {
-  const declared = (rules || []).flatMap((rule) =>
+  // A SOURCE THIS PAGE DOES NOT LOAD EXPLAINS NOTHING ABOUT WHAT IT RENDERED.
+  //
+  // Both halves below are statements about the rendered element, and a rule in
+  // a component the page never imports is not on the rendered element. Left in,
+  // it silenced a genuinely unexplained property and — worse — signed for a
+  // rule the browser reported, on the strength of the two sharing a selector
+  // string. `:global(.pricing-grid)` in an orphaned component and
+  // `.pricing-grid` in the served stylesheet are not the same rule; they are
+  // the same eleven characters.
+  const onThisPage = (rules || []).filter((rule) => rule.source?.reachedByOpenPage !== false);
+  const declared = onThisPage.flatMap((rule) =>
     (rule.declarations || []).filter((d) => d.winning !== false).map((d) => d.property)
   );
   const unexplained = Object.entries(computed || {})
@@ -363,8 +382,8 @@ export function reconcileComputed(rules, computed, documentRules = null) {
       reason: 'no authored declaration Stacki can see sets this property on this element',
     }));
 
-  const authored = new Set((rules || []).map((rule) => normalizeSelector(rule.selector)));
-  for (const rule of rules || []) for (const sel of rule.matchedSelectors || []) authored.add(normalizeSelector(sel));
+  const authored = new Set(onThisPage.map((rule) => normalizeSelector(rule.selector)));
+  for (const rule of onThisPage) for (const sel of rule.matchedSelectors || []) authored.add(normalizeSelector(sel));
   const unaccountedRules = (documentRules || [])
     .filter((rule) => !authored.has(normalizeSelector(rule.selector)))
     .map((rule) => ({ selector: rule.selector, stylesheet: rule.stylesheet || null, properties: propertiesIn(rule.cssText) }));
@@ -382,8 +401,9 @@ const EXCLUDED_FROM_AUTHORED = [
 
 const CASCADE_SCOPE =
   'every .css/.scss/.sass/.less file in the project, whether or not this page imports it, plus the <style> blocks of ' +
-  'the open file and the page-wide blocks of its components. `source.reachedByOpenPage` says which of them this page ' +
-  'was proved to load.';
+  'the open file and the page-wide blocks of its components. All of them are LISTED; the winner is decided only over ' +
+  'the ones this page was proved to load — `source.reachedByOpenPage` and `source.reachEvidence` say which those are, ' +
+  'and a declaration from anywhere else carries `notInCascade` or `unprovenSource` in place of a verdict.';
 
 /** The stylesheets the open page imports, as far as they can be followed. */
 async function reachingFiles() {
@@ -493,6 +513,320 @@ async function reachingComponents() {
   return read ? components : null;
 }
 
+// ─────────────── WHICH RULES THE CASCADE IS ALLOWED TO BE DECIDED OVER ───────
+//
+// `winning: true` is a claim about a box on a screen. A stylesheet the page
+// never loads is not on that screen, so a declaration in one cannot be the
+// winner, cannot be the thing that overrides a declaration that IS on the
+// screen, and cannot be named as the reason one lost. All three were being
+// said: `.pricing-grid { gap: 99px }` in a file no import chain reaches was
+// reported `winning: true` while `gap: var(--gap)` in the imported stylesheet
+// beside it was told, by name and by file, that it had lost to it.
+//
+// The reason was ordering, not arithmetic. Reachability was annotated onto the
+// response AFTER computeRuleModel had already picked a winner over every rule
+// in the project — a label pinned to a decision it had no part in, which is how
+// `reachedByOpenPage: false` came to be printed beside `winning: true` in one
+// object. So it is decided FIRST, and the engine is asked over the rules that
+// survive it. The engine itself is untouched: it is the same computeRuleModel
+// the Style panel a person is looking at runs, and a second one would be a
+// second set of answers about the same page.
+//
+// FOUR TIERS, because "we did not prove it reaches" and "we proved it does not"
+// and "we could not look" are three different facts and only one of them is
+// `false`:
+//
+//   loaded     an import chain from the open page was followed to this source,
+//              or it is a <style> block of the open file itself.
+//   not-loaded the walk RAN and this component is not in the page's module
+//              graph. Astro emits a component's CSS for the pages that import
+//              it, so its `:global()` rules paint nothing here.
+//   unproven   the walk ran and did not arrive here. Not `false` — an @import
+//              inside a package, a Vite plugin or astro.config can load a
+//              stylesheet nothing here can follow — but it is evidence, and a
+//              source with less evidence than its rival may not beat it.
+//   unchecked  no walk could be run at all (no open file, no bridge). Nothing
+//              is known about ANY source, so nothing is held back from anything:
+//              a uniform absence of evidence is not a reason to hedge every
+//              declaration in the project.
+const TIER = { loaded: 'loaded', absent: 'not-loaded', unproven: 'unproven', unchecked: 'unchecked' };
+
+/** The project-relative file a rule was authored in, or null for a page block. */
+function fileOfRule(rule) {
+  const key = String(rule.embedKey || '');
+  if (!key.startsWith('file:') && !key.startsWith('astro:')) return null;
+  const shown = publicKey(key);
+  return shown.slice(shown.indexOf(':') + 1);
+}
+
+/**
+ * Whether the walk starts where Astro decides a page's CSS from.
+ *
+ * Astro bundles a page's stylesheets from the PAGE's module graph, so a walk
+ * rooted at `src/pages/x.astro` can say what does and does not reach the
+ * rendered document. Rooted anywhere else — a component opened for editing,
+ * which is what `openFilePath` becomes the moment somebody drills into one —
+ * it is a walk through PART of the page, and what it does not reach it may not
+ * deny: the page above imports the rest. `.link { font-weight: 700 }` in the
+ * project's own stylesheet is on the screen whether or not the Nav component
+ * being edited happens to import it.
+ *
+ * So from inside a component nothing NEGATIVE is published: every source but
+ * the open file's own blocks is unchecked, which is what it was before any of
+ * this and is the honest answer from there.
+ */
+function rootedAtPage() {
+  const host = getHost();
+  if (!host.openFilePath) return false;
+  const root = String(host.projectPath || '').replace(/\\/g, '/').replace(/\/$/, '');
+  const posix = String(host.openFilePath).replace(/\\/g, '/');
+  const rel = root && posix.startsWith(`${root}/`) ? posix.slice(root.length + 1) : posix;
+  return /^src\/pages\//.test(rel);
+}
+
+/**
+ * What can be shown about every source in `rules`, keyed by embedKey.
+ *
+ * Per SOURCE and not per rule: whether the page loads a file is a fact about
+ * the file, and the `:global()` rules escaped from a component's scoped block
+ * carry that component's own key.
+ */
+async function reachabilityByKey(rules) {
+  const page = rootedAtPage();
+  const [reaching, renderedComponents] = page
+    ? await Promise.all([reachingFiles(), reachingComponents()])
+    : [null, null];
+  const tiers = new Map();
+  for (const rule of rules) {
+    const key = rule.embedKey;
+    if (tiers.has(key)) continue;
+    const file = fileOfRule(rule);
+    // A <style> block of the file being edited is on the file being edited.
+    if (String(key).startsWith('node:')) tiers.set(key, TIER.loaded);
+    else if (reaching && file && reaching.has(file)) tiers.set(key, TIER.loaded);
+    else if (String(key).startsWith('astro:') && file && renderedComponents) {
+      tiers.set(key, renderedComponents.has(file) ? TIER.loaded : TIER.absent);
+    } else if (reaching || renderedComponents) tiers.set(key, TIER.unproven);
+    else tiers.set(key, TIER.unchecked);
+  }
+  return tiers;
+}
+
+// What `source.reachedByOpenPage` has always published, from the tier that now
+// decides the cascade as well. Only `not-loaded` may be published as false.
+const REACHED_BY_OPEN_PAGE = {
+  [TIER.loaded]: true,
+  [TIER.absent]: false,
+  [TIER.unproven]: 'unknown',
+  [TIER.unchecked]: 'unknown',
+};
+
+/**
+ * What the served document proves that an import walk could not.
+ *
+ * The browser's list is the rules that actually reach this element. When it can
+ * be trusted whole — every sheet readable, and short enough that nothing was
+ * dropped by the preload's cap — a selector that is not in it does not reach
+ * this element, and a source whose every matching rule is missing from it is
+ * not on this page. That narrows `unproven` to `not-loaded`, and a declaration
+ * that was hedging against it can go back to being an answer.
+ *
+ * ONE DIRECTION ONLY. The reverse — "the browser reports `.pricing-grid`, so
+ * this file's `.pricing-grid` is the rule it is reporting" — is the conflation
+ * this whole area exists to stop: three files in this project declare that
+ * selector and the browser's rule is at most one of them. Selector text is
+ * evidence of ABSENCE, never of identity.
+ *
+ * Values are not compared, deliberately: the CSSOM hands back `#3355ff` as
+ * `rgb(51, 85, 255)`, so a value that does not match is as likely to be the
+ * same declaration renormalised as a different one.
+ */
+function narrowByDocument(tiers, listed, documentRules, unreadable) {
+  if (!Array.isArray(documentRules) || !documentRules.length) return tiers;
+  // A truncated list is not a complete list, and absence in it proves nothing.
+  if (unreadable !== 0 || documentRules.length >= MAX_DOCUMENT_RULES) return tiers;
+  const served = new Set(documentRules.map((r) => normalizeSelector(r.selector)));
+  // Every selector this source aims at this element, so one rule that IS served
+  // keeps the whole source.
+  const seen = new Map();
+  for (const entry of listed) {
+    const key = entry.rule.embedKey;
+    if (tiers.get(key) !== TIER.unproven) continue;
+    const hit =
+      served.has(normalizeSelector(entry.rule.selectorText)) ||
+      entry.matchedSelectors.some((sel) => served.has(normalizeSelector(sel.text)));
+    seen.set(key, (seen.get(key) ?? false) || hit);
+  }
+  const narrowed = new Map(tiers);
+  for (const [key, hit] of seen) if (!hit) narrowed.set(key, TIER.absent);
+  return narrowed;
+}
+
+// The preload's own cap on how many matching rules the served document reports
+// (electron/preload.js, MAX_DOCUMENT_RULES). Mirrored rather than imported —
+// the preload runs in an isolated world — and mirrored because a list that hit
+// the cap may be missing the very rule this would take as proof of absence.
+const MAX_DOCUMENT_RULES = 60;
+
+/**
+ * The same engine, twice, over two answers to "does this reach the page".
+ *
+ * `confident` is the cascade among the sources the page is known to load (plus,
+ * where nothing could be checked at all, everything — see TIER.unchecked).
+ * `open` is that plus the sources nothing could prove either way. The
+ * DIFFERENCE between them is the whole of what is not known: a declaration that
+ * wins in `confident` and loses in `open` lost to a file that may not be on the
+ * page, and the honest answer for it is not `true` and not `false` but "this
+ * wins among what is proved to be here, and here is what contests it".
+ *
+ * Sources proved absent are in neither, so nothing they declare can win, be
+ * overridden, or override.
+ */
+async function cascadeTiers(rules, target, viewport, tiers, listing) {
+  const tierOf = (rule) => tiers.get(rule.embedKey) || TIER.unchecked;
+  const anyAbsent = rules.some((rule) => tierOf(rule) === TIER.absent);
+  const anyUnproven = rules.some((rule) => tierOf(rule) === TIER.unproven);
+  // Nothing was held back, so the listing pass already IS both answers. The
+  // ordinary project — every stylesheet imported, no orphaned component —
+  // takes this path and pays for one pass, as it always did.
+  const open = anyAbsent
+    ? await computeRuleModel(rules.filter((rule) => tierOf(rule) !== TIER.absent), target, { viewport })
+    : listing;
+  const confident = anyUnproven
+    ? await computeRuleModel(rules.filter((rule) => tierOf(rule) !== TIER.absent && tierOf(rule) !== TIER.unproven), target, { viewport })
+    : open;
+  return { open: statusIndex(open), confident: statusIndex(confident) };
+}
+
+/** Declaration id → its status in one model. declIds are seeded per source, so
+ *  one flat map cannot collide across stylesheets. */
+function statusIndex(model) {
+  const index = new Map();
+  for (const entry of [...model.base, ...model.conditional]) {
+    for (const [declId, status] of Object.entries(entry.declStatus || {})) index.set(declId, status);
+  }
+  return index;
+}
+
+/**
+ * Where a rule that beat this one, or might, was authored — the shape both
+ * `overriddenBy` and each `contestedBy` entry take.
+ *
+ * The selector alone cannot name it: three stylesheets in this project can
+ * declare `.pricing-grid`, and one of them may be a file this page never loads.
+ * The query travels with it for the same reason — without it a base declaration
+ * beaten by `@media (min-width: 50em) { .section-header h3 }` was told it lost
+ * to `.section-header h3`, itself as far as a reader could tell.
+ */
+const originOf = (origin) =>
+  origin
+    ? {
+        selector: origin.selector,
+        atContext: origin.atContext || [],
+        source: publicKey(origin.source),
+        sourceLabel: origin.sourceLabel,
+      }
+    : null;
+
+/** Two rivals are the same rival when they are the same rule in the same file
+ *  under the same query — one property beaten twice is one entry. */
+const originKey = (c) => `${c.source}|${(c.atContext || []).join('|')}|${c.selector}`;
+
+/**
+ * What one declaration is entitled to claim, given who is proved to be here.
+ *
+ * Three answers, and the tier decides which question is even being asked:
+ *
+ *   not-loaded  it was never in the cascade. Not `false` — nothing beat it, and
+ *               saying it lost would name a winner it never ran against.
+ *   unproven    it may be on this page and it may not, so it may not be the
+ *               answer. It can still be told it LOST, but only to a source that
+ *               is at least as well evidenced as it is.
+ *   loaded /    the cascade among what is proved to be here decides it — and
+ *   unchecked   where letting the unproven sources in would change that answer,
+ *               the difference is published as a contest rather than swallowed.
+ */
+function declarationVerdict(entry, decl, tier, confident, open) {
+  const rule = entry.rule;
+  if (tier === TIER.absent) {
+    return {
+      winning: null,
+      appliesWhen: null,
+      overriddenBy: null,
+      notInCascade:
+        `${rule.embedLabel} is not loaded by this page — no import chain from the page reaches it — so this ` +
+        'declaration was left out before the winner was computed. It is not painting this element, and nothing ' +
+        'here lost to it.',
+    };
+  }
+
+  const wide = open.get(decl.declId) || {};
+  // An unproven source is not in the confident model at all, so the wider one
+  // is the only place it has a status.
+  const status = tier === TIER.unproven ? wide : confident.get(decl.declId) || wide;
+  const resolved = status.resolved !== false;
+  const appliesWhen = resolved
+    ? null
+    : (rule.atContext || []).length
+      ? rule.atContext
+      : entry.matchedSelectors.map((sel) => sel.text);
+
+  if (tier === TIER.unproven) {
+    // Losing to something that IS here is a fact whichever way this file's own
+    // reachability goes; winning would be a claim it has not earned.
+    const lost = resolved && status.winning === false && status.overriddenByOrigin;
+    return {
+      winning: lost ? false : null,
+      appliesWhen,
+      overriddenBy: lost ? originOf(status.overriddenByOrigin) : null,
+      ...(lost
+        ? {}
+        : {
+            unprovenSource:
+              `Nothing followed an import chain from this page to ${rule.embedLabel}, so this may or may not be ` +
+              'reaching the element. It is reported because it is in the project, not because it was proved to ' +
+              'apply; `computed` is what the element actually has.',
+          }),
+    };
+  }
+
+  // Everything that sets this property and might still turn out to be the value
+  // the element has: a query nobody could decide, and a file nobody could prove
+  // is on the page.
+  const contested = new Map();
+  for (const list of [status.contestedBy, wide.contestedBy])
+    for (const by of list || []) {
+      const c = originOf(by);
+      contested.set(originKey(c), c);
+    }
+  // It wins among what is proved to be here, and loses once the unproven files
+  // are let in. That difference IS the uncertainty, and it is the whole reason
+  // the engine is run twice.
+  if (resolved && status.winning !== false && wide.winning === false && wide.overriddenByOrigin) {
+    const c = originOf(wide.overriddenByOrigin);
+    contested.set(originKey(c), c);
+  }
+  const contestedBy = resolved && status.winning !== false && contested.size ? [...contested.values()] : null;
+
+  return {
+    winning: resolved ? (contestedBy ? null : status.winning !== false) : null,
+    appliesWhen,
+    overriddenBy: originOf(status.overriddenByOrigin),
+    // Only ever present when it is the reason `winning` is null.
+    ...(contestedBy
+      ? {
+          contestedBy,
+          // Kept to one line: it repeats per contested declaration, and the
+          // evidence is `contestedBy` rather than the sentence.
+          undecided:
+            'This wins among the rules that could be resolved and proved to reach this page; `contestedBy` sets the ' +
+            'same property under something nothing here could decide — a query at an unknown viewport, or a file no ' +
+            'import chain leads to. `computed` is what the element actually has.',
+        }
+      : {}),
+  };
+}
+
 /** The dependency whose output is missing from an authored-source scan. */
 async function generatorNote() {
   const host = getHost();
@@ -526,22 +860,42 @@ async function generatorNote() {
  * resolved: a property nothing here can account for is named, not omitted.
  */
 export async function readStyles(node, { pathOf, properties = null, viewport: measuredAt = null } = {}) {
-  const { docs, model, rootSnapshot, errors, asked, viewport } = await readCascade(node, measuredAt);
+  const { docs, rules: parsed, model, target, rootSnapshot, errors, asked, viewport } = await readCascade(node, measuredAt);
   const all = [...model.base, ...model.conditional];
   const matched = all.slice(0, MAX_RULES);
-  const [reaching, renderedComponents] = await Promise.all([reachingFiles(), reachingComponents()]);
 
+  // THE PROPERTIES THE ANSWER IS ABOUT, decided before any verdict is.
+  //
+  // What the caller named, plus every property the rules this answer will
+  // return declare — which is a fact about the LISTING and needs no cascade.
+  // It has to be settled here because the served document is asked next, and
+  // what it says is evidence about which sources are on this page: the winner
+  // cannot be computed until after that question has been put.
   const wanted = new Set(properties || []);
+  for (const entry of matched)
+    for (const decl of entry.rule.declarations.slice(0, MAX_DECLS_PER_RULE)) wanted.add(decl.prop);
+
+  const { computed, documentRules, runtime } = await askDocument(node, [...wanted].slice(0, 200), pathOf);
+
+  // WHO IS ON THIS PAGE — settled before the cascade, not annotated after it.
+  const tiers = narrowByDocument(
+    await reachabilityByKey(parsed),
+    all,
+    documentRules,
+    runtime.available === true ? runtime.unreadableStyleSheets : null
+  );
+  const { open, confident } = await cascadeTiers(parsed, target, viewport, tiers, model);
+
   const rules = matched.map((entry) => {
     const rule = entry.rule;
+    const tier = tiers.get(rule.embedKey) || TIER.unchecked;
     const declarations = rule.declarations.slice(0, MAX_DECLS_PER_RULE).map((decl) => {
-      const status = entry.declStatus?.[decl.declId] || {};
       // A conditional declaration nothing resolved (:hover, or an @media at an
       // unknown viewport) was never measured against anything: nothing here
       // knows where the pointer is. It used to be reported `winning: true`
       // beside the base declaration that also said it won — one property, two
       // winners, in one response.
-      const resolved = status.resolved !== false;
+      //
       // AND THE OTHER HALF OF THE SAME SENTENCE. A base declaration a media
       // query overrides at the viewport being measured is not the winner
       // either, and saying so contradicts the `computed` value in this same
@@ -549,53 +903,22 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
       // `font-size: var(--text-2xl)` (34px) won. When the query could be
       // decided the cascade above has already settled it; when it could not,
       // `winning` is null and the rules that make it undecidable are named.
-      const contested = resolved && status.winning !== false && status.contestedBy?.length ? status.contestedBy : null;
+      //
+      // AND THE THIRD, which is the same shape one axis over: a file this page
+      // was never proved to load is undecidable in exactly the way an
+      // unresolved query is, so it contests rather than wins — and a file
+      // proved NOT to be here is not undecidable at all, it is simply not in
+      // the cascade.
+      const verdict = declarationVerdict(entry, decl, tier, confident, open);
       return {
         property: decl.prop,
         value: clip(decl.value),
         important: !!decl.important,
-        winning: resolved ? (contested ? null : status.winning !== false) : null,
-        appliesWhen: resolved
-          ? null
-          : (rule.atContext || []).length
-            ? rule.atContext
-            : entry.matchedSelectors.map((sel) => sel.text),
-        // Only ever present when it is the reason `winning` is null.
-        ...(contested
-          ? {
-              contestedBy: contested.map((by) => ({
-                selector: by.selector,
-                atContext: by.atContext,
-                source: publicKey(by.source),
-                sourceLabel: by.sourceLabel,
-              })),
-              // Kept to one line: it repeats per contested declaration, and the
-              // evidence is `contestedBy` rather than the sentence.
-              undecided:
-                'This wins among the rules that could be resolved; `contestedBy` sets the same property under a ' +
-                'condition nothing here could decide. `computed` is what the element actually has.',
-            }
-          : {}),
-        // The selector alone cannot name the winner: three stylesheets in this
-        // project can declare `.pricing-grid`, and one of them may be a file
-        // this page never loads.
-        overriddenBy: status.overriddenByOrigin
-          ? {
-              selector: status.overriddenByOrigin.selector,
-              // The query the winner is under. Without it, a base declaration
-              // beaten by `@media (min-width: 50em) { .section-header h3 }`
-              // was told it lost to `.section-header h3` — itself, as far as
-              // anything reading the answer could tell.
-              atContext: status.overriddenByOrigin.atContext || [],
-              source: publicKey(status.overriddenByOrigin.source),
-              sourceLabel: status.overriddenByOrigin.sourceLabel,
-            }
-          : null,
+        ...verdict,
         variables: variablesIn(decl.value),
         identity: declarationIdentity(rule, decl.prop, digestOfDoc(docs, rule.embedKey)),
       };
     });
-    for (const decl of declarations) wanted.add(decl.property);
     const doc = docFor(docs, rule.embedKey);
     const file =
       rule.embedKey.startsWith('file:') || rule.embedKey.startsWith('astro:')
@@ -637,19 +960,19 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
         // element, and the `:global()` rules read out of its scoped block must
         // not be offered as though they were. Still 'unknown' when the walk
         // could not be done at all.
-        reachedByOpenPage:
-          rule.embedKey.startsWith('node:') || (reaching && file && reaching.has(file))
-            ? true
-            : rule.embedKey.startsWith('astro:') && renderedComponents && file
-              ? renderedComponents.has(file)
-              : 'unknown',
+        reachedByOpenPage: REACHED_BY_OPEN_PAGE[tier],
+        // WHY it says that, because 'unknown' has two causes and they are not
+        // the same fact. `unproven` is a walk that ran from this page and did
+        // not arrive here — enough for this source to lose an argument with one
+        // that did, which is what `winning` above now reflects; `unchecked` is
+        // no walk at all, and holds nothing against anybody.
+        reachEvidence: tier,
       },
       declarations,
       declarationsOmitted: Math.max(0, rule.declarations.length - MAX_DECLS_PER_RULE),
     };
   });
 
-  const { computed, documentRules, runtime } = await askDocument(node, [...wanted].slice(0, 200), pathOf);
   const { explainsComputed, unexplained, unaccountedRules } = reconcileComputed(rules, computed, documentRules);
   const kinds = { stylesheet: 0, component: 0, block: 0 };
   for (const doc of docs) {

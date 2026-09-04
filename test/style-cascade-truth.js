@@ -75,11 +75,35 @@ const FIXTURE = {
 }
 `,
 
-  // Imported by nothing. listCssFiles walks the whole project, so it is in the
-  // cascade anyway — the question is whether the answer says so.
+  // A SECOND stylesheet the layout imports, later in document order than
+  // site.css. It is what makes "overridden" a real case in this fixture: the
+  // thing that beats a declaration on the page has to be another declaration
+  // ON the page, and before this the only rule that beat one was the unimported
+  // file below.
+  'src/styles/theme.css': `.pricing-grid {
+  gap: 3rem;
+}
+`,
+
+  // Imported by nothing. listCssFiles walks the whole project, so it is LISTED
+  // anyway — the question is whether it is allowed to decide anything.
   'src/styles/zz-unimported.css': `.pricing-grid {
   gap: 99px;
 }
+`,
+
+  // Both stylesheets, so `reachedByOpenPage` has two files to say true about
+  // and the cascade between them is a cascade between two rules on the page.
+  'src/layouts/Base.astro': `---
+import '../styles/site.css';
+import '../styles/theme.css';
+---
+<html lang="en">
+  <head><title>Fixture</title></head>
+  <body>
+    <slot />
+  </body>
+</html>
 `,
 
   'src/styles/many.css': `${MANY}\n`,
@@ -276,6 +300,19 @@ const declsOf = (answer, prop) =>
     check(
       'and the one nothing imports is not claimed to reach it',
       fromNowhere && fromNowhere.source.reachedByOpenPage === 'unknown',
+      short(fromNowhere && fromNowhere.source)
+    );
+    // Being LISTED is not being allowed to decide. Tolerating this file in the
+    // cascade "as long as it is labelled unknown" is what let `gap: 99px` come
+    // back as the winner over the stylesheet the page actually loads.
+    check(
+      '  so it is not allowed to claim the property either',
+      fromNowhere && fromNowhere.declarations.every((d) => d.winning !== true),
+      short(fromNowhere && fromNowhere.declarations.map((d) => ({ p: d.property, winning: d.winning })))
+    );
+    check(
+      '  and the walk that could not find it is named as the reason',
+      fromNowhere && fromNowhere.source.reachEvidence === 'unproven',
       short(fromNowhere && fromNowhere.source)
     );
     check(
@@ -550,6 +587,33 @@ const declsOf = (answer, prop) =>
       '  and it is the rule the reviewer\'s magenta outline came in on',
       orphan[0] && orphan[0].declarations.some((d) => d.property === 'outline'),
       short(orphan[0] && orphan[0].declarations)
+    );
+    // AND THE HALF THIS FILE USED TO LEAVE ALONE. `reachedByOpenPage: false`
+    // was being printed beside `winning: true` in the same object, because the
+    // label was pinned on after a cascade computed over every rule in the
+    // project. A response that says both is not hedged, it is contradictory —
+    // and the fuller account of the tiers is test/style-reachability.js.
+    check(
+      '  and it does not claim to win, having been said not to be here',
+      orphan[0] && orphan[0].declarations.every((d) => d.winning !== true),
+      short(orphan[0] && orphan[0].declarations.map((d) => ({ p: d.property, winning: d.winning })))
+    );
+    check(
+      '  nor to have lost, which would name a winner it never ran against',
+      orphan[0] && orphan[0].declarations.every((d) => d.winning === null && d.overriddenBy === null),
+      short(orphan[0] && orphan[0].declarations.map((d) => ({ p: d.property, winning: d.winning, by: d.overriddenBy })))
+    );
+    // Nothing on the page may be told it lost to a file that is not on it.
+    check(
+      'and no declaration anywhere is overridden by a source proved not to be here',
+      (answer.rules || []).every((r) =>
+        (r.declarations || []).every((d) => {
+          if (!d.overriddenBy) return true;
+          const winner = (answer.rules || []).find((other) => other.source.key === d.overriddenBy.source);
+          return !winner || winner.source.reachedByOpenPage !== false;
+        })
+      ),
+      short((answer.rules || []).flatMap((r) => r.declarations.map((d) => d.overriddenBy?.source || null)))
     );
 
     // THE OTHER HALF, or the fix is just a blanket `false`. Escaping.astro is

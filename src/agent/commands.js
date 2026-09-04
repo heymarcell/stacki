@@ -385,7 +385,20 @@ export function createAgentCommands(getApp) {
 
     try {
       if (action === 'read') {
-        const styles = await styleAgent.readStyles(node, { pathOf: a.pathFor, properties: args.properties || null });
+        // THE VIEWPORT THE ANSWER IS ABOUT, which the app has been measuring
+        // all along and nothing was handing over. PreviewPane reports the
+        // iframe's own client box, App keeps it as `canvasReport`, and it
+        // already travels in the MCP payload as `page.viewportWidth` — but
+        // style.read was reaching the cascade without it, so a live read of an
+        // element inside `@media (min-width: 50em)` came back `viewport: null`
+        // and hedged `winning: null` about a query the app could see holds.
+        // Null when nothing has measured one, which readStyles answers as null
+        // rather than as a guessed width.
+        const styles = await styleAgent.readStyles(node, {
+          pathOf: a.pathFor,
+          properties: args.properties || null,
+          viewport: a.canvas?.() || null,
+        });
         return { ok: true, ...styles, document: documentOf(a) };
       }
       if (action === 'set_property') {
@@ -564,7 +577,14 @@ export function createAgentCommands(getApp) {
       return fail('bad_domain', `Stacki's window answers for target, style, project and page — not \"${domain}\".`);
     } catch (err) {
       // A command that throws must not look like a command that timed out.
-      return fail('command_failed', String(err?.message || err));
+      //
+      // And a cause with a name must not arrive as the generic one. The main
+      // process carries a branchable code on the Error as `refusalCode` and
+      // `runMain` reads it; the renderer's throws reach the wire through here
+      // instead, so this reads the same field. Anything that does not carry one
+      // is genuinely unclassified and still says so.
+      const named = typeof err?.refusalCode === 'string' && err.refusalCode ? err.refusalCode : null;
+      return fail(named || 'command_failed', String(err?.message || err));
     }
   };
 }
