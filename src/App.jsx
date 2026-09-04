@@ -1077,12 +1077,22 @@ export default function App() {
     const entry = h.past.pop();
     if (entry.kind === 'cmd') {
       h.future.push(entry);
+      // AN INVERSE THAT THREW IS NOT AN UNDO, AND USED TO REPORT AS ONE.
+      //
+      // The toast tells the person, and a person can see the file did not
+      // change. An agent cannot: `project.undo` measured success by whether the
+      // history stack got shorter, and it got shorter at `pop()` above whatever
+      // the inverse did -- so a failed undo answered `ok: true, undone: true`.
+      // The failure is carried back on the result instead, where the caller can
+      // read it, and the toast is unchanged.
+      let failed = null;
       try {
         await entry.undo();
       } catch (err) {
-        showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${cleanError(err)}`, 'error');
+        failed = cleanError(err);
+        showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${failed}`, 'error');
       }
-      return { kind: 'cmd', files: entry.files || [] };
+      return { kind: 'cmd', files: entry.files || [], ...(failed ? { failed } : {}) };
     }
     const state = pageStateRef.current.pageState;
     if (!state) return null; // its page is gone — nothing to restore onto

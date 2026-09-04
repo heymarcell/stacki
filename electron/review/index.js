@@ -973,7 +973,15 @@ async function focus(threadId) {
       ok: false,
       code: 'no_answer',
       message: 'Stacki did not answer in time — the preview may still be starting.',
-      review: summarize(thread),
+      // `reviewOf`, not `summarize`. The tool declares `review: Full` and every
+      // OTHER return in this function sends `reviewOf(...)`; this one sent a
+      // Summary, which is missing twelve of Full's properties. It survived only
+      // because `ok: false` sets `isError`, and both the server and the official
+      // client skip output validation on an error result -- so the one path that
+      // shipped a payload contradicting its own schema was the one nothing
+      // checked. It is also the commonest transient in the surface: an agent
+      // that focuses a review while the preview is still coming up lands here.
+      review: reviewOf(thread),
     };
   }
   // The renderer is the only thing that can say whether the anchor resolved,
