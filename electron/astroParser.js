@@ -961,6 +961,26 @@ function parsePage(source, opts = {}) {
   // shuffle one group past the other.
   imports.sort((a, b) => (a.at ?? Infinity) - (b.at ?? Infinity));
   cuts.sort((a, b) => a[0] - b[0]);
+  // A `//` COMMENT AFTER THE `;` BELONGS TO THE IMPORT IT SITS ON.
+  //
+  // Both regexes above stop at the semicolon, so `import Hero from '...'; //
+  // above the fold` left ` // above the fold` in the frontmatter TEXT: every
+  // full save hoisted it to the bottom of the block, and cutting the statement
+  // out by position left it behind on a line of its own -- with a stray
+  // leading space, now reading as an annotation on whichever import moved up
+  // into its place. It travels with its statement instead, which is what the
+  // comment-stays-on-its-import property means one file shape over.
+  const trails = new Map();
+  for (const cut of cuts) {
+    const trail = /^[ \t]*\/\/[^\r\n]*/.exec(frontmatter.slice(cut[1]));
+    if (!trail) continue;
+    trails.set(cut[0], trail[0]);
+    cut[1] += trail[0].length;
+  }
+  for (const imp of imports) {
+    const trail = trails.get(imp.at);
+    if (trail !== undefined) imp.trail = trail;
+  }
   // The same ranges again, this time as offsets into the FILE, so an anchored
   // write can cut one import statement out of the block instead of rebuilding
   // the block. `at` is the frontmatter-relative start each import entry already
@@ -1098,7 +1118,7 @@ function serializeImports(model, lines, specFor) {
     // one character is a diff on a page that was only opened.
     const q = imp.quote === '"' ? '"' : "'";
     if (!imp.named) {
-      lines.push(`import ${imp.name} from ${q}${specFor ? specFor(imp) : imp.path}${q};`);
+      lines.push(`import ${imp.name} from ${q}${specFor ? specFor(imp) : imp.path}${q};${imp.trail || ''}`);
       continue;
     }
     const group = model.imports.filter((i) => i.named && i.path === imp.path);
@@ -1107,7 +1127,7 @@ function serializeImports(model, lines, specFor) {
       const base = g.imported && g.imported !== g.name ? `${g.imported} as ${g.name}` : g.name;
       return g.typeOnly ? `type ${base}` : base;
     });
-    lines.push(`import { ${specs.join(', ')} } from ${q}${imp.path}${q};`);
+    lines.push(`import { ${specs.join(', ')} } from ${q}${imp.path}${q};${imp.trail || ''}`);
   }
 }
 
@@ -1353,20 +1373,64 @@ const withEol = (text, eol) => (eol === '\n' ? text : text.replace(/\r?\n/g, eol
  * a file that does not exist yet. Grafted onto a file written with tabs it
  * produced `\t  <Card` -- one tab and two spaces inside a single element -- on
  * every insert. The file has already said what a step is; this reads it back.
+ *
+ * FROM THE TREE, NOT FROM THE TEXT. Reading it off `body.split('\n')` is how
+ * the defect above came back: a text scan cannot tell markup from the inside
+ * of a raw `<script>`, a `<pre>` or a hand-wrapped line, so one tab in a
+ * script won the vote outright in an otherwise two-space page and the next
+ * insert wrote `  \t<small>`. The parse already knows which offsets are the
+ * starts of nodes; a step is what one of them adds to its parent's indent, and
+ * the step the file uses MOST is the one it is written with -- so a single
+ * oddly-indented block cannot speak for the file.
  */
-function indentStepOf(source) {
-  const fence = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(source);
-  const body = source.slice(fence ? fence[0].length : 0);
-  let tabbed = false;
-  let smallest = null;
-  for (const line of body.split('\n')) {
-    const lead = (/^[ \t]+(?=\S)/.exec(line) || [null])[0];
-    if (lead === null) continue;
-    if (lead.includes('\t')) tabbed = true;
-    else if (smallest === null || lead.length < smallest) smallest = lead.length;
+function indentStepOf(source, nodes) {
+  const votes = new Map();
+  const walk = (list, outer) => {
+    for (const node of list || []) {
+      const lead = typeof node.start === 'number' ? lineIndentOf(source, node.start) : null;
+      // A child sharing its parent's line -- an inline run, a text node that
+      // starts where its sibling ended -- has no indent of its own to read,
+      // and casts no vote and passes its parent's down.
+      if (lead !== null && outer !== null && lead.length > outer.length && lead.startsWith(outer)) {
+        const step = lead.slice(outer.length);
+        votes.set(step, (votes.get(step) || 0) + 1);
+      }
+      if (Array.isArray(node.children)) walk(node.children, lead === null ? outer : lead);
+    }
+  };
+  // The top level votes for nothing: a page whose roots are themselves
+  // indented would otherwise call that indent a step.
+  walk(nodes, null);
+  let best = null;
+  for (const [step, count] of votes) {
+    if (best === null || count > votes.get(best)) best = step;
   }
-  if (tabbed) return '\t';
-  return smallest ? ' '.repeat(smallest) : '  ';
+  return best || '  ';
+}
+
+// WHERE LEADING SPACES ARE CONTENT.
+//
+// Inside these four the bytes on each line are what the browser renders or
+// what a script runs -- `<pre>` and `<textarea>` show them, a `<script>` or a
+// `<style>` can hold a template literal or a quoted string across lines. Every
+// other rule in this file treats leading whitespace as layout it is free to
+// shift, and inside these it is not.
+const HOLDS_RENDERED_SPACE = /<(pre|textarea|script|style)[\s>]/i;
+
+/**
+ * The inner bytes of every `<pre>` and `<textarea>`, in document order.
+ *
+ * Only ever run over serializer OUTPUT, where the two texts being compared
+ * were written by the same printer, so a `>` inside an attribute value cannot
+ * make one of them count a tag the other did not -- and a difference in how
+ * many were found is itself a disagreement, which refuses.
+ */
+function renderedWhitespace(text) {
+  const runs = [];
+  const re = /<(pre|textarea)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi;
+  let hit;
+  while ((hit = re.exec(text)) !== null) runs.push(hit[2].replace(/\r\n/g, '\n'));
+  return runs;
 }
 
 /**
@@ -1502,11 +1566,18 @@ function twinFinder(baseNodes) {
 function printNode(node, indent, ctx) {
   const twin = ctx.twin(node);
   if (twin) {
-    const copied = reindentBlock(
-      ctx.source.slice(twin.start, twin.end),
-      lineIndentOf(ctx.source, twin.start),
-      indent
-    );
+    const held = ctx.source.slice(twin.start, twin.end);
+    // A SHIFT WOULD EDIT THE CONTENT, NOT THE LAYOUT.
+    //
+    // `reindentBlock` slices the same prefix off every line in the block, and
+    // inside a `<pre>` those leading spaces are what the page shows: moving
+    // one out a level turned `alpha\n  beta\ngamma` into `alpha\nbeta\ngamma`
+    // -- a rendered change nothing asked for, and one main did not make. So
+    // these bytes travel exactly as written. The block then sits at its old
+    // inner indentation, which is cosmetic; the alternative was silent data
+    // loss.
+    if (HOLDS_RENDERED_SPACE.test(held)) return held;
+    const copied = reindentBlock(held, lineIndentOf(ctx.source, twin.start), indent);
     if (copied !== null) return copied;
   }
   return withEol(nodeText(node, indent, ctx.step), ctx.eol);
@@ -1774,7 +1845,17 @@ function spliceImports(source, baseModel, model, eol) {
     for (const span of spans) {
       if (!statements.has(span.at)) continue;
       let to = span.to;
-      const eolAfter = /^[ \t]*\r?\n/.exec(source.slice(to));
+      // THE STATEMENT HAS TO END ITS LINE.
+      //
+      // A trailing `//` comment is already inside the span -- `parsePage`
+      // gives it to the import it annotates -- but a second statement or a
+      // `/* */` after this one is code that still has to run, and there is no
+      // rule here for dividing a line. The frontmatter is rebuilt instead of
+      // guessed at.
+      const rest = /^[ \t]*(?=\r?\n|$)/.exec(source.slice(to));
+      if (!rest) return null;
+      to += rest[0].length;
+      const eolAfter = /^\r?\n/.exec(source.slice(to));
       if (eolAfter) to += eolAfter[0].length;
       cuts.push({ start: span.from, end: to, text: '' });
     }
@@ -1794,7 +1875,18 @@ function spliceImports(source, baseModel, model, eol) {
   return [{ start: last.to, end: last.to, text: lines.map((line) => eol + line).join('') }];
 }
 
-/** The splices applied back to front, so an earlier one cannot shift a later one. */
+/**
+ * The splices applied back to front, so an earlier one cannot shift a later one.
+ *
+ * `limit` is the start of the edit already written, so a span reaching past it
+ * would be reading bytes that are no longer there and writing over an edit that
+ * has already landed: the whole list is refused and the caller falls back to a
+ * full serialization. Nothing above can currently produce that -- `alignChildren`
+ * hands out disjoint runs, `spliceHead`'s spans sit outside the children's, and
+ * an import cut is in the frontmatter -- so this is the guard for the producer
+ * that someday can, and test/source-fidelity-matrix.js drives it directly
+ * rather than pretending some fixture reaches it.
+ */
 function applySplices(source, edits) {
   const ordered = [...edits].sort((a, b) => b.start - a.start || b.end - a.end);
   let out = source;
@@ -1845,7 +1937,7 @@ function anchoredSerialize(source, model) {
   const ctx = {
     source,
     eol,
-    step: indentStepOf(source),
+    step: indentStepOf(source, base.model.nodes || []),
     inline: false,
     structural: true,
     twin: twinFinder(base.model.nodes || []),
@@ -1877,6 +1969,28 @@ function anchoredSerialize(source, model) {
   if (!check?.editable || !check.model) return canonical;
   if (!sameMeaning(check.model.nodes, model.nodes)) return canonical;
   if (frontmatterText(check.model) !== frontmatterText(model)) return canonical;
+
+  // AND THE WHITESPACE THE PAGE RENDERS, WHICH THE TREE DOES NOT CARRY.
+  //
+  // `parsePage` collapses a `<pre>`'s content into `value` -- 'alpha\n  beta'
+  // reads back as 'alpha beta' -- and parks the real bytes in `source`, which
+  // is an AS_WRITTEN field the comparison above skips. So the check passed on
+  // two identical trees while a cross-level move had deleted two spaces the
+  // browser shows. Both texts here are serializations of the SAME model, so
+  // their whitespace-significant runs have to be the same bytes; comparing
+  // them rather than the file keeps the layout the splice preserved out of it.
+  //
+  // Belt and braces: `printNode` already refuses to shift a block holding one
+  // of these, and that refusal is the only producer the suite can drive today
+  // -- removing it turns test/source-fidelity-matrix.js red, removing this
+  // does not. It is here for the next path that copies bytes, and it was
+  // measured on its own by taking the refusal out and watching this catch the
+  // same move.
+  const asked = renderedWhitespace(canonical);
+  if (asked.length) {
+    const got = renderedWhitespace(serializePage(check.model));
+    if (got.length !== asked.length || got.some((run, i) => run !== asked[i])) return canonical;
+  }
   return spliced;
 }
 
@@ -3797,4 +3911,7 @@ module.exports = {
   numberRules,
   parseAttrs,
   serializeAttrs,
+  // No production caller can hand this overlapping spans today; it is exported
+  // so the refusal that would catch one is measured rather than assumed.
+  applySplices,
 };

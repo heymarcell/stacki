@@ -41,7 +41,7 @@
 
 const crypto = require('node:crypto');
 const H = require('./agent-harness.js');
-const { parsePage, anchoredSerialize } = require('../electron/astroParser.js');
+const { parsePage, anchoredSerialize, applySplices } = require('../electron/astroParser.js');
 
 const failures = [];
 let checked = 0;
@@ -125,11 +125,26 @@ function makeSource({ ind, eol, q }) {
     `${ind}</div>`,
     `${ind}<section class=${q}pills${q}>`,
     `${ind}${ind}<Card title=${q}Inline${q}><strong>Bold</strong> words</Card>`,
+    // A MULTI-LINE BLOCK ONE LEVEL DOWN, so a move can carry it out to the
+    // body: the bytes travel AND every line in them shifts a step left, and
+    // the only fixture that could tell a shift from a reprint before this was
+    // a one-line <Hero /> whose reprint is byte-identical to its source.
+    `${ind}${ind}<Card`,
+    `${ind}${ind}${ind}title=${q}Deep${q}`,
+    `${ind}${ind}${ind}body=${q}nested on purpose${q}`,
+    `${ind}${ind}/>`,
     `${ind}</section>`,
     `${ind}<Card`,
     `${ind}${ind}title=${q}Wide${q}`,
     `${ind}${ind}body=${q}across lines on purpose${q}`,
     `${ind}/>`,
+    // A BLANK LINE BETWEEN TWO SIBLINGS. `cutNodeSplice` takes the blank lines
+    // an author left in FRONT of a node with the node, because left behind
+    // they attach to whatever follows and the reparse stops agreeing with the
+    // model about where the gaps are -- at which point the write falls back to
+    // reprinting the whole document, in two spaces, with every quote changed.
+    // Without this line no fixture reaches that rule.
+    '',
     `${ind}<p class=${q}fine-print${q}>Made carefully.</p>`,
     `${ind}<footer>`,
     `${ind}${ind}<small>Made in 2026</small>`,
@@ -161,6 +176,26 @@ const IMG_TEXT = '<img src="/x.png" alt="x" />';
 function operations(f) {
   const { ind, eol, q } = f;
   const heroLine = `${eol}${ind}<Hero heading={site.tagline} />`;
+  // The Card whose attributes the author spread over three lines, exactly as
+  // the file writes it -- and the same block one nesting level in, which is
+  // what a move into the <section> has to produce.
+  const cardBlock =
+    `${eol}${ind}<Card` +
+    `${eol}${ind}${ind}title=${q}Wide${q}` +
+    `${eol}${ind}${ind}body=${q}across lines on purpose${q}` +
+    `${eol}${ind}/>`;
+  // The block that lives inside the <section>, and the same block raised one
+  // step -- what a move out to the body has to write.
+  const deepBlock =
+    `${eol}${ind}${ind}<Card` +
+    `${eol}${ind}${ind}${ind}title=${q}Deep${q}` +
+    `${eol}${ind}${ind}${ind}body=${q}nested on purpose${q}` +
+    `${eol}${ind}${ind}/>`;
+  const deepBlockRaised =
+    `${eol}${ind}<Card` +
+    `${eol}${ind}${ind}title=${q}Deep${q}` +
+    `${eol}${ind}${ind}body=${q}nested on purpose${q}` +
+    `${eol}${ind}/>`;
   return [
     {
       name: 'set_prop on a component',
@@ -307,6 +342,47 @@ function operations(f) {
       },
     },
     {
+      // THE COPIED BYTES ARE THE SAME BYTES. `duplicate` above copies a
+      // one-line <Hero />, whose reprint is byte-identical to its source, so
+      // it cannot tell a copy from a reprint. This one can: reprinted, the
+      // three lines collapse to one and the author's quotes are swapped.
+      name: 'duplicate a multi-line attribute block',
+      target: 'wideCard',
+      call: (ref) => ['duplicate', { ref }],
+      mark: `${cardBlock}${cardBlock}`,
+      back: (after) => removeOnce(after, cardBlock),
+    },
+    {
+      // ACROSS A NESTING LEVEL, which nothing else here does. The bytes move
+      // AND every line in them shifts a step left -- and the shift is a shift,
+      // not a reprint: the attribute block is still four lines, in the
+      // author's quotes, at the body's indentation. Left un-shifted the block
+      // keeps the section's indentation inside the body; reprinted it comes
+      // back as one line with the quotes swapped. Both are visible here.
+      name: 'move a multi-line block up a nesting level',
+      target: 'deepCard',
+      call: (ref, ctx) => ['move', { ref, to: { parentRef: ctx.pageRef, index: 5 } }],
+      mark: `${deepBlockRaised}${eol}${ind}<footer>`,
+      back: (after, before) => {
+        const cut = removeOnce(after, deepBlockRaised);
+        if (cut === null) return null;
+        const at = before.indexOf(deepBlock);
+        return at === -1 ? null : cut.slice(0, at) + deepBlock + cut.slice(at);
+      },
+    },
+    {
+      // The blank line the author left above it goes with it. Left behind, it
+      // attaches to the <footer> and the readback no longer agrees with the
+      // model -- and the fallback is the whole-document reprint this suite
+      // exists to catch.
+      name: 'remove a node with a blank line above it',
+      target: 'fine',
+      call: (ref) => ['remove', { ref }],
+      mark: `${eol}${ind}/>${eol}${ind}<footer>`,
+      forward: (before) =>
+        removeOnce(before, `${eol}${eol}${ind}<p class=${q}fine-print${q}>Made carefully.</p>`),
+    },
+    {
       name: 'a batched target.edit',
       target: 'section',
       call: (ref) => [
@@ -350,13 +426,20 @@ async function runFixture(f) {
     }
     const baselineSha = sha(baseline);
 
-    const pageRef = (await run('target', 'read')).target?.ref ?? null;
+    let pageRef = (await run('target', 'read')).target?.ref ?? null;
     check(`[${f.id}] the page answers with a ref`, !!pageRef, short(pageRef));
 
     // Every target the operations name, re-resolved before each one: a ref is
     // a position on a tree, and the tree is rebuilt by every undo.
     const resolve = async (which) => {
-      const top = (await run('target', 'read', { ref: pageRef })).target?.children || [];
+      const seen = (await run('target', 'read', { ref: pageRef })).target;
+      // READING THE PAGE RE-ISSUES ITS REF against the file that is there now.
+      // A `move` names its destination with a ref, and that ref has to have
+      // seen the same version as the node being moved -- every operation below
+      // rewrites the file, so a page ref taken once at the top is stale by the
+      // second one and the move is refused rather than aimed at the wrong tree.
+      if (seen?.ref) pageRef = seen.ref;
+      const top = seen?.children || [];
       const byTag = (t) => top.find((c) => c.tag === t) || null;
       if (which === 'hero') return byTag('Hero')?.ref ?? null;
       if (which === 'grid') return byTag('div')?.ref ?? null;
@@ -364,11 +447,12 @@ async function runFixture(f) {
       if (which === 'footer') return byTag('footer')?.ref ?? null;
       if (which === 'fine') return byTag('p')?.ref ?? null;
       if (which === 'wideCard') return byTag('Card')?.ref ?? null;
-      if (which === 'inlineCard') {
+      if (which === 'inlineCard' || which === 'deepCard') {
         const section = byTag('section');
         if (!section?.ref) return null;
         const kids = (await run('target', 'read', { ref: section.ref })).target?.children || [];
-        return kids.find((c) => c.tag === 'Card')?.ref ?? null;
+        const cards = kids.filter((c) => c.tag === 'Card');
+        return (which === 'inlineCard' ? cards[0] : cards[1])?.ref ?? null;
       }
       return null;
     };
@@ -381,7 +465,7 @@ async function runFixture(f) {
       const ref = await resolve(op.target);
       if (!check(`${label}: the target resolves`, !!ref, op.target)) continue;
 
-      const [action, args] = op.call(ref, { pageRef });
+      const [action, args] = await op.call(ref, { pageRef, resolve });
       const answer = await run('target', action, args);
       const after = app.read(PAGE);
 
@@ -550,10 +634,265 @@ function fileStartCut() {
   );
 }
 
+// --- WHITESPACE THE BROWSER RENDERS ------------------------------------------
+//
+// Inside a <pre> or a <textarea> the leading spaces on each line are content.
+// Nothing else in this suite can see them: `parsePage` collapses the run into
+// value:'alpha beta gamma' and keeps the real bytes in `source`, which is an
+// as-written field the write path's readback gate skips -- so a cross-level
+// move deleted two spaces the page shows and every tree comparison agreed the
+// file still meant the same thing. The oracle here is the bytes between the
+// tags.
+
+function whitespaceThePageRenders() {
+  for (const tag of ['pre', 'textarea']) {
+    // TWO SPACES ON THE SECOND LINE, in a page indented in two spaces: a shift
+    // out of one level slices exactly that prefix off every line in the block,
+    // and those two are content. The <footer> nobody touches keeps the
+    // author's single quotes only if the write was a SPLICE -- a fall back to
+    // reprinting the document also preserves the <pre>, so without it
+    // "refused and reprinted the whole page" would read as success.
+    const body = 'alpha\n  beta\ngamma';
+    const source =
+      `---\nimport Base from '../layouts/Base.astro';\n---\n<Base>\n` +
+      `  <div class='wrap'>\n    <${tag}>${body}</${tag}>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n</Base>\n`;
+    const parsed = parsePage(source);
+    if (!check(`a page with a <${tag}> parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const root = model.nodes[0];
+    const div = root.children.find((n) => n.name === 'div');
+    const node = div?.children?.find((n) => n.name === tag);
+    if (!check(`  and the <${tag}> is where a move can reach it`, !!node, short(div?.children?.map((n) => n.name)))) continue;
+    div.children = div.children.filter((n) => n !== node);
+    root.children.splice(root.children.indexOf(div) + 1, 0, node);
+    const after = anchoredSerialize(source, model);
+    // POSITIVE CONTROL: it really left the <div>, so "the content survived"
+    // cannot be satisfied by a write that did nothing at all.
+    if (
+      !check(
+        `moving a <${tag}> out of its <div> moves it`,
+        /<div[^>]*><\/div>/.test(after),
+        short(changedSpan(source, after))
+      )
+    ) {
+      continue;
+    }
+    const held = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(after);
+    check(
+      `  and every space the browser renders inside it is still there`,
+      !!held && held[1] === body,
+      short({ want: body, got: held ? held[1] : null })
+    );
+    check(
+      `  and the page was spliced to do it, not reprinted`,
+      after.includes(`<footer class='end'>end</footer>`),
+      short({ span: changedSpan(source, after) })
+    );
+  }
+}
+
+// --- THE NESTING STEP, READ OFF THE TREE -------------------------------------
+//
+// `indentStepOf` exists so a graft never writes `\t  <Card` -- one tab and two
+// spaces inside a single element. Reading it off the raw text brought that back
+// from the other side: a scan of `body.split('\n')` cannot tell markup from the
+// inside of a raw <script> or a hand-wrapped line, so one tab in a script won
+// outright and an ordinary two-space page reprinted an element as `  \t<small>`.
+// None of the four fixtures has a script, a pre or an odd-width line in it.
+
+function stepFromTheTree() {
+  // <footer> holds its <small> on ONE line, so an <img> joining it changes how
+  // the whole element is written and the element is reprinted -- which is the
+  // path that asks what a step is.
+  const page = (extra) =>
+    `---\nimport Base from '../layouts/Base.astro';\n---\n` +
+    `<Base>\n  <footer><small>Made in 2026</small></footer>\n${extra}</Base>\n`;
+  const cases = [
+    { id: 'nothing unusual (the control)', extra: '' },
+    { id: 'a tab inside a <script>', extra: "  <script>\n\tconsole.log('hi');\n  </script>\n" },
+    { id: 'a tab inside a <style>', extra: '  <style>\n\t.a { color: red; }\n  </style>\n' },
+    { id: 'a hand-wrapped one-space line', extra: '  <p>\n odd\n  </p>\n' },
+  ];
+  for (const c of cases) {
+    const source = page(c.extra);
+    const parsed = parsePage(source);
+    if (!check(`a two-space page with ${c.id} parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const footer = model.nodes[0].children.find((n) => n.name === 'footer');
+    if (!check(`  and it has its footer`, !!footer, short(model.nodes[0].children.map((n) => n.name)))) continue;
+    footer.children.push({
+      id: 'added',
+      kind: 'element',
+      name: 'img',
+      props: { src: { type: 'string', value: '/x.png' }, alt: { type: 'string', value: 'x' } },
+      children: null,
+    });
+    const after = anchoredSerialize(source, model);
+    check(
+      `appending to a reprinted element with ${c.id} uses the page's own step`,
+      after.includes(`\n  <footer>\n    <small>Made in 2026</small>\n    ${IMG_TEXT}\n  </footer>\n`),
+      short({ span: changedSpan(source, after) })
+    );
+    // And nowhere in the file did an indent become two kinds of whitespace.
+    check(
+      `  with no line indented in spaces and tabs at once`,
+      !indentsIn(after).some((lead) => lead.includes(' ') && lead.includes('\t')),
+      short(indentsIn(after))
+    );
+  }
+}
+
+// --- TABS AGAINST SPACES IS NOT A SHIFT --------------------------------------
+//
+// `reindentBlock` refuses when neither indentation is a prefix of the other,
+// and the refusal sends the node through the serializer at the destination's
+// indentation instead. Without it a tab-indented block grafted into a
+// space-indented parent keeps its tabs and the file ends up with `  \ttitle=`
+// -- mixed leading whitespace inside one element, which is the defect the
+// whole indent machinery exists to prevent.
+
+function tabsAgainstSpaces() {
+  const source =
+    `---\nimport Base from '../layouts/Base.astro';\n---\n<Base>\n` +
+    `\t<div>\n\t\t<Card\n\t\t\ttitle='Wide'\n\t\t/>\n\t</div>\n` +
+    `  <section>\n    <p>x</p>\n  </section>\n</Base>\n`;
+  const parsed = parsePage(source);
+  if (!check('a page written in tabs and spaces at once parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const div = root.children.find((n) => n.name === 'div');
+  const section = root.children.find((n) => n.name === 'section');
+  const card = div?.children?.find((n) => n.name === 'Card');
+  if (!check('  and holds a tab-indented Card and a space-indented section', !!card && !!section, short({ card: !!card, section: !!section }))) return;
+  div.children = div.children.filter((n) => n !== card);
+  section.children.push(card);
+  const after = anchoredSerialize(source, model);
+  // The refusal's answer is the serializer's: the node printed fresh at the
+  // destination's own indentation. Kept as bytes because "it landed somewhere"
+  // is satisfied by the guess too -- shifted, the block arrives as
+  // `    <Card` followed by `\t\t\ttitle='Wide'`, tabs inside a space-indented
+  // element, and every indentation this suite knows how to look at is still
+  // one character wide.
+  const want =
+    `---\nimport Base from '../layouts/Base.astro';\n---\n<Base>\n` +
+    `\t<div>\n\t</div>\n` +
+    `  <section>\n    <p>x</p>\n    <Card title="Wide" />\n  </section>\n</Base>\n`;
+  check('a tab-indented block moved into a space-indented parent is reprinted, not guessed at', after === want, short({ span: changedSpan(want, after) }));
+  const inSection = after.slice(after.indexOf('<section>'), after.indexOf('</section>'));
+  check(
+    '  with no line inside that parent indented with a tab',
+    !/\n[ \t]*\t/.test(inSection),
+    short(inSection)
+  );
+}
+
+// --- A COMMENT THAT SITS ON AN IMPORT ----------------------------------------
+//
+// The four fixtures put their comments on their own lines above the import
+// they annotate, and that shape is measured end to end above. A comment AFTER
+// the semicolon is the same annotation written the other ordinary way, and
+// cutting the statement out from under it left it behind on a line of its own,
+// with a stray leading space, now reading as an annotation on whichever import
+// moved up into its place.
+
+function trailingImportComment() {
+  const source =
+    `---\nimport Base from '../layouts/Base.astro';\n` +
+    `import Hero from '../components/Hero.astro'; // above the fold\n` +
+    `import Card from '../components/Card.astro';\n---\n` +
+    `<Base>\n\t<Hero title='a' />\n\t<Card title='b' />\n</Base>\n`;
+  const parsed = parsePage(source);
+  if (!check('a page with a comment after an import parses', parsed.editable === true, short(parsed.reason))) return;
+  // THE CONTROL: reading and writing it back unchanged does not move the
+  // comment either. A serializer that hoists it to the bottom of the block
+  // would make the removal below look right for the wrong reason.
+  check(
+    'writing the page back unchanged leaves the comment on its import',
+    anchoredSerialize(source, structuredClone(parsed.model)) === source,
+    short(changedSpan(source, anchoredSerialize(source, structuredClone(parsed.model))))
+  );
+
+  const model = structuredClone(parsed.model);
+  const hero = model.nodes[0].children.find((n) => n.name === 'Hero');
+  model.nodes[0].children = model.nodes[0].children.filter((n) => n !== hero);
+  model.imports = model.imports.filter((i) => i.name !== 'Hero');
+  const after = anchoredSerialize(source, model);
+  const want =
+    `---\nimport Base from '../layouts/Base.astro';\n` +
+    `import Card from '../components/Card.astro';\n---\n` +
+    `<Base>\n\t<Card title='b' />\n</Base>\n`;
+  check(
+    'removing the component takes its import AND the comment on it, and nothing else',
+    after === want,
+    short({ span: changedSpan(want, after) })
+  );
+
+  // A statement is not a line. Another statement after the semicolon is code
+  // that has to keep working, so the splice steps aside rather than guessing
+  // where the line divides -- and the frontmatter is rebuilt, which is allowed
+  // to move things, but the import must not be left half-cut.
+  const shared = source.replace(
+    `import Hero from '../components/Hero.astro'; // above the fold\n`,
+    `import Hero from '../components/Hero.astro'; const n = 1;\n`
+  );
+  const p2 = parsePage(shared);
+  if (!check('a page with two statements on one import line parses', p2.editable === true, short(p2.reason))) return;
+  const m2 = structuredClone(p2.model);
+  const hero2 = m2.nodes[0].children.find((n) => n.name === 'Hero');
+  m2.nodes[0].children = m2.nodes[0].children.filter((n) => n !== hero2);
+  m2.imports = m2.imports.filter((i) => i.name !== 'Hero');
+  const after2 = anchoredSerialize(shared, m2);
+  check(
+    'the statement sharing the line survives the import being pruned',
+    after2.includes('const n = 1;') && !after2.includes("import Hero from"),
+    short({ span: changedSpan(shared, after2) })
+  );
+}
+
+// --- TWO SPLICES THAT WOULD CLOBBER EACH OTHER -------------------------------
+//
+// `applySplices` writes back to front and refuses a list whose spans overlap,
+// because the second write would be reading bytes the first one has already
+// replaced. No producer in the writer can hand it one today -- the aligned
+// runs are disjoint, an opening tag's spans sit outside its children's, and an
+// import cut is in the frontmatter -- so the guard is driven here directly
+// rather than left to a fixture that cannot reach it.
+
+function overlappingSplices() {
+  const source = '<p>one</p>\n<p>two</p>\n';
+  check(
+    'two splices that do not overlap are applied back to front',
+    applySplices(source, [
+      { start: 1, end: 2, text: 'b' },
+      { start: 12, end: 13, text: 'b' },
+    ]) === '<b>one</p>\n<b>two</p>\n',
+    short(applySplices(source, [{ start: 1, end: 2, text: 'b' }, { start: 12, end: 13, text: 'b' }]))
+  );
+  check(
+    '  and two that DO overlap are refused, all of them, rather than half-applied',
+    applySplices(source, [
+      { start: 0, end: 10, text: 'X' },
+      { start: 5, end: 15, text: 'Y' },
+    ]) === null,
+    short(applySplices(source, [{ start: 0, end: 10, text: 'X' }, { start: 5, end: 15, text: 'Y' }]))
+  );
+  check(
+    '  and so is a span reaching past the end of the file',
+    applySplices(source, [{ start: 0, end: source.length + 1, text: 'X' }]) === null,
+    short(applySplices(source, [{ start: 0, end: source.length + 1, text: 'X' }]))
+  );
+}
+
 (async () => {
   for (const f of FIXTURES) await runFixture(f);
   importInsert();
   fileStartCut();
+  whitespaceThePageRenders();
+  stepFromTheTree();
+  tabsAgainstSpaces();
+  trailingImportComment();
+  overlappingSplices();
 
   if (failures.length) {
     console.error(`source-fidelity-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
