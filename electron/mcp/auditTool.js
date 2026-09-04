@@ -164,6 +164,10 @@ const AuditOutput = z.object({
     .object({
       accessibility: z.string().nullable(),
       error: z.string().nullable(),
+      // Rule ids the caller named that this engine does not have: `[]` when all
+      // were known, `null` when none were named. A typo used to be accepted in
+      // silence and look exactly like a rule that found nothing.
+      unknownRules: z.array(z.string()).nullable().optional(),
       // Whether this run actually began from a wiped audit session.
       sessionIsolated: z.boolean().optional(),
     })
@@ -194,8 +198,15 @@ const AuditOutput = z.object({
       // Findings returned whole but with one of their own fields shortened.
       // `truncated` is about the list; this is the other kind of loss.
       findingsWithShortenedFields: z.number().int(),
+      // Captures whose image was not sent because the whole envelope would not
+      // have fitted. The metadata row stays, saying included:false, so a caller
+      // is never told a picture is present when it is not.
+      omittedCaptureCount: z.number().int().optional(),
       responseCap: z.number().int(),
       responseByteCap: z.number().int(),
+      // The budget over the WHOLE serialized answer, images included, as
+      // distinct from responseByteCap which governs the findings alone.
+      totalByteCap: z.number().int().optional(),
       fieldCaps: z.record(z.string(), z.number().int()),
       incompleteReserved: z.number().int(),
     })

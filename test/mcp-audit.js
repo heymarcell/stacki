@@ -42,6 +42,71 @@ const short = (v) => JSON.stringify(v ?? null).slice(0, 220);
 
 process.env.STACKI_NO_DIALOGS = '1';
 
+// WHAT THE CLIENT WOULD HAVE REFUSED.
+//
+// This suite speaks raw JSON-RPC, so nothing here ever checked `structuredContent`
+// against the schema the tool publishes -- and a real MCP client does exactly
+// that, and hard-fails the call. Three fields were added to the audit answer
+// (engine.unknownRules, truncation.omittedCaptureCount, truncation.totalByteCap)
+// and not to AuditOutput, and every check in this file stayed green while the
+// packaged app, driven by the official client, could not run an audit at all.
+// So every audit answer is now validated the way the SDK validates it: the
+// published JSON Schema, additionalProperties and all.
+// Deliberately dependency-free. The obvious move is ajv, and it is the wrong
+// one twice over: the copy in node_modules is a transitive v6 that cannot read
+// the draft zod emits, and ANY throw at require-time in an Electron test is a
+// modal crash dialog on somebody's screen rather than a red line in a terminal.
+// So the one rule that actually failed -- additionalProperties:false -- is
+// walked directly off the published schema, inside a try/catch that turns a bug
+// in this checker into a reported failure instead of a dialog.
+const zod = require('zod');
+const { AuditOutput } = require('../electron/mcp/auditTool.js');
+
+let auditSchemaJson = null;
+try {
+  auditSchemaJson = zod.toJSONSchema(AuditOutput, { io: 'output', unrepresentable: 'any' });
+} catch {
+  auditSchemaJson = null;
+}
+
+// Every key the payload carries that its schema does not declare, deep. Returns
+// [] when the schema could not be built, so a failure to derive it is visible as
+// the separate check below rather than as a silent pass.
+function undeclaredKeys(value, schema, at = '') {
+  if (!schema || typeof schema !== 'object' || !value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) {
+    const item = schema.items;
+    return item ? value.flatMap((v, i) => undeclaredKeys(v, item, `${at}[${i}]`)) : [];
+  }
+  // anyOf/oneOf: a key is undeclared only if EVERY branch rejects it.
+  const branches = schema.anyOf || schema.oneOf;
+  if (Array.isArray(branches) && branches.length) {
+    const per = branches.map((b) => undeclaredKeys(value, b, at));
+    return per.some((p) => p.length === 0) ? [] : per[0];
+  }
+  const props = schema.properties;
+  if (!props) return [];
+  const out = [];
+  for (const key of Object.keys(value)) {
+    if (!Object.prototype.hasOwnProperty.call(props, key)) {
+      if (schema.additionalProperties === false) out.push(`${at}/${key}`);
+      continue;
+    }
+    out.push(...undeclaredKeys(value[key], props[key], `${at}/${key}`));
+  }
+  return out;
+}
+
+// The oracle has to be satisfiable before a clean run means anything. These two
+// are the whole reason the real defect was invisible: the schema must actually
+// have been derived, and the walk must actually find a key that is not in it.
+check('the audit output schema could be derived', !!auditSchemaJson?.properties, String(auditSchemaJson && Object.keys(auditSchemaJson)));
+check(
+  'and an undeclared field is detected when one is present',
+  undeclaredKeys({ engine: { accessibility: null, error: null, notADeclaredField: 1 } }, auditSchemaJson).length === 1,
+  short(undeclaredKeys({ engine: { accessibility: null, error: null, notADeclaredField: 1 } }, auditSchemaJson))
+);
+
 const { makeCanvasProject, removeCanvasProject, astroCached, sweepStaleRuns } = require('./agent-canvas-fixture.js');
 const { ownedTempDir, releaseTempDir } = require('./support/ownedTemp.js');
 const { projectFingerprint } = require('../electron/mcp/agent/refs.js');
@@ -209,7 +274,27 @@ let stopPreview = null;
     // A handler that threw comes back as content with no structuredContent. Say
     // what it said rather than reporting the absence -- "no_content" is a
     // symptom, and the stack that caused it is right there in the payload.
-    if (body.result?.structuredContent) return body.result.structuredContent;
+    if (body.result?.structuredContent) {
+      // Every audit answer, on the way past. A real client validates here and
+      // refuses the whole call if it does not fit, so a green suite that skipped
+      // this was measuring a payload nobody could receive.
+      if (name === 'audit') {
+        let extra = [];
+        try {
+          extra = undeclaredKeys(body.result.structuredContent, auditSchemaJson);
+        } catch (e) {
+          extra = [`checker threw: ${e && e.message}`];
+        }
+        if (extra.length) {
+          check(
+            `audit answer carries only fields its schema declares (${JSON.stringify(args).slice(0, 50)})`,
+            false,
+            extra.join(', ')
+          );
+        }
+      }
+      return body.result.structuredContent;
+    }
     const said = (body.result?.content || []).map((c) => c.text || '').join(' ').slice(0, 400);
     return { ok: false, code: 'no_content', message: said || JSON.stringify(body.result).slice(0, 400) };
   };
