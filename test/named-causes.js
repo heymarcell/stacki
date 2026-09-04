@@ -245,6 +245,29 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
       check('and the same switch with nothing in the way still happens', went.ok === true, short(went));
       check('  and git agrees', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'conflicting', git(root, 'rev-parse', '--abbrev-ref', 'HEAD'));
 
+      // AND A CHOICE THE HANDLER CANNOT READ MUST NOT BE GUESSED AT.
+      //
+      // `resolveMerge` took anything that was not the string 'theirs' as "keep
+      // ours" and then COMMITTED it, answering `{ok:true, changed:true}` with
+      // `undoable:false` — so an agent that sent the choice in any shape but
+      // the one undocumented shape discarded the other branch's work silently
+      // and Stacki's own undo could not bring it back. The refusal above now
+      // routes agents here, which is exactly why this has to be safe.
+      // Back on main, where the two branches still disagree, so resolve_merge
+      // re-runs a merge that really does conflict.
+      await run('git', 'checkout', { branch: 'main', parkFirst: false });
+      const guessed = await run('git', 'resolve_merge', {
+        branch: 'conflicting',
+        choices: { [CONFLICTED]: { hunk0: 'theirs' } },
+      });
+      check('a choice the handler cannot read is refused', guessed.ok === false, short(guessed));
+      check('  as bad_choices', guessed.code === 'bad_choices', short({ code: guessed.code }));
+      check('  naming the vocabulary it should have used',
+        /"ours"/.test(String(guessed.message || '')) && /"both"/.test(String(guessed.message || '')),
+        short(guessed.message));
+      check('  and nothing was committed', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+      check('  and HEAD did not move', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main');
+
       // Put the repository back where the rest of the suite expects it.
       await run('git', 'checkout', { branch: 'main', parkFirst: false });
       await run('git', 'delete_branch', { branch: 'conflicting', force: true });

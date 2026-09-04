@@ -205,9 +205,62 @@ function closed(union) {
   const key = union.def?.discriminator || 'action';
   return z.discriminatedUnion(
     key,
-    union.options.map((branch) => z.strictObject(branch.shape))
+    union.options.map((branch) => {
+      const rebuilt = closeShape(branch.shape);
+      // A BRANCH CAN CARRY A DESCRIPTION, AND REBUILDING IT DROPPED ONE.
+      //
+      // `z.strictObject(shape)` keeps every FIELD's `.describe()` and none of
+      // the object's own, so two operations lost the sentence published beside
+      // them in `tools/list` — retrieval metadata deleted by a change that was
+      // about validation.
+      return branch.description ? rebuilt.describe(branch.description) : rebuilt;
+    })
   );
 }
+
+/**
+ * Close an object shape, and everything object-shaped inside it.
+ *
+ * Closing only the top level left the same silent strip one level down: the
+ * arguments that are themselves objects — a node spec, a move target, a
+ * declaration identity — went on dropping keys nobody typed correctly. A
+ * mistyped field inside `node` is exactly as invisible as a mistyped field
+ * beside it, and rather more likely, because those are the shapes an agent has
+ * to construct rather than copy.
+ *
+ * Wrappers are unwrapped and put back: `.optional()`, `.nullable()`,
+ * `.default()` and arrays all hold an inner type that may itself be an object.
+ * Anything this does not recognise is returned untouched — a rebuilt schema
+ * that dropped a refinement would be worse than an open one.
+ */
+function closeShape(shape) {
+  const out = {};
+  for (const [name, field] of Object.entries(shape)) out[name] = closeField(field);
+  return z.strictObject(out);
+}
+
+function closeField(field) {
+  const def = field?.def;
+  if (!def) return field;
+  if (def.type === 'object') {
+    const rebuilt = closeShape(field.shape);
+    return field.description ? rebuilt.describe(field.description) : rebuilt;
+  }
+  // One inner type, held under a name that differs by wrapper.
+  const innerKey = def.type === 'array' ? 'element' : 'innerType';
+  const inner = def[innerKey];
+  if (!inner || typeof inner !== 'object' || !inner.def) return field;
+  const closedInner = closeField(inner);
+  if (closedInner === inner) return field;
+  if (def.type === 'array') return withDescription(z.array(closedInner), field);
+  if (def.type === 'optional') return withDescription(closedInner.optional(), field);
+  if (def.type === 'nullable') return withDescription(closedInner.nullable(), field);
+  if (def.type === 'default') return withDescription(closedInner.default(def.defaultValue), field);
+  return field;
+}
+
+const withDescription = (rebuilt, original) =>
+  original.description ? rebuilt.describe(original.description) : rebuilt;
 
 const Operation = closed(z.discriminatedUnion('type', [
   // `value` is this form's name and stays the declared one; `text` is accepted
@@ -666,7 +719,18 @@ const GitInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('commit'), message: z.string().min(1).max(4000), paths: z.array(z.string().max(1024)).max(500).optional() }),
   z.object({ action: z.literal('checkout'), branch: z.string().max(300), create: z.boolean().optional(), parkFirst: z.boolean().optional() }),
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
-  z.object({ action: z.literal('resolve_merge'), branch: z.string().max(300), choices: z.record(z.string(), z.unknown()) }),
+  z.object({
+    action: z.literal('resolve_merge'),
+    branch: z.string().max(300),
+    choices: z
+      .record(z.string(), z.unknown())
+      .describe(
+        'How to settle each conflicting file, keyed by its project-relative path. A value is either "ours" or ' +
+          '"theirs" for the whole file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per ' +
+          'conflicting hunk, in the order git reports them, which is the order git.merge listed them in. A file ' +
+          'you leave out keeps this branch\'s version. Anything else is refused with nothing changed.'
+      ),
+  }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
   z.object({ action: z.literal('restore_file'), ref: z.string().max(200).optional().describe('The revision to come back to. Defaults to HEAD — the last commit.'), path: RelPath }),
   z.object({ action: z.literal('restore_project'), ref: z.string().max(200) }),
@@ -682,13 +746,20 @@ const GitInput = closed(z.discriminatedUnion('action', [
 // — the schema already says the fields, and a description that repeats them is
 // paid for in every client's context on every call.
 
+// The eight domain schemas by name, so a refusal can say what the action it
+// named actually accepts without a second table to go stale.
+const DOMAIN_SCHEMAS = {};
+
 const DESCRIPTIONS = {
   target:
     'Inspect and edit the source-backed element behind what is on screen. read returns everything Stacki knows ' +
     'about it — file and lines, the component chain, props, classes, children, where its words come from and how ' +
     'many copies of it the page is rendering — so you do not have to search the repository for any of that. ' +
-    'The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo stack, and ' +
-    'save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
+    'It EDITS as well as reads, and the structural verbs are here rather than in source: set_text, set_prop, ' +
+    'set_classes, add_class, set_tag, insert_before, insert_after, append_child, duplicate, move and remove — so ' +
+    '"put this inside that", "delete this" and "add a card here" are one call on the object Stacki already ' +
+    'identified. The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo ' +
+    'stack, and save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
     'to act on what the user has selected right now. A ref carries the document as your read found it, so an ' +
     'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
     'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
@@ -808,8 +879,11 @@ function registerAgentTools(server, { api }) {
     }
   );
 
-  const domain = (name, inputSchema, annotations) =>
-    server.registerTool(
+  const domain = (name, inputSchema, annotations) => {
+    // Kept by name so a refusal can say what the action it named accepts,
+    // without a second table that would go stale.
+    DOMAIN_SCHEMAS[name] = inputSchema;
+    return server.registerTool(
       name,
       {
         title: `Stacki ${name}`,
@@ -842,6 +916,7 @@ function registerAgentTools(server, { api }) {
         return answer(await api.run(name, action, shaped));
       }
     );
+  };
 
   domain('target', TargetInput, annotationsFor('target'));
   domain('style', StyleInput, annotationsFor('style'));
@@ -1005,6 +1080,21 @@ function issuesOf(error) {
 }
 
 /**
+ * The same object, with unknown keys refused rather than dropped.
+ *
+ * Only touches a plain object schema. Anything else — a union, something with
+ * a refinement wrapped round it, a schema that is already strict — is handed
+ * back untouched, because rebuilding one from `.shape` would lose whatever the
+ * wrapper was there to add.
+ */
+function closedObject(schema) {
+  const shape = schema && typeof schema === 'object' ? schema.shape : null;
+  if (!shape || typeof shape !== 'object') return schema;
+  if (schema.def?.catchall && schema.def.catchall.def?.type === 'never') return schema;
+  return z.strictObject(shape);
+}
+
+/**
  * The same refusal for a tool that is not a domain.
  *
  * The fix below was applied to the eight domain tools and stopped there, so
@@ -1044,7 +1134,22 @@ function badToolArguments(tool, error) {
  * back as an output-validation crash instead of an answer.
  */
 function publishChecked(server, name, config, handler) {
-  const schema = config.inputSchema;
+  // CLOSED HERE TOO, AND FOR THE SAME REASON.
+  //
+  // `closed()` was applied to the eight domain unions and stopped there, which
+  // left the six tools that are not domains — get_context, capture,
+  // get_comments, comment, get_capabilities and audit — still stripping a key
+  // they did not recognise. That is the same silent retarget, on tools where it
+  // is just as consequential: `audit({ rout: '/pricing' })` dropped the typo
+  // and audited the site root instead, reporting findings about a page nobody
+  // asked about; `get_comments({ scop: 'selection' })` widened a read of one
+  // element's reviews to the whole project.
+  //
+  // Applied at the composition point rather than at six registration sites, so
+  // a tool added beside them tomorrow is closed without its author knowing to
+  // ask — which is the same argument the `checked` facade in tools.js already
+  // makes for the refusal shape.
+  const schema = closedObject(config.inputSchema);
   return server.registerTool(name, { ...config, inputSchema: advertised(schema) }, async (args, extra) => {
     const parsed = schema.safeParse(args || {});
     if (!parsed.success) return answer(badToolArguments(name, parsed.error));
@@ -1074,15 +1179,34 @@ function badArguments(domain, action, error) {
     };
   }
   const issues = issuesOf(error);
+  // AND WHAT IT WOULD HAVE TAKEN.
+  //
+  // Naming the key the caller got wrong is half an answer: "Unrecognized key:
+  // \"rout\"" tells an agent to stop guessing but not what to guess next, and
+  // the top-level `properties` block the schema publishes lists every branch's
+  // arguments side by side, which is what invited the mistake. The accepted
+  // set is right here in the schema, so it travels with the refusal — as a
+  // field a client can read, and in the sentence for one that only shows text.
+  const accepts = acceptedBy(domain, action);
   return {
     ok: false,
     code: 'bad_arguments',
     operation: `${domain}.${action}`,
     issues,
-    message: `${domain}.${action} could not run — ${issues
-      .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
-      .join('; ')}`,
+    accepts,
+    message:
+      `${domain}.${action} could not run — ${issues
+        .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
+        .join('; ')}` + (accepts.length ? `. ${domain}.${action} takes: ${accepts.join(', ')}.` : ''),
   };
+}
+
+/** The argument names one action actually declares, read from its own branch. */
+function acceptedBy(domain, action) {
+  const schema = DOMAIN_SCHEMAS[domain];
+  const branch = schema?.options?.find((o) => o.shape?.action?.def?.values?.[0] === action || o.shape?.action?.def?.value === action);
+  if (!branch?.shape) return [];
+  return Object.keys(branch.shape).filter((k) => k !== 'action');
 }
 
 /**
