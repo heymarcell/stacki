@@ -56,12 +56,12 @@ handler, all proven by raw HTTP in `test/mcp.js`:
 
 | Surface | v1 | Cost |
 | --- | --- | --- |
-| Server instructions | 1,838 bytes, capped at 2,000 by `test/mcp.js` | every connection |
-| Tools | **14** | `tools/list` is **140,885 bytes** |
+| Server instructions | 1,826 bytes, capped by `test/host-limits.js` against a host limit of 2,048 characters | every connection |
+| Tools | **14** | `tools/list` is **165,135 bytes** (17,783 gzipped) |
 | Agent operations | **<!--count:total-->111<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->110<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
 | Permission answers | **<!--count:permAnswers-->444<!--/-->** (<!--count:total-->111<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
-| Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,229 bytes; a read costs only when asked |
-| Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,131 bytes |
+| Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,233 bytes; a read costs only when asked |
+| Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,135 bytes |
 
 ### The connection preamble, measured on a real host
 
@@ -70,11 +70,23 @@ across eleven sessions:
 
 | | bytes |
 | --- | --- |
-| `server/discover` | 2,205 |
-| `tools/list` | 140,885 |
-| `resources/list` | 2,229 |
-| `prompts/list` | 1,131 |
-| **total, before the model has seen the task** | **146,450** |
+| `server/discover` | 2,188 |
+| `tools/list` | 165,135 |
+| `resources/list` | 2,233 |
+| `prompts/list` | 1,135 |
+| **total, before the model has seen the task** | **170,691** |
+
+Those are HTTP bytes, and HTTP bytes are not model context. Claude Code has MCP
+tool search on by default: it is handed the catalogue and gives the model tool
+NAMES, fetching a schema when one becomes relevant. So the number above is what
+the transport carries, not what the model is charged — see
+`docs/mcp-compatibility.md` for the measured difference.
+
+The figures moved from the ones this table used to carry (140,885 for
+`tools/list`), which were measured before later work and were never pinned by a
+test. They are pinned now, in the sense that matters: `test/host-limits.js`
+fails if any description or the instructions cross what a real host will
+carry.
 
 `tools/list` is 96% of it. Of that, the shared `Envelope` output schema is 4,621
 bytes and is serialised once per domain tool — **41,589 bytes, 30% of the whole
@@ -92,21 +104,55 @@ it.**
 roots, elicitation, and the tasks/apps extensions. None are declared and none are
 served. A host should not probe for them.
 
-### `listChanged` — declared, and never emitted
+### `listChanged` — now declared false, because it is false
 
 The SDK sets `listChanged: true` on tools, resources and prompts the first time
-one is registered. **Nothing in Stacki has ever sent a list-changed
-notification**, and the surface genuinely does change: a server built without the
-Agent API serves 4 tools instead of 14, and opening a different project rotates
-every ref an agent is holding.
+one is registered, unless the server said otherwise at construction. Stacki said
+nothing, so for a long time `server/discover` advertised three times over that
+this server would tell a client when its lists changed. **Nothing in Stacki has
+ever sent a list-changed notification.**
 
-Observed rather than assumed: across eleven real Claude Code sessions the client
-**never opened a `subscriptions/listen` stream**, so the predicted cost — a
-held-open SSE connection that never carries an event — did not occur in headless
-use. It may still occur in an interactive host.
+Stacki now declares `listChanged: false` on all three, which is the truth: a
+fresh `McpServer` is built per request, every registration happens before it
+answers anything, and one POST per request leaves no channel to push a
+notification down afterwards. A modern client reads these bits to decide which
+notification types to ask for on its listen filter, so a false one buys a
+listener that can never fire.
 
-**v1 does not claim `listChanged`.** Treat the flag as unbacked: do not wait for a
-notification, and re-list after anything that could have changed the surface.
+The lists a SERVER INSTANCE serves are fixed for its life. What varies between
+instances — a server built without the Agent API serves 5 tools instead of 14 —
+is decided before it answers, and a client that reconnects is answered by a new
+instance. Re-list after anything that could have changed the surface; nothing
+will be pushed to you.
+
+The right way to make these `true` is to emit the notifications. Asserted in
+`test/mcp-cache-hints.js`.
+
+### Cache hints — what a client may keep
+
+The 2026-07-28 revision requires `ttlMs` and `cacheScope` on six results
+(SEP-2549). The SDK fills them with the conservative `{ttlMs: 0, cacheScope:
+'private'}` when nothing says otherwise, and for five of them that was a wrong
+description of what Stacki serves.
+
+| result | `ttlMs` | `cacheScope` | why |
+| --- | --- | --- | --- |
+| `server/discover` | 300,000 | `public` | built from registrations decided before the server answers; identical on every machine running this build |
+| `tools/list` | 300,000 | `public` | same |
+| `prompts/list` | 300,000 | `public` | same |
+| `resources/list` | 300,000 | `public` | same — the catalogue is deliberately constant at every permission level |
+| `resources/read` of `stacki://guide/*` | 300,000 | `public` | a frozen table compiled into the app; no project is read to produce one |
+| `resources/read` of `stacki://project/profile` | 0 | `private` | this person's project, gated on the level they granted |
+
+Five minutes is a staleness budget rather than a guess: the catalogue can only
+change when a different build answers on this port, which needs Stacki to be
+restarted.
+
+The boundary is asserted by RULE rather than by listing today's URIs — every
+`stacki://guide/*` resource must be publicly cacheable and every other resource
+must not be — so a project resource added later inherits `private`, and a guide
+that stopped being static fails the suite rather than reaching a shared cache.
+Responses to 2025-era requests carry no cache fields at all.
 
 ---
 
@@ -292,7 +338,9 @@ Summary of what v1 claims:
 | `audit`, default | 3 viewports × one real page load each, plus axe |
 
 An `audit` in flight **runs to completion even if the client disconnects.**
-Stacki reads no cancellation signal and emits no progress notifications. Bound
+An audit reads the request's `AbortSignal` and stops at the next viewport
+boundary; nothing else here is cancellable, and no progress notifications are
+emitted. Bound
 your own timeouts accordingly.
 
 ---
@@ -312,6 +360,22 @@ byte sizes above, which axe rules run as axe-core is updated, the finding caps,
 and the set of resources and prompts. New tools, operations, resources, prompts
 and finding kinds may be added; a client must tolerate fields it does not know.
 
-**Explicitly not promised:** `listChanged` notifications, cancellation, progress,
-resource cache hints, a stable client-identity label across protocol eras, and
+**Now promised, and not before:** cache hints on the six cacheable results
+(§2), and cancellation of an audit whose caller has gone away — the run stops at
+the next viewport boundary, destroys the window it owns, resets its session and
+answers `code: 'cancelled'`, and an audit queued behind an abandoned one is
+never started.
+
+**Explicitly not promised:** `listChanged` notifications (declared `false`,
+because they are not sent), progress notifications, a stable client-identity
+label across protocol eras, cancellation of anything other than an audit, and
 compatibility with revisions older than 2025-11-25.
+
+**Known residual, stated rather than left to be found:** whitespace a page
+renders because of a rule in a STYLESHEET — `.card { white-space: pre }` — is
+not detected when a node is moved or duplicated. The guard covers the tags whose
+inner whitespace is always content (`pre`, `textarea`, `script`, `style`) and,
+since this revision, a `white-space` declaration written ON the element as an
+inline style or a whitespace utility class. Detecting it through the cascade
+would mean resolving CSS in the parser, which is a second CSS engine and is not
+something this surface is willing to become.
