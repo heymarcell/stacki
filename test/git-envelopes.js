@@ -450,6 +450,114 @@ exit 64
         fs.rmSync(empty, { recursive: true, force: true });
       }
     }
+
+    // ── and the code the envelope carries, which is the other half ──────────
+    //
+    // The message stopped being Node's. The CODE did not: `runMain`'s catch was
+    // the only thing between a throw and the wire and it answered
+    // `{code: 'failed'}` for everything except one git special case, so a cause
+    // the handler knew exactly arrived as the code that means "something went
+    // wrong and nobody knows what". A client can branch on a code; it cannot
+    // branch on a sentence.
+    //
+    // Handlers here are called two ways — by a panel over IPC, and directly by
+    // the Agent API — so the reason rides on the thrown Error as `refusalCode`
+    // and the throw itself is untouched. Both halves are checked: the envelope
+    // gets a code, and the panel still gets the throw it was written against.
+    {
+      const hostPath = (text) => String(text).includes(root) || /(^|[\s'"(])\/(Users|private|var|home)\//.test(String(text));
+      // Every refusal below must name its own cause, so a code that is right
+      // for one case cannot be right for all of them.
+      const codes = new Set();
+
+      const cases = [
+        ['content', 'cms_read', { path: 'src/data/nope.json' }, 'no_file', 'src/data/nope.json'],
+        ['content', 'cms_read', { path: 'src/pages/index.astro' }, 'wrong_kind', 'src/pages/index.astro'],
+        ['content', 'cms_write', { path: 'src/data/nope.json', data: [] }, 'no_file', 'src/data/nope.json'],
+        ['content', 'entries', { collection: 'nope' }, 'no_collection', 'nope'],
+        ['asset', 'read_text', { path: 'src/data/nope.txt' }, 'no_file', 'src/data/nope.txt'],
+        ['asset', 'delete', { path: 'src/data/nope.json' }, 'no_file', 'src/data/nope.json'],
+        ['page', 'read', { path: 'src/pages/nope.astro' }, 'no_file', 'src/pages/nope.astro'],
+        ['page', 'delete', { path: 'src/pages/nope.astro' }, 'no_file', 'src/pages/nope.astro'],
+        ['source', 'write', { path: 'src/nope/deep/x.ts', text: 'x' }, 'no_file', 'src/nope/deep/x.ts'],
+      ];
+      for (const [domain, action, args, code, names] of cases) {
+        const env = await run(domain, action, args);
+        check(`${domain}.${action} on a cause it knows is refused`, env.ok === false, short(env));
+        check(`  with ${code} rather than the code that means nobody knows`, env.code === code, short({ code: env.code, message: env.message }));
+        check(`  naming ${names} in the caller's own spelling`, String(env.message).includes(names), short(env.message));
+        check('  and with no absolute path from this machine in it', !hostPath(JSON.stringify(env)), short(env.message));
+        check('  nor Node\u2019s errno sentence', !/ENOENT|no such file or directory/.test(JSON.stringify(env)), short(env.message));
+        codes.add(env.code);
+      }
+      check('the refusals do not all say the same thing', codes.size >= 3, short([...codes]));
+
+      // POSITIVE CONTROLS. A surface that had learned to refuse everything
+      // would pass every line above. These are the same four operations
+      // against things that are really there.
+      {
+        const ok1 = await run('content', 'cms_read', { path: 'src/data/site.json' });
+        check('reading a data file that IS there still works', ok1.ok === true, short(ok1));
+        const ok2 = await run('page', 'read', { path: 'src/pages/index.astro' });
+        check('reading a page that IS there still works', ok2.ok === true, short(ok2));
+        const ok3 = await run('asset', 'read_text', { path: 'src/styles/site.css' });
+        check('reading a text asset that IS there still works', ok3.ok === true, short(ok3));
+        const ok4 = await run('source', 'write', { path: 'src/lib/written-by-a-test.ts', text: 'export const x = 1;\n' });
+        check('writing a source file into a directory that exists still works', ok4.ok === true, short(ok4));
+        check('  and the bytes are on disk', read('src/lib/written-by-a-test.ts') === 'export const x = 1;\n');
+        fs.rmSync(path.join(root, 'src/lib/written-by-a-test.ts'), { force: true });
+      }
+
+      // A cause nothing here recognises must still arrive as `failed` — the
+      // mapper classifies, it does not relabel.
+      {
+        const env = await run('project', 'resolve_import', { spec: './nowhere', from: 'src/pages/index.astro' });
+        check('an unrecognised failure is not given a code it has not earned', env.ok !== false || env.code !== 'no_file', short(env));
+      }
+
+      // THE PANEL HALF. `cms:read` is called by the CMS view over IPC, which
+      // gets a rejected promise and shows the message. That is what the codes
+      // above must not have cost: the handler still throws, with the same
+      // sentence, and nothing about the envelope shape leaked into it.
+      {
+        const handler = app.handlers.get('cms:read');
+        check('the CMS panel\u2019s own handler is registered', typeof handler === 'function');
+        let thrown = null;
+        let returned;
+        try {
+          returned = await handler(null, { projectPath: root, rel: 'data/nope.json' });
+        } catch (err) {
+          thrown = err;
+        }
+        check('reading a missing data file still THROWS at the handler', thrown instanceof Error, short({ returned }));
+        check('  with the sentence the panel shows', String(thrown?.message) === 'src/data/nope.json is not in this project.', short(thrown?.message));
+        check('  and no in-band refusal handed back instead', returned === undefined, short(returned));
+        // The code rides along for the direct caller and is invisible over IPC:
+        // Electron serialises an Error as its message.
+        check('  while the cause is on the error for the API to read', thrown?.refusalCode === 'no_file', short(thrown?.refusalCode));
+      }
+
+      // THE BACKSTOP, called directly. Every case above reaches the mapper
+      // through an operation, and every one of them happens to be an fs error
+      // that names its own file — so the rewrite covers them and the scrub is
+      // never the thing that saves them. The leaks it exists for cannot be
+      // provoked from a fixture: `project.install` puts up to 400 bytes of a
+      // package manager's stderr on the wire, and npm's stderr is full of
+      // absolute paths. So the mapper is handed those shapes itself.
+      const { thrownFailure } = require('../electron/mcp/agent/domains.js');
+      {
+        const inside = thrownFailure(new Error(`npm install failed: could not read ${root}/package.json`), { root });
+        check('a path inside the project is said the way the caller spells it', /(^|[^/])package\.json/.test(inside.message) && !inside.message.includes(root), short(inside.message));
+        const outside = thrownFailure(new Error("npm install failed: EACCES '/Users/someone/.npm/_cacache'"), { root });
+        check('a path outside it is not repeated at all', !/\/Users\/someone/.test(outside.message), short(outside.message));
+        check('  and the rest of the sentence survives', /npm install failed/.test(outside.message), short(outside.message));
+        const url = thrownFailure(new Error('the preview at http://localhost:4321/about did not answer'), { root });
+        check('a url is not a path and is left alone', url.message.includes('http://localhost:4321/about'), short(url.message));
+        const errno = Object.assign(new Error("EACCES: permission denied, open '/etc/shadow'"), { code: 'EACCES', path: '/etc/shadow' });
+        check('an errno outside the project keeps its code', thrownFailure(errno, { root }).code === 'permission_denied', short(thrownFailure(errno, { root })));
+        check('  and still names nothing on this machine', !thrownFailure(errno, { root }).message.includes('/etc/shadow'), short(thrownFailure(errno, { root }).message));
+      }
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);

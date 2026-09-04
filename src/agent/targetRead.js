@@ -226,6 +226,21 @@ function bindingsOf(node, { model, ancestors, keys }) {
  * instead.
  */
 function occurrenceOf(node, { canvas, bindings, ancestors }) {
+  // WHAT THIS NUMBER IS. Not renders — PLACES THE CANVAS MEASURED. It reaches
+  // here from `rectsForPath` in electron/preload.js by way of the canvas
+  // report, and that returns one entry per marker RUN, or, where no marker pair
+  // survived the compile, one per outermost tagged element. One rendering
+  // measures as several places whenever it puts several elements on the page
+  // under a single name: a component with two root elements (both roots carry
+  // the caller's name for the instance), or a paragraph a line-splitter
+  // rebuilt as one clone per line. test/target-occurrence.js measures both
+  // through the real preload, and both come out 2 — the same 2 a genuine
+  // two-item loop gives. So the number cannot be read as a count of renders,
+  // and `repeated` below must not be decided by it.
+  //
+  // It stays in the answer because it is the right number for the question it
+  // does answer: which measured box `target select occurrence` and a review pin
+  // are addressing.
   const count = Number.isInteger(canvas?.occurrenceCount) ? canvas.occurrenceCount : null;
   const index = Number.isInteger(canvas?.occurrence) ? canvas.occurrence : null;
   // The loop itself is not one of its own copies. Saying "editing this changes
@@ -243,11 +258,23 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
       list,
     };
   }
-  const inLoop = (ancestors || []).some((a) => a?.kind === 'map');
-  const repeated = inLoop || (count != null && count > 1);
+  // THE SOURCE DECIDES THIS, and only the source can. A node is rendered once
+  // per item exactly when a `map` is above it; anywhere else the document
+  // renders it once, however many boxes it happens to occupy. Letting `count`
+  // decide instead put the warning on a <p> beside an <h3> in a plain
+  // `header.section-header` — nothing repeated, two measured places — and an
+  // agent that believes "editing this changes every copy" stops editing the
+  // node it was asked to edit and goes hunting for a data item that does not
+  // exist.
+  const repeated = (ancestors || []).some((a) => a?.kind === 'map');
   // The list behind the repetition, when a binding names one. That ref is the
   // difference between changing one card and changing the template.
   const item = bindings.find((b) => b.source?.kind === 'loop_item')?.source || null;
+  // How many copies, in the only two forms that are true. A measured count is
+  // worth quoting once repetition is established — but it is the number of
+  // places, so it may be 1 for a one-item list, and "rendered 1 times" is both
+  // ungrammatical and a contradiction of the sentence after it.
+  const many = count != null && count > 1 ? `${count} times` : 'once for every item in the list it sits in';
   return {
     index,
     count,
@@ -257,7 +284,7 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
       ? 'shared_template'
       : 'single',
     note: repeated
-      ? `This is one source node rendered ${count == null ? 'more than once' : `${count} times`}. ` +
+      ? `This is one source node rendered ${many}. ` +
         'Editing it here changes every copy. To change one copy, change the data item behind it — ' +
         (item ? `follow perOccurrence.` : 'Stacki could not resolve which list it comes from, so say so rather than editing one and hoping.')
       : null,

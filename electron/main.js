@@ -442,6 +442,31 @@ function callMainOp(channel, payload) {
   return fn(null, payload);
 }
 
+/**
+ * A refusal a handler knows the reason for, thrown.
+ *
+ * A handler here has two callers with two different needs. A panel calls it
+ * over `ipcRenderer.invoke` and wants a rejected promise it can catch and show
+ * — that is what every CMS and Pages panel is written against, and changing it
+ * would mean changing them. The Agent API calls the same function directly
+ * (see callMainOp) and needs a CODE: `{code:'failed'}` is the one answer a
+ * client cannot branch on, and it was what every cause below arrived as.
+ *
+ * So the reason rides on the Error. Electron's IPC serializer carries only the
+ * message across a channel, so a panel sees exactly what it saw before; the
+ * direct call gets the whole object, and electron/mcp/agent/domains.js reads
+ * `refusalCode` off it. One throw, both callers served, no handler rewritten.
+ *
+ * `code` is deliberately NOT the property name: fs errors already use that for
+ * an errno, and a reader that could not tell 'ENOENT' from 'no_file' would put
+ * an errno on the wire as though Stacki had chosen it.
+ */
+function refuse(code, message) {
+  const err = new Error(message);
+  err.refusalCode = code;
+  return err;
+}
+
 // THE ONE NON-INTERACTIVE WAY TO OPEN A PROJECT, AND ITS FENCE.
 //
 // Opening a project is a human act by design: the reopen file is dev-only,
@@ -2424,7 +2449,7 @@ const rootOfRel = (rel) => String(rel || '').split('/')[0];
 function assetAbs(projectPath, rel) {
   const clean = String(rel || '').replace(/^\/+/, '');
   const root = rootOfRel(clean);
-  if (!ASSET_ROOTS.includes(root)) throw new Error('Invalid asset path');
+  if (!ASSET_ROOTS.includes(root)) throw refuse('bad_path', 'Invalid asset path');
   const rootAbs = path.resolve(projectPath, root);
   const abs = path.resolve(projectPath, clean);
   if (abs !== rootAbs && !abs.startsWith(rootAbs + path.sep)) {
@@ -2558,7 +2583,7 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
   if (!fs.existsSync(from)) return { ok: false };
   // Refuse moving a folder into itself/its own subtree.
   if (fs.statSync(from).isDirectory() && (toDir === from || toDir.startsWith(from + path.sep))) {
-    throw new Error('Cannot move a folder into itself.');
+    throw refuse('bad_path', 'Cannot move a folder into itself.');
   }
   const dest = uniqueDest(toDir, path.basename(from));
   markSelfWrite(from);
@@ -2571,11 +2596,11 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
 
 handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   const clean = String(newName).trim().replace(/[/\\]/g, '');
-  if (!clean) throw new Error('Invalid name');
+  if (!clean) throw refuse('bad_request', 'Invalid name');
   const from = assetAbs(projectPath, rel);
   const dest = path.join(path.dirname(from), clean);
   if (dest === from) return { ok: true };
-  if (fs.existsSync(dest)) throw new Error('Something with that name already exists.');
+  if (fs.existsSync(dest)) throw refuse('exists', 'Something with that name already exists.');
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
@@ -2589,7 +2614,12 @@ handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
 // can get it back from without us.
 handle('assets:delete', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
-  if (!fs.existsSync(abs)) return { ok: false };
+  // Refused in band rather than thrown — the Assets panel branches on `ok`
+  // and writes its own sentence, and it still does. The code and the sentence
+  // are additions: without them the Agent API's envelope said `failed` and
+  // "That operation was refused.", which is the generic answer for a cause
+  // this line knows exactly.
+  if (!fs.existsSync(abs)) return { ok: false, code: 'no_file', message: `${rel} is not in this project.` };
   markSelfWrite(abs);
   await shell.trashItem(abs);
   send('assets:changed', {});
@@ -2603,7 +2633,7 @@ handle('assets:readText', async (_e, { projectPath, rel }) => {
   const abs = assetAbs(projectPath, rel);
   const stat = fs.statSync(abs);
   if (stat.size > MAX_EDITABLE_BYTES) {
-    throw new Error('That file is too large to edit in the app (over 5 MB).');
+    throw refuse('too_large', 'That file is too large to edit in the app (over 5 MB).');
   }
   return { text: fs.readFileSync(abs, 'utf8') };
 });
@@ -2617,7 +2647,7 @@ handle('assets:writeText', async (_e, { projectPath, rel, text }) => {
 
 handle('assets:mkdir', async (_e, { projectPath, parentRel, name }) => {
   const clean = String(name).trim().replace(/[/\\]/g, '');
-  if (!clean) throw new Error('Invalid folder name');
+  if (!clean) throw refuse('bad_request', 'Invalid folder name');
   const dir = path.join(assetAbs(projectPath, parentRel), clean);
   markSelfWrite(dir);
   fs.mkdirSync(dir, { recursive: true });
@@ -2669,7 +2699,7 @@ function splitCmsRel(rel) {
 function cmsAbs(projectPath, rel) {
   const root = path.resolve(projectPath, 'src');
   const abs = path.resolve(root, rel || '');
-  if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error('Invalid data path');
+  if (abs !== root && !abs.startsWith(root + path.sep)) throw refuse('outside_project', 'Invalid data path');
   return abs;
 }
 
@@ -2816,14 +2846,17 @@ function readDataFile(abs, fileRel) {
   try {
     return fs.readFileSync(abs, 'utf8');
   } catch (err) {
-    if (err?.code === 'ENOENT') throw new Error(`src/${fileRel} is not in this project.`);
-    throw new Error(`src/${fileRel} could not be read (${err?.code || 'unreadable'}).`);
+    if (err?.code === 'ENOENT') throw refuse('no_file', `src/${fileRel} is not in this project.`);
+    throw refuse(
+      err?.code === 'EACCES' || err?.code === 'EPERM' ? 'permission_denied' : 'unreadable',
+      `src/${fileRel} could not be read (${err?.code || 'unreadable'}).`
+    );
   }
 }
 
 function parseDataFile(abs, fileRel) {
   if (!/\.json$/i.test(fileRel)) {
-    throw new Error(`src/${fileRel} is not a JSON data file. ${DATA_FILE_SHAPE}`);
+    throw refuse('wrong_kind', `src/${fileRel} is not a JSON data file. ${DATA_FILE_SHAPE}`);
   }
   const text = readDataFile(abs, fileRel);
   try {
@@ -2831,7 +2864,7 @@ function parseDataFile(abs, fileRel) {
   } catch (err) {
     // The same trim cms:list uses, for the same reason: "in JSON at position 1
     // (line 1 column 2)" is about a buffer nobody but the parser can see.
-    throw new Error(`src/${fileRel} is not valid JSON — ${String(err?.message || err).replace(/\s+in JSON.*$/, '')}.`);
+    throw refuse('invalid_json', `src/${fileRel} is not valid JSON — ${String(err?.message || err).replace(/\s+in JSON.*$/, '')}.`);
   }
 }
 
@@ -2844,22 +2877,23 @@ handle('cms:read', async (_e, { projectPath, rel }) => {
   // scanners must never see.
   const page = isAstroRel(fileRel);
   const source = page ? frontmatterOf(file) : file;
-  if (source == null) throw new Error(`src/${fileRel} has no frontmatter.`);
+  if (source == null) throw refuse('wrong_kind', `src/${fileRel} has no frontmatter.`);
   const scan = page ? PAGE_SCAN : undefined;
   if (exportName === GENERAL) {
     const general = readGeneral(source, scan);
-    if (!general) throw new Error(`src/${fileRel} has no single values left to edit.`);
+    if (!general) throw refuse('no_export', `src/${fileRel} has no single values left to edit.`);
     return { data: general };
   }
   const col = findCollections(source, scan).find((c) => c.name === exportName);
   if (!col) {
-    throw new Error(
+    throw refuse(
+      'no_export',
       page
         ? `${exportName} is no longer declared in src/${fileRel}.`
         : `${exportName} is no longer exported from src/${fileRel}.`
     );
   }
-  if (!col.data) throw new Error(`${exportName} isn't plain data — ${col.reason}.`);
+  if (!col.data) throw refuse('wrong_kind', `${exportName} isn't plain data — ${col.reason}.`);
   return { data: col.data };
 });
 
@@ -2869,7 +2903,7 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
   const { fileRel, exportName } = splitCmsRel(rel);
   if (exportName) {
     const abs = cmsAbs(projectPath, fileRel);
-    if (!fs.existsSync(abs)) throw new Error(`src/${fileRel} no longer exists.`);
+    if (!fs.existsSync(abs)) throw refuse('no_file', `src/${fileRel} no longer exists.`);
     // Only the edited span is rewritten — imports, comments and the file's
     // other exports are left exactly as they were.
     // Through the same reader as cms:read: the existence check above is not the
@@ -2880,14 +2914,14 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
     // span is spliced back — the markup below is never re-serialized.
     const page = isAstroRel(fileRel);
     const span = page ? frontmatterSpan(file) : null;
-    if (page && !span) throw new Error(`src/${fileRel} has no frontmatter.`);
+    if (page && !span) throw refuse('wrong_kind', `src/${fileRel} has no frontmatter.`);
     const source = page ? file.slice(span.start, span.end) : file;
     const scan = page ? PAGE_SCAN : undefined;
     const written =
       exportName === GENERAL
         ? writeGeneral(source, data && typeof data === 'object' && !Array.isArray(data) ? data : {}, scan)
         : replaceCollection(source, exportName, data, scan);
-    if (written == null) throw new Error(`Couldn't write ${exportName} back into src/${fileRel}.`);
+    if (written == null) throw refuse('write_failed', `Couldn't write ${exportName} back into src/${fileRel}.`);
     const next = page ? file.slice(0, span.start) + written + file.slice(span.end) : written;
     markSelfWrite(abs);
     fs.writeFileSync(abs, next, 'utf8');
@@ -2900,7 +2934,7 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
   const abs = cmsAbs(projectPath, rel);
   // A save still in flight when the collection is deleted must not recreate
   // the file — the editor closes a moment after the delete lands.
-  if (!fs.existsSync(abs)) throw new Error(`src/${rel} no longer exists.`);
+  if (!fs.existsSync(abs)) throw refuse('no_file', `src/${rel} no longer exists.`);
   let indent = 2;
   let trailingNewline = true;
   const before = readDataFile(abs, rel);
@@ -2916,10 +2950,10 @@ handle('cms:write', async (_e, { projectPath, rel, data }) => {
 // that isn't a content collection.
 handle('cms:create', async (_e, { projectPath, name }) => {
   const slug = String(name).trim().toLowerCase().replace(/\.json$/i, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  if (!slug) throw new Error('Give the collection a name.');
+  if (!slug) throw refuse('bad_request', 'Give the collection a name.');
   const rel = `data/${slug}.json`;
   const abs = cmsAbs(projectPath, rel);
-  if (fs.existsSync(abs)) throw new Error(`src/${rel} already exists.`);
+  if (fs.existsSync(abs)) throw refuse('exists', `src/${rel} already exists.`);
   markSelfWrite(abs);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, '[]\n', 'utf8');
@@ -2956,7 +2990,7 @@ handle('content:config', async (_e, { projectPath, force } = {}) =>
 const collectionOf = async (projectPath, name) => {
   const config = await readContentConfig(projectPath);
   const collection = (config.collections || []).find((c) => c.name === name);
-  if (!collection) throw new Error(`${name} is not a collection in this project.`);
+  if (!collection) throw refuse('no_collection', `${name} is not a collection in this project.`);
   return { config, collection };
 };
 
@@ -3242,7 +3276,7 @@ handle('cms:delete', async (_e, { projectPath, rel }) => {
   // An export shares its file with other code, so there's no file to trash and
   // removing the statement is a code edit, not a content one.
   if (splitCmsRel(rel).exportName) {
-    throw new Error('This collection is an export inside a source file — remove it in code.');
+    throw refuse('wrong_kind', 'This collection is an export inside a source file — remove it in code.');
   }
   const abs = cmsAbs(projectPath, rel);
   const hits = importersOf(projectPath, abs);
@@ -3402,9 +3436,9 @@ handle('page:create', async (_e, { projectPath, name, layout }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   let fileName = name.trim().replace(/\.astro$/i, '');
   fileName = fileName.replace(/[^a-zA-Z0-9/_-]+/g, '-');
-  if (!fileName) throw new Error('Invalid page name');
+  if (!fileName) throw refuse('bad_request', 'Invalid page name');
   const pagePath = path.join(pagesDir, fileName + '.astro');
-  if (fs.existsSync(pagePath)) throw new Error('A page with that name already exists.');
+  if (fs.existsSync(pagePath)) throw refuse('exists', 'A page with that name already exists.');
   fs.mkdirSync(path.dirname(pagePath), { recursive: true });
 
   const model = { imports: [], extraFrontmatter: '', nodes: [] };
@@ -3430,9 +3464,9 @@ handle('page:delete', async (_e, pagePath) => {
 handle('page:move', async (_e, { projectPath, from, to }) => {
   const pagesDir = path.join(projectPath, 'src', 'pages');
   const dest = path.resolve(pagesDir, to);
-  if (!dest.startsWith(pagesDir + path.sep)) throw new Error('Invalid destination.');
+  if (!dest.startsWith(pagesDir + path.sep)) throw refuse('outside_project', 'Invalid destination.');
   if (path.resolve(from) === dest) return { newPath: dest };
-  if (fs.existsSync(dest)) throw new Error('A page with that name already exists there.');
+  if (fs.existsSync(dest)) throw refuse('exists', 'A page with that name already exists there.');
   fs.mkdirSync(path.dirname(dest), { recursive: true });
 
   let source = fs.readFileSync(from, 'utf8');
@@ -3475,7 +3509,7 @@ handle('pagefolder:create', async (_e, { projectPath, dir }) => {
 handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   const a = resolvePagesDir(projectPath, from);
   const b = resolvePagesDir(projectPath, to);
-  if (fs.existsSync(b)) throw new Error('A folder with that name already exists.');
+  if (fs.existsSync(b)) throw refuse('exists', 'A folder with that name already exists.');
   fs.renameSync(a, b);
   return { ok: true };
 });

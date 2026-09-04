@@ -1464,9 +1464,20 @@ async function runMain(domain, action, input, ctx) {
   const entry = DOMAINS[domain]?.[action];
   if (!entry) return { ok: false, code: 'bad_action', message: `${domain} has no main-process action "${action}".` };
   if (typeof entry === 'function') {
-    const out = await entry(input, ctx);
-    if (out?.error) return out.error;
-    return { ok: true, ...(out?.value || {}) };
+    // THE SAME CATCH AS THE CHANNEL BRANCH BELOW. It did not have one: the
+    // source domain writes files itself rather than through a handler, and a
+    // write into a directory that is not there left `fs.writeFileSync`'s throw
+    // to whatever caught it last — which spelled Node's own ENOENT sentence,
+    // absolute path and all, out to the client under `code: 'failed'`. The
+    // domain a failure came from is not a reason for it to be reported
+    // differently.
+    try {
+      const out = await entry(input, ctx);
+      if (out?.error) return out.error;
+      return { ok: true, ...(out?.value || {}) };
+    } catch (err) {
+      return thrownFailure(err, ctx);
+    }
   }
   const built = await entry.args(input, ctx);
   if (built?.error) return built.error;
@@ -1474,14 +1485,7 @@ async function runMain(domain, action, input, ctx) {
   try {
     raw = await ctx.callMain(entry.channel, built);
   } catch (err) {
-    const message = String(err?.message || err);
-    // A project that was never `git init`ed is a normal state, not a failure —
-    // and an agent told "fatal: not a git repository" will go looking for a
-    // bug rather than reading it as "there is no history here".
-    if (/not a git repository/i.test(message)) {
-      return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
-    }
-    return { ok: false, code: 'failed', message };
+    return thrownFailure(err, ctx);
   }
   // Awaited, because a result mapper may need to ASK: a commit that answers
   // with the sha it made has to read the sha, and reading it is what makes
@@ -1511,6 +1515,100 @@ async function runMain(domain, action, input, ctx) {
   return { ok: true, ...(shaped && typeof shaped === 'object' && !Array.isArray(shaped) ? shaped : { value: shaped }) };
 }
 
+// An absolute path, as it appears inside a sentence: at the start, or after a
+// space, a quote, an opening bracket or an `=`. Not after a colon, which is
+// what keeps `http://localhost:4321/x` out of it.
+const ABSOLUTE_IN_TEXT = /(^|[\s'"`([=,])((?:\/|[A-Za-z]:\\)[^\s'"`)\],]+)/g;
+
+/**
+ * A message with this machine taken out of it.
+ *
+ * The handlers that know they are answering an agent already speak in
+ * project-relative paths. The ones that simply let an fs error out do not, and
+ * an fs error carries the absolute path inside its message: `content.cms_read`
+ * on a missing file reached a real client as `ENOENT: no such file or
+ * directory, open '/Users/…/src/data/nope.json'`, somebody's home directory in
+ * an answer an agent is free to quote back, log, or paste into a commit.
+ *
+ * That was fixed at one handler and it is not a property of one handler. This
+ * is the last place a thrown message becomes wire text, so it is where the
+ * rule belongs: inside the project, a path is said the only way that means
+ * anything off this machine — relative to the project root. Outside it,
+ * nothing is said at all, because nothing outside the project is any of the
+ * client's business.
+ */
+function withoutHostPaths(message, root) {
+  return String(message).replace(ABSOLUTE_IN_TEXT, (whole, lead, abs) => {
+    const rel = relativeTo(root, abs.replace(/[.,;:]+$/, ''));
+    return rel ? `${lead}${rel}` : `${lead}a path outside this project`;
+  });
+}
+
+// What an fs errno means, in the vocabulary the rest of this surface refuses
+// in. A raw fs throw is the commonest way a known cause reaches the wire as
+// `failed`: every one of asset.read_text, asset.write_text, asset.rename,
+// page.read, page.delete, page.move and source.write answered a missing file
+// with `code: 'failed'` and Node's own ENOENT sentence, which is the one code
+// a client cannot branch on and the one sentence it cannot show anybody.
+const ERRNO_CODES = {
+  ENOENT: 'no_file',
+  ENOTDIR: 'no_file',
+  EACCES: 'permission_denied',
+  EPERM: 'permission_denied',
+  EROFS: 'permission_denied',
+  EISDIR: 'bad_path',
+  EEXIST: 'exists',
+  EMFILE: 'failed',
+};
+
+/**
+ * A handler that threw, in the envelope's own vocabulary.
+ *
+ * `runMain`'s catch is the only thing between a throw and the wire, and it
+ * used to answer `{code: 'failed'}` for everything but one git special case —
+ * so a cause the handler knew exactly (there is no such file; that is not a
+ * collection; something is already there) arrived as the code that means
+ * "something went wrong and nobody knows what".
+ *
+ * THE HANDLERS STILL THROW. They are called by the CMS panel and the Pages
+ * panel over IPC as well as by this API, and turning a throw into an in-band
+ * `{ok:false}` would change what every one of those callers sees. So the cause
+ * rides on the Error instead, as `refusalCode` (electron/main.js's `refuse`),
+ * which Electron's IPC serializer drops on the way to a panel — the panel
+ * still catches the same throw with the same message — and which arrives
+ * intact here, because the Agent API calls the handler function directly.
+ */
+function thrownFailure(err, ctx) {
+  const message = withoutHostPaths(err?.message || err, ctx?.root);
+  // What the handler said this is, when it knew.
+  const named = typeof err?.refusalCode === 'string' && err.refusalCode ? err.refusalCode : null;
+  if (named) return { ok: false, code: named, message };
+  // A project that was never `git init`ed is a normal state, not a failure —
+  // and an agent told "fatal: not a git repository" will go looking for a
+  // bug rather than reading it as "there is no history here".
+  if (/not a git repository/i.test(message)) {
+    return { ok: false, code: 'no_repo', message: 'This project is not a git repository. Nothing was changed.' };
+  }
+  // An fs error names its own cause and its own path, and says both in Node's
+  // words. Both are rewritten: the errno becomes a code a client can branch
+  // on, and the sentence becomes one about the file the caller asked for.
+  const errno = typeof err?.code === 'string' ? ERRNO_CODES[err.code] : null;
+  if (errno) {
+    const rel = relativeTo(ctx?.root, err.path) || relativeTo(ctx?.root, err.dest);
+    const what = rel ? rel : 'that path';
+    const said =
+      errno === 'no_file'
+        ? `${what} is not in this project.`
+        : errno === 'exists'
+          ? `${what} already exists.`
+          : errno === 'permission_denied'
+            ? `Stacki is not allowed to use ${what} (${err.code}).`
+            : `${what} could not be used (${err.code}).`;
+    return { ok: false, code: errno, message: rel ? said : message };
+  }
+  return { ok: false, code: 'failed', message };
+}
+
 /** A main-process `{ok:false, …}` said in the envelope's own vocabulary. */
 function refusal(raw) {
   const { ok, code, message, error, reason, ...rest } = raw;
@@ -1525,4 +1623,16 @@ function refusal(raw) {
   };
 }
 
-module.exports = { runMain, resolveContentEntry, DOMAINS, outlineOf, summarizeScan, MAX_LIST, MAX_TEXT_BYTES };
+module.exports = {
+  runMain,
+  // Exported for test/git-envelopes.js, which calls it with the error shapes
+  // that reach it — including the ones no fixture can provoke end to end, like
+  // a package manager's stderr with somebody's home directory in it.
+  thrownFailure,
+  resolveContentEntry,
+  DOMAINS,
+  outlineOf,
+  summarizeScan,
+  MAX_LIST,
+  MAX_TEXT_BYTES,
+};
