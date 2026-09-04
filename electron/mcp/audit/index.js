@@ -630,6 +630,22 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
   // constraint of the design, not an oversight: the alternative is a session per
   // run, which is the unbounded thing being avoided.
   let queue = Promise.resolve();
+
+  /**
+   * What an audit answers when the caller stopped waiting.
+   *
+   * A refusal rather than a throw, in the vocabulary the rest of this surface
+   * uses, for two reasons that outlive the request: the queue behind it has to
+   * be released cleanly, and a cancel is not an error — nothing went wrong and
+   * nothing was changed. Nobody may ever read it, which is the point: the value
+   * of cancelling is the windows that were not opened and the audit behind this
+   * one that starts now.
+   */
+  const cancelled = (when) => ({
+    ok: false,
+    code: 'cancelled',
+    message: `The audit was cancelled ${when}. Nothing was measured and the project was not touched.`,
+  });
   /**
    * @param {object} opts
    * @param {string=} opts.route          route to audit; defaults to the site root
@@ -637,14 +653,20 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
    * @param {Array=}  opts.rules          specific accessibility rule ids; defaults to WCAG A/AA
    * @param {boolean=} opts.capture       return a screenshot per viewport
    */
-  async function run(opts = {}) {
+  async function run(opts = {}, { signal = null } = {}) {
+    // GIVING UP WHILE STILL IN THE QUEUE COSTS NOTHING, AND USED TO COST A RUN.
+    //
+    // Audits are serialised, so a caller that has already gone away can be
+    // holding a place in front of one that has not. Checked here, before the
+    // chain, so an abandoned request never becomes work.
+    if (signal?.aborted) return cancelled('before it started');
     // Chain rather than reject: a second audit waits its turn.
-    const mine = queue.then(() => runExclusive(opts));
+    const mine = queue.then(() => (signal?.aborted ? cancelled('while it was queued') : runExclusive(opts, signal)));
     queue = mine.catch(() => {});
     return mine;
   }
 
-  async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}) {
+  async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}, signal = null) {
     // An empty list is a request for NO accessibility pass. See the engine block
     // below; `null` and `undefined` still mean the WCAG A/AA default.
     const skipAxe = Array.isArray(rules) && rules.length === 0;
@@ -746,6 +768,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         };
       }
       for (const viewport of chosen.viewports) {
+        // BETWEEN VIEWPORTS, WHICH IS WHERE THE WORK IS.
+        //
+        // Six viewports is six page loads and six axe injections; stopping at a
+        // boundary is what makes cancelling worth anything. It is checked here
+        // rather than only at the top because the caller usually goes away part
+        // way through, and the outer `finally` still resets the session on the
+        // way out.
+        if (signal?.aborted) return cancelled(`after ${findings.length ? 'measuring part of the page' : 'starting'}`);
         const started = Date.now();
         let win = null;
         try {
@@ -816,7 +846,12 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
             win.webContents.once('did-fail-load', (_e, code, desc) => reject(new Error(`${desc || 'load failed'} (${code})`)));
           });
           loaded.catch(() => {});
-          await win.loadURL(url).catch(() => {});
+          // WRAPPED, like its four neighbours. `loadURL` settles when the load
+          // does, and a page that never finishes streaming never settles it --
+          // so the twenty-second budget that exists for exactly that sat on the
+          // NEXT line and was never reached. Rejection is swallowed here as
+          // before; the timeout's only job is to stop waiting for ever.
+          await withTimeout(win.loadURL(url), LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`).catch(() => {});
           // A BLOCKED NAVIGATION LOOKS LIKE A FAILED LOAD, and it is not one.
           //
           // preventDefault on will-redirect aborts the load, so did-fail-load
@@ -935,7 +970,10 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           let axeResult = null;
           if (!skipAxe) {
             try {
-              await win.webContents.executeJavaScript(axeSource(), true);
+              // The 580 KB injection, on a budget. A wedged JS context never
+              // returns from this, and the `withTimeout` that would have caught
+              // it was on the line below, guarding only the RUN.
+              await withTimeout(win.webContents.executeJavaScript(axeSource(), true), PROBE_TIMEOUT_MS, 'loading the accessibility engine');
               axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine');
               axeVersion = axeResult.version;
               // Named back rather than dropped. `rules` are the caller's
