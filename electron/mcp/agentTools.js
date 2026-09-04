@@ -246,6 +246,14 @@ function closeField(field) {
     const rebuilt = closeShape(field.shape);
     return field.description ? rebuilt.describe(field.description) : rebuilt;
   }
+  // A UNION OF SHAPES IS STILL SHAPES. `audit`'s `viewports` takes either a
+  // named string or a `{width, height}` object, and the object half was the
+  // last place on the surface still dropping a key silently.
+  if (def.type === 'union' && Array.isArray(def.options)) {
+    const rebuilt = def.options.map(closeField);
+    if (rebuilt.every((o, i) => o === def.options[i])) return field;
+    return withDescription(z.union(rebuilt), field);
+  }
   // One inner type, held under a name that differs by wrapper.
   const innerKey = def.type === 'array' ? 'element' : 'innerType';
   const inner = def[innerKey];
@@ -1091,7 +1099,12 @@ function closedObject(schema) {
   const shape = schema && typeof schema === 'object' ? schema.shape : null;
   if (!shape || typeof shape !== 'object') return schema;
   if (schema.def?.catchall && schema.def.catchall.def?.type === 'never') return schema;
-  return z.strictObject(shape);
+  // `closeShape`, not `z.strictObject`, so a nested argument is closed here for
+  // the same reason it is inside a domain branch: `audit`'s `viewports` takes
+  // objects, and a key added beside `width` and `height` was dropped without a
+  // word. What stays open is what should — a record's VALUES, where arbitrary
+  // keys are the point.
+  return closeShape(shape);
 }
 
 /**
