@@ -195,7 +195,23 @@ Refusals an agent must expect and can act on:
 | `stale_target` | the file moved under you; carries `observed` and `current` |
 | `wrong_project` | the ref belongs to a project this Stacki no longer has open |
 | `no_project` | nothing is open; ask the person to open one |
-| `no_preview` | there is no dev server; `project.dev_start` |
+| `no_preview` | there is no dev server; `project.dev_start`. Also what `page.dynamic_paths` answers rather than reporting zero routes it could not ask about |
+| `bad_arguments` | names the key that was wrong AND what that action does accept |
+| `bad_action` | no such action on this tool; lists the ones there are |
+| `merge_conflict` | the branches disagree; the merge was unwound, the clashing hunks travel, the whole files do not |
+| `working_tree_blocked` | uncommitted work is in the way of a switch or a merge; nothing was changed |
+| `bad_choices` | a `resolve_merge` choice could not be understood; nothing was written, and the message states the vocabulary |
+| `cancelled` | the caller went away mid-audit; says how many viewports had been measured and discarded |
+| `undo_failed` / `redo_failed` | the recorded inverse threw. The stack moved, the file did not |
+
+This table is the ones worth knowing rather than all of them; the surface has
+more, and `get_capabilities` lists every operation it can refuse.
+
+Four of these are new in this revision, and each replaced something worse: three
+git causes that arrived as `failed` (the code this codebase's own comment calls
+"the code that means nobody knows"), and one answer that was not a refusal at
+all — `page.dynamic_paths` reported a dynamic route as standing for no paths
+whenever it had no dev server to ask.
 
 **Every refusal reaches the wire with `isError: true`** as well as `ok: false`, on
 every tool. A host that keys off `isError` and a host that reads the envelope both
