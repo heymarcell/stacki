@@ -111,15 +111,40 @@ const unmergedPaths = async (git, cwd) =>
  * asked at all: it is the shape that becomes an option, and no version of git
  * may be relied upon to read it as a name rather than as a flag.
  *
+ * AND A NAME GIT EXPANDS IS NOT THE NAME THAT WAS TYPED.
+ *
+ * `--branch` does not only validate: it is documented to also EXPAND git's
+ * `@{-n}` "previous checkout" syntax, and asking it whether a name is legal
+ * therefore accepts a spelling that MEANS A DIFFERENT BRANCH. Measured, on a
+ * repository sitting on `feature` after a checkout from `main`:
+ * `git check-ref-format --branch '@{-1}'` prints `main` and exits 0, so the
+ * name was accepted; `git branch -d -- '@{-1}'` then expanded it the same way
+ * and DELETED MAIN, past a trunk guard that compares the caller's own string
+ * against `'main'`, and answered `{ok:true}`. `--` stops git parsing the token
+ * as an OPTION; it does not stop it resolving the token as a REF. The same
+ * spelling took `switch` to another branch and merged another branch, each
+ * reporting `@{-1}` as the branch it had acted on.
+ *
+ * So the expansion itself is the test: git is asked what the name means, and a
+ * name that does not come back as itself is refused. That is exactly the
+ * `@{-n}` family and nothing else — measured, check-ref-format already refuses
+ * `@{u}`, `@{upstream}`, `HEAD@{1}`, `main@{yesterday}`, `@{now}` and every
+ * other `@{…}` shape outright, and echoes ordinary names (`feature@work`,
+ * `fix/thing`, `@feature`) back unchanged.
+ *
  * NOTE what is deliberately still ACCEPTED: `refs/heads/main` and `heads/main`
- * are valid branch names as far as check-ref-format is concerned, and the trunk
- * guard in deleteBranch relies on git itself refusing them a moment later.
+ * are valid branch names as far as check-ref-format is concerned, and they are
+ * refused a moment later — by git itself for merge and switch, and by
+ * deleteBranch's own resolution guard, which will not delete under a spelling
+ * that names something other than itself.
  */
 async function usableBranchName(git, projectPath, branch) {
   if (typeof branch !== 'string' || branch === '' || branch.startsWith('-')) return false;
   try {
-    await git(projectPath, ['check-ref-format', '--branch', branch]);
-    return true;
+    const { stdout } = await git(projectPath, ['check-ref-format', '--branch', branch]);
+    // What git printed is what git will act on. Anything else is a name whose
+    // meaning is decided after this function has said yes.
+    return String(stdout).trim() === branch;
   } catch {
     return false;
   }
@@ -141,7 +166,8 @@ const badBranchName = (branch, extra = {}, undone = 'Nothing was changed.') => (
   message:
     `${typeof branch === 'string' && branch ? `"${branch}"` : 'That'} is not a name git will accept for a branch, ` +
     `so it was never given to git. ${undone} A name that begins with "-" is an option as far as git is ` +
-    'concerned, not a branch.',
+    'concerned, and a name like "@{-1}" is git\'s own shorthand for whichever branch you were on last — ' +
+    'neither one names a branch.',
 });
 
 /** Whether the working tree has anything uncommitted in it. */
@@ -153,6 +179,38 @@ async function isDirty(git, projectPath) {
 async function currentBranch(git, projectPath) {
   try {
     return (await git(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * THE BRANCH GIT WILL ACT ON, ASKED FOR RATHER THAN ASSUMED.
+ *
+ * A destructive command must not be guarded by a string comparison against the
+ * caller's spelling, because git resolves the spelling afterwards and can
+ * resolve it to something else. `usableBranchName` closes the `@{-n}` family
+ * ahead of this; this closes the shapes that survive it, and it is the answer
+ * the guard and the report are both taken from rather than the argument.
+ *
+ * Returns the short name under `refs/heads/`, or null when the name resolves to
+ * nothing (git's own "branch not found" is a better sentence than one invented
+ * here) or to something that is not a local branch at all — a tag, a
+ * remote-tracking ref — which `git branch -d` would refuse anyway.
+ *
+ * `--end-of-options` for the same reason as everywhere else in this file, with
+ * one wrinkle worth knowing: rev-parse ECHOES that token back on a line of its
+ * own before it answers, so the answer is the last line and not the first.
+ */
+async function resolvedBranch(git, projectPath, branch) {
+  try {
+    const { stdout } = await git(projectPath, ['rev-parse', '--symbolic-full-name', '--end-of-options', branch]);
+    const lines = String(stdout)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const full = lines[lines.length - 1] || '';
+    return full.startsWith('refs/heads/') ? full.slice('refs/heads/'.length) : null;
   } catch {
     return null;
   }
@@ -1116,17 +1174,27 @@ async function mergeBranch(git, { projectPath, branch }) {
  * it is a second, separately asked-for call with `force`.
  */
 async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
-  const here = await currentBranch(git, projectPath);
-  if (branch === here) {
-    throw new Error(`"${branch}" is the branch you are on — switch to another one first.`);
-  }
+  // THE NAME IS SETTLED BEFORE ANY GUARD IS ASKED ABOUT IT, because every guard
+  // below compares something against it and a comparison against a string that
+  // is not yet a branch name compares nothing.
+  //
   // THROWN, not returned, and this is the one place in the file where that is
   // deliberate rather than habit. A delete that answers `{ok:false}` in any
   // shape the MCP mapper does not recognise by name is turned into
   // `{deleted: <branch>}` — a refusal reported as a success. There is no name
-  // to recognise here, because there is no branch: the caller sent an option.
+  // to recognise here, because there is no branch: the caller sent an option,
+  // or a spelling that means some other branch.
   if (!(await usableBranchName(git, projectPath, branch))) {
     throw new Error(badBranchName(branch).message);
+  }
+  // WHAT GIT WOULD DELETE, NOT WHAT WAS TYPED. Every guard below is a question
+  // about a branch, so every one of them is asked about the branch git will
+  // actually reach — `refs/heads/main` and `heads/main` are the trunk, and `@`
+  // is the branch you are standing on, however little they look like it.
+  const target = await resolvedBranch(git, projectPath, branch);
+  const here = await currentBranch(git, projectPath);
+  if ((target || branch) === here) {
+    throw new Error(`"${branch}" is the branch you are on — switch to another one first.`);
   }
   // Git will delete main as readily as anything else — `git branch -d main`
   // succeeds the moment main is merged into wherever you are standing, which
@@ -1135,9 +1203,35 @@ async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
   // because a caller somewhere forgot.
   // (Reaching here at all means another branch is checked out, so there is
   // always somewhere for the trunk's work to have gone — no need to check.)
-  if (!allowTrunk && (branch === 'main' || branch === 'master')) {
+  //
+  // CASE-INSENSITIVELY, because on a case-insensitive filesystem — macOS's
+  // default — git resolves a loose ref through the filesystem and the guard is
+  // one keystroke wide. Measured, on a repository holding only `main` and
+  // `feature`: `git branch -d -- MAIN` printed "Deleted branch MAIN" and main
+  // was gone, past a guard that had compared `'MAIN' === 'main'`. Where the
+  // filesystem IS case-sensitive this refuses a genuinely different branch
+  // called `Main`, which is a refusal with `allowTrunk` behind it rather than
+  // a loss with nothing behind it.
+  const trunk = (target || branch).toLowerCase();
+  if (!allowTrunk && (trunk === 'main' || trunk === 'master')) {
     throw new Error(
       `"${branch}" is the branch everything comes back to. Deleting it would leave the project without its main line of work.`
+    );
+  }
+  // AND NOTHING GOES UNDER AN ALIAS, even a harmless one.
+  //
+  // Deleting under a spelling that is not the branch's own name cannot be
+  // reported honestly: the MCP envelope for this operation is built in
+  // electron/mcp/agent/domains.js out of the caller's OWN argument
+  // (`{ deleted: input.branch }`), so the only spelling whose success can be
+  // described truthfully is one that names itself. It also keeps git's own
+  // answer for these from being the last word — `git branch -d refs/heads/x`
+  // says "branch 'refs/heads/x' not found", which is true of the spelling and
+  // reads as a claim about the branch.
+  if (target && target !== branch) {
+    throw new Error(
+      `"${branch}" is how git spells "${target}" from where you are standing, not a branch name. ` +
+        'Nothing was deleted. Ask for the branch by its own name.'
     );
   }
   try {
@@ -1162,7 +1256,10 @@ async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
     }
     throw new Error(detail.trim() || `Could not delete "${branch}".`);
   }
-  return { ok: true };
+  // The branch that actually went, named. It is `branch` by construction —
+  // anything git would have resolved elsewhere was refused above — and saying
+  // so here is what lets a caller check that rather than take it on trust.
+  return { ok: true, deleted: target || branch };
 }
 
 /**

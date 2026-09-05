@@ -40,6 +40,14 @@ const H = require('./agent-harness.js');
 const refs = require('../electron/mcp/agent/refs.js');
 const { digestOf } = require('../electron/mcp/agent/digest.js');
 const { anchorFrom } = require('../electron/review/anchor.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite starts real apps and awaits real
+// IPC, and its whole subject is concurrency — two writes racing for one ref —
+// which is the shape most likely to end with an await nobody settles. Node
+// exits 0 on an empty event loop, so that ending is recorded as success unless
+// something says otherwise. See test/support/suiteGuard.js.
+const suiteDone = guardSuite('ref-concurrency');
 
 const failures = [];
 let checked = 0;
@@ -1349,6 +1357,7 @@ async function open(extra = {}) {
 
   for (const root of projects) H.removeProject(root);
 
+  suiteDone();
   if (failures.length) {
     console.error(`\nref-concurrency: ${failures.length} failed, ${checked - failures.length} passed\n`);
     console.error(failures.join('\n') + '\n');
@@ -1357,6 +1366,7 @@ async function open(extra = {}) {
   console.log(`ref-concurrency: ${checked} passed  [no unobserved write handle, and no refusal that writes]`);
   process.exit(0);
 })().catch((err) => {
+  suiteDone();
   console.error(err);
   process.exit(1);
 });

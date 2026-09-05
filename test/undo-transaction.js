@@ -63,6 +63,13 @@ const os = require('node:os');
 const path = require('node:path');
 const H = require('./agent-harness.js');
 const { guardSuite } = require('./support/suiteGuard.js');
+// THE HOST-PATH ORACLE IS NOT THIS FILE'S TO SPELL. It used to be, under a
+// docstring claiming it was "the same function, at the same strength" as the
+// copy in test/refusal-contract.js — and it was weaker: its anchors omitted the
+// apostrophe, which is the character every Node fs error puts in front of a
+// path (`open '/Users/…'`). Every assertion here is an ABSENCE, so the weaker
+// copy passed them all by seeing nothing. See test/support/hostPaths.js.
+const { hostPathsIn, QUOTINGS } = require('./support/hostPaths.js');
 
 // THE ROLLBACKS ARE READ OUT OF THE SHIPPED FILES, not reimplemented here.
 //
@@ -121,41 +128,6 @@ const same = (a, b) => !!a && !!b && a.past === b.past && a.future === b.future;
 // wire; the names are what this file asks about.
 const filesOf = (envelope) =>
   (envelope?.restored?.files || []).map((entry) => (typeof entry === 'string' ? entry : entry?.file)).filter(Boolean);
-
-/**
- * Every way a payload could name a place on this machine.
- *
- * The oracle here used to be `JSON.stringify(envelope).includes(root)` and
- * nothing more, which on macOS misses the spelling the operating system
- * actually hands back: the fixture root is `/var/folders/…` and its realpath is
- * `/private/var/folders/…`, so a refusal naming the resolved path of the very
- * file the test locked would have gone through unremarked. The temp and home
- * directories go the same way, and the shape rule catches a path from somewhere
- * none of the four covers.
- *
- * The same function, at the same strength, as `hostPathsIn` in
- * test/refusal-contract.js.
- */
-function hostPathsIn(payload, root) {
-  const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? null);
-  const hits = [];
-  const named = [
-    ['the fixture root', root],
-    ['the fixture root, resolved', fs.realpathSync(root)],
-    ['the temp directory', os.tmpdir()],
-    ['the home directory', os.homedir()],
-  ];
-  for (const [what, needle] of named) {
-    if (needle && needle !== '/' && text.includes(needle)) hits.push(`${what} (${needle})`);
-  }
-  // And the shape, anchored on a quote or a space so that a project-relative
-  // `src/pages/index.astro` -- which these refusals are expected to name -- is
-  // not mistaken for one.
-  for (const m of text.matchAll(/(?:^|["\s(])(\/(?:Users|home|var|private|tmp|opt|etc|Applications|Library)\/[^"\s)]{2,})/g)) {
-    hits.push(`an absolute path: ${m[1].slice(0, 80)}`);
-  }
-  return hits;
-}
 
 const ASSET = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>\n';
 const COLLIDER = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="2"/></svg>\n';
@@ -1050,20 +1022,54 @@ const UNCOALESCED = 900;
         check('  THE SHEET IT CREATED IS TAKEN AWAY AGAIN', !fs.existsSync(abs('made-up.css')), String(textAt('made-up.css')));
         check('  and the broken one is still put back', textAt('b.css') === 'BBB', String(textAt('b.css')));
 
-        // The third capture state, the one the sentinel exists for, and the one
-        // `writeAllOrNone` above is already asked about. "There was no file" and
-        // "I could not look" must not be the same answer here either: deleting
-        // on the second throws away bytes nobody asked to lose.
+        // The third capture state, the one the sentinel exists for — AND BOTH
+        // HALVES OF IT, which is what this used to ask only one of.
+        //
+        // "There was no file" and "I could not look" must not be the same
+        // answer: deleting on the second throws away bytes nobody asked to
+        // lose. That half was here. The other half is that a sheet whose old
+        // bytes could not be read must not be WRITTEN either — it is the one
+        // file the rollback can never repair, so writing it and putting every
+        // other file back around it leaves the project in neither the state
+        // before the change nor the state after it. `writeAllOrNone` in
+        // src/App.jsx is asked both, and its comment says "fix one and fix the
+        // other"; only one was fixed. Measured on the shipped panel before
+        // this, with the read of unreadable.css refused and the write of b.css
+        // refused: b.css came back to "BBB" and unreadable.css was left holding
+        // "U-NEW", its original bytes gone.
+        //
+        // THE UNREADABLE SHEET IS FIRST IN THE ENTRY ORDER, so the write really
+        // is attempted on it — an entry the loop never reaches would pass this
+        // for the wrong reason. And NOTHING ELSE BREAKS: the writer is armed
+        // for a file that is not in the set, so "nothing was written" is a
+        // decision the panel made and not a failure it ran into.
         seed({ 'unreadable.css': 'MINE', 'b.css': 'BBB' });
         threw = null;
         try {
-          await makePutFiles('b.css', { readThrowsFor: 'unreadable.css' })({ 'unreadable.css': 'U-NEW', 'b.css': 'B-NEW' });
+          await makePutFiles('nothing-breaks.css', { readThrowsFor: 'unreadable.css' })({ 'unreadable.css': 'U-NEW', 'b.css': 'B-NEW' });
         } catch (err) {
           threw = String(err?.message || err);
         }
-        check('the panel’s rollback, with a sheet that could not be READ at capture', /ENOSPC/.test(String(threw)), String(threw));
+        check('a sheet the panel could not READ at capture refuses the whole write', !!threw, 'it went through');
+        check('  naming the sheet it could not read', /unreadable\.css/.test(String(threw)), String(threw));
+        check('  and saying nothing was written', /nothing was written/i.test(String(threw)), String(threw));
+        check('  keeping the original error as the reason', /EACCES/.test(String(threw)), String(threw));
         check('  A SHEET IT COULD NOT READ IS NOT DELETED BY THE PANEL EITHER', fs.existsSync(abs('unreadable.css')), 'gone');
-        check('  and the broken one is put back all the same', textAt('b.css') === 'BBB', String(textAt('b.css')));
+        check('  NOR WRITTEN OVER BY THE PANEL EITHER', textAt('unreadable.css') === 'MINE', String(textAt('unreadable.css')));
+        check('  and the sheet it COULD have written is untouched', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        // The same refusal with the unreadable sheet SECOND: the capture pass
+        // covers the whole set before any of it is written, so the order the
+        // entries arrive in cannot decide whether a sheet moves.
+        seed({ 'a.css': 'AAA', 'unreadable.css': 'MINE' });
+        threw = null;
+        try {
+          await makePutFiles('nothing-breaks.css', { readThrowsFor: 'unreadable.css' })({ 'a.css': 'A-NEW', 'unreadable.css': 'U-NEW' });
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the same when the unreadable sheet is not the first entry', !!threw, 'it went through');
+        check('  and the sheet BEFORE it in the list never moved', textAt('a.css') === 'AAA', String(textAt('a.css')));
       }
 
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -1161,6 +1167,37 @@ const UNCOALESCED = 900;
         // project-relative `src/pages/index.astro` must not be mistaken for an
         // absolute path, so the rule cannot simply look for a leading slash.
         check(`  the oracle catches ${what}`, hostPathsIn({ restored: { failed: `open ${needle}/x.css` } }, root).length > 0, needle);
+      }
+
+      // AND IT CATCHES THEM HOWEVER THE MESSAGE QUOTES THEM.
+      //
+      // The four rows above all put a SPACE in front of the path, and the copy
+      // of the oracle that used to live in this file anchored only on a space,
+      // a double quote or an open paren. Node's fs errors use none of those —
+      // `EACCES: permission denied, open '/Users/…'` puts an APOSTROPHE there —
+      // so the one spelling that actually arrives was the one spelling the
+      // oracle could not see, and every absence assertion above passed on it.
+      // The path here is deliberately not under the fixture root, the temp
+      // directory or the home directory, so none of the four named needles can
+      // answer for the shape rule: this measures the shape rule alone.
+      for (const [how, message] of QUOTINGS) {
+        const elsewhere = '/Applications/Something.app/Contents';
+        check(
+          `  and catches a path written ${how}`,
+          hostPathsIn({ restored: { failed: message(elsewhere) } }, root).length > 0,
+          message(elsewhere)
+        );
+      }
+      // AND STILL DOES NOT CALL A PROJECT-RELATIVE FILE A LEAK, which is the
+      // property the anchoring exists for and the one a wider rule would lose:
+      // a "fix" that matched any slash turns every refusal this suite is built
+      // on into a false positive, and this is where that would show.
+      for (const relative of ['src/pages/index.astro', "EACCES: permission denied, open 'src/styles/one.css'"]) {
+        check(
+          `  and does not mistake ${relative.slice(0, 42)} for a host path`,
+          hostPathsIn({ restored: { failed: relative } }, root).length === 0,
+          relative
+        );
       }
 
       // ── THE SCRUBBER ITSELF, ON THE TWO SHAPES A WALK CAN GET WRONG ────────

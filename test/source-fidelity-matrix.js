@@ -3048,6 +3048,100 @@ function theRunTheReprintCollapsed() {
 }
 
 /**
+ * T14b -- a `remove` that emptied an element and wrote NOTHING to the file.
+ *
+ * `serializeNode`'s zero-children branch printed `node.source`, the element's
+ * inner as the file wrote it. That cache is set for two different elements: one
+ * authored empty across lines, and one holding an inline run written across
+ * lines. Only the first still has no children. Emptying the second -- removing
+ * its last child -- printed the run's own bytes back, so the child was still in
+ * the file afterwards and the operation reported success. A no-op write is
+ * worse than a refusal, because nothing downstream can tell it apart from a
+ * real one.
+ *
+ * TWO SHAPES, because the defect reaches the file by two roads. `wrapped` puts
+ * the child on its own line, so `cutNodeSplice` can lift it out and the anchored
+ * write is correct -- the leak is only in the whole-document reprint that is
+ * `anchoredSerialize`'s own fallback. `hugging` puts the run against the tags,
+ * which the cut refuses, so the reprint IS the write and the emptied `<p>` came
+ * back with both children intact. Both are asserted, so a fix that only moved
+ * the leak from one road to the other cannot pass.
+ *
+ * AND THE NARROWING IS ASSERTED TOO. The cache is what makes untouched markup
+ * travel byte for byte, so the third check writes an element that really was
+ * authored empty across lines and requires its blank line back out of the
+ * reprint. A "fix" that simply stopped reading the cache passes the first two
+ * checks and fails this one.
+ */
+function theElementAnEditEmptied() {
+  const label = '[emptied]';
+  const bodyOf = (text) => {
+    const hit = /<Base>\n([\s\S]*)<\/Base>\n$/.exec(text);
+    return hit ? hit[1] : null;
+  };
+  for (const shape of [
+    { id: 'wrapped', body: `  <p class='lead'>\n    <strong>Acme</strong>\n  </p>\n`, anchored: `  <p class='lead'>\n  </p>\n` },
+    { id: 'hugging', body: `  <p class='lead'>Hello\n    <strong>Acme</strong></p>\n`, anchored: `  <p class='lead'></p>\n` },
+  ]) {
+    const source = commentedPage(shape.body);
+    const parsed = parsePage(source);
+    if (!check(`${label} ${shape.id} parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const p = model.nodes[0].children.find((n) => n.name === 'p');
+    // PREMISE: the element really is one the parser cached as-written, and it
+    // really does hold the child the edit is about to take out. Without this a
+    // green below could be a fixture the defect never applied to.
+    if (
+      !check(
+        `${label} ${shape.id} the element carries an as-written cache of the run it holds`,
+        typeof p?.source === 'string' && p.source.includes('<strong>') && (p.children || []).length > 0,
+        short({ source: p?.source, children: (p?.children || []).map((n) => n.kind + (n.name ? `:${n.name}` : '')) })
+      )
+    ) {
+      continue;
+    }
+    p.children = [];
+
+    const canonical = serializePage(model);
+    check(
+      `${label} ${shape.id} the whole-document reprint does not put the removed child back`,
+      bodyOf(canonical) === `  <p class='lead'></p>\n`,
+      short({ got: bodyOf(canonical) })
+    );
+    const after = anchoredSerialize(source, model);
+    check(
+      `${label} ${shape.id} and neither does the write that lands on disk`,
+      after === commentedPage(shape.anchored),
+      short({ span: changedSpan(source, after) })
+    );
+    check(
+      `${label} ${shape.id} the removed child is gone from the file by every spelling`,
+      !after.includes('Acme') && !after.includes('<strong'),
+      short({ after })
+    );
+  }
+
+  // THE NARROWING. An element the author wrote empty across lines still comes
+  // back exactly as authored, blank line and all, through the same branch.
+  const held = `  <div class='slot'>\n\n  </div>\n  <p>x</p>\n`;
+  const parsedEmpty = parsePage(commentedPage(held));
+  if (check(`${label} a page with an element authored empty parses`, parsedEmpty.editable === true, short(parsedEmpty.reason))) {
+    const div = parsedEmpty.model.nodes[0].children.find((n) => n.name === 'div');
+    check(
+      `${label} an element authored empty across lines carries the cache`,
+      typeof div?.source === 'string' && div.source.includes('\n') && (div.children || []).length === 0,
+      short({ source: div?.source })
+    );
+    const reprint = serializePage(structuredClone(parsedEmpty.model));
+    check(
+      `${label} and it reprints byte for byte, its blank line included`,
+      bodyOf(reprint) === held,
+      short({ got: bodyOf(reprint) })
+    );
+  }
+}
+
+/**
  * T15 -- `replaceNodeSplice` reprinting a preserving element from the model.
  *
  * When the node whose span is replaced is ITSELF preserving, reprinting its
@@ -4309,6 +4403,7 @@ function theStampForAStylesheetHandedIn() {
   theLinkOutOfTheProject();
   theEntryThatIsNotAFile();
   theRunTheReprintCollapsed();
+  theElementAnEditEmptied();
   theReorderInsideAPre();
   theReorderOfBlockChildrenInsideAPre();
   theReorderThatAlsoAddsOrRemovesAChild();

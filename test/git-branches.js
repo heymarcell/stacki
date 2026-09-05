@@ -1307,6 +1307,159 @@ async function suite() {
   }
 
   {
+    // T16b — A BRANCH NAME GIT EXPANDS IS NOT THE BRANCH THAT WAS NAMED.
+    //
+    // The option guard asks `git check-ref-format --branch` whether a name is a
+    // name. That flag does not only VALIDATE — it also EXPANDS git's `@{-n}`
+    // previous-checkout syntax, so it answers "yes, and here is the OTHER
+    // branch you meant". Measured on the shipped file, on a repository sitting
+    // on `feature` after a checkout from `main`:
+    //
+    //   delete_branch "@{-1}" -> {ok:true}, and MAIN WAS GONE. The trunk guard
+    //     compared the caller's own string against 'main' and `@{-1}` is not
+    //     'main'; `git branch -d -- '@{-1}'` then expanded it and deleted the
+    //     trunk. `--` stops OPTION parsing, not REF resolution. With
+    //     `force:true` the same call is `-D`, which destroys commits on no
+    //     other branch and never asks the `unmerged` question at all.
+    //   switch "@{-1}" -> {ok:true, from:"main"} having moved to a branch the
+    //     caller never named.
+    //   merge "@{-1}" -> {ok:true, into:"main", changed:true}, with another
+    //     branch's commits on main and the envelope naming `@{-1}` as what it
+    //     had merged.
+    //
+    // AND THE OTHER SPELLING THAT MEANT ANOTHER BRANCH: on a case-insensitive
+    // filesystem — the macOS default — `git branch -d -- MAIN` printed "Deleted
+    // branch MAIN" and main was gone, one keystroke past the same guard.
+    //
+    // The oracles are the repository, not the answer.
+    const on = async (name) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      await sh(dir, 'checkout', '-qb', 'feature');
+      await commitOn(dir, 'feature', 'b.txt', 'work\n');
+      // main -> feature by an ordinary checkout, so `@{-1}` has something to
+      // expand to. Without this git would refuse it for want of a reflog and
+      // the test would pass on the wrong reason.
+      await sh(dir, 'checkout', '-q', 'main');
+      await sh(dir, 'checkout', '-q', 'feature');
+      return dir;
+    };
+
+    {
+      const dir = await on('expand-delete');
+      const before = await repoState(dir);
+      const answer = await caught(() => deleteBranch(git, { projectPath: dir, branch: '@{-1}' }));
+      check('T16b delete "@{-1}" is refused', answer.value === null && /not a name git will accept/.test(String(answer.error)), JSON.stringify(answer));
+      check(
+        'T16b delete "@{-1}": THE TRUNK IS STILL THERE',
+        (await sh(dir, 'branch', '--format=%(refname:short)')).split('\n').sort().join(',') === 'feature,main',
+        await sh(dir, 'branch', '--format=%(refname:short)')
+      );
+      check('T16b delete "@{-1}": HEAD did not move', (await repoState(dir)).head === before.head);
+      // Forcing is the same call with `-D` behind it, and `-D` is the one that
+      // takes commits nothing else holds.
+      const forced = await caught(() => deleteBranch(git, { projectPath: dir, branch: '@{-1}', force: true }));
+      check('T16b delete "@{-1}" with force is refused too', forced.value === null && !!forced.error, JSON.stringify(forced));
+      check(
+        'T16b delete "@{-1}" with force: the trunk is still there',
+        (await sh(dir, 'branch', '--format=%(refname:short)')).includes('main')
+      );
+      check(
+        'T16b delete "@{-1}": the refusal carries no filesystem path',
+        !/\/(Users|home|var|private|tmp)\//.test(String(answer.error)),
+        String(answer.error)
+      );
+    }
+
+    {
+      // THE SAME SPELLING THROUGH THE OTHER TWO DOORS.
+      const dir = await on('expand-switch');
+      const answer = await switchBranch(git, { projectPath: dir, branch: '@{-1}' });
+      check('T16b switch "@{-1}" is refused', answer?.ok === false && answer?.code === 'bad_branch_name', JSON.stringify(answer));
+      check(
+        'T16b switch "@{-1}": still on the branch it was on',
+        (await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')) === 'feature',
+        await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')
+      );
+
+      const merging = await repo('expand-merge');
+      cleanup.push(merging);
+      await sh(merging, 'checkout', '-qb', 'feature');
+      await commitOn(merging, 'feature', 'b.txt', 'work\n');
+      await sh(merging, 'checkout', '-q', 'main');
+      const before = await repoState(merging);
+      const merged = await mergeBranch(git, { projectPath: merging, branch: '@{-1}' });
+      await refusedCleanly('T16b merge "@{-1}"', merged, merging, before, 'bad_branch_name', (a) => a.branch === '@{-1}');
+      check(
+        'T16b merge "@{-1}": the other branch\'s work did not arrive',
+        !fs.existsSync(path.join(merging, 'b.txt'))
+      );
+    }
+
+    {
+      // THE TRUNK UNDER A SPELLING THAT IS NOT ITS OWN. On a case-insensitive
+      // filesystem this is main; on a case-sensitive one it is a branch that
+      // does not exist. Either way it must not delete the trunk, and the
+      // refusal must be the trunk's own rather than git's "not found".
+      const dir = await on('expand-case');
+      const answer = await caught(() => deleteBranch(git, { projectPath: dir, branch: 'MAIN' }));
+      check('T16b delete "MAIN" is refused', answer.value === null && !!answer.error, JSON.stringify(answer));
+      check('T16b delete "MAIN": as the trunk refusal', /comes back to|main line/i.test(String(answer.error)), String(answer.error));
+      check('T16b delete "MAIN": main is still there', (await sh(dir, 'branch', '--format=%(refname:short)')).includes('main'));
+
+      // AND THE TWO SPELLINGS THAT WERE ALWAYS REFUSED GO ON BEING REFUSED —
+      // as the TRUNK now, rather than by git a moment later as "branch
+      // 'refs/heads/main' not found", which is true of the spelling and reads
+      // as a claim about the branch. Both resolve to main, so both are asked
+      // the question main is asked.
+      for (const spelling of ['refs/heads/main', 'heads/main']) {
+        const said = await caught(() => deleteBranch(git, { projectPath: dir, branch: spelling }));
+        check(`T16b delete "${spelling}" is refused`, said.value === null && !!said.error, JSON.stringify(said));
+        check(
+          `T16b delete "${spelling}": as the trunk refusal, not as a name git never heard of`,
+          /comes back to|main line/i.test(String(said.error)),
+          String(said.error)
+        );
+        check(
+          `T16b delete "${spelling}": main is still there`,
+          (await sh(dir, 'branch', '--format=%(refname:short)')).includes('main')
+        );
+      }
+
+      // AN ALIAS FOR AN ORDINARY BRANCH IS REFUSED TOO, and the refusal names
+      // the branch git would have reached. The envelope this feeds reports the
+      // caller's own argument as the branch that went, so a spelling that means
+      // something else cannot be allowed to succeed however harmless the branch
+      // behind it is.
+      await sh(dir, 'branch', 'aliased');
+      const alias = await caught(() => deleteBranch(git, { projectPath: dir, branch: 'refs/heads/aliased' }));
+      check('T16b delete "refs/heads/aliased" is refused', alias.value === null && !!alias.error, JSON.stringify(alias));
+      check('T16b delete "refs/heads/aliased": naming the branch git would have reached', /"aliased"/.test(String(alias.error)), String(alias.error));
+      check('T16b delete "refs/heads/aliased": and saying to ask for it by that name', /own name/i.test(String(alias.error)), String(alias.error));
+      check('T16b delete "refs/heads/aliased": the branch is still there', (await sh(dir, 'branch', '--format=%(refname:short)')).includes('aliased'));
+
+      // `@` is git's shorthand for HEAD, which is the branch you are standing
+      // on — so this is the "you are on it" refusal, arrived at through a
+      // spelling that does not look like the branch's name at all. Git's own
+      // answer is "branch '@' not found".
+      const atHead = await caught(() => deleteBranch(git, { projectPath: dir, branch: '@' }));
+      check('T16b delete "@" is refused', atHead.value === null && !!atHead.error, JSON.stringify(atHead));
+      check('T16b delete "@": as the branch you are on', /branch you are on/i.test(String(atHead.error)), String(atHead.error));
+      check('T16b delete "@": and feature is still there', (await sh(dir, 'branch', '--format=%(refname:short)')).includes('feature'));
+
+      // AND THE CONTROL: a branch named by itself still goes, and the answer
+      // says which one went. The envelope this feeds
+      // (electron/mcp/agent/domains.js) reports the caller's own argument, so
+      // "the name means itself" is what makes that report true.
+      await sh(dir, 'branch', 'spare');
+      const went = await deleteBranch(git, { projectPath: dir, branch: 'spare' });
+      check('T16b control: an ordinary branch still deletes', went.ok === true, JSON.stringify(went));
+      check('T16b control: and the answer names the branch that went', went.deleted === 'spare', JSON.stringify(went));
+      check('T16b control: and it really is gone', !(await sh(dir, 'branch', '--format=%(refname:short)')).includes('spare'));
+    }
+  }
+
+  {
     // T17 — A PROJECT INSIDE ITS REPOSITORY.
     //
     // The ordinary monorepo layout: the repository is at <root> and the project

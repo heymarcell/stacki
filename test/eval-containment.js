@@ -36,6 +36,18 @@ const { execFileSync } = require('node:child_process');
 const { containedEnv, runHost, CREDENTIAL_VARS } = require('../scripts/eval/heldout/host.js');
 const { hostRan, isolationVerdict } = require('../scripts/eval/heldout/run.js');
 const { startPackagedApp } = require('./support/packagedApp.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+const { makeFakeGh } = require('./support/fakeGh.js');
+
+// A HANG MUST NOT REPORT A PASS, AND THIS SUITE IS ALL AWAITS.
+//
+// It spawns a packaged app and a host process; node exits 0 on an empty event
+// loop, so a spawn that never settles would print nothing after the last line
+// it reached and the runner would record a pass — of a containment proof that
+// had not made a single check. This file is NEW on this branch and was added to
+// `npm test` in the same change that introduced the guard for exactly that
+// failure, and it did not have one. See test/support/suiteGuard.js.
+const suiteDone = guardSuite('eval-containment');
 
 const failures = [];
 let checked = 0;
@@ -503,12 +515,87 @@ const sentinel = (name) => `sentinel-value-for-${name}`;
   // before: `cleanup()` lived only on the success path, so a containment that
   // declined to launch left its fake `gh` and its GH_CONFIG_DIR in os.tmpdir()
   // every time.
+  // --- THE LOG THAT IS THE CONTAINMENT EVIDENCE, AND HOW IT LOST A CALL.
+  //
+  // `ghCallsDuringTrial` is what this harness offers as proof that a trial did
+  // not reach GitHub. It comes from the fake `gh`, which recorded each
+  // invocation by shelling out to `node`. On any PATH where `node` does not
+  // resolve — a packaged app launched from Finder, a host with a trimmed
+  // environment, the deliberately-empty PATH the section above spawns with —
+  // the command substitution came back empty, `printf` appended a bare
+  // newline, and the reader's `.filter(Boolean)` threw the line away. The fake
+  // still answered the caller correctly, so nothing failed anywhere: the fake
+  // was fail-closed and the LOG was silently short. Evidence with a silent gap
+  // in it is not evidence.
+  //
+  // So the recorder is asked the question under the condition that broke it.
+  {
+    const fake = makeFakeGh();
+    try {
+      // PREMISE: this environment really has no `node`, so a recorder that
+      // needs one really cannot work here. Without this the checks below could
+      // be passing on a PATH that happened to carry node after all.
+      const bare = { PATH: path.join(fake.dir, 'nothing-lives-here') };
+      let nodeSeen = null;
+      try {
+        nodeSeen = execFileSync('/bin/sh', ['-c', 'command -v node'], { env: bare, encoding: 'utf8' }).trim();
+      } catch {
+        nodeSeen = null;
+      }
+      check('the environment the fake gh is invoked in has no node at all', !nodeSeen, short(nodeSeen));
+
+      // stderr is CAPTURED rather than inherited: most of these invocations are
+      // meant to be refused, and letting the fake's refusals through would put
+      // alarming lines in a passing run's output.
+      const run = (args) => {
+        const opts = { env: bare, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+        try {
+          return { code: 0, out: execFileSync(fake.bin, args, opts), err: '' };
+        } catch (err) {
+          return { code: err.status ?? null, out: String(err.stdout || ''), err: String(err.stderr || '') };
+        }
+      };
+      const asked = [['--version'], ['auth', 'status'], ['repo', 'create', 'a name with spaces', '--private'], []];
+      for (const args of asked) run(args);
+
+      const seen = fake.calls();
+      check('  every gh invocation is recorded there anyway', seen.length === asked.length, short({ want: asked.length, got: seen.length }));
+      check('  in the order they were made, argument for argument', JSON.stringify(seen) === JSON.stringify(asked), short(seen));
+
+      // AND A CALL THAT CANNOT BE RECORDED IS LOUD. The log path is replaced
+      // by a directory, which is the simplest way to make the append fail for
+      // real; a fake that answered anyway would be handing back the very
+      // "well, it probably didn't call GitHub" this module refuses to say.
+      fs.rmSync(fake.log, { force: true });
+      fs.mkdirSync(fake.log);
+      const blocked = run(['--version']);
+      check('a gh that cannot record itself refuses to answer', blocked.code !== 0 && !/gh version/.test(blocked.out), short(blocked));
+      check('  and says so where a runner will see it', /could not record/i.test(blocked.err), short(blocked.err));
+      fs.rmSync(fake.log, { recursive: true, force: true });
+
+      // AND THE READER REFUSES A LOG IT CANNOT READ WHOLE, rather than
+      // returning the part it could — which is what the old `.filter(Boolean)`
+      // did, and is how a missing record became invisible in the first place.
+      fs.writeFileSync(fake.log, '2\0only-one-argument\0');
+      let threw = null;
+      try {
+        fake.calls();
+      } catch (err) {
+        threw = String(err.message || err);
+      }
+      check('a truncated log is an error, not a shorter answer', threw !== null && /does not carry|mid-record/.test(threw), short(threw));
+    } finally {
+      fake.cleanup();
+    }
+  }
+
   {
     const after = tmpResidue();
     const left = after.filter((n) => !tmpBefore.includes(n));
     check('nothing this file created is left in os.tmpdir()', left.length === 0, short(left));
   }
 
+  suiteDone();
   if (failures.length) {
     console.error(`eval-containment: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
@@ -517,6 +604,7 @@ const sentinel = (name) => `sentinel-value-for-${name}`;
     `eval-containment: ${checked} passed  [GitHub credentials and credential-shaped names are gone, the host's own logins and the trial's own token survive, gh is the fake, and a host that never starts is not graded]`
   );
 })().catch((err) => {
+  suiteDone();
   console.error('eval-containment: threw\n', err?.stack || err);
   process.exit(1);
 });

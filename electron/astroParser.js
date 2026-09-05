@@ -3658,7 +3658,27 @@ function serializeNode(node, indent, lines, step = '  ') {
         return;
       }
       if (node.children.length === 0) {
-        openTag(`>${node.source ? reindentRun(node.source, indent) : ''}${closeTag}`);
+        // AN EMPTIED ELEMENT WAS PRINTED FROM THE CACHE OF WHAT IT USED TO HOLD.
+        //
+        // `source` is set at parse time for two different elements: one written
+        // empty across lines (`<div>\n\n</div>`, whose blank line is nowhere
+        // else in the tree), and one holding an inline run written across lines
+        // (`<p>\n  <strong>Acme</strong>\n</p>`, whose line breaks are nowhere
+        // else either). Only the first still has no children. When an edit
+        // emptied the second — a `remove` of its only child — this branch
+        // printed the run's own bytes back, so the removed node stayed in the
+        // file and the operation reported success. A no-op write is worse than
+        // a refusal: nothing downstream can tell it apart from a real one.
+        //
+        // Whitespace is the whole difference, and it is exact rather than a
+        // heuristic: an element parsed with zero children had whitespace-only
+        // inner, because any text, comment, tag or expression in there would
+        // have become a child. So a cache with anything else in it describes
+        // children this element no longer has, and is not its to print. An
+        // untouched empty element still comes back byte-for-byte — its blank
+        // lines included — which is what this cache is for.
+        const asWritten = node.source && /^\s*$/.test(node.source) ? node.source : '';
+        openTag(`>${asWritten ? reindentRun(asWritten, indent) : ''}${closeTag}`);
         return;
       }
       openTag('>');

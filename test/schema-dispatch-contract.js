@@ -57,6 +57,14 @@ const { createContextStore } = require('../electron/mcp/contextStore.js');
 const { createCapture } = require('../electron/mcp/capture.js');
 const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 const { startWireRig } = require('./support/mcpWireRig.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite drives a real MCP wire and awaits a
+// reply for every operation in the registry; a server that stops answering one
+// of them leaves an await nobody settles, and node exits 0 on an empty event
+// loop — so the run would print nothing after the last operation it reached and
+// be recorded as a pass of the whole contract. See test/support/suiteGuard.js.
+const suiteDone = guardSuite('schema-dispatch-contract');
 
 const failures = [];
 let checked = 0;
@@ -600,12 +608,14 @@ function productToolNames() {
   // Cleanup failure is test failure.
   check('the rig left nothing behind', problems.length === 0, problems.join('; '));
 
+  suiteDone();
   if (failures.length) {
     console.error(`schema-dispatch-contract: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`schema-dispatch-contract: ${checked} passed  [${OPERATIONS.length} operations: schema, registry, dispatch and the shape of every refusal]`);
 })().catch((err) => {
+  suiteDone();
   // WHAT HAD ALREADY FAILED, BEFORE WHATEVER THREW.
   //
   // A wire that stops publishing a tool fails the surface check at the top and

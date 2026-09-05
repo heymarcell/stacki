@@ -46,6 +46,13 @@ const { thrownFailure } = require('../electron/mcp/agent/domains.js');
 // reads. Held directly at the end of this file, for the shapes no fixture here
 // provokes — see THE COMPOSER, HANDED THE ISSUE SHAPES NO FIXTURE PROVOKES.
 const { badToolArguments } = require('../electron/mcp/agentTools.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite starts a real app and awaits real
+// IPC for every cause it provokes; node exits 0 on an empty event loop, so an
+// await that never settles prints nothing after the last line it reached and is
+// recorded as success. See test/support/suiteGuard.js.
+const suiteDone = guardSuite('named-causes');
 
 const failures = [];
 let checked = 0;
@@ -499,12 +506,14 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
   }
   check('the fixture is gone', !fs.existsSync(root), root);
 
+  suiteDone();
   if (failures.length) {
     console.error(`named-causes: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`named-causes: ${checked} passed  [a cause the code knows the name of is answered by name]`);
 })().catch((err) => {
+  suiteDone();
   console.error('named-causes: threw\n', err?.stack || err);
   process.exit(1);
 });
