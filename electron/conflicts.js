@@ -239,8 +239,11 @@ const END = /^>>>>>>> ?(.*)$/;
  * A conflicted file as a list of parts.
  *
  * Each part is either `{ kind: 'same', text }` — agreed text — or
- * `{ kind: 'clash', ours, theirs }`, one disagreement. Joining the `same`
- * parts with a chosen side of each `clash` rebuilds the file.
+ * `{ kind: 'clash', ours, theirs, oursLines, theirsLines }`, one disagreement.
+ * Joining the `same` parts with a chosen side of each `clash` rebuilds the
+ * file; the two counts are how many LINES each side has, which its text cannot
+ * be asked once a side of no lines and a side of one blank line are both the
+ * empty string. See `sideLines`.
  *
  * A file with no markers comes back as a single `same` part, which is the
  * honest answer: there is nothing to choose.
@@ -319,6 +322,12 @@ function parseConflict(text) {
         kind: 'clash',
         ours: run.ours.join('\n'),
         theirs: run.theirs.join('\n'),
+        // HOW MANY LINES EACH SIDE HAS, WHICH THE TEXT ITSELF CANNOT SAY. See
+        // `sideLines`: a side that was DELETED and a side that is one BLANK
+        // line are the same empty string, and rebuilding the two has to produce
+        // different files.
+        oursLines: run.ours.length,
+        theirsLines: run.theirs.length,
         changedBy: run.changedBy || 'both',
       };
       // Both sides touched these lines — but perhaps not the same part of
@@ -363,6 +372,28 @@ function conflictAtEnd(parts) {
 }
 
 /**
+ * How many LINES a side of a clash has, which its text cannot be asked.
+ *
+ * ONE BLANK LINE AND NO LINES AT ALL ARE THE SAME EMPTY STRING. Measured with
+ * real git from the ancestor "a\nX\nz\n": a branch that DELETED X and a branch
+ * that replaced X with a BLANK line both parse to `{ours: '', theirs: 'C'}`,
+ * byte for byte — and rebuilding them has to produce different files, "a\nz\n"
+ * for the deletion and "a\n\nz\n" for the blank line. Joining the parts cannot
+ * decide between them from the string, so `parseConflict` records the count and
+ * everything that has to know asks here.
+ *
+ * A part built by hand carries no count, and the empty string is then read as
+ * no lines at all: that is the shape git writes far more often — one branch
+ * deleting what the other changed — and it is already the reading the rest of
+ * this file takes.
+ */
+const sideLines = (part, side) => {
+  const counted = part?.[side === 'theirs' ? 'theirsLines' : 'oursLines'];
+  if (Number.isInteger(counted)) return counted;
+  return part?.[side] === '' ? 0 : 1;
+};
+
+/**
  * Put the file back together, given one answer per disagreement.
  *
  * `picks` is an array in the order the clashes appear: `'ours'`, `'theirs'`,
@@ -382,24 +413,58 @@ function conflictAtEnd(parts) {
  */
 function renderResolved(parts, picks = [], sides = null) {
   let n = -1;
-  const text = (parts || [])
-    .map((part) => {
-      if (part.kind === 'same') return part.text;
-      n++;
-      const pick = picks[n];
-      // Both edits, combined — only offered where they were found not to
-      // overlap, so this is the two changes and not a duplication.
-      if (pick === 'merged' && part.merged != null) return part.merged;
-      if (pick === 'theirs') return part.theirs;
+  // A CHOSEN SIDE WITH NO LINES IN IT USED TO BECOME A BLANK LINE.
+  //
+  // The parts are runs of LINES and the join puts a newline between them, so a
+  // hunk that contributes nothing still got a separator on each side of it and
+  // the rebuilt file gained an empty line NEITHER BRANCH HAD. That is the
+  // ordinary shape of one branch deleting lines the other modified, and it was
+  // written, staged and committed as `{ok: true, changed: true, resolved: 1}`.
+  // MEASURED with real git — base "a\nX\nz\n", ours "a\nz\n", theirs
+  // "a\nC\nz\n", answered `['ours']` — the commit read "a\n\nz\n" against an
+  // `ours` that simply had nothing there.
+  //
+  // So a run of no lines is dropped from the join rather than joined as an
+  // empty one, which removes exactly one separator with it. `both` is asked the
+  // same way and keeps its newline between two sides that BOTH have lines.
+  const chunks = [];
+  for (const part of parts || []) {
+    if (part.kind === 'same') {
+      chunks.push(part.text);
+      continue;
+    }
+    n++;
+    const pick = picks[n];
+    let piece;
+    let lines;
+    // Both edits, combined — only offered where they were found not to
+    // overlap, so this is the two changes and not a duplication.
+    if (pick === 'merged' && part.merged != null) {
+      piece = part.merged;
+      // A combined version is text rather than a list of lines, so there is no
+      // count to read: empty is nothing, the same reading the terminator below
+      // has always taken of it.
+      lines = piece === '' ? 0 : 1;
+    } else if (pick === 'theirs') {
+      piece = part.theirs;
+      lines = sideLines(part, 'theirs');
+    } else if (pick === 'both') {
       // Both sides, in the order they appear in the file. A heading changed on
       // two branches is usually one or the other; a list that gained an item on
-      // each is usually both.
-      if (pick === 'both') {
-        return [part.ours, part.theirs].filter((s) => s !== '').join('\n');
-      }
-      return part.ours;
-    })
-    .join('\n');
+      // each is usually both. A side with no lines is not one of them — and
+      // this asks the count rather than the string, so a side that IS one blank
+      // line is kept.
+      const kept = ['ours', 'theirs'].filter((side) => sideLines(part, side) > 0);
+      piece = kept.map((side) => part[side]).join('\n');
+      lines = kept.length;
+    } else {
+      piece = part.ours;
+      lines = sideLines(part, 'ours');
+    }
+    if (lines === 0) continue;
+    chunks.push(piece);
+  }
+  const text = chunks.join('\n');
   if (!sides || typeof sides !== 'object' || !conflictAtEnd(parts) || !text.endsWith('\n')) return text;
   // WHOSE LAST LINE THIS NOW IS — READ OFF THE TEXT, NOT OFF THE WORD.
   //
@@ -420,7 +485,9 @@ function renderResolved(parts, picks = [], sides = null) {
   const pick = picks[clashCount(parts) - 1];
   let endsOn = 'ours';
   if (pick === 'theirs') endsOn = 'theirs';
-  else if (pick === 'both') endsOn = last?.theirs !== '' ? 'theirs' : last?.ours !== '' ? 'ours' : null;
+  // Asked by line count, the same question the `both` render above asks, so
+  // the side the terminator is read off is the side that actually got written.
+  else if (pick === 'both') endsOn = sideLines(last, 'theirs') > 0 ? 'theirs' : sideLines(last, 'ours') > 0 ? 'ours' : null;
   else if (pick === 'merged' && last?.merged != null) {
     if (last.merged === '') endsOn = null;
     else if (last.theirs !== '' && last.merged.endsWith(last.theirs)) endsOn = 'theirs';

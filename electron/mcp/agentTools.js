@@ -186,6 +186,11 @@ const MoveTarget = z
  * closed tree asking each node what it used to be, rather than needing a handle
  * on an open tree nobody exports.
  *
+ * The original in every row is a schema this file never rebuilt, and that is a
+ * property `closeField` has to maintain rather than one that comes for free:
+ * see the note there on closing a closed schema twice, which for a while left
+ * thirty rows pointing at a rebuild instead of at an open tree.
+ *
  * Read by test/schema-strictness.js, which converts both halves of every pair
  * to JSON Schema and requires every keyword to be identical bar the fence. That
  * grades the MECHANISM rather than the six fields this defect happened to hurt,
@@ -272,6 +277,26 @@ function closeShape(shape) {
 function closeField(field) {
   const def = field?.def;
   if (!def) return field;
+  // CLOSING A CLOSED SCHEMA A SECOND TIME BLINDED THE CHECK THAT GRADES THE
+  // REBUILD.
+  //
+  // `Operation` is closed at declaration and then embedded in `target.edit`, so
+  // walking into `operations` found a discriminated union and rebuilt it again.
+  // The second generation was identical in what it accepts — but its
+  // OPEN_SOURCE entry pointed at the FIRST generation, which is itself a
+  // rebuild, and the genuinely open union was then reachable from neither half
+  // of any pair. Measured: 30 of the 197 pairs test/schema-strictness.js grades
+  // — the `Operation` union, its thirteen branches, the node specs, their
+  // props record and the move target — compared one rebuild against another, so
+  // a keyword lost by the FIRST close was invisible to the one assertion whose
+  // whole purpose is to notice a keyword going missing that nobody predicted.
+  //
+  // A node this file has already rebuilt is already closed, all the way down,
+  // so handing it straight back is both correct and one generation cheaper. The
+  // wrapper around it then sees `closedInner === inner` and keeps its own
+  // identity too, which is why the array of operations stops being rebuilt at
+  // all: there is nothing left in it to close.
+  if (OPEN_SOURCE.has(field)) return field;
   if (def.type === 'object') return carried(closeShape(field.shape), field);
   // A UNION OF SHAPES IS STILL SHAPES. `audit`'s `viewports` takes either a
   // named string or a `{width, height}` object, and the object half was the

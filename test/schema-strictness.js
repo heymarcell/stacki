@@ -938,13 +938,20 @@ const declaredDefaults = (json) => {
       });
     }
 
-    // NAMED HERE BECAUSE IT IS A DECISION. 197 is every node the rebuild
+    // NAMED HERE BECAUSE IT IS A DECISION. 196 is every node the rebuild
     // replaced across the fourteen tools — the eight domain unions and their
     // branches, the nested `Operation` union and its thirteen, every nested
     // object, record and bounded array, and the six tools closed at
     // registration. If it moves, somebody changed the shape of the surface or
     // the reach of the rebuild, and either should have to be written down.
-    check('the rebuild replaced 197 nodes on the published surface, and each remembers its original', pairs.length === 197, `${pairs.length} rebuilt nodes`);
+    //
+    // It was 197 while `Operation` was closed TWICE — once at declaration and
+    // again on the way into `target.edit.operations` — because the array around
+    // it was rebuilt to hold the second generation. `closeField` now hands back
+    // a schema it has already closed, so the array keeps its own identity and
+    // there is one fewer rebuilt node. Nothing a client is shown changed:
+    // measured, the fourteen published documents are byte-identical either way.
+    check('the rebuild replaced 196 nodes on the published surface, and each remembers its original', pairs.length === 196, `${pairs.length} rebuilt nodes`);
     check(
       '  including the eight domain unions themselves',
       ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((n) => pairs.some((p) => p.at === n)),
@@ -954,6 +961,32 @@ const declaredDefaults = (json) => {
       '  and audit’s schema, which is closed at registration rather than at declaration',
       pairs.some((p) => p.at === 'audit'),
       'audit was registered without being closed'
+    );
+
+    // AND EVERY PAIR HAS TO HAVE AN OPEN HALF THAT IS ACTUALLY OPEN.
+    //
+    // The comparison below grades a rebuild against the schema it was built
+    // from. If that schema is ITSELF something this rebuild produced, the pair
+    // compares one generation against the next and agrees with itself: whatever
+    // the first close lost, the second close lost too, so the difference is
+    // zero and the loss is invisible. That is not a hypothetical — it is where
+    // `Operation` sat. Closed at declaration and closed again inside
+    // `target.edit.operations`, its thirty nodes were graded generation-2
+    // against generation-1, and the union nobody had touched was reachable from
+    // neither half of any pair, in the very block whose header calls it the
+    // only assertion that would have caught twelve bounds being deleted.
+    //
+    // MEASURED with a bound deleted by the FIRST close of `Operation` (the
+    // `set_classes` branch's `classes` array, `.max(80)` dropped in `closed()`):
+    // before the fix the comparison below stayed GREEN and only the hard-coded
+    // totals moved; after it, it reports
+    // `target|4.operations.<element>.oneOf.3.properties.classes.maxItems: the
+    // rebuild LOST 80`.
+    const shadowed = pairs.filter((p) => A.openSourceOf(p.open));
+    check(
+      '  and every pair’s open half is a schema the rebuild never touched, so the comparison below is not grading a rebuild against a rebuild',
+      shadowed.length === 0,
+      `${shadowed.length} of ${pairs.length} pairs have an open half this file rebuilt: ${shadowed.slice(0, 6).map((p) => p.at).join(', ')}`
     );
 
     /** Every keyword difference between the two documents, position by position. */
@@ -1016,10 +1049,18 @@ const declaredDefaults = (json) => {
     // nothing" is exactly the state the defect left behind. So the fences the
     // comparison forgave and the bounds it compared are both counted, over the
     // same walk, and both are numbers that go down when a keyword is lost.
+    //
+    // The totals are per PAIR rather than per position, so a nested tree is
+    // counted once for itself and once again inside every rebuilt ancestor.
+    // They fell from 1,122 and 432 when `Operation` stopped being closed a
+    // second time: the array around it is no longer a rebuilt node, and with it
+    // went one whole extra count of the union's own thirty. Nothing was
+    // dropped from the surface — the published documents are byte-identical —
+    // and every one of those keywords is still counted, once, under the union.
     check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
     check(
-      '  and compared real constraints: 1,122 bound keywords across the rebuilt nodes',
-      bounds === 1122,
+      '  and compared real constraints: 1,091 bound keywords across the rebuilt nodes',
+      bounds === 1091,
       `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
     );
 
@@ -1049,7 +1090,7 @@ const declaredDefaults = (json) => {
       for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
     }
     check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
-    check('  and the tally walked something: 1,108 checks across the rebuilt nodes', checksSeen === 1108, `${checksSeen} checks`);
+    check('  and the tally walked something: 1,076 checks across the rebuilt nodes', checksSeen === 1076, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────

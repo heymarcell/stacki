@@ -138,8 +138,92 @@ const conflicted = [
   check('a one-sided change is still a choice', clashCount(addedParts) === 1);
   check('taking theirs adds the block', renderResolved(addedParts, ['theirs']) === 'a\nnew from them\nb', JSON.stringify(renderResolved(addedParts, ['theirs'])));
   // The empty side must not leave a blank line behind where nothing was.
-  check('taking ours leaves nothing behind', renderResolved(addedParts, ['ours']) === 'a\n\nb', JSON.stringify(renderResolved(addedParts, ['ours'])));
+  //
+  // THIS ASSERTION USED TO DEMAND THE DEFECT. It read `=== 'a\n\nb'` under a
+  // sentence saying a blank line must not be left behind, so the one check
+  // pointed at this failure was pinning it in place: the parts are runs of
+  // LINES and the join puts a newline between them, so a side with no lines in
+  // it still collected a separator on each side and the rebuilt file gained an
+  // empty line neither branch wrote.
+  check('taking ours leaves nothing behind', renderResolved(addedParts, ['ours']) === 'a\nb', JSON.stringify(renderResolved(addedParts, ['ours'])));
   check('both is just the one that exists', renderResolved(addedParts, ['both']) === 'a\nnew from them\nb', JSON.stringify(renderResolved(addedParts, ['both'])));
+}
+
+// --- No lines at all, against one blank line --------------------------------
+//
+// THE TWO SHAPES A JOIN CANNOT TELL APART, and the reason `parseConflict`
+// counts lines rather than letting the render ask whether a string is empty.
+//
+// Both of these were produced by REAL git from the ancestor "a\nX\nz\n" with
+// merge.conflictStyle=diff3 — one branch DELETING X, the other REPLACING it
+// with a blank line, both merged against a branch that changed X to "C". The
+// two conflicted files differ by one byte, the clash objects they parse to are
+// identical, and the file each one has to rebuild for `ours` differs by a line.
+{
+  const deleted = ['a', '<<<<<<< HEAD', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', 'z', ''].join('\n');
+  const blank = ['a', '<<<<<<< HEAD', '', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', 'z', ''].join('\n');
+  const deletedParts = parseConflict(deleted);
+  const blankParts = parseConflict(blank);
+
+  const clashOf = (parts) => parts.find((p) => p.kind === 'clash');
+  check(
+    'the deleted side and the blank-line side read as the same text',
+    clashOf(deletedParts).ours === '' && clashOf(blankParts).ours === '',
+    JSON.stringify([clashOf(deletedParts).ours, clashOf(blankParts).ours])
+  );
+  check(
+    '  and are told apart only by the line count the parse records',
+    clashOf(deletedParts).oursLines === 0 && clashOf(blankParts).oursLines === 1,
+    JSON.stringify([clashOf(deletedParts).oursLines, clashOf(blankParts).oursLines])
+  );
+
+  // The two files ours actually has. Neither is a guess: they are what the
+  // branch that produced each conflict has on disk.
+  check(
+    'a side that deleted the line rebuilds to the file it deleted it from',
+    renderResolved(deletedParts, ['ours']) === 'a\nz\n',
+    JSON.stringify(renderResolved(deletedParts, ['ours']))
+  );
+  check(
+    'and a side that is one blank line keeps the blank line',
+    renderResolved(blankParts, ['ours']) === 'a\n\nz\n',
+    JSON.stringify(renderResolved(blankParts, ['ours']))
+  );
+  // `both` has the same question to answer and must answer it the same way,
+  // or the two readings disagree about what a side is.
+  check(
+    'keeping both sides skips the one that has nothing',
+    renderResolved(deletedParts, ['both']) === 'a\nC\nz\n',
+    JSON.stringify(renderResolved(deletedParts, ['both']))
+  );
+  check(
+    'and keeps a blank line that is genuinely there',
+    renderResolved(blankParts, ['both']) === 'a\n\nC\nz\n',
+    JSON.stringify(renderResolved(blankParts, ['both']))
+  );
+  check(
+    'taking the other side is untouched by any of it',
+    renderResolved(deletedParts, ['theirs']) === 'a\nC\nz\n' && renderResolved(blankParts, ['theirs']) === 'a\nC\nz\n',
+    JSON.stringify([renderResolved(deletedParts, ['theirs']), renderResolved(blankParts, ['theirs'])])
+  );
+
+  // AND THE ONE PLACE THE EMPTY SIDE ALREADY MATTERED, asked at the end of the
+  // file where the terminator is git's invention. The two readings must not
+  // fight: the side the terminator is read off has to be the side that was
+  // actually written, and with `ours` contributing nothing that is what the
+  // whole `ours` file says, terminator and all.
+  const atEnd = parseConflict(['a', '<<<<<<< HEAD', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', ''].join('\n'));
+  check('a conflict at the end with an empty side is still one', conflictAtEnd(atEnd) === true, JSON.stringify(atEnd));
+  check(
+    'an ours that ends there and has no terminator does not gain one',
+    renderResolved(atEnd, ['ours'], { ours: 'a', theirs: 'a\nC\n' }) === 'a',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a', theirs: 'a\nC\n' }))
+  );
+  check(
+    '  and one that has a terminator keeps exactly one',
+    renderResolved(atEnd, ['ours'], { ours: 'a\n', theirs: 'a\nC\n' }) === 'a\n',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a\n', theirs: 'a\nC\n' }))
+  );
 }
 
 // --- diff3, which carries the common ancestor too ---------------------------

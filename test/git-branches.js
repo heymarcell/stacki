@@ -1701,6 +1701,70 @@ async function suite() {
   }
 
   {
+    // T19 — THE BLANK LINE NOBODY WROTE.
+    //
+    // The ordinary shape of one branch DELETING lines the other modified: the
+    // chosen side of the hunk has no lines in it at all. `renderResolved` joins
+    // the parts with '\n', so a hunk contributing nothing still collected a
+    // separator on each side of it and the rebuilt file gained an empty line
+    // NEITHER BRANCH HAD — written, staged and committed as
+    // `{ok:true, changed:true, resolved:1}`. The digest binding cannot catch
+    // it: the binding is about the conflict git reported, not about what was
+    // rendered from it.
+    //
+    // The oracle is not a shape, it is the file `main` already had on disk.
+    // Answering `ours` for every hunk is a decision that cannot change a byte of
+    // it, so anything but "identical to ours" is this defect or another one.
+    const deletion = async (name, ours) => {
+      const dir = await repo(name);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'a\nX\nz\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ancestor');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'a\nC\nz\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'feature changed it');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'a.txt'), ours);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'main did something else');
+      return dir;
+    };
+
+    const gone = await deletion('deletedhunk', 'a\nz\n');
+    cleanup.push(gone);
+    const clashG = await mergeBranch(git, { projectPath: gone, branch: 'feature' });
+    check('T19: deleting a line the other branch changed conflicts', clashG?.conflicted === true, JSON.stringify(clashG).slice(0, 200));
+    check('T19: as one disagreement', (clashG.files?.[0]?.parts || []).filter((p) => p.kind === 'clash').length === 1, JSON.stringify(clashG.files?.[0]?.parts));
+    const doneG = await resolveMerge(git, { projectPath: gone, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clashG.at });
+    check('T19: answering it with your own side goes through', doneG?.ok === true, JSON.stringify(doneG));
+    const bytesG = (await git(gone, ['show', 'HEAD:a.txt'])).stdout;
+    check(
+      'T19: and commits the file this branch already had, without a blank line where it deleted one',
+      bytesG === 'a\nz\n',
+      JSON.stringify(bytesG)
+    );
+
+    // THE CONTROL, AND THE OTHER WAY TO GET THIS WRONG. A side that is one
+    // BLANK line parses to the same empty string as a side that is not there
+    // at all, so a fix that reads emptiness off the text deletes a line this
+    // branch really does have. Same ancestor, same incoming change, one byte
+    // different on `main` — and the answer has to differ by a line.
+    const blank = await deletion('blankhunk', 'a\n\nz\n');
+    cleanup.push(blank);
+    const clashB = await mergeBranch(git, { projectPath: blank, branch: 'feature' });
+    check('T19 control: a blank line where the other branch edited also conflicts', clashB?.conflicted === true, JSON.stringify(clashB).slice(0, 200));
+    const doneB = await resolveMerge(git, { projectPath: blank, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clashB.at });
+    check('T19 control: and resolves', doneB?.ok === true, JSON.stringify(doneB));
+    const bytesB = (await git(blank, ['show', 'HEAD:a.txt'])).stdout;
+    check(
+      'T19 control: keeping a blank line this branch really wrote',
+      bytesB === 'a\n\nz\n',
+      JSON.stringify(bytesB)
+    );
+  }
+
+  {
     // T18 — THE ONE RESOLVE FAILURE AN AGENT HAD TO READ ENGLISH TO CLASSIFY.
     //
     // Uncommitted work in a conflicting file stops git before the merge starts,
