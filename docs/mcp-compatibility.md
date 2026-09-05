@@ -49,7 +49,7 @@ only the first while sounding like the second.
 | `subscriptions/listen` | **never opened, in any session** | ✗ | **UNSUPPORTED** | nothing emits; see `docs/mcp-v1.md` §2 |
 | `listChanged` notifications | — | — | **UNSUPPORTED, and now declared so** | was advertised `true` by SDK default and emitted by nothing; the server now declares `false` on all three. `test/mcp-cache-hints.js` |
 | Cache hints (`ttlMs`/`cacheScope`) | — | ✅ | **TESTED** | the four catalogue results and the five guides are `public`/300 s; `stacki://project/profile` is `private`/0, asserted by rule. `test/mcp-cache-hints.js` |
-| Cancellation of an audit | — | ✅ | **TESTED** | the handler reads `mcpReq.signal`; the run stops at the next viewport, destroys its window and answers `cancelled`. `test/audit-cancel.js` |
+| Cancellation of an audit | — | ✅ | **TESTED** | the handler reads `mcpReq.signal` and every await inside a viewport races it, so work already in flight is abandoned rather than waited out: a hanging load let go 39,633 ms after the signal before this and inside 2 s after, and the window goes with it. `test/audit-cancel-inflight.js` (real Electron, official client, wall-clock), `test/audit-cancel.js` |
 | Cancellation of anything else | — | — | **UNSUPPORTED** | no other operation is long enough to be worth it |
 | Progress notifications | — | — | **UNSUPPORTED** | none sent |
 | Logging, completions, sampling, roots, elicitation | — | — | **UNSUPPORTED** | not declared |

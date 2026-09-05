@@ -350,16 +350,28 @@ async function startWireRig({
   // and it is slower still the first time a fixture runs one. The client's
   // default deadline is shorter than that, so a working lifecycle came back as
   // "Request timed out" — a wire timeout dressed up as an operation failure.
+  //
+  // AND IT WAS NOT ACTUALLY BEING ASKED FOR. Both calls below passed the v1
+  // THREE-argument form, `callTool(params, resultSchema, options)`, with
+  // `undefined` in the middle. @modelcontextprotocol/client 2.0.0 declares
+  // `callTool(params, options?)` — two arguments, and the runtime reads the
+  // second one as the options — so the third was dropped on the floor and every
+  // wire call in this repository ran on the SDK's own 60s default while this
+  // constant said 180,000 and the comment above explained why it had to.
+  // Measured on the same call: the three-argument form answered
+  // `Request timed out` at 61,013ms; the two-argument form honoured its budget
+  // and ran to a real answer. A deadline that is not the deadline is worse than
+  // none, because the number written here is the one a reader trusts.
   const CALL_TIMEOUT_MS = 180000;
 
   const call = async (domain, action, args = {}) => {
-    const res = await client.callTool({ name: domain, arguments: { action, ...args } }, undefined, { timeout: CALL_TIMEOUT_MS });
+    const res = await client.callTool({ name: domain, arguments: { action, ...args } }, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
   };
 
   /** get_capabilities, get_context and the rest of the non-domain surface. */
   const tool = async (name, args = {}) => {
-    const res = await client.callTool({ name, arguments: args }, undefined, { timeout: CALL_TIMEOUT_MS });
+    const res = await client.callTool({ name, arguments: args }, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
   };
 
