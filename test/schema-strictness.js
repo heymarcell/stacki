@@ -33,18 +33,35 @@
 //   ACCEPTED and must ARRIVE at the app intact. A fix that closed user data
 //   would be a regression, and this is what catches it.
 //
-//   AUDITS the rebuild for lost semantics. `closeShape` reconstructs an object
-//   from its `.shape`, and anything not carried across is gone: a refinement, a
-//   catch, a transform, an object-level description, a function default. The
-//   inventory that says none of those is used on the real surface is an
-//   ASSERTION here rather than a sentence in a report, and the mechanism itself
-//   is driven with probe schemas that DO use them, so the inventory rule is
-//   known to be load-bearing rather than assumed to be.
+//   DRIVES EVERY BOUND AT ITS EDGE. A rebuild that only ever refused more
+//   would be a nuisance; one that ACCEPTS more is the failure this mechanism
+//   must not have. So every `minItems`/`maxItems` the document publishes is
+//   sent one item too few and one too many over the wire and must be refused
+//   with nothing dispatched, and sent EXACTLY the bound and must reach the app.
 //
-// WHAT IT FOUND. One class of object on the input surface is still open, and
-// it is not user data: the `{type, value}` pair inside a node's `props` record.
-// See NOT_CLOSED below — it is registered, its current behaviour is pinned, and
-// the one-line production fix is in the failure message.
+//   HOLDS THE CLOSED SCHEMA AGAINST THE OPEN ONE. Every node the rebuild
+//   replaced remembers what it replaced (`openSourceOf` in agentTools.js), and
+//   both halves are converted to the JSON Schema a client is served and
+//   required to be identical except for the fence the rebuild exists to add.
+//   That is the assertion that catches the whole class rather than the fields
+//   that happened to be hurt: a keyword nobody thought to look for cannot go
+//   missing quietly. The zod trees are compared a second time, check by check,
+//   because a `.refine()` is invisible in JSON Schema.
+//
+//   AUDITS the rebuild for lost semantics. `closeShape` reconstructs an object
+//   from its `.shape`, and anything not carried across is gone. The mechanism
+//   is driven with probe schemas that DO use every such construct — a
+//   refinement, a bound on an array of objects, a catch, both kinds of default
+//   — so what survives and what does not is measured rather than assumed.
+//
+// WHAT IT FOUND. Three defects, each fixed in electron/mcp/agentTools.js and
+// each still asserted here from two independent readings: objects inside a
+// `z.record` left open (the `{type, value}` pair in a node's `props`); a nested
+// discriminated union demoted to a plain one, so a refusal stopped naming the
+// key; and — the only one that WIDENED the surface — every bound on an array of
+// objects deleted by the rebuild, twelve advertised keywords at once, so
+// `target.edit` accepted an empty batch and `content.write_entry` accepted
+// five thousand edits in one undo transaction.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -52,6 +69,9 @@ const path = require('node:path');
 const { registerTools } = require('../electron/mcp/tools.js');
 const A = require('../electron/mcp/agentTools.js');
 const { AuditInput } = require('../electron/mcp/auditTool.js');
+// The transport's size gate, so the premise it is sized against can be checked
+// where that premise is actually declared. See the write_entry block below.
+const { MAX_BODY_BYTES } = require('../electron/mcp/server.js');
 const { startStrictnessWire } = require('./support/strictnessWire.js');
 
 const failures = [];
@@ -157,6 +177,59 @@ function locationsIn(toolName, json) {
   };
   walk(json, [], toolName);
   return out;
+}
+
+/**
+ * Every ARRAY position that publishes a bound, with the route to it.
+ *
+ * A separate walk from `locationsIn` because an array is not one of its four
+ * kinds — `kindOf` returns null for it — so the sweep that proves keys are
+ * refused walked straight past the twelve keywords that went missing. Derived
+ * the same way and for the same reason: a bound added tomorrow is driven at its
+ * edge without anybody adding a row to a list.
+ */
+function boundedArraysIn(toolName, json) {
+  const out = [];
+  const walk = (node, route, label) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'array' && (node.minItems !== undefined || node.maxItems !== undefined)) {
+      out.push({ tool: toolName, route, label, node, min: node.minItems, max: node.maxItems });
+    }
+    const branches = branchesOf(node);
+    if (branches) {
+      branches.forEach((b, i) => walk(b, [...route, { k: 'branch', i }], `${label}|${i}`));
+      return;
+    }
+    if (node.type === 'object' && node.properties) {
+      for (const [name, sub] of Object.entries(node.properties)) walk(sub, [...route, { k: 'prop', name }], `${label}.${name}`);
+    }
+    if (node.type === 'array' && node.items) walk(node.items, [...route, { k: 'item' }], `${label}[]`);
+    if (node.type === 'object' && node.additionalProperties && typeof node.additionalProperties === 'object') {
+      walk(node.additionalProperties, [...route, { k: 'value' }], `${label}{*}`);
+    }
+  };
+  walk(json, [], toolName);
+  return out;
+}
+
+/**
+ * Put a value at the end of a route inside an already-built call.
+ *
+ * The builder below constructs a call that is valid everywhere; this replaces
+ * exactly one array in it with one of a chosen length, so the ONLY thing wrong
+ * with a refused call is its size. Branch steps are dropped because a built
+ * value has already taken its branch, and an array step lands on element 0
+ * because that is the element the builder filled in.
+ */
+function place(root, route, items) {
+  const steps = route.filter((s) => s.k !== 'branch');
+  let cur = root;
+  for (const step of steps.slice(0, -1)) cur = step.k === 'prop' ? cur[step.name] : step.k === 'item' ? cur[0] : cur[RECORD_KEY];
+  const last = steps[steps.length - 1];
+  if (last.k === 'prop') cur[last.name] = items;
+  else if (last.k === 'item') cur[0] = items;
+  else cur[RECORD_KEY] = items;
+  return root;
 }
 
 /** The property path a refusal should name, read off the same route. */
@@ -589,6 +662,102 @@ const declaredDefaults = (json) => {
       check(`  ${tool}: and nothing dispatched`, res.dispatched === 0, short(res.handedOver));
     }
 
+    // ── EVERY PUBLISHED BOUND, DRIVEN AT ITS EDGE ────────────────────────────
+    //
+    // THE THIRD DEFECT THIS SUITE FOUND, and the only one so far that WIDENED
+    // what the surface accepts. Everything above is about a key being refused;
+    // this is about a call that should have been refused and was not.
+    //
+    // `closeField`'s array branch was `return z.array(closedInner)`. In zod 4 a
+    // bound is a CHECK on the wrapper, not part of the type, so rebuilding the
+    // wrapper deleted it — and because `Operation` is a discriminated union the
+    // element always came back a new instance, so the rebuild always fired.
+    // Twelve advertised keywords went missing at once, `minItems`/`maxItems`
+    // vanished from the document a validating client refuses against, and
+    // `target.edit` accepted 0 operations and 40 of them. Five of the six had
+    // no downstream guard: five thousand variable renames in one undo
+    // transaction was a schema-legal call. Twelve keywords across seven fields,
+    // `audit.viewports` included -- the seventh was found by the invariance
+    // check below rather than by anybody predicting it.
+    //
+    // So each bound is driven at both sides of its edge, over the wire, with
+    // the positive control ON the boundary — a refusal at max+1 proves nothing
+    // if max itself is refused too, and a suite that only checked max+1 would
+    // pass against a schema that refused every array.
+    const bounded = [];
+    for (const [name] of tools) bounded.push(...boundedArraysIn(name, delivered.get(name)));
+    check('the input surface publishes 17 bounded arrays', bounded.length === 17, `${bounded.length}: ${bounded.map((b) => `${b.label} ${b.min ?? ''}..${b.max ?? ''}`).join(', ')}`);
+    check(
+      '  including the six the rebuild had emptied',
+      ['target|4.operations', 'style|4.declarations', 'style|9.adds', 'style|10.renames', 'style|11.moves', 'content|11.edits'].every((l) => bounded.some((b) => b.label === l)),
+      bounded.map((b) => b.label).join(', ')
+    );
+
+    for (const loc of bounded) {
+      const json = delivered.get(loc.tool);
+      const sized = (n) => {
+        const call = place(value(json, loc.route, false), loc.route, Array.from({ length: n }, () => value(loc.node.items, [], false)));
+        return { ...call, ...extraFor(loc.tool, call) };
+      };
+      const where = `${loc.label} (${pathOf(loc.route).join('.')})`;
+      const reportsHere = (res, code) =>
+        (res.envelope?.issues || []).some((i) => JSON.stringify(i.path || []) === JSON.stringify(pathOf(loc.route)) && i.code === code);
+
+      // TOO FEW. Only where the schema says there is a floor; `min` of 1 is
+      // "this operation has to do something", and it is the one bound that had
+      // a partner guard in the handler — which is exactly why losing it went
+      // unnoticed for the other five.
+      if (loc.min > 0) {
+        const under = await wire.call(loc.tool, sized(loc.min - 1));
+        check(`${where}: ${loc.min - 1} items is refused, the floor is ${loc.min}`, under.envelope?.code === 'bad_arguments', short(under.envelope));
+        check(`  ${where}: naming the array and saying it is too small`, reportsHere(under, 'too_small'), short(under.envelope?.issues));
+        check(`  ${where}: and NOTHING was dispatched`, under.dispatched === 0, short(under.handedOver));
+
+        const atFloor = await wire.call(loc.tool, sized(loc.min));
+        check(`  ${where}: and exactly ${loc.min} is ACCEPTED — the control that stops "refuses everything" passing`, atFloor.envelope?.code !== 'bad_arguments', short(atFloor.envelope));
+        check(`  ${where}: reaching the app`, atFloor.dispatched > 0, short(atFloor.envelope));
+      }
+
+      // TOO MANY. The half with teeth: `content.write_entry` at 501 edits and
+      // `style.rename_variables` at 101 are single calls that land in a single
+      // undo transaction.
+      if (loc.max !== undefined) {
+        const over = await wire.call(loc.tool, sized(loc.max + 1));
+        check(`${where}: ${loc.max + 1} items is refused, the ceiling is ${loc.max}`, over.envelope?.code === 'bad_arguments', short(over.envelope));
+        check(`  ${where}: naming the array and saying it is too big`, reportsHere(over, 'too_big'), short(over.envelope?.issues));
+        check(`  ${where}: and NOTHING was dispatched`, over.dispatched === 0, short(over.handedOver));
+
+        const atCeiling = await wire.call(loc.tool, sized(loc.max));
+        check(`  ${where}: and exactly ${loc.max} is ACCEPTED`, atCeiling.envelope?.code !== 'bad_arguments', short(atCeiling.envelope));
+        check(`  ${where}: reaching the app`, atCeiling.dispatched > 0, short(atCeiling.envelope));
+      }
+    }
+
+    // ── AND THE ONE BOUND ANOTHER FILE'S ARGUMENT RESTS ON ───────────────────
+    //
+    // `MAX_BODY_BYTES` in electron/mcp/server.js is sized from "the largest
+    // schema-legal request", and the request it names is a
+    // `content.write_entry`: 500 edits plus a one-million-character body.
+    // docs/mcp-compatibility.md repeats that reasoning and test/mcp.js asserts
+    // the gate is above 11 MB on the strength of it.
+    //
+    // With `.max(500)` deleted by the rebuild there was no largest
+    // schema-legal `write_entry` at all, so the transport's number was sized
+    // against a premise that had stopped being true — and nothing said so,
+    // because the assertion that depends on it compares one constant with
+    // another. It is checked HERE, where the premise lives, off the document a
+    // client is actually served.
+    const writeEntry = (delivered.get('content')?.oneOf || []).find((b) => b?.properties?.action?.const === 'write_entry');
+    if (check('content publishes a write_entry branch', !!writeEntry, short(Object.keys(delivered.get('content') || {})))) {
+      check('  the premise the transport limit is sized against: at most 500 edits', writeEntry.properties?.edits?.maxItems === 500, short(writeEntry.properties?.edits));
+      check('  and a body of at most a million characters', writeEntry.properties?.body?.maxLength === 1000000, short(writeEntry.properties?.body));
+      check(
+        '  and the transport gate is above what those two make, so no schema-legal write is refused at the socket',
+        MAX_BODY_BYTES > 1000000 + 500 * 1000,
+        `${MAX_BODY_BYTES} bytes`
+      );
+    }
+
   } finally {
     const said = await wire.stop();
     problems.push(...(said?.problems || []));
@@ -659,10 +828,22 @@ const declaredDefaults = (json) => {
     );
     check('  no pipe, so nothing on the input surface transforms or preprocesses', !types.has('pipe'), short([...types.keys()]));
     check('  no catch, which closeField would leave OPEN rather than close', !types.has('catch'), short([...types.keys()]));
+    // THE SURFACE REALLY DOES DECLARE BOUNDS, IN QUANTITY. Without this line
+    // the invariance check below — "the closed tree publishes the same
+    // keywords as the open one" — would be satisfied by a surface that
+    // declared none at all, which is the shape the defect it exists to catch
+    // actually left behind.
+    //
+    // This replaced a rule that used to read "no custom check, so no
+    // refinement is riding on an object that gets rebuilt". That rule was
+    // load-bearing only while the rebuild DELETED checks; it now carries them,
+    // proved on a probe below and asserted over the real trees in the
+    // invariance block, so the surface is no longer forbidden a refinement it
+    // would silently lose.
     check(
-      '  and no custom check, so no refinement is riding on an object that gets rebuilt',
-      !checks.has('custom'),
-      `checks in use: ${[...checks.keys()].sort().join(', ')}`
+      '  and the bounds this suite drives are declared in quantity, so the invariance check is not vacuous',
+      (checks.get('max_length') || 0) > 40 && (checks.get('min_length') || 0) > 5,
+      `checks in use: ${[...checks.entries()].map(([k, n]) => `${k}×${n}`).sort().join(', ')}`
     );
     check('  the inventory really walked the surface', objects > 140 && types.get('literal') > 100, `${objects} objects, ${types.get('literal')} literals`);
 
@@ -692,6 +873,170 @@ const declaredDefaults = (json) => {
       demoted.length === 0,
       demoted.join('; ') || 'none'
     );
+  }
+
+  // ── CLOSING A SCHEMA CHANGES THE FENCE AND NOTHING ELSE ──────────────────
+  //
+  // THE GENERAL FORM OF THE THIRD DEFECT, and the only assertion in this file
+  // that could have caught it before it shipped. Everything else here grades the
+  // closed schema against what it OUGHT to say; this grades it against what the
+  // schema itself said before `closed()` touched it, which is the only reading
+  // that notices a keyword going missing that nobody thought to look for.
+  //
+  // The comparison is possible at all because every node `carried()` builds
+  // remembers the node it was built from — `openSourceOf` in agentTools.js.
+  // Without that the open tree is unreachable the moment the rebuild returns,
+  // which is precisely how twelve advertised bounds were deleted with 1,565
+  // assertions watching.
+  //
+  // The rule is deliberately absolute: convert both halves to the JSON Schema a
+  // client is served and require them to be IDENTICAL except for
+  // `additionalProperties: false` appearing where a fence was added. Not "the
+  // bounds match" — everything. A description, a `const`, a `format`, an
+  // `enum`, a `required` list: if the rebuild drops any of it this is red,
+  // whether or not anybody predicted that construct.
+  {
+    const z = require('zod');
+    const jsonOf = (schema) => z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' });
+
+    // EVERY REBUILT NODE ON THE PUBLISHED SURFACE, found by walking the trees
+    // the fourteen tools were actually registered with. Reading the schemas off
+    // `composed()` rather than off the eight exports is what puts `audit`,
+    // `get_context`, `capture`, `get_comments`, `comment` and
+    // `get_capabilities` inside this check too — they are closed at
+    // registration by `publishChecked`, and their open schemas are not exported
+    // anywhere.
+    const walkTree = (node, at, visit) => {
+      const def = node?.def;
+      if (!def) return;
+      visit(node, at);
+      if (def.type === 'object') for (const [k, v] of Object.entries(node.shape || {})) walkTree(v, `${at}.${k}`, visit);
+      if (Array.isArray(def.options)) def.options.forEach((o, i) => walkTree(o, `${at}|${i}`, visit));
+      for (const key of ['innerType', 'element', 'valueType', 'keyType']) if (def[key]) walkTree(def[key], `${at}.<${key}>`, visit);
+    };
+
+    const pairs = [];
+    for (const [name, entry] of tools) {
+      const tree = entry.config.inputSchema.schema;
+      if (!check(`${name} publishes the zod schema it was registered with`, !!tree?.def, 'advertised() stopped exposing `schema`, and the invariance check below is grading nothing')) continue;
+      walkTree(tree, name, (node, at) => {
+        const open = A.openSourceOf(node);
+        if (open) pairs.push({ at, open, shut: node });
+      });
+    }
+
+    // NAMED HERE BECAUSE IT IS A DECISION. 197 is every node the rebuild
+    // replaced across the fourteen tools — the eight domain unions and their
+    // branches, the nested `Operation` union and its thirteen, every nested
+    // object, record and bounded array, and the six tools closed at
+    // registration. If it moves, somebody changed the shape of the surface or
+    // the reach of the rebuild, and either should have to be written down.
+    check('the rebuild replaced 197 nodes on the published surface, and each remembers its original', pairs.length === 197, `${pairs.length} rebuilt nodes`);
+    check(
+      '  including the eight domain unions themselves',
+      ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((n) => pairs.some((p) => p.at === n)),
+      pairs.filter((p) => !p.at.includes('.') && !p.at.includes('|')).map((p) => p.at).join(', ')
+    );
+    check(
+      '  and audit’s schema, which is closed at registration rather than at declaration',
+      pairs.some((p) => p.at === 'audit'),
+      'audit was registered without being closed'
+    );
+
+    /** Every keyword difference between the two documents, position by position. */
+    const differences = (open, shut, at) => {
+      const out = [];
+      const walk = (a, b, p) => {
+        if (a === b) return;
+        const bothObjects = a && typeof a === 'object' && b && typeof b === 'object';
+        if (!bothObjects) {
+          if (JSON.stringify(a) !== JSON.stringify(b)) out.push(`${p}: ${JSON.stringify(a)} became ${JSON.stringify(b)}`);
+          return;
+        }
+        for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+          // THE ONE DIFFERENCE THE REBUILD IS FOR. Anything else — including
+          // `additionalProperties` appearing as anything other than `false` —
+          // falls through to the walk and is reported.
+          if (!(k in a) && k === 'additionalProperties' && b[k] === false) continue;
+          if (!(k in a)) out.push(`${p}.${k}: the rebuild INVENTED ${JSON.stringify(b[k])}`);
+          else if (!(k in b)) out.push(`${p}.${k}: the rebuild LOST ${JSON.stringify(a[k])}`);
+          else walk(a[k], b[k], `${p}.${k}`);
+        }
+      };
+      walk(open, shut, at);
+      return out;
+    };
+
+    const BOUNDS = ['minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'pattern', 'multipleOf'];
+    const countKeys = (node, pred) => {
+      let n = 0;
+      const walk = (v) => {
+        if (!v || typeof v !== 'object') return;
+        if (Array.isArray(v)) return v.forEach(walk);
+        for (const [k, val] of Object.entries(v)) {
+          if (pred(k, val)) n += 1;
+          walk(val);
+        }
+      };
+      walk(node);
+      return n;
+    };
+
+    const lost = [];
+    let fences = 0;
+    let bounds = 0;
+    for (const { at, open, shut } of pairs) {
+      const before = jsonOf(open);
+      const after = jsonOf(shut);
+      lost.push(...differences(before, after, at));
+      fences += countKeys(after, (k, v) => k === 'additionalProperties' && v === false);
+      bounds += countKeys(after, (k) => BOUNDS.includes(k));
+    }
+
+    check(
+      'closing a schema changes nothing a client is shown except the fence it exists to add',
+      lost.length === 0,
+      lost.slice(0, 20).join('\n    ')
+    );
+    // THE POSITIVE CONTROLS FOR THE COMPARISON ITSELF. Two identical documents
+    // that both said nothing would satisfy the assertion above, and "said
+    // nothing" is exactly the state the defect left behind. So the fences the
+    // comparison forgave and the bounds it compared are both counted, over the
+    // same walk, and both are numbers that go down when a keyword is lost.
+    check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
+    check(
+      '  and compared real constraints: 1,122 bound keywords across the rebuilt nodes',
+      bounds === 1122,
+      `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
+    );
+
+    // AND THE SAME QUESTION ASKED OF THE ZOD TREES, which is not the same
+    // question. A check JSON Schema cannot express — a `.refine()` — is
+    // invisible to the comparison above: both halves emit nothing for it and
+    // agree. So every check object in each open node is tallied by kind and
+    // required to be present in the rebuilt one, walking WITHOUT deduplication
+    // so a shape shared by three branches counts three times on both sides,
+    // exactly as the rebuild expands it three times.
+    const tally = (root) => {
+      const out = new Map();
+      walkTree(root, '', (node) => {
+        for (const c of node.def?.checks || []) out.set(c?._zod?.def?.check ?? 'unknown', (out.get(c?._zod?.def?.check ?? 'unknown') || 0) + 1);
+      });
+      return out;
+    };
+    const mismatched = [];
+    let checksSeen = 0;
+    for (const { at, open, shut } of pairs) {
+      const before = tally(open);
+      const after = tally(shut);
+      for (const [kind, n] of before) {
+        checksSeen += n;
+        if ((after.get(kind) || 0) !== n) mismatched.push(`${at}: ${kind} ${n} before, ${after.get(kind) || 0} after`);
+      }
+      for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
+    }
+    check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
+    check('  and the tally walked something: 1,108 checks across the rebuilt nodes', checksSeen === 1108, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────
@@ -736,17 +1081,48 @@ const declaredDefaults = (json) => {
     check('a nested object keeps its own description through the rebuild', described.properties?.thing?.description === 'a sentence a client reads', short(described.properties?.thing));
     check('  and is closed at the same time', described.properties?.thing?.additionalProperties === false, short(described.properties?.thing));
 
-    // A REFINEMENT DOES NOT SURVIVE. This is why the inventory asserts no
-    // custom check exists on the input surface: if one did, rebuilding would
-    // delete the rule and the schema would go on looking correct.
+    // A CHECK ON A REBUILT WRAPPER SURVIVES — the fix for the third defect, on
+    // a probe rather than on the surface. This assertion used to read the other
+    // way round: the rebuild dropped every check, and the inventory forbade the
+    // surface a refinement so that nothing would be silently deleted. It did
+    // not forbid a BOUND, and bounds are checks too, so twelve of them went.
+    // `carried()` now re-attaches `def.checks` on every rebuilt wrapper.
     const refinedSchema = () => z.object({ pair: z.object({ a: z.number(), b: z.number() }).refine((v) => v.a < v.b, 'a must be below b') });
     const wouldHaveFailed = { pair: { a: 9, b: 1 } };
     check(
-      'a refinement attached to a nested object is DROPPED by the rebuild',
-      closeIt(refinedSchema()).schema.safeParse(wouldHaveFailed).success === true,
-      'if this went red, closeField learned to carry checks across and the inventory rule can be relaxed'
+      'a refinement attached to a nested object SURVIVES the rebuild',
+      closeIt(refinedSchema()).schema.safeParse(wouldHaveFailed).success === false,
+      short(closeIt(refinedSchema()).schema.safeParse(wouldHaveFailed))
     );
-    check('  (the same schema unrebuilt does refuse it, so the probe is real)', refinedSchema().safeParse(wouldHaveFailed).success === false);
+    check('  (the same schema unrebuilt refuses it identically, so the probe is real)', refinedSchema().safeParse(wouldHaveFailed).success === false);
+    check(
+      '  and the value the refinement allows is still accepted, so it was carried rather than replaced by a blanket refusal',
+      closeIt(refinedSchema()).schema.safeParse({ pair: { a: 1, b: 9 } }).success === true,
+      short(closeIt(refinedSchema()).schema.safeParse({ pair: { a: 1, b: 9 } }))
+    );
+
+    // AND A BOUND ON AN ARRAY OF OBJECTS, which is the exact shape that was
+    // lost. `.min(1).max(2)` on an array whose element is an object: the
+    // element always rebuilds to a new instance, so the array always rebuilt,
+    // and `z.array(closedInner)` published no `minItems` and no `maxItems` and
+    // accepted an empty batch. Both the runtime answer and the ADVERTISED
+    // document are read, because the two failed together and a fix that only
+    // restored one would leave a validating client refusing calls Stacki takes,
+    // or taking calls Stacki refuses.
+    const boundedProbe = closeIt(z.object({ ops: z.array(z.object({ a: z.string() })).min(1).max(2) }));
+    const opsOf = (n) => ({ ops: Array.from({ length: n }, () => ({ a: 'x' })) });
+    check('a bound on an array of objects survives the rebuild: 0 is refused', boundedProbe.schema.safeParse(opsOf(0)).success === false, short(boundedProbe.schema.safeParse(opsOf(0))));
+    check('  1 is accepted', boundedProbe.schema.safeParse(opsOf(1)).success === true, short(boundedProbe.schema.safeParse(opsOf(1))));
+    check('  2 is accepted', boundedProbe.schema.safeParse(opsOf(2)).success === true, short(boundedProbe.schema.safeParse(opsOf(2))));
+    check('  3 is refused', boundedProbe.schema.safeParse(opsOf(3)).success === false, short(boundedProbe.schema.safeParse(opsOf(3))));
+    check('  and the advertised document still says so', boundedProbe.json.properties?.ops?.minItems === 1 && boundedProbe.json.properties?.ops?.maxItems === 2, short(boundedProbe.json.properties?.ops));
+    // AND THE SAME BOUND ON AN ARRAY OF A DISCRIMINATED UNION, which is what
+    // `target.edit.operations` actually is.
+    const unionProbe = closeIt(z.object({ ops: z.array(z.discriminatedUnion('t', [z.object({ t: z.literal('a') }), z.object({ t: z.literal('b') })])).min(1).max(2) }));
+    const tOf = (n) => ({ ops: Array.from({ length: n }, () => ({ t: 'a' })) });
+    check('the same bound on an array of a discriminated union survives too', unionProbe.schema.safeParse(tOf(0)).success === false && unionProbe.schema.safeParse(tOf(3)).success === false, short([unionProbe.schema.safeParse(tOf(0)).success, unionProbe.schema.safeParse(tOf(3)).success]));
+    check('  and it still accepts the sizes it declares', unionProbe.schema.safeParse(tOf(1)).success === true && unionProbe.schema.safeParse(tOf(2)).success === true, short(unionProbe.schema.safeParse(tOf(2))));
+    check('  and publishes both keywords', unionProbe.json.properties?.ops?.minItems === 1 && unionProbe.json.properties?.ops?.maxItems === 2, short(unionProbe.json.properties?.ops));
 
     // A CATCH IS LEFT OPEN. `closeField` recognises the wrapper well enough to
     // close its inner type and then falls through to `return field`, handing
@@ -809,12 +1185,20 @@ const declaredDefaults = (json) => {
 
   // ── THE BLIND SPOT OF THE INVENTORY, CLOSED BY READING THE SOURCE ────────
   //
-  // The walk above reads the schemas AFTER closeShape has run, which sees a
-  // catch, a pipe or a refinement on a SCALAR, because those are returned
-  // untouched. The one thing it cannot see is a refinement that was attached to
-  // an OBJECT and deleted by the rebuild — the tree it would have been in no
-  // longer exists. That case is caught here instead, and `.refine` and
-  // `.superRefine` have no homonym in this codebase, so the reading is exact.
+  // The walk above reads the schemas AFTER closeShape has run, so a construct
+  // the rebuild DELETED leaves no tree to find it in. The invariance block
+  // closed most of that gap — it holds the open node beside the rebuilt one and
+  // compares them — but only for nodes the rebuild replaced. A `z.preprocess`
+  // or a `.brand` is a wrapper `closeField` does not recognise: it returns the
+  // ORIGINAL, so there is no pair to compare and the object inside goes on
+  // stripping. That is what is scanned for here, and neither construct has a
+  // homonym in this codebase, so the reading is exact.
+  //
+  // `.refine` and `.superRefine` used to be on this list, because the rebuild
+  // deleted them without a word. They are not any more: `carried()` re-attaches
+  // every check, the probe above proves a nested refinement still refuses what
+  // it refused, and the check tally in the invariance block would go red if one
+  // were dropped on the real surface.
   {
     const dir = path.join(__dirname, '..', 'electron', 'mcp');
     const files = [];
@@ -829,7 +1213,7 @@ const declaredDefaults = (json) => {
     const hits = [];
     for (const file of files) {
       const text = fs.readFileSync(file, 'utf8');
-      for (const construct of ['.refine(', '.superRefine(', 'z.preprocess(', '.brand(']) {
+      for (const construct of ['z.preprocess(', '.brand(']) {
         let from = 0;
         for (;;) {
           const at = text.indexOf(construct, from);
@@ -840,9 +1224,9 @@ const declaredDefaults = (json) => {
       }
     }
     check(
-      'no refinement, preprocess or brand is declared anywhere in electron/mcp',
+      'no preprocess or brand is declared anywhere in electron/mcp',
       hits.length === 0,
-      hits.length ? `${hits.join('; ')}\n    one of these on an object schema is deleted by closeShape without a word — see the probe above` : ''
+      hits.length ? `${hits.join('; ')}\n    closeField does not recognise either wrapper, so it hands back the ORIGINAL and the object inside goes on stripping — see the catch probe above` : ''
     );
     // POSITIVE CONTROL for the scanner itself: it must find something it is
     // looking for, or "no hits" means only that the search was broken.

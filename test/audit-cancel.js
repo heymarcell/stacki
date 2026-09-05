@@ -51,6 +51,11 @@
 //                         while the operation is still outstanding
 //   it says how far it got a run abandoned after one viewport says one viewport
 //   nothing leaks         liveWindowCount() is 0 on every path out
+//   nothing is inherited  the audit session is CLEARED on every path out, and
+//                         the last thing to happen to the shared partition is
+//                         always a clear rather than a page load — the property
+//                         `sessionIsolated` claims, read off a double that
+//                         models the state rather than counting nothing
 //   too late is harmless  aborting after the run finished changes nothing
 //   the wire carries it   the real MCP tool handler passes the SDK's signal to
 //                         the engine, rather than the engine being told by a
@@ -215,11 +220,20 @@ function controlledWindows(log, { onOpen = null, gateFor = () => null } = {}) {
       // Fired after the window for viewport N exists, which is how a test aborts
       // "in the middle" without racing a timer against the engine.
       if (onOpen) onOpen(nth);
-      this.loadURL = () =>
-        held('load').then((v) => {
+      this.loadURL = () => {
+        // NAVIGATING DIRTIES THE PARTITION, WHICH IS THE WHOLE POINT OF
+        // CLEARING IT. A page that has begun loading may already have set a
+        // cookie or written to localStorage, and on this engine's single
+        // `stacki-audit` partition that state outlives the window — measured,
+        // and written up at AUDIT_PARTITION in electron/mcp/audit/index.js. So
+        // the double marks it here rather than on a successful load: a run
+        // abandoned mid-load is exactly the case that must still clean up.
+        log.session.dirty = true;
+        return held('load').then((v) => {
           if (finishLoad) setImmediate(finishLoad);
           return v;
         });
+      };
     }
     setContentSize() {}
     isDestroyed() {
@@ -245,14 +259,67 @@ function controlledWindows(log, { onOpen = null, gateFor = () => null } = {}) {
   };
 }
 
-// The shape the engine actually asks for -- a partition factory, not a session.
-const cleanSession = {
-  fromPartition: () => ({
-    clearStorageData: async () => {},
-    clearCache: async () => {},
-    clearAuthCache: async () => {},
-  }),
+/**
+ * The session, as a thing that can be DIRTY.
+ *
+ * A DOUBLE THAT COUNTS NOTHING GRADES NOTHING. This file's headline says an
+ * abandoned audit "cleans up", and `audit/index.js` promises the final reset
+ * runs "on every path out" — but the double here used to be three `async () =>
+ * {}` no-ops, so the only cleanup any assertion could observe was the window
+ * count. Measured: deleting the reset from the engine's `finally` whenever the
+ * signal had aborted left the cancelled page's cookies, localStorage and auth
+ * cache in the shared audit partition for the NEXT audit to read — the exact
+ * thing `sessionIsolated` claims cannot happen — and this suite still reported
+ * 71 passed.
+ *
+ * So the double models the property rather than the call. Every window that
+ * navigates on the partition DIRTIES it, the way a real page setting a cookie
+ * does; `clearStorageData` is what makes it clean again. `dirty` is therefore
+ * not a count of calls but an ordering: it can only be false if a clear
+ * happened AFTER the last page was loaded, which is what "on every path out"
+ * means and what a counter alone cannot tell you.
+ *
+ * The shape is the one the engine asks for -- a partition factory, not a
+ * session -- and it is per-log, so each case reads its own.
+ */
+const sessionFor = (log) => ({
+  fromPartition: (name) => {
+    log.session.partitions.add(name);
+    return {
+      clearStorageData: async () => {
+        log.session.storage += 1;
+        log.session.dirty = false;
+      },
+      clearCache: async () => {
+        log.session.cache += 1;
+      },
+      clearAuthCache: async () => {
+        log.session.auth += 1;
+      },
+    };
+  },
+});
+
+/**
+ * The run left the shared partition clean, whatever else it did.
+ *
+ * Called on every case that reached the engine's own try block, because that is
+ * where the `finally` lives. A case that never got that far -- refused before
+ * it started, or abandoned while queued -- has nothing to clean and is asserted
+ * separately.
+ */
+const cleanedUp = (label, log) => {
+  const state = () => short({ ...log.session, partitions: [...log.session.partitions] });
+  check(`${label}: the audit session was cleared`, log.session.storage > 0, state());
+  check(`  ${label}: cache and auth cache with it, which sit outside clearStorageData`, log.session.cache === log.session.storage && log.session.auth === log.session.storage, state());
+  check(
+    `  ${label}: and the LAST thing that happened to the partition was a clear, so the next audit inherits nothing`,
+    log.session.dirty === false,
+    `${state()} — a page was loaded on the audit partition and no reset followed it; the next audit reads this one's cookies`
+  );
+  check(`  ${label}: all of it on the one audit partition`, [...log.session.partitions].join() === 'stacki-audit', [...log.session.partitions].join() || 'no partition was ever asked for');
 };
+
 const THREE = [
   { width: 375, height: 700 },
   { width: 768, height: 900 },
@@ -260,7 +327,15 @@ const THREE = [
 ];
 const ONE = [{ width: 375, height: 700 }];
 
-const newLog = () => ({ opened: 0, destroyed: 0, destroyRefused: 0, destroyRefusalsLeft: 0, encoded: 0, blockedOn: [] });
+const newLog = () => ({
+  opened: 0,
+  destroyed: 0,
+  destroyRefused: 0,
+  destroyRefusalsLeft: 0,
+  encoded: 0,
+  blockedOn: [],
+  session: { storage: 0, cache: 0, auth: 0, dirty: false, partitions: new Set() },
+});
 
 /**
  * An audit with a deadline of the TEST's own.
@@ -312,7 +387,7 @@ const engineWith = (log, opts = {}) =>
   createAudit({
     BrowserWindow: controlledWindows(log, opts),
     getPreviewUrl: () => 'http://127.0.0.1:4321',
-    session: cleanSession,
+    session: sessionFor(log),
     encodeImage: opts.encoder ? fakeEncoder(log) : null,
   });
 
@@ -327,6 +402,16 @@ const engineWith = (log, opts = {}) =>
     check('  and opens one window per viewport', log.opened === 3, short(log));
     check('  and destroys every one of them', log.destroyed === 3, short(log));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('an ordinary audit', log);
+    // THE SHAPE OF THE CLEARING, NAMED, so the counters below are known to be
+    // reading a real sequence rather than any number above zero: once before the
+    // run, once before each of the three viewports, once in the `finally`.
+    check('  and clears the session five times: once before the run, once per viewport, once on the way out', log.session.storage === 5, short(log.session));
+    check(
+      '  and it says so in the result, which is the claim those clears support',
+      res?.engine?.sessionIsolated === true,
+      short(res?.engine)
+    );
   }
 
   // ---- POSITIVE CONTROL, ON A WINDOW THAT ACTUALLY BLOCKS -------------------
@@ -362,6 +447,13 @@ const engineWith = (log, opts = {}) =>
     check('  and opens no window at all', log.opened === 0, short(log));
     check('  and says so in words', typeof res?.message === 'string' && /cancelled/i.test(res.message), short(res?.message));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    // NOTHING TO CLEAN, AND NOTHING CLEANED. This one is refused before the
+    // engine's try block, so the `finally` never runs -- and it must not need
+    // to: no window was opened, so nothing was written to the partition. The
+    // assertion is the negative one, and it is what stops `cleanedUp` being
+    // satisfiable by an engine that resets the session on paths that never
+    // touched it.
+    check('  and never touched the session, having never opened a page', log.session.storage === 0 && log.session.dirty === false, short(log.session));
   }
 
   // ---- ABORTED WHILE QUEUED -------------------------------------------------
@@ -397,6 +489,11 @@ const engineWith = (log, opts = {}) =>
     check('  and only the first run ever opened a window', log.opened === 1, short(log));
     check('  and its window was destroyed', log.destroyed === 1, short(log));
     check('  and none is live', liveWindowCount() === 0, String(liveWindowCount()));
+    // The cancelled one never reached the engine's try; the one in FRONT of it
+    // did, and it is that run's cleanup being read here. Three clears: before
+    // the run, before its one viewport, and on the way out.
+    cleanedUp('the audit in front of a cancelled one', log);
+    check('  and the queued refusal added no clears of its own', log.session.storage === 3, short(log.session));
   }
 
   // ---- ABORTED DURING THE LOAD ---------------------------------------------
@@ -425,6 +522,10 @@ const engineWith = (log, opts = {}) =>
     check('  and opened only the one window', log.opened === 1, short(log));
     check('  and destroyed it', log.destroyed === 1, short(log));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    // THE CASE THE MUTATION SURVIVED. The page had begun loading on the shared
+    // partition when the caller left; if the `finally` skips its reset on an
+    // aborted run, whatever that page wrote is what the NEXT audit starts from.
+    cleanedUp('an audit abandoned during a load', log);
   }
 
   // ---- ABORTED DURING A PROBE ----------------------------------------------
@@ -455,6 +556,7 @@ const engineWith = (log, opts = {}) =>
     check('  and answers promptly', took < ANSWER_BY_MS, `${took}ms`);
     check('  and destroyed the window it was measuring in', log.destroyed === log.opened && log.opened === 1, short(log));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('an audit abandoned inside a probe', log);
   }
 
   // ---- HOW FAR IT GOT -------------------------------------------------------
@@ -472,6 +574,7 @@ const engineWith = (log, opts = {}) =>
     check('  and stops before measuring every viewport', log.opened === 2, short(log));
     check('  and destroys every window it did open', log.destroyed === log.opened, short(log));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('an audit cancelled between viewports', log);
   }
 
   // ---- ONE VIEWPORT ---------------------------------------------------------
@@ -495,6 +598,7 @@ const engineWith = (log, opts = {}) =>
     check('  and does not wait its only load out', hang.released() === false && took < ANSWER_BY_MS, `${took}ms`);
     check('  with its window destroyed', log.destroyed === log.opened && log.opened === 1, short(log));
     check('  and none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('a one-viewport audit abandoned mid-load', log);
   }
 
   // ---- TOO LATE -------------------------------------------------------------
@@ -506,6 +610,8 @@ const engineWith = (log, opts = {}) =>
     check('an audit that had already finished keeps its answer', res?.ok === true, short(res));
     check('  and aborting afterwards destroys nothing further', log.destroyed === log.opened && log.opened === 3, short(log));
     check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('an audit aborted after it finished', log);
+    check('  and aborting afterwards clears nothing further either', log.session.storage === 5, short(log.session));
   }
 
   // ---- NO LISTENER SURVIVES THE AWAIT IT GUARDED ---------------------------
@@ -572,6 +678,11 @@ const engineWith = (log, opts = {}) =>
     check('  and encoded nothing, because there was no frame to encode', captureLog.encoded === 0, short(captureLog));
     check('  and both windows went', freezeLog.destroyed === 1 && captureLog.destroyed === 1, short({ freezeLog, captureLog }));
     check('  and none is live', liveWindowCount() === 0, String(liveWindowCount()));
+    // A BUDGET EXPIRING IS ANOTHER PATH OUT, and the `finally` covers it too.
+    // Neither of these runs was cancelled: one measured the page anyway, the
+    // other gave up on the photograph. Both leave the partition clean.
+    cleanedUp('an audit whose freeze never returned', freezeLog);
+    cleanedUp('an audit whose capture never returned', captureLog);
   }
 
   // ---- WHEN THE WINDOW CANNOT BE DESTROYED AT ALL --------------------------
@@ -610,6 +721,11 @@ const engineWith = (log, opts = {}) =>
     check('  and it answered promptly', took < ANSWER_BY_MS, `${took}ms`);
     check('  and the destroy really was attempted and really did fail', log.destroyRefused >= 1 && log.destroyed === 0, short(log));
     check('  and the window it could not destroy is still counted', liveWindowCount() === 1, String(liveWindowCount()));
+    // AND THE SESSION IS CLEARED EVEN THEN. The window is stuck, the run was
+    // cancelled, and the `finally` still has to leave the partition clean --
+    // otherwise the one case where cleanup is hardest is the one case where the
+    // next audit inherits a page's cookies.
+    cleanedUp('an audit whose window will not die', log);
   }
 
   // ---- THE WIRE CARRIES IT --------------------------------------------------

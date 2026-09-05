@@ -92,7 +92,7 @@ const DocumentState = z
 
 const Envelope = z.looseObject({
   ok: z.boolean().describe('Whether the operation happened. False is a status with a code, never a crash.'),
-  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, bound_value, not_editable, no_project, bad_request, …'),
+  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, bound_value, not_editable, no_project, bad_request, command_failed, …'),
   message: z.string().nullable().optional(),
 
   // --- what a mutation answers with ---------------------------------------
@@ -170,6 +170,33 @@ const MoveTarget = z
   })
   .describe('Where the node should end up.');
 
+/**
+ * EVERY REBUILT SCHEMA, BESIDE THE ONE IT WAS REBUILT FROM.
+ *
+ * A rebuild can only be trusted if what came out can be compared with what went
+ * in, and once `closed()` has run the open tree is unreachable from anywhere —
+ * which is how twelve advertised bounds were deleted with a suite of 1,565
+ * assertions watching. Every node `carried()` produces remembers its original
+ * here.
+ *
+ * A WeakMap, keyed by the REBUILT node, for two reasons. It must not keep a
+ * schema alive: `publishChecked` closes a tool's schema on every registration,
+ * and a server that registers per request would otherwise accumulate a row per
+ * request forever. And keying by the rebuilt node is what lets a reader walk a
+ * closed tree asking each node what it used to be, rather than needing a handle
+ * on an open tree nobody exports.
+ *
+ * Read by test/schema-strictness.js, which converts both halves of every pair
+ * to JSON Schema and requires every keyword to be identical bar the fence. That
+ * grades the MECHANISM rather than the six fields this defect happened to hurt,
+ * so a wrapper added tomorrow whose checks are not carried fails the day it is
+ * written.
+ */
+const OPEN_SOURCE = new WeakMap();
+
+/** What `schema` was before this file closed it, if it did. */
+const openSourceOf = (schema) => (schema && typeof schema === 'object' ? OPEN_SOURCE.get(schema) : undefined);
+
 // One operation inside a batch. The same vocabulary as the single-operation
 // actions, so learning one teaches the other.
 /**
@@ -203,19 +230,22 @@ const MoveTarget = z
  */
 function closed(union) {
   const key = union.def?.discriminator || 'action';
-  return z.discriminatedUnion(
+  const rebuilt = z.discriminatedUnion(
     key,
     union.options.map((branch) => {
-      const rebuilt = closeShape(branch.shape);
       // A BRANCH CAN CARRY A DESCRIPTION, AND REBUILDING IT DROPPED ONE.
       //
       // `z.strictObject(shape)` keeps every FIELD's `.describe()` and none of
       // the object's own, so two operations lost the sentence published beside
       // them in `tools/list` — retrieval metadata deleted by a change that was
-      // about validation.
-      return branch.description ? rebuilt.describe(branch.description) : rebuilt;
+      // about validation. `carried()` puts the sentence back, and the branch's
+      // own checks with it.
+      return carried(closeShape(branch.shape), branch);
     })
   );
+  // The union's own checks and description, which the rebuild above does not
+  // reach: `z.discriminatedUnion` was handed the branches, not the wrapper.
+  return carried(rebuilt, union);
 }
 
 /**
@@ -242,10 +272,7 @@ function closeShape(shape) {
 function closeField(field) {
   const def = field?.def;
   if (!def) return field;
-  if (def.type === 'object') {
-    const rebuilt = closeShape(field.shape);
-    return field.description ? rebuilt.describe(field.description) : rebuilt;
-  }
+  if (def.type === 'object') return carried(closeShape(field.shape), field);
   // A UNION OF SHAPES IS STILL SHAPES. `audit`'s `viewports` takes either a
   // named string or a `{width, height}` object, and the object half was the
   // last place on the surface still dropping a key silently.
@@ -264,7 +291,7 @@ function closeField(field) {
     // mistyped key inside an edit batch came back as `operations.0: Invalid
     // input`, the one shape on this surface an agent cannot act on,
     // reintroduced one level down by the fix for the level above.
-    return withDescription(
+    return carried(
       def.discriminator ? z.discriminatedUnion(def.discriminator, rebuilt) : z.union(rebuilt),
       field
     );
@@ -279,7 +306,7 @@ function closeField(field) {
   if (def.type === 'record' && def.valueType) {
     const closedValue = closeField(def.valueType);
     if (closedValue === def.valueType) return field;
-    return withDescription(z.record(def.keyType, closedValue), field);
+    return carried(z.record(def.keyType, closedValue), field);
   }
   // One inner type, held under a name that differs by wrapper.
   const innerKey = def.type === 'array' ? 'element' : 'innerType';
@@ -287,15 +314,57 @@ function closeField(field) {
   if (!inner || typeof inner !== 'object' || !inner.def) return field;
   const closedInner = closeField(inner);
   if (closedInner === inner) return field;
-  if (def.type === 'array') return withDescription(z.array(closedInner), field);
-  if (def.type === 'optional') return withDescription(closedInner.optional(), field);
-  if (def.type === 'nullable') return withDescription(closedInner.nullable(), field);
-  if (def.type === 'default') return withDescription(closedInner.default(def.defaultValue), field);
+  if (def.type === 'array') return carried(z.array(closedInner), field);
+  if (def.type === 'optional') return carried(closedInner.optional(), field);
+  if (def.type === 'nullable') return carried(closedInner.nullable(), field);
+  if (def.type === 'default') return carried(closedInner.default(def.defaultValue), field);
   return field;
 }
 
-const withDescription = (rebuilt, original) =>
-  original.description ? rebuilt.describe(original.description) : rebuilt;
+/**
+ * THE REBUILD WIDENED WHAT THE SURFACE ACCEPTS.
+ *
+ * Every branch above hands back a NEW schema built from the old one's inner
+ * types, and everything hanging off the OLD wrapper that was not explicitly
+ * copied across went with it. Only the description was copied. In zod 4 a
+ * wrapper's bounds live in `def.checks` — `.min()`, `.max()`, `.int()`,
+ * `.regex()` are all checks rather than part of the type — so
+ * `z.array(closedInner)` is the same array with its bounds deleted.
+ *
+ * That is the one failure this mechanism must not have. Closing an object only
+ * ever REFUSES more; losing a check ACCEPTS more, silently, and the advertised
+ * JSON Schema stops naming the bound at the same moment, so a validating client
+ * stops catching it either. Because `Operation` is a discriminated union,
+ * `closeField(element) !== element` always held, so the array rebuild always
+ * fired: twelve published keywords went missing at once, across seven fields —
+ * `target.edit.operations` (1..30), `style.set_declarations` (1..40),
+ * `style.add_variables` / `rename_variables` / `move_variables` (1..100 each),
+ * `content.write_entry.edits` (..500) and `audit.viewports` (..6). Six of the
+ * seven have no downstream guard, so one call could put five thousand variable
+ * renames inside a single undo transaction, and `MAX_BODY_BYTES` in server.js
+ * lost the largest schema-legal write it is sized against.
+ *
+ * Nothing else was lost, and that is a measurement rather than a hope: a string
+ * `.max()`, a `.regex()`, a number's `.int()` all sit on a primitive, and
+ * `closeField` returns a primitive untouched, so those checks were never in the
+ * rebuild's path. The invariance check in test/schema-strictness.js is what
+ * says so for every position rather than for the ones anybody thought of.
+ *
+ * So the checks are carried across with the description, on EVERY rebuilt
+ * wrapper rather than on arrays alone — a refinement on an object, a bound on
+ * a record, a check on an optional, all of them. `.check()` re-attaches the
+ * check objects themselves, so the runtime rule and the emitted `minItems` /
+ * `maxItems` come back together. test/schema-strictness.js asserts that the
+ * closed tree's JSON Schema keywords are IDENTICAL to the open tree's, which is
+ * what makes this a class closed rather than an instance fixed.
+ */
+const carried = (rebuilt, original) => {
+  const checks = original?.def?.checks;
+  const withChecks = checks && checks.length ? rebuilt.check(...checks) : rebuilt;
+  const kept = original.description ? withChecks.describe(original.description) : withChecks;
+  OPEN_SOURCE.set(kept, original);
+  return kept;
+};
 
 const Operation = closed(z.discriminatedUnion('type', [
   // `value` is this form's name and stays the declared one; `text` is accepted
@@ -1107,6 +1176,15 @@ function advertised(schema) {
     // suite green by making its question meaningless.
     safeParse: (value) => schema.safeParse(value),
     parse: (value) => schema.parse(value),
+    // AND THE TREE ITSELF, for the one reader that needs the schema rather than
+    // an answer from it. test/schema-strictness.js walks the CLOSED tree asking
+    // each node, through `openSourceOf`, what it was before the rebuild, and
+    // requires the two to publish the same keywords — the check that would have
+    // caught twelve bounds being deleted. There is no way to do that through a
+    // `safeParse`, and the schema a tool is registered with is otherwise
+    // reachable only for the eight domains that export theirs. Not read by the
+    // SDK, which looks at `~standard` and nothing else.
+    schema,
   };
 }
 
@@ -1145,7 +1223,13 @@ function closedObject(schema) {
   // objects, and a key added beside `width` and `height` was dropped without a
   // word. What stays open is what should — a record's VALUES, where arbitrary
   // keys are the point.
-  return closeShape(shape);
+  //
+  // Through `carried()`, so the top-level object of a non-domain tool keeps its
+  // own checks and description too. Nothing on the surface hangs a check on a
+  // tool's outermost object today; the five tools that come through here are
+  // rebuilt by the same rule as everything below them so that the day one does,
+  // it is not deleted on the way to being published.
+  return carried(closeShape(shape), schema);
 }
 
 /**
@@ -1368,6 +1452,9 @@ module.exports = {
   badToolArguments,
   DESCRIPTIONS,
   Envelope,
+  // What a closed schema was before it was closed, for the invariance check in
+  // test/schema-strictness.js. See OPEN_SOURCE.
+  openSourceOf,
   TargetInput,
   StyleInput,
   SourceInput,

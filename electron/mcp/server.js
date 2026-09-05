@@ -292,11 +292,17 @@ function createStackiMcpServer({
     // bearer, so this is not the first line of defence -- but "authenticated"
     // and "unbounded" is still the wrong pair.
     //
-    // EIGHT MEGABYTES, from the largest thing the surface actually accepts: a
-    // stylesheet through `style.write_source`, capped by its own schema at two
-    // million characters. Eight is comfortably clear of that after JSON
-    // escaping and the envelope, and nowhere near a size worth buffering by
-    // accident.
+    // HOW BIG, AND WHY THAT NUMBER: `MAX_BODY_BYTES` at the top of this file,
+    // which is the one place the arithmetic lives.
+    //
+    // THE PARAGRAPH THAT USED TO BE HERE IS RETRACTED. It argued for EIGHT
+    // megabytes from `style.write_source`'s two-million-character cap, and the
+    // constant's own comment says why that was "the wrong field and the wrong
+    // arithmetic" and what replaced it. The gate has read 32 MB since. A
+    // comment that argues for a number the code does not use is worse than no
+    // comment, in a file whose convention is that the reasoning travels with
+    // the constant — a reader who came here for the number was handed the
+    // retracted one, twice as confidently as the real one is stated.
     //
     // AFTER THE PATH CHECK, so a 40 MB POST to /nonsense is answered 404 for
     // the reason it is actually wrong, rather than being told about a limit on
@@ -306,9 +312,12 @@ function createStackiMcpServer({
     // it wrong. Resetting the socket while the client is still streaming its
     // body means the carefully-worded 413 never arrives: the official client,
     // in both eras, saw `fetch failed` / EPIPE and could not tell whether the
-    // write had landed. The response is sent, the rest of the body is drained
-    // and discarded rather than buffered, and the connection closes when the
-    // response has actually flushed.
+    // write had landed. So the response is sent and NOTHING else is done — see
+    // `refuse()`, which is one line for exactly that reason. Node dumps the
+    // rest of the body itself, read and discarded rather than buffered, and the
+    // socket is left alone. This block used to claim the connection closes once
+    // the response has flushed; that was `Connection: close`, which was tried,
+    // measured to reset the very requests it was meant to rescue, and removed.
     // ONLY WHAT CARRIES A BODY. A GET has none, and telling it to supply a
     // Content-Length is nonsense — this endpoint's answer to a GET is 405, and
     // an earlier version of this gate turned that into 411 for every method
