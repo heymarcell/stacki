@@ -205,6 +205,7 @@ Refusals an agent must expect and can act on:
 | `guard_required` | a `resolve_merge` with no `mergeRef`, or one carrying no observation. The handle `git.merge` hands back is what binds an answer to the conflict it answers |
 | `cancelled` | the caller went away mid-audit; says how many viewports had been measured and discarded |
 | `undo_failed` / `redo_failed` | the recorded inverse threw. Neither the project nor the history moved, so the same entry is still the one to retry |
+| `command_failed` | the editor's own window threw where no named cause fits — most often the filesystem refusing a write to the open document. The honest answer to an exception nobody planned, and the one code here that carries no advice beyond the sentence git or node gave |
 
 This table is the ones worth knowing rather than all of them; the surface has
 more, and `get_capabilities` lists every operation it can refuse.
@@ -425,16 +426,36 @@ whitespace utility class; the same declaration on any ANCESTOR, because
 rule anywhere in the project's stylesheets or its `<style>` blocks whose
 selector could reach the element. That last one is a one-sided static scan, not
 a cascade: a selector shape it does not fully understand, a stylesheet it cannot
-read and one it cannot parse all resolve to "could match anything", which costs
-an element its reindentation and never its bytes. `pre-line`, `normal` and
-`nowrap` are deliberately not in the refusing set — measured in a real browser,
-a reindent under those three renders identically.
+read, a directory it cannot list, one postcss cannot parse, one too big to be
+worth reading, and a tree deeper than the walk goes all resolve to "could match
+anything". `pre-line`, `normal` and `nowrap` are deliberately not in the
+refusing set — measured in a real browser, a reindent under those three renders
+identically. The scan covers the whole project rather than a fixed list of
+stylesheet directories, so a stylesheet a page imports out of `assets/`, or from
+anywhere else inside the project, is read like any other; `node_modules`, `dist`
+and the build caches are the only things skipped.
 
-**Known residual, stated rather than left to be found:** the scan reads CSS that
-is in the project as text. It therefore does not see a rule that arrives from
-outside it — a stylesheet fetched from a URL or served out of `node_modules` —
-one injected at runtime by script, or a class name that only exists after a
-build step and is not written in the markup. It also cannot resolve a `class`
+**What "could match anything" costs, precisely.** It costs the elements it
+covers their REINDENTATION, and nothing else. It is an admission that the scan
+came back incomplete, not a measurement that every element renders its
+whitespace, and the writer keeps the two apart: an unproven element keeps the
+authored bytes of whatever moves into or out of it, while the markup around that
+move keeps the indentation the file already had. Only an element the guard
+positively identified — a `pre` or `textarea`, a declaration on the element or
+on an ancestor, a rule whose selector was actually reduced — has the
+indentation between its children treated as content and therefore left out.
+
+**Known residuals, stated rather than left to be found:** the scan reads CSS
+that is in the project as text. It therefore does not see a rule that arrives
+from outside it — a stylesheet fetched from a URL or served out of
+`node_modules` — one injected at runtime by script, or a class name that only
+exists after a build step and is not written in the markup. It reads `.css`
+only, so a rule written in `.scss`, `.sass`, `.less` or `.styl` is not seen. It
+does not run a build: a custom utility declared in a JavaScript config rather
+than in CSS is invisible, so `@apply my-utility` reads as preserving nothing —
+whereas an `@utility` or `@mixin` block in the project's CSS that declares
+`white-space` does resolve to "could match anything", because which elements end
+up with it is not answerable from the text. It also cannot resolve a `class`
 whose value is an expression rather than a literal, and it never consults the
 live preview: doing so would make the bytes written to disk depend on whether a
 window is open and which route it shows, and could not answer about a

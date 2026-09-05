@@ -20,10 +20,25 @@
 // whitespace into rendered content?" -- and only ever acts on the answer NO. So
 // an over-approximation is sound: every rule that MIGHT match contributes its
 // tokens, a selector shape the reducer does not fully understand contributes
-// the sentinel ANY, and every failure (a file that will not read, a stylesheet
-// postcss will not parse) also contributes ANY. Being wrong in that direction
-// costs an element its reindentation, which is cosmetic. Being wrong the other
-// way deletes bytes the page shows.
+// the sentinel ANY, and every failure contributes ANY too. The failures, named
+// rather than implied, because "every failure also contributes ANY" was written
+// here while one of them did the opposite: a file that will not read, a
+// DIRECTORY that will not list, a stylesheet postcss will not parse, one too
+// big to be worth reading, and a walk that hit its depth cap. Being wrong in
+// that direction costs an element its reindentation, which is cosmetic. Being
+// wrong the other way deletes bytes the page shows.
+//
+// AND ANY IS NOT "EVERY ELEMENT PRESERVES ITS WHITESPACE". THE SENTINEL DAMAGED
+// LAYOUT WHILE IT WAS READ THAT WAY. "We cannot prove a reindent here is safe"
+// and "this element renders its own whitespace" are different statements, and
+// the consumer keeps them apart: the first holds a moved subtree's authored
+// bytes, the second additionally says the indentation BETWEEN an element's
+// children is content and must not be written at all. Read as the second, one
+// stylesheet left mid-edit anywhere in the project put every subsequent page
+// write's surrounding markup at COLUMN ZERO -- unrelated `<h2>`s and closing
+// tags de-indented, which is an active edit rather than a missing one. See
+// `rendersIndent` in electron/astroParser.js, which is built from the named
+// tokens alone and never from this sentinel.
 //
 // AND IT IS NOT `getComputedStyle`. The live preview could answer this exactly,
 // and using it would make the bytes written to disk depend on whether a window
@@ -32,10 +47,10 @@
 // not exist until after the write. The preview's only legitimate role here is
 // as a test oracle.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const postcss = require('postcss');
-const { findStylesheets } = require('./cssVars');
 
 // The sentinel for "some rule in this project may match anything". A real token
 // is always prefixed (`.name`, `#name`) or a bare tag name, so `*` cannot
@@ -48,6 +63,15 @@ const ANY = '*';
 const MAX_BYTES = 2 * 1024 * 1024;
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '.astro', '.stacki']);
+
+// Deep enough for any hand-written source tree, and a cap rather than a
+// promise: a directory below it is a part of the project nobody looked at, and
+// hitting it is a failure that contributes ANY rather than a quiet stop.
+const MAX_DEPTH = 12;
+
+// Every file whose text could hold a rule. Stylesheets, and the `<style>`
+// blocks of pages, layouts and components.
+const SOURCE_FILE = /\.(css|astro|svelte|vue|html)$/i;
 
 // THE THREE VALUES THAT RENDER DIFFERENTLY AFTER A REINDENT, AND THE THREE THAT
 // DO NOT. Measured in a real Blink window: with `pre`, `pre-wrap` and
@@ -113,6 +137,37 @@ function declarationPreserves(decl) {
   return PRESERVING_VALUE.test(value);
 }
 
+// THE DECLARATION SPELLED AS A UTILITY NAME INSIDE A RULE.
+//
+// `.preserved { @apply whitespace-pre; }` is the same statement as
+// `.preserved { white-space: pre; }`, and postcss hands it over as an AtRule
+// rather than a Decl -- so `rule.each` looked straight past it and the rule
+// contributed NOTHING, not even ANY. Measured: `tokensInCss('.preserved {
+// @apply whitespace-pre; }')` answered `[]`, which the parser reads as the
+// positive statement "no rule preserves this element's whitespace", and the
+// authored `alpha\n      beta\ngamma` came back two spaces shorter.
+//
+// The variants are matched loosely on purpose: a configured prefix
+// (`tw-whitespace-pre`) or a variant (`md:whitespace-pre`) is still the same
+// utility, and over-matching here only ever refuses a reindent.
+const APPLY_PRESERVES = /whitespace-(pre(-wrap)?|break-spaces)(?![\w-])/i;
+
+// AND THE SPELLINGS WHOSE UTILITY LIST IS NOT IN THE TEXT need no branch here,
+// which is worth saying because one was written and then deleted for claiming
+// to catch something it never reached. `@apply #{$utils}`, `${utils}` and
+// `@{utils}` all make postcss throw on the WORD inside the braces, so the file
+// arrives at ANY through `tokensInCss`'s own parse gate before any of this
+// runs. What is genuinely left over is an `@apply` naming a custom utility --
+// and that is ANY too whenever the utility was declared in CSS the scan
+// reached, through the `walkAtRules` pass below. A utility defined in a
+// JavaScript config is the residual, and docs/mcp-v1.md says so.
+
+/** Does one at-rule written INSIDE a style rule preserve whitespace? */
+function atRuleInRule(at) {
+  if (String(at.name || '').toLowerCase() !== 'apply') return false;
+  return APPLY_PRESERVES.test(String(at.params || ''));
+}
+
 /**
  * Every token any preserving rule in one stylesheet's text can match.
  *
@@ -133,6 +188,7 @@ function tokensInCss(text) {
     let preserves = false;
     rule.each((node) => {
       if (node.type === 'decl' && declarationPreserves(node)) preserves = true;
+      else if (node.type === 'atrule' && atRuleInRule(node)) preserves = true;
     });
     if (!preserves) return;
     // A rule nested inside `@media`, `@supports`, `@layer` or a parent rule
@@ -142,6 +198,20 @@ function tokensInCss(text) {
     for (const one of rule.selectors || [rule.selector]) {
       for (const token of tokensOfSelector(one)) found.add(token);
     }
+  });
+  // A DECLARATION THAT NAMES NO ELEMENT, BECAUSE ITS SUBJECT IS A NAME SOMEWHERE
+  // ELSE. `@utility keep-space { white-space: pre }` and `@mixin keep-space {
+  // white-space: pre }` both declare the property with no selector to reduce,
+  // and whatever `@apply keep-space` or `@include keep-space` is written on
+  // inherits it. Which elements those are is not answerable from this file
+  // alone, so the whole project's answer is ANY -- which is also what covers an
+  // `@apply` naming a utility this reducer has never heard of, as long as the
+  // utility itself was declared in CSS the scan reached.
+  root.walkAtRules((at) => {
+    if (typeof at.each !== 'function') return;
+    at.each((node) => {
+      if (node.type === 'decl' && declarationPreserves(node)) found.add(ANY);
+    });
   });
   return found;
 }
@@ -156,33 +226,56 @@ function styleBlocksIn(text) {
 }
 
 /**
- * Every file whose text could hold a rule: the project's stylesheets, and the
- * `<style>` blocks of its pages, layouts and components.
+ * Every file whose text could hold a rule, and whether the walk saw all of it.
  *
- * Whose components a page actually uses is a question about imports, and
- * answering it wrongly is the one direction that loses bytes -- so the scan is
- * the whole of `src`, which is a superset of any page's own chain and is sound
- * for a question only ever read as NO.
+ * ITS OWN WALK, NOT `cssVars.findStylesheets`. That one answers a question
+ * where a directory it cannot list is fairly reported as "no variables in
+ * there", and it swallows the failure with a bare `return`. Here the same
+ * silence is a positive claim -- "this project has no rule that preserves
+ * whitespace" -- and it deletes rendered bytes. Measured on one fixture and one
+ * move: an unreadable FILE gave `['*']` and kept `alpha\n      beta\ngamma`; an
+ * unreadable DIRECTORY holding the same stylesheet gave `[]` and wrote back
+ * `alpha\n    beta\ngamma`, two spaces gone. So this walk reports `failed`
+ * instead, and it is left as a separate walk rather than pushed down into the
+ * shared one, whose callers want the forgiving answer.
+ *
+ * A directory that is NOT THERE is not a directory that was hidden: a project
+ * with no `public/` is a fact, not a failure, and only an error that is neither
+ * ENOENT nor ENOTDIR says part of the tree was unreadable.
+ *
+ * THE WHOLE PROJECT, not `src` plus the three stylesheet roots. Whose
+ * stylesheet a page actually imports is a question about module resolution, and
+ * answering it wrongly is the one direction that loses bytes -- measured, an
+ * `assets/site.css` holding `.preserved { white-space: pre }` and imported from
+ * a page's frontmatter sat outside every scanned root and answered `[]`. The
+ * superset is sound for a question only ever read as NO, and `SKIP_DIRS` keeps
+ * it off the build output and the dependency tree.
  */
 function sourcesOf(projectPath) {
-  const files = [...findStylesheets(projectPath)];
+  const files = [];
+  let failed = false;
   const walk = (dir, depth) => {
-    if (depth > 8) return;
+    if (depth > MAX_DEPTH) {
+      failed = true;
+      return;
+    }
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) return;
+      failed = true;
       return;
     }
     for (const entry of entries) {
       if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full, depth + 1);
-      else if (/\.(astro|svelte|vue|html)$/i.test(entry.name)) files.push(full);
+      else if (SOURCE_FILE.test(entry.name)) files.push(full);
     }
   };
-  walk(path.join(projectPath, 'src'), 0);
-  return [...new Set(files)].sort();
+  walk(projectPath, 0);
+  return { files: [...new Set(files)].sort(), failed };
 }
 
 // The last answer, and the stamp it was computed from. A page:write asks this
@@ -190,10 +283,43 @@ function sourcesOf(projectPath) {
 // keyed on the same thing a rebuild would be: every candidate file's path, size
 // and mtime.
 let cached = null;
+// How many times the scan has actually run, for a test that needs to know the
+// cache hit rather than assume it.
+let scans = 0;
 
-function stampOf(files) {
+const hash = (text) => crypto.createHash('sha1').update(text, 'utf8').digest('hex');
+
+/**
+ * The text of one file the caller already holds, or null.
+ *
+ * THE PAGE BEING WRITTEN IS ONE OF THE FILES THIS SCAN COVERS, which is why the
+ * cache never hit. `page:write` asks for the tokens and then changes the page's
+ * bytes, so save N moved the page's size and mtime and save N+1 missed on its
+ * own stamp: measured, files read during `preservingTokens` were 3, 3, 3, 3, 3
+ * across five consecutive saves -- a full synchronous re-read and postcss
+ * re-parse of every stylesheet on the main process, every save.
+ *
+ * Dropping the page from the scan is not the fix: its own `<style>` block
+ * styles its own elements, and losing those rules is the byte-losing
+ * direction. So the caller hands in the text it already read, and that file is
+ * stamped by the HASH OF ITS `<style>` BLOCKS instead of by size and mtime --
+ * the only part of it this scan reads. A save that leaves the style block alone
+ * therefore hits the cache, and one that edits it still misses.
+ */
+function knownTextOf(known, abs) {
+  if (!known) return null;
+  const text = known.get(abs);
+  return typeof text === 'string' ? text : null;
+}
+
+function stampOf(files, known) {
   const parts = [];
   for (const abs of files) {
+    const text = knownTextOf(known, abs);
+    if (text !== null) {
+      parts.push(`${abs}:style:${hash(JSON.stringify(styleBlocksIn(text)))}`);
+      continue;
+    }
     try {
       const st = fs.statSync(abs);
       parts.push(`${abs}:${st.size}:${st.mtimeMs}`);
@@ -204,6 +330,17 @@ function stampOf(files) {
   return parts.join('|');
 }
 
+/** `options.knownText` as a map keyed the way the walk keys its files. */
+function knownMap(options) {
+  const given = options && typeof options === 'object' ? options.knownText : null;
+  if (!given || typeof given !== 'object') return null;
+  const map = new Map();
+  for (const [key, value] of Object.entries(given)) {
+    if (typeof key === 'string' && typeof value === 'string') map.set(path.resolve(key), value);
+  }
+  return map.size ? map : null;
+}
+
 /**
  * The token set for one project, or a set holding only ANY when the project
  * cannot be scanned at all.
@@ -212,33 +349,42 @@ function stampOf(files) {
  * it can act on, and the answer to "something went wrong" is the one that
  * refuses reindentation rather than the one that permits it.
  */
-function preservingTokens(projectPath) {
+function preservingTokens(projectPath, options = {}) {
   if (!projectPath || typeof projectPath !== 'string') return new Set();
-  let files;
+  const known = knownMap(options);
+  let scan;
   try {
-    files = sourcesOf(projectPath);
+    scan = sourcesOf(projectPath);
   } catch {
     return new Set([ANY]);
   }
-  const stamp = `${projectPath}\n${stampOf(files)}`;
+  const stamp = `${projectPath}\n${scan.failed ? 'unwalkable\n' : ''}${stampOf(scan.files, known)}`;
   if (cached && cached.stamp === stamp) return cached.tokens;
+  scans += 1;
 
   const tokens = new Set();
-  for (const abs of files) {
-    let text;
-    try {
-      if (fs.statSync(abs).size > MAX_BYTES) {
+  // A PART OF THE TREE NOBODY LOOKED AT IS NOT A PART OF THE TREE WITH NO RULES
+  // IN IT. A directory that would not list, or one below the depth cap, takes
+  // every stylesheet under it out of the file list, and an empty list is the
+  // positive answer "nothing here preserves whitespace".
+  if (scan.failed) tokens.add(ANY);
+  for (const abs of scan.files) {
+    let text = knownTextOf(known, abs);
+    if (text === null) {
+      try {
+        if (fs.statSync(abs).size > MAX_BYTES) {
+          tokens.add(ANY);
+          continue;
+        }
+        text = fs.readFileSync(abs, 'utf8');
+      } catch {
+        // A FILE THAT WILL NOT READ IS NOT A FILE WITH NO RULES IN IT.
+        // Answering "no tokens" here is how a permissions error or a file
+        // deleted mid-scan would quietly re-enable a reindent that deletes
+        // rendered spaces.
         tokens.add(ANY);
         continue;
       }
-      text = fs.readFileSync(abs, 'utf8');
-    } catch {
-      // A FILE THAT WILL NOT READ IS NOT A FILE WITH NO RULES IN IT.
-      // Answering "no tokens" here is how a permissions error or a file
-      // deleted mid-scan would quietly re-enable a reindent that deletes
-      // rendered spaces.
-      tokens.add(ANY);
-      continue;
     }
     const texts = /\.css$/i.test(abs) ? [text] : styleBlocksIn(text);
     for (const one of texts) for (const token of tokensInCss(one)) tokens.add(token);
@@ -252,9 +398,15 @@ function forgetCache() {
   cached = null;
 }
 
+/** How many scans have actually run, so a test can measure a cache hit. */
+function scansSoFar() {
+  return scans;
+}
+
 module.exports = {
   preservingTokens,
   tokensInCss,
   styleBlocksIn,
   forgetCache,
+  scansSoFar,
 };

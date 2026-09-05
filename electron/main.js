@@ -3439,14 +3439,31 @@ handle('page:write', async (_e, { pagePath, model }) => {
   // project side of that question is answered here -- the class, id and tag
   // tokens of every rule in this project's CSS that could preserve whitespace,
   // cached on the files' own mtimes -- and handed in. The scanner never throws
-  // and answers `'*'` for anything it could not read or reduce, so a broken
-  // stylesheet costs an element its reindentation rather than its bytes.
+  // and answers `'*'` for anything it could not read, list or reduce, so a
+  // broken stylesheet costs an element its reindentation rather than its bytes,
+  // and the writer is careful to read that answer as the admission it is rather
+  // than as a claim about how anything renders.
   //
-  // Required at the call site because this is the only place that asks; the
-  // module cache makes every save after the first a lookup.
+  // Required at the call site because this is the only place that asks.
+  //
+  // AND THE CACHE THAT NEVER HIT, because the page being saved is itself one of
+  // the files the scan covers and this call happens BEFORE `writePageText`:
+  // save N moved the page's size and mtime, so save N+1 missed on the page's
+  // own stamp. Measured, files read during `preservingTokens` were 3, 3, 3, 3,
+  // 3 across five consecutive saves — a synchronous re-read and postcss
+  // re-parse of every stylesheet and every style-bearing component on the main
+  // process, on every save. Dropping the page out of the scan would be the
+  // wrong fix: its own `<style>` block styles its own elements, and losing
+  // those rules is the direction that costs bytes. So the bytes just read are
+  // handed in — the scanner uses them instead of reading the file again, and
+  // stamps that one file by the hash of its `<style>` blocks, which is the only
+  // part of it it reads. A save that leaves the style block alone therefore
+  // hits the cache; one that edits it still misses.
   const { preservingTokens } = require('./whitespaceRules');
   const text = anchoredSerialize(before, model, {
-    preservingTokens: preservingTokens(openProjectRoot),
+    preservingTokens: preservingTokens(openProjectRoot, {
+      knownText: typeof before === 'string' ? { [pagePath]: before } : null,
+    }),
   });
   writePageText(pagePath, text);
   writeChunks(model);

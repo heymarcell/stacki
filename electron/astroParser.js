@@ -1569,7 +1569,34 @@ function litProp(node, name) {
  * any file it could not read. An EMPTY set is a real answer -- "this project
  * has no rule that preserves whitespace" -- and no set at all is the same
  * answer, which is the explicit decision recorded on `anchoredSerialize`.
+ *
+ * THE SENTINEL IS AN ADMISSION, NOT A MEASUREMENT, and this is the predicate
+ * that reads it as one. Everything that asks this is deciding whether to KEEP
+ * THE AUTHORED BYTES of something, which is the safe answer to "we do not
+ * know". The other question -- may the indentation BETWEEN an element's
+ * children be dropped, because that element renders it -- is not answerable
+ * from `'*'` at all, and is asked of `namedTokens` instead.
  */
+/**
+ * The same set with the scanner's admission of ignorance taken out of it.
+ *
+ * "WE COULD NOT PROVE A REINDENT IS SAFE" AND "THIS ELEMENT RENDERS ITS OWN
+ * WHITESPACE" ARE DIFFERENT STATEMENTS, and they shared one flag until one
+ * stylesheet left mid-edit -- a single unclosed brace -- made
+ * `preservingTokens` answer `{'*'}`, marked every node in the page as
+ * preserving, and put the layout around every subsequent splice at column
+ * zero: an `<h2>` from column 4 to 2, a `</section>` and a `<p>` from 2 to 0,
+ * on a move that named none of them. Uncertainty has to mean KEEP THE AUTHORED
+ * BYTES, never WRITE THE SURROUNDING LAYOUT AT COLUMN ZERO -- so the decisions
+ * of the second kind read this set, which holds only tokens a rule really
+ * named, and answers "no" where the scanner only said "unknown".
+ */
+function namedTokens(tokens) {
+  if (!tokens || typeof tokens.has !== 'function') return tokens;
+  if (!tokens.has('*')) return tokens;
+  return new Set([...tokens].filter((one) => one !== '*'));
+}
+
 function matchesPreservingTokens(node, tokens) {
   if (!tokens || typeof tokens.has !== 'function' || !tokens.size) return false;
   if (tokens.has('*')) return true;
@@ -1641,6 +1668,11 @@ function declaresRenderedSpace(node, tokens) {
  *
  * So: one top-down pass over the BASE tree before any splice is planned, and
  * the answer for every node is membership of the set this returns.
+ *
+ * Run TWICE, over the same tree, with two different token sets -- see
+ * `namedTokens` and `anchoredSerialize`. The question is the same one; what
+ * differs is whether the project's scanner is allowed to answer it with an
+ * admission of ignorance.
  */
 function preservingContext(nodes, tokens) {
   const preserves = new Set();
@@ -1966,19 +1998,35 @@ function childContext(base, next, ctx) {
     // itself. `preserving` on the context is the DESTINATION's flag: every
     // splice below is about the bytes between this element's tags, and inside a
     // preserving element those bytes are content rather than layout.
+    //
+    // AND THE SECOND FLAG, WHICH IS A STRICTLY SMALLER CLAIM. `preserving` is
+    // allowed to be true because the project's scanner could not prove
+    // otherwise, and everything it gates keeps bytes the file already has.
+    // `indentIsContent` gates the opposite kind of act -- writing the layout
+    // around a splice at COLUMN ZERO -- and that is only right for an element
+    // genuinely known to render its children's leading spaces. While the two
+    // shared one flag, one unparseable stylesheet anywhere in the project
+    // de-indented unrelated markup on every subsequent save.
     const preserving = ctx.preserves.has(base);
+    const indentIsContent = !!ctx.rendersIndent?.has(base);
     if (baseInline !== nextInline) {
       if (!laidOutAsBlock(base, ctx.source)) return null;
-      return { ...ctx, inline: false, structural: true, preserving };
+      return { ...ctx, inline: false, structural: true, preserving, indentIsContent };
     }
-    return { ...ctx, inline: baseInline, structural: true, preserving };
+    return { ...ctx, inline: baseInline, structural: true, preserving, indentIsContent };
   }
   // A loop, a condition and a branch keep the file's own block verbatim and
   // there is no rule here for putting a sibling INTO one, so only an aligned,
   // same-shaped child list is patched in place -- which is what this did
   // before, and it is what test/loop-source.js is about.
   if (base.kind === 'map' || base.kind === 'cond' || base.kind === 'branch') {
-    return { ...ctx, inline: false, structural: false, preserving: ctx.preserves.has(base) };
+    return {
+      ...ctx,
+      inline: false,
+      structural: false,
+      preserving: ctx.preserves.has(base),
+      indentIsContent: !!ctx.rendersIndent?.has(base),
+    };
   }
   return null;
 }
@@ -2102,7 +2150,15 @@ function insertSplice(source, baseNodes, at, newNodes, ctx) {
   // every line of it that the page then renders -- measured, two of them, in
   // front of a line that had none. The break has to be there, because the
   // element is genuinely on a new line; the spaces do not.
-  const indent = ctx.preserving ? '' : held;
+  //
+  // `indentIsContent` AND NOT `preserving`, because this is the one place where
+  // the uncertain answer and the preserving answer point opposite ways. Writing
+  // nothing is an ACT: it moves the sibling to column zero. Doing that because
+  // the project's scanner shrugged is how one stylesheet left mid-edit
+  // de-indented every page written after it. When the answer is "we do not
+  // know", the file's own indent is what goes in -- and the moved subtree still
+  // travels as authored, because `printNode` reads the wider flag.
+  const indent = ctx.indentIsContent ? '' : held;
   const gaps = (node) => ctx.eol.repeat(1 + (node.blankBefore || 0));
   if (at > 0) {
     const text = newNodes.map((node) => gaps(node) + indent + printNode(node, indent, ctx)).join('');
@@ -2124,8 +2180,10 @@ function rangeSplice(source, baseRun, nextRun, ctx) {
   const held = lineIndentOf(source, start);
   if (held === null) return null;
   // See `insertSplice`: inside a preserving element the indent between siblings
-  // is content, so the run is joined by the break alone.
-  const indent = ctx.preserving ? '' : held;
+  // is content, so the run is joined by the break alone -- and, for the same
+  // reason as there, only when the element is KNOWN to render it rather than
+  // merely unproven.
+  const indent = ctx.indentIsContent ? '' : held;
   const text = nextRun.map((node) => printNode(node, indent, ctx)).join(ctx.eol + indent);
   return [{ start, end, text }];
 }
@@ -2416,10 +2474,23 @@ function anchoredSerialize(source, model, options = {}) {
     // Every node of the BASE tree that renders its own leading spaces, walked
     // down from the root once so inheritance is answered rather than guessed.
     preserves: preservingContext(base.model.nodes || [], tokens),
+    // AND THE SAME WALK WITHOUT THE SCANNER'S SHRUG IN IT.
+    //
+    // Membership of `preserves` can come from the sentinel `'*'`, which says
+    // only that the project could not be scanned -- one unparseable stylesheet
+    // anywhere in it puts every node in that set. Everything gated on
+    // `preserves` keeps the bytes the file already has, so that is the right
+    // reading there. Writing a splice's surrounding layout at COLUMN ZERO is
+    // not that: it is an edit to markup nobody touched, and it needs the
+    // element to be KNOWN to render its children's indentation. So the same
+    // top-down walk runs again over `namedTokens`, and only the second set is
+    // allowed to move anything to column zero.
+    rendersIndent: preservingContext(base.model.nodes || [], namedTokens(tokens)),
     // The destination for the page's own top-level children is the document,
     // which preserves nothing. `childContext` sets this from the parent whose
     // children it is about to print.
     preserving: false,
+    indentIsContent: false,
   };
   const body = collectSplices(source, base.model.nodes || [], model.nodes || [], ctx);
   if (!body) return canonical;

@@ -1486,7 +1486,24 @@ function preservedFixture({ ind, eol }) {
   const raised = innerLines
     .map((line, n) => (n === 0 || !line.startsWith(ind) ? line : line.slice(ind.length)))
     .join(eol);
-  return { source, inner, raised };
+  // AND THE WHOLE FILE AFTER THAT MOVE WHEN THE BLOCK'S BYTES ARE HELD, spelled
+  // out rather than asked about one substring at a time. `innerOf` looks only
+  // between one element's tags, so it cannot see what the splice did to the
+  // markup AROUND it -- which is where the damage was: an unparseable
+  // stylesheet made the parser mark every node preserving, and every splice
+  // then wrote its surrounding layout at COLUMN ZERO. The `<h2>`-equivalents
+  // here are the `</div>` lines and the moved element's own line, and this is
+  // the only oracle that looks at them.
+  const kept = source.replace(
+    body,
+    `${i(1)}<div class='outer'>${eol}` +
+      `${i(2)}<div class='wrap'>${eol}` +
+      `${i(3)}<div class='preserved'>${inner}</div>${eol}` +
+      `${i(2)}</div>${eol}` +
+      `${i(2)}<div class='ordinary'>${inner}</div>${eol}` +
+      `${i(1)}</div>${eol}`
+  );
+  return { source, inner, raised, kept };
 }
 
 const innerOf = (text, cls) => {
@@ -1514,6 +1531,28 @@ async function raiseThroughTheApp(app, cls) {
   const which = cls === 'preserved' ? 0 : 1;
   if (!kids[which]?.ref) return { ok: false, why: `no child ${which}` };
   return run('target', 'move', { ref: kids[which].ref, to: { parentRef: outerRead.ref, index: 1 } });
+}
+
+/**
+ * The same raise with nothing mounted, for the failure modes that stop a
+ * project being opened at all.
+ *
+ * The construction is the one T7 (`theSameBytesWithNoWindow`) proves writes the
+ * same bytes as the move through the running app, so a byte oracle applied to
+ * this is a byte oracle applied to the product.
+ */
+function raiseHeadless(source, cls, tokens) {
+  const parsed = parsePage(source);
+  if (!parsed.editable) return null;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const wrap = outer?.children?.find((n) => n.name === 'div');
+  const kids = (wrap?.children || []).filter((n) => n.name === 'div');
+  const moved = kids[cls === 'preserved' ? 0 : 1];
+  if (!moved) return null;
+  wrap.children = wrap.children.filter((n) => n !== moved);
+  outer.children.splice(1, 0, moved);
+  return anchoredSerialize(source, model, { preservingTokens: tokens });
 }
 
 /**
@@ -1667,20 +1706,33 @@ async function neutralRulesChangeNothing(value) {
 }
 
 /**
- * T6 -- every failure resolves to keeping the bytes.
+ * T6 -- every failure resolves to keeping the bytes, AND TO NOTHING ELSE.
  *
- * A stylesheet postcss will not parse, and one the process cannot read. Neither
- * is a stylesheet with no rules in it, and answering "no tokens" for either is
- * how a permissions error would quietly re-enable a reindent that deletes
- * rendered spaces. The write still has to SUCCEED -- a broken stylesheet is not
- * a reason to refuse an edit -- and the bytes still have to be there.
+ * A stylesheet postcss will not parse, one the process cannot read, and one
+ * inside a DIRECTORY the process cannot list. None of the three is a stylesheet
+ * with no rules in it, and answering "no tokens" for any of them is how a
+ * permissions error would quietly re-enable a reindent that deletes rendered
+ * spaces. The write still has to SUCCEED -- a broken stylesheet is not a reason
+ * to refuse an edit -- and the bytes still have to be there.
+ *
+ * AND THE SURROUNDING MARKUP HAS TO BE UNTOUCHED, which is the half this used
+ * to miss. Its only byte assertion was `innerOf`, which reads between one
+ * element's tags; the failure sentinel was also being read as "every element
+ * renders its own whitespace", so every splice wrote the layout AROUND it at
+ * column zero and this stayed green while unrelated markup was de-indented on
+ * every save. The oracle is now the whole file.
  */
 async function aStylesheetThatCannotBeReadOrParsed(kind) {
   const label = `[css ${kind}]`;
   const shape = { id: 'two-space', ind: '  ', eol: '\n' };
-  const { source, inner } = preservedFixture(shape);
+  const { source, inner, kept } = preservedFixture(shape);
   const root = H.makeProject({ [PAGE]: source });
-  const broken = path.join(root, 'src', 'styles', 'broken.css');
+  // Its own directory, so the one the app's own style panel reads stays
+  // readable and this stays a test of the whitespace scan rather than of
+  // everything that walks a project.
+  const brokenDir = path.join(root, 'src', 'vendor');
+  fs.mkdirSync(brokenDir, { recursive: true });
+  const broken = path.join(brokenDir, 'broken.css');
   if (kind === 'unparseable') fs.writeFileSync(broken, '.preserved { white-space: pre\n@media {\n', 'utf8');
   else {
     fs.writeFileSync(broken, '.preserved { white-space: pre; }\n', 'utf8');
@@ -1689,7 +1741,7 @@ async function aStylesheetThatCannotBeReadOrParsed(kind) {
   const app = await H.start(root, { agentMode: 'full' });
   await H.settle(400);
   try {
-    // THE PREMISE: the file really is unusable. A test whose broken input is
+    // THE PREMISE: the thing really is unusable. A test whose broken input is
     // quietly fine is a test of nothing.
     if (kind === 'unparseable') {
       let threw = false;
@@ -1717,9 +1769,19 @@ async function aStylesheetThatCannotBeReadOrParsed(kind) {
       innerOf(after, 'ordinary') === inner && innerOf(after, 'preserved') === inner,
       short({ want: inner, ordinary: innerOf(after, 'ordinary'), preserved: innerOf(after, 'preserved') })
     );
+    // THE ONE THE OLD ASSERTIONS COULD NOT SEE: uncertainty holds the moved
+    // block's bytes and changes NOTHING else. Every other line of the file --
+    // the two `</div>`s and the line the block now sits on -- keeps the
+    // indentation the author wrote.
+    check(
+      `${label} and the markup around the move keeps the indentation the file had`,
+      after === kept,
+      short({ span: changedSpan(kept, after) })
+    );
   } finally {
     app.stop();
     try {
+      fs.chmodSync(brokenDir, 0o755);
       fs.chmodSync(broken, 0o644);
     } catch {
       /* already gone */
@@ -1863,6 +1925,47 @@ function movedIntoPreservedWhitespace(attr, preserved) {
 }
 
 /**
+ * T2b -- THE SAME MOVE INTO AN ELEMENT NOBODY COULD MEASURE.
+ *
+ * The destination declares nothing at all; what is unknown is the PROJECT --
+ * `preservingTokens` answered `{'*'}` because a stylesheet somewhere in it
+ * would not parse. That sentinel used to be read as "every element renders its
+ * own whitespace", so the insert went in at COLUMN ZERO: the layout of markup
+ * nobody touched, actively rewritten because a scan failed.
+ *
+ * The two halves of the right answer are asserted in one string, and they pull
+ * in opposite directions, which is the whole point. The moved block's own bytes
+ * travel UNSHIFTED, because a reindent could be the thing that deletes rendered
+ * spaces. The line it lands on gets the SIBLING'S INDENT, because writing
+ * nothing there is not caution, it is an edit.
+ */
+function movedIntoAnUnprovenElement() {
+  const label = '[into unproven]';
+  const source = commentedPage(
+    `  <div class='plain'>\n    <span class='kept'>one</span>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n  <p>alpha\nbeta</p>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const box = root.children.find((n) => n.name === 'div');
+  const p = root.children.find((n) => n.name === 'p');
+  if (!check(`${label} both are where a move can reach them`, !!box && !!p, short(root.children.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== p);
+  box.children.push(p);
+  const after = anchoredSerialize(source, model, { preservingTokens: new Set(['*']) });
+  if (!check(`${label} the move puts the <p> inside the box`, /<span class='kept'>one<\/span>[\s\S]*<p>[\s\S]*<\/div>/.test(after), short(changedSpan(source, after)))) return;
+  const held = /<div [^>]*>([\s\S]*?)<\/div>/.exec(after);
+  const inserted = held ? held[1] : '';
+  check(
+    `${label} a project that could not be scanned holds the moved bytes and leaves the layout alone`,
+    inserted === `\n    <span class='kept'>one</span>\n    <p>alpha\nbeta</p>\n  `,
+    short({ got: inserted })
+  );
+}
+
+/**
  * T3 -- the value table, which is what keeps this a narrowing.
  *
  * Measured in a real Blink window over the same reindent: with `pre`,
@@ -1941,9 +2044,18 @@ function theWhitespaceValueTable() {
  * produces the identical damage and the two agree about it.
  */
 function elementChildrenInsideAPre() {
-  for (const tag of ['pre', 'div']) {
-    const label = `[children of <${tag}>]`;
-    const preserved = tag === 'pre';
+  // The third case is the one an element cannot answer about itself: an
+  // ordinary `<div>` in a project whose scan FAILED. Uncertainty has to keep
+  // the bytes here -- reprinting an inline run from the model is what collapsed
+  // `alpha\n beta\ngamma` into one line -- while, in `movedIntoAnUnprovenElement`,
+  // the same uncertainty must NOT move the surrounding layout to column zero.
+  // Both directions come off one flag each, and this pins the wide one.
+  const cases = [
+    { tag: 'pre', tokens: null, preserved: true, label: '[children of <pre>]' },
+    { tag: 'div', tokens: null, preserved: false, label: '[children of <div>]' },
+    { tag: 'div', tokens: new Set(['*']), preserved: true, label: '[children of <div> unproven]' },
+  ];
+  for (const { tag, tokens, preserved, label } of cases) {
     const body = `  <${tag}><span class='wrap'><span class='moved'>alpha\n beta\ngamma</span></span><span class='tail'>tail</span></${tag}>\n`;
     const source = commentedPage(body);
     const parsed = parsePage(source);
@@ -1967,7 +2079,7 @@ function elementChildrenInsideAPre() {
     }
     wrap.children = wrap.children.filter((n) => n !== moved);
     box.children.splice(1, 0, moved);
-    const after = anchoredSerialize(source, model);
+    const after = anchoredSerialize(source, model, tokens ? { preservingTokens: tokens } : {});
     // POSITIVE CONTROL: the span really left the wrap.
     if (!check(`${label} the move empties the wrap`, /<span class='wrap'><\/span>/.test(after), short(changedSpan(source, after)))) continue;
     const want = commentedPage(
@@ -2096,6 +2208,29 @@ function theSelectorReducer() {
     // Cut in half by the split and still right: the subject survived it whole.
     ['.a[data-x] .b { white-space: pre }', ['.b']],
     ['[data-x="a b"] { white-space: pre }', ['*']],
+    // THE DECLARATION SPELLED AS A UTILITY NAME. postcss hands `@apply` over as
+    // an AtRule, not a Decl, so `rule.each` looked straight past it and the
+    // rule contributed NOTHING -- not even ANY -- while the element's class was
+    // `.preserved`, which the element-local guard does not fire on either.
+    ['.preserved { @apply whitespace-pre; }', ['.preserved']],
+    ['@layer components { .preserved { @apply whitespace-pre; } }', ['.preserved']],
+    // A configured prefix or a variant is the same utility.
+    ['.preserved { @apply md:whitespace-pre-wrap; }', ['.preserved']],
+    // NEGATIVE CONTROL: an `@apply` that cannot preserve whitespace is read,
+    // not shrugged at. A scanner that answered ANY for every `@apply` would
+    // switch reindentation off for every project that uses Tailwind that way.
+    ['.card { @apply text-sm font-bold; }', []],
+    ['.card { @apply whitespace-normal; }', []],
+    // A declaration whose SUBJECT is a name somewhere else: whatever `@apply
+    // keep-space` is written on inherits it, and which elements those are is
+    // not answerable from this text.
+    ['@utility keep-space { white-space: pre; }', ['*']],
+    ['@mixin keep-space { white-space: pre; }', ['*']],
+    // And an `@apply` whose list a preprocessor builds at compile time. This
+    // one arrives at ANY through the parse gate rather than through any rule
+    // about `@apply` -- postcss throws on the word inside the braces -- and it
+    // is here so that stays true rather than being assumed.
+    ['.preserved { @apply #{$utils}; }', ['*']],
     // NEGATIVE CONTROLS: nothing here preserves anything, so nothing is
     // contributed -- not even ANY.
     ['.card { color: red }', []],
@@ -2145,6 +2280,182 @@ function theSelectorReducer() {
     WS.preservingTokens(null).size === 0 && WS.preservingTokens('').size === 0,
     short([...WS.preservingTokens(null)])
   );
+}
+
+/**
+ * T9 -- the three layouts the WALK missed, each of which answered `[]`.
+ *
+ * The empty set is not a shrug. The parser reads it as the positive statement
+ * "this project has no rule that preserves whitespace", and acts on it by
+ * reindenting -- so every hole in the walk is a hole that deletes rendered
+ * bytes, and the module header's claim that "every failure also contributes
+ * ANY" has to be true of directories and depth caps, not only of files.
+ */
+function theWalkThatCameBackShort() {
+  const rule = '.preserved { white-space: pre; }\n';
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner, raised } = preservedFixture(shape);
+
+  // A DIRECTORY THAT WILL NOT LIST TAKES EVERY STYLESHEET UNDER IT WITH IT.
+  // Measured on one fixture and one move: an unreadable FILE answered `['*']`
+  // and kept `alpha\n      beta\ngamma`; an unreadable DIRECTORY holding the
+  // same file answered `[]` and wrote back `alpha\n    beta\ngamma`, two spaces
+  // the page renders deleted. So the bytes are the oracle here too, and the
+  // move is done headlessly because an unlistable directory stops the app from
+  // opening the project at all.
+  const hiddenDir = H.makeProject({ [PAGE]: source, 'src/vendor/keep.css': rule });
+  const dir = path.join(hiddenDir, 'src', 'vendor');
+  WS.forgetCache();
+  const listed = [...WS.preservingTokens(hiddenDir)];
+  let listable = true;
+  let hidden = null;
+  let hiddenText = null;
+  try {
+    fs.chmodSync(dir, 0o000);
+    try {
+      fs.readdirSync(dir);
+    } catch {
+      listable = false;
+    }
+    WS.forgetCache();
+    const tokens = WS.preservingTokens(hiddenDir);
+    hidden = [...tokens];
+    hiddenText = raiseHeadless(source, 'preserved', tokens);
+  } finally {
+    try {
+      fs.chmodSync(dir, 0o755);
+    } catch {
+      /* already gone */
+    }
+    H.removeProject(hiddenDir);
+  }
+  if (check('[walk] the fixture directory really cannot be listed', !listable, 'the directory listed')) {
+    // PREMISE: while it IS readable the rule in it is found, so the check below
+    // is about the permission and not about the walk never reaching the file.
+    check('[walk] the rule in that directory is found while it is readable', listed.includes('.preserved'), short(listed));
+    check('[walk] a directory that cannot be listed contributes ANY', !!hidden && hidden.includes('*'), short(hidden));
+    check(
+      '[walk] and the move under it keeps the bytes the hidden rule protects',
+      !!hiddenText && innerOf(hiddenText, 'preserved') === inner && raised !== inner,
+      short({ want: inner, got: hiddenText === null ? null : innerOf(hiddenText, 'preserved') })
+    );
+  }
+
+  // A STYLESHEET THE PROJECT REALLY IMPORTS, SITTING OUTSIDE `src`, `public`
+  // AND `styles`. Measured: `assets/site.css` imported from the page's own
+  // frontmatter answered `[]`, and the authored `alpha\n      beta\ngamma` was
+  // written back two spaces shorter.
+  const outside = H.makeProject({ 'assets/site.css': rule });
+  WS.forgetCache();
+  const found = [...WS.preservingTokens(outside)];
+  H.removeProject(outside);
+  check('[walk] a stylesheet outside the three old roots is still scanned', found.includes('.preserved'), short(found));
+
+  // AND THE DEPTH CAP, which is a part of the tree nobody looked at rather than
+  // a part of the tree with nothing in it.
+  const deep = H.makeProject({ 'src/a/b/c/d/e/f/g/h/i/j/k/l/m/deep.css': rule });
+  WS.forgetCache();
+  const capped = [...WS.preservingTokens(deep)];
+  H.removeProject(deep);
+  check('[walk] a tree deeper than the cap contributes ANY', capped.includes('*'), short(capped));
+}
+
+/**
+ * T10 -- the cache that never hit.
+ *
+ * `page:write` asks for the tokens and THEN writes the page, and the page is
+ * itself one of the files the scan covers -- so save N moved its size and
+ * mtime and save N+1 missed on the page's own stamp. Measured, files read
+ * during `preservingTokens` were 3, 3, 3, 3, 3 across five consecutive saves:
+ * a synchronous re-read and postcss re-parse of every stylesheet and every
+ * style-bearing component, on the main process, on every save.
+ *
+ * Both halves are asserted, because they can fail apart: that the scanner can
+ * hit its cache when the caller hands in the page's bytes, and that a save
+ * through the real product actually does.
+ */
+async function theScanThatRanOnEverySave() {
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source } = preservedFixture(shape);
+  const css = `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space: pre; }\n`;
+
+  // --- THE SCANNER ON ITS OWN, counted by the reads it really does.
+  const root = H.makeProject({ [PAGE]: source, 'src/styles/site.css': css });
+  const abs = path.join(root, PAGE);
+  const realRead = fs.readFileSync;
+  const counts = [];
+  WS.forgetCache();
+  try {
+    for (let n = 0; n < 3; n += 1) {
+      const before = realRead.call(fs, abs, 'utf8');
+      let reads = 0;
+      fs.readFileSync = function counted(...args) {
+        if (typeof args[0] === 'string' && args[0].startsWith(root)) reads += 1;
+        return realRead.apply(fs, args);
+      };
+      try {
+        WS.preservingTokens(root, { knownText: { [abs]: before } });
+      } finally {
+        fs.readFileSync = realRead;
+      }
+      counts.push(reads);
+      // What page:write does next: the page's own bytes change.
+      fs.writeFileSync(abs, `${before}<!-- ${n} -->\n`, 'utf8');
+    }
+  } finally {
+    fs.readFileSync = realRead;
+  }
+  check('[cache] the first scan really reads the project', counts[0] > 0, short(counts));
+  check(
+    '[cache] a save that changed only the page reads nothing the second time',
+    counts.slice(1).every((n) => n === 0),
+    short(counts)
+  );
+  // AND THE CACHE STILL HAS TO MISS ON THE THING IT COVERS. The page is kept in
+  // the scan -- its own `<style>` block styles its own elements -- and stamped
+  // by the hash of those blocks, so editing one is a miss.
+  WS.forgetCache();
+  const without = [...WS.preservingTokens(root, { knownText: { [abs]: '<p>a</p>' } })];
+  const with_ = [...WS.preservingTokens(root, { knownText: { [abs]: "<p>a</p><style>.kept{white-space:pre}</style>" } })];
+  check(
+    '[cache] a page that gains a preserving <style> block is a miss, not a hit',
+    !without.includes('.kept') && with_.includes('.kept'),
+    short({ without, with: with_ })
+  );
+  H.removeProject(root);
+
+  // --- AND THE PRODUCT, because the scanner hitting its cache proves nothing
+  // about whether page:write hands it what it needs to.
+  const live = H.makeProject({ [PAGE]: source, 'src/styles/site.css': css });
+  const app = await H.start(live, { agentMode: 'full' });
+  await H.settle(400);
+  try {
+    const run = (d, a, args = {}) => app.api.run(d, a, args);
+    const page = (await run('target', 'read')).target;
+    const outer = (page?.children || []).find((c) => c.tag === 'div');
+    if (!check('[cache] the element a save can be aimed at is there', !!outer?.ref, short(page))) return;
+    const first = await run('target', 'set_prop', { ref: outer.ref, name: 'data-n', value: '1' });
+    if (!check('[cache] the first save through the product is accepted', first?.ok === true, short(first))) return;
+    // A write moves the document's revision on, so the second edit is aimed
+    // through a fresh read exactly as an agent's would be. `target.read` writes
+    // nothing, so the scan count below is still the second SAVE's.
+    const again = (await run('target', 'read')).target;
+    const outerAgain = (again?.children || []).find((c) => c.tag === 'div');
+    if (!check('[cache] the element is still there for a second save', !!outerAgain?.ref, short(again))) return;
+    const before = WS.scansSoFar();
+    const second = await run('target', 'set_prop', { ref: outerAgain.ref, name: 'data-n', value: '2' });
+    const after = WS.scansSoFar();
+    if (!check('[cache] the second save through the product is accepted', second?.ok === true, short(second))) return;
+    if (!check('[cache] the second save really wrote the page', app.read(PAGE).includes('data-n="2"'), tag(app.read(PAGE)))) return;
+    check(
+      '[cache] a second save re-scans no stylesheet the first one already read',
+      after === before,
+      short({ scansBefore: before, scansAfter: after })
+    );
+  } finally {
+    app.stop();
+    H.removeProject(live);
+  }
 }
 
 /**
@@ -2211,6 +2522,7 @@ function aDescendantThatDeclaresIt() {
   for (const attr of ["style='white-space: pre'", "class='whitespace-pre'", "class='plain'"]) {
     movedIntoPreservedWhitespace(attr, !attr.includes('plain'));
   }
+  movedIntoAnUnprovenElement();
   theWhitespaceValueTable();
   elementChildrenInsideAPre();
   movedIntoAPresInlineRun();
@@ -2219,6 +2531,7 @@ function aDescendantThatDeclaresIt() {
   }
   aDescendantThatDeclaresIt();
   theSelectorReducer();
+  theWalkThatCameBackShort();
   for (const shape of [
     { id: 'two-space', ind: '  ', eol: '\n' },
     { id: 'tabs', ind: '\t', eol: '\n' },
@@ -2230,8 +2543,13 @@ function aDescendantThatDeclaresIt() {
     await stylesheetPreservedWhitespace({ id: 'two-space', ind: '  ', eol: '\n' }, where);
   }
   for (const value of ['nowrap', 'pre-line']) await neutralRulesChangeNothing(value);
+  // 'unreadable-dir' is deliberately NOT here: an unlistable directory stops
+  // `listAstroFiles` before a project can be opened at all, so that failure
+  // mode is measured end to end in `theWalkThatCameBackShort` instead, with
+  // the same bytes and the same move but nothing mounted.
   for (const kind of ['unparseable', 'unreadable']) await aStylesheetThatCannotBeReadOrParsed(kind);
   await theSameBytesWithNoWindow();
+  await theScanThatRanOnEverySave();
 
   if (failures.length) {
     console.error(`source-fidelity-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
