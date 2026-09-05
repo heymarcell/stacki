@@ -921,7 +921,35 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // could not be cleared still ran, still returned ok:true, and still carried
       // `sessionIsolated`. A result that cannot support its own isolation claim
       // is worse than no result.
-      sessionReset = await withTimeout(resetAuditSession(session), PROBE_TIMEOUT_MS, 'clearing the audit session', signal);
+      //
+      // AND THE ABANDONED CLEAR THIS ONE USED TO DROP ON THE FLOOR.
+      //
+      // The reset on the way out hands its promise to `strand` when its budget
+      // expires, because a time box stops the WAITING and not the clear. These
+      // two awaits are the same round trip against the same shared partition,
+      // and they were letting go of it without a word. `resetAuditSession`
+      // NEVER rejects -- it answers {ok:false, reason} -- so the only ways out
+      // of this await are the timer and the abort, and both of them leave a
+      // live clearStorageData outstanding on `stacki-audit`.
+      //
+      // Reproduced on the double, one engine, two runs: run 1 is cancelled
+      // while its OPENING clear is in flight, run 1's own `finally` clear then
+      // succeeds so nothing is marked suspect, and run 2 is NOT refused -- it
+      // loads its page and answers `ok:true` with `sessionIsolated:true` while
+      // run 1's clear lands in the middle of it:
+      //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},{clear:1,whileRun:2}]
+      //
+      // So the promise is kept and handed on, exactly as the `finally` does.
+      // WHAT THE CALLER IS TOLD DOES NOT CHANGE: the error is rethrown, so a
+      // cancelled run still answers `cancelled` and a timed-out one still
+      // answers `audit_failed`. It is the NEXT audit that reads the mark.
+      const clearing = resetAuditSession(session);
+      try {
+        sessionReset = await withTimeout(clearing, PROBE_TIMEOUT_MS, 'clearing the audit session', signal);
+      } catch (err) {
+        strand(clearing, err);
+        throw err;
+      }
       if (!sessionReset.ok) {
         return {
           ok: false,
@@ -952,12 +980,25 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // as across two. Without this, a page that sets state on its first
           // visit shows the phone a first visit and the tablet a return visit,
           // and the two viewports are no longer measuring the same page.
-          const between = await withTimeout(
-            resetAuditSession(session),
-            PROBE_TIMEOUT_MS,
-            `clearing the audit session before the ${viewport.key} viewport`,
-            signal
-          );
+          //
+          // AND THE SAME ABANDONED CLEAR, for the same reason as the reset at
+          // the top of the run: the timer and the abort both walk away from a
+          // round trip that is still live on the shared partition, and the next
+          // audit has to be told rather than left to measure a page this clear
+          // may wipe underneath it.
+          const clearingBetween = resetAuditSession(session);
+          let between;
+          try {
+            between = await withTimeout(
+              clearingBetween,
+              PROBE_TIMEOUT_MS,
+              `clearing the audit session before the ${viewport.key} viewport`,
+              signal
+            );
+          } catch (err) {
+            strand(clearingBetween, err);
+            throw err;
+          }
           if (!between.ok) {
             return {
               ok: false,

@@ -3180,6 +3180,313 @@ function theReorderOfBlockChildrenInsideAPre() {
 }
 
 /**
+ * T15c -- A REORDER COMBINED WITH AN INSERT OR A DELETE IS STILL A REORDER.
+ *
+ * T15b fixed a PURE permutation of a preserving element's children by asking
+ * `reorderedInPlace` before the descent. That function answered only a pure
+ * permutation and returned null for everything else, so a reorder that ALSO
+ * added or dropped a sibling fell straight back through to the child splices --
+ * and those write the layout AROUND each child, which inside a preserving
+ * element is no indent at all. The child that merely MOVED then landed at
+ * COLUMN ZERO, with `ok` and no fallback. Measured before the fix, on
+ * `<pre>\n      <p>alpha</p>\n      <p>beta</p>\n      <p>gamma</p>\n</pre>`:
+ *
+ *   [beta, alpha, gamma, +delta] -> `<pre>\n      <p>beta</p>\n<p>alpha</p>\n      <p>gamma</p>\n<p>delta</p>\n</pre>`
+ *   [gamma, alpha], beta dropped -> `<pre>\n      <p>gamma</p>\n<p>alpha</p>\n</pre>`
+ *
+ * Six rendered spaces deleted from a node the edit only asked to MOVE, in a
+ * file the caller was told had been written successfully.
+ *
+ * THE ORACLE IS THE WHOLE FILE, byte for byte, for T15's reason: the fallback
+ * reprint is damaged too -- `serializePage` re-lays a `<pre>`'s element
+ * children out and the block comes back on one line -- so "not the reprint"
+ * would pass on the same damage arriving by another road.
+ *
+ * THE ORACLE IS ALSO A RULE RATHER THAN A TABLE OF STRINGS, and the rule is the
+ * one the fix is stated in: a child THE FILE ALREADY HOLDS contributes its own
+ * authored indent, and a child that is genuinely NEW contributes the indent
+ * this code is allowed to decide -- nothing inside a preserving element, the
+ * sibling's own indent everywhere else. `PLAIN` is the row that keeps the
+ * second half honest: an ordinary `<div>` must still indent everything,
+ * including the node that moved, so a fix that simply stopped writing indents
+ * cannot pass this.
+ *
+ * And the cascaded row ties this to T18: an element whose preserving
+ * declaration is only reachable by reading the cascade in order has to reach
+ * every one of these decisions too, not just the one T18 measures.
+ */
+const REORDER_SHAPES = [
+  { id: '<pre>', open: '<pre>', close: '</pre>', tag: 'pre', ind: '      ', closeInd: '', preserved: true },
+  { id: '<textarea>', open: '<textarea>', close: '</textarea>', tag: 'textarea', ind: '    ', closeInd: '', preserved: true },
+  { id: "style='white-space: pre'", open: "<div style='white-space: pre'>", close: '</div>', tag: 'div', ind: '      ', closeInd: '  ', preserved: true },
+  { id: 'cascaded style', open: "<div style='white-space: normal; white-space: pre'>", close: '</div>', tag: 'div', ind: '      ', closeInd: '  ', preserved: true },
+  { id: "class='plain'", open: "<div class='plain'>", close: '</div>', tag: 'div', ind: '    ', closeInd: '  ', preserved: false },
+  // THE ROW WHERE THE TWO WHITESPACE FLAGS POINT OPPOSITE WAYS, which is the
+  // only place the indent this code decides is read off the ACTING flag rather
+  // than off the branch that got here. A project whose stylesheet scan shrugged
+  // puts every element in `preserves` -- so the reorder path runs at all -- and
+  // nothing in `rendersIndent`, so a node it inserts must still be written at
+  // the file's own indent. Bytes identical to the plain row above, reached by a
+  // different road: writing column zero because the scanner could not answer is
+  // how one unparseable stylesheet de-indented every page saved after it.
+  {
+    id: 'unproven project',
+    open: "<div class='plain'>",
+    close: '</div>',
+    tag: 'div',
+    ind: '    ',
+    closeInd: '  ',
+    preserved: false,
+    tokens: new Set(['*']),
+  },
+];
+
+// Each entry is the child list the model is left holding, written as the
+// authored children's own names plus `+delta` for one the file has never seen.
+const REORDER_ORDERS = [
+  { id: 'reorder + insert at the end', want: ['beta', 'alpha', 'gamma', '+delta'] },
+  { id: 'reorder + insert at the front', want: ['+delta', 'beta', 'alpha', 'gamma'] },
+  { id: 'reorder + insert in the middle', want: ['beta', '+delta', 'alpha', 'gamma'] },
+  { id: 'reorder + delete', want: ['gamma', 'alpha'] },
+  { id: 'reorder + delete + insert', want: ['gamma', '+delta', 'alpha'] },
+  // The control T15b already owns, run here on the same builder so a fix that
+  // answers the new shapes by dropping the old one cannot hide.
+  { id: 'pure reorder', want: ['beta', 'alpha', 'gamma'] },
+];
+
+function theReorderThatAlsoAddsOrRemovesAChild() {
+  for (const shape of REORDER_SHAPES) {
+    const authored = ['alpha', 'beta', 'gamma'];
+    const body =
+      `  ${shape.open}\n` +
+      authored.map((name) => `${shape.ind}<p>${name}</p>\n`).join('') +
+      `${shape.closeInd}${shape.close}\n`;
+    const source = commentedPage(body);
+    for (const order of REORDER_ORDERS) {
+      const label = `[${order.id}/${shape.id}]`;
+      const parsed = parsePage(source);
+      if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+      const model = structuredClone(parsed.model);
+      const box = model.nodes[0].children.find((n) => n.name === shape.tag);
+      if (!check(`${label} the element is where a reorder can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) {
+        continue;
+      }
+      // The gap between two children arrives as a whitespace-only text node or
+      // as nothing at all; either way it is the file's bytes and not a child
+      // any operation names.
+      const real = (box.children || []).filter((n) => !(n.kind === 'text' && !String(n.value ?? '').trim()));
+      const named = (name) => real.find((n) => n.children?.[0]?.value === name);
+      if (!check(`${label} all three children are addressable`, authored.every(named), short(real.map((n) => n.children?.[0]?.value)))) {
+        continue;
+      }
+      box.children = order.want.map((name) =>
+        name.startsWith('+')
+          ? { kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: name.slice(1) }] }
+          : named(name)
+      );
+      const after = anchoredSerialize(source, model, shape.tokens ? { preservingTokens: shape.tokens } : {});
+      // A NEW child has no authored bytes, so its indent is the one decision
+      // this code may make; every other child keeps the one the file gave it.
+      const want = commentedPage(
+        `  ${shape.open}\n` +
+          order.want
+            .map((name) => `${shape.preserved && name.startsWith('+') ? '' : shape.ind}<p>${name.replace('+', '')}</p>\n`)
+            .join('') +
+          `${shape.closeInd}${shape.close}\n`
+      );
+      // POSITIVE CONTROL: the operation really happened, so a write that
+      // changed nothing at all cannot read as a pass.
+      if (
+        !check(
+          `${label} the children really are in the order the model asked for`,
+          order.want.map((n) => n.replace('+', '')).join(',') ===
+            (after.match(/<p>(\w+)<\/p>/g) || []).map((m) => /<p>(\w+)<\/p>/.exec(m)[1]).join(','),
+          short({ span: changedSpan(source, after) })
+        )
+      ) {
+        continue;
+      }
+      check(
+        shape.preserved
+          ? `${label} every child the file already held keeps its own authored indent`
+          : `${label} an ordinary element still indents all of them`,
+        after === want,
+        short({ span: changedSpan(want, after) })
+      );
+    }
+  }
+}
+
+/**
+ * T15d -- AND THE SHAPE THE REORDER PATH MUST HAND BACK.
+ *
+ * The generalised reorder can place a NEW child only where the file gave every
+ * child a line of its own. Inside an INLINE RUN the gaps are text nodes the
+ * MODEL holds rather than bytes between anchors, so a break written where the
+ * model has no text node produces a tree `saysWhatTheModelSaid` does not
+ * recognise -- and a splice that fails the readback does not fall back to the
+ * older splice, it falls back to REPRINTING THE DOCUMENT. Measured: a swap of
+ * two `<span>`s inside a `<pre>` with a third appended came back with
+ * `// Component imports` torn off the import it annotates, on an edit that
+ * named neither the frontmatter nor the comment.
+ *
+ * WHAT THIS CHECKS IS THE BLAST RADIUS, NOT THE `<pre>`. The `<pre>`'s own
+ * bytes are collapsed here either way, by the older inline-run limitation
+ * `movedIntoAPresInlineRun` is about -- `serializePage` re-lays the run out and
+ * `preservedRun` is the splice that owns that shape. What the reorder path owes
+ * this fixture is that it does not make things worse by dragging the whole file
+ * through the reprint, so the oracle is every byte the `<pre>` is not.
+ */
+function theReorderBesideAnInlineRun() {
+  const label = '[reorder + append in an inline run]';
+  const body = `  <pre>\n<span class='a'>alpha\n  beta</span>\n<span class='b'>tail</span>\n</pre>\n`;
+  const source = commentedPage(body);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const pre = model.nodes[0].children.find((n) => n.name === 'pre');
+  const kids = pre?.children || [];
+  const ia = kids.findIndex((n) => n.props?.class?.value === 'a');
+  const ib = kids.findIndex((n) => n.props?.class?.value === 'b');
+  if (!check(`${label} both spans are where a reorder can reach them`, ia >= 0 && ib >= 0, short(kids.map((n) => n.name)))) return;
+  const swap = kids[ia];
+  kids[ia] = kids[ib];
+  kids[ib] = swap;
+  kids.push({
+    kind: 'element',
+    name: 'span',
+    props: { class: { type: 'string', value: 'c' } },
+    children: [{ kind: 'text', value: 'new' }],
+  });
+  const after = anchoredSerialize(source, model);
+  if (!check(`${label} the third span really was appended`, after.includes('new</span>'), short({ span: changedSpan(source, after) }))) return;
+  const head = source.slice(0, source.indexOf('---\n<Base>'));
+  check(
+    `${label} the frontmatter comments stay on the imports they annotate`,
+    after.startsWith(head),
+    short({ want: head, got: after.slice(0, head.length) })
+  );
+  check(
+    `${label} and nothing outside the <pre> is rewritten`,
+    after.slice(after.indexOf('</pre>')) === '</pre>\n</Base>\n',
+    short({ got: after.slice(after.indexOf('</pre>')) })
+  );
+}
+
+/**
+ * T18 -- INLINE CSS READ WITHOUT CASCADE ORDER.
+ *
+ * `ownWhitespaceRule` tested the DROPPING regex first and both regexes matched
+ * anywhere in the `style` attribute, so nothing here read declaration order at
+ * all. `style='white-space: normal; white-space: pre'` -- computed `pre` in
+ * every browser, because a later declaration of the same property wins -- was
+ * treated as NOT preserving in both directions at once:
+ *
+ *   * the ACTING flag said the element does not render its children's indent,
+ *     so an insert into it was written at the sibling's indent -- SIX SPACES of
+ *     rendered content in front of a node the caller only asked to add, with
+ *     `ok` and no fallback; and
+ *   * the WIDE flag said the element preserves nothing, so a block moved OUT of
+ *     it was reindented and two rendered spaces went with the move.
+ *
+ * `white-space: normal; white-space: pre !important` behaved the same, and so
+ * did every other ordering, which is the tell: this was not a wrong rule about
+ * order, it was no rule about order.
+ *
+ * THE ROWS THAT MAKE THIS A TEST OF THE CASCADE rather than of "any preserving
+ * value wins" are the reversed ones. `white-space: pre; white-space: normal`
+ * must come out NOT preserving in both directions -- a fix that reordered the
+ * two tests and stopped there fails exactly there -- and
+ * `white-space: pre !important; white-space: normal` must come out preserving
+ * even though the dropping declaration is last, which is the half that order
+ * alone cannot answer.
+ *
+ * `white-space: pre; white-space: var(--ws)` is the row where the two readers
+ * still disagree, and it is deliberately spelled with a readable value FIRST:
+ * the winner is the unreadable one, so the acting flag has nothing to act on
+ * and abstains, while the wide flag counts it as a could. That difference is
+ * documented on `UNREADABLE_SPACE_VALUE` and is not a cascade
+ * question; the row is here so the cascade fix cannot quietly erase it.
+ */
+function theCascadeInsideOneStyleAttribute() {
+  const kept = `    <span class='kept'>one</span>`;
+  // Does the element RENDER its children's indentation -- the acting flag, read
+  // through an insert, which is the only place it writes markup at column zero.
+  const ACTING = [
+    ['white-space: pre', true],
+    ['white-space: normal', false],
+    ['white-space: normal; white-space: pre', true],
+    ['white-space: normal;white-space:pre', true],
+    ['white-space: normal; white-space: pre !important', true],
+    ['white-space: pre !important; white-space: normal', true],
+    ['white-space: pre; white-space: normal', false],
+    ['white-space: nowrap; white-space: break-spaces', true],
+    ['color: red; white-space: normal; padding: 0; white-space: pre-wrap', true],
+    // `pre-line` collapses runs of spaces, so it is neither, exactly as a bare
+    // one always was: the cascade picks it and it still says nothing.
+    ['white-space: normal; white-space: pre-line', false],
+    ['white-space: pre; white-space: var(--ws)', false],
+  ];
+  for (const [style, acts] of ACTING) {
+    const label = `[cascade acting ${style}]`;
+    const source = commentedPage(`  <div style='${style}'>\n${kept}\n  </div>\n`);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === 'div');
+    if (!check(`${label} the div is where an insert can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) continue;
+    box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+    const after = anchoredSerialize(source, model);
+    const want = commentedPage(`  <div style='${style}'>\n${kept}\n${acts ? '' : '    '}<p>new</p>\n  </div>\n`);
+    check(
+      acts
+        ? `${label} computes to a preserving value, so the insert writes no indent`
+        : `${label} computes to a dropping value, so the file's own indent goes in`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+  }
+
+  // And the WIDE flag, which the same defect got wrong in the other direction:
+  // a block moved OUT of the element is reindented unless the element is read
+  // as preserving, and a reindent inside one deletes rendered spaces.
+  const WIDE = [
+    ['white-space: pre', true],
+    ['white-space: normal', false],
+    ['white-space: normal; white-space: pre', true],
+    ['white-space: pre; white-space: normal', false],
+    ['white-space: normal; white-space: pre !important', true],
+    ['white-space: pre !important; white-space: normal', true],
+    ['white-space: normal; white-space: var(--ws)', true],
+    ['white-space: normal; white-space: pre-line', false],
+  ];
+  for (const [style, holds] of WIDE) {
+    const label = `[cascade wide ${style}]`;
+    const source = commentedPage(
+      `  <div class='outer'>\n    <div style='${style}'>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </div>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const box = outer?.children?.find((n) => n.name === 'div');
+    const moved = box?.children?.find((n) => n.name === 'div');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(box?.children?.map((n) => n.name)))) continue;
+    box.children = box.children.filter((n) => n !== moved);
+    outer.children.push(moved);
+    const after = anchoredSerialize(source, model);
+    const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(after);
+    check(
+      holds
+        ? `${label} computes to a preserving value, so the moved block travels as authored`
+        : `${label} computes to a dropping value, so the moved block is reindented`,
+      !!got && got[1] === (holds ? 'alpha\n        beta\ngamma' : 'alpha\n      beta\ngamma'),
+      short({ got: got ? got[1] : null })
+    );
+  }
+}
+
+/**
  * T17 -- A COMPONENT IS NOT THE HTML ELEMENT WITH THE SAME NAME.
  *
  * `rendersIndent` is the one flag documented as "evidence rather than a
@@ -3415,6 +3722,9 @@ function theStampForAStylesheetHandedIn() {
   theRunTheReprintCollapsed();
   theReorderInsideAPre();
   theReorderOfBlockChildrenInsideAPre();
+  theReorderThatAlsoAddsOrRemovesAChild();
+  theReorderBesideAnInlineRun();
+  theCascadeInsideOneStyleAttribute();
   theComponentNamedAfterATag();
   theValueNobodyCanRead();
   theStampForAStylesheetHandedIn();

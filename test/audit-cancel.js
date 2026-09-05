@@ -319,6 +319,12 @@ const sessionFor = (log) => ({
           ? log.session.attempted === log.session.holdClearOnly
           : log.session.holdClearFrom && log.session.attempted >= log.session.holdClearFrom;
         if (held) {
+          // WHEN THE ROUND TRIP IS GENUINELY IN FLIGHT, which is the only moment
+          // at which cancelling one proves anything. `attempted` moves before
+          // this branch is even chosen, so a test that aborts on `attempted`
+          // can be aborting on a clear that already came back; `holding` moves
+          // only for a call that is really hanging.
+          log.session.holding += 1;
           await log.session.holdClear.promise;
         }
         log.session.storage += 1;
@@ -368,7 +374,7 @@ const newLog = () => ({
   destroyRefusalsLeft: 0,
   encoded: 0,
   blockedOn: [],
-  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holdClearFrom: 0, holdClearOnly: 0, holdClear: null, dirty: false, partitions: new Set() },
+  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holding: 0, holdClearFrom: 0, holdClearOnly: 0, holdClear: null, dirty: false, partitions: new Set() },
 });
 
 /**
@@ -946,6 +952,108 @@ const engineWith = (log, opts = {}) =>
     check('  and opened its window', strandedLog.opened === story?.openedAfterFirst + 1, short(strandedLog.opened));
     check('  and claims isolation again', third.value?.engine?.sessionIsolated === true, short(third.value?.engine));
     check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
+  }
+
+  // ---- AND THE TWO RESETS THAT USED TO LET GO OF THEIR CLEAR ---------------
+  //
+  // The case above strands the clear on the way OUT, which is the one site that
+  // ever handed its promise to `strand`. There are two more, and until this
+  // block nothing measured them: the reset at the top of a run and the reset
+  // between viewports both dropped the promise the moment their await stopped
+  // waiting for it.
+  //
+  // A TIME BOX IS NOT THE ONLY WAY OUT OF THOSE AWAITS, AND IT IS NOT THE
+  // COMMON ONE. `resetAuditSession` never rejects -- it answers {ok:false,
+  // reason} -- so nothing but the timer and the ABORT can end them, and the
+  // abort is the one that fires on every host tool-timeout. Cancelling a run
+  // during its opening clear therefore left a live clearStorageData outstanding
+  // on the shared `stacki-audit` partition with no record of it anywhere.
+  //
+  // Reproduced against the real engine on this double, one engine, two runs:
+  // run 1 cancelled during its OPENING clear; run 1's own `finally` clear then
+  // SUCCEEDS, so `strandedCleanup` stayed null; run 2 was not refused, loaded
+  // its page, answered `ok:true` with `sessionIsolated:true`, and run 1's clear
+  // landed in the middle of it --
+  //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},{clear:1,whileRun:2}]
+  //
+  // Both sites, because they are separate lines with separate `withTimeout`
+  // calls and fixing one says nothing about the other. Each runs on ONE engine,
+  // because the state under test is the engine's, and each ends with the audit
+  // that follows the landed clear -- the positive control that stops "refuse
+  // everything for ever" satisfying the refusal.
+  //
+  // These cases cost milliseconds rather than the thirty seconds the block
+  // above pays, because the way out being measured here is the ABORT and not
+  // the budget: the clear is still held when the assertions are read.
+  for (const site of [
+    { where: 'the reset at the top of the run', nth: 1, clearsBeforeAnswer: 2 },
+    { where: 'the reset between viewports', nth: 2, clearsBeforeAnswer: 3 },
+  ]) {
+    const log = newLog();
+    log.session.holdClear = gate(`a clear abandoned by ${site.where}`);
+    // ONE call held, not every call from the Nth on. The clear run 1 abandons
+    // must hang while the clear in run 1's own `finally` succeeds -- that is
+    // precisely the shape that left `strandedCleanup` null, and a double that
+    // hangs everything afterwards cannot produce it.
+    log.session.holdClearOnly = site.nth;
+    const engine = engineWith(log);
+    const ac = new AbortController();
+    // The abort fires when the clear is really hanging, which is what makes
+    // this a cancel of an IN-FLIGHT round trip rather than a cancel that
+    // happens to land near one.
+    const abortWhenHeld = (async () => {
+      for (let i = 0; i < 5000 && log.session.holding < 1; i += 1) await new Promise((r) => setImmediate(r));
+      ac.abort();
+    })();
+    const first = await answeredCancel(
+      `an audit cancelled inside ${site.where}`,
+      engine.run({ route: '/', viewports: ONE, rules: [] }, { signal: ac.signal })
+    );
+    await abortWhenHeld;
+    // WHAT THE CALLER IS TOLD DOES NOT CHANGE. A cancelled run answers
+    // `cancelled`; keeping the promise is the NEXT audit's business, and a fix
+    // that turned this answer into `session_not_isolated` would be telling the
+    // caller its own cancel was a failure of the page.
+    check(`  and still answers as cancelled, not as a session failure`, first?.ok === false && first?.code === 'cancelled', short(first));
+    check('  while the clear it walked away from is still outstanding', log.session.holdClear.released() === false, short(log.session));
+    check(
+      '  and its own cleanup clear really did succeed, so nothing below can be coming from that',
+      log.session.attempted === site.clearsBeforeAnswer && log.session.storage === site.clearsBeforeAnswer - 1,
+      short({ attempted: log.session.attempted, storage: log.session.storage })
+    );
+
+    const openedAfterFirst = log.opened;
+    const at = Date.now();
+    const second = await boundDeadline(`the audit after ${site.where} was abandoned`, engine.run({ route: '/', viewports: ONE, rules: [] }), 75000);
+    const secondTook = Date.now() - at;
+    const stillOutstanding = log.session.holdClear.released() === false;
+    check(`the audit after ${site.where} was abandoned answers`, second.answered === true, short(second.value));
+    check(
+      '  and refuses at the door rather than measuring a partition that clear may wipe',
+      second.value?.ok === false && second.value?.code === 'session_not_isolated',
+      short(second.value)
+    );
+    check(
+      '  naming the abandoned cleanup rather than inventing a reason',
+      /previous audit's cleanup was abandoned/.test(String(second.value?.message || '')),
+      short(second.value?.message)
+    );
+    check('  and opens no window at all', log.opened === openedAfterFirst, short({ before: openedAfterFirst, after: log.opened }));
+    check('  and adds no clear of its own to a partition that has one outstanding', log.session.attempted === site.clearsBeforeAnswer, short(log.session));
+    check('  and says so at once rather than waiting the stray clear out', secondTook < ANSWER_BY_MS, `${secondTook}ms`);
+    check('  while that clear really was still outstanding when it answered', stillOutstanding === true, short(log.session));
+
+    // AND THE PARTITION COMES BACK. Without this, "refuse every audit after the
+    // first cancel, for the life of the process" satisfies everything above.
+    log.session.holdClear.release();
+    for (let i = 0; i < 5000 && log.session.auth < site.clearsBeforeAnswer; i += 1) await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    const after = await boundDeadline(`the audit after ${site.where}'s stray clear landed`, engine.run({ route: '/', viewports: ONE, rules: [] }), 75000);
+    check('an audit run after that stray clear has landed is measured normally', after.value?.ok === true, short(after.value));
+    check('  and opened its window', log.opened === openedAfterFirst + 1, short(log.opened));
+    check('  and claims isolation again', after.value?.engine?.sessionIsolated === true, short(after.value?.engine));
+    check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp(`an audit following ${site.where}'s abandoned clear`, log);
   }
 
   // ---- WHEN THE WINDOW CANNOT BE DESTROYED AT ALL --------------------------

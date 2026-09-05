@@ -1709,7 +1709,48 @@ const git = {
     // branch's work and answered `ok: true, changed: true` with
     // `undoable: false`. It now refuses; this gives that refusal a code and
     // states the vocabulary an agent should have been told in the first place.
-    result: (raw, input) => {
+    result: (raw, input, ctx) => {
+      // THE TWO GIT FAILURES THIS MAPPER USED TO WALK PAST.
+      //
+      // `merge_blocked` and `merge_stuck` are minted in gitBranches.js and are
+      // the only two refusals here that are about GIT rather than about the
+      // answers: the re-merge would not start, or it started and would not
+      // unwind. The branch below only recognises a refusal by `badChoices`, so
+      // both of these fell through to `runMain`'s spread and reached a client
+      // exactly as the handler wrote them — which is two things this surface
+      // does not allow anywhere else.
+      //
+      // `files` is `git ls-files -u`, one entry per path still holding conflict
+      // markers, and NOTHING CAPPED IT. A tree in the middle of a large merge
+      // has as many as the merge touched, and an unbounded list is the promise
+      // this API breaks least willingly. It is cut to MAX_LIST like every other
+      // list that leaves here.
+      //
+      // And `gitSaid` is git's own stderr, verbatim by design — which is right,
+      // and is also the one field in this refusal whose text Stacki did not
+      // write. Git names a path from time to time (`unable to create
+      // '<...>/.git/index.lock'` is the cause the handler's own comment was
+      // measured against), so it goes through the same scrub as every other
+      // sentence that started life outside this surface.
+      //
+      // The sentences themselves are the handler's and stay whole: they name
+      // the branch, quote git, and say what clears it. What is added here is
+      // the path space, for the same reason the `bad_choices` refusal below
+      // declares it — every path in this answer is git's own spelling, relative
+      // to the REPOSITORY root, and an agent that re-spells them the way
+      // source.read wants is the mistake that declaration exists to stop.
+      if (raw?.ok === false && (raw.code === 'merge_stuck' || raw.code === 'merge_blocked')) {
+        const scrub = (text) => (typeof text === 'string' && text ? withoutHostPaths(text, ctx?.root) : text ?? null);
+        return {
+          ...raw,
+          branch: raw.branch ?? input.branch ?? null,
+          gitSaid: scrub(raw.gitSaid),
+          message: scrub(raw.message),
+          ...(raw.code === 'merge_stuck'
+            ? { files: take(raw.files, MAX_LIST), pathsRelativeTo: 'repository-root' }
+            : {}),
+        };
+      }
       if (raw?.ok === false && Array.isArray(raw.badChoices)) {
         const first = raw.badChoices[0] || {};
         // WHAT IS WRONG WITH THE FIRST ONE, in the sentence rather than only in

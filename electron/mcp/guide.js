@@ -87,7 +87,7 @@ it carries both branch tips and a digest of what git actually wrote.
                                             one merge's answers cannot be paired
                                             with another merge's branch.
 
-Three refusals, and none of them merges anything:
+Five refusals. Four of them merge nothing and leave the branch as it was:
 
   guard_required   no mergeRef. Run git.merge and use the one it hands back.
   stale_merge      a commit landed on either branch, or git reconciles them
@@ -97,6 +97,20 @@ Three refusals, and none of them merges anything:
   bad_choices      a key that is not one of the conflicting paths, a list that
                    is not exactly as long as that file's hunks, "merged" where
                    the hunk offered none. The message says which and why.
+  merge_blocked    git would not start the re-merge — usually another git
+                   process holding the repository for a moment. gitSaid carries
+                   git's own words. Send exactly the same call again with the
+                   same mergeRef; the conflict has not moved.
+
+The fifth one has NOT left the project as it was, and it is the only refusal on
+this surface that says so:
+
+  merge_stuck      the re-merge ran and would not unwind. The project is still
+                   mid-merge and \`files\` names the paths still holding conflict
+                   markers, spelled the way git spells them — relative to the
+                   REPOSITORY root, not to the project. Nothing was committed,
+                   but nothing else Stacki reads is trustworthy until a person
+                   runs \`git merge --abort\` there. Do not retry; ask.
 
 ## Semantic first, source as the fallback
 

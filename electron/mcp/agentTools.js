@@ -92,7 +92,15 @@ const DocumentState = z
 
 const Envelope = z.looseObject({
   ok: z.boolean().describe('Whether the operation happened. False is a status with a code, never a crash.'),
-  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, bound_value, not_editable, no_project, bad_request, command_failed, …'),
+  // THE THREE THAT REACHED A CLIENT WITHOUT BEING NAMED HERE. `merge_blocked`,
+  // `merge_stuck` and `bad_branch_name` are minted in electron/gitBranches.js
+  // and pass through the git mappers untouched — the resolve mapper only
+  // rewrites a refusal carrying `badChoices` — so they were arriving on the
+  // wire under a `code` this description told nobody about. They are named here
+  // because this line is the shortest thing a client ever reads about refusals
+  // and the only one that travels with the schema, whichever layer of the
+  // process actually mints the code.
+  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, merge_blocked, merge_stuck, bad_branch_name, bound_value, not_editable, no_project, bad_request, command_failed, …'),
   message: z.string().nullable().optional(),
 
   // --- what a mutation answers with ---------------------------------------
@@ -1344,6 +1352,35 @@ const ToolRefusal = z.strictObject({
 /** What a tool publishes when its answer is either a payload or a refusal. */
 const orRefusal = (payload) => z.union([payload, ToolRefusal]);
 
+/**
+ * A CLAUSE, NOT A SENTENCE — THE FULL STOP THE ISSUE HAD ALREADY WRITTEN.
+ *
+ * `issuesOf` ends its own sentence ("name is required.") and both composers
+ * below dropped that straight into a longer one and then punctuated again. A
+ * real agent received this from the packaged app, during the native dogfood:
+ *
+ *   asset.rename could not run — name: name is required.. asset.rename takes: path, name.
+ *
+ * Two full stops, because two layers each believed they were the last one. The
+ * same seam puts a stop in front of a semicolon as soon as there are two issues
+ * — "path: path is required.; name: name is required." — which is the identical
+ * mistake wearing different punctuation.
+ *
+ * So a clause is a clause here: whatever sentence-ending punctuation the issue
+ * brought with it is trimmed, and the composer — the only thing that knows
+ * whether a clause is followed by a semicolon, by another sentence, or by the
+ * end — puts one back exactly once. Nothing about WHICH issue is reported
+ * changes. This is only the surface talking to an agent in a sentence it has to
+ * parse, which is the thing the surface is for.
+ */
+const asClause = (issue) => `${(issue?.path || []).join('.') || 'arguments'}: ${String(issue?.message ?? '').replace(/[.\s]+$/, '')}`;
+
+/** Those clauses as one sentence, ended once. */
+const clausesOf = (issues) => `${issues.map(asClause).join('; ')}.`;
+
+/** Whatever zod called the failure at one top-level field, if it named one. */
+const zodCodeAt = (error, field) => (error?.issues || []).find((i) => (i?.path || [])[0] === field)?.code || null;
+
 function badToolArguments(tool, error) {
   const issues = issuesOf(error);
   return {
@@ -1351,7 +1388,7 @@ function badToolArguments(tool, error) {
     code: 'bad_arguments',
     operation: tool,
     issues,
-    message: `${tool} could not run — ${issues.map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`).join('; ')}`,
+    message: `${tool} could not run — ${clausesOf(issues)}`,
   };
 }
 
@@ -1403,15 +1440,55 @@ function publishChecked(server, name, config, handler) {
  */
 function badArguments(domain, action, error) {
   const known = actionsOf(domain);
+  // NO ACTION AT ALL IS A MISSING ARGUMENT, NOT AN UNKNOWN ACTION.
+  //
+  // These were one branch, and a call with no `action` came back as this,
+  // reproduced against the packaged app during the native dogfood:
+  //
+  //   {"ok":false,"code":"bad_action","operation":"project.",
+  //    "message":"Stacki has no project.(no action). Call get_capabilities for
+  //               what it does have."}
+  //
+  // `operation` is "project." with a dangling dot — a value a client reads as
+  // an operation name, and there is no operation called "project." — and
+  // "Stacki has no project.(no action)" is not a sentence. Underneath the
+  // wording it was also the wrong classification: nothing unknown was named,
+  // a REQUIRED ARGUMENT was left out, and `bad_arguments` is the code this
+  // surface uses for that everywhere else. An agent branching on `bad_action`
+  // goes looking for a name it got wrong; there is no name to look at.
+  //
+  // What was right about the old answer is kept whole: it listed every action
+  // the tool has, which is the one thing that gets the caller unstuck, so
+  // `actions` and the sentence both still carry the list.
+  if (typeof action !== 'string') {
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      // The tool, not "project." — a domain with no action is named by the
+      // domain, which is the only true thing there is to say about it.
+      operation: domain,
+      // Stacki's own sentence for a value that is simply not there, in the
+      // shape `issuesOf` gives every other absent argument — and carrying
+      // ZOD'S OWN issue code for the discriminator rather than a hand-picked
+      // one. Two reasons, and the second is the load-bearing one: whatever zod
+      // called it is the truthful label for what failed, and a refusal-code
+      // literal written here would be swept up by the enumeration discovery in
+      // test/refusal-contract.js, which reads `code:` properties out of this
+      // file and cannot tell a zod issue code from a refusal code.
+      issues: [{ path: ['action'], message: 'action is required.', ...(zodCodeAt(error, 'action') ? { code: zodCodeAt(error, 'action') } : {}) }],
+      actions: known,
+      message: `${domain} needs an action and this call named none. ${domain} takes: ${known.join(', ')}.`,
+    };
+  }
   // An action the tool does not have is a bad ACTION, not a bad argument — the
   // same envelope the dispatcher produces, rather than zod's "Invalid
   // discriminator value" followed by the list in prose.
-  if (typeof action !== 'string' || !known.includes(action)) {
+  if (!known.includes(action)) {
     return {
       ok: false,
       code: 'bad_action',
-      operation: `${domain}.${typeof action === 'string' ? action : ''}`,
-      message: `Stacki has no ${domain}.${typeof action === 'string' ? action : '(no action)'}. Call get_capabilities for what it does have.`,
+      operation: `${domain}.${action}`,
+      message: `Stacki has no ${domain}.${action}. Call get_capabilities for what it does have.`,
       actions: known,
     };
   }
@@ -1432,9 +1509,8 @@ function badArguments(domain, action, error) {
     issues,
     accepts,
     message:
-      `${domain}.${action} could not run — ${issues
-        .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
-        .join('; ')}` + (accepts.length ? `. ${domain}.${action} takes: ${accepts.join(', ')}.` : ''),
+      `${domain}.${action} could not run — ${clausesOf(issues)}` +
+      (accepts.length ? ` ${domain}.${action} takes: ${accepts.join(', ')}.` : ''),
   };
 }
 

@@ -62,9 +62,11 @@
 // REAL BEHAVIOUR, NOT MAPPER UNITS. The families that matter are provoked on the
 // wire against a real repository: two branches that genuinely conflict, a dirty
 // tree that genuinely blocks a switch, a ref that has genuinely expired, an undo
-// whose inverse genuinely cannot run. Six codes cannot be reached over this wire
-// at all — three need a running dev server, two need the project's dependencies
-// installed, one is the terminal fallback — and those are graded IN PROCESS
+// whose inverse genuinely cannot run. Nine codes cannot be reached over this
+// wire at all — three are states of the app rather than of the project, two need
+// a running dev server, two need the project's dependencies installed, one needs
+// a `git merge --abort` that fails with the index still holding unmerged
+// entries, and one is the terminal fallback — and those are graded IN PROCESS
 // against the schema the tool publishes, exactly as schema-dispatch-contract.js
 // grades get_context, and they are named as such in the output. One more,
 // `bad_topic`, is dead: the published enum makes its branch unreachable, and
@@ -81,7 +83,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
+const { execFile, execFileSync } = require('node:child_process');
 
 const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 
@@ -89,6 +91,9 @@ const { startWireRig } = require('./support/mcpWireRig.js');
 const { withPremiseServer, MALFORMED } = require('./support/refusal-premise.js');
 const DOMAINS_MODULE = require('../electron/mcp/agent/domains.js');
 const { createAgentApi } = require('../electron/mcp/agent/index.js');
+// The branch handler itself, for the one refusal in its vocabulary that no wire
+// can reach — see the merge_stuck grade in section 7.
+const { mergeBranch, resolveMerge } = require('../electron/gitBranches.js');
 const refs = require('../electron/mcp/agent/refs.js');
 const { TOPICS, TOPIC_NAMES } = require('../electron/mcp/guide.js');
 const { guardSuite } = require('./support/suiteGuard.js');
@@ -124,6 +129,21 @@ const REPO = path.join(__dirname, '..');
 // surface. The two of its codes the published contract promises an agent,
 // `undo_failed` and `redo_failed`, arrive through the documentation table below
 // instead, and are provoked on the wire like the rest.
+//
+// AND THE HANDLER WHOSE REFUSALS ARE NOT SHAPED AT ALL, which is the gap this
+// list had. electron/gitBranches.js mints seven codes and the git mappers in
+// domains.js rewrite only the ones they recognise — the resolve mapper keys off
+// `badChoices`, the checkout mapper off `blocked` — so everything else is spread
+// into an envelope word for word and reaches a client exactly as the handler
+// wrote it. That makes it a shaping file in the only sense that matters here:
+// what it writes down IS what a client is told.
+//
+// It was not in this list, and three of its codes were on the wire without being
+// named anywhere a client can read: `merge_blocked` and `merge_stuck`, added by
+// this campaign, and `bad_branch_name`, which had been shipping for longer. A
+// list that discovers the enumeration from eight files and misses the ninth is
+// not a discovery, it is a longer hand-written list — so the file goes in and
+// the completeness assertion at the bottom does the rest.
 const SHAPING_FILES = [
   'electron/mcp/agent/domains.js',
   'electron/mcp/agent/digest.js',
@@ -133,6 +153,7 @@ const SHAPING_FILES = [
   'electron/mcp/agent/permissions.js',
   'electron/mcp/agent/index.js',
   'electron/mcp/agentTools.js',
+  'electron/gitBranches.js',
 ];
 
 /** The block a named `const NAME = { … }` or `[ … ]` spans, as text. */
@@ -235,10 +256,10 @@ for (const [where, codes] of [['docs/mcp-v1.md', PROMISED], ['the Envelope schem
 
 // A POSITIVE CONTROL ON THE DISCOVERY ITSELF. Everything below divides by this
 // set, so a scanner that quietly stopped matching would turn the completeness
-// check into a tautology over nothing. These seven are found by five different
+// check into a tautology over nothing. These eight are found by six different
 // rules — a `code:` property, a `problem()` call, a `no()` call, a git-cause
-// pair, an errno pair and the documentation table — so a rule that breaks takes
-// one of them with it.
+// pair, an errno pair, the branch handler whose refusals no mapper touches, and
+// the documentation table — so a rule that breaks takes one of them with it.
 check('the enumeration was discovered from the shipping source', DECLARED.size >= 40, `${DECLARED.size} codes`);
 for (const [code, why] of [
   ['permission_denied', 'a `code:` property, in permissions.js'],
@@ -247,9 +268,31 @@ for (const [code, why] of [
   ['no_branch', 'a GIT_CAUSES pair'],
   ['exists', 'an ERRNO_CODES pair'],
   ['bad_topic', 'the tool layer'],
+  // The file this list used to stop one short of. `merge_stuck` is minted in
+  // gitBranches.js and rewritten by nothing, so it is only in the enumeration
+  // if the handler itself is being read.
+  ['merge_stuck', 'the branch handler, whose refusals reach a client unshaped'],
   ['undo_failed', 'the published table, for a code the renderer mints'],
 ]) {
   check(`  and it found ${code} — ${why}`, DECLARED.has(code), [...DECLARED.keys()].sort().join(', '));
+}
+
+// AND IT FOUND THEM IN THE HANDLER, NOT IN THE DOCUMENTATION.
+//
+// `DECLARED` is the union of the sweep with the two client-facing declarations,
+// so a code named in docs/mcp-v1.md is in it whether or not any file was read
+// for it. That union is right for completeness and useless as a control on the
+// SWEEP: with gitBranches.js taken back out of SHAPING_FILES the row above
+// would still pass, on the documentation row this same campaign added. So this
+// asks `SHAPED` — the sweep alone — and names the file it has to have come
+// from.
+{
+  const HANDLER = 'electron/gitBranches.js';
+  const fromHandler = [...SHAPED].filter(([, where]) => [...where].some((w) => w.startsWith(HANDLER))).map(([code]) => code);
+  check(`the sweep reads ${HANDLER}, whose refusals no mapper rewrites`, fromHandler.length >= 5, fromHandler.join(', '));
+  for (const code of ['merge_blocked', 'merge_stuck', 'bad_branch_name']) {
+    check(`  and it is where ${code} was found`, fromHandler.includes(code), fromHandler.join(', '));
+  }
 }
 
 // ── THE CAPS THE SURFACE DECLARES ────────────────────────────────────────────
@@ -551,6 +594,30 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
     // ARGUMENTS, ACTIONS AND THE GATE
     await provoke('a mistyped branch name', 'bad_arguments', 'git', 'checkout', { branch: 12 });
     await provoke('an action this tool does not have', 'bad_action', 'git', 'not_an_action', {});
+    // AND A CALL THAT NAMES NO ACTION AT ALL, which is not the same mistake.
+    //
+    // This used to be one branch with the case above, and a real agent got
+    // `{"code":"bad_action","operation":"project.","message":"Stacki has no
+    // project.(no action). …"}` out of the packaged app: an `operation` field
+    // holding a name no operation has, and a sentence that is not one. It is
+    // also the wrong classification — nothing unknown was named, a REQUIRED
+    // ARGUMENT was left out — and an agent branching on `bad_action` goes
+    // looking for a word it got wrong when there is no word to look at.
+    //
+    // What was right about the old answer is asserted too: it listed every
+    // action the tool has, which is the half that gets a caller unstuck.
+    const noAction = await provoke('a domain tool called with no action', 'bad_arguments', 'project', null, {});
+    check('  the no-action refusal names the argument that was missing', (noAction?.issues || []).some((i) => Array.isArray(i.path) && i.path[0] === 'action'), short(noAction?.issues, 200));
+    check('  and names the tool as the operation, not "project." with a dot on the end', noAction?.operation === 'project', short(noAction?.operation));
+    check('  and still lists every action the tool does have', Array.isArray(noAction?.actions) && noAction.actions.includes('undo') && noAction.actions.includes('scan'), short(noAction?.actions, 200));
+    check('  and says so in the sentence too, for a client that only shows text', /takes: /.test(String(noAction?.message || '')), short(noAction?.message, 240));
+    // A REQUIRED ARGUMENT LEFT OUT OF AN ACTION THAT EXISTS. The same sentence
+    // seam one level down: the issue ends its own sentence, and the composer
+    // used to end it again — "name: name is required.. asset.rename takes: …".
+    // Held to the punctuation promise in the sweep below with everything else.
+    const missingArg = await provoke('an action called without a required argument', 'bad_arguments', 'asset', 'rename', { path: 'public/spare.txt' });
+    check('  the missing-argument refusal names the key', (missingArg?.issues || []).some((i) => Array.isArray(i.path) && i.path[0] === 'name'), short(missingArg?.issues, 200));
+    check('  and what that action would have taken', Array.isArray(missingArg?.accepts) && missingArg.accepts.includes('name'), short(missingArg?.accepts));
     // THE ONE TOOL WITH A STRICT OUTPUT SCHEMA. Every other schema on this wire
     // is loose about fields it does not name, so "the refusal validates" is a
     // claim about the DECLARED fields having the declared types. `audit` names
@@ -628,6 +695,13 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
     await provoke('a commit with nothing to commit', 'nothing_to_commit', 'git', 'commit', { message: 'nothing has changed' });
     await provoke('a commit with no message', 'bad_request', 'git', 'commit', { message: '   ' });
     await provoke('a branch that is not there', 'no_branch', 'git', 'checkout', { branch: 'no-such-branch' });
+    // A NAME GIT WOULD HAVE READ AS AN OPTION. Not the same refusal as the one
+    // above and deliberately so: "no-such-branch" was a name and git did not
+    // have it; "-x" is not a name at all and was never given to git. The code
+    // is minted in gitBranches.js and no mapper rewrites it, which is why it
+    // reached clients for a long time without being declared anywhere — see
+    // SHAPING_FILES.
+    await provoke('a branch name git would have read as an option', 'bad_branch_name', 'git', 'checkout', { branch: '-x' });
     await provoke('a revision that is not there', 'no_ref', 'git', 'file_at', { ref: 'no-such-ref', path: 'src/pages/index.astro' });
     await provoke('a file that did not exist at that revision', 'missing_at_ref', 'git', 'restore_file', { path: 'public/never-existed.txt', ref: 'HEAD' }, {
       // The file has to exist NOW and not THEN, or the refusal is about the
@@ -734,6 +808,68 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
         },
       });
     })();
+
+    // AND THE MERGE GIT WOULD NOT START, which is the other half of the pair
+    // this campaign added and the one that CAN be reached on a wire.
+    //
+    // `resolve_merge` re-runs the merge before it applies anything. If git
+    // cannot get that far there is no conflict to answer, nothing was written,
+    // and the binding is still good — so the recovery is the same call again
+    // rather than a new merge, which is a different sentence from every other
+    // refusal here and needs its own code to be one.
+    //
+    // Provoked with a permission, not a stub: the conflicting file lives in its
+    // own directory and that directory is made read-only before the resolve, so
+    // git's own worktree update fails ("unable to unlink old …") on the second
+    // merge exactly as it would if another process held the repository. Its own
+    // conflict, its own directory and its own branch, for the reason written
+    // over the staleness probe above.
+    //
+    // The directory is put back in a `finally`: leaving it read-only would take
+    // the positive control at the bottom of this file down with it, which is
+    // precisely the failure that control exists to catch.
+    {
+      const dir = path.join(root, 'public/blocked');
+      const at = (side) => fs.writeFileSync(path.join(dir, 'f.txt'), `${side}\n`);
+      fs.mkdirSync(dir, { recursive: true });
+      at('base');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'a file for the blocked-merge probe');
+      git(root, 'checkout', '-q', '-b', 'blocked-other');
+      at('theirs');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'their answer, in a directory of its own');
+      git(root, 'checkout', '-q', 'main');
+      at('ours');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'our answer, in a directory of its own');
+      const { envelope: clash } = await rig.call('git', 'merge', { branch: 'blocked-other' });
+      check('the blocked-merge probe starts from a real conflict', clash?.code === 'merge_conflict', short(clash, 160));
+      try {
+        await provoke('a re-merge git will not start', 'merge_blocked', 'git', 'resolve_merge', {
+          mergeRef: clash?.mergeRef,
+          branch: 'blocked-other',
+          choices: { 'public/blocked/f.txt': 'ours' },
+        }, {
+          setup: () => fs.chmodSync(dir, 0o555),
+        });
+      } finally {
+        fs.chmodSync(dir, 0o755);
+      }
+      const blocked = observed[observed.length - 1]?.envelope;
+      // THE THING THAT MAKES IT THIS REFUSAL AND NOT ANOTHER: git's own words
+      // travel, attributed, rather than being folded into a sentence that
+      // sounds like Stacki worked the cause out.
+      check('  and it carries git’s own sentence about why', typeof blocked?.gitSaid === 'string' && blocked.gitSaid.length > 0, short(blocked?.gitSaid, 200));
+      check('  and never the command line echoed back at the agent', !/Command failed:/i.test(String(blocked?.gitSaid || '')), short(blocked?.gitSaid, 200));
+      // AND THE RECOVERY IS THE OPPOSITE OF THE STALE ONE. `stale_merge` says
+      // run git.merge again; this says send exactly this call again. An agent
+      // that cannot tell them apart does the one thing that cannot work.
+      check('  and it says to send the same call again rather than to re-merge', /same mergeRef/i.test(String(blocked?.message || '')), short(blocked?.message, 240));
+      // The disk oracle above already asserted nothing moved. This asserts the
+      // repository is not half-merged either — the state merge_stuck is for.
+      check('  and the repository is not left mid-merge', gitQuiet(root, 'ls-files', '-u') === '' && !fs.existsSync(path.join(root, '.git/MERGE_HEAD')), gitQuiet(root, 'status', '--porcelain'));
+    }
 
     // THE PREVIEW
     await provoke('probing a project nothing is serving', 'no_preview', 'project', 'probe', {});
@@ -842,6 +978,24 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       // ACTIONABLE
       check(`  ${where}: with a code the surface declares`, typeof envelope?.code === 'string' && DECLARED.has(envelope.code), short(envelope?.code));
       check(`  ${where}: and a sentence to show somebody`, typeof envelope?.message === 'string' && envelope.message.length > 0, short(envelope?.message));
+      // AND IT IS A SENTENCE, NOT A CONCATENATION. Two of these reached a real
+      // agent during the native dogfood, out of the packaged app: "name: name
+      // is required.. asset.rename takes: path, name." — two full stops,
+      // because the issue ended its own sentence and the composer ended it
+      // again — and the same seam puts a stop in front of a semicolon as soon
+      // as there are two issues. The rule is narrow on purpose: a word,
+      // then two stops, then whitespace or the end. `../` in a path and an
+      // ellipsis both survive it.
+      const said = String(envelope?.message || '');
+      check(`  ${where}: punctuated once, not twice`, !/\w\.\.(\s|$)/.test(said) && !/\.\s*;/.test(said), short(said, 240));
+      // AND WHAT IT SAYS THE CALL WAS. `operation` is a name a client reads
+      // back and quotes; "project." is not the name of anything, and it is what
+      // a domain with no action used to answer.
+      check(
+        `  ${where}: and any operation it names is a name, not a fragment`,
+        envelope?.operation == null || (typeof envelope.operation === 'string' && envelope.operation.length > 0 && !/\.$/.test(envelope.operation)),
+        short(envelope?.operation)
+      );
       // AND THE CLIENT IS TOLD. This is the bit that buys the unvalidated
       // channel proved in section 1: a host keying off `isError` records a
       // refused call as refused.
@@ -1030,7 +1184,7 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       }
     }
 
-    // ── 7. THE EIGHT THE WIRE CANNOT REACH ─────────────────────────────────────
+    // ── 7. THE NINE THE WIRE CANNOT REACH ──────────────────────────────────────
     //
     // Said plainly rather than quietly skipped. Each is graded IN PROCESS against
     // the schema the tool that would carry it publishes — the idiom
@@ -1092,6 +1246,111 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
         'content’s own entry resolver, over a collection that has no such entry',
         (await DOMAINS_MODULE.resolveContentEntry({ collection: 'notes', id: 'no-such-entry' }, listing({ entries: [] }))).error
       );
+
+      // THE MERGE THAT WOULD NOT UNWIND.
+      //
+      // `merge_stuck` is the one refusal in this whole enumeration that does NOT
+      // mean "nothing changed": the re-merge ran, the answers were refused, and
+      // the `git merge --abort` that was supposed to put the tree back failed —
+      // so the project is left mid-merge with conflict markers in files Stacki
+      // parses as markup a moment later. Its sibling `merge_blocked` is provoked
+      // on the wire above; this one is graded here, and the reason is honest:
+      // reaching it needs the abort to fail while the index still holds unmerged
+      // entries, and that is a race with a second git process rather than a
+      // state a test can arrange from outside a single `resolve_merge` call. A
+      // read-only directory — which is what makes merge_blocked real above —
+      // stops the merge before MERGE_HEAD is written, not after.
+      //
+      // So the SEAM is the git runner, exactly as test/git-branches.js T23 does
+      // it, and everything either side of the seam is shipping code: the real
+      // `mergeBranch` produces the real binding, the real `resolveMerge`
+      // produces the refusal, and the real domains.js mapper shapes it. The one
+      // thing this test does is remove MERGE_HEAD when the abort is attempted,
+      // which is precisely what a crash or somebody else's `git merge --abort`
+      // does.
+      //
+      // AND THE CAP IS MEASURED, NOT ASSERTED. The handler's `files` is
+      // `git ls-files -u` with nothing capping it, so the fixture conflicts on
+      // MORE than MAX_LIST paths and both sides are checked: that the handler
+      // really hands back more than the cap, and that what leaves the mapper is
+      // exactly the cap. Without the first half the second is a claim about a
+      // list that was short anyway.
+      {
+        const gitAsync = (cwd, args) =>
+          new Promise((settle, fail) => {
+            execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+              if (err) {
+                err.stdout = stdout;
+                err.stderr = stderr;
+                fail(err);
+                return;
+              }
+              settle({ stdout, stderr });
+            });
+          });
+        // Its own repository, off the fixture, so the disk oracle bracketing
+        // every refusal above is not asked about a tree this block wrecks on
+        // purpose. Realpath'd because macOS hands out /var/folders/… and git
+        // answers /private/var/folders/… — and the host-path assertion below is
+        // worth nothing if it is comparing two spellings of the same place.
+        const stuckRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'refusal-merge-stuck-')));
+        try {
+          const OVER_CAP = MAX_LIST + 20;
+          const writeAll = (side) => {
+            for (let i = 0; i < OVER_CAP; i += 1) fs.writeFileSync(path.join(stuckRoot, `f${i}.txt`), `${side}\n`);
+          };
+          git(stuckRoot, 'init', '-q', '-b', 'main');
+          git(stuckRoot, 'config', 'user.email', 'refusal@example.com');
+          git(stuckRoot, 'config', 'user.name', 'Refusal Contract');
+          git(stuckRoot, 'config', 'commit.gpgsign', 'false');
+          writeAll('base');
+          git(stuckRoot, 'add', '-A');
+          git(stuckRoot, 'commit', '-q', '-m', 'base');
+          git(stuckRoot, 'checkout', '-q', '-b', 'other');
+          writeAll('theirs');
+          git(stuckRoot, 'add', '-A');
+          git(stuckRoot, 'commit', '-q', '-m', 'their answer');
+          git(stuckRoot, 'checkout', '-q', 'main');
+          writeAll('ours');
+          git(stuckRoot, 'add', '-A');
+          git(stuckRoot, 'commit', '-q', '-m', 'our answer');
+          const clash = await mergeBranch(gitAsync, { projectPath: stuckRoot, branch: 'other' });
+          check('the stuck-merge fixture conflicts, on more paths than the surface caps at', clash?.conflicted === true, short({ ok: clash?.ok, conflicted: clash?.conflicted }, 160));
+          let aborts = 0;
+          const abortRefusingGit = async (cwd, args) => {
+            if (args[0] === 'merge' && args[1] === '--abort') {
+              aborts += 1;
+              fs.rmSync(path.join(stuckRoot, '.git', 'MERGE_HEAD'), { force: true });
+            }
+            return gitAsync(cwd, args);
+          };
+          const rawStuck = await resolveMerge(abortRefusingGit, {
+            projectPath: stuckRoot,
+            branch: 'other',
+            // One key git never reported, which is enough to make the answers
+            // unusable and send the handler to its unwind.
+            choices: { 'not-a-conflicting-path.txt': 'ours' },
+            expect: clash?.at,
+          });
+          check('  and the unwind really was attempted', aborts === 1, String(aborts));
+          check('  and the handler hands back more paths than MAX_LIST', Array.isArray(rawStuck?.files) && rawStuck.files.length > MAX_LIST, String(rawStuck?.files?.length));
+          const stuck = await DOMAINS_MODULE.DOMAINS.git.resolve_merge.result(rawStuck, { branch: 'other' }, { root: stuckRoot });
+          gradeInProcess('merge_stuck', 'the shipping handler and mapper, with an abort that fails', stuck);
+          check('  merge_stuck: and the mapper cut that list to the cap the surface declares', stuck?.files?.length === MAX_LIST, String(stuck?.files?.length));
+          check('  merge_stuck: declaring which path space those are spelled in', stuck?.pathsRelativeTo === 'repository-root', short(stuck?.pathsRelativeTo));
+          check('  merge_stuck: naming no place on THIS machine either', hostPathsIn(stuck, stuckRoot).length === 0, hostPathsIn(stuck, stuckRoot).join('; '));
+          // AND IT DOES NOT TELL THE AGENT THE LIE EVERY OTHER REFUSAL HERE
+          // TELLS TRUTHFULLY. The tree really is still merged, so a sentence
+          // saying otherwise would be the defect the code exists to prevent.
+          check('  merge_stuck: and it does not claim nothing was merged', !/nothing was merged/i.test(String(stuck?.message || '')), short(stuck?.message, 240));
+          check('  merge_stuck: it says how a person clears it', /merge --abort/.test(String(stuck?.message || '')), short(stuck?.message, 240));
+          // THE PREMISE, MEASURED: without this the assertions above could all
+          // be about a tree that unwound perfectly well.
+          check('  merge_stuck: and the tree really is still mid-merge', gitQuiet(stuckRoot, 'ls-files', '-u') !== '', short(gitQuiet(stuckRoot, 'status', '--porcelain'), 120));
+        } finally {
+          fs.rmSync(stuckRoot, { recursive: true, force: true });
+        }
+      }
 
       // THE TERMINAL FALLBACK. `failed` is the code this codebase's own comment
       // calls "the code that means nobody knows", and provoking it end to end
@@ -1204,10 +1463,36 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       // in the surface wrote down.
       const undeclared = [...EXERCISED.keys()].filter((c) => !DECLARED.has(c));
       check('and nothing answered with a code the surface never declared', undeclared.length === 0, undeclared.join(', '));
+
+      // AND THE HALF THAT SHIPPED WRONG: DECLARED WHERE A CLIENT CAN READ IT.
+      //
+      // Being in the enumeration is not the same as being told to anybody. The
+      // branch handler mints codes that no mapper rewrites, so what it writes
+      // down IS what a client receives — and `merge_blocked`, `merge_stuck` and
+      // `bad_branch_name` were all being answered while appearing in neither of
+      // the two places a client can read: the `code` description that travels
+      // with the schema, and the refusal table in docs/mcp-v1.md. Nothing
+      // caught it, because the sweep did not read the handler.
+      //
+      // So: anything that handler mints and this file could actually reach has
+      // to be named in one of those two. A code it mints and nothing here can
+      // provoke is left alone deliberately — that is a claim about coverage,
+      // and the completeness check above is where coverage is argued.
+      const clientFacing = new Set([...(PROMISED || []), ...(DESCRIBED || [])]);
+      const HANDLER = 'electron/gitBranches.js';
+      const handlerCodes = [...SHAPED].filter(([, where]) => [...where].some((w) => w.startsWith(HANDLER))).map(([code]) => code);
+      const reachable = handlerCodes.filter((code) => EXERCISED.has(code) || GRADED.has(code));
+      check('  the branch handler’s codes were reached at all, so the next line is about something', reachable.length >= 5, reachable.join(', '));
+      const unnamed = reachable.filter((code) => !clientFacing.has(code));
+      check(
+        '  and every one a client can receive is named where a client can read it',
+        unnamed.length === 0,
+        unnamed.length ? `${unnamed.join(', ')} — in neither the Envelope code description nor the docs/mcp-v1.md table` : ''
+      );
       // Most of them are real behaviour, not a graded mapper. Said as a number so
       // that a rewrite which quietly moved families into the in-process bucket
       // has to change it deliberately.
-      check('and most of them were provoked on the wire rather than graded in process', EXERCISED.size >= 25, `${EXERCISED.size} on the wire, ${GRADED.size} in process, ${UNREACHABLE.size} unreachable, of ${DECLARED.size} declared`);
+      check('and most of them were provoked on the wire rather than graded in process', EXERCISED.size >= 27, `${EXERCISED.size} on the wire, ${GRADED.size} in process, ${UNREACHABLE.size} unreachable, of ${DECLARED.size} declared`);
     }
 
     // ── 10. WHAT THE CLIENT WAS TOLD, AGAINST WHAT ARRIVES ──────────────────────

@@ -42,6 +42,10 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const H = require('./agent-harness.js');
 const { thrownFailure } = require('../electron/mcp/agent/domains.js');
+// The composer that turns zod's issues into the sentence an agent actually
+// reads. Held directly at the end of this file, for the shapes no fixture here
+// provokes — see THE COMPOSER, HANDED THE ISSUE SHAPES NO FIXTURE PROVOKES.
+const { badToolArguments } = require('../electron/mcp/agentTools.js');
 
 const failures = [];
 let checked = 0;
@@ -458,6 +462,36 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
       // `failed` — the mapper classifies, it does not relabel.
       check('a failure nothing here recognises is still failed', said('the preview server exited with code 137').code === 'failed', short(said('the preview server exited with code 137')));
       check('  and a repository that is not one is still no_repo', said('fatal: not a git repository (or any of the parent directories): .git').code === 'no_repo', short(said('fatal: not a git repository (or any of the parent directories): .git')));
+    }
+
+    // ── THE COMPOSER, HANDED THE ISSUE SHAPES NO FIXTURE PROVOKES ────────────
+    //
+    // A named cause is only half of what reaches an agent; the other half is
+    // the sentence, and this is the seam where it was malformed. From the
+    // packaged app, during the native dogfood, for a call that left out one
+    // required argument:
+    //
+    //   asset.rename could not run — name: name is required.. asset.rename takes: path, name.
+    //
+    // Two full stops. `issuesOf` ends its own sentence and the composer ended
+    // it again, so every layer that thought it was last put one in. The same
+    // seam puts a stop in FRONT OF A SEMICOLON as soon as there are two issues,
+    // which no fixture in this file provokes and which is the identical mistake
+    // — hence handing the composer the issue lists directly, the way the block
+    // above hands the mapper git's own stderr.
+    {
+      const composed = (issues) => String(badToolArguments('capture', { issues }).message || '');
+      const absent = (field) => ({ path: [field], message: 'Invalid input: expected string, received undefined' });
+      const one = composed([absent('target')]);
+      check('one missing argument is one sentence, ended once', /— target: target is required\.$/.test(one), short(one));
+      const two = composed([absent('target'), absent('scope')]);
+      check('  two are joined by a semicolon, not by a full stop and a semicolon', /target: target is required; scope: scope is required\.$/.test(two), short(two));
+      check('  and neither sentence doubles a stop anywhere in it', !/\w\.\.(\s|$)/.test(one) && !/\w\.\.(\s|$)/.test(two), short(two));
+      // THE CONTROL, so the trim is a normalisation and not a deletion: an
+      // issue whose own text ends in no stop still gets one, and the text
+      // itself is passed through untouched.
+      const bare = composed([{ path: ['viewports'], message: 'Expected an array of viewports' }]);
+      check('  and an issue that ended in no stop is still ended, with its own words kept', /— viewports: Expected an array of viewports\.$/.test(bare), short(bare));
     }
   } finally {
     await app.stop?.();

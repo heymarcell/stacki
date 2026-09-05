@@ -203,6 +203,9 @@ Refusals an agent must expect and can act on:
 | `bad_choices` | a `resolve_merge` choice does not describe the conflict: an unreadable value, a path git never reported as conflicting, a list of answers that is not one per disagreement, or `"merged"` where no combined version exists. Nothing was written, and the entry names the path and the reason |
 | `stale_merge` | the conflict the choices were made against is not the conflict that is there now — either branch has moved, or git reconciles the same two commits differently. Nothing was merged; the message names both branches and both short commits then and now, and the recovery is `git.merge` again |
 | `guard_required` | a `resolve_merge` with no `mergeRef`, or one carrying no observation. The handle `git.merge` hands back is what binds an answer to the conflict it answers |
+| `merge_blocked` | git would not start the re-merge a `resolve_merge` runs — most often another git process holding the repository for a moment. Nothing was merged and nothing was written, the conflict those answers are about is still the current one, and the recovery is to send **exactly the same call again with the same `mergeRef`**. Carries git's own sentence under `gitSaid` |
+| `merge_stuck` | the re-merge ran, the answers were refused, and the unwind that puts the tree back **failed**. This is the one refusal here that does not mean "nothing changed": the project is still mid-merge and `files` names the paths still holding conflict markers, relative to the repository root. Nothing was committed and `HEAD` did not move, but nothing else Stacki reads can be trusted until a person runs `git merge --abort` in the project |
+| `bad_branch_name` | a name git would not have read as a name — most often one beginning with `-`, which git reads as an option. It was never given to git, so nothing was changed |
 | `cancelled` | the caller went away mid-audit; says how many viewports had been measured and discarded |
 | `undo_failed` / `redo_failed` | the recorded inverse threw. Neither the project nor the history moved, so the same entry is still the one to retry |
 | `command_failed` | the editor's own window threw where no named cause fits — most often the filesystem refusing a write to the open document. The honest answer to an exception nobody planned, and the one code here that carries no advice beyond the sentence git or node gave |
@@ -215,6 +218,13 @@ git causes that arrived as `failed` (the code this codebase's own comment calls
 "the code that means nobody knows"), and one answer that was not a refusal at
 all — `page.dynamic_paths` reported a dynamic route as standing for no paths
 whenever it had no dev server to ask.
+
+Three more — `merge_blocked`, `merge_stuck` and `bad_branch_name` — were already
+being sent to clients before they were written down here. They are minted in the
+branch handler rather than in the MCP layer and pass through its mappers
+untouched, which is exactly the gap that let them ship undeclared; the contract
+test now reads that handler's codes too, so the next one cannot arrive the same
+way.
 
 **Every refusal reaches the wire with `isError: true`** as well as `ok: false`, on
 every tool. A host that keys off `isError` and a host that reads the envelope both
