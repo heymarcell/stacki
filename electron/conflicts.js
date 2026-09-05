@@ -340,6 +340,29 @@ function parseConflict(text) {
 const clashCount = (parts) => (parts || []).filter((p) => p.kind === 'clash').length;
 
 /**
+ * Whether the file's last line is inside the last disagreement.
+ *
+ * THE ONE PLACE THE FINAL NEWLINE IS NOT IN THE MARKED-UP FILE.
+ *
+ * A marker has to sit on a line of its own, so when the conflict runs to the
+ * end of the file git writes a newline after the chosen side's last line
+ * whether or not that side had one. Everywhere else the terminator is ordinary
+ * text and survives the round trip; here it is git's invention, and rebuilding
+ * from the marked-up file alone cannot tell an invented one from a real one.
+ *
+ * Recognised as a shape rather than guessed at: the parse ends with the empty
+ * `same` part that a file-ending newline always produces, and the part before
+ * it is the clash.
+ */
+function conflictAtEnd(parts) {
+  const list = parts || [];
+  const last = list[list.length - 1];
+  if (!last || last.kind !== 'same' || last.text !== '') return false;
+  const before = list[list.length - 2];
+  return !!before && before.kind === 'clash';
+}
+
+/**
  * Put the file back together, given one answer per disagreement.
  *
  * `picks` is an array in the order the clashes appear: `'ours'`, `'theirs'`,
@@ -347,10 +370,19 @@ const clashCount = (parts) => (parts || []).filter((p) => p.kind === 'clash').le
  * dropping the user's own work and silently dropping work they asked to merge
  * in, the first is worse, because the incoming version is still on its branch
  * and theirs may exist nowhere else.
+ *
+ * `sides` is the two whole versions git is holding — `{ours, theirs}` from
+ * stages 2 and 3 — and it is here for one reason: the final newline above.
+ * MEASURED, both ways round: with an incoming file that ends without a
+ * terminator, `choices: {'a.txt': 'theirs'}` committed `"a\nfeat"` while
+ * `choices: {'a.txt': ['theirs']}` committed `"a\nfeat\n"`. Same decision, two
+ * different files, and which one you got depended on the shape you happened to
+ * phrase it in. Left out, this argument changes nothing — a caller with no
+ * stages to hand gets what it always got.
  */
-function renderResolved(parts, picks = []) {
+function renderResolved(parts, picks = [], sides = null) {
   let n = -1;
-  return (parts || [])
+  const text = (parts || [])
     .map((part) => {
       if (part.kind === 'same') return part.text;
       n++;
@@ -368,6 +400,16 @@ function renderResolved(parts, picks = []) {
       return part.ours;
     })
     .join('\n');
+  if (!sides || typeof sides !== 'object' || !conflictAtEnd(parts) || !text.endsWith('\n')) return text;
+  // Whose last line this now is. 'both' and 'merged' both end on the incoming
+  // side; an answer that was never given keeps ours, the same default the
+  // renderer above applies.
+  const pick = picks[clashCount(parts) - 1];
+  const source = pick === 'theirs' || pick === 'both' || pick === 'merged' ? sides.theirs : sides.ours;
+  // Null is a side that deleted the file. There is no version of it to take a
+  // terminator from, so git's own is the only answer there is.
+  if (typeof source !== 'string' || source === '' || source.endsWith('\n')) return text;
+  return text.slice(0, -1);
 }
 
-module.exports = { parseConflict, renderResolved, clashCount, threeWay, lineDiff, mergeInline };
+module.exports = { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, lineDiff, mergeInline };

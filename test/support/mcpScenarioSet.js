@@ -1955,11 +1955,19 @@ fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call, fixtu
   const attempt = await call('git', 'merge', { branch: 'wire-conflict' });
   const clashed = JSON.stringify(attempt.envelope?.conflicts || attempt.envelope || {});
 
-  const { envelope } = await call('git', 'resolve_merge', { branch: 'wire-conflict', choices: { [FILE]: 'theirs' } });
+  // WHICH CONFLICT THESE ANSWERS ARE ABOUT. Applying them re-runs the merge, so
+  // a resolve that cannot name the conflict it is settling is refused — the
+  // handle the conflict envelope hands back is what names it, and the branch
+  // comes out of the handle rather than out of this call.
+  const { envelope } = await call('git', 'resolve_merge', {
+    mergeRef: attempt.envelope?.mergeRef,
+    choices: { [FILE]: 'theirs' },
+  });
   const after = fixture.read(FILE);
   const status = git(fixture, ['status', '--porcelain']);
   return { envelope, checks: [
     ['the two branches really disagree about that file', clashed.includes('conflict-canary')],
+    ['and the conflict handed back a handle to settle it with', typeof attempt.envelope?.mergeRef === 'string'],
     ['and the merge was the one thing that could not go through cleanly', attempt.envelope?.ok !== true || clashed.includes('conflict-canary')],
     ['resolving takes the side that was asked for', after.trim() === 'the incoming side'],
     ['leaving no conflict markers behind', !/^<{7}|^={7}|^>{7}/m.test(after)],

@@ -1125,6 +1125,152 @@ async function open(extra = {}) {
     app.stop();
   }
 
+  // ── 8. The one thing in this surface a ref names that is not a file ────────
+  //
+  // THE GIT DOMAIN WAS NOT IN THIS SUITE AT ALL, and it had the same hole in a
+  // worse place. git.resolve_merge RE-RUNS the merge to apply the answers, so
+  // the answers are applied to whatever git produces at that moment — and
+  // nothing bound them to the conflict the caller was actually shown. There was
+  // no ref, no SHA and no digest at any of the three layers; `refs.js` had no
+  // 'merge' kind to mint one with.
+  //
+  // Measured before the fix, with real commits and real committed bytes: a
+  // commit landing on either branch in between committed work nobody had read;
+  // a disagreement that stopped being one shifted the rest up, so the answer
+  // given for the top of a file landed on the bottom and this branch's own work
+  // left the tree. Every one of them answered `{"ok":true,"changed":true}`.
+  //
+  // So the conflict envelope hands back a signed handle, and the resolve
+  // requires it. The checks below are the ones this suite exists for: the ref
+  // records what was seen (a ref with an empty observation is not a weaker
+  // guard, it is no guard), the guard cannot be switched off by leaving the
+  // field out, and every refusal is paired with the bytes on disk and with a
+  // CONTROL that does the same thing with a fresh handle and still works.
+  {
+    const MB = require('./support/mergeBinding.js');
+    const { root, app, run } = await open();
+    MB.initRepo(root);
+    const PAGE = 'src/pages/about.astro';
+    const made = MB.makeConflict(root, {
+      branch: 'incoming',
+      file: PAGE,
+      base: '---\n---\n<h1>the original heading</h1>\n',
+      ours: '---\n---\n<h1>the heading as it is on main</h1>\n',
+      theirs: '---\n---\n<h1>the heading the branch wrote</h1>\n',
+    });
+
+    const clash = await run('git', 'merge', { branch: 'incoming' });
+    check('git.merge over two branches that disagree is a conflict', clash.ok === false && clash.code === 'merge_conflict', short(clash));
+    check('  naming the file', (clash.files || []).some((f) => f.path === PAGE), short(clash.files));
+    check('  and it hands back a handle for the conflict', typeof clash.mergeRef === 'string' && clash.mergeRef.startsWith('stacki:'), short(clash.mergeRef));
+
+    const body = dec(clash.mergeRef);
+    check('the handle is a merge ref', body.k === 'merge', short(body));
+    check('  naming the branch, so the resolve does not have to be told', body.d?.branch === 'incoming', short(body.d));
+    // THE ASSERTION THIS SUITE WAS WRITTEN ABOUT. A ref minted with no
+    // observation reads as a guard and is not one: there is nothing for a
+    // staleness check to compare against, so everything passes it.
+    check('and it records what was observed', body.o != null && Object.keys(body.o).length > 0, short(body.o));
+    check('  the commit it was merging into', body.o?.head === made.head, short({ saw: body.o?.head, was: made.head }));
+    check('  the commit it was merging in', body.o?.incoming === made.tip, short({ saw: body.o?.incoming, was: made.tip }));
+    // Not only the two SHAs. They are an argument from git's determinism; the
+    // digest is a measurement of what git actually wrote.
+    check('  and a digest of the conflict itself', typeof body.o?.digest === 'string' && body.o.digest.length > 8, short(body.o));
+    check('nothing absolute travelled inside it', !JSON.stringify(body).includes(root), short(body.d));
+
+    // ── mergeRef omitted ──────────────────────────────────────────────────
+    let before = MB.repoState(root);
+    const unguarded = await run('git', 'resolve_merge', { branch: 'incoming', choices: { [PAGE]: 'theirs' } });
+    check('a resolve that does not say which conflict it settles is refused', unguarded.ok === false, short(unguarded));
+    check('  as guard_required', unguarded.code === 'guard_required', short({ code: unguarded.code, message: unguarded.message }));
+    check('  and nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0, MB.movedBetween(before.bytes, MB.bytesOf(root)).join(', '));
+    check('  with HEAD where it was', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+
+    // ── a forged handle ───────────────────────────────────────────────────
+    const flipped = (() => {
+      const dot = clash.mergeRef.lastIndexOf('.');
+      const at = 'stacki:'.length + 4;
+      const ch = clash.mergeRef[at] === 'a' ? 'b' : 'a';
+      return `${clash.mergeRef.slice(0, at)}${ch}${clash.mergeRef.slice(at + 1, dot)}${clash.mergeRef.slice(dot)}`;
+    })();
+    before = MB.repoState(root);
+    const forged = await run('git', 'resolve_merge', { mergeRef: flipped, choices: { [PAGE]: 'theirs' } });
+    check('one character of the handle changed is not a handle', forged.ok === false && forged.code === 'bad_ref', short(forged));
+    check('  and nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0);
+    check('  with HEAD where it was', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+
+    // ── merge A's handle paired with merge B's branch ─────────────────────
+    //
+    // The reason the branch is taken OUT OF THE REF rather than out of the
+    // call: an agent holding two conflicts holds two sets of answers and two
+    // branch names, and pairing them wrongly is one transposed argument away.
+    const OTHER = 'src/pages/contact.astro';
+    const second = MB.makeConflict(root, {
+      branch: 'other-incoming',
+      file: OTHER,
+      base: '---\n---\n<p>the original</p>\n',
+      ours: '---\n---\n<p>as it is on main</p>\n',
+      theirs: '---\n---\n<p>as the other branch wrote it</p>\n',
+    });
+    const clashB = await run('git', 'merge', { branch: 'other-incoming' });
+    check('a second, separate merge also conflicts', clashB.ok === false && clashB.code === 'merge_conflict', short(clashB));
+    check('  with a handle of its own', typeof clashB.mergeRef === 'string' && clashB.mergeRef !== clash.mergeRef);
+    check('  naming its own branch', dec(clashB.mergeRef).d?.branch === 'other-incoming', short(dec(clashB.mergeRef).d));
+    before = MB.repoState(root);
+    const crossed = await run('git', 'resolve_merge', { mergeRef: clashB.mergeRef, branch: 'incoming', choices: { [OTHER]: 'theirs' } });
+    check('one merge’s handle with another merge’s branch is refused', crossed.ok === false, short(crossed));
+    check('  as wrong_target', crossed.code === 'wrong_target', short({ code: crossed.code, message: crossed.message }));
+    check('  naming both branches, so the mistake is visible', /incoming/.test(String(crossed.message)) && /other-incoming/.test(String(crossed.message)), short(crossed.message));
+    check('  and nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0);
+
+    // ── a commit landing on one of the branches ───────────────────────────
+    //
+    // The handle is still perfectly good; the world it describes is gone. That
+    // is the difference between `bad_ref` and `stale_merge`, and an agent acts
+    // on them differently.
+    MB.commitOn(root, 'other-incoming', 'src/pages/moved.astro', '---\n---\n<p>arrived after you looked</p>\n');
+    before = MB.repoState(root);
+    const moved = await run('git', 'resolve_merge', { mergeRef: clashB.mergeRef, choices: { [OTHER]: 'theirs' } });
+    check('a commit on either branch makes the answers stale', moved.ok === false, short(moved));
+    check('  as stale_merge', moved.code === 'stale_merge', short({ code: moved.code, message: moved.message }));
+    check('  naming what it saw and what is there now', moved.expected?.incoming === second.tip && moved.current?.incoming !== second.tip, short({ expected: moved.expected, current: moved.current }));
+    check('  and saying to run the merge again rather than retry this', /git\.merge/.test(String(moved.message)), short(moved.message));
+    check('  nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0, MB.movedBetween(before.bytes, MB.bytesOf(root)).join(', '));
+    check('  HEAD did not move', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+    check('  and no merge was left in progress', !fs.existsSync(path.join(root, '.git', 'MERGE_HEAD')));
+
+    // ── THE CONTROL ───────────────────────────────────────────────────────
+    //
+    // Every check above is refusal-shaped, and a domain that refused every
+    // resolve would satisfy all of them. Handing back the handle unchanged,
+    // against a conflict that has not moved, must still merge.
+    const fresh = await run('git', 'merge', { branch: 'incoming' });
+    check('the first conflict is still there to settle', fresh.ok === false && fresh.code === 'merge_conflict', short(fresh));
+    const settled = await run('git', 'resolve_merge', { mergeRef: fresh.mergeRef, choices: { [PAGE]: 'theirs' } });
+    check('the handle handed back unchanged settles the merge', settled.ok === true, short(settled));
+    check('  taking the side that was asked for', app.read(PAGE).includes('the heading the branch wrote'), short(app.read(PAGE)));
+    check('  as a real two-parent merge commit', MB.git(root, 'log', '-1', '--format=%P').split(' ').length === 2, MB.git(root, 'log', '-1', '--format=%P'));
+    check('  on a clean tree', MB.git(root, 'status', '--porcelain') === '', MB.git(root, 'status', '--porcelain'));
+    check('  with no markers surviving', !app.read(PAGE).includes('<<<<<<<'), short(app.read(PAGE)));
+
+    // ── the era ends ──────────────────────────────────────────────────────
+    //
+    // Last, because rotating is global: every ref this run issued stops
+    // resolving, which is the point. A merge handle that outlived the project
+    // it was made in would name a branch in somebody else's repository.
+    const lastClash = await run('git', 'merge', { branch: 'other-incoming' });
+    check('a handle exists to be invalidated', typeof lastClash.mergeRef === 'string', short(lastClash.code));
+    refs.rotate();
+    before = MB.repoState(root);
+    const afterRotate = await run('git', 'resolve_merge', { mergeRef: lastClash.mergeRef, choices: { [OTHER]: 'theirs' } });
+    check('a handle from before the project was reopened does not resolve', afterRotate.ok === false, short(afterRotate));
+    check('  as stale_ref', afterRotate.code === 'stale_ref', short({ code: afterRotate.code, message: afterRotate.message }));
+    check('  and nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0);
+    check('  with HEAD where it was', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+
+    app.stop();
+  }
+
   for (const root of projects) H.removeProject(root);
 
   if (failures.length) {

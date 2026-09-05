@@ -13,7 +13,7 @@
 // cannot understand must keep all of its lines rather than losing the parts it
 // failed to parse.
 
-const { parseConflict, renderResolved, clashCount, threeWay, mergeInline } = require('../electron/conflicts.js');
+const { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, mergeInline } = require('../electron/conflicts.js');
 
 const failures = [];
 let checked = 0;
@@ -332,6 +332,85 @@ const conflicted = [
     'and asking for one falls back to your side',
     renderResolved([plain], ['merged']) === 'aaa',
     JSON.stringify(renderResolved([plain], ['merged']))
+  );
+}
+
+// --- The newline the markers made up ----------------------------------------
+//
+// A marker sits on a line of its own, so when the conflict runs to the end of
+// the file git writes a newline after the chosen side's last line whether or
+// not that side had one. Rebuilding from the marked-up file alone cannot tell
+// an invented terminator from a real one — and that made the two ways of
+// phrasing the SAME decision produce different bytes: `'theirs'` for the whole
+// file is `git checkout --theirs`, which is the incoming file exactly, while
+// `['theirs']` came back with a terminator the incoming file did not have.
+{
+  const atEnd = parseConflict(
+    ['a', '<<<<<<< HEAD', 'main', '||||||| base', 'base', '=======', 'feat', '>>>>>>> f', ''].join('\n')
+  );
+  check('a conflict at the end of the file is recognised as one', conflictAtEnd(atEnd) === true, JSON.stringify(atEnd));
+  check(
+    'with no sides to consult, it renders as it always did',
+    renderResolved(atEnd, ['theirs']) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs']))
+  );
+  check(
+    'an incoming side with no terminator does not gain one',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }) === 'a\nfeat',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }))
+  );
+  check(
+    'and one that has a terminator keeps exactly one',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  // The ANSWER decides which side is consulted, not the other way round.
+  check(
+    'keeping this branch reads this branch’s terminator',
+    renderResolved(atEnd, ['ours'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nmain',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  check(
+    'and an answer nobody gave keeps this branch’s, like the render itself does',
+    renderResolved(atEnd, [], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nmain',
+    JSON.stringify(renderResolved(atEnd, [], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  // 'both' ends on the incoming side, so that is the side to ask.
+  check(
+    '"both" ends on the incoming side, so it reads that terminator',
+    renderResolved(atEnd, ['both'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }) === 'a\nmain\nfeat',
+    JSON.stringify(renderResolved(atEnd, ['both'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }))
+  );
+  // A side that DELETED the file has no version to take a terminator from, and
+  // must not be read as "a version with no terminator".
+  check(
+    'a deleted side leaves git’s own terminator alone',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: null }) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: null }))
+  );
+
+  // AND THE CASE THIS MUST NOT TOUCH. When the file ends with text both sides
+  // agree on, the terminator is ordinary content and came through the markers
+  // intact — trimming there would delete a real newline.
+  const inMiddle = parseConflict(
+    ['<<<<<<< HEAD', 'main', '||||||| base', 'base', '=======', 'feat', '>>>>>>> f', 'z', ''].join('\n')
+  );
+  check('a conflict with settled text after it is not at the end', conflictAtEnd(inMiddle) === false, JSON.stringify(inMiddle));
+  check(
+    'and its terminator is left exactly as the file had it',
+    renderResolved(inMiddle, ['theirs'], { ours: 'main\nz', theirs: 'feat\nz' }) === 'feat\nz\n',
+    JSON.stringify(renderResolved(inMiddle, ['theirs'], { ours: 'main\nz', theirs: 'feat\nz' }))
+  );
+  // A marked-up file with no final newline has no trailing empty part, so
+  // there is nothing to take off and nothing was invented to take off.
+  const noTerminator = parseConflict(
+    ['a', '<<<<<<< HEAD', 'main', '=======', 'feat', '>>>>>>> f'].join('\n')
+  );
+  check('a marked-up file with no final newline is not at the end either', conflictAtEnd(noTerminator) === false, JSON.stringify(noTerminator));
+  check(
+    'and renders without one',
+    renderResolved(noTerminator, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat' }) === 'a\nfeat',
+    JSON.stringify(renderResolved(noTerminator, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat' }))
   );
 }
 

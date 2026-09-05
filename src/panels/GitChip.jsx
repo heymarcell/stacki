@@ -495,11 +495,31 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
           onResolve={async (choices) => {
             const done = await act(
               async () => {
+                // WHICH CONFLICT THESE ANSWERS ARE ABOUT.
+                //
+                // The merge is re-run when the answers are applied, so a commit
+                // arriving on either branch while this dialog was open would
+                // have had the picks applied to a different conflict — measured
+                // to the point of committing the wrong half of a file with
+                // `ok: true`. `conflict.at` is what git:merge measured before it
+                // unwound, carried back unchanged. Plain IPC, and plain on
+                // purpose: this is the panel that was shown the conflict, and a
+                // signed handle is what the MCP boundary is for.
                 const r = await window.avb.gitResolveMerge({
                   projectPath: project.path,
                   branch: conflict.branch,
                   choices,
+                  expect: conflict.at,
                 });
+                // A RETURNED REFUSAL IS STILL A REFUSAL. resolveMerge answers
+                // `{ok:false}` rather than throwing, so this used to fall
+                // straight through to "Merged x into undefined" over a merge
+                // that had not happened. Thrown here so it reaches the same
+                // error line every other git refusal in this panel does, and so
+                // the dialog stays open with the answers still in it.
+                if (r?.ok === false) {
+                  throw new Error(r.message || `Could not finish merging “${conflict.branch}”.`);
+                }
                 // The tidy-up was chosen back when the merge was started, before
                 // anyone knew it would clash. It still applies now it is settled.
                 if (conflict.deleteAfter) {

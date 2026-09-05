@@ -1502,7 +1502,7 @@ const git = {
     // conflicting HUNKS (`parts`) rather than the files they came from, both
     // bounded and both saying so when they bite. The whole versions stay
     // available to the panel over IPC, which is where they were needed.
-    result: (raw, input) => {
+    result: (raw, input, ctx) => {
       if (raw?.ok === false && raw.conflicted) {
         const all = Array.isArray(raw.files) ? raw.files : [];
         // A PER-FILE CAP IS NOT A BUDGET. Twenty conflicting files each just
@@ -1532,16 +1532,30 @@ const git = {
             hunksOmitted: !fits,
           };
         });
+        // THE HANDLE THAT SAYS WHICH CONFLICT THIS IS.
+        //
+        // The merge is re-run when the answers are applied, so answers given
+        // against this conflict must not be applied to a later one \u2014 measured
+        // to the point of committing the wrong half of a file, `ok: true`, when
+        // a commit arrived on either branch in between. The ref carries the two
+        // commits and a digest of what git actually wrote, and it carries the
+        // BRANCH, so resolve_merge takes the branch out of the ref rather than
+        // out of the call. Signed here and nowhere else: the panel is handed
+        // the same three facts unsigned over IPC, because the panel is Stacki.
+        const mergeRef = typeof ctx?.mergeRef === 'function' ? ctx.mergeRef({ branch: input.branch, into: raw.from ?? null }, raw.at) : null;
         return {
           ...problem(
             'merge_conflict',
             `Merging "${input.branch}" stopped on ${all.length} conflicting ${all.length === 1 ? 'file' : 'files'}. ` +
               'The merge was unwound, so the project is exactly as it was. Reconcile the files named here and ' +
-              'apply the result with git.resolve_merge, whose `choices` takes "ours" or "theirs" per file, or an ' +
-              'array of "ours" | "theirs" | "both" | "merged" \u2014 one per hunk, in the order they are listed here.'
+              'apply the result with git.resolve_merge, passing the `mergeRef` below back unchanged \u2014 it says which ' +
+              'conflict your answers are about, and a resolve without it is refused. `choices` takes "ours" or ' +
+              '"theirs" per file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per hunk, ' +
+              'exactly as many as the hunks listed here, in this order.'
           ).error,
           branch: input.branch,
           into: raw.from ?? null,
+          mergeRef,
           conflictCount: all.length,
           files,
           filesOmitted: Math.max(0, all.length - files.length),
@@ -1573,7 +1587,29 @@ const git = {
   },
   resolve_merge: {
     channel: 'git:resolveMerge',
-    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }),
+    // THE BRANCH COMES OUT OF THE REF, NOT OUT OF THE CALL.
+    //
+    // An agent that has run two merges holds two sets of answers and two branch
+    // names, and pairing them wrongly is one transposed argument away. Taking
+    // the branch from the signed handle makes that pairing impossible rather
+    // than unlikely. `branch` stays in the schema because it reads as the
+    // obvious argument and leaving it out would be a trap of its own \u2014 but it
+    // is cross-checked, never used.
+    args: (input, ctx) => {
+      if (typeof ctx.mergeBinding !== 'function') {
+        return problem('bad_ref', 'Stacki cannot read refs right now, so a merge cannot be finished safely.');
+      }
+      const bound = ctx.mergeBinding(input.mergeRef);
+      if (bound.error) return bound;
+      if (input.branch != null && input.branch !== bound.branch) {
+        return problem(
+          'wrong_target',
+          `That mergeRef is for the conflict from merging "${bound.branch}", and this call names "${input.branch}". ` +
+            'Those are two different merges and the answers to one are not answers to the other. Nothing was merged.'
+        );
+      }
+      return { projectPath: ctx.root, branch: bound.branch, choices: input.choices || {}, expect: bound.observed };
+    },
     // A CHOICE THAT WAS NOT UNDERSTOOD IS NOT A RESOLUTION.
     //
     // The handler used to treat anything that was not the string 'theirs' as
@@ -1584,13 +1620,34 @@ const git = {
     result: (raw, input) => {
       if (raw?.ok === false && Array.isArray(raw.badChoices)) {
         const first = raw.badChoices[0] || {};
+        // WHAT IS WRONG WITH THE FIRST ONE, in the sentence rather than only in
+        // the list. The refusal used to say "could not be understood, starting
+        // with <path>", which was true while the only failure was a word
+        // outside the vocabulary on a path git had reported. It now also
+        // catches a path git never reported at all \u2014 a typo, a file git merged
+        // by itself, one left over from an earlier merge \u2014 and an array of the
+        // wrong length, where the offending thing is a COUNT. "The choice for
+        // src/pages/abot.astro could not be understood" sends an agent looking
+        // at the value; the file is spelled wrong.
+        const why = {
+          unknown_path: `"${first.path}" is not one of the files this merge could not reconcile, so nothing would have answered for it`,
+          wrong_length: `"${first.path}" has ${first.hunks} conflicting ${first.hunks === 1 ? 'hunk' : 'hunks'} and ${first.given} ${first.given === 1 ? 'answer' : 'answers'} were given for it`,
+          no_merged: `"${first.path}" hunk ${first.hunk} has no combined version, so "merged" is not one of its answers`,
+          empty: `"${first.path}" was given an empty list of answers, which answers none of its hunks`,
+          null: `"${first.path}" was given null, which is neither an answer nor leaving the file out`,
+          not_splittable: `"${first.path}" has no hunks to answer one at a time \u2014 it takes "ours" or "theirs" for the whole file`,
+          bad_pick: `"${first.given}" is not one of the answers a hunk of "${first.path}" can take`,
+          bad_value: `"${first.given}" is not one of the answers "${first.path}" can take`,
+          bad_shape: `the choice for "${first.path}" is a ${first.given}, which is neither a word nor a list of them`,
+        }[first.reason] || `the choice for "${first.path}" could not be understood`;
         return {
           ...problem(
             'bad_choices',
-            `Nothing was merged: ${raw.badChoices.length} of the choices could not be understood, starting with ` +
-              `${first.path}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
-              '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk, in the order git reports ' +
-              "them. A file you leave out keeps this branch's version."
+            `Nothing was merged: ${raw.badChoices.length} of the choices could not be used, starting with the ` +
+              `first \u2014 ${why}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
+              '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk and exactly as many ' +
+              'entries as that file has hunks, in the order git.merge listed them. Every key must be a path ' +
+              "git.merge reported. A file you leave out entirely keeps this branch's version."
           ).error,
           branch: input.branch,
           into: raw.from ?? null,

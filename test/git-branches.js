@@ -71,6 +71,115 @@ const caught = async (fn) => {
   }
 };
 
+// --- what a refusal is measured against --------------------------------------
+//
+// `ok:false` ON ITS OWN IS NOT AN ORACLE. A resolve that refused but left the
+// tree mid-merge would satisfy it — and so would one that refused after it had
+// already committed. Both are worse than the bug being fixed. So every refusal
+// below is held to all six of: it said no, it said why in a word a caller can
+// branch on, it named the offender, HEAD did not move, the working tree is
+// clean with no merge left in progress, and not one byte anywhere in the
+// repository changed.
+
+const crypto = require('crypto');
+
+/** Every file in the working tree, by content. Never .git, which merging churns. */
+function bytesOf(dir) {
+  const out = {};
+  const walk = (rel) => {
+    for (const entry of fs.readdirSync(rel ? path.join(dir, rel) : dir, { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const at = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(at);
+      else out[at] = crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, at))).digest('hex');
+    }
+  };
+  walk('');
+  return out;
+}
+
+const repoState = async (dir) => ({
+  head: await sh(dir, 'rev-parse', 'HEAD'),
+  status: await sh(dir, 'status', '--porcelain'),
+  mergeHead: fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')),
+  bytes: bytesOf(dir),
+});
+
+/**
+ * A refusal that changed nothing.
+ *
+ * `names` is a predicate over the answer: whatever in it identifies the thing
+ * that was wrong. A refusal that will not say which choice it could not use
+ * sends the caller back to re-read every file it named.
+ */
+async function refusedCleanly(what, answer, dir, before, code, names) {
+  check(`${what} is refused`, answer?.ok === false, JSON.stringify(answer));
+  check(`  ${what}: as ${code}`, answer?.code === code, JSON.stringify({ code: answer?.code, message: answer?.message }));
+  check(`  ${what}: naming what was wrong`, !!names && names(answer), JSON.stringify(answer).slice(0, 400));
+  // A code is for the caller; this is for the person the caller is working for.
+  check(
+    `  ${what}: with a sentence somebody can act on`,
+    typeof answer?.message === 'string' && answer.message.length > 40 && /nothing was merged/i.test(answer.message),
+    JSON.stringify(answer?.message)
+  );
+  const after = await repoState(dir);
+  check(`  ${what}: HEAD did not move`, after.head === before.head, `${before.head} -> ${after.head}`);
+  check(`  ${what}: the working tree is clean`, after.status === '', after.status);
+  check(`  ${what}: no merge was left in progress`, after.mergeHead === false);
+  const moved = Object.keys({ ...before.bytes, ...after.bytes }).filter((f) => before.bytes[f] !== after.bytes[f]);
+  check(`  ${what}: not one file in the repository changed`, moved.length === 0, moved.join(', '));
+}
+
+/**
+ * A repository whose `src/pages/about.astro` clashes in THREE places, with a
+ * second file git reconciles by itself beside it.
+ *
+ * Three, because two of the ways a per-hunk answer used to go wrong are about
+ * the LENGTH of the list, and a one-hunk file cannot tell a short list from an
+ * empty one.
+ */
+async function threeClashRepo(name) {
+  const dir = await repo(name);
+  const gap = (n) => Array.from({ length: 6 }, (_, i) => `${n}${i}`);
+  const page = (a, b, c) => [a, ...gap('k'), b, ...gap('m'), c].join('\n') + '\n';
+  fs.mkdirSync(path.join(dir, 'src', 'pages'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), page('A-base', 'B-base', 'C-base'));
+  fs.writeFileSync(path.join(dir, 'other.txt'), 'shared\n');
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'about');
+  await sh(dir, 'checkout', '-qb', 'feature');
+  fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), page('A-feat', 'B-feat', 'C-feat'));
+  // Touched on ONE branch only, so git reconciles it without asking. It is a
+  // real path in a real repository and it is never conflicted, which is
+  // exactly what makes a choice naming it a choice for nothing.
+  fs.writeFileSync(path.join(dir, 'other.txt'), 'shared, edited on feature\n');
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'feature about');
+  await sh(dir, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), page('A-main', 'B-main', 'C-main'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'main about');
+  return dir;
+}
+
+/** A repository whose a.txt clashes at the top and at the bottom, and nowhere else. */
+async function twoClashRepo(name) {
+  const dir = await repo(name);
+  const page = (top, bottom) => [top, ...Array.from({ length: 6 }, (_, i) => `m${i}`), bottom].join('\n') + '\n';
+  fs.writeFileSync(path.join(dir, 'a.txt'), page('TOP-base', 'BOTTOM-base'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'two ends');
+  await sh(dir, 'checkout', '-qb', 'feature');
+  fs.writeFileSync(path.join(dir, 'a.txt'), page('TOP-feat', 'BOTTOM-feat'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'feature ends');
+  await sh(dir, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(dir, 'a.txt'), page('TOP-main', 'BOTTOM-main'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'main ends');
+  return dir;
+}
+
 (async () => {
   const cleanup = [];
 
@@ -173,6 +282,10 @@ const caught = async (fn) => {
       projectPath: dir,
       branch: 'feature',
       choices: { 'a.txt': 'ours', 'b.txt': 'theirs' },
+      // Which conflict these answers are about. The merge is re-run to apply
+      // them, so a resolve that cannot say is refused — see the stale-snapshot
+      // block below, which is what that guard exists for.
+      expect: clash.at,
     });
     check('the merge finishes', done.ok === true, JSON.stringify(done));
     check('keeping mine where I said', fs.readFileSync(path.join(dir, 'a.txt'), 'utf8').trim() === 'main a');
@@ -226,6 +339,7 @@ const caught = async (fn) => {
       projectPath: dir,
       branch: 'feature',
       choices: { 'p.astro': ['theirs', 'ours'] },
+      expect: clash.at,
     });
     check('a mixed merge finishes', done.ok === true, JSON.stringify(done));
     const out = fs.readFileSync(path.join(dir, 'p.astro'), 'utf8');
@@ -286,6 +400,7 @@ const caught = async (fn) => {
       projectPath: dir,
       branch: 'new-branch',
       choices: { 'index.astro': picks },
+      expect: clash.at,
     });
     check('the merge finishes', done.ok === true, JSON.stringify(done));
 
@@ -332,6 +447,7 @@ const caught = async (fn) => {
       projectPath: dir,
       branch: 'new-branch',
       choices: { 'index.astro': ['merged'] },
+      expect: clash.at,
     });
     check('the merge finishes', done.ok === true, JSON.stringify(done));
     const out = fs.readFileSync(path.join(dir, 'index.astro'), 'utf8');
@@ -358,17 +474,689 @@ const caught = async (fn) => {
     await sh(dir, 'add', '-A');
     await sh(dir, 'commit', '-qm', 'mine');
 
-    await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
     // No answer for this file. Between silently dropping your own work and
     // silently dropping work you asked to merge in, the first is worse: the
     // incoming version is still on its branch, yours may exist nowhere else.
-    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: {} });
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: {}, expect: clash.at });
     check('an unanswered file keeps your own version', done.ok === true, JSON.stringify(done));
     check(
       'rather than the incoming one',
       fs.readFileSync(path.join(dir, 'a.txt'), 'utf8').trim() === 'mine',
       fs.readFileSync(path.join(dir, 'a.txt'), 'utf8')
     );
+  }
+
+  // --- A choice that answers nothing ----------------------------------------
+  //
+  // The pre-flight checked the VALUES on the paths git had reported and nothing
+  // else. Its loop ran over the CONFLICTED files, so a choice was only ever
+  // looked up under a name git had already supplied — and every way of getting
+  // that name wrong, or of getting the SHAPE of a per-hunk answer wrong,
+  // reached the apply loop and was committed. Six of them, each ending in
+  // `{ok:true, changed:true}` over a file the caller had not described:
+  //
+  //   a typo in the path, so the real conflict got no answer and took --ours;
+  //   a path git had auto-merged; a path left over from an earlier merge;
+  //   two answers for three clashes, and five; "merged" where there is no
+  //   combined version; an explicit null; an empty list.
+  //
+  // Every one of them is now measured the same way: nothing merged, HEAD where
+  // it was, no merge in progress, and every byte in the repository unchanged.
+  {
+    // T1 — A TYPO IN THE PATH. The one that reads as a success: the caller
+    // asked for THEIRS and the file it meant was committed as OURS.
+    const dir = await threeClashRepo('typokey');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('the fixture really clashes in three places', (clash.files[0].parts || []).filter((p) => p.kind === 'clash').length === 3, JSON.stringify(clash.files.map((f) => f.path)));
+    check('and only in the one file', clash.files.length === 1, JSON.stringify(clash.files.map((f) => f.path)));
+
+    const before = await repoState(dir);
+    const typo = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      // "abot" — one transposition away from the file git actually named.
+      choices: { 'src/pages/abot.astro': ['theirs', 'theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T1 a choice under a path git never reported',
+      typo,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r.badChoices?.[0]?.path === 'src/pages/abot.astro' && r.badChoices[0].reason === 'unknown_path'
+    );
+    check(
+      'T1: the file the caller meant still says what this branch said',
+      fs.readFileSync(path.join(dir, 'src/pages/about.astro'), 'utf8').includes('A-main'),
+      fs.readFileSync(path.join(dir, 'src/pages/about.astro'), 'utf8').split('\n')[0]
+    );
+
+    // T9 — THE ESCALATION. The wrong resolution used to record a real
+    // two-parent merge commit, which satisfies git's "fully merged" test — so
+    // Stacki's safe branch delete stopped protecting the branch whose work had
+    // just been discarded. With the refusal above, it still does.
+    const guard = await deleteBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T9 the branch is still protected from a plain delete', guard.ok === false && guard.unmerged === true, JSON.stringify(guard));
+    check(
+      'T9: and the branch is still there',
+      (await sh(dir, 'branch', '--format=%(refname:short)')).includes('feature')
+    );
+  }
+
+  {
+    // T2 — A CHOICE FOR A PATH GIT MERGED BY ITSELF.
+    const dir = await threeClashRepo('notconflicting');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T2: the second file is not one of the conflicts', !clash.files.some((f) => f.path === 'other.txt'), JSON.stringify(clash.files.map((f) => f.path)));
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'other.txt': 'theirs', 'src/pages/about.astro': ['theirs', 'theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T2 a choice for a path that is not conflicted',
+      answer,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r.badChoices?.some((b) => b.path === 'other.txt' && b.reason === 'unknown_path')
+    );
+  }
+
+  {
+    // T3 — A PATH LEFT OVER FROM AN EARLIER MERGE IN THE SAME REPOSITORY.
+    // It was conflicted once, so it reads as a plausible key, and it is not
+    // conflicted now.
+    const dir = await threeClashRepo('stalepath');
+    cleanup.push(dir);
+    // An earlier merge, over a different file, settled and committed.
+    await sh(dir, 'checkout', '-qb', 'earlier', 'main');
+    fs.writeFileSync(path.join(dir, 'old.txt'), 'from the earlier branch\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'earlier old');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'old.txt'), 'from main\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main old');
+    const first = await mergeBranch(git, { projectPath: dir, branch: 'earlier' });
+    check('T3: the earlier merge really clashed over old.txt', first.files?.[0]?.path === 'old.txt', JSON.stringify(first.files?.map((f) => f.path)));
+    const settled = await resolveMerge(git, { projectPath: dir, branch: 'earlier', choices: { 'old.txt': 'ours' }, expect: first.at });
+    check('T3: and it settled', settled.ok === true, JSON.stringify(settled));
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T3: the new conflict is not about old.txt', !clash.files.some((f) => f.path === 'old.txt'), JSON.stringify(clash.files.map((f) => f.path)));
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'old.txt': 'theirs', 'src/pages/about.astro': ['theirs', 'theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T3 a path from an earlier merge in the same repository',
+      answer,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r.badChoices?.some((b) => b.path === 'old.txt' && b.reason === 'unknown_path')
+    );
+  }
+
+  {
+    // T4 and T5 — TOO FEW ANSWERS AND TOO MANY.
+    //
+    // Short: `picks[n]` was undefined for the surplus clashes and renderResolved
+    // reads that as `ours`, so the third disagreement was answered by nobody.
+    // Long: the surplus was dropped without a word, which means the caller and
+    // Stacki disagreed about which answer went where.
+    // A REPOSITORY EACH.
+    //
+    // These used to share one, and sharing hid things: the first case in the
+    // block is the only one whose repository is in the state the block set up.
+    // If a guard stops holding, that first resolve MERGES — and every case
+    // after it is then answering against a moved HEAD, so it is refused for a
+    // completely different reason and still looks like a pass. Measured while
+    // proving these tests can fail: with the length check deleted, the short
+    // list committed and the long list came back `stale_merge`, so the case
+    // that was supposed to be catching the defect reported green.
+    const PAGE = 'src/pages/about.astro';
+    const fresh = async (name) => {
+      const dir = await threeClashRepo(name);
+      cleanup.push(dir);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      return { dir, clash, before: await repoState(dir) };
+    };
+
+    {
+      const { dir, clash, before } = await fresh('arrayshort');
+      const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: ['theirs', 'theirs'] }, expect: clash.at });
+      await refusedCleanly(
+        'T4 two answers for three disagreements',
+        answer,
+        dir,
+        before,
+        'bad_choices',
+        (r) => r.badChoices?.[0]?.reason === 'wrong_length' && r.badChoices[0].hunks === 3 && r.badChoices[0].given === 2
+      );
+    }
+
+    {
+      const { dir, clash, before } = await fresh('arraylong');
+      const answer = await resolveMerge(git, {
+        projectPath: dir,
+        branch: 'feature',
+        choices: { [PAGE]: ['theirs', 'theirs', 'theirs', 'ours', 'ours'] },
+        expect: clash.at,
+      });
+      await refusedCleanly(
+        'T5 five answers for three disagreements',
+        answer,
+        dir,
+        before,
+        'bad_choices',
+        (r) => r.badChoices?.[0]?.reason === 'wrong_length' && r.badChoices[0].hunks === 3 && r.badChoices[0].given === 5
+      );
+    }
+
+    {
+      // T8 — AN EMPTY LIST. `[].find(...)` is undefined, so it validated as a
+      // list of acceptable words and then answered every clash with nothing.
+      const { dir, clash, before } = await fresh('arrayempty');
+      const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: [] }, expect: clash.at });
+      await refusedCleanly(
+        'T8 an empty list of answers',
+        answer,
+        dir,
+        before,
+        'bad_choices',
+        (r) => r.badChoices?.[0]?.reason === 'empty' && r.badChoices[0].path === PAGE
+      );
+    }
+
+    {
+      // T7 — AN EXPLICIT NULL. "I have not decided about this file" and "I have
+      // decided, and here is nothing" are not the same sentence, and the guard
+      // used to read them as one.
+      const { dir, clash, before } = await fresh('nullchoice');
+      const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: null }, expect: clash.at });
+      await refusedCleanly(
+        'T7 an explicit null for a whole file',
+        answer,
+        dir,
+        before,
+        'bad_choices',
+        (r) => r.badChoices?.[0]?.reason === 'null' && r.badChoices[0].path === PAGE
+      );
+    }
+
+    // THE POSITIVE CONTROL, kept beside them rather than at the end of the
+    // file: a pre-flight that refused everything would satisfy all four cases
+    // above and nothing here would notice.
+    const { dir, clash } = await fresh('arrayright');
+    const right = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { [PAGE]: ['theirs', 'ours', 'theirs'] },
+      expect: clash.at,
+    });
+    check('and exactly three answers for three disagreements still merges', right.ok === true, JSON.stringify(right));
+    const out = fs.readFileSync(path.join(dir, PAGE), 'utf8');
+    check('  taking each side where it was asked for', out.includes('A-feat') && out.includes('B-main') && out.includes('C-feat'), out);
+    check('  and no other version survived', !out.includes('A-main') && !out.includes('B-feat') && !out.includes('C-main'), out);
+    check('  as a real two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
+    check('  on a clean tree', (await sh(dir, 'status', '--porcelain')) === '');
+    check('  with no markers surviving', !out.includes('<<<<<<<'), out);
+  }
+
+  {
+    // T6 — "merged" WHERE THERE IS NOTHING TO MERGE.
+    //
+    // 'merged' is in the per-hunk vocabulary, so it validated everywhere it was
+    // said. renderResolved then asks `part.merged != null` and falls through to
+    // `ours`, so asking for the combination of two edits silently kept one.
+    const dir = await repo('mergednone');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'the original sentence\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'sentence');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a completely different sentence written on the branch\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature sentence');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'another entirely unrelated line typed here instead\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main sentence');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const c = (clash.files[0].parts || []).find((p) => p.kind === 'clash');
+    // ASSERTED FIRST, so the fixture cannot quietly stop being the negative
+    // case: if the inline splitter ever learns to combine these two, this whole
+    // block is measuring something else and says so here rather than passing.
+    check('T6: the fixture offers no combined version', !!c && c.merged === undefined, JSON.stringify(c));
+    check('T6: and both branches really did change it', c.changedBy === 'both', JSON.stringify(c));
+
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['merged'] }, expect: clash.at });
+    await refusedCleanly(
+      'T6 "merged" for a hunk that has no combined version',
+      answer,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r.badChoices?.[0]?.reason === 'no_merged' && r.badChoices[0].hunk === 0
+    );
+    check(
+      'T6: and the incoming version was not silently discarded',
+      fs.readFileSync(path.join(dir, 'a.txt'), 'utf8').includes('unrelated line'),
+      fs.readFileSync(path.join(dir, 'a.txt'), 'utf8')
+    );
+  }
+
+  // --- The conflict the answers were made against ---------------------------
+  //
+  // resolveMerge RE-RUNS the merge, so the answers are applied to whatever git
+  // produces at that moment — and nothing used to say that had to be the
+  // conflict the caller was shown. Six ways it went wrong, all measured with
+  // real commits and all answering `{ok:true, changed:true}`.
+  //
+  // The oracle is the COMMITTED BYTES, not `ok`. A refusal that still committed
+  // would pass an `ok:false` check while being the whole defect.
+  {
+    // T10 (a) — A COMMIT ON THE BRANCH BEING MERGED INTO.
+    const dir = await twoClashRepo('stalehead');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'MAIN-2-NEVER-SEEN\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main moves on');
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T10 a commit landing on the branch being merged into',
+      answer,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.expected?.head === clash.at.head && r.current?.head !== clash.at.head && /main/.test(String(r.message))
+    );
+    check('T10: no merge commit was made', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+  }
+
+  {
+    // T11 (b) — A COMMIT ON THE BRANCH COMING IN. The caller asked for the
+    // version it had read; a version it had never seen was committed instead.
+    const dir = await twoClashRepo('staleincoming');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    await sh(dir, 'checkout', '-q', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), ['TOP-FEAT-2-NEVER-SEEN', ...Array.from({ length: 6 }, (_, i) => `m${i}`), 'BOTTOM-FEAT-2-NEVER-SEEN'].join('\n') + '\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature moves on');
+    await sh(dir, 'checkout', '-q', 'main');
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T11 a commit landing on the branch coming in',
+      answer,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.expected?.incoming === clash.at.incoming && r.current?.incoming !== clash.at.incoming && /feature/.test(String(r.message))
+    );
+    check(
+      'T11: nothing anybody never read reached the tree',
+      !fs.readFileSync(path.join(dir, 'a.txt'), 'utf8').includes('NEVER-SEEN'),
+      fs.readFileSync(path.join(dir, 'a.txt'), 'utf8')
+    );
+    check('T11: and no merge commit was made', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+  }
+
+  {
+    // T12 (d) — THE HUNK SWAP, the worst of them.
+    //
+    // The TOP of the file stops conflicting, so BOTTOM becomes hunk index 0 —
+    // and `picks[0]`, the answer given for TOP, lands on BOTTOM. Measured:
+    // BOTTOM-main, this branch's own work, was gone from the committed tree
+    // under `{"ok":true,"into":"main","changed":true,"resolved":1}`.
+    //
+    // The discriminating assertion is the COMMITTED BYTES: a refusal that
+    // aborted and then committed anyway would pass every `ok` check here.
+    const dir = await twoClashRepo('hunkswap');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const clashes = (clash.files[0].parts || []).filter((p) => p.kind === 'clash');
+    check('T12: the caller was shown two disagreements', clashes.length === 2, JSON.stringify(clashes.map((c) => c.ours)));
+    check('T12: the first of them is the top of the file', clashes[0].ours.trim() === 'TOP-main', clashes[0].ours);
+
+    // Main adopts the branch's top line, so the top stops being a
+    // disagreement at all and everything below it shifts up one.
+    fs.writeFileSync(path.join(dir, 'a.txt'), ['TOP-feat', ...Array.from({ length: 6 }, (_, i) => `m${i}`), 'BOTTOM-main'].join('\n') + '\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main takes the branch top');
+
+    const before = await repoState(dir);
+    // 'theirs' was the answer for TOP. There is now no TOP to answer.
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'ours'] },
+      expect: clash.at,
+    });
+    await refusedCleanly('T12 a disagreement that stopped being one', answer, dir, before, 'stale_merge', (r) => !!r.expected?.head && !!r.current);
+    const committed = (await git(dir, ['show', 'HEAD:a.txt'])).stdout;
+    check('T12: this branch’s own bottom line is still in the committed tree', committed.includes('BOTTOM-main'), JSON.stringify(committed));
+    check('T12: and the answer for the top did not land on the bottom', !committed.includes('BOTTOM-feat'), JSON.stringify(committed));
+    check('T12: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+  }
+
+  {
+    // T13 (d2) — THE COUNT GROWS. A third disagreement appears below the two
+    // that were answered, and takes the `ours` default: the incoming work in it
+    // is discarded without a word.
+    const dir = await twoClashRepo('hunkgrow');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const line = (top, bottom, tail) => [top, ...Array.from({ length: 6 }, (_, i) => `m${i}`), bottom, ...Array.from({ length: 6 }, (_, i) => `n${i}`), tail].join('\n') + '\n';
+    await sh(dir, 'checkout', '-q', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), line('TOP-feat', 'BOTTOM-feat', 'TAIL-feat'));
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature grows a tail');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), line('TOP-main', 'BOTTOM-main', 'TAIL-main'));
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main grows a different tail');
+
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly('T13 a third disagreement appearing below the answers', answer, dir, before, 'stale_merge', (r) => !!r.current);
+    const committed = (await git(dir, ['show', 'HEAD:a.txt'])).stdout;
+    check('T13: the incoming tail was not silently discarded into a commit', !/TAIL-main[\s\S]*merge/.test(committed) && committed.includes('TAIL-main'), JSON.stringify(committed));
+    check('T13: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+  }
+
+  {
+    // T14 (e) — ONE OF THE CONFLICTED FILES STOPS CONFLICTING. `resolved` came
+    // back 1 against 2 choices and nothing said the snapshot had moved.
+    const dir = await repo('conflictgone');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'base b\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'two files');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'feature a\n');
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'feature b\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature both');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'main a\n');
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'main b\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main both');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T14: both files clash to begin with', clash.files.length === 2, JSON.stringify(clash.files.map((f) => f.path)));
+    // Main adopts the branch's b.txt, so b.txt is no longer a disagreement.
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'feature b\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main takes b from the branch');
+
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'ours', 'b.txt': 'ours' },
+      expect: clash.at,
+    });
+    await refusedCleanly('T14 a conflicted file that stopped conflicting', answer, dir, before, 'stale_merge', (r) => !!r.current);
+    check('T14: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+  }
+
+  {
+    // T15 (f) — A NEW CONFLICT IN A FILE THE CALLER WAS NEVER TOLD ABOUT. It
+    // took `--ours` and was committed, and the envelope said "resolved: 2"
+    // against one choice.
+    const dir = await repo('newconflict');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'base b\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'two files');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'feature a\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature a');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'main a\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main a');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T15: only one file clashes to begin with', clash.files.length === 1 && clash.files[0].path === 'a.txt', JSON.stringify(clash.files.map((f) => f.path)));
+    // A disagreement over b.txt appears on both branches afterwards.
+    await sh(dir, 'checkout', '-q', 'feature');
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'feature b, arrived later\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature b');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'main b, arrived later\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main b');
+
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'theirs' },
+      expect: clash.at,
+    });
+    await refusedCleanly('T15 a conflict in a file the caller was never told about', answer, dir, before, 'stale_merge', (r) => !!r.current);
+    check(
+      'T15: the unmentioned file was not resolved on the caller’s behalf',
+      fs.readFileSync(path.join(dir, 'b.txt'), 'utf8') === 'main b, arrived later\n',
+      fs.readFileSync(path.join(dir, 'b.txt'), 'utf8')
+    );
+    check('T15: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+  }
+
+  {
+    // T15b — NEITHER COMMIT MOVED, AND THE CONFLICT DID.
+    //
+    // The two SHAs are an argument from git's determinism: same two commits,
+    // same merge. That is true of the ALGORITHM and not of everything feeding
+    // it. `.git/info/attributes` is not in either commit, and marking the file
+    // binary makes git stop producing a hunk-level conflict at all — so the
+    // per-hunk answers would be applied to something the caller never saw with
+    // both SHAs matching exactly. This is the case the content digest is for,
+    // and it is the mutation proof that the digest is not decoration.
+    const dir = await twoClashRepo('machinerymoved');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), 'a.txt binary\n');
+    const before = await repoState(dir);
+    check('T15b: HEAD is where the conflict said it was', before.head === clash.at.head, `${clash.at.head} -> ${before.head}`);
+    check('T15b: and so is the branch coming in', (await sh(dir, 'rev-parse', 'feature^{commit}')) === clash.at.incoming);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T15b both commits where they were, and git reconciling them differently',
+      answer,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.current?.head === r.expected?.head && r.current?.incoming === r.expected?.incoming && r.current?.digest !== r.expected?.digest
+    );
+    check('T15b: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+  }
+
+  {
+    // T16 — A RESOLVE WITH NO BINDING AT ALL.
+    //
+    // An optional guard is the hole the binding exists to close: a caller that
+    // simply never sends the field gets a resolve that takes whatever it finds,
+    // and the protection exists only for callers that remembered to ask.
+    const dir = await twoClashRepo('nobinding');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const before = await repoState(dir);
+    const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs', 'theirs'] } });
+    await refusedCleanly('T16 a resolve that does not say which conflict it settles', answer, dir, before, 'guard_required', (r) => /which conflict/i.test(String(r.message)));
+    // AND THE HALF-BINDINGS. A shape that carries some of it is not a binding.
+    for (const [what, partial] of [
+      ['an empty object', {}],
+      ['only the head', { head: clash.at.head }],
+      ['head and incoming but no digest', { head: clash.at.head, incoming: clash.at.incoming }],
+      ['a string', 'stacki:not-an-observation'],
+    ]) {
+      const half = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs', 'theirs'] }, expect: partial });
+      check(`T16: ${what} is not a binding`, half?.ok === false && half.code === 'guard_required', JSON.stringify(half).slice(0, 200));
+    }
+    check('T16: and HEAD never moved through any of it', (await sh(dir, 'rev-parse', 'HEAD')) === before.head);
+    // THE CONTROL. The same call with the binding it was given still merges.
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs', 'theirs'] }, expect: clash.at });
+    check('T16 control: the same resolve with its binding still merges', done.ok === true, JSON.stringify(done));
+    check('T16 control: as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
+  }
+
+  {
+    // T17 — THE SAME DECISION, THE SAME BYTES.
+    //
+    // renderResolved joins with '\n', and when the conflict runs to the end of
+    // the file git has written a newline after the last marker whether or not
+    // the chosen side had one. Measured, over an incoming file with no
+    // terminator: `'theirs'` for the whole file committed "a\nfeat", and
+    // `['theirs']` for the same file committed "a\nfeat\n". Same decision, two
+    // different files, and which you got depended on how you phrased it.
+    const build = async (name, theirsBody) => {
+      const dir = await repo(name);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'a\nbase\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), theirsBody);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'feature');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'a\nmain\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'main');
+      return dir;
+    };
+    const settle = async (dir, choice) => {
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': choice }, expect: clash.at });
+      check(`T17: the ${Array.isArray(choice) ? 'per-hunk' : 'whole-file'} resolve went through`, done.ok === true, JSON.stringify(done));
+      return (await git(dir, ['show', 'HEAD:a.txt'])).stdout;
+    };
+
+    // The incoming file has no terminating newline.
+    const wholeA = await build('nlwhole', 'a\nfeat');
+    cleanup.push(wholeA);
+    const hunkA = await build('nlhunk', 'a\nfeat');
+    cleanup.push(hunkA);
+    const w = await settle(wholeA, 'theirs');
+    const h = await settle(hunkA, ['theirs']);
+    check('T17 the two ways of saying "take theirs" commit the same bytes', w === h, JSON.stringify({ whole: w, perHunk: h }));
+    check('T17: and neither invented a terminator the incoming file did not have', !w.endsWith('\n') && !h.endsWith('\n'), JSON.stringify({ whole: w, perHunk: h }));
+
+    // THE CONTROL, and the case that must not regress the other way: an
+    // incoming file that DOES end with a newline keeps exactly one.
+    const wholeB = await build('nlwhole2', 'a\nfeat\n');
+    cleanup.push(wholeB);
+    const hunkB = await build('nlhunk2', 'a\nfeat\n');
+    cleanup.push(hunkB);
+    const w2 = await settle(wholeB, 'theirs');
+    const h2 = await settle(hunkB, ['theirs']);
+    check('T17 control: a terminated incoming file agrees too', w2 === h2, JSON.stringify({ whole: w2, perHunk: h2 }));
+    check('T17 control: and keeps exactly one terminator', w2 === 'a\nfeat\n' && h2 === 'a\nfeat\n', JSON.stringify({ whole: w2, perHunk: h2 }));
+  }
+
+  {
+    // T18 — THE ONE RESOLVE FAILURE AN AGENT HAD TO READ ENGLISH TO CLASSIFY.
+    //
+    // Uncommitted work in a conflicting file stops git before the merge starts,
+    // so there is nothing conflicted to apply the answers to — and the failure
+    // surfaced two calls later as the bare string "Command failed: git commit
+    // --no-edit", with no code on it at all.
+    const dir = await twoClashRepo('dirtyresolve');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'typed after the conflict was reported\n');
+    const headBefore = await sh(dir, 'rev-parse', 'HEAD');
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': ['theirs', 'theirs'] },
+      expect: clash.at,
+    });
+    check('T18 a resolve blocked by unsaved work is refused', answer?.ok === false, JSON.stringify(answer));
+    check('T18: with a code rather than a shell error', answer?.code === 'working_tree_blocked', JSON.stringify({ code: answer?.code, message: answer?.message }));
+    check('T18: and not the command line echoed back', !/^Command failed:/.test(String(answer?.message || '')), String(answer?.message));
+    check('T18: naming the file in the way', (answer?.files || []).some((f) => String(f).includes('a.txt')), JSON.stringify(answer?.files));
+    check('T18: HEAD did not move', (await sh(dir, 'rev-parse', 'HEAD')) === headBefore);
+    check('T18: no merge was left in progress', !fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')));
+    check(
+      'T18: and the unsaved work is untouched',
+      fs.readFileSync(path.join(dir, 'a.txt'), 'utf8') === 'typed after the conflict was reported\n',
+      fs.readFileSync(path.join(dir, 'a.txt'), 'utf8')
+    );
+  }
+
+  {
+    // THE LAST POSITIVE CONTROL: an exactly-right-length list containing
+    // 'both' at a hunk both branches really changed. 'both' is the one answer
+    // in the per-hunk vocabulary that none of the blocks above exercises, and a
+    // pre-flight that rejected it would be caught nowhere else.
+    const dir = await repo('bothpick');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'list.md'), '- base item\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'list');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'list.md'), '- an item added on the branch\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature list');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'list.md'), '- an item added on main\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main list');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const c = (clash.files[0].parts || []).filter((p) => p.kind === 'clash');
+    check('the both-sides fixture is one disagreement', c.length === 1, JSON.stringify(c));
+    check('and both branches changed it', c[0].changedBy === 'both', JSON.stringify(c[0]));
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'list.md': ['both'] }, expect: clash.at });
+    check('"both" at a hunk both branches changed still merges', done.ok === true, JSON.stringify(done));
+    const out = fs.readFileSync(path.join(dir, 'list.md'), 'utf8');
+    check('  keeping this branch’s item', out.includes('added on main'), out);
+    check('  and the incoming one', out.includes('added on the branch'), out);
+    check('  with no markers left', !out.includes('<<<<<<<'), out);
+    check('  on a clean tree', (await sh(dir, 'status', '--porcelain')) === '');
+    check('  as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
   }
 
   // --- A merge with unsaved work that is NOT in the way ---------------------

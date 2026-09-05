@@ -94,11 +94,14 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
         ['reading a file at a ref that is not there', ['file_at', { ref: 'no-such-ref', path: 'src/pages/index.astro' }], 'no_ref'],
         ['listing the files of a ref that is not there', ['commit_files', { ref: 'no-such-ref' }], 'no_ref'],
         ['restoring the project to a ref that is not there', ['restore_project', { ref: 'no-such-ref' }], 'no_ref'],
-        // resolve_merge re-runs the merge and then commits what it reconciled;
-        // with no such branch there is nothing to reconcile and git says so in
-        // the words the commit case above earns. What matters is that it is a
-        // code and not `failed`.
-        ['finishing a merge that never started', ['resolve_merge', { branch: 'no-such-branch' }], 'nothing_to_commit'],
+        // resolve_merge used to take the branch out of the call and re-run the
+        // merge against whatever it found, so this reached git and came back
+        // wearing the words the commit case above earns. The branch now comes
+        // out of the `mergeRef` git.merge hands back with a conflict, so a call
+        // with no handle never reaches git at all — and that is the answer, not
+        // a weaker one: an agent naming a branch it never merged has skipped
+        // the step that would have told it what there was to reconcile.
+        ['finishing a merge nothing said had started', ['resolve_merge', { branch: 'no-such-branch' }], 'guard_required'],
       ];
       for (const [what, [action, args], code] of cases) {
         const env = await run('git', action, args);
@@ -256,8 +259,17 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
       // Back on main, where the two branches still disagree, so resolve_merge
       // re-runs a merge that really does conflict.
       await run('git', 'checkout', { branch: 'main', parkFirst: false });
+      // The conflict, and the handle that says which conflict it is. Both are
+      // needed now: the branch comes out of the handle, so every call below
+      // reaches the same merge the envelope described.
+      const conflictEnv = await run('git', 'merge', { branch: 'conflicting' });
+      check('the two branches really disagree about that file', conflictEnv.code === 'merge_conflict', short({ code: conflictEnv.code }));
+      check('  and the conflict hands back a handle for itself', typeof conflictEnv.mergeRef === 'string' && conflictEnv.mergeRef.startsWith('stacki:'), short(conflictEnv.mergeRef));
+      const mergeRef = conflictEnv.mergeRef;
+      const headBefore = git(root, 'rev-parse', 'HEAD');
+
       const guessed = await run('git', 'resolve_merge', {
-        branch: 'conflicting',
+        mergeRef,
         choices: { [CONFLICTED]: { hunk0: 'theirs' } },
       });
       check('a choice the handler cannot read is refused', guessed.ok === false, short(guessed));
@@ -267,6 +279,75 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
         short(guessed.message));
       check('  and nothing was committed', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
       check('  and HEAD did not move', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main');
+
+      // AND THE FIVE THAT USED TO BE SUCCESSES.
+      //
+      // Everything above is about a VALUE the handler could not read, on a path
+      // git had reported. The pre-flight only ever looked up choices under
+      // names git had already supplied, so none of these was ever enumerated:
+      // each one reached the apply loop, took the `--ours` default and was
+      // COMMITTED, with `{ok:true, changed:true, resolved:1}` over the top.
+      //
+      // The typo is the one that reads worst. The caller asked for THEIRS; the
+      // file it meant was committed as OURS and it was told the merge worked.
+      const typoKey = `${CONFLICTED.slice(0, -1)}`;
+      const notThere = [
+        ['a choice under a path git never reported', { [typoKey]: 'theirs' }, 'unknown_path'],
+        ['a choice for a path that is not in the repository at all', { 'src/pages/invented.astro': 'theirs' }, 'unknown_path'],
+        ['more answers than the file has disagreements', { [CONFLICTED]: ['theirs', 'ours', 'theirs', 'ours'] }, 'wrong_length'],
+        ['an empty list of answers', { [CONFLICTED]: [] }, 'empty'],
+        ['an explicit null for a whole file', { [CONFLICTED]: null }, 'null'],
+      ];
+      for (const [what, choices, reason] of notThere) {
+        const env = await run('git', 'resolve_merge', { mergeRef, choices });
+        check(`${what} is refused`, env.ok === false, short(env));
+        check(`  as bad_choices, not a success envelope`, env.code === 'bad_choices', short({ code: env.code, message: env.message }));
+        check(`  saying which one and why (${reason})`,
+          (env.badChoices || []).some((b) => b.reason === reason),
+          short(env.badChoices));
+        check('  in a sentence rather than only a field name',
+          typeof env.message === 'string' && env.message.length > 60 && /Nothing was merged/.test(env.message),
+          short(env.message));
+        check('  without this machine in the message', !String(env.message || '').includes(root), short(env.message));
+        check('  and nothing was committed', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+        check('  and HEAD did not move', git(root, 'rev-parse', 'HEAD') === headBefore, git(root, 'rev-parse', 'HEAD'));
+        check('  with no merge left in progress', !fs.existsSync(path.join(root, '.git', 'MERGE_HEAD')));
+      }
+
+      // AND THE CONFLICT MOVING UNDER THE ANSWERS.
+      //
+      // A commit landing on either branch while the caller was deciding used to
+      // commit work nobody had read, `ok: true`. The handle carries what the
+      // conflict was; this is the code that says it is not that any more.
+      {
+        git(root, 'checkout', '-q', 'conflicting');
+        fs.writeFileSync(path.join(root, 'public/arrived-later.txt'), 'after you looked\n', 'utf8');
+        git(root, 'add', '-A');
+        git(root, 'commit', '-q', '-m', 'the branch moved on');
+        git(root, 'checkout', '-q', 'main');
+        const stale = await run('git', 'resolve_merge', { mergeRef, choices: { [CONFLICTED]: 'theirs' } });
+        check('answers made against a conflict that has moved are refused', stale.ok === false, short(stale));
+        check('  as stale_merge', stale.code === 'stale_merge', short({ code: stale.code, message: stale.message }));
+        check('  naming both branches', /conflicting/.test(String(stale.message)) && /main/.test(String(stale.message)), short(stale.message));
+        check('  and saying to merge again rather than retry', /git\.merge/.test(String(stale.message)), short(stale.message));
+        check('  without this machine in the message', !String(stale.message || '').includes(root), short(stale.message));
+        check('  and HEAD did not move', git(root, 'rev-parse', 'HEAD') === headBefore, git(root, 'rev-parse', 'HEAD'));
+        check('  with a clean tree', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+        // Wound back, so the block below finds the repository as it expects.
+        git(root, 'checkout', '-q', 'conflicting');
+        git(root, 'reset', '-q', '--hard', 'HEAD~1');
+        git(root, 'checkout', '-q', 'main');
+      }
+
+      // THE POSITIVE CONTROL. Every check in this block is refusal-shaped, and
+      // a resolve_merge that refused everything would satisfy all of them.
+      {
+        const again = await run('git', 'merge', { branch: 'conflicting' });
+        const done = await run('git', 'resolve_merge', { mergeRef: again.mergeRef, choices: { [CONFLICTED]: 'theirs' } });
+        check('and the same call with a handle it was given still merges', done.ok === true, short(done));
+        check('  as a two-parent merge commit', git(root, 'log', '-1', '--format=%P').split(' ').length === 2, git(root, 'log', '-1', '--format=%P'));
+        check('  on a clean tree', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+      }
 
       // Put the repository back where the rest of the suite expects it.
       await run('git', 'checkout', { branch: 'main', parkFirst: false });

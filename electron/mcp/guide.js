@@ -76,6 +76,28 @@ each is a chain across SIBLINGS: editing one bumps the document, so the refs you
 read for the others are stale. N siblings is N reads. That is the price of never
 writing over somebody's change.
 
+## A merge conflict is a moment, and its ref says which one
+
+git.merge that clashes answers \`merge_conflict\` with a \`mergeRef\` beside the
+hunks. Applying your answers RE-RUNS the merge, so the answers are only answers
+to the conflict you were shown, and the ref is what proves it is still that one:
+it carries both branch tips and a digest of what git actually wrote.
+
+  git.resolve_merge { mergeRef, choices }   the branch comes out of the ref, so
+                                            one merge's answers cannot be paired
+                                            with another merge's branch.
+
+Three refusals, and none of them merges anything:
+
+  guard_required   no mergeRef. Run git.merge and use the one it hands back.
+  stale_merge      a commit landed on either branch, or git reconciles them
+                   differently now. The envelope names both SHAs then and now.
+                   Run git.merge again and answer what it reports THIS time —
+                   do not re-send the old answers.
+  bad_choices      a key that is not one of the conflicting paths, a list that
+                   is not exactly as long as that file's hunks, "merged" where
+                   the hunk offered none. The message says which and why.
+
 ## Semantic first, source as the fallback
 
 Prefer the operation that names what you mean:
