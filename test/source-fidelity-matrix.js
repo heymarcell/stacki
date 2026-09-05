@@ -3318,6 +3318,368 @@ function theReorderThatAlsoAddsOrRemovesAChild() {
 }
 
 /**
+ * T15e -- A REORDER THAT ALSO EDITS ONE OF THE CHILDREN.
+ *
+ * T15c stated the rule as "a child THE FILE ALREADY HOLDS keeps its own authored
+ * leading bytes", and then answered a narrower question than the rule, because
+ * `ctx.twin` is a search BY MEANING and an edited child no longer means what any
+ * base node means. So the reorder path read the edited child as NEW and wrote it
+ * at the indent it is allowed to decide for one -- which inside a preserving
+ * element is column zero. Measured on
+ * `<pre>\n      <p>alpha</p>\n      <p>beta</p>\n      <p>gamma</p>\n</pre>`,
+ * against electron/astroParser.js at c4a4b39:
+ *
+ *   [beta, alpha, GAMMA]        -> `\n      <p>beta</p>\n      <p>alpha</p>\n<p>GAMMA</p>\n`
+ *   [BETA, alpha, gamma]        -> `\n<p>BETA</p>\n      <p>alpha</p>\n      <p>gamma</p>\n`
+ *   [beta, alpha, gamma+class]  -> the same, on a `set_prop` that touched no text
+ *
+ * Six rendered spaces deleted from a node the edit asked only to move or to
+ * retitle, `ok`, no fallback. And the second of those had a second cause worth
+ * naming separately: the "did anything move" test was asked of the MEANING
+ * matches alone, and `[BETA, alpha, gamma]` matches only `alpha` and `gamma`,
+ * whose file positions are 0 then 2 and so read as standing still. The reorder
+ * path was skipped entirely and the child splices did the damage.
+ *
+ * WHAT THE FIX HAD TO BE, and what these rows exist to hold it to: an identity
+ * rather than a resemblance. Pairing the leftover children up by position is a
+ * guess -- a delete plus an insert leaves exactly the same leftovers as an edit
+ * -- and it hands a brand-new child some deleted node's rendered spaces.
+ * `parsePage` numbers what it builds `n<counter>` and the editor numbers what it
+ * builds `c<counter>`, so the node itself says whether it was ever in the file;
+ * the constant offset between the two parses' counters, agreed by every sibling
+ * already matched, says WHICH child it was.
+ *
+ * THE ORACLE IS THE WHOLE FILE for T15's reason: the fallback reprint is damaged
+ * too, so "not the reprint" would pass on the same damage arriving by another road.
+ *
+ * AND THE ORDINARY ROWS ARE NOT DECORATION. `class='plain'` must still reindent
+ * every child including the edited one, so a fix that answers these rows by
+ * writing no indent at all cannot pass; the `unproven project` row must write
+ * the file's own indent for the NEW child while the edited one keeps its own, so
+ * a fix that treats "recovered" and "decided" as one answer cannot pass either.
+ */
+const REORDER_EDIT_ORDERS = [
+  { id: 'reorder + edit a child that stayed', want: ['beta', 'alpha', '*gamma'] },
+  { id: 'reorder + edit the child that moved', want: ['*beta', 'alpha', 'gamma'] },
+  { id: 'reorder + edit + insert', want: ['beta', '*alpha', '+delta', 'gamma'] },
+  { id: 'reorder + edit + delete', want: ['*gamma', 'alpha'] },
+  { id: 'reorder + edit two of them', want: ['*gamma', '*beta', 'alpha'] },
+  { id: 'reorder + set_prop', want: ['beta', 'alpha', '@gamma'] },
+];
+
+// How one entry of the tables above reads back out of the file. `*` is a child
+// whose text was edited, `@` one whose props were, `+` one the file has never
+// seen; anything else is a child exactly as it was authored.
+const editedName = (nm) => (nm[0] === '*' ? nm.slice(1).toUpperCase() : nm.replace(/^[@+]/, ''));
+// A prop the file never held has no `attrSource` to spell it with, so the
+// reprint writes the serializer's own quotes -- which is a change to the node
+// the edit DID name, and not the leading bytes this fixture is about.
+const editedMarkup = (nm) =>
+  nm[0] === '@' ? `<p class="x">${nm.slice(1)}</p>` : `<p>${editedName(nm)}</p>`;
+
+/** The child list an order asks for, built out of a parsed element's own nodes. */
+function childrenFor(want, named) {
+  return want.map((nm) => {
+    if (nm[0] === '+') {
+      return { kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: nm.slice(1) }] };
+    }
+    const node = named(nm.replace(/^[*@]/, ''));
+    if (nm[0] === '*') node.children[0].value = nm.slice(1).toUpperCase();
+    if (nm[0] === '@') node.props = { class: { type: 'string', value: 'x' } };
+    return node;
+  });
+}
+
+function theReorderThatAlsoEditsAChild() {
+  for (const shape of REORDER_SHAPES) {
+    const authored = ['alpha', 'beta', 'gamma'];
+    const body =
+      `  ${shape.open}\n` +
+      authored.map((name) => `${shape.ind}<p>${name}</p>\n`).join('') +
+      `${shape.closeInd}${shape.close}\n`;
+    const source = commentedPage(body);
+    for (const order of REORDER_EDIT_ORDERS) {
+      const label = `[${order.id}/${shape.id}]`;
+      const parsed = parsePage(source);
+      if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+      const model = structuredClone(parsed.model);
+      const box = model.nodes[0].children.find((n) => n.name === shape.tag);
+      if (!check(`${label} the element is where a reorder can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) {
+        continue;
+      }
+      const real = (box.children || []).filter((n) => !(n.kind === 'text' && !String(n.value ?? '').trim()));
+      const named = (name) => real.find((n) => n.children?.[0]?.value === name);
+      if (!check(`${label} all three children are addressable`, authored.every(named), short(real.map((n) => n.children?.[0]?.value)))) {
+        continue;
+      }
+      // PREMISE: the model really does carry the parse's own numbering, which is
+      // the whole basis of the identity the fix uses. A fixture that handed in
+      // freshly-built nodes would be measuring nothing.
+      check(
+        `${label} the authored children carry the ids the parse gave them`,
+        real.every((n) => /^n\d+$/.test(n.id || '')),
+        short(real.map((n) => n.id))
+      );
+      box.children = childrenFor(order.want, named);
+      const after = anchoredSerialize(source, model, shape.tokens ? { preservingTokens: shape.tokens } : {});
+      // A NEW child has no authored bytes, so its indent is the one decision
+      // this code may make; every child the file already held -- edited or not
+      // -- keeps the one the file gave it.
+      const want = commentedPage(
+        `  ${shape.open}\n` +
+          order.want
+            .map((nm) => `${shape.preserved && nm[0] === '+' ? '' : shape.ind}${editedMarkup(nm)}\n`)
+            .join('') +
+          `${shape.closeInd}${shape.close}\n`
+      );
+      // POSITIVE CONTROL: the edit really happened, so a write that changed
+      // nothing at all cannot read as a pass.
+      if (
+        !check(
+          `${label} the children really are what the model asked for`,
+          order.want.map(editedName).join(',') ===
+            (after.match(/<p[^>]*>(\w+)<\/p>/g) || []).map((m) => /<p[^>]*>(\w+)<\/p>/.exec(m)[1]).join(','),
+          short({ span: changedSpan(source, after) })
+        )
+      ) {
+        continue;
+      }
+      check(
+        shape.preserved
+          ? `${label} the edited child keeps the leading bytes the file gave it`
+          : `${label} an ordinary element still indents all of them`,
+        after === want,
+        short({ span: changedSpan(want, after) })
+      );
+    }
+  }
+}
+
+/**
+ * T15f -- AND THE CHILD'S OWN BYTES RATHER THAN A NEIGHBOUR'S.
+ *
+ * Every row above is written at ONE indent, so a fix that recovers "the indent
+ * this element's children are written at" passes all of them while still not
+ * knowing which child it is holding. That is the guess the fix had to refuse:
+ * inside a `<pre>` the leading spaces are glyphs, and writing two of them in
+ * front of a node the author gave six is a rendered change nothing asked for.
+ *
+ * So this file indents its three children DIFFERENTLY -- two spaces, six, none
+ * -- and the oracle is each child's own lead following it through the reorder.
+ * A positional pairing of the leftovers gets the third row wrong, a uniform
+ * indent gets every row wrong, and only an identity gets them all.
+ *
+ * The last two rows are the other direction, and they are what stops the fix
+ * from becoming "give every unmatched child some authored lead": a child the
+ * EDITOR built has no bytes in this file, and a child dragged in from the
+ * `<div>` next door has bytes that are not this element's. Both must land at the
+ * indent this code is allowed to decide, which inside a `<pre>` is column zero.
+ */
+function theEditedChildTheFileIndentedDifferently() {
+  const RAG = ['  ', '      ', ''];
+  const authored = ['alpha', 'beta', 'gamma'];
+  const lead = (name) => RAG[authored.indexOf(name)];
+  const body =
+    `  <pre>\n` +
+    authored.map((name, i) => `${RAG[i]}<p>${name}</p>\n`).join('') +
+    `</pre>\n  <div>\n    <p>outside</p>\n  </div>\n`;
+  const source = commentedPage(body);
+
+  const ROWS = [
+    { id: 'edit the last one', want: ['beta', 'alpha', '*gamma'] },
+    { id: 'edit the first one', want: ['*alpha', 'gamma', 'beta'] },
+    { id: 'edit and drop a sibling', want: ['*gamma', 'alpha'] },
+    { id: 'edit two of three', want: ['*gamma', '*alpha', 'beta'] },
+    { id: 'a child the editor built', want: ['beta', 'alpha', '+delta', 'gamma'], fresh: ['delta'] },
+    // THE TWO COUNTERS ARE NOT ONE COUNTER, and this is the row that makes the
+    // prefix load-bearing rather than decorative. `newId` in src/modelOps.js
+    // counts `c1, c2, ...` from its own zero while `makeId` here counts
+    // `n1, n2, ...` from its, so a node the editor built genuinely can wear the
+    // same NUMBER as a node the parse built -- and a match that read the number
+    // without the letter would hand a brand-new child some authored sibling's
+    // rendered spaces. `collide` gives it exactly that number -- and the number
+    // belongs to the child this row DROPS, so the anchor it would land on is
+    // free and the six spaces it would steal are not column zero.
+    { id: 'an editor-built child wearing a parse number', want: ['gamma', 'alpha', '+delta'], fresh: ['delta'], collide: 'beta' },
+    { id: 'a child from the div next door', want: ['beta', 'alpha', '^outside', 'gamma'], fresh: ['OUTSIDE'] },
+  ];
+
+  for (const row of ROWS) {
+    const label = `[ragged pre/${row.id}]`;
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === 'pre');
+    const div = model.nodes[0].children.find((n) => n.name === 'div');
+    if (!check(`${label} both elements are reachable`, !!box && !!div, short({ box: !!box, div: !!div }))) continue;
+    const real = (box.children || []).filter((n) => !(n.kind === 'text' && !String(n.value ?? '').trim()));
+    const named = (name) => real.find((n) => n.children?.[0]?.value === name);
+    // PREMISE: the file really does give its three children three different
+    // leads, which is what makes a neighbour's bytes the wrong answer rather
+    // than an indistinguishable one.
+    check(
+      `${label} the file wrote three different leading runs`,
+      new Set(RAG).size === 3 && authored.every((n) => source.includes(`\n${lead(n)}<p>${n}</p>`)),
+      short(RAG)
+    );
+    const outside = (div.children || []).find((n) => n.name === 'p');
+    box.children = row.want.map((nm) => {
+      if (nm[0] === '^') {
+        div.children = (div.children || []).filter((n) => n !== outside);
+        outside.children[0].value = 'OUTSIDE';
+        return outside;
+      }
+      const built = childrenFor([nm], named)[0];
+      // The editor's own numbering, and where asked for it, the number an
+      // authored sibling is already wearing under the other letter.
+      if (nm[0] === '+') built.id = `c${row.collide ? /^n(\d+)$/.exec(named(row.collide).id)[1] : 1}`;
+      return built;
+    });
+    if (row.collide) {
+      check(
+        `${label} the built child really does collide with ${row.collide}'s number`,
+        box.children.some((n) => n.id === `c${/^n(\d+)$/.exec(named(row.collide).id)[1]}`),
+        short(box.children.map((n) => n.id))
+      );
+    }
+    const after = anchoredSerialize(source, model);
+    const want = commentedPage(
+      `  <pre>\n` +
+        row.want
+          .map((nm) =>
+            nm[0] === '+' || nm[0] === '^'
+              ? `<p>${nm[0] === '^' ? 'OUTSIDE' : nm.slice(1)}</p>\n`
+              : `${lead(nm.replace(/^[*@]/, ''))}${editedMarkup(nm)}\n`
+          )
+          .join('') +
+        `</pre>\n  <div>\n${row.id.includes('div next door') ? '' : '    <p>outside</p>\n'}  </div>\n`
+    );
+    if (
+      !check(
+        `${label} the edit really happened`,
+        after !== source && (row.fresh || []).every((w) => after.includes(`<p>${w}</p>`)),
+        short({ span: changedSpan(source, after) })
+      )
+    ) {
+      continue;
+    }
+    check(`${label} every child kept the leading bytes the file gave IT`, after === want, short({ span: changedSpan(want, after) }));
+  }
+}
+
+/**
+ * T15g -- A MODEL TWO PARSES NUMBERED, AND THE OFFSET THAT THEREFORE MEANS
+ * NOTHING.
+ *
+ * The identity is an OFFSET, not a handle: both trees came out of the same walk
+ * over the same bytes, so `baseId - modelId` is one constant, and every child
+ * this element has already matched by meaning has to agree on it. That
+ * agreement is the whole of the safety, so this drives the case where it fails.
+ *
+ * A model whose nodes were numbered by more than one parse is not a hypothesis.
+ * `resolveChunks` splices the nodes of another FILE into a page's model in
+ * electron/main.js, and those carry that file's numbering; a caller that
+ * assembles a model out of two parses gets the same shape. This fixture makes
+ * one directly, by giving a matched child the number one of its siblings wears,
+ * because the point is what the parser does when the arithmetic stops meaning
+ * anything -- not how the model came to be that way.
+ *
+ * WHAT MUST HAPPEN IS THAT NOTHING IS INVENTED. With the numbering split, the
+ * offset the first matched pair reports maps the edited child onto the WRONG
+ * anchor -- the dropped `<p>gamma</p>`, four authored spaces the edited node
+ * never had -- and the file would come back with four rendered spaces nobody
+ * wrote. Refusing to recover writes the indent this code is allowed to decide,
+ * which inside a `<pre>` is column zero, and that is exactly what the edited
+ * child was authored with. Trusting one pair rather than requiring agreement is
+ * a one-word change, and it makes this file wrong.
+ */
+const TWO_PARSE_ROWS = [
+  // THE OFFSET DISAGREES. A child that is still MATCHED carries a number from
+  // somewhere else, so the pairs report two different offsets and none of them
+  // can be believed. Trusting the first one maps the edited `<p>kappa</p>` onto
+  // the dropped `<p>gamma</p>` and writes gamma's four spaces in front of it.
+  {
+    id: 'a matched child numbered by another parse',
+    rag: { alpha: '  ', beta: '      ', gamma: '    ', kappa: '' },
+    renumber: ['beta', 'gamma'],
+    edit: 'kappa',
+    want: ['*kappa', 'beta', 'alpha'],
+  },
+  // THE ANCHOR IS ALREADY SPOKEN FOR. Here the offset is perfectly consistent
+  // -- only the EDITED child wears a number that is not its own -- so the
+  // arithmetic answers, and it answers with a child of this element that
+  // another child is already being written from. Believing it would put
+  // `<p>beta</p>`'s six rendered spaces in front of `<p>GAMMA</p>` and leave
+  // beta wearing them too.
+  {
+    id: 'the edited child wearing a sibling number',
+    rag: { alpha: '  ', beta: '      ', gamma: '', kappa: '    ' },
+    renumber: ['gamma', 'beta'],
+    edit: 'gamma',
+    want: ['*gamma', 'beta', 'alpha'],
+  },
+];
+
+function theModelNumberedByTwoParses() {
+  for (const row of TWO_PARSE_ROWS) {
+    const label = `[two parses numbered this model/${row.id}]`;
+    const authored = ['alpha', 'beta', 'gamma', 'kappa'];
+    const body = `  <pre>\n` + authored.map((n) => `${row.rag[n]}<p>${n}</p>\n`).join('') + `</pre>\n`;
+    const source = commentedPage(body);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === 'pre');
+    const real = (box.children || []).filter((n) => !(n.kind === 'text' && !String(n.value ?? '').trim()));
+    const named = (name) => real.find((n) => n.children?.[0]?.value === name);
+    if (!check(`${label} all four children are addressable`, authored.every(named), short(real.map((n) => n.id)))) continue;
+
+    // PREMISE: one parse numbered them, and after this line two did. The child
+    // keeps its meaning and its bytes -- only its number moves -- so the twin
+    // lookup still finds whatever it found before.
+    const [takes, from] = row.renumber;
+    const before = named(takes).id;
+    named(takes).id = named(from).id;
+    check(
+      `${label} two of the children now wear one number`,
+      named(takes).id !== before && named(takes).id === named(from).id,
+      short({ before, now: named(takes).id })
+    );
+    // The nodes are picked out by the words the file wrote before the edit
+    // rewrites one of them.
+    const picked = row.want.map((nm) => named(nm.replace('*', '')));
+    named(row.edit).children[0].value = row.edit.toUpperCase();
+    box.children = picked;
+    const after = anchoredSerialize(source, model);
+    // PREMISE: the edited child's own lead is the one this code would write for
+    // a child it had never seen, so "refuse to recover" and "get it right" are
+    // the same bytes here -- and the only way to fail this row is to write some
+    // OTHER child's rendered spaces.
+    check(`${label} the edited child was authored at column zero`, row.rag[row.edit] === '', short(row.rag));
+    const want = commentedPage(
+      `  <pre>\n` +
+        row.want.map((nm) => `${row.rag[nm.replace('*', '')]}<p>${nm[0] === '*' ? nm.slice(1).toUpperCase() : nm}</p>\n`).join('') +
+        `</pre>\n`
+    );
+    const dropped = authored.filter((n) => !row.want.some((nm) => nm.replace('*', '') === n));
+    if (
+      !check(
+        `${label} the reorder and the edit really happened`,
+        after.includes(`<p>${row.edit.toUpperCase()}</p>`) && dropped.every((n) => !after.includes(`<p>${n}</p>`)),
+        short({ span: changedSpan(source, after) })
+      )
+    ) {
+      continue;
+    }
+    check(
+      `${label} no child was handed a lead that could not be proved to be its own`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+  }
+}
+
+/**
  * T15d -- AND THE SHAPE THE REORDER PATH MUST HAND BACK.
  *
  * The generalised reorder can place a NEW child only where the file gave every
@@ -3723,6 +4085,9 @@ function theStampForAStylesheetHandedIn() {
   theReorderInsideAPre();
   theReorderOfBlockChildrenInsideAPre();
   theReorderThatAlsoAddsOrRemovesAChild();
+  theReorderThatAlsoEditsAChild();
+  theEditedChildTheFileIndentedDifferently();
+  theModelNumberedByTwoParses();
   theReorderBesideAnInlineRun();
   theCascadeInsideOneStyleAttribute();
   theComponentNamedAfterATag();

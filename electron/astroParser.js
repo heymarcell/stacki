@@ -31,6 +31,25 @@ const RAW_ELEMENTS = new Set(['style', 'script']);
 let nextId = 1;
 const makeId = () => `n${nextId++}`;
 
+/**
+ * The counter reading behind a node's id, when a PARSE is what put it there.
+ *
+ * The prefix is the provenance and it is already load-bearing elsewhere: this
+ * file stamps `n`, the editor's `newId` stamps `c` (src/modelOps.js, and
+ * `cloneWithNewIds` re-stamps a duplicated subtree with it), and the markdown
+ * parser stamps `m`. So a node wearing `n<digits>` came out of `parsePage`, and
+ * one wearing anything else -- or nothing at all -- was built rather than read.
+ *
+ * The NUMBER is not a handle across parses and nothing here treats it as one:
+ * the counter keeps counting, so the same node is `n2` in one parse and `n14`
+ * in the next. What survives is the SPACING between two parses of the same
+ * bytes, which is what `reorderedInPlace` measures and uses.
+ */
+function parseId(node) {
+  const m = /^n(\d+)$/.exec((node && node.id) || '');
+  return m ? Number(m[1]) : null;
+}
+
 // ---------------------------------------------------------------------------
 // Attribute (prop) parsing
 // ---------------------------------------------------------------------------
@@ -2266,20 +2285,36 @@ function spliceHead(source, base, next) {
  * already keep their bytes; this must not take them over, because it would
  * reprint the edited child from the model to do it.
  *
- * AND THE ONE SUB-CASE THIS STILL DOES NOT ANSWER, said out loud because it is
- * the same defect wearing different clothes: a reorder in which one of the
- * children was ALSO EDITED. An edited child means nothing any base node means,
- * so `ctx.twin` cannot find it, so this reads it as new and writes it at the
- * decided indent -- which for a preserving element is column zero, and its
- * authored lead is gone. Measured on the fixture above, `[beta, alpha, GAMMA]`
- * puts `<p>GAMMA</p>` at column zero, before this fix and after it alike: the
- * behaviour is unchanged, not introduced. Fixing it needs an identity for "the
- * same child, edited", which nothing here has -- pairing the leftovers by
- * position is a guess, and a guess writes ANOTHER child's rendered spaces in
- * front of this one, which is not obviously better than writing none. Refusing
- * instead is worse than both: the only refusal available at this layer is the
- * document reprint, and that re-lays a `<pre>`'s element children onto one
- * line.
+ * AND THE SUB-CASE THAT NEEDED AN IDENTITY RATHER THAN A MEANING: a reorder in
+ * which one of the children was ALSO EDITED. An edited child means nothing any
+ * base node means, so `ctx.twin` comes back empty, so this used to read it as
+ * NEW and write it at the decided indent -- which for a preserving element is
+ * column zero. Measured on the fixture above, `[beta, alpha, GAMMA]` put
+ * `<p>GAMMA</p>` at column zero with six rendered spaces deleted, `ok` and no
+ * fallback.
+ *
+ * AND ON THAT FIXTURE IT WAS NOT PRE-EXISTING, which is the opposite of what
+ * was believed while it stood. Re-measured against the base parser (ac57c20),
+ * the same model over the same bytes came back `\n      <p>GAMMA</p>` -- right,
+ * and right by luck: that parser reindents every child to the file's own indent
+ * and this file writes all three at one. What the whitespace work added was the
+ * DECISION to write column zero inside an element known to render its
+ * children's indentation, and this branch reached that decision for a child it
+ * had misread as new. Where the base parser really is worse is a `<pre>` whose
+ * children are written at DIFFERENT indents: it rewrites the ones that merely
+ * moved -- measured, `  ` and `      ` both flattened to the first child's --
+ * which is the damage the reorder path exists to stop.
+ *
+ * It is answered below by asking the question `sameMeaning` cannot: not what
+ * this node MEANS but which node it IS. Pairing the leftovers by position would
+ * have been the guess this comment used to refuse -- a delete and an insert
+ * leave exactly the same leftovers as an edit, and the guess hands a brand-new
+ * child some deleted node's rendered spaces. The parse id is not that guess: it
+ * says whether a parse or the editor built this node at all, and the offset
+ * between the two parses' counters, agreed by every sibling this element has
+ * already matched, says which anchored child it was. Where that cannot be
+ * established nothing is recovered and nothing is invented; the node keeps the
+ * indent it had before.
  */
 function reorderedInPlace(source, base, next, ctx) {
   if (!Array.isArray(base.children) || !Array.isArray(next.children)) return null;
@@ -2308,8 +2343,7 @@ function reorderedInPlace(source, base, next, ctx) {
   // `node` is a child it does not.
   const plan = [];
   const used = new Set();
-  let last = -1;
-  let anyMoved = false;
+  const agreed = [];
   for (const kid of next.children) {
     if (isGap(kid)) continue;
     const twin = ctx.twin(kid);
@@ -2321,31 +2355,125 @@ function reorderedInPlace(source, base, next, ctx) {
     const at = twin ? anchored.indexOf(twin) : -1;
     if (at >= 0 && !used.has(at)) {
       used.add(at);
-      if (at < last) anyMoved = true;
-      last = at;
       plan.push({ at });
+      // WHAT THE TWO PARSES' COUNTERS DIFFER BY, measured off a pair this
+      // element has already identified by meaning. See below.
+      const mine = parseId(kid);
+      const theirs = parseId(twin);
+      if (mine !== null && theirs !== null) agreed.push(theirs - mine);
     } else {
-      plan.push({ node: kid });
+      // AN EDITED CHILD IS NOT A NEW ONE, and only the node itself can say so.
+      // `ctx.twin` came back empty because nothing in the file MEANS what this
+      // node now means -- which is what an edit does -- so the meaning search
+      // cannot tell it apart from markup that never existed. Its `id` can:
+      // `parsePage` stamps every node it builds `n<counter>` and the editor
+      // stamps every node IT builds `c<counter>` (`newId`, src/modelOps.js), so
+      // a node wearing a parse id came out of a parse of this very file and the
+      // base tree still holds the node it was.
+      plan.push({ node: kid, edited: !twin });
     }
   }
-  if (!anyMoved) return null;
 
   const leadOf = (i) => source.slice(i === 0 ? openEnd : anchored[i - 1].end, anchored[i].start);
+
+  // THE CHILD THAT WAS REORDERED AND EDITED, MATCHED BY IDENTITY.
+  //
+  // The counter behind `makeId` keeps counting across parses, so the same node
+  // is `n2` in the caller's model and `n14` in the base parse this splice is
+  // written against -- which is why `twinFinder` says an id is worse than
+  // useless as a HANDLE, and it measured that before saying it. It is not
+  // useless as an OFFSET. Both trees came out of the same walk over the same
+  // bytes, so every node's id differs by the SAME constant, and this element's
+  // own meaning-matched children measure it: each matched pair contributes
+  // `twinId - kidId`, and only a value every one of them agrees on is used. A
+  // model that is not a parse of this file cannot make them agree.
+  //
+  // The edited child's base counterpart is then the anchored child whose id is
+  // its own plus that constant -- an identity rather than a resemblance -- and
+  // it has to be an anchor no other child has claimed.
+  //
+  // A DOCUMENT-ORDER CROSS-CHECK STOOD HERE AND WAS TAKEN OUT, because it could
+  // not fail. Siblings are numbered in the order they are written, so the base
+  // ids ascend with the anchor index; one constant offset maps an ascending
+  // sequence onto an ascending sequence, and "this node's id sits after that
+  // matched sibling's, so its anchor must too" is then true by construction. A
+  // mutation that deleted the whole condition left the suite green, which is
+  // what a check that cannot fail looks like. The agreement above is the guard
+  // that does the work.
+  //
+  // What that buys is ONE thing: the child's own authored leading bytes, which
+  // inside a preserving element are rendered content. Its markup is still
+  // reprinted from the model, because the model is what the edit changed.
+  //
+  // WHERE IT CANNOT ANSWER, NOTHING IS INVENTED -- and the cases it cannot
+  // answer are the ones where there is nothing to recover. An unmatched node
+  // with a `c` id or no id at all is one the editor built, and it never had a
+  // lead in this file; a node whose id lands outside this element is one
+  // dragged in from elsewhere, whose lead belonged to its old parent. Both keep
+  // the decided indent, which is what they had before and what `insertSplice`
+  // would give them. Only a node this element can prove was its own is handed
+  // its bytes back, so a wrong match cannot put one child's rendered spaces in
+  // front of another.
+  const delta = agreed.length && agreed.every((d) => d === agreed[0]) ? agreed[0] : null;
+  if (delta !== null) {
+    // Keyed by the WHOLE id rather than by its number, so the arithmetic is
+    // never done on a node that has no parse id to do it with. A `c12` and an
+    // `n12` are two different nodes from two different counters, and reading
+    // this element's children out of a map keyed `n...` is what keeps the
+    // editor's numbering from ever answering for the parser's.
+    const holds = new Map(anchored.map((n, i) => [n.id, i]));
+    for (const step of plan) {
+      if (!step.edited) continue;
+      const mine = parseId(step.node);
+      const at = mine === null ? -1 : holds.get(`n${mine + delta}`) ?? -1;
+      if (at < 0 || used.has(at)) continue;
+      used.add(at);
+      step.was = at;
+      step.lead = leadOf(at);
+    }
+  }
+
+  // DID ANY SURVIVING CHILD ACTUALLY MOVE -- asked of every child the file
+  // already held, which is the identified ones as well as the matched ones.
+  //
+  // This used to be answered inside the matching loop, over meaning-matches
+  // alone, and that is a second way the edited child fell out: `[BETA, alpha,
+  // gamma]` matches only `alpha` and `gamma`, whose anchors are 0 then 2 and so
+  // read as standing still. The whole reorder path was then skipped and the
+  // child splices wrote `<p>BETA</p>` at column zero -- the identity above had
+  // recovered its lead and nothing ever asked for it.
+  //
+  // It is still the same gate and it still refuses the same edits. A plain
+  // insert, a plain delete and a plain edit inside a preserving element are
+  // already surgical and keep their own bytes; taking them over would reprint a
+  // child from the model to no purpose, so a child list whose file order never
+  // goes backwards is handed straight back.
+  const order = plan.map((step) => (step.node ? step.was : step.at)).filter((at) => typeof at === 'number');
+  if (!order.some((at, i) => i > 0 && at < order[i - 1])) return null;
+
   let indent = null;
   let inner = null;
   if (plan.some((step) => step.node)) {
     inner = childContext(base, next, ctx);
     if (!inner) return null;
-    // A NEW CHILD IS ONLY PLACEABLE WHERE THE FILE GAVE EVERY CHILD A LINE.
-    //
-    // Inside an inline run the gaps are text nodes the MODEL holds, not bytes
-    // between anchors, and a break written where the model has no text node is
-    // a tree the readback will not recognise -- measured: an append beside a
-    // reordered `<span>` inside a `<pre>` produced correct-looking bytes,
-    // failed `saysWhatTheModelSaid`, and took the whole write down to the
-    // document reprint, which then moved a frontmatter comment off its import.
-    // The run splices own that shape (`preservedRun` joins by nothing), so it
-    // is handed back to them.
+  }
+  // A NEW CHILD IS ONLY PLACEABLE WHERE THE FILE GAVE EVERY CHILD A LINE.
+  //
+  // Inside an inline run the gaps are text nodes the MODEL holds, not bytes
+  // between anchors, and a break written where the model has no text node is
+  // a tree the readback will not recognise -- measured: an append beside a
+  // reordered `<span>` inside a `<pre>` produced correct-looking bytes,
+  // failed `saysWhatTheModelSaid`, and took the whole write down to the
+  // document reprint, which then moved a frontmatter comment off its import.
+  // The run splices own that shape (`preservedRun` joins by nothing), so it
+  // is handed back to them.
+  //
+  // ASKED ONLY OF A CHILD WHOSE INDENT THIS CODE HAS TO DECIDE. A recovered
+  // child brings its own leading bytes out of the file, so there is no break to
+  // write and no layout to invent; refusing the whole reorder because the
+  // file's layout leaves nowhere to put a NEW child would refuse an edit that
+  // adds none.
+  if (plan.some((step) => step.node && step.lead === undefined)) {
     if (!laidOutAsBlock(base, source)) return null;
     const held = lineIndentOf(source, anchored[0].start);
     if (held === null) return null;
@@ -2357,6 +2485,13 @@ function reorderedInPlace(source, base, next, ctx) {
   let text = source.slice(base.start, openEnd);
   for (const step of plan) {
     if (step.node) {
+      if (step.lead !== undefined) {
+        // Its own gap, and its own indentation for whatever a reprint puts on a
+        // second line -- the bytes the file wrote in front of this node, not
+        // the ones this code would choose for a node it had never seen.
+        text += step.lead + printNode(step.node, step.lead.slice(step.lead.lastIndexOf('\n') + 1), inner);
+        continue;
+      }
       const gap = ctx.eol.repeat(1 + (step.node.blankBefore || 0));
       text += gap + indent + printNode(step.node, indent, inner);
     } else {
