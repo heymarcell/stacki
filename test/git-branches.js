@@ -1014,6 +1014,227 @@ async function twoClashRepo(name) {
   }
 
   {
+    // T15c — AND THE CONFLICT STOPPED BEING ONE AT ALL.
+    //
+    // T15b moves the machinery so git reconciles the two commits DIFFERENTLY.
+    // This moves it so git reconciles them CLEANLY, which used to be the one
+    // way past every guard in the function: the binding was checked against the
+    // two SHAs, the merge was re-run, it went through, and `{ok:true,
+    // changed:true, resolved:0}` was returned and committed BEFORE the content
+    // digest was ever compared. The caller's answers were discarded without a
+    // word, and the branch they thought they had merged stopped being protected
+    // from deletion.
+    //
+    // The lever is git's own BUILT-IN union driver, so this needs no git
+    // config, no custom program and no tracked file: `*.txt merge=union` in the
+    // untracked `.git/info/attributes`, written between the merge and the
+    // resolve, makes git keep both sides of every clash and call it agreement.
+    // Observed before the fix: resolve answered ok with `resolved: 0`, a.txt
+    // held both branches' lines, and `log -1 --format=%P` had two parents.
+    const dir = await twoClashRepo('cleanremerge');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T15c: the caller was shown a conflict to answer', clash.ok === false && clash.files?.length === 1, JSON.stringify(clash.files?.map((f) => f.path)));
+    fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '*.txt merge=union\n');
+    const before = await repoState(dir);
+    check('T15c: HEAD is where the conflict said it was', before.head === clash.at.head, `${clash.at.head} -> ${before.head}`);
+    check('T15c: and so is the branch coming in', (await sh(dir, 'rev-parse', 'feature^{commit}')) === clash.at.incoming);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'ours' },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T15c a conflict that stopped being one, with both commits where they were',
+      answer,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.current?.head === r.expected?.head && r.current?.incoming === r.expected?.incoming
+    );
+    check('T15c: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+    // The bytes, said separately from `refusedCleanly`'s whole-tree compare:
+    // the union merge's signature is BOTH branches' lines in one file, and the
+    // point of the refusal is that neither of them arrived.
+    const onDisk = fs.readFileSync(path.join(dir, 'a.txt'), 'utf8');
+    check('T15c: this branch’s own file is untouched on disk', onDisk.includes('TOP-main') && onDisk.includes('BOTTOM-main'), JSON.stringify(onDisk));
+    check('T15c: and the incoming side was not unioned into it behind the caller', !onDisk.includes('TOP-feat') && !onDisk.includes('BOTTOM-feat'), JSON.stringify(onDisk));
+    // AND THE CONTROL, so the refusal is about the machinery moving and not
+    // about a resolve that stopped working. The same repository, the same
+    // binding, with the attributes taken away again.
+    fs.unlinkSync(path.join(dir, '.git', 'info', 'attributes'));
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
+    check('T15c control: the same resolve without the union driver still merges', done?.ok === true, JSON.stringify(done));
+    check('T15c control: as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
+  }
+
+  {
+    // T15d — A CONFLICT IN A FILE WHOSE NAME GIT WILL NOT PRINT PLAINLY.
+    //
+    // `core.quotePath` defaults to true, so `git diff --name-only
+    // --diff-filter=U` printed `"src/pages/caf\303\251.astro"` — quotation
+    // marks included — for a clash in `café.astro`. Measured, all three
+    // consequences at once: `conflictDigest` could not open that name so the
+    // file hashed as the UNREADABLE sentinel, which is a measurement of nothing
+    // wearing the shape of a measurement; the caller was handed the quoted name
+    // with `ours`, `theirs` and `parts` all null, so there was nothing to
+    // choose between; and a resolve naming the real path was refused as
+    // `unknown_path` while one naming the quoted path died inside git on
+    // `pathspec ... did not match any file(s) known to git`. A clash in any
+    // accented or CJK filename was unresolvable by every route there is.
+    const PAGE = 'src/pages/café.astro';
+    // AND ONE THE QUOTING FIX DOES NOT REACH, carried in the same fixture
+    // because it is the same question asked of the same command. The listing
+    // was newline-separated with a `.trim()` over every line, so a path that
+    // BEGINS with a space came back without it — a name no file has, arrived at
+    // with no quoting involved at all.
+    const SPACED = ' draft.astro';
+    // The same clash over both files, with `body` the thing the two branches
+    // disagree about. Two of these differing only in that is what says the
+    // binding measured the files rather than its own failure to open them.
+    const accented = async (name, body) => {
+      const at = await repo(name);
+      cleanup.push(at);
+      fs.mkdirSync(path.join(at, 'src', 'pages'), { recursive: true });
+      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), 'base\n');
+      await sh(at, 'add', '-A');
+      await sh(at, 'commit', '-qm', 'both pages');
+      await sh(at, 'checkout', '-qb', 'feature');
+      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), `from feature, ${body}\n`);
+      await sh(at, 'add', '-A');
+      await sh(at, 'commit', '-qm', 'feature pages');
+      await sh(at, 'checkout', '-q', 'main');
+      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), 'from main\n');
+      await sh(at, 'add', '-A');
+      await sh(at, 'commit', '-qm', 'main pages');
+      return at;
+    };
+
+    const dir = await accented('nonascii', 'one');
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const listed = (clash.files || []).map((f) => f.path);
+    check('T15d: the accented path comes back as the name the file has', listed.includes(PAGE), JSON.stringify(listed));
+    check('T15d: and not C-quoted', !listed.some((one) => one.includes('\\')), JSON.stringify(listed));
+    check('T15d: a path that begins with a space keeps it', listed.includes(SPACED), JSON.stringify(listed));
+    const only = (clash.files || []).find((f) => f.path === PAGE);
+    // The two sides are read by `git show :2:` and `:3:` on that same name, so
+    // a quoted one came back null from both and left nothing to decide.
+    check('T15d: this branch’s version of the accented file was read', only?.ours === 'from main\n', JSON.stringify(only?.ours));
+    check('T15d: and the incoming one', only?.theirs === 'from feature, one\n', JSON.stringify(only?.theirs));
+    check('T15d: and the marked-up file was parsed into a disagreement', (only?.parts || []).filter((part) => part.kind === 'clash').length === 1, JSON.stringify(only?.parts));
+    // AND THE BINDING MEASURED THE FILES, not its own failure to open them.
+    // Under the quoted name `conflictDigest` read nothing and hashed the
+    // UNREADABLE sentinel, so the SAME conflict in the SAME paths digested to
+    // the same value whatever was inside them — a binding that binds nothing.
+    // Two repositories with identical paths and different conflicting content
+    // say so without needing to know what a digest looks like.
+    const twin = await accented('nonascii-twin', 'two');
+    const clash2 = await mergeBranch(git, { projectPath: twin, branch: 'feature' });
+    check(
+      'T15d: two conflicts differing only in content do not share one binding',
+      !!clash.at?.digest && clash.at.digest !== clash2.at?.digest,
+      JSON.stringify({ one: clash.at?.digest, two: clash2.at?.digest })
+    );
+    const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: 'theirs', [SPACED]: 'theirs' }, expect: clash.at });
+    check('T15d: a resolve naming those paths goes through', answer?.ok === true, JSON.stringify(answer).slice(0, 400));
+    check('T15d: and the incoming bytes are what is on disk', fs.readFileSync(path.join(dir, PAGE), 'utf8') === 'from feature, one\n', fs.readFileSync(path.join(dir, PAGE), 'utf8'));
+    check('T15d: for the space-led path too', fs.readFileSync(path.join(dir, SPACED), 'utf8') === 'from feature, one\n', fs.readFileSync(path.join(dir, SPACED), 'utf8'));
+    check('T15d: as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
+  }
+
+  {
+    // T15e — A WORD IN THE VOCABULARY THAT THE FILE HAS NO VERSION FOR.
+    //
+    // One branch edits a file and the other deletes it. There is no stage 3, so
+    // "theirs" names nothing — but it is a legal word, so the validator whose
+    // whole purpose is to say no before anything is written passed it, and
+    // `git checkout --theirs` then failed with `error: path 'a.txt' does not
+    // have their version`. Nothing was corrupted (the catch aborts, and HEAD
+    // and the tree were measured intact) but the agent got an unnamed `failed`
+    // carrying git's sentence instead of `bad_choices` naming the offender.
+    const dir = await repo('modifydelete');
+    cleanup.push(dir);
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.unlinkSync(path.join(dir, 'a.txt'));
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'delete a on feature');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'kept, and edited on main\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'edit a on main');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T15e: the file clashes', clash.ok === false && clash.files?.[0]?.path === 'a.txt', JSON.stringify(clash.files?.map((f) => f.path)));
+    check('T15e: and the incoming side of it is an absence', clash.files?.[0]?.theirs === null, JSON.stringify(clash.files?.[0]?.theirs));
+    const before = await repoState(dir);
+    // Through `caught`, because the whole point is that this used to LEAVE the
+    // function as a throw. A test that awaited it directly would die on the
+    // unhandled rejection and report nothing by name.
+    const attempt = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'theirs' }, expect: clash.at }));
+    check('T15e: the choice is refused rather than thrown out of git', attempt.error === null, String(attempt.error));
+    const answer = attempt.value;
+    await refusedCleanly(
+      'T15e a side the file does not have',
+      answer,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r?.badChoices?.[0]?.path === 'a.txt' && r.badChoices[0].reason === 'no_such_side'
+    );
+    // WHICH SIDES IT DOES HAVE. A refusal that only says no sends the caller
+    // back to guess the other word.
+    check(
+      'T15e: the refusal names the sides that file actually has',
+      JSON.stringify(answer?.badChoices?.[0]?.sides) === JSON.stringify(['ours']),
+      JSON.stringify(answer?.badChoices?.[0])
+    );
+    check('T15e: and which branch deleted it', answer?.badChoices?.[0]?.deletedBy === 'theirs', JSON.stringify(answer?.badChoices?.[0]));
+    // The sentence a PERSON gets, which for this one reason has to say more
+    // than the general one: "a choice is ours or theirs" is exactly what they
+    // said, so on its own it sends them back to stare at a word that was fine.
+    check(
+      'T15e: and the sentence says the file exists on only one branch',
+      /only one branch/.test(String(answer?.message)) && /"ours"/.test(String(answer?.message)),
+      String(answer?.message)
+    );
+    check('T15e: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+    // THE CONTROL, both ways round: the side that does exist still resolves.
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
+    check('T15e control: the side the file does have still merges', done?.ok === true, JSON.stringify(done));
+    check('T15e control: keeping the file this branch edited', fs.readFileSync(path.join(dir, 'a.txt'), 'utf8') === 'kept, and edited on main\n');
+
+    // AND THE MIRROR IMAGE. This branch deleted it, the incoming one edited it,
+    // and 'ours' is the word with nothing behind it — the same defect with the
+    // sides swapped, which a check written only for `--theirs` would miss.
+    const other = await repo('deletemodify');
+    cleanup.push(other);
+    await sh(other, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(other, 'a.txt'), 'kept, and edited on feature\n');
+    await sh(other, 'add', '-A');
+    await sh(other, 'commit', '-qm', 'edit a on feature');
+    await sh(other, 'checkout', '-q', 'main');
+    fs.unlinkSync(path.join(other, 'a.txt'));
+    await sh(other, 'add', '-A');
+    await sh(other, 'commit', '-qm', 'delete a on main');
+    const clash2 = await mergeBranch(git, { projectPath: other, branch: 'feature' });
+    const before2 = await repoState(other);
+    const attempt2 = await caught(() => resolveMerge(git, { projectPath: other, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash2.at }));
+    check('T15e: the mirror image is refused rather than thrown out of git', attempt2.error === null, String(attempt2.error));
+    const answer2 = attempt2.value;
+    await refusedCleanly(
+      'T15e the mirror image — a file this branch deleted, asked for as "ours"',
+      answer2,
+      other,
+      before2,
+      'bad_choices',
+      (r) => r?.badChoices?.[0]?.reason === 'no_such_side' && JSON.stringify(r.badChoices[0].sides) === JSON.stringify(['theirs'])
+    );
+    check('T15e: the mirror image names the branch that deleted it', answer2?.badChoices?.[0]?.deletedBy === 'ours', JSON.stringify(answer2?.badChoices?.[0]));
+  }
+
+  {
     // T16 — A RESOLVE WITH NO BINDING AT ALL.
     //
     // An optional guard is the hole the binding exists to close: a caller that

@@ -19,6 +19,38 @@ const { parseConflict, renderResolved, clashCount, conflictAtEnd } = require('./
 // `git` is passed in rather than imported: main.js runs git through a PATH it
 // has had to repair for the packaged app, and the tests run it plainly.
 
+/**
+ * The conflicting paths out of `diff --name-only --diff-filter=U -z`.
+ *
+ * A PATH GIT PRINTED IS NOT ALWAYS A PATH GIT WILL ACCEPT BACK, and the
+ * line-oriented listing this replaces got it wrong twice over.
+ *
+ * `core.quotePath` defaults to true, so git C-quotes any name holding a byte
+ * outside ASCII or a control character: `café.astro` came out as
+ * `"caf\303\251.astro"`, quotation marks and all. MEASURED, on a clash in one
+ * accented file, all three consequences at once — `conflictDigest` could not
+ * open that name so the file hashed as the UNREADABLE sentinel, which is a
+ * measurement of nothing wearing the shape of a measurement; the panel and the
+ * MCP envelope were handed the quoted name with `ours`, `theirs` and `parts`
+ * all null, so there was nothing to choose between; and a resolve naming the
+ * real path was refused as `unknown_path` while one naming the quoted path died
+ * inside git on `pathspec ... did not match any file(s) known to git`. A clash
+ * in any accented or CJK filename was unresolvable by every route there is.
+ *
+ * And the `.trim()` that the line form needed ate the leading and trailing
+ * spaces of any path that has them, so ` draft.astro` came back as
+ * `draft.astro` — the same defect, arrived at with no quoting involved, and one
+ * that turning the quoting off does not reach.
+ *
+ * -z answers both and is stronger than `-c core.quotePath=false` would be: git
+ * emits NUL-terminated names verbatim, with no escaping rule left to get wrong
+ * and nothing to strip off either end. (The flag is deliberately NOT also
+ * scattered over the merge and switch commands whose stderr this file scrapes
+ * file lists out of: measured on those two messages, git does not C-quote
+ * there, and a flag that cannot be shown to change anything is decoration.)
+ */
+const conflictedPaths = (stdout) => String(stdout || '').split('\0').filter(Boolean);
+
 /** Whether the working tree has anything uncommitted in it. */
 async function isDirty(git, projectPath) {
   const { stdout } = await git(projectPath, ['status', '--porcelain']);
@@ -174,23 +206,64 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       `"${branch}" was at ${short(bound.incoming)} and is now at ${short(incomingNow)}`
     );
   }
+  const abort = async () => {
+    try {
+      await git(projectPath, ['merge', '--abort']);
+    } catch {
+      /* already unwound */
+    }
+  };
   let blocked = null;
+  let clean = false;
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
-    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-edit', branch]);
-    // It went through cleanly this time. Both commits are the ones the caller
-    // was shown, so git reconciled everything by itself and kept both sides —
-    // there was nothing left to choose between and nothing was discarded.
-    return { ok: true, into, changed: true, resolved: 0 };
+    //
+    // --no-commit --no-ff: NOTHING HERE MAY REACH A COMMIT BEFORE THE BINDING
+    // HAS BEEN CONSULTED. This used to be a plain merge, so a re-run that went
+    // through cleanly committed itself before any of the checks below ran —
+    // see the refusal underneath. Leaving it uncommitted costs nothing: the
+    // clashing path never committed either, and the `git commit --no-edit` at
+    // the end of the apply loop is what finishes both. (A fast-forward cannot
+    // happen here — the caller was shown a conflict from these same two
+    // commits, and a fast-forward never conflicts — but --no-ff says so rather
+    // than leaving it to be worked out, because a fast-forward is the one
+    // merge --no-commit cannot stop and the one `merge --abort` cannot undo.)
+    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', branch]);
+    clean = true;
   } catch (err) {
     /* expected — it clashes again, which is what the choices are for */
     blocked = err;
   }
-  const left = (await git(projectPath, ['diff', '--name-only', '--diff-filter=U'])).stdout
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
+  // A RESOLVE THAT WAS TOLD ABOUT A CONFLICT AND FINDS NONE IS A STALE BINDING,
+  // NOT A SUCCESS.
+  //
+  // This used to answer `{ok:true, changed:true, resolved:0}` and commit, on
+  // the reasoning that both commits were where the caller left them so git had
+  // simply reconciled everything itself. The reasoning is the SHA argument
+  // again, and it is wrong for the same reason conflictDigest exists: the merge
+  // machinery is not in either commit. MEASURED, with git's own built-in union
+  // driver and an untracked `.git/info/attributes` holding `*.txt merge=union`
+  // written between the merge and the resolve — no git config, no tracked file:
+  // a caller that asked for `{a.txt: 'ours'}` got `"OURS\nTHEIRS\n"` committed
+  // as a two-parent merge, and was told ok. Its choice was never applied and
+  // never mentioned. With a custom driver the mirror image — asked theirs, got
+  // ours, and the incoming work was gone while the branch stopped being
+  // protected from deletion.
+  //
+  // The digest below cannot catch it, because there is nothing left to digest:
+  // the conflict the answers were about is not there. So the absence IS the
+  // finding, and it is refused by name with the merge unwound and HEAD where it
+  // was.
+  if (clean) {
+    await abort();
+    return stale(
+      { head: headNow, incoming: incomingNow, digest: null },
+      'both branches are where they were, but git reconciles them cleanly now — there is no conflict left for ' +
+        'those answers to be about, and applying them would have discarded them in silence'
+    );
+  }
+  const left = conflictedPaths((await git(projectPath, ['diff', '--name-only', '--diff-filter=U', '-z'])).stdout);
   if (!left.length) {
     // THE MERGE NEVER STARTED, and until this it had no name. Unsaved work in
     // one of the conflicting files stops git before it writes anything, so
@@ -223,11 +296,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // is a measurement of what git actually wrote.
   const digestNow = conflictDigest(projectPath, left);
   if (digestNow !== bound.digest) {
-    try {
-      await git(projectPath, ['merge', '--abort']);
-    } catch {
-      /* already unwound */
-    }
+    await abort();
     return stale(
       { head: headNow, incoming: incomingNow, digest: digestNow },
       left.length
@@ -292,6 +361,38 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     parsed.set(file, parts);
     return parts;
   };
+  // WHICH SIDES EACH CONFLICTED FILE ACTUALLY HAS, asked once.
+  //
+  // Stage 2 is this branch's version and stage 3 the incoming one, and a
+  // modify/delete clash has only one of them. `git show :3:path` would answer
+  // the same question by reading the whole blob — which for the binary files
+  // this validator also has to cover means pulling a video through a pipe to
+  // ask whether it exists. `ls-files -u` is the index itself, and -z for the
+  // same reason conflictedPaths uses it: NUL-terminated names are verbatim, so
+  // the name matched against `left` here is the name git reported there.
+  const sidesByFile = new Map();
+  try {
+    for (const row of (await git(projectPath, ['ls-files', '-u', '-z'])).stdout.split('\0')) {
+      // "<mode> <object> <stage>\t<path>"
+      const tab = row.indexOf('\t');
+      if (tab === -1) continue;
+      const stage = Number(row.slice(0, tab).trim().split(/\s+/)[2]);
+      const file = row.slice(tab + 1);
+      if (!sidesByFile.has(file)) sidesByFile.set(file, new Set());
+      sidesByFile.get(file).add(stage);
+    }
+  } catch {
+    /* no index to ask — every side reads as present, and the apply loop's own
+       catch is what is left. Refusing here on a git that would not answer would
+       turn a working merge into a refusal. */
+  }
+  const sidesOf = (file) => {
+    const stages = sidesByFile.get(file);
+    // A file the index said nothing about is not evidence of an absence, so
+    // both sides read as present and nothing new is refused.
+    if (!stages || !stages.size) return ['ours', 'theirs'];
+    return [...(stages.has(2) ? ['ours'] : []), ...(stages.has(3) ? ['theirs'] : [])];
+  };
   const unusable = [];
   // A NAME GIT NEVER SAID. Named first, because it is the failure that used to
   // be completely invisible: the file the caller meant is still down there
@@ -312,7 +413,31 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       continue;
     }
     if (typeof choice === 'string') {
-      if (!WHOLE_FILE.has(choice)) unusable.push({ path: file, given: choice, reason: 'bad_value', expected: [...WHOLE_FILE] });
+      if (!WHOLE_FILE.has(choice)) {
+        unusable.push({ path: file, given: choice, reason: 'bad_value', expected: [...WHOLE_FILE] });
+        continue;
+      }
+      // A SIDE THAT IS IN THE VOCABULARY IS NOT ALWAYS A SIDE THIS FILE HAS.
+      //
+      // A modify/delete clash — one branch edited the file, the other deleted
+      // it — has no stage 3 (or no stage 2, the other way round). "theirs"
+      // passed this validator as a word, and then `git checkout --theirs`
+      // failed with `error: path 'a.txt' does not have their version`, which
+      // reached the agent as an unnamed `failed` with git's sentence in it.
+      // Nothing was corrupted (the catch aborts, and HEAD and the tree were
+      // measured intact) but the one job of a validator is to say no BEFORE
+      // anything is written, and this got through it.
+      //
+      // Note what the refusal has to say as well as which sides exist: when the
+      // incoming side deleted the file there is no way to ACCEPT that deletion
+      // here. The vocabulary is "ours" and "theirs", both of which name a
+      // version to keep, and neither names an absence. Keeping the file is the
+      // only answer this file can take, and an agent that wanted the deletion
+      // has to make it a commit of its own.
+      const has = sidesOf(file);
+      if (!has.includes(choice)) {
+        unusable.push({ path: file, given: choice, reason: 'no_such_side', sides: has, expected: has, deletedBy: choice });
+      }
       continue;
     }
     if (Array.isArray(choice)) {
@@ -370,6 +495,16 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // a red box quoting a field name. The mapper composes a longer one from the
     // same `reason`; this is the one anybody gets who does not.
     const first = unusable[0];
+    // AND THE ONE REASON THE GENERAL SENTENCE ACTIVELY MISLEADS. "A choice is
+    // 'ours' or 'theirs' for a whole file" is exactly what the caller said, so
+    // reading only that leaves a person staring at a word they already used.
+    // The vocabulary is not what was wrong: the file has one side, not two.
+    const also =
+      first.reason === 'no_such_side'
+        ? ` "${first.path}" exists on only one branch here — the other deleted it — so it takes ` +
+          `${(first.sides || []).map((side) => `"${side}"`).join(' or ') || 'neither side'} and nothing else, ` +
+          'and accepting the deletion means keeping the file now and deleting it in a commit of its own.'
+        : '';
     return {
       ok: false,
       code: 'bad_choices',
@@ -379,7 +514,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       message:
         `Nothing was merged: ${unusable.length} of the choices could not be used, starting with "${first.path}". ` +
         'A choice is "ours" or "theirs" for a whole file, or one answer per disagreement in that file — as many ' +
-        'answers as it has disagreements, and only for files the merge actually reported.',
+        `answers as it has disagreements, and only for files the merge actually reported.${also}`,
     };
   }
 
@@ -462,10 +597,7 @@ async function mergeBranch(git, { projectPath, branch }) {
     // clears it.
     let files = [];
     try {
-      files = (await git(projectPath, ['diff', '--name-only', '--diff-filter=U'])).stdout
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean);
+      files = conflictedPaths((await git(projectPath, ['diff', '--name-only', '--diff-filter=U', '-z'])).stdout);
     } catch {
       /* no index to ask about — the merge never started */
     }

@@ -124,6 +124,23 @@ function lineStarts(text) {
 /** Lines `from`..`to` inclusive, terminators included, as they sit in the file. */
 const sliceLines = (text, starts, from, to) => text.slice(starts[from - 1], to < starts.length ? starts[to] : text.length);
 
+/**
+ * A file's text, or null when there is no file.
+ *
+ * `digestOfFile` reads and hashes in one step, which is right where the digest
+ * is all anyone wants. It is wrong where the SAME read has to answer a second
+ * question — how big is it — because two reads of one file are two answers, and
+ * a write racing between them reports a digest and a size belonging to
+ * different versions. So the read is separated from what is computed off it.
+ */
+function readTextOrNull(abs) {
+  try {
+    return fs.readFileSync(abs, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 // The two things the API layer supplies, with the behaviour to fall back on
 // when it has not — so `runMain` stays a function of its context and can be
 // driven straight in a test.
@@ -230,22 +247,32 @@ const source = {
     }
     const wrote = await putText(ctx, at.rel, input.text);
     if (wrote.error) return wrote;
+    // WHAT IS ON DISK, not what the caller asked for -- the same rule
+    // asset.write_text already carries a comment about, and BOTH numbers in
+    // this envelope obey it now.
+    //
+    // It matters most here, because these bytes genuinely can differ: a write
+    // to the OPEN document is routed through the renderer (agent/index.js
+    // `write_open_source`), which parses the text into a model and lets the
+    // normal save write the SERIALIZER's bytes. Hashing the input meant a
+    // client storing `afterDigest` for optimistic concurrency held a digest no
+    // file had, and its next guarded write was refused as `stale_target`
+    // against a file nobody had touched.
+    //
+    // `bytes` was still measured from the request after that was fixed, so in
+    // exactly the case the paragraph above names one envelope reported the
+    // digest of the file on disk beside the size of a file that was never
+    // written. Read ONCE and both derived from the same string, because two
+    // reads of one file are two answers waiting for the day they disagree --
+    // and byte-counted the way source.read counts `wholeFileBytes`, so the two
+    // numbers a client compares were arrived at the same way.
+    const landed = readTextOrNull(at.abs);
     return {
       value: {
         path: at.rel,
         beforeDigest: before,
-        // THE DIGEST OF WHAT IS ON DISK, not of what the caller asked for --
-        // the same rule asset.write_text already carries a comment about.
-        //
-        // It matters most here, because these bytes genuinely can differ: a
-        // write to the OPEN document is routed through the renderer
-        // (agent/index.js `write_open_source`), which parses the text into a
-        // model and lets the normal save write the SERIALIZER's bytes. Hashing
-        // the input meant a client storing `afterDigest` for optimistic
-        // concurrency held a digest no file had, and its next guarded write was
-        // refused as `stale_target` against a file nobody had touched.
-        afterDigest: digestOfFile(at.abs),
-        bytes: Buffer.byteLength(input.text, 'utf8'),
+        afterDigest: landed === null ? null : digestOf(landed),
+        bytes: landed === null ? null : Buffer.byteLength(landed, 'utf8'),
         ...wrote.through,
       },
     };
@@ -1639,6 +1666,21 @@ const git = {
           bad_pick: `"${first.given}" is not one of the answers a hunk of "${first.path}" can take`,
           bad_value: `"${first.given}" is not one of the answers "${first.path}" can take`,
           bad_shape: `the choice for "${first.path}" is a ${first.given}, which is neither a word nor a list of them`,
+          // A WORD IN THE VOCABULARY THAT THIS FILE HAS NO VERSION FOR.
+          //
+          // One branch edited the file and the other deleted it, so the side
+          // asked for does not exist. This used to pass validation as
+          // vocabulary and then die inside `git checkout --theirs` with
+          // `error: path 'a.txt' does not have their version`, which reached
+          // the agent as an unnamed `failed`. The sentence also has to say the
+          // thing the vocabulary cannot: "ours" and "theirs" both name a
+          // version to KEEP, so accepting the other branch's deletion is not
+          // expressible as a choice at all.
+          no_such_side:
+            `"${first.path}" was deleted on the ${first.deletedBy === 'theirs' ? 'incoming' : 'current'} branch, so it has ` +
+            `no "${first.given}" version to take — ` +
+            `${(first.sides || []).length ? `"${(first.sides || []).join('" or "')}" is the only answer it can take` : 'it has no side left to take'}, ` +
+            'and accepting the deletion is not something a choice can say: keep the file here and delete it in a commit of its own',
         }[first.reason] || `the choice for "${first.path}" could not be understood`;
         return {
           ...problem(
