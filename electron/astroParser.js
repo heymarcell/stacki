@@ -1570,33 +1570,15 @@ function litProp(node, name) {
  * has no rule that preserves whitespace" -- and no set at all is the same
  * answer, which is the explicit decision recorded on `anchoredSerialize`.
  *
- * THE SENTINEL IS AN ADMISSION, NOT A MEASUREMENT, and this is the predicate
- * that reads it as one. Everything that asks this is deciding whether to KEEP
- * THE AUTHORED BYTES of something, which is the safe answer to "we do not
- * know". The other question -- may the indentation BETWEEN an element's
- * children be dropped, because that element renders it -- is not answerable
- * from `'*'` at all, and is asked of `namedTokens` instead.
+ * A SUPERSET IS AN ADMISSION, NOT A MEASUREMENT, and this is the predicate that
+ * reads it as one -- the sentinel loudly, and a bare tag off `.prose div`
+ * quietly. Everything that asks this is deciding whether to KEEP THE AUTHORED
+ * BYTES of something, which is the safe answer to "we do not know". The other
+ * question -- may the indentation BETWEEN an element's children be dropped,
+ * because that element renders it -- is an act rather than an abstention, is
+ * not answerable from a superset at all, and never asks this: see
+ * `rendersIndent` in `anchoredSerialize`.
  */
-/**
- * The same set with the scanner's admission of ignorance taken out of it.
- *
- * "WE COULD NOT PROVE A REINDENT IS SAFE" AND "THIS ELEMENT RENDERS ITS OWN
- * WHITESPACE" ARE DIFFERENT STATEMENTS, and they shared one flag until one
- * stylesheet left mid-edit -- a single unclosed brace -- made
- * `preservingTokens` answer `{'*'}`, marked every node in the page as
- * preserving, and put the layout around every subsequent splice at column
- * zero: an `<h2>` from column 4 to 2, a `</section>` and a `<p>` from 2 to 0,
- * on a move that named none of them. Uncertainty has to mean KEEP THE AUTHORED
- * BYTES, never WRITE THE SURROUNDING LAYOUT AT COLUMN ZERO -- so the decisions
- * of the second kind read this set, which holds only tokens a rule really
- * named, and answers "no" where the scanner only said "unknown".
- */
-function namedTokens(tokens) {
-  if (!tokens || typeof tokens.has !== 'function') return tokens;
-  if (!tokens.has('*')) return tokens;
-  return new Set([...tokens].filter((one) => one !== '*'));
-}
-
 function matchesPreservingTokens(node, tokens) {
   if (!tokens || typeof tokens.has !== 'function' || !tokens.size) return false;
   if (tokens.has('*')) return true;
@@ -1669,10 +1651,11 @@ function declaresRenderedSpace(node, tokens) {
  * So: one top-down pass over the BASE tree before any splice is planned, and
  * the answer for every node is membership of the set this returns.
  *
- * Run TWICE, over the same tree, with two different token sets -- see
- * `namedTokens` and `anchoredSerialize`. The question is the same one; what
- * differs is whether the project's scanner is allowed to answer it with an
- * admission of ignorance.
+ * Run TWICE over the same tree -- see `anchoredSerialize`. The question is the
+ * same one; what differs is who is allowed to answer it. The wide pass lets a
+ * rule the project's SCANNER found say yes, because everything gated on it only
+ * keeps bytes; the narrow one is handed no tokens at all, because what it gates
+ * is an edit to markup nobody named.
  */
 function preservingContext(nodes, tokens) {
   const preserves = new Set();
@@ -1703,6 +1686,68 @@ function renderedWhitespace(text) {
   let hit;
   while ((hit = re.exec(text)) !== null) runs.push(hit[2].replace(/\r\n/g, '\n'));
   return runs;
+}
+
+/**
+ * One rendered run's non-whitespace bytes, and the whitespace run in front of
+ * each of them -- plus the one at the end, so there are always N+1 of them.
+ */
+function whitespaceGaps(text) {
+  const bare = [];
+  const gaps = [];
+  let run = '';
+  for (const ch of text) {
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
+      run += ch;
+      continue;
+    }
+    bare.push(ch);
+    gaps.push(run);
+    run = '';
+  }
+  gaps.push(run);
+  return { bare: bare.join(''), gaps };
+}
+
+/**
+ * Did the spliced file's rendered run keep everything the reprint's did?
+ *
+ * COLLAPSED WHERE THE TWO DIFFER, NOT ACROSS THE WHOLE RUN. The relaxation used
+ * to be `run === want || run.replace(/\s+/g, ' ') === want`, which flattens the
+ * ENTIRE run before comparing -- so the moment `want` held any whitespace of
+ * its own the collapse could not equal it, however faithful the splice was.
+ * Measured on a plain text edit inside `<pre>\n<code>alpha\n  beta</code>\n<span
+ * class='tail'>tail</span>\n</pre>`: the splice kept every byte, `serializePage`
+ * printed the run as one inline line, and the whole-run collapse turned the
+ * `<code>`'s own newline into a space too -- so the gate refused, threw the
+ * CORRECT splice away, and returned `canonical`, which is the text that had
+ * deleted the rendered newlines. Refusing is normally the safe direction; here
+ * it is the damaging one, because the refusal's fallback IS the damage.
+ *
+ * So the two runs are lined up on their non-whitespace bytes, which must be
+ * identical, and each gap is judged on its own. `want` -- the reprint -- is
+ * allowed to hold the same whitespace, or that whitespace collapsed to the one
+ * space a renderer would draw, or (at the two ends of the run, where
+ * `inlineString` trims) nothing at all. It is NOT allowed to hold whitespace
+ * the splice does not have: that is a run the splice LOST, which is exactly
+ * what a twin copying the wrong `<pre>`'s bytes produces, and it still refuses.
+ */
+function keptRenderedWhitespace(run, want) {
+  if (run === want) return true;
+  const mine = whitespaceGaps(run);
+  const theirs = whitespaceGaps(want);
+  if (mine.bare !== theirs.bare) return false;
+  const last = theirs.gaps.length - 1;
+  for (let i = 0; i <= last; i += 1) {
+    const held = mine.gaps[i];
+    const asked = theirs.gaps[i];
+    if (asked === held) continue;
+    if (held === '') return false;
+    if (asked === ' ') continue;
+    if (asked === '' && (i === 0 || i === last)) continue;
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -2055,6 +2100,57 @@ function spliceHead(source, base, next) {
   return out;
 }
 
+/**
+ * A PRESERVING ELEMENT'S CHILDREN PUT BACK IN A NEW ORDER, AS THE FILE'S OWN
+ * BYTES -- or null when that is not what happened to them.
+ *
+ * `replaceNodeSplice` below reprints a node's whole subtree from the model, and
+ * for a `<pre>` the model is the one place its inter-element newlines are NOT:
+ * `parsePage` collapses them into a text node's `value` and parks the real
+ * bytes in an as-written cache the reprint does not read. Measured on a reorder
+ * of two `<span>`s inside a `<pre>` written across lines, the whole block came
+ * back on ONE LINE -- `alpha\n  beta` flattened to `alpha beta` -- and the
+ * readback gate passed it because `canonical` had collapsed the same run the
+ * same way, so there was no fallback line to find it by.
+ *
+ * The reorder is answerable exactly, and without reprinting anything: the
+ * element's own bytes already hold every gap -- the break after the open tag,
+ * the break between two children, the indent before the closing tag -- and a
+ * reorder does not change one of them. So the gaps stay where the file put
+ * them and only the children's spans are permuted. What this refuses to guess
+ * at, by returning null, is anything else: a child that is not one of the
+ * base's own, a child added or dropped, an opening tag that changed, or a
+ * child list this file has no offsets for.
+ */
+function reorderedInPlace(source, base, next, ctx) {
+  if (!Array.isArray(base.children) || !Array.isArray(next.children)) return null;
+  if (!sameMeaning(headOf(base), headOf(next))) return null;
+  const anchored = base.children.filter(
+    (n) => typeof n.start === 'number' && typeof n.end === 'number'
+  );
+  if (!anchored.length) return null;
+  // A text node carries no offsets of its own -- its bytes are part of the gap
+  // between the children either side of it -- so a whitespace-only one is
+  // already accounted for and anything else is a change this cannot place.
+  const moved = [];
+  for (const kid of next.children) {
+    if (kid.kind === 'text' && typeof kid.value === 'string' && !kid.value.trim()) continue;
+    const twin = ctx.twin(kid);
+    if (!twin || !anchored.includes(twin) || moved.includes(twin)) return null;
+    moved.push(twin);
+  }
+  if (moved.length !== anchored.length) return null;
+  let text = '';
+  let at = base.start;
+  for (let i = 0; i < anchored.length; i += 1) {
+    text += source.slice(at, anchored[i].start);
+    text += source.slice(moved[i].start, moved[i].end);
+    at = anchored[i].end;
+  }
+  text += source.slice(at, base.end);
+  return [{ start: base.start, end: base.end, text }];
+}
+
 /** One node's whole span, replaced by what the model now says it is. */
 function replaceNodeSplice(source, base, next, ctx) {
   const { start, end } = base;
@@ -2063,6 +2159,29 @@ function replaceNodeSplice(source, base, next, ctx) {
   // its twin cannot be its own bytes; it would be some OTHER node in the file
   // that happens to mean the same, and copying THAT one's whitespace into a
   // preserving element is the twin defect rather than a fix for it.
+  //
+  // AND THAT REASONING IS ABOUT A TWIN, NOT ABOUT THE NODE ITSELF. `ctx` here
+  // belongs to the PARENT -- the parent of a `<pre>` is an ordinary `<div>`, so
+  // `ctx.preserving` is false -- and nothing below asked whether the node whose
+  // span is being replaced is the preserving one. `printNode` has four guards
+  // for exactly that and this had none, so a reorder inside a `<pre>` reprinted
+  // the `<pre>` from the model and wrote the block back on one line. Its own
+  // bytes are the only text that has those newlines in it.
+  //
+  // A SUBTREE IS WHAT IS AT RISK, so this asks about a node that HAS one. A
+  // text node inside a `<pre>` inherits the flag and carries no layout of its
+  // own -- its words are replaced between the boundary bytes below, which is
+  // the branch that keeps `<label>Name: <input /></label>` intact -- and
+  // refusing there would send an ordinary text edit inside a `<pre>` through
+  // the whole-document reprint, which is the very text that collapses it.
+  if (
+    base.kind !== 'text' &&
+    Array.isArray(base.children) &&
+    base.children.length > 0 &&
+    ctx.preserves.has(base)
+  ) {
+    return reorderedInPlace(source, base, next, ctx);
+  }
   if (ctx.inline) return [{ start, end, text: withEol(inlineString([next]), ctx.eol) }];
   // A TEXT NODE'S SPAN IS NOT ITS WORDS.
   //
@@ -2474,18 +2593,31 @@ function anchoredSerialize(source, model, options = {}) {
     // Every node of the BASE tree that renders its own leading spaces, walked
     // down from the root once so inheritance is answered rather than guessed.
     preserves: preservingContext(base.model.nodes || [], tokens),
-    // AND THE SAME WALK WITHOUT THE SCANNER'S SHRUG IN IT.
+    // AND THE SAME WALK WITH NO STYLESHEET IN IT AT ALL.
     //
-    // Membership of `preserves` can come from the sentinel `'*'`, which says
-    // only that the project could not be scanned -- one unparseable stylesheet
-    // anywhere in it puts every node in that set. Everything gated on
-    // `preserves` keeps the bytes the file already has, so that is the right
-    // reading there. Writing a splice's surrounding layout at COLUMN ZERO is
-    // not that: it is an edit to markup nobody touched, and it needs the
-    // element to be KNOWN to render its children's indentation. So the same
-    // top-down walk runs again over `namedTokens`, and only the second set is
-    // allowed to move anything to column zero.
-    rendersIndent: preservingContext(base.model.nodes || [], namedTokens(tokens)),
+    // WRITING A SPLICE'S SURROUNDING LAYOUT AT COLUMN ZERO IS AN EDIT TO MARKUP
+    // NOBODY TOUCHED, and it is the only positive, act-taking use of the
+    // whitespace answer. Everything else gated on `preserves` keeps the bytes
+    // the file already has, which is the safe reading of a "could"; this one
+    // needs the element to be KNOWN to render its children's indentation, and
+    // the token set cannot say that about anything. It is documented as an
+    // OVER-approximation, sound "only because it is only ever read as NO":
+    // `tokensOfSelector` reduces a selector to its rightmost compound and
+    // `matchesPreservingTokens` matches ANY token in it, so `.prose div {
+    // white-space: pre-wrap }` -- an ordinary, correctly-parsed stylesheet --
+    // answers `['div']`, and measured, EVERY `<div>` in the project then had
+    // its inserted siblings written at column zero. The sentinel was only the
+    // loudest way in; a bare tag off a descendant selector is the quiet one,
+    // and a class token is no better -- `@media print { .preserved {
+    // white-space: pre } }` names a class the rule may never reach.
+    //
+    // So this walk reads no tokens. What puts a node in it is what the element
+    // itself says -- its tag (`<pre>`, `<textarea>`, `<script>`, `<style>`),
+    // its own `style` declaration, its own whitespace utility class -- or an
+    // ancestor that said one of those, because the property inherits. That is
+    // evidence rather than a superset, and where there is none the file's own
+    // indent goes in, which changes nothing.
+    rendersIndent: preservingContext(base.model.nodes || [], null),
     // The destination for the page's own top-level children is the document,
     // which preserves nothing. `childContext` sets this from the parent whose
     // children it is about to print.
@@ -2547,16 +2679,19 @@ function anchoredSerialize(source, model, options = {}) {
   // so on a move inside such a `<pre>` the reprint collapses the whole block to
   // one line while the splice keeps every byte. Held to plain equality this
   // gate threw the good answer away and returned the collapsed one. Where the
-  // reprint is EXACTLY the splice's run with its whitespace collapsed, the
-  // splice is the text that kept the bytes and the reprint is the one that lost
-  // them. Anything else -- a run whose words differ, or one that lost
-  // whitespace the reprint holds, which is what a twin copying the wrong bytes
-  // produces -- still refuses.
+  // reprint is the splice's run with its whitespace collapsed, the splice is
+  // the text that kept the bytes and the reprint is the one that lost them.
+  // Anything else -- a run whose words differ, or one that lost whitespace the
+  // reprint holds, which is what a twin copying the wrong bytes produces --
+  // still refuses. Judged GAP BY GAP rather than over the whole run, which is
+  // the difference between reading the reprint as collapsed and flattening
+  // both texts until neither says anything: see `keptRenderedWhitespace`.
   const asked = renderedWhitespace(canonical);
   if (asked.length) {
     const got = renderedWhitespace(serializePage(check.model));
-    const kept = (run, want) => run === want || run.replace(/\s+/g, ' ') === want;
-    if (got.length !== asked.length || got.some((run, i) => !kept(run, asked[i]))) return canonical;
+    if (got.length !== asked.length || got.some((run, i) => !keptRenderedWhitespace(run, asked[i]))) {
+      return canonical;
+    }
   }
   return spliced;
 }

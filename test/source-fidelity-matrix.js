@@ -47,8 +47,16 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const H = require('./agent-harness.js');
-const { parsePage, anchoredSerialize, applySplices } = require('../electron/astroParser.js');
+const { parsePage, anchoredSerialize, serializePage, applySplices } = require('../electron/astroParser.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite starts real Electron apps and awaits
+// real IPC; node exits 0 on an empty event loop, so an await that never settles
+// would print nothing after the last line it reached and be recorded as success.
+// See test/support/suiteGuard.js.
+const suiteDone = guardSuite('source-fidelity-matrix');
 
 const failures = [];
 let checked = 0;
@@ -2500,6 +2508,356 @@ function aDescendantThatDeclaresIt() {
   }
 }
 
+/**
+ * T11 -- THE SECOND FLAG, FED AN OVER-APPROXIMATION.
+ *
+ * The token set is documented as a superset and sound "only because it is only
+ * ever read as NO": `tokensOfSelector` reduces a selector to its rightmost
+ * compound and `matchesPreservingTokens` matches ANY token in it. So an
+ * ordinary, correctly-parsed `.prose div { white-space: pre-wrap }` answers
+ * `['div']` -- measured, and asserted below rather than assumed -- and while
+ * `indentIsContent` read that set, EVERY `<div>` in the project satisfied it:
+ * every block insert and every range splice inside any `<div>` wrote the markup
+ * around it at COLUMN ZERO. That is the same "active edit rather than a missing
+ * one" the second flag was added to prevent, reached from a stylesheet with
+ * nothing wrong with it rather than from a broken one, and it is a regression
+ * against a base that always used `lineIndentOf`.
+ *
+ * BOTH DIRECTIONS, because a fix that just ignores the tokens everywhere would
+ * pass the first check and lose the whole mechanism: the moved subtree still
+ * has to travel as authored, which is what the wide flag is for.
+ */
+function theTokenThatNamesEveryDiv() {
+  const label = '[over-approximated]';
+  // PREMISE: the reducer really does hand a bare tag out of a descendant
+  // selector. Without this the checks below could pass for want of a token.
+  const tokens = WS.tokensInCss('.prose div { white-space: pre-wrap; }');
+  if (
+    !check(
+      `${label} an ordinary descendant selector reduces to a bare tag`,
+      tokens.size === 1 && tokens.has('div'),
+      short([...tokens])
+    )
+  ) {
+    return;
+  }
+  const source = commentedPage(
+    `  <div class='plain'>\n    <span class='kept'>one</span>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n  <p>alpha\nbeta</p>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const box = root.children.find((n) => n.name === 'div');
+  const p = root.children.find((n) => n.name === 'p');
+  if (!check(`${label} both are where a move can reach them`, !!box && !!p, short(root.children.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== p);
+  box.children.push(p);
+  const after = anchoredSerialize(source, model, { preservingTokens: tokens });
+  if (
+    !check(
+      `${label} the move puts the <p> inside the box`,
+      /<span class='kept'>one<\/span>[\s\S]*<p>[\s\S]*<\/div>/.test(after),
+      short(changedSpan(source, after))
+    )
+  ) {
+    return;
+  }
+  const held = /<div [^>]*>([\s\S]*?)<\/div>/.exec(after);
+  const inserted = held ? held[1] : '';
+  check(
+    `${label} a bare tag off a stylesheet does not put the surrounding markup at column zero`,
+    inserted === `\n    <span class='kept'>one</span>\n    <p>alpha\nbeta</p>\n  `,
+    short({ got: inserted })
+  );
+  // AND THE WIDE FLAG IS UNTOUCHED: the same token still holds the moved
+  // subtree's own bytes, which is the direction that keeps rendered spaces.
+  check(
+    `${label}   and the moved subtree still travels as it was authored`,
+    inserted.includes('<p>alpha\nbeta</p>'),
+    short({ got: inserted })
+  );
+}
+
+/**
+ * T12 -- THE WALK, ROUND TWO: what a `Dirent` does not answer about.
+ *
+ * `isDirectory()` is false for a symlink TO a directory, so `src/styles ->
+ * ../../packages/ui/styles` -- the ordinary monorepo shape -- was neither
+ * walked nor counted as a failure: `failed` stayed false and the answer was the
+ * empty set, which the parser reads as the positive claim that nothing in this
+ * project preserves whitespace. Measured, and asserted here as both halves: the
+ * real directory answers `.preserved`, the identical stylesheet behind a
+ * symlinked one used to answer nothing, and the move under it then deleted two
+ * rendered spaces.
+ *
+ * The same `else` is why a FIFO named `site.css` was READ: see
+ * `theEntryThatIsNotAFile`.
+ */
+function theStylesheetBehindASymlink() {
+  const rule = '.preserved { white-space: pre; }\n';
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner, raised } = preservedFixture(shape);
+
+  const root = H.makeProject({ [PAGE]: source });
+  // The shared package the link points at, OUTSIDE the scanned tree, because
+  // that is what makes the link the only way in.
+  const shared = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'stacki-shared-'));
+  let real = [];
+  let linked = [];
+  let text = null;
+  try {
+    fs.mkdirSync(path.join(shared, 'styles'), { recursive: true });
+    fs.writeFileSync(path.join(shared, 'styles', 'shared.css'), rule, 'utf8');
+    // PREMISE: the same rule in a real directory in the project is found, so a
+    // failure below is about the link and not about the rule.
+    fs.mkdirSync(path.join(root, 'src', 'proof'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'proof', 'shared.css'), rule, 'utf8');
+    WS.forgetCache();
+    real = [...WS.preservingTokens(root)];
+    fs.rmSync(path.join(root, 'src', 'proof'), { recursive: true, force: true });
+
+    fs.symlinkSync(path.join(shared, 'styles'), path.join(root, 'src', 'vendored'));
+    const entry = fs
+      .readdirSync(path.join(root, 'src'), { withFileTypes: true })
+      .find((e) => e.name === 'vendored');
+    check(
+      '[symlink] the fixture really is a link that a Dirent calls no directory',
+      !!entry && entry.isSymbolicLink() && entry.isDirectory() === false,
+      short({ link: !!entry?.isSymbolicLink?.(), dir: entry?.isDirectory?.() })
+    );
+    WS.forgetCache();
+    const tokens = WS.preservingTokens(root);
+    linked = [...tokens];
+    text = raiseHeadless(source, 'preserved', tokens);
+  } finally {
+    H.removeProject(root);
+    H.removeProject(shared);
+  }
+  check('[symlink] the rule is found in a real directory', real.includes('.preserved'), short(real));
+  check('[symlink] a symlinked directory is walked, not silently dropped', linked.includes('.preserved'), short(linked));
+  check(
+    '[symlink] and the move under it keeps the bytes that rule protects',
+    !!text && innerOf(text, 'preserved') === inner && raised !== inner,
+    short({ want: inner, got: text === null ? null : innerOf(text, 'preserved') })
+  );
+}
+
+/**
+ * T13 -- an entry with a stylesheet's NAME that is not a file at all.
+ *
+ * The walk classified with `isDirectory()` and an `else`, never `isFile()`, so
+ * a FIFO called `site.css` went into the list; `statSync().size` is 0 for one,
+ * so the size gate did not fire, and `readFileSync` BLOCKED FOREVER.
+ * `preservingTokens` runs synchronously on the Electron MAIN process inside
+ * `page:write`, so that is the whole app hung -- no repaint, no IPC, the write
+ * neither completing nor refusing. Measured: SIGKILLed after 8s with no answer.
+ *
+ * Driven in a CHILD process on a deadline, because a synchronous hang in this
+ * one cannot be measured from inside it: the suite would hang with it, and
+ * `guardSuite`'s own timer would report the hang without naming this as the
+ * cause.
+ */
+function theEntryThatIsNotAFile() {
+  const root = H.makeProject({});
+  const fifo = path.join(root, 'src', 'styles', 'piped.css');
+  let made = false;
+  try {
+    execFileSync('mkfifo', [fifo], { stdio: 'ignore' });
+    made = fs.statSync(fifo).isFIFO();
+  } catch {
+    made = false;
+  }
+  if (!check('[not-a-file] the fixture really is a FIFO named like a stylesheet', made, fifo)) {
+    H.removeProject(root);
+    return;
+  }
+  const driver = `
+    const WS = require(${JSON.stringify(path.resolve(__dirname, '..', 'electron', 'whitespaceRules.js'))});
+    WS.forgetCache();
+    process.stdout.write(JSON.stringify([...WS.preservingTokens(${JSON.stringify(root)})]));
+  `;
+  let answered = null;
+  let threw = null;
+  try {
+    answered = execFileSync(process.execPath, ['-e', driver], {
+      timeout: 8000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (err) {
+    threw = err?.signal || err?.code || String(err);
+  } finally {
+    H.removeProject(root);
+  }
+  if (
+    !check(
+      '[not-a-file] the scan answers at all rather than blocking the main process',
+      threw === null,
+      short({ threw })
+    )
+  ) {
+    return;
+  }
+  let tokens = null;
+  try {
+    tokens = JSON.parse(answered);
+  } catch {
+    tokens = null;
+  }
+  check(
+    '[not-a-file] and an entry it cannot account for contributes ANY',
+    Array.isArray(tokens) && tokens.includes('*'),
+    short({ answered })
+  );
+}
+
+/**
+ * T14 -- the readback gate throwing the CORRECT bytes away.
+ *
+ * The relaxation was `run === want || run.replace(/\s+/g, ' ') === want`, which
+ * collapses the WHOLE rendered run rather than only where the two texts differ.
+ * So the moment a `<pre>` run held whitespace BOTH texts preserved -- a
+ * multi-line value inside `<code>` -- the collapse could never equal `want`,
+ * the gate refused, and `anchoredSerialize` returned `canonical`: the text that
+ * had deleted a rendered newline. Refusing is normally the safe direction; here
+ * the refusal's fallback IS the damage.
+ *
+ * PREMISES FIRST: the reprint really does lose the newline this file has, so a
+ * pass below cannot be the two answers agreeing.
+ */
+function theRunTheReprintCollapsed() {
+  const label = '[readback]';
+  const body = `  <pre>\n<code>alpha\n  beta</code>\n<span class='tail'>tail</span>\n</pre>\n`;
+  const source = commentedPage(body);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const pre = model.nodes[0].children.find((n) => n.name === 'pre');
+  const span = pre?.children?.find((n) => n.name === 'span');
+  const word = span?.children?.find((n) => n.kind === 'text');
+  if (!check(`${label} the word a plain text edit lands on is there`, !!word, short(pre?.children?.map((n) => n.name)))) return;
+  word.value = 'TAIL';
+  delete word.source;
+
+  const canonical = serializePage(model);
+  const runOf = (text) => {
+    const hit = /<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/.exec(text);
+    return hit ? hit[1] : null;
+  };
+  // PREMISE: the whole-document reprint really is the damaged text here.
+  if (
+    !check(
+      `${label} the reprint really does delete the newlines this file holds`,
+      runOf(canonical) === `<code>alpha beta</code> <span class='tail'>TAIL</span>`,
+      short({ got: runOf(canonical) })
+    )
+  ) {
+    return;
+  }
+  const after = anchoredSerialize(source, model);
+  check(
+    `${label} a run whose whitespace BOTH texts preserved does not refuse the splice`,
+    after !== canonical,
+    short({ span: changedSpan(canonical, after) })
+  );
+  check(
+    `${label} and the file keeps every rendered byte the edit did not name`,
+    after === commentedPage(`  <pre>\n<code>alpha\n  beta</code>\n<span class='tail'>TAIL</span>\n</pre>\n`),
+    short({ span: changedSpan(source, after) })
+  );
+}
+
+/**
+ * T15 -- `replaceNodeSplice` reprinting a preserving element from the model.
+ *
+ * When the node whose span is replaced is ITSELF preserving, reprinting its
+ * subtree writes back a `<pre>` whose inter-element newlines the model no
+ * longer holds -- `parsePage` collapses them into a text node's `value` and
+ * parks the bytes in an as-written cache the printer does not read. Measured on
+ * a reorder of two `<span>`s inside a `<pre>` written across lines: the whole
+ * block came back on ONE LINE, THE SPLICE wrote it (there was no fallback), and
+ * the readback gate passed it because `canonical` had collapsed the same run
+ * the same way. `printNode` has four guards for this; this branch had none, and
+ * its comment declines to consult `ctx.preserving` -- which is right, and is
+ * about a TWIN being the wrong node rather than about the node itself.
+ *
+ * THE ORACLE IS THE WHOLE FILE, byte for byte, because the fallback here is
+ * equally damaged: an oracle that only asked "is this not the reprint" would
+ * pass on the reprint's own bytes arriving by another road.
+ */
+function theReorderInsideAPre() {
+  const label = '[reorder in pre]';
+  const body = `  <pre>\n<span class='a'>alpha\n  beta</span>\n<span class='b'>tail</span>\n</pre>\n`;
+  const source = commentedPage(body);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const pre = model.nodes[0].children.find((n) => n.name === 'pre');
+  const kids = pre?.children || [];
+  const at = (cls) => kids.findIndex((n) => n.props?.class?.value === cls);
+  const ia = at('a');
+  const ib = at('b');
+  if (!check(`${label} both spans are where a reorder can reach them`, ia >= 0 && ib >= 0, short(kids.map((n) => n.name)))) return;
+  const swap = kids[ia];
+  kids[ia] = kids[ib];
+  kids[ib] = swap;
+
+  const canonical = serializePage(model);
+  // PREMISE: the reprint is not the answer here either, so "not the reprint"
+  // would be a weaker oracle than the bytes.
+  check(
+    `${label} the whole-document reprint collapses the block onto one line`,
+    /<pre>[^\n]*<\/pre>/.test(canonical),
+    short({ got: /<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/.exec(canonical)?.[1] })
+  );
+  const after = anchoredSerialize(source, model);
+  check(
+    `${label} the two spans really did swap`,
+    /<span class='b'>tail<\/span>[\s\S]*<span class='a'>alpha/.test(after),
+    short({ span: changedSpan(source, after) })
+  );
+  check(
+    `${label} and every gap the file wrote is still in it, byte for byte`,
+    after === commentedPage(`  <pre>\n<span class='b'>tail</span>\n<span class='a'>alpha\n  beta</span>\n</pre>\n`),
+    short({ span: changedSpan(source, after) })
+  );
+}
+
+/**
+ * T16 -- the stamp for a stylesheet the caller hands in.
+ *
+ * `knownTextOf` exists so `page:write` need not re-read the page it is about to
+ * write, and the file it hands in is stamped by what this scan READS of it. For
+ * a page that is its `<style>` blocks; for a `.css` path it is the whole text
+ * -- and the stamp asked for `<style>` blocks whatever the path was, which for
+ * a stylesheet are ALWAYS none. Every possible text of that file therefore
+ * produced the SAME stamp, so the cache would have served the first answer for
+ * ever. Not reachable from the single call site today; the documented contract
+ * ("the caller hands in the text it already read") is an invitation to reach
+ * it, and this is the assertion that it cannot be reached.
+ */
+function theStampForAStylesheetHandedIn() {
+  const root = H.makeProject({});
+  const abs = path.join(root, 'src', 'styles', 'site.css');
+  fs.writeFileSync(abs, '.card { color: red }\n', 'utf8');
+  WS.forgetCache();
+  const first = [...WS.preservingTokens(root, { knownText: { [abs]: '.card { color: red }\n' } })];
+  const second = [...WS.preservingTokens(root, { knownText: { [abs]: '.preserved { white-space: pre }\n' } })];
+  H.removeProject(root);
+  check(
+    '[stamp] a stylesheet handed in with no preserving rule contributes nothing',
+    !first.includes('.preserved'),
+    short(first)
+  );
+  check(
+    '[stamp] and a DIFFERENT text for the same .css path is a cache miss, not the first answer again',
+    second.includes('.preserved'),
+    short(second)
+  );
+}
+
 (async () => {
   for (const f of FIXTURES) await runFixture(f);
   importInsert();
@@ -2532,6 +2890,12 @@ function aDescendantThatDeclaresIt() {
   aDescendantThatDeclaresIt();
   theSelectorReducer();
   theWalkThatCameBackShort();
+  theTokenThatNamesEveryDiv();
+  theStylesheetBehindASymlink();
+  theEntryThatIsNotAFile();
+  theRunTheReprintCollapsed();
+  theReorderInsideAPre();
+  theStampForAStylesheetHandedIn();
   for (const shape of [
     { id: 'two-space', ind: '  ', eol: '\n' },
     { id: 'tabs', ind: '\t', eol: '\n' },
@@ -2553,11 +2917,13 @@ function aDescendantThatDeclaresIt() {
 
   if (failures.length) {
     console.error(`source-fidelity-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
+    suiteDone();
     process.exit(1);
   }
   console.log(
     `source-fidelity-matrix: ${checked} passed  [every operation changes only the bytes it means to, in five differently-written files]`
   );
+  suiteDone();
 })().catch((err) => {
   console.error('source-fidelity-matrix: threw\n', err?.stack || err);
   process.exit(1);

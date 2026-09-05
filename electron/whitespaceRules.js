@@ -24,9 +24,10 @@
 // rather than implied, because "every failure also contributes ANY" was written
 // here while one of them did the opposite: a file that will not read, a
 // DIRECTORY that will not list, a stylesheet postcss will not parse, one too
-// big to be worth reading, and a walk that hit its depth cap. Being wrong in
-// that direction costs an element its reindentation, which is cosmetic. Being
-// wrong the other way deletes bytes the page shows.
+// big to be worth reading, a walk that hit its depth cap, a symlink that will
+// not resolve, and an entry with a stylesheet's NAME that is not a regular file
+// at all. Being wrong in that direction costs an element its reindentation,
+// which is cosmetic. Being wrong the other way deletes bytes the page shows.
 //
 // AND ANY IS NOT "EVERY ELEMENT PRESERVES ITS WHITESPACE". THE SENTINEL DAMAGED
 // LAYOUT WHILE IT WAS READ THAT WAY. "We cannot prove a reindent here is safe"
@@ -226,6 +227,25 @@ function styleBlocksIn(text) {
 }
 
 /**
+ * The only parts of one file this scan actually looks at.
+ *
+ * A `.css` file IS the stylesheet; anything else contributes its `<style>`
+ * blocks and nothing more. Said once, because the cache stamp below and the
+ * reducer below that have to agree about it: while the stamp asked for the
+ * `<style>` blocks of every file, a `.css` path handed in as `knownText` was
+ * stamped by the blocks of a stylesheet, which are ALWAYS none -- so every
+ * possible text of that file produced the same stamp and the cache would have
+ * served the first answer for ever.
+ */
+function readableTexts(abs, text) {
+  return /\.css$/i.test(abs) ? [text] : styleBlocksIn(text);
+}
+
+// A path that is not there is a fact about the project; anything else is a part
+// of it nobody could look at.
+const MISSING = (err) => !!err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
+
+/**
  * Every file whose text could hold a rule, and whether the walk saw all of it.
  *
  * ITS OWN WALK, NOT `cssVars.findStylesheets`. That one answers a question
@@ -243,6 +263,35 @@ function styleBlocksIn(text) {
  * with no `public/` is a fact, not a failure, and only an error that is neither
  * ENOENT nor ENOTDIR says part of the tree was unreadable.
  *
+ * AND A `Dirent` ANSWERS ABOUT THE LINK, NOT ABOUT WHAT IT POINTS AT.
+ * `isDirectory()` is FALSE for a symlink to a directory, so `src/styles ->
+ * ../../packages/ui/styles` -- the ordinary monorepo shape -- was neither
+ * walked nor counted: measured, a real directory answered `['.preserved']` and
+ * the identical stylesheet behind a symlinked one answered `[]`, with `failed`
+ * still false, and two rendered spaces were then deleted. That is the same `[]`
+ * and the same damage the unreadable-directory case above was written for, with
+ * no error anywhere. So a symlink is resolved -- with `statSync`, which follows
+ * it -- and classified by what it resolves to, and the same rule then covers
+ * the FILE symlinks the walk was already reading through, which is the
+ * consistency the two halves used not to have. A link that resolves to nothing
+ * is ENOENT and is skipped like a directory that is not there; a link that will
+ * not resolve for any other reason (a loop, a permission) is a part of the tree
+ * nobody looked at, and contributes ANY.
+ *
+ * Following links means the same directory can be reached twice, and a link
+ * pointing at its own ancestor can be reached for ever, so each directory is
+ * walked once, keyed on its resolved path.
+ *
+ * AND AN ENTRY WITH A STYLESHEET'S NAME THAT IS NOT A FILE. The walk classified
+ * with `isDirectory()` and an `else`, so anything else whose name matched --
+ * a FIFO, a socket, a device -- was added to the list. `preservingTokens` runs
+ * SYNCHRONOUSLY on the Electron main process inside `page:write`, and
+ * `statSync` reports a FIFO's size as 0, so the size gate did not fire and
+ * `readFileSync` blocked FOREVER: measured, `mkfifo site.css` in a project made
+ * the whole app hang, no repaint, no IPC, the write neither completing nor
+ * refusing. Only a regular file is read; anything else with a matching name is
+ * something this scan cannot account for, so it contributes ANY.
+ *
  * THE WHOLE PROJECT, not `src` plus the three stylesheet roots. Whose
  * stylesheet a page actually imports is a question about module resolution, and
  * answering it wrongly is the one direction that loses bytes -- measured, an
@@ -254,24 +303,46 @@ function styleBlocksIn(text) {
 function sourcesOf(projectPath) {
   const files = [];
   let failed = false;
+  const walked = new Set();
   const walk = (dir, depth) => {
     if (depth > MAX_DEPTH) {
       failed = true;
       return;
     }
+    // Keyed on the resolved path so a link and its target, or two links to one
+    // shared directory, are one directory. A path that will not resolve is left
+    // to `readdirSync` below, which reports the same failure in one place.
+    try {
+      const real = fs.realpathSync(dir);
+      if (walked.has(real)) return;
+      walked.add(real);
+    } catch {
+      /* handled by the read below */
+    }
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (err) {
-      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) return;
+      if (MISSING(err)) return;
       failed = true;
       return;
     }
     for (const entry of entries) {
       if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full, depth + 1);
-      else if (SOURCE_FILE.test(entry.name)) files.push(full);
+      let what = entry;
+      if (entry.isSymbolicLink()) {
+        try {
+          what = fs.statSync(full);
+        } catch (err) {
+          if (!MISSING(err)) failed = true;
+          continue;
+        }
+      }
+      if (what.isDirectory()) walk(full, depth + 1);
+      else if (!SOURCE_FILE.test(entry.name)) continue;
+      else if (what.isFile()) files.push(full);
+      else failed = true;
     }
   };
   walk(projectPath, 0);
@@ -302,9 +373,9 @@ const hash = (text) => crypto.createHash('sha1').update(text, 'utf8').digest('he
  * Dropping the page from the scan is not the fix: its own `<style>` block
  * styles its own elements, and losing those rules is the byte-losing
  * direction. So the caller hands in the text it already read, and that file is
- * stamped by the HASH OF ITS `<style>` BLOCKS instead of by size and mtime --
- * the only part of it this scan reads. A save that leaves the style block alone
- * therefore hits the cache, and one that edits it still misses.
+ * stamped by the HASH OF WHAT THIS SCAN READS OF IT (`readableTexts`) instead
+ * of by size and mtime. A save that leaves the style block alone therefore hits
+ * the cache, and one that edits it still misses.
  */
 function knownTextOf(known, abs) {
   if (!known) return null;
@@ -317,7 +388,7 @@ function stampOf(files, known) {
   for (const abs of files) {
     const text = knownTextOf(known, abs);
     if (text !== null) {
-      parts.push(`${abs}:style:${hash(JSON.stringify(styleBlocksIn(text)))}`);
+      parts.push(`${abs}:text:${hash(JSON.stringify(readableTexts(abs, text)))}`);
       continue;
     }
     try {
@@ -386,8 +457,9 @@ function preservingTokens(projectPath, options = {}) {
         continue;
       }
     }
-    const texts = /\.css$/i.test(abs) ? [text] : styleBlocksIn(text);
-    for (const one of texts) for (const token of tokensInCss(one)) tokens.add(token);
+    for (const one of readableTexts(abs, text)) {
+      for (const token of tokensInCss(one)) tokens.add(token);
+    }
   }
   cached = { stamp, tokens };
   return tokens;
