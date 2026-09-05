@@ -27,6 +27,11 @@ const { guardSuite } = require('./support/suiteGuard.js');
 // joining strings here: a spelling this file agrees with but resolveInProject
 // refuses is exactly the failure that field exists to close.
 const { resolveInProject } = require('../electron/mcp/agent/paths.js');
+// The shaping layer a client actually reads. Two of the refusals below are
+// wrong in the SENTENCE rather than in the code, and the sentence an agent gets
+// is composed here and not in gitBranches.js — so the answers are put through
+// the real mapper rather than being asserted only where they were minted.
+const { DOMAINS } = require('../electron/mcp/agent/domains.js');
 
 const failures = [];
 let checked = 0;
@@ -2949,6 +2954,309 @@ async function suite() {
     check('T25 control: and answering it from that same detached HEAD still merges', settledSolo?.ok === true, JSON.stringify(settledSolo).slice(0, 240));
     check('T25 control:   as a two-parent commit', (await sh(solo, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(solo, 'log', '-1', '--format=%P'));
     check('T25 control:   taking the side that was asked for', /TOP-feat/.test(String(textOf(path.join(solo, 'a.txt')))), JSON.stringify(textOf(path.join(solo, 'a.txt'))));
+  }
+
+  {
+    // T26 — THE UNWIND NEVER LOOKED WHERE THE DAMAGE IS.
+    //
+    // T23 gave the failed unwind a name, and measured it in the one shape
+    // where the INDEX still shows the trouble: MERGE_HEAD gone, unmerged
+    // entries left. Its own docstring names the other half of that scenario —
+    // "a second git process, a crash, or an editor plugin's own merge --abort"
+    // — and nothing ever measured it. A plain `git reset` (mixed) is exactly
+    // that shape: MERGE_HEAD and the index stages both go, and the WORKING
+    // TREE keeps every byte the trial merge wrote.
+    //
+    // Every index-side signal then says "it unwound". `unmergedPaths` answers
+    // [], `rev-parse -q --verify MERGE_HEAD` exits 1 with EMPTY stderr because
+    // of the -q, so `midMerge` returned null and `abort` answered "nothing to
+    // abort, and nothing left behind". MEASURED 3/3 before the fix, with no
+    // stubs anywhere:
+    //
+    //   bad_choices     "Nothing was merged: 1 of the choices could not be
+    //                   used…" over an a.txt holding `<<<<<<< HEAD … |||||||
+    //                   … ======= … >>>>>>> feature`
+    //   digest mismatch `stale_merge`, "…Nothing was merged and "main" is
+    //                   exactly as it was."
+    //   clean re-merge  the same sentence, over an a.txt holding
+    //                   "OURS\nkeep\nTHEIRS\nkeep\n" — bytes NEITHER BRANCH HAS
+    //
+    // HEAD really was unmoved every time, so the half of the claim that was
+    // being checked was true and the half about the tree was not. Stacki
+    // parses that file as markup a moment later.
+    //
+    // NOTHING BELOW IS FAKED. One ordinary `git reset` runs at the moment
+    // resolveMerge fires `merge --abort`; the real abort then runs and fails
+    // on its own, and every other call goes straight to the real runner.
+    const seed = async (name, extra) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, 'other.txt'), 'shared\n');
+      if (extra) fs.writeFileSync(path.join(dir, extra), 'base\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'a file neither branch touches');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'THEIRS\nkeep\n');
+      if (extra) fs.writeFileSync(path.join(dir, extra), 'THEIRS\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'feature');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'OURS\nkeep\n');
+      if (extra) fs.writeFileSync(path.join(dir, extra), 'OURS\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'main');
+      return dir;
+    };
+    /** A runner that loses the merge out from under the abort, the way a second git process does. */
+    const resetting = (dir) => {
+      let resets = 0;
+      const runner = async (cwd, args) => {
+        if (args[0] === 'merge' && args[1] === '--abort') {
+          resets += 1;
+          await git(dir, ['reset', '-q']);
+        }
+        return git(cwd, args);
+      };
+      runner.resets = () => resets;
+      return runner;
+    };
+    /**
+     * What a refusal over a tree that did not come back has to say.
+     *
+     * `onDisk` is the oracle for the bytes actually left there, so each case
+     * proves its own damage rather than sharing one.
+     */
+    const leftBehind = async (what, dir, answer, head, files, onDisk) => {
+      check(`${what}: does not throw`, answer.error === null, String(answer.error));
+      const r = answer.value;
+      // THE PREMISE, MEASURED. Without these three the assertions below could
+      // pass over a tree that unwound perfectly well.
+      check(`${what}: the trial merge really is still in the tree`, (await sh(dir, 'status', '--porcelain')) !== '', await sh(dir, 'status', '--porcelain'));
+      check(`${what}:   holding what it wrote`, onDisk(String(textOf(path.join(dir, 'a.txt')))), JSON.stringify(textOf(path.join(dir, 'a.txt'))));
+      check(
+        `${what}:   and NOTHING on the index side left to notice it`,
+        (await sh(dir, 'ls-files', '-u')) === '' && !fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')),
+        `${await sh(dir, 'ls-files', '-u')} | MERGE_HEAD ${fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD'))}`
+      );
+      check(`${what}: HEAD did not move`, (await sh(dir, 'rev-parse', 'HEAD')) === head, `${head} -> ${await sh(dir, 'rev-parse', 'HEAD')}`);
+      // WHAT IT MUST NOT SAY over that tree.
+      check(`${what}: it does not claim nothing was merged`, !/nothing was merged/i.test(String(r?.message || '')), String(r?.message));
+      check(`${what}: nor that the branch is exactly as it was`, !/exactly as it was/i.test(String(r?.message || '')), String(r?.message));
+      // WHAT IT DOES SAY.
+      check(`${what}: it is refused as merge_stuck`, r?.ok === false && r?.code === 'merge_stuck', JSON.stringify({ ok: r?.ok, code: r?.code }));
+      check(`${what}:   saying no merge is in progress`, r?.mergeInProgress === false, JSON.stringify({ mergeInProgress: r?.mergeInProgress }));
+      check(`${what}:   naming every path left different`, JSON.stringify(r?.files) === JSON.stringify(files), JSON.stringify(r?.files));
+      // AND THE REMEDY IS THE ONE THAT WORKS. `git merge --abort` is what the
+      // other shape of this refusal says to run, and here it answers "there is
+      // no merge to abort" and leaves the person no further forward.
+      check(`${what}:   that merge --abort will not clear it`, /`git merge --abort` will not clear this/.test(String(r?.message || '')), String(r?.message));
+      check(`${what}:   and something that will`, /git checkout HEAD --/.test(String(r?.message || '')), String(r?.message));
+    };
+
+    // (1) THE REFUSAL ABOUT THE CHOICES.
+    {
+      const dir = await seed('treebad');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T26: the fixture conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 160));
+      const head = await sh(dir, 'rev-parse', 'HEAD');
+      const runner = resetting(dir);
+      const answer = await caught(() =>
+        resolveMerge(runner, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'sideways' }, expect: clash.at })
+      );
+      check('T26: the unwind was attempted exactly once', runner.resets() === 1, String(runner.resets()));
+      await leftBehind('T26 a bad choice over a tree that did not come back', dir, answer, head, ['a.txt'], (text) => /^<<<<<<< /m.test(text));
+      // AND IT REACHES A CLIENT AS THIS REFUSAL, not as the choices one. The
+      // resolve mapper rewrites anything carrying `badChoices`, and this must
+      // not be carrying any.
+      const mapped = await DOMAINS.git.resolve_merge.result(answer.value, { branch: 'feature' }, { root: dir });
+      check('T26:   and the MCP mapper passes it through as merge_stuck', mapped?.code === 'merge_stuck', JSON.stringify({ code: mapped?.code }));
+      check('T26:   with the paths and the shape intact', JSON.stringify(mapped?.files) === '["a.txt"]' && mapped?.mergeInProgress === false, JSON.stringify({ files: mapped?.files, mergeInProgress: mapped?.mergeInProgress }));
+    }
+
+    // (2) THE REFUSAL ABOUT THE CONFLICT HAVING MOVED. `b.txt` clashed when the
+    // caller was shown it and is union-merged now, so the digest is a
+    // different one and the answer is `stale_merge` — over a tree holding the
+    // markers of the clash that IS still there.
+    {
+      const dir = await seed('treedigest', 'b.txt');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T26: the two-file fixture conflicts in both', clash.files?.length === 2, JSON.stringify(clash.files?.map((f) => f.path)));
+      const head = await sh(dir, 'rev-parse', 'HEAD');
+      fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), 'b.txt merge=union\n');
+      const answer = await caught(() =>
+        resolveMerge(resetting(dir), { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours', 'b.txt': 'ours' }, expect: clash.at })
+      );
+      await leftBehind('T26 a conflict that moved, over a tree that did not come back', dir, answer, head, ['a.txt', 'b.txt'], (text) => /^<<<<<<< /m.test(text));
+      check('T26:   and b.txt holds the union nobody asked for', textOf(path.join(dir, 'b.txt')) === 'OURS\nTHEIRS\n', JSON.stringify(textOf(path.join(dir, 'b.txt'))));
+    }
+
+    // (3) THE REFUSAL ABOUT THERE BEING NO CONFLICT LEFT. This one is the
+    // worst of the three: the re-merge went through CLEANLY, so the file on
+    // disk holds neither branch's version — the union driver's own bytes — and
+    // the answer said "main" is exactly as it was.
+    {
+      const dir = await seed('treeclean');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const head = await sh(dir, 'rev-parse', 'HEAD');
+      fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '*.txt merge=union\n');
+      const answer = await caught(() =>
+        resolveMerge(resetting(dir), { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at })
+      );
+      await leftBehind(
+        'T26 a re-merge that went clean, over a tree that did not come back',
+        dir,
+        answer,
+        head,
+        ['a.txt'],
+        (text) => text === 'OURS\nkeep\nTHEIRS\nkeep\n'
+      );
+      check(
+        'T26:   and those bytes are on neither branch',
+        (await sh(dir, 'show', 'main:a.txt')) !== 'OURS\nkeep\nTHEIRS\nkeep' && (await sh(dir, 'show', 'feature:a.txt')) !== 'OURS\nkeep\nTHEIRS\nkeep',
+        `${await sh(dir, 'show', 'main:a.txt')} | ${await sh(dir, 'show', 'feature:a.txt')}`
+      );
+    }
+
+    // THE CONTROL, AND IT IS THE ONE A CHECK LIKE THIS GETS WRONG. A caller
+    // may have unrelated uncommitted work open, and a tree check that reads
+    // "dirty" as "damaged" would refuse every resolve on a working project.
+    // The same bad choice, with a working abort and a modified file and an
+    // untracked file sitting in the tree, is still the ordinary refusal — and
+    // both files come out byte for byte.
+    {
+      const dir = await seed('treecontrol');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      fs.writeFileSync(path.join(dir, 'other.txt'), 'edited and not committed\n');
+      fs.writeFileSync(path.join(dir, 'notes.txt'), 'untracked\n');
+      const before = await repoState(dir);
+      check('T26 control: the tree really is dirty before the call', before.status !== '', JSON.stringify(before.status));
+      const bad = await caught(() =>
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'sideways' }, expect: clash.at })
+      );
+      check('T26 control: a bad choice over unrelated dirty work is still bad_choices', bad.value?.code === 'bad_choices', JSON.stringify({ code: bad.value?.code, message: bad.value?.message }).slice(0, 300));
+      check('T26 control:   and it still says nothing was merged', /nothing was merged/i.test(String(bad.value?.message || '')), String(bad.value?.message));
+      const after = await repoState(dir);
+      check('T26 control:   HEAD did not move', after.head === before.head, `${before.head} -> ${after.head}`);
+      check('T26 control:   the unrelated edit survived', textOf(path.join(dir, 'other.txt')) === 'edited and not committed\n', JSON.stringify(textOf(path.join(dir, 'other.txt'))));
+      check('T26 control:   the untracked file survived', textOf(path.join(dir, 'notes.txt')) === 'untracked\n', JSON.stringify(textOf(path.join(dir, 'notes.txt'))));
+      check('T26 control:   and not one byte anywhere else moved', Object.keys({ ...before.bytes, ...after.bytes }).filter((f) => before.bytes[f] !== after.bytes[f]).length === 0, Object.keys(after.bytes).join(', '));
+      // AND THE SAME UNRELATED WORK DOES NOT STOP A GOOD ANSWER MERGING. A
+      // check that refused everything would pass every assertion above.
+      const good = await caught(() =>
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at })
+      );
+      check('T26 control: and the same answers still merge with that work open', good.value?.ok === true && good.value?.resolved === 1, JSON.stringify(good.value).slice(0, 240));
+      check('T26 control:   as a two-parent commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(dir, 'log', '-1', '--format=%P'));
+      check('T26 control:   with the unrelated edit still open', textOf(path.join(dir, 'other.txt')) === 'edited and not committed\n', JSON.stringify(textOf(path.join(dir, 'other.txt'))));
+    }
+  }
+
+  {
+    // T27 — A CONFLICT THE VOCABULARY CANNOT EXPRESS, ANSWERED AS THOUGH THE
+    // CALLER HAD PICKED THE WRONG SIDE.
+    //
+    // Both branches rename the same file to different names. Git's conflict
+    // then includes the ORIGINAL name carrying stage 1 and nothing else — the
+    // base, with neither branch's own version registered under it — beside the
+    // two new names. MEASURED, git 2.50.1: `ls-files -u` gives `orig.txt`
+    // stage 1 alone, `sidesOf` answers [], and the default `ours` was refused
+    // as `no_such_side` with `sides: []` and `deletedBy: "ours"`, saying
+    // `"orig.txt" exists on only one branch here — the other deleted it`. On
+    // the MCP surface it read `"orig.txt" was deleted on the current branch`.
+    // Three claims and all three false: it is on both branches, under two
+    // names, and nobody deleted anything.
+    //
+    // Refusing is still right — the default is `git checkout --ours` and that
+    // dies on `does not have our version` — but there is no other word to send
+    // the caller back to try. "ours" and "theirs" both name a version to KEEP
+    // and this path has neither.
+    const dir = await repo('renamerename');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'orig.txt'), 'one\ntwo\nthree\nfour\nfive\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'a file both branches will move');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    await sh(dir, 'mv', 'orig.txt', 'theirs.txt');
+    await sh(dir, 'commit', '-qm', 'renamed on feature');
+    await sh(dir, 'checkout', '-q', 'main');
+    await sh(dir, 'mv', 'orig.txt', 'ours.txt');
+    await sh(dir, 'commit', '-qm', 'renamed on main');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T27: the fixture conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    check(
+      'T27: over the original name as well as the two new ones',
+      JSON.stringify((clash.files || []).map((f) => f.path).sort()) === JSON.stringify(['orig.txt', 'ours.txt', 'theirs.txt']),
+      JSON.stringify((clash.files || []).map((f) => f.path))
+    );
+    // THE SHAPE THIS IS ABOUT, read out of git's own report rather than
+    // assumed: the original name has neither side, while the two new names
+    // have one each. (The index cannot be inspected here — mergeBranch unwinds
+    // the merge before it answers — so this is the observation that survives.)
+    const sidesReported = (p) => (clash.files || []).find((f) => f.path === p) || {};
+    check('T27: git offers neither side under the original name', sidesReported('orig.txt').ours === null && sidesReported('orig.txt').theirs === null, JSON.stringify(sidesReported('orig.txt')));
+    check('T27:   while each new name has exactly one', sidesReported('ours.txt').ours !== null && sidesReported('ours.txt').theirs === null && sidesReported('theirs.txt').theirs !== null && sidesReported('theirs.txt').ours === null, JSON.stringify([sidesReported('ours.txt'), sidesReported('theirs.txt')]));
+
+    const before = await repoState(dir);
+    const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: {}, expect: clash.at }));
+    check('T27: the resolve does not throw', answer.error === null, String(answer.error));
+    await refusedCleanly(
+      'T27 a rename/rename answered by leaving it out',
+      answer.value,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r?.badChoices?.[0]?.path === 'orig.txt' && r?.badChoices?.[0]?.reason === 'no_sides'
+    );
+    const first = answer.value?.badChoices?.[0];
+    check('T27:   with no side to offer', JSON.stringify(first?.sides) === '[]' && JSON.stringify(first?.expected) === '[]', JSON.stringify(first));
+    // AND NO CULPRIT NAMED, because there is not one. `deletedBy` is what the
+    // MCP sentence turns into "deleted on the current branch".
+    check('T27:   and nobody named as having deleted it', !('deletedBy' in (first || {})), JSON.stringify(first));
+    check('T27: the sentence does not say it was deleted', !/delet/i.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T27: nor that it exists on only one branch', !/only one branch/i.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T27: it says the file has neither side', /has no "ours" and no "theirs"/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T27:   and that renaming on both branches is what does this', /renaming or moving the same file/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T27:   and what to do instead', /by hand/.test(String(answer.value?.message || '')), String(answer.value?.message));
+
+    // NAMING THE SIDE EXPLICITLY IS THE SAME ANSWER. There is no word that
+    // works, so a caller that spells one out is told the same thing rather
+    // than being sent round again.
+    const named = await caught(() =>
+      resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'orig.txt': 'theirs', 'ours.txt': 'ours', 'theirs.txt': 'theirs' }, expect: clash.at })
+    );
+    check('T27: naming a side explicitly is refused the same way', named.value?.badChoices?.[0]?.reason === 'no_sides' && named.value?.badChoices?.[0]?.path === 'orig.txt', JSON.stringify(named.value?.badChoices));
+
+    // AND WHAT A CLIENT IS TOLD, which is where the false sentence actually
+    // reached an agent.
+    const mapped = await DOMAINS.git.resolve_merge.result(answer.value, { branch: 'feature' }, { root: dir });
+    check('T27 MCP: still bad_choices', mapped?.code === 'bad_choices', JSON.stringify({ code: mapped?.code }));
+    check('T27 MCP: and it no longer says the file was deleted on a branch', !/was deleted on the/i.test(String(mapped?.message || '')), String(mapped?.message));
+    check('T27 MCP: it says there is no side to choose', /has no "ours" and no "theirs"/.test(String(mapped?.message || '')), String(mapped?.message));
+    check('T27 MCP: and that this merge cannot be finished through resolve_merge', /cannot be finished through resolve_merge/.test(String(mapped?.message || '')), String(mapped?.message));
+
+    // THE CONTROL, on the same repository: a genuine modify/delete still gets
+    // the one-sided sentence, so the two shapes are told apart rather than
+    // both being answered with the new one.
+    const md = await repo('modifydelete');
+    cleanup.push(md);
+    await sh(md, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(md, 'a.txt'), 'EDITED\n');
+    await sh(md, 'add', '-A');
+    await sh(md, 'commit', '-qm', 'edited on feature');
+    await sh(md, 'checkout', '-q', 'main');
+    await sh(md, 'rm', '-q', 'a.txt');
+    await sh(md, 'commit', '-qm', 'deleted on main');
+    const mdClash = await mergeBranch(git, { projectPath: md, branch: 'feature' });
+    check('T27 control: the modify/delete fixture conflicts', mdClash.ok === false && mdClash.conflicted === true, JSON.stringify(mdClash).slice(0, 160));
+    const mdAnswer = await caught(() => resolveMerge(git, { projectPath: md, branch: 'feature', choices: {}, expect: mdClash.at }));
+    check('T27 control: a file with one side is still no_such_side', mdAnswer.value?.badChoices?.[0]?.reason === 'no_such_side', JSON.stringify(mdAnswer.value?.badChoices));
+    check('T27 control:   naming the side it does have', JSON.stringify(mdAnswer.value?.badChoices?.[0]?.sides) === '["theirs"]', JSON.stringify(mdAnswer.value?.badChoices?.[0]));
+    check('T27 control:   and still saying the other branch deleted it', /the other deleted it/.test(String(mdAnswer.value?.message || '')), String(mdAnswer.value?.message));
+    const mdMapped = await DOMAINS.git.resolve_merge.result(mdAnswer.value, { branch: 'feature' }, { root: md });
+    check('T27 control MCP: still says which branch deleted it', /was deleted on the current branch/.test(String(mdMapped?.message || '')), String(mdMapped?.message));
   }
 
 }

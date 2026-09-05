@@ -506,16 +506,99 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       return String(err?.stderr || '').trim() ? [] : null;
     }
   };
+  /**
+   * THE WORKING TREE, WHICH IS WHERE THE DAMAGE IS AND THE ONE PLACE THE
+   * UNWIND NEVER LOOKED.
+   *
+   * `midMerge` above asks the INDEX and the metadata: unmerged entries, or a
+   * MERGE_HEAD git is still holding. Its own docstring names the scenario it
+   * was written for — MERGE_HEAD removed between the merge and the abort by a
+   * second git process, a crash, or an editor plugin's own `merge --abort` —
+   * and it was only ever measured for the half of that scenario where the
+   * unmerged ENTRIES survive. A plain `git reset` (mixed) clears MERGE_HEAD
+   * AND the stages while leaving the working tree exactly as the trial merge
+   * wrote it, and that is the blind spot: `unmergedPaths` answers [],
+   * `rev-parse -q --verify MERGE_HEAD` exits 1 with EMPTY stderr because of
+   * the -q, so `midMerge` read "it unwound" and `abort` answered "nothing to
+   * abort, and nothing left behind".
+   *
+   * MEASURED 3/3, no stubs, the only extra thing being one ordinary `git
+   * reset` run at the moment `merge --abort` would have run:
+   *
+   *   bad_choices    "Nothing was merged: 1 of the choices could not be
+   *                  used…" while a.txt on disk held `<<<<<<< HEAD … |||||||
+   *                  … ======= … >>>>>>> feature`
+   *   unknown_path   the same sentence over the same file
+   *   clean re-merge `stale_merge`, "…Nothing was merged and "main" is exactly
+   *                  as it was.", while a.txt held "OURS\nkeep\nTHEIRS\nkeep\n"
+   *                  — bytes NEITHER BRANCH HAS
+   *
+   * HEAD really was unmoved in all three, so the half of the claim this file
+   * already checked was true and the half about the tree was not. Stacki
+   * parses that file as markup a moment later.
+   *
+   * WHAT IS COMPARED, AND THE FALSE POSITIVE IT IS SHAPED AROUND. A caller may
+   * legitimately have unrelated uncommitted work open, and refusing because of
+   * THAT would be a new defect worse than the one being fixed. So this is a
+   * difference between two readings, not a dirtiness test: `diff --name-only
+   * HEAD` names the paths whose WORKING TREE bytes differ from the commit HEAD
+   * is on and `ls-files --others` adds the ones git is not tracking; both are
+   * read once before the trial merge and once after the unwind, and a path in
+   * both readings is the caller's own business. MEASURED with an unrelated
+   * modified file and an untracked file in the tree: the ordinary refusal is
+   * still `bad_choices`, both files survive byte for byte, and the same
+   * answers still merge.
+   *
+   * `diff HEAD` rather than `status` because status splits its answer between
+   * the index and the tree, and this claim is about the tree — the file Stacki
+   * is about to parse as markup.
+   *
+   * The same path-space pins as everywhere else in this file: `diff.relative`
+   * is an ordinary user config and is pinned for the invocation, `--full-name`
+   * with a cwd of the repository root stops `ls-files` answering about the
+   * project only, and -z means these names are spelled the way every other
+   * list in this refusal is.
+   */
+  const treeNow = async () => {
+    try {
+      const changed = conflictedPaths(
+        (await git(at, ['-c', 'diff.relative=false', 'diff', '--name-only', '-z', 'HEAD'])).stdout
+      );
+      const untracked = conflictedPaths(
+        (await git(at, ['ls-files', '-z', '--others', '--exclude-standard', '--full-name'])).stdout
+      );
+      return [...new Set([...changed, ...untracked])].sort();
+    } catch {
+      // A repository that will not answer is not evidence that something was
+      // left behind, and refusing on it would turn a working merge into a
+      // refusal. The index and MERGE_HEAD are still asked below.
+      return null;
+    }
+  };
+  /** The paths this call left different, out of two `treeNow` readings. */
+  const changedSince = (was, is) => {
+    if (!was || !is) return [];
+    const before = new Set(was);
+    const after = new Set(is);
+    return [...new Set([...is.filter((f) => !before.has(f)), ...was.filter((f) => !after.has(f))])].sort();
+  };
+  // Read immediately before the trial merge, below. Declared here so `abort`
+  // can close over it; `abort` is only ever called after that merge has run.
+  let treeBefore = null;
   const abort = async () => {
     let refused = null;
     try {
       await git(projectPath, ['merge', '--abort']);
-      return null;
     } catch (err) {
       refused = err;
     }
-    const left = await midMerge();
-    if (left === null) return null; // nothing to abort, and nothing left behind
+    // TWO QUESTIONS, AND THE ANSWER TO THE FIRST IS NOT THE ANSWER TO THE
+    // SECOND. Is a merge still in progress — asked only when the abort
+    // refused, because an abort that returned 0 concluded the merge by
+    // definition — and is the working tree back where it was.
+    const mid = refused ? await midMerge() : null;
+    const touched = changedSince(treeBefore, await treeNow());
+    if (mid === null && !touched.length) return null; // nothing left behind
     const said = String(refused?.stderr || refused?.message || '')
       .split('\n')
       .map((line) => line.trim())
@@ -523,23 +606,48 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       .filter((line) => !/^(hint|warning):/i.test(line))
       .join(' ')
       .replace(/\.+$/, '');
+    // WHAT TO NAME. A merge still in progress is named by its unmerged
+    // entries; when there is none of that left to point at, the paths the tree
+    // itself differs at are what a person has to go and look at.
+    const files = mid && mid.length ? mid : touched;
+    const one = files.length === 1;
+    const list = files.slice(0, 10).join(', ');
     return {
       ok: false,
       code: 'merge_stuck',
       from: into,
       branch,
+      // WHICH OF THE TWO SHAPES THIS IS, because the remedy differs and the
+      // advice for one of them cannot reach the other: a caller who runs `git
+      // merge --abort` on the second shape is told there is no merge to abort
+      // and is no further forward.
+      mergeInProgress: mid !== null,
       gitSaid: said || null,
-      files: left,
+      files,
       message:
-        `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
-        `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
-        `${left.length ? ` and ${left.length} ${left.length === 1 ? 'file holds' : 'files hold'} conflict markers: ${left.slice(0, 10).join(', ')}` : ''}. ` +
-        'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
-        'finish the merge there by hand), then ask Stacki again.',
+        mid !== null
+          ? `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
+            `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
+            `${files.length ? ` and ${files.length} ${one ? 'file holds' : 'files hold'} conflict markers: ${list}` : ''}. ` +
+            'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
+            'finish the merge there by hand), then ask Stacki again.'
+          : `Nothing of "${branch}" was committed and "${into}" did not move, but the merge Stacki ran to check ` +
+            `those answers did not come back out of the working tree${said ? ` — git said: ${said}` : ''}: ` +
+            `${files.length} ${one ? 'file is' : 'files are'} not as ${one ? 'it was' : 'they were'} before it ` +
+            `ran — ${list}. ${one ? 'It may hold' : 'They may hold'} conflict markers, or bytes neither branch ` +
+            'wrote. There is no merge left in progress, so `git merge --abort` will not clear this: look at ' +
+            `${one ? 'that file' : 'those files'} in the project and put back what you did not want ` +
+            '(`git checkout HEAD -- <path>` — nothing was committed, so HEAD still holds the version this ' +
+            'started from), then ask Stacki again.',
     };
   };
   let blocked = null;
   let clean = false;
+  // The reading every "nothing was merged" below is measured against. Taken
+  // here rather than at the top of the function so it is the tree as it was
+  // the instant before git touched it, and taken on every path that runs a
+  // trial merge rather than only on the ones that expect to unwind.
+  treeBefore = await treeNow();
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
@@ -833,6 +941,40 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     if (!stages || !stages.size) return ['ours', 'theirs'];
     return [...(stages.has(2) ? ['ours'] : []), ...(stages.has(3) ? ['theirs'] : [])];
   };
+  /**
+   * ONE SIDE MISSING AND NO SIDES AT ALL ARE DIFFERENT REFUSALS.
+   *
+   * A conflicted path can carry stage 1 and NOTHING ELSE — the base, with
+   * neither branch's own version registered under that name. MEASURED, git
+   * 2.50.1, both branches renaming the same file (`orig.txt` -> `ours.txt` on
+   * main, -> `theirs.txt` on feature): `diff --diff-filter=U` reports all
+   * three paths and `ls-files -u` gives orig.txt stage 1 alone, so `sidesOf`
+   * answers [] and the default `ours` was refused as `no_such_side` with
+   * `sides: []` and `deletedBy: "ours"`. The refusal then said `"orig.txt"
+   * exists on only one branch here — the other deleted it`, and the MCP
+   * sentence said it `was deleted on the current branch` — three claims, all
+   * false: it exists on both branches, under two different names, and nobody
+   * deleted anything.
+   *
+   * Refusing is still right — the default is `git checkout --ours`, which dies
+   * on `does not have our version` — but the reason is not that the caller
+   * picked the wrong side. There is no side to pick. "ours" and "theirs" both
+   * name a version to KEEP and this path has neither, so the vocabulary cannot
+   * express this conflict at all, and the sentence has to say that rather than
+   * send someone back to try the other word.
+   */
+  const noSide = (file, given, has, extra) => ({
+    path: file,
+    given,
+    reason: has.length ? 'no_such_side' : 'no_sides',
+    sides: has,
+    expected: has,
+    // `deletedBy` is only true of the one-sided shape. On a path with neither
+    // side nobody deleted anything, and a field naming a culprit there would
+    // be the same untruth the sentence is being corrected for.
+    ...(has.length ? { deletedBy: given } : {}),
+    ...extra,
+  });
   const unusable = [];
   // A NAME GIT NEVER SAID. Named first, because it is the failure that used to
   // be completely invisible: the file the caller meant is still down there
@@ -864,7 +1006,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     if (choice === undefined) {
       const has = sidesOf(file);
       if (!has.includes('ours')) {
-        unusable.push({ path: file, given: 'ours', reason: 'no_such_side', sides: has, expected: has, deletedBy: 'ours', byDefault: true });
+        unusable.push(noSide(file, 'ours', has, { byDefault: true }));
       }
       continue;
     }
@@ -896,7 +1038,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       // has to make it a commit of its own.
       const has = sidesOf(file);
       if (!has.includes(choice)) {
-        unusable.push({ path: file, given: choice, reason: 'no_such_side', sides: has, expected: has, deletedBy: choice });
+        unusable.push(noSide(file, choice, has));
       }
       continue;
     }
@@ -958,16 +1100,23 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // a red box quoting a field name. The mapper composes a longer one from the
     // same `reason`; this is the one anybody gets who does not.
     const first = unusable[0];
-    // AND THE ONE REASON THE GENERAL SENTENCE ACTIVELY MISLEADS. "A choice is
+    // AND THE TWO REASONS THE GENERAL SENTENCE ACTIVELY MISLEADS. "A choice is
     // 'ours' or 'theirs' for a whole file" is exactly what the caller said, so
     // reading only that leaves a person staring at a word they already used.
-    // The vocabulary is not what was wrong: the file has one side, not two.
+    // The vocabulary is not what was wrong: the file has one side, not two —
+    // or, in the second case, it has none, and the vocabulary cannot say
+    // anything about it at all. See noSide.
     const also =
       first.reason === 'no_such_side'
         ? ` "${first.path}" exists on only one branch here — the other deleted it — so it takes ` +
-          `${(first.sides || []).map((side) => `"${side}"`).join(' or ') || 'neither side'} and nothing else, ` +
+          `${(first.sides || []).map((side) => `"${side}"`).join(' or ')} and nothing else, ` +
           'and accepting the deletion means keeping the file now and deleting it in a commit of its own.'
-        : '';
+        : first.reason === 'no_sides'
+          ? ` "${first.path}" has no "ours" and no "theirs": git kept only the version this merge started from ` +
+            'under that name, which is what both branches renaming or moving the same file leaves behind. Both ' +
+            'words name a version to keep and there is neither, so no choice can answer for that path — this ' +
+            'merge has to be finished in the project by hand.'
+          : '';
     return {
       ok: false,
       code: 'bad_choices',

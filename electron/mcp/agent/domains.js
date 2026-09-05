@@ -1805,11 +1805,30 @@ const git = {
           // thing the vocabulary cannot: "ours" and "theirs" both name a
           // version to KEEP, so accepting the other branch's deletion is not
           // expressible as a choice at all.
+          //
+          // The other side is always there on this reason — a path with NEITHER
+          // is `no_sides` below, which is a different thing to say — so this
+          // sentence no longer carries a branch for a list it cannot be given.
           no_such_side:
             `"${first.path}" was deleted on the ${first.deletedBy === 'theirs' ? 'incoming' : 'current'} branch, so it has ` +
-            `no "${first.given}" version to take — ` +
-            `${(first.sides || []).length ? `"${(first.sides || []).join('" or "')}" is the only answer it can take` : 'it has no side left to take'}, ` +
+            `no "${first.given}" version to take — "${(first.sides || []).join('" or "')}" is the only answer it can take, ` +
             'and accepting the deletion is not something a choice can say: keep the file here and delete it in a commit of its own',
+          // AND A CONFLICT THE VOCABULARY CANNOT EXPRESS AT ALL.
+          //
+          // Both branches renamed the same file, so git's conflict includes the
+          // ORIGINAL name carrying the base and nothing else — no "ours" and no
+          // "theirs" under that name. MEASURED with git 2.50.1: it was refused
+          // as `no_such_side`, and this sentence told the agent the path "was
+          // deleted on the current branch", which is not what happened and
+          // sends it to try the other word. There is no other word. Both name a
+          // version to keep and this path has neither, so the honest answer is
+          // that `choices` cannot describe this merge — not that the wrong side
+          // was picked.
+          no_sides:
+            `"${first.path}" has no "ours" and no "theirs" — git kept only the version this merge started from ` +
+            'under that name, which is what both branches renaming or moving the same file leaves behind. Both ' +
+            'words name a version to keep and there is neither, so no choice can answer for that path and this ' +
+            'merge cannot be finished through resolve_merge: it has to be done in the project by hand',
         }[first.reason] || `the choice for "${first.path}" could not be understood`;
         return {
           ...problem(

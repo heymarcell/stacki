@@ -105,12 +105,13 @@ Five refusals. Four of them merge nothing and leave the branch as it was:
 The fifth one has NOT left the project as it was, and it is the only refusal on
 this surface that says so:
 
-  merge_stuck      the re-merge ran and would not unwind. The project is still
-                   mid-merge and \`files\` names the paths still holding conflict
-                   markers, spelled the way git spells them — relative to the
-                   REPOSITORY root, not to the project. Nothing was committed,
-                   but nothing else Stacki reads is trustworthy until a person
-                   runs \`git merge --abort\` there. Do not retry; ask.
+  merge_stuck      the re-merge ran and the unwind did not take. Nothing was
+                   committed and the branch did not move, but the project is not
+                   as it was and \`files\` names what differs, relative to the
+                   REPOSITORY root rather than the project. \`mergeInProgress\`
+                   picks the remedy: true, \`git merge --abort\`; false, that
+                   says there is no merge to abort and it takes
+                   \`git checkout HEAD -- <path>\`. Do not retry; ask.
 
 ## Semantic first, source as the fallback
 
