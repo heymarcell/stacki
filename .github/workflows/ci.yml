@@ -262,6 +262,16 @@ jobs:
       - name: a real project, changed and undone in the packaged app
         run: npm run test:packagedacceptance
 
+      # A SUITE THAT EXISTED AND RAN NOWHERE. `test:packagedundo` was in
+      # package.json and in neither `npm test` nor any job here, so the one
+      # proof that a completed `project.undo` has its restore ON DISK in the
+      # SHIPPED bundle — the thing test/undo-bytes.js can only show against a
+      # harness whose timing flatters it — was never executed by anything. It
+      # belongs in this job rather than in `npm test` because it needs the
+      # bundle the build step above produces.
+      - name: an undo is not done until its restore is on disk, in the bundle
+        run: npm run test:packagedundo
+
       # Phase B and Phase C, from the bundle rather than from source. This is
       # the only job that can catch axe-core not being packaged: the engine is
       # required lazily out of node_modules, so a packaging config that drops it

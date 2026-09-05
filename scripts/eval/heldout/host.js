@@ -53,6 +53,52 @@ const CREDENTIAL_VARS = [
   'GH_ENTERPRISE_TOKEN',
 ];
 
+// AND EVERYTHING ELSE SHAPED LIKE A CREDENTIAL.
+//
+// The five names above are the ones that reach GitHub, and stripping exactly
+// those was read — by two independent reviewers — as a claim that the child got
+// no credentials at all. It got every other one in the environment. A trial is
+// an autonomous agent with Bash; the names it might find are not a list anybody
+// can keep current, so the rule is a shape rather than an inventory.
+//
+// PATH, HOME and the rest of the ordinary environment are deliberately NOT
+// matched: the child needs a working shell, and `claude` needs its own login
+// under HOME. That is stated as a residual below rather than papered over.
+const CREDENTIAL_SHAPE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|_KEY$|^KEY$|AUTH)/i;
+const CREDENTIAL_SHAPE_KEEP = new Set(['SSH_AUTH_SOCK', 'GH_CONFIG_DIR', 'PATH', 'HOME']);
+
+/**
+ * The other way to GitHub, which no GITHUB_* variable is involved in.
+ *
+ * `git push` over https authenticates through the credential helper in the
+ * user's global config — on this machine `osxkeychain`, set in the system
+ * gitconfig — and over ssh through the keys in ~/.ssh. Neither reads an
+ * environment variable the strip above can see, so a trial that was handed a
+ * shell could reach a real remote without ever touching `gh`, which is the
+ * route the fake was built to close.
+ *
+ * These point git at a config the trial owns, holding an identity so commits
+ * still work and no helper so authentication cannot. `false` for the ssh
+ * command and the askpass hooks means a push that tries anyway fails closed
+ * instead of prompting a human who is not there.
+ */
+function gitContainment(dir) {
+  const config = path.join(dir, 'gitconfig');
+  fs.writeFileSync(
+    config,
+    '[user]\n\tname = Stacki Trial\n\temail = trial@stacki.invalid\n[credential]\n\thelper =\n',
+    'utf8'
+  );
+  return {
+    GIT_CONFIG_GLOBAL: config,
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '/usr/bin/false',
+    SSH_ASKPASS: '/usr/bin/false',
+    GIT_SSH_COMMAND: '/usr/bin/false',
+  };
+}
+
 /**
  * The environment a trial's child actually gets, and the proof that it is safe.
  *
@@ -62,15 +108,35 @@ const CREDENTIAL_VARS = [
  */
 function containedEnv(extra = {}) {
   const fake = makeFakeGh();
-  const ghConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-trial-ghconfig-'));
+  let ghConfigDir = null;
+  try {
+    ghConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-trial-ghconfig-'));
+    return build();
+  } catch (err) {
+    // EVERY REFUSAL BELOW LEAVES SOMETHING ON DISK OTHERWISE. `shadowedPath`
+    // throws when the shadow did not take, and the strip checks throw on a
+    // survivor — all of them after the fake gh directory exists, and one of
+    // them after the config directory does. test/support/fakeGh.js's own
+    // `withFakeGh` gets this right; this did not.
+    fake.cleanup();
+    if (ghConfigDir) fs.rmSync(ghConfigDir, { recursive: true, force: true });
+    throw err;
+  }
+
+  function build() {
   const env = { ...process.env, CI: '1', ...extra };
   for (const name of CREDENTIAL_VARS) delete env[name];
+  const shaped = Object.keys(env).filter((n) => !CREDENTIAL_SHAPE_KEEP.has(n) && CREDENTIAL_SHAPE.test(n));
+  for (const name of shaped) delete env[name];
+  Object.assign(env, gitContainment(ghConfigDir));
   env.GH_CONFIG_DIR = ghConfigDir;
   // Throws unless `command -v gh` under THIS env resolves to the fake.
   env.PATH = shadowedPath(fake.dir, env.PATH);
 
   const leaked = CREDENTIAL_VARS.filter((name) => env[name] !== undefined);
   if (leaked.length) throw new Error(`refusing to launch: ${leaked.join(', ')} survived the strip`);
+  const leakedShape = Object.keys(env).filter((n) => !CREDENTIAL_SHAPE_KEEP.has(n) && CREDENTIAL_SHAPE.test(n));
+  if (leakedShape.length) throw new Error(`refusing to launch: ${leakedShape.join(', ')} survived the strip`);
   if (fake.calls().length) throw new Error('refusing to launch: the fake gh log was not empty before the trial started');
 
   return {
@@ -82,9 +148,23 @@ function containedEnv(extra = {}) {
       // The names only. A test that printed the values it removed would be the
       // leak it exists to prevent.
       credentialsPresentAfter: leaked,
+      // The NAMES the shape rule caught, so a run can be read for what it
+      // actually removed rather than for what the list above intended.
+      credentialsStrippedByShape: shaped,
       ghResolvesTo: fake.bin,
       ghConfigDir,
+      gitConfigGlobal: env.GIT_CONFIG_GLOBAL,
+      gitCredentialHelperDisabled: true,
       fakeGhLogEmptyAtStart: true,
+      // WHAT THIS DOES NOT CLOSE, recorded beside what it does, because a
+      // containment block that lists only its successes reads as a proof.
+      // `command -v gh` is the fake, and GH_CONFIG_DIR is the trial's — but a
+      // child that runs the real binary by absolute path, in a shell that
+      // unsets GH_CONFIG_DIR, is still running as a user whose HOME holds a gh
+      // login. HOME is not overridden because `claude` needs its own. The fake
+      // gh log therefore proves what went through `gh`, not that nothing else
+      // did; `ghCallsDuringTrial` should be read that way.
+      residual: 'gh by absolute path with GH_CONFIG_DIR unset reaches the login under HOME; HOME is not overridden because the host binary needs it',
     },
     cleanup: () => {
       const calls = fake.calls();
@@ -93,6 +173,7 @@ function containedEnv(extra = {}) {
       return calls;
     },
   };
+  }
 }
 
 
@@ -286,6 +367,38 @@ function runHost({
       }
     });
     child.stderr.on('data', (c) => stderr.push(String(c)));
+
+    // A SPAWN THAT NEVER STARTS STILL HAS TO SETTLE, AND STILL HAS TO CLEAN UP.
+    //
+    // `cleanup()` lived only inside the 'exit' handler, and 'exit' does not
+    // fire when the spawn itself fails — no `claude` on PATH, EACCES on the
+    // binary. The fake gh directory and the trial's GH_CONFIG_DIR were both
+    // left behind, and the promise never settled, so the runner hung instead of
+    // reporting. A host that is not installed is an ordinary outcome of this
+    // harness and has to arrive as a result.
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      let ghCalls = [];
+      try {
+        ghCalls = contained.cleanup();
+      } catch {
+        /* nothing to tear down */
+      }
+      resolve({
+        ok: false,
+        code: null,
+        error: String(err?.message || err),
+        ms: Date.now() - began,
+        events,
+        stderr: stderr.join(''),
+        result: null,
+        used: {},
+        mcpUsed: {},
+        resourceUsed: {},
+        escaped: {},
+        containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
+      });
+    });
 
     const timer = setTimeout(() => {
       log(`host exceeded ${timeoutMs}ms; terminating`);

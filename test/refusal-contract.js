@@ -91,6 +91,13 @@ const DOMAINS_MODULE = require('../electron/mcp/agent/domains.js');
 const { createAgentApi } = require('../electron/mcp/agent/index.js');
 const refs = require('../electron/mcp/agent/refs.js');
 const { TOPICS, TOPIC_NAMES } = require('../electron/mcp/guide.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite awaits a real wire and a real
+// repository; node exits 0 on an empty event loop, so an await that never settles
+// would print nothing after the last line it reached and be recorded as success.
+// See test/support/suiteGuard.js.
+const suiteDone = guardSuite('refusal-contract');
 
 const failures = [];
 let checked = 0;
@@ -365,7 +372,7 @@ function hostPathsIn(payload, root) {
   // on a quote or a space so that a project-relative `src/pages/index.astro` —
   // which every one of these refusals is allowed and expected to name — is not
   // mistaken for one.
-  for (const m of text.matchAll(/(?:^|["\s(])(\/(?:Users|home|var|private|tmp|opt|etc|Applications|Library)\/[^"\s)]{2,})/g)) {
+  for (const m of text.matchAll(/(?:^|["'`\s(])(\/(?:Users|home|var|private|tmp|opt|etc|Applications|Library)\/[^"'`\s)]{2,})/g)) {
     hits.push(`an absolute path: ${m[1].slice(0, 80)}`);
   }
   return hits;
@@ -749,6 +756,60 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       fs.rmSync(path.join(root, 'public/renamed.svg'));
     }
 
+    // A REFUSAL BUILT FROM A RAW fs THROW, WHICH IS THE ONE THE SCRUBBER EXISTS FOR.
+    //
+    // Every other refusal in this sweep is composed by Stacki, out of strings
+    // Stacki chose, so none of them ever had a host path in it to begin with —
+    // which made the SANITIZED promise above unfalsifiable: deleting host-path
+    // scrubbing from the product entirely left this suite reporting the
+    // identical green. The one shape that genuinely carries the machine's
+    // layout is an errno bubbling up from the filesystem, where the text is
+    // node's rather than ours: "EACCES: permission denied, open
+    // '/var/folders/.../src/pages/index.astro'".
+    //
+    // So the file is made unwritable and written to. Both halves are asserted:
+    // that the refusal names nothing on this machine, AND — separately, against
+    // the same locked file — that an unscrubbed attempt at the same write really
+    // does produce an absolute path. Without that second half this is one more
+    // assertion about a payload that never had anything to hide.
+    {
+      const rel = 'src/pages/index.astro';
+      const abs = path.join(root, rel);
+      const read = await rig.call('source', 'read', { path: rel });
+      const ref = read.envelope?.ref;
+      const raw = (() => {
+        try {
+          fs.chmodSync(abs, 0o444);
+          fs.writeFileSync(abs, 'probe\n');
+          return null;
+        } catch (err) {
+          return String(err?.message || err);
+        }
+      })();
+      check(
+        'a locked file really does throw an errno naming this machine',
+        typeof raw === 'string' && hostPathsIn({ message: raw }, root).length > 0,
+        short({ raw })
+      );
+      try {
+        await provoke('a write the filesystem refuses', null, 'source', 'write', {
+          path: rel,
+          ref,
+          text: '---\n---\n<p>blocked</p>\n',
+          expectedDigest: read.envelope?.digest,
+        });
+      } finally {
+        fs.chmodSync(abs, 0o644);
+      }
+      const fsRefusal = observed[observed.length - 1]?.envelope;
+      check('  and the refusal that comes back is a refusal', fsRefusal?.ok === false, short(fsRefusal, 200));
+      check(
+        '  and it carries none of that path, though the errno behind it did',
+        hostPathsIn(fsRefusal, root).length === 0,
+        hostPathsIn(fsRefusal, root).join('; ')
+      );
+    }
+
     // THE GATE. Collected before this rig existed, for the reason written at the
     // top of section 2.
     observed.push({
@@ -849,6 +910,16 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       const planted = { ok: false, code: 'failed', message: 'scrubbed', restored: { failed: path.join(root, 'src/styles/site.css') } };
       check('the path scanner finds one buried two levels down', hostPathsIn(planted, root).length > 0, short(hostPathsIn(planted, root)));
       check('  and passes a payload that names only project-relative paths', hostPathsIn({ ok: false, message: 'src/styles/site.css is not in this project.' }, root).length === 0, '');
+      // AND IN THE SHAPE AN fs ERROR ACTUALLY USES. The lead character class
+      // did not include an apostrophe, so the one form every Node fs failure
+      // produces — and the very form quoted in this scanner's own comment,
+      // `open '/var/folders/.../site.css'` — was invisible to it. A scanner
+      // blind to the shape it was written for makes every assertion that uses
+      // it free.
+      const quoted = { ok: false, code: 'failed', message: "EACCES: permission denied, open '/Users/someone/secret/site.css'" };
+      check('  and finds one in the single-quoted form fs errors use', hostPathsIn(quoted, root).length > 0, short(hostPathsIn(quoted, root)));
+      const backticked = { ok: false, code: 'failed', message: 'cannot rename `/opt/other/a`' };
+      check('  and in a backticked one', hostPathsIn(backticked, root).length > 0, short(hostPathsIn(backticked, root)));
     }
 
     // ── 5. THE BOUNDS, PROVOKED RATHER THAN ASSUMED ────────────────────────────
@@ -1209,6 +1280,7 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
     console.error(`refusal-contract: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
+  suiteDone();
   console.log(
     `refusal-contract: ${checked} passed  [${DECLARED.size} declared codes: ${EXERCISED.size} provoked on the wire, ` +
       `${GRADED.size} graded in process, ${UNREACHABLE.size} proved unreachable]`

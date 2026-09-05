@@ -36,6 +36,11 @@ const path = require('node:path');
 
 const { createStackiMcpServer, CAPABILITIES, CACHE_HINTS } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. See test/support/suiteGuard.js: node exits 0
+// on an empty event loop, so an await that never settles reads as success.
+const suiteDone = guardSuite('mcp-cache-hints');
 
 const failures = [];
 let checked = 0;
@@ -300,6 +305,7 @@ const readResource = (port, uri) => modern(port, 'resources/read', { uri }, { 'm
     console.error(`mcp-cache-hints: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
+  suiteDone();
   console.log(`mcp-cache-hints: ${checked} passed  [truthful capabilities; the catalogue is public, the project is not]`);
 })().catch((err) => {
   console.error('mcp-cache-hints: threw', err);

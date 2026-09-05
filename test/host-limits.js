@@ -31,6 +31,11 @@
 
 const { createStackiMcpServer } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. See test/support/suiteGuard.js: node exits 0
+// on an empty event loop, so an await that never settles reads as success.
+const suiteDone = guardSuite('host-limits');
 
 // The host's cap, in characters. Not bytes: the measurement was of characters.
 const HOST_LIMIT = 2048;
@@ -137,6 +142,7 @@ const TOKEN = 'host-limits-token-aaaaaaaaaaaaaaaa';
     console.error(`host-limits: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
+  suiteDone();
   console.log(`host-limits: ${checked} passed  [nothing this server says is being silently cut in half]`);
 })().catch((err) => {
   console.error('host-limits: threw', err);
