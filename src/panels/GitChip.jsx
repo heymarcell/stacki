@@ -505,6 +505,19 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
                 // unwound, carried back unchanged. Plain IPC, and plain on
                 // purpose: this is the panel that was shown the conflict, and a
                 // signed handle is what the MCP boundary is for.
+                //
+                // AND WHICH BRANCH THIS WAS BEING MERGED INTO, which `at` did
+                // not used to carry. The two commits pin a COMMIT, and two
+                // branches at one commit are ordinary — a branch cut and not
+                // yet committed on is exactly that. So a branch switch while
+                // this dialog was open passed every staleness check there was:
+                // measured, the conflict taken on `main`, a checkout to a
+                // sibling `release` at the same tip, and the resolve answering
+                // `{ok: true, into: "release"}` over a two-parent merge commit
+                // on a branch nobody had chosen — with the toast below then
+                // announcing a merge the person never asked for. `at` names the
+                // branch now and gitBranches.js refuses the mismatch, so the
+                // `r.into` below can only be the branch this dialog was about.
                 const r = await window.avb.gitResolveMerge({
                   projectPath: project.path,
                   branch: conflict.branch,

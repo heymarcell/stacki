@@ -330,7 +330,17 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // caller that simply never sent the field is exactly the caller this exists
   // to stop.
   const bound = expect && typeof expect === 'object' && !Array.isArray(expect) ? expect : null;
-  const named = bound && typeof bound.head === 'string' && bound.head && typeof bound.incoming === 'string' && bound.incoming && typeof bound.digest === 'string' && bound.digest;
+  // ALL FOUR FACTS, OR IT IS NOT A BINDING. `into` is in here for the same
+  // reason the other three are: a field a caller may leave out is a guard that
+  // protects only the callers who remembered to ask for it, and the caller that
+  // never sends it is the one this exists to stop. Both routes carry it — the
+  // panel from `at`, the MCP surface from the signed ref's data.
+  const named =
+    bound &&
+    typeof bound.head === 'string' && bound.head &&
+    typeof bound.incoming === 'string' && bound.incoming &&
+    typeof bound.digest === 'string' && bound.digest &&
+    typeof bound.into === 'string' && bound.into;
   if (!named) {
     return {
       ok: false,
@@ -351,14 +361,40 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     code: 'stale_merge',
     from: into,
     branch,
-    expected: { head: bound.head, incoming: bound.incoming, digest: bound.digest },
-    current,
+    expected: { head: bound.head, incoming: bound.incoming, digest: bound.digest, into: bound.into },
+    // The branch the project is actually on, on every one of these. The call
+    // sites below each measure commits and pass those; a `current` that reports
+    // less than `expected` is not something a caller can compare.
+    current: { into, ...current },
     message:
       `The conflict those choices were made against is not the conflict that is there now — ${why}. ` +
       `Nothing was merged and "${into}" is exactly as it was. Run git.merge on "${branch}" again and answer ` +
       'the conflict it reports this time.',
   });
   const short = (sha) => (typeof sha === 'string' ? sha.slice(0, 8) : 'nothing');
+  // THE BRANCH BEING MERGED INTO IS PART OF THE CONFLICT, AND ONLY THE COMMIT
+  // WAS BEING CHECKED.
+  //
+  // `into` is read fresh from currentBranch above, and the guard below compares
+  // `tipOf('HEAD')`. Two branches at one commit are completely ordinary, so a
+  // checkout between the conflict and the resolve is invisible to a SHA
+  // comparison. MEASURED, with real git: the conflict taken on `main`, `git
+  // checkout release` where release had just been cut from main and had no
+  // commits of its own, and the resolve answered `{ok: true, into: "release",
+  // changed: true, resolved: 1}` over a two-parent merge commit on a branch the
+  // caller had never named — with the panel then toasting that it had merged
+  // into a branch the person never chose. A detached HEAD at that commit is the
+  // same case and is refused here too: `rev-parse --abbrev-ref` says "HEAD"
+  // there, which is not the branch name the binding carries.
+  //
+  // Refused before the trial merge rather than after it, so this is the one
+  // staleness refusal that never has a tree to unwind.
+  if (into !== bound.into) {
+    return stale(
+      { head: headNow, incoming: incomingNow, digest: null },
+      `those answers were for merging into "${bound.into}" and the project is on "${into || 'no branch'}" now`
+    );
+  }
   if (headNow !== bound.head) {
     return stale(
       { head: headNow, incoming: incomingNow, digest: null },
@@ -1013,7 +1049,16 @@ async function mergeBranch(git, { projectPath, branch }) {
       // still on disk — after the abort there is nothing left to measure, and
       // a digest taken from the copies above would be a digest of this code's
       // reading of git rather than of git.
-      const at = { head: before, incoming, digest: conflictDigest(root, files) };
+      // AND WHICH BRANCH THIS WAS BEING MERGED INTO, the fourth fact a resolve
+      // needs and the one this handle used to leave out. `head` pins
+      // the COMMIT, and two branches at one commit are ordinary — a branch cut
+      // and not yet committed on is exactly that — so a checkout to a sibling
+      // at the same tip passed every staleness check there was and the answers
+      // given about merging into `main` were committed onto the other branch.
+      // See resolveMerge, which refuses that now. Named the same as `from` on
+      // the envelope; `into` here because that is what the argument to
+      // resolveMerge's guard is about.
+      const at = { head: before, incoming, digest: conflictDigest(root, files), into };
       // Unwound before returning. Conflict markers sitting in the files would
       // be read as markup by the editor a moment later, and the page would
       // come back broken with nothing to say why. So the tree goes back to

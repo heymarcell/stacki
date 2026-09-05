@@ -50,6 +50,31 @@ handler, all proven by raw HTTP in `test/mcp.js`:
   logged.
 - **Path** — only `POST /mcp` exists. Everything else is 404.
 
+**The Origin gate is port-agnostic, deliberately, and that was threat-modelled
+rather than assumed.** The SDK's `localhostOriginValidation` accepts any origin
+whose HOSTNAME is `localhost`/`127.0.0.1`/`[::1]` at ANY port — so the project's
+own Astro dev server, or anything else a person is running on loopback, clears
+it. It gets no further, for four reasons each checked against a running
+endpoint rather than read off the code:
+
+1. the bearer is checked BEFORE the path and before the size gate, so the first
+   thing a browser-originated request meets is a 401;
+2. a cross-origin `fetch` cannot attach `Authorization` without a successful
+   CORS preflight, and the preflight is an `OPTIONS` carrying no credentials —
+   measured: it comes back 401 with `www-authenticate: Bearer` and **no
+   `Access-Control-Allow-*` header at all**, so the browser fails it and the
+   real request is never sent;
+3. the only CORS-emitting code in the SDK is the OAuth protected-resource
+   metadata document, which Stacki does not mount;
+4. even a no-preflight simple POST gets 401, and with no `Access-Control-Allow-Origin`
+   its response is unreadable by the page.
+
+Origin acceptance widens who can reach the 401, not who can pass it. For a
+non-browser process on the same machine, Host and Origin are attacker-controlled
+anyway and the bearer is the whole control — so port-agnosticism changes nothing
+there either. Tightening it would buy no authorization property Stacki does not
+already have.
+
 ---
 
 ## 2. The surface

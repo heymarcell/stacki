@@ -1574,12 +1574,117 @@ const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(?:(pre|pre-wrap|break-space
 // is.
 const PRESERVES_SPACE_VALUE = /^(pre|pre-wrap|break-spaces)$/i;
 const UNREADABLE_SPACE_VALUE = /^var\s*\(/i;
-const PRESERVES_SPACE_CLASS = /(^|\s)(whitespace-pre(-wrap)?|whitespace-break-spaces)(\s|$)/i;
+// THE UTILITY, AFTER TAILWIND HAS FINISHED SPELLING IT.
+//
+// This used to be an attribute-wide `(^|\s)whitespace-pre...(\s|$)`, which is
+// the BARE utility and nothing else. Every ordinary spelling in a real project
+// carries something on the front or the back of it, and each of these was read
+// as "this element does not preserve its whitespace":
+//
+//   md:whitespace-pre        a VARIANT -- the rule applies inside a media query
+//   tw-whitespace-pre        a configured PREFIX (`prefix: 'tw-'`)
+//   !whitespace-pre          the IMPORTANT modifier, v3's leading `!`
+//   whitespace-pre!          the same modifier, v4's trailing one
+//   md:!whitespace-pre-wrap  all of it at once, which is also legal
+//
+// Measured on this file before the fix: a move across a nesting level of a
+// `<div class='md:whitespace-pre'>` came back two spaces shorter on its middle
+// line -- rendered text deleted, `ok: true` -- and an insert into `<div
+// class='!whitespace-pre'>` wrote four spaces of rendered content in front of
+// the new child. The guard existed and did not fire for anything but the one
+// spelling a tutorial uses.
+//
+// So a class LIST is tokenised and each token is taken apart the way Tailwind
+// builds it: `variant:variant:` on the front, `!` on either end of what is
+// left, an optional prefix segment, then the utility. `whitespace-pre-line` is
+// deliberately still not in here, for the reason written on PRESERVES_SPACE.
+const CLASS_PRESERVES_UTILITY = /^(?:[A-Za-z0-9_]+-)?whitespace-(?:pre|pre-wrap|break-spaces)$/i;
+// AND THE SPELLING THAT IS THE DECLARATION ITSELF. `class='[white-space:pre]'`
+// is Tailwind's arbitrary property: not a named utility at all, but the CSS
+// written into the class list, and it renders exactly what `style='white-space:
+// pre'` renders. It is unconditional, so it is evidence for both flags -- and
+// it is the reason the variant split below counts brackets instead of taking
+// the last `:` in the token, which would have read this one as a variant named
+// `[white-space` and a utility named `pre]`.
+const CLASS_PRESERVES_ARBITRARY = /^\[white-space:(?:pre|pre-wrap|break-spaces)\]$/i;
 // And the two spellings that turn it back OFF. Inheritance is overridable, and
 // saying so is the only thing that stops one `white-space: pre` near the top of
 // a page from smearing the flag over every element under it.
+//
+// THIS ONE IS DELIBERATELY LEFT BARE, and the asymmetry is the point. A missed
+// PRESERVING spelling costs bytes, which is why the one above was widened. A
+// missed DROPPING spelling costs nothing: the token is simply not recognised
+// and the element falls through to its inherited answer, which is where every
+// unrecognised class has always gone. Widening THIS one is the class-list error
+// that can cost bytes -- an invented drop cancels an ancestor's real `pre` and
+// hands the wide pass a licence to reindent -- so `tw-whitespace-normal` in a
+// project that configured no such prefix stays unread rather than believed.
 const DROPS_SPACE_VALUE = /^(normal|nowrap)$/i;
 const DROPS_SPACE_CLASS = /(^|\s)(whitespace-normal|whitespace-nowrap)(\s|$)/i;
+
+/**
+ * ONE `class` ATTRIBUTE, RESOLVED: true, false, or null for "it says nothing".
+ *
+ * `acting` is the same distinction it is on `ownWhitespaceRule`, and the class
+ * list is where the two readers disagree about A VARIANT.
+ *
+ * `md:whitespace-pre` is a statement about SOME viewports. For the wide flag
+ * that is a perfectly good could -- the page renders those spaces at some
+ * width, so a reindent can delete rendered text at that width, and refusing one
+ * costs a cosmetic indent. For the ACTING flag it is not evidence at all: that
+ * flag writes a splice's surrounding layout at COLUMN ZERO on the strength of
+ * the element being KNOWN to render the indentation between its children, and
+ * an element that renders it only above 768px is not known to render it. Acting
+ * on `print:whitespace-pre` would de-indent markup for a rule that fires when
+ * the page is printed. So a variant-carrying token is counted by the wide pass
+ * and ignored by the acting one -- ignored, not denied: "not evidence" is not
+ * "evidence against", so it falls through to the inherited answer exactly as a
+ * `<Textarea>` and a `var()` do.
+ *
+ * A PREFIX AND THE IMPORTANT MODIFIER ARE NOT VARIANTS. `tw-whitespace-pre` and
+ * `!whitespace-pre` name a rule that applies whenever the element is on screen
+ * at all, so both are evidence for both flags. The prefix does cost something:
+ * a project that configured no prefix could carry a hand-written class ENDING
+ * in `-whitespace-pre` and this would believe it. That is the same bet the bare
+ * spelling has always made in a project that does not use Tailwind, and it is
+ * the cheaper of the two errors available here -- believing it writes no indent
+ * where the file's own indent would have done, while disbelieving it writes
+ * SPACES THE BROWSER RENDERS into a page nobody asked to change.
+ */
+function classWhitespaceRule(cls, acting) {
+  if (typeof cls !== 'string' || !cls) return null;
+  let preserves = false;
+  for (const token of cls.split(/\s+/)) {
+    if (!token) continue;
+    // Variants are everything up to the last `:` OUTSIDE brackets. Both halves
+    // of Tailwind's syntax put a `:` inside them -- an arbitrary variant
+    // (`[&:hover]:`) and an arbitrary property (`[white-space:pre]`) -- and the
+    // bracket depth is what tells a separator from a colon that is part of one
+    // of those.
+    let depth = 0;
+    let cut = -1;
+    for (let i = 0; i < token.length; i++) {
+      const ch = token[i];
+      if (ch === '[' || ch === '(') depth++;
+      else if (ch === ']' || ch === ')') depth--;
+      else if (ch === ':' && depth <= 0) cut = i;
+    }
+    const conditional = cut !== -1;
+    const body = token.slice(cut + 1).replace(/^!/, '').replace(/!$/, '');
+    if (!CLASS_PRESERVES_UTILITY.test(body) && !CLASS_PRESERVES_ARBITRARY.test(body)) continue;
+    if (acting && conditional) continue;
+    preserves = true;
+  }
+  // The order is the two flags' own. For the one that WRITES, counter-evidence
+  // is read first: a bare `whitespace-normal` in the list withholds the act
+  // whatever else is in there, which is what this always did. For the wide one
+  // the preserving token wins, because the answer that keeps bytes is the safe
+  // one and a list naming both spellings is exactly a case nothing here can
+  // resolve.
+  if (acting) return DROPS_SPACE_CLASS.test(cls) ? false : preserves ? true : null;
+  if (preserves) return true;
+  return DROPS_SPACE_CLASS.test(cls) ? false : null;
+}
 
 /**
  * THE VALUE AN INLINE `style` ATTRIBUTE ACTUALLY COMPUTES TO -- or null when it
@@ -1691,24 +1796,34 @@ function matchesPreservingTokens(node, tokens) {
  * holds bytes the file has, and "is this element KNOWN to render the
  * indentation between its children", which writes the surrounding layout at
  * column zero. The first is allowed to be a superset. The second is evidence or
- * it is nothing, and two things that are fair evidence for the first are not
+ * it is nothing, and three things that are fair evidence for the first are not
  * evidence at all for the second:
  *
- *   * A COMPONENT IS NOT THE HTML ELEMENT WITH THE SAME NAME. `node.name` was
- *     lowercased and looked up in `PRESERVING_TAGS` with no glance at
- *     `node.kind`, so `<Textarea>` -- shadcn/ui's exact component name, and
- *     `<Pre>`, `<Script>`, `<Style>` with it -- was treated as the HTML
- *     `<textarea>`. What that component renders is in another file; it is quite
- *     ordinarily a `<div>` with a label. Being wrong about it in the wide
- *     direction only refuses a reindent, so the wide pass still counts it as a
- *     could; the acting pass wants the tag itself, and asks for `kind ===
- *     'element'`.
+ *   * A COMPONENT IS NOT THE HTML ELEMENT WITH THE SAME NAME, AND IT IS NOT THE
+ *     ELEMENT ITS `class` WOULD DESCRIBE EITHER. `node.name` was lowercased and
+ *     looked up in `PRESERVING_TAGS` with no glance at `node.kind`, so
+ *     `<Textarea>` -- shadcn/ui's exact component name, and `<Pre>`,
+ *     `<Script>`, `<Style>` with it -- was treated as the HTML `<textarea>`;
+ *     and the exclusion that fixed that covered only the tag, so `<Card
+ *     class='whitespace-pre'>` walked straight into the `style` and `class`
+ *     tests underneath it. What a component renders is in another file: it is
+ *     quite ordinarily a `<div>` with a label, and a `class` prop is quite
+ *     ordinarily dropped, merged onto a wrapper, or put on something that is
+ *     not the parent of these children. Being wrong about any of it in the wide
+ *     direction only refuses a reindent, so the wide pass still counts all of
+ *     it as a could; the acting pass wants the element itself, and asks for
+ *     `kind === 'element'` before it reads anything at all.
+ *   * A VARIANT-CARRYING UTILITY CLASS -- `md:whitespace-pre`,
+ *     `print:whitespace-pre-wrap` -- is a rule that applies at some viewports
+ *     and not others, which is a could by construction. See
+ *     `classWhitespaceRule`, where the two flags part company over it.
  *   * `white-space: var(--ws)` is an unreadable value, and the reasoning for
  *     counting it as preserving is written on `UNREADABLE_SPACE_VALUE` above.
  *
- * Neither is turned into a `false`. "Not evidence" is not "evidence against",
- * so both fall through to the inherited answer -- a `<Textarea>` inside a real
- * `<pre>` still renders its indentation because the `<pre>` does.
+ * None of the three is turned into a `false`. "Not evidence" is not "evidence
+ * against", so all of them fall through to the inherited answer -- a
+ * `<Textarea>` inside a real `<pre>` still renders its indentation because the
+ * `<pre>` does.
  */
 function ownWhitespaceRule(node, tokens, acting = false) {
   if (!node || typeof node !== 'object') return null;
@@ -1719,6 +1834,23 @@ function ownWhitespaceRule(node, tokens, acting = false) {
   // file, and it is the only one excluded here.
   const isTag = !acting || node.kind === 'element' || node.kind === 'raw';
   if (name && isTag && PRESERVING_TAGS.has(name)) return true;
+  // AND THE SAME COMPONENT, CARRYING THE DECLARATION ITSELF.
+  //
+  // Excluding a component from the tag test and then reading its `style` and
+  // `class` was excluding it from one third of the question. `<Card
+  // class='whitespace-pre'>` and `<Card style='white-space: pre'>` were both
+  // treated as elements KNOWN to render the indentation between their children,
+  // and a newly inserted child went in at COLUMN ZERO -- measured on this file.
+  // A component is a function call: `class` and `style` reach it as props, and
+  // what it does with them is in another file. It may drop them; it may spread
+  // them onto a wrapper that is not the parent of these children at all; it may
+  // render the children into a slot three elements deeper. None of that is
+  // evidence, and this flag is the one place a guess writes.
+  //
+  // The wide pass still reads them, and should: being wrong there only refuses
+  // a reindent, and a component that DOES forward `class` to the element around
+  // its slot is common enough that the could is worth having.
+  if (!isTag) return null;
   const style = litProp(node, 'style');
   // ONE value, the one the cascade left standing -- see `resolvedWhiteSpace`.
   // The order of the three tests below is no longer a cascade of its own: it is
@@ -1735,8 +1867,8 @@ function ownWhitespaceRule(node, tokens, acting = false) {
     // which is where a bare `white-space: pre-line` always went.
   }
   const cls = litProp(node, 'class') || litProp(node, 'className');
-  if (cls && DROPS_SPACE_CLASS.test(cls)) return false;
-  if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+  const byClass = classWhitespaceRule(cls, acting);
+  if (byClass !== null) return byClass;
   if (matchesPreservingTokens(node, tokens)) return true;
   return null;
 }
@@ -1754,7 +1886,11 @@ function declaresRenderedSpace(node, tokens) {
   const style = litProp(node, 'style');
   if (style && PRESERVES_SPACE.test(style)) return true;
   const cls = litProp(node, 'class') || litProp(node, 'className');
-  if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+  // Looking DOWN is a wide-direction question -- everything gated on it keeps
+  // the bytes the file already has -- so it asks the wide reader, variants and
+  // all, and reads only its positive answer. A `whitespace-normal` on one node
+  // says nothing about whether something ELSE inside declares the property.
+  if (classWhitespaceRule(cls, false) === true) return true;
   if (matchesPreservingTokens(node, tokens)) return true;
   return (
     Array.isArray(node.children) && node.children.some((kid) => declaresRenderedSpace(kid, tokens))
@@ -3034,13 +3170,16 @@ function anchoredSerialize(source, model, options = {}) {
     // evidence rather than a superset, and where there is none the file's own
     // indent goes in, which changes nothing.
     //
-    // AND "NO TOKENS" WAS NOT THE WHOLE OF IT. Two things reached this walk
+    // AND "NO TOKENS" WAS NOT THE WHOLE OF IT. Three things reached this walk
     // that are not evidence either and had nothing to do with the scanner: a
-    // COMPONENT named after one of the four tags (`<Textarea>` is shadcn/ui's
-    // own component name, and it is a `<div>` with a label), and a
-    // `white-space` whose value is a `var()` this file cannot resolve. Both are
-    // fair "coulds" for the wide pass and neither is evidence for this one, so
-    // this pass is `acting` as well as tokenless -- see `ownWhitespaceRule`.
+    // COMPONENT, whether it is named after one of the four tags (`<Textarea>`
+    // is shadcn/ui's own component name, and it is a `<div>` with a label) or
+    // merely carries a `class`/`style` it is free to drop or forward somewhere
+    // else; a utility class behind a VARIANT (`md:whitespace-pre`), which is a
+    // rule about some viewports; and a `white-space` whose value is a `var()`
+    // this file cannot resolve. All three are fair "coulds" for the wide pass
+    // and none is evidence for this one, so this pass is `acting` as well as
+    // tokenless -- see `ownWhitespaceRule` and `classWhitespaceRule`.
     rendersIndent: preservingContext(base.model.nodes || [], null, true),
     // The destination for the page's own top-level children is the document,
     // which preserves nothing. `childContext` sets this from the parent whose

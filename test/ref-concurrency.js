@@ -1167,6 +1167,10 @@ async function open(extra = {}) {
     const body = dec(clash.mergeRef);
     check('the handle is a merge ref', body.k === 'merge', short(body));
     check('  naming the branch, so the resolve does not have to be told', body.d?.branch === 'incoming', short(body.d));
+    // AND THE BRANCH IT IS BEING MERGED INTO. It has always been minted onto
+    // the handle and the resolve dropped it on the way to the handler, which is
+    // the hole the sub-section below measures.
+    check('  and the branch it is being merged INTO', body.d?.into === 'main', short(body.d));
     // THE ASSERTION THIS SUITE WAS WRITTEN ABOUT. A ref minted with no
     // observation reads as a guard and is not one: there is nothing for a
     // staleness check to compare against, so everything passes it.
@@ -1238,6 +1242,78 @@ async function open(extra = {}) {
     check('  nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0, MB.movedBetween(before.bytes, MB.bytesOf(root)).join(', '));
     check('  HEAD did not move', MB.git(root, 'rev-parse', 'HEAD') === before.head);
     check('  and no merge was left in progress', !fs.existsSync(path.join(root, '.git', 'MERGE_HEAD')));
+
+    // ── the same commit, a different branch ───────────────────────────────
+    //
+    // A HANDLE THAT PINS TWO COMMITS DOES NOT PIN THE BRANCH IT IS LANDING ON.
+    //
+    // Every check above moves a commit, because moving a commit is how a
+    // conflict goes stale. It is not the only way. The handler read `into`
+    // fresh from `git rev-parse --abbrev-ref HEAD` and compared only
+    // `tipOf('HEAD')` against the handle — and two branches at one commit are
+    // completely ordinary: a branch cut and not yet committed on is exactly
+    // that. So a checkout to a sibling passed every staleness check there was.
+    //
+    // MEASURED, against a real repository, before the fix: the conflict taken
+    // on `main`, `git checkout release`, and the resolve answered
+    // `{ok: true, into: "release", changed: true, resolved: 1}` over a
+    // two-parent merge commit on a branch the caller had never named. The ref
+    // had carried the branch all along — `mergeRef` is minted `{branch, into}`
+    // — and `resolve_merge.args` handed the handler `bound.observed` alone,
+    // which is the two commits and the digest and nothing about a branch.
+    //
+    // THE BYTES CANNOT SEE THIS ONE COMING. A sibling at the same tip has the
+    // same working tree, so "nothing was merged" is read from the commit graph
+    // of the branch nobody named as well as from the files.
+    {
+      const fresh = await run('git', 'merge', { branch: 'incoming' });
+      check('a handle for the conflict as it stands now', fresh.ok === false && typeof fresh.mergeRef === 'string', short({ code: fresh.code }));
+      check('  minted on the branch being merged into', dec(fresh.mergeRef).d?.into === 'main', short(dec(fresh.mergeRef).d));
+
+      // A sibling cut from main with nothing committed on it: the ordinary
+      // shape, and the very same commit.
+      MB.git(root, 'branch', 'release');
+      MB.git(root, 'checkout', '-q', 'release');
+      check(
+        'a sibling branch at the very same commit is ordinary',
+        MB.git(root, 'rev-parse', 'release') === MB.git(root, 'rev-parse', 'main'),
+        `${MB.git(root, 'rev-parse', 'release')} vs ${MB.git(root, 'rev-parse', 'main')}`
+      );
+      before = MB.repoState(root);
+      const elsewhere = await run('git', 'resolve_merge', { mergeRef: fresh.mergeRef, choices: { [PAGE]: 'theirs' } });
+      check('ANSWERS FOR ONE BRANCH ARE NOT APPLIED TO A SIBLING AT THE SAME COMMIT', elsewhere.ok === false, short(elsewhere));
+      check('  as stale_merge', elsewhere.code === 'stale_merge', short({ code: elsewhere.code, message: elsewhere.message }));
+      check(
+        '  naming the branch it was for and the one the project is on',
+        /"main"/.test(String(elsewhere.message)) && /"release"/.test(String(elsewhere.message)),
+        short(elsewhere.message)
+      );
+      check('  saying what it saw and what is there now', elsewhere.expected?.into === 'main' && elsewhere.current?.into === 'release', short({ expected: elsewhere.expected, current: elsewhere.current }));
+      check('  and nothing was merged', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0, MB.movedBetween(before.bytes, MB.bytesOf(root)).join(', '));
+      check('  with HEAD where it was', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+      check(
+        '  AND NO MERGE COMMIT ON THE BRANCH NOBODY NAMED',
+        MB.git(root, 'log', '-1', '--format=%P', 'release').split(' ').length === 1,
+        MB.git(root, 'log', '-1', '--format=%P', 'release')
+      );
+      check('  and no merge was left in progress', !fs.existsSync(path.join(root, '.git', 'MERGE_HEAD')));
+
+      // A DETACHED HEAD AT THAT COMMIT IS THE SAME CASE. `rev-parse
+      // --abbrev-ref` says "HEAD" there, which is not the branch the handle
+      // carries — and committing a merge onto a detached HEAD is worse than
+      // committing it onto a sibling, because there is no branch pointing at it
+      // afterwards to find it by.
+      MB.git(root, 'checkout', '-q', '--detach', 'release');
+      before = MB.repoState(root);
+      const detached = await run('git', 'resolve_merge', { mergeRef: fresh.mergeRef, choices: { [PAGE]: 'theirs' } });
+      check('a detached HEAD at that same commit is refused too', detached.ok === false && detached.code === 'stale_merge', short(detached));
+      check('  and nothing was merged there either', MB.movedBetween(before.bytes, MB.bytesOf(root)).length === 0);
+      check('  with HEAD where it was', MB.git(root, 'rev-parse', 'HEAD') === before.head);
+
+      MB.git(root, 'checkout', '-q', 'main');
+      MB.git(root, 'branch', '-D', 'release');
+      check('the project is back on the branch the conflict was about', MB.git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main');
+    }
 
     // ── THE CONTROL ───────────────────────────────────────────────────────
     //

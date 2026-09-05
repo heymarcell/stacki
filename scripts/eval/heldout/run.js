@@ -74,6 +74,36 @@ function previewUrlOf(root) {
   }
 }
 
+/**
+ * Did a host actually run?
+ *
+ * `runHost` resolves `{ ok:false, error }` when `claude` could not be spawned at
+ * all — not on PATH, EACCES, killed before it said anything. Every count in that
+ * answer is zero because nothing happened, so everything derived from those
+ * counts is meaningless and must be refused rather than computed.
+ *
+ * A PURE FUNCTION ON PURPOSE. This question has been got wrong twice, both times
+ * inside a 200-line trial body that needs a packaged app, a real model and
+ * twenty minutes to reach — so nothing ever asked it directly. It is asked
+ * directly now, by test/eval-containment.js.
+ */
+const hostRan = (host) => !(host?.ok === false && !!host?.error);
+
+/**
+ * The isolation claim, or the refusal to make one.
+ *
+ * In `mcp-only` the model has no built-in tools at all, so any built-in call
+ * means the flag did not take. `null` when there was no run: a host that never
+ * started has no built-in calls because it has no calls, and both `0 === 0`
+ * (isolation HELD) and `undefined === 0` (isolation FAILED — the shape that
+ * actually shipped) are answers to a question nobody may ask.
+ */
+function isolationVerdict({ mode, host }) {
+  if (!hostRan(host)) return null;
+  if (mode !== 'mcp-only') return true;
+  return host.builtinToolCalls === 0;
+}
+
 async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log }) {
   const task = byId(id);
   const started = Date.now();
@@ -108,7 +138,21 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
     log(`${id}/${arm}: project ready`);
 
     const port = await freePort(44500 + ((process.pid % 50) * 6));
-    app = await startPackagedApp({ access: task.access, project: projectDir, app: appPath, portFrom: port });
+    // `contained: true` IS THE HALF OF THE CONTAINMENT THAT WAS MISSING.
+    //
+    // `git.publish` runs inside the APP, not inside the agent host. A trial
+    // that contained only its host was a contained agent asking an UNCONTAINED
+    // app to create a repository — the exact route that made a real one in an
+    // earlier campaign. Both processes are built with `containedEnv` now, and
+    // both records travel in the result file.
+    app = await startPackagedApp({
+      access: task.access,
+      project: projectDir,
+      app: appPath,
+      portFrom: port,
+      contained: true,
+    });
+    result.appContainment = app.containment;
     log(`${id}/${arm}: app on ${app.url}`);
 
     // At `visual` every project read is refused, so "is it open" cannot be
@@ -140,6 +184,10 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
       effort,
       schema: task.schema,
       timeoutMs: task.timeoutMs,
+      // The app above was launched with `containedEnv` too, so the recorded
+      // residual list must not go on saying it was not. Said here rather than
+      // assumed there: `runHost` cannot see what else a trial started.
+      siblingsContained: true,
       log: (m) => log(`${id}/${arm}: ${m}`),
     });
     await recorder.stop();
@@ -164,15 +212,8 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
       toolUse: host.toolUse,
       text: host.text,
     };
-    // THE ISOLATION CLAIM, CHECKED RATHER THAN ASSERTED. In `mcp-only` the
-    // model has no built-in tools at all, so any built-in call means the flag
-    // did not take and the trial's MCP counts are not the whole story.
-    // NULL RATHER THAN A VERDICT WHEN THERE WAS NO RUN. A host that never
-    // started has no built-in calls because it has no calls at all, and
-    // `0 === 0` would report that as isolation HOLDING just as surely as an
-    // earlier shape reported it as isolation FAILING. Neither is true.
-    result.isolationHeld =
-      host.ok === false && host.error ? null : task.mode !== 'mcp-only' || host.builtinToolCalls === 0;
+    // THE ISOLATION CLAIM, CHECKED RATHER THAN ASSERTED. See `isolationVerdict`.
+    result.isolationHeld = isolationVerdict({ mode: task.mode, host });
 
     result.wire = summarise(wirePath);
     const wireRows = fs
@@ -193,21 +234,21 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
     // scores those zeros: the oracle fails, `result.ok` is false, and the run
     // lands in the results file beside real failures with nothing to say it was
     // the harness rather than the product. That is the same shape as the
-    // `isolationHeld` defect below it — a derived answer computed without
+    // `isolationHeld` defect above it — a derived answer computed without
     // asking whether there was anything to derive it from.
     // NOT an early `return`: `result.elapsedMs` and the write of result.json
     // happen after the `finally` below, and returning from here would skip both
     // — leaving the run with no record at all, which is a worse answer than the
     // wrong one this is fixing.
-    const hostRan = !(host.ok === false && host.error);
-    if (!hostRan) {
+    const ran = hostRan(host);
+    if (!ran) {
       result.hostUnavailable = host.error;
       result.oracle = { pass: null, why: `the host never ran: ${host.error}` };
       result.ok = null;
       log(`${id}/${arm}: NOT GRADED — the host never ran (${host.error})`);
     }
 
-    if (hostRan) result.oracle = await task.check({
+    if (ran) result.oracle = await task.check({
       app,
       root: projectDir,
       previewUrl,
@@ -218,7 +259,7 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
       // assert that nothing at all changed rather than that one string survived.
       projectHash: result.projectHash,
     });
-    if (hostRan) result.ok = result.oracle?.pass === true;
+    if (ran) result.ok = result.oracle?.pass === true;
   } catch (err) {
     result.error = String(err?.stack || err?.message || err);
   } finally {
@@ -226,6 +267,12 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
     if (app) {
       const said = await app.stop().catch((e) => ({ problems: [String(e?.message || e)] }));
       result.cleanupProblems = said?.problems || [];
+      // WHAT THE APP'S OWN FAKE `gh` SAW. The agent's log says what went
+      // through the agent's `gh`; this says what went through the app's, which
+      // is the process `git.publish` actually runs in. `undefined` would mean
+      // the app was not contained, and `null` says so rather than reading as an
+      // empty list of calls.
+      if (result.appContainment) result.appContainment.ghCallsDuringTrial = said?.ghCallsDuringTrial ?? null;
     }
     // The project the app opened is removed by the app's own teardown; the
     // workspace around it is this run's evidence and stays.
@@ -295,4 +342,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runTrial, previewUrlOf, TASKS };
+module.exports = { runTrial, previewUrlOf, hostRan, isolationVerdict, TASKS };

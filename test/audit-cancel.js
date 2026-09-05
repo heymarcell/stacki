@@ -147,6 +147,28 @@ function gate(name) {
 }
 
 /**
+ * Wait for something to become true, ON THE CLOCK.
+ *
+ * Every other wait in this file spins on `setImmediate`, which is right when the
+ * thing being waited for is a microtask away. It is WRONG when a real timer
+ * stands in front of it: the engine sleeps `SETTLE_MS` (250ms) after every page
+ * load, and five thousand immediates go by in a fraction of that — so a spin
+ * that "waits for the run to reach its overflow probe" fell straight through
+ * with nothing blocked, and the case went on to release its stray at a moment
+ * of the loop's choosing rather than the one it names. Bounded in milliseconds,
+ * and it reports whether the condition actually came true rather than assuming
+ * it did.
+ */
+const until = async (condition, ms = 3000) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  return !!condition();
+};
+
+/**
  * A window that counts itself AND blocks where a real one blocks.
  *
  * `gateFor(phase, nth)` is asked before every operation the engine awaits on
@@ -314,10 +336,27 @@ const sessionFor = (log) => ({
         // subsequent clear hanging too, the next run merely times out again, and
         // whether it measured the page on a partition a stray clear was about to
         // wipe cannot be seen.
+        //
+        // `holdClearAt` holds NAMED CALLS ON GATES OF THEIR OWN, which is the
+        // only way two abandoned clears can be told apart. Every case above
+        // shares one gate, so releasing it releases everything held on it, and
+        // "the second one landed while the first was still outstanding" -- the
+        // exact sequence that let a second `strand` erase the first record --
+        // cannot be posed at all. Keyed by call number, same numbering as
+        // `holdClearOnly`.
         log.session.attempted += 1;
-        const held = log.session.holdClearOnly
-          ? log.session.attempted === log.session.holdClearOnly
-          : log.session.holdClearFrom && log.session.attempted >= log.session.holdClearFrom;
+        // WHICH CALL THIS IS, held for the whole of it. Read back off
+        // `attempted` after the await, a clear that hung for three more calls
+        // reported itself as the LAST one -- which is precisely the clear whose
+        // identity matters, and the reading that made a stray look like a
+        // routine one.
+        const nth = log.session.attempted;
+        const at = log.session.holdClearAt[nth] || null;
+        const held = at
+          ? true
+          : log.session.holdClearOnly
+            ? nth === log.session.holdClearOnly
+            : log.session.holdClearFrom && nth >= log.session.holdClearFrom;
         if (held) {
           // WHEN THE ROUND TRIP IS GENUINELY IN FLIGHT, which is the only moment
           // at which cancelling one proves anything. `attempted` moves before
@@ -325,10 +364,15 @@ const sessionFor = (log) => ({
           // can be aborting on a clear that already came back; `holding` moves
           // only for a call that is really hanging.
           log.session.holding += 1;
-          await log.session.holdClear.promise;
+          await (at || log.session.holdClear).promise;
         }
         log.session.storage += 1;
         log.session.dirty = false;
+        // WHICH RUN THE WIPE ACTUALLY LANDED IN, which is the property the mark
+        // exists to protect and the only reading that can tell "refused" from
+        // "was not wiped". `liveRun` is set by the case; a case that does not
+        // set it records 0 and reads nothing here.
+        log.session.landed.push({ clear: nth, whileRun: log.liveRun });
       },
       clearCache: async () => {
         log.session.cache += 1;
@@ -374,7 +418,23 @@ const newLog = () => ({
   destroyRefusalsLeft: 0,
   encoded: 0,
   blockedOn: [],
-  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holding: 0, holdClearFrom: 0, holdClearOnly: 0, holdClear: null, dirty: false, partitions: new Set() },
+  // Which run the case believes is in flight, so `landed` can say which run a
+  // stray wipe arrived in. Only the cases that care set it.
+  liveRun: 0,
+  session: {
+    storage: 0,
+    cache: 0,
+    auth: 0,
+    attempted: 0,
+    holding: 0,
+    holdClearFrom: 0,
+    holdClearOnly: 0,
+    holdClearAt: {},
+    holdClear: null,
+    dirty: false,
+    landed: [],
+    partitions: new Set(),
+  },
 });
 
 /**
@@ -832,8 +892,125 @@ const engineWith = (log, opts = {}) =>
       };
     })();
 
+    // AND THE SIXTH, WHICH IS ABOUT A RUN THAT STRANDS TWO CLEARS RATHER THAN
+    // ONE.
+    //
+    // The mark was a SINGLE SLOT, so a second `strand` inside one run
+    // overwrote the first record -- and the drop only fired when the mark WAS
+    // the settling record, so the second clear coming back cleared the mark
+    // while the FIRST was still loose on the shared partition.
+    //
+    // One run strands twice on the ordinary path: its opening reset is walked
+    // away from the instant its caller aborts (that await races the signal),
+    // and the reset in its own `finally` then overruns its budget on the way
+    // out (that one races the clock alone, deliberately). Two clears, two
+    // gates, released in the order that hides the first behind the second.
+    //
+    // Reproduced against the real engine on this double before the fix, one
+    // engine, two runs, with the partition logging which run had a page on it:
+    // run 2 was NOT refused, opened its window, answered `ok:true` -- and run
+    // 1's opening clear landed inside it:
+    //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},{clear:1,whileRun:2}]
+    //
+    // THE ORACLE IS `landed`, not the refusal code. A door that refused for any
+    // other reason would satisfy a code assertion; what has to be true is that
+    // no clear from run 1 ever lands while run 2 has a page on the partition.
+    const firstStray = gate('the opening clear run 1 was cancelled inside');
+    const secondStray = gate('the clear run 1\'s own finally timed out on');
+    // Run 2's measurement is held open at its overflow probe -- page loaded,
+    // state written to the partition, the measurement half done -- so the first
+    // stray can be released WHILE that run is using the partition, which is the
+    // moment a stray wipe does its damage and the only moment at which `landed`
+    // distinguishes "refused" from "was lucky". The overflow probe rather than
+    // the axe one because these runs pass `rules: []`, which skips the
+    // accessibility pass entirely: a gate on a phase that never happens holds
+    // nothing and would quietly turn this into a case about timing. Run 1 opens
+    // no window at all (it is cancelled inside its opening clear, before the
+    // first viewport), so the first window this engine ever makes is run 2's.
+    const twoHold = gate('run 2\'s overflow probe, held so a stray can land inside it');
+    const twoLog = newLog();
+    twoLog.session.holdClearAt = { 1: firstStray, 2: secondStray };
+    const twoEngine = engineWith(twoLog, { gateFor: (phase, nth) => (phase === 'overflow' && nth === 1 ? twoHold : null) });
+    const twoAc = new AbortController();
+    const twoStory = (async () => {
+      twoLog.liveRun = 1;
+      // Aborted when the opening clear is really in flight, so run 1 strands a
+      // live round trip rather than one that happens to be near a cancel.
+      const abortWhenHeld = (async () => {
+        for (let i = 0; i < 5000 && twoLog.session.holding < 1; i += 1) await new Promise((r) => setImmediate(r));
+        twoAc.abort();
+      })();
+      const first = await twoEngine.run({ route: '/', viewports: ONE, rules: [] }, { signal: twoAc.signal });
+      await abortWhenHeld;
+      const strandedTwice = twoLog.session.attempted === 2 && twoLog.session.holding === 2;
+      twoLog.liveRun = 0;
+
+      // WITH BOTH STILL OUTSTANDING, THE DOOR HAS TO SAY THERE ARE TWO. A
+      // caller told to try again "once it has settled" when two clears are
+      // loose is being told to wait for the wrong thing, and a set that reports
+      // only its first member is a slot wearing a Set's clothes.
+      const bothOut = await twoEngine.run({ route: '/', viewports: ONE, rules: [] });
+
+      // Only the SECOND stray lands. This is the whole case: the old drop was
+      // satisfied by whichever record settled last, so this release alone
+      // reopened the door.
+      secondStray.release();
+      for (let i = 0; i < 5000 && twoLog.session.auth < 1; i += 1) await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      const openedAfterFirst = twoLog.opened;
+      const at = Date.now();
+      // `liveRun` goes back to 0 THE MOMENT run 2 answers, before anything the
+      // test does next -- so a stray released after the refusal is recorded as
+      // landing on a quiet partition, and only a stray that lands on a run that
+      // is genuinely still measuring is recorded against it.
+      twoLog.liveRun = 2;
+      let answered = false;
+      let secondTook = 0;
+      // Read AT THE MOMENT run 2 answers: a refusal that arrived after the
+      // stray had already landed would prove nothing.
+      let firstStrayStillOutstanding = false;
+      const running = twoEngine.run({ route: '/', viewports: ONE, rules: [] }).then((v) => {
+        answered = true;
+        secondTook = Date.now() - at;
+        firstStrayStillOutstanding = firstStray.released() === false;
+        twoLog.liveRun = 0;
+        return v;
+      });
+      // Released either when run 2 is demonstrably measuring a page, or when it
+      // has refused -- never on a timer's guess at which.
+      await until(() => answered || twoLog.blockedOn.includes('overflow'));
+      const releasedMidMeasurement = !answered && twoLog.blockedOn.includes('overflow');
+      firstStray.release();
+      await until(() => twoLog.session.landed.some((l) => l.clear === 1));
+      twoHold.release();
+      const second = await running;
+      const story = {
+        first,
+        second,
+        bothOut,
+        strandedTwice,
+        openedAfterFirst,
+        openedAfterSecond: twoLog.opened,
+        secondTook,
+        releasedMidMeasurement,
+        firstStrayStillOutstanding,
+        firstStrayLandedAt: twoLog.session.landed.find((l) => l.clear === 1) || null,
+      };
+
+      // AND THE PARTITION COMES BACK once both strays have landed -- the
+      // control that stops "refuse for ever" satisfying the refusal.
+      twoLog.liveRun = 3;
+      await until(() => twoLog.session.landed.length >= 2);
+      await new Promise((r) => setImmediate(r));
+      story.third = await twoEngine.run({ route: '/', viewports: ONE, rules: [] });
+      story.openedAfterThird = twoLog.opened;
+      story.landed = twoLog.session.landed;
+      return story;
+    })();
+
     const started = Date.now();
-    const [freeze, picture, onTheWayOut, cancelledCleanup, stranded] = await Promise.all([
+    const [freeze, picture, onTheWayOut, cancelledCleanup, stranded, twoStrays] = await Promise.all([
       boundDeadline(
         'a freeze that never returns',
         engineWith(freezeLog, { gateFor: (phase) => (phase === 'freeze' ? freezeGate : null) }).run({ route: '/', viewports: ONE, rules: [] }),
@@ -861,6 +1038,7 @@ const engineWith = (log, opts = {}) =>
         75000
       ),
       boundDeadline('an audit whose abandoned cleanup outlives it', strandedStory, 75000),
+      boundDeadline('an audit that abandoned TWO clears', twoStory, 75000),
     ]);
     const took = Date.now() - started;
     check('a freeze that never returns does not hold the audit for ever', freeze.answered === true, short(freeze.value));
@@ -951,6 +1129,80 @@ const engineWith = (log, opts = {}) =>
     check('an audit run after the stray clear has landed is measured normally', third.value?.ok === true, short(third.value));
     check('  and opened its window', strandedLog.opened === story?.openedAfterFirst + 1, short(strandedLog.opened));
     check('  and claims isolation again', third.value?.engine?.sessionIsolated === true, short(third.value?.engine));
+    check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
+
+    // ---- AND A RUN THAT ABANDONED TWO CLEARS, WHICH ONE SLOT COULD NOT HOLD --
+    const two = twoStrays.value;
+    check('an audit that abandoned two clears still answers', twoStrays.answered === true, short(two));
+    check('  and answers as cancelled, which is what its caller did', two?.first?.ok === false && two?.first?.code === 'cancelled', short(two?.first));
+    // THE PREMISE, ASSERTED. Without this the case below could be passing
+    // because only ONE clear was ever stranded, which is the case already
+    // covered above and proves nothing about the slot.
+    check(
+      '  having really left TWO clears outstanding on the partition, not one',
+      two?.strandedTwice === true,
+      short({ attempted: twoLog.session.attempted, holding: twoLog.session.holding })
+    );
+    check(
+      'an audit attempted while BOTH are outstanding is refused',
+      two?.bothOut?.ok === false && two?.bothOut?.code === 'session_not_isolated',
+      short(two?.bothOut)
+    );
+    check(
+      '  and counts the second one rather than reporting only the first',
+      /1 further cleanup is outstanding on the same partition\./.test(String(two?.bothOut?.message || '')) &&
+        /Try again once they have settled\./.test(String(two?.bothOut?.message || '')),
+      short(two?.bothOut?.message)
+    );
+    check(
+      'the audit after them refuses even though the SECOND stray has landed',
+      two?.second?.ok === false && two?.second?.code === 'session_not_isolated',
+      short(two?.second)
+    );
+    check('  while the FIRST was still outstanding', two?.firstStrayStillOutstanding === true, short(two));
+    check('  and opens no window at all', two?.openedAfterSecond === two?.openedAfterFirst, short({ before: two?.openedAfterFirst, after: two?.openedAfterSecond }));
+    check('  and says so at once rather than waiting it out', two?.secondTook < ANSWER_BY_MS, `${two?.secondTook}ms`);
+    // AND WHAT THE REFUSAL SAYS, which has to name the reason the OLDEST clear
+    // was let go of -- a cancel, not a budget. The engine used to assert
+    // "after it overran its budget" whichever way out the await took, and to
+    // print the module-private CANCELLED symbol as the reason.
+    check(
+      '  naming the cancel that stranded the oldest one, rather than a budget it never reached',
+      /previous audit's cleanup was abandoned \(the audit that started it was cancelled while the clear was in flight\)/.test(String(two?.second?.message || '')) &&
+        !/Symbol\(/.test(String(two?.second?.message || '')),
+      short(two?.second?.message)
+    );
+    // AND THE PARTITION COMES BACK, so this is a refusal that ends.
+    check('an audit run after BOTH strays landed is measured normally', two?.third?.ok === true, short(two?.third));
+    check('  and opened its window', two?.openedAfterThird === two?.openedAfterFirst + 1, short({ after: two?.openedAfterThird, before: two?.openedAfterFirst }));
+    check('  and claims isolation again', two?.third?.engine?.sessionIsolated === true, short(two?.third?.engine));
+    // THE PROPERTY ITSELF, read off the partition rather than off the refusal.
+    //
+    // The stray is released while run 2 is HELD OPEN AT ITS AXE INJECTION -- a
+    // page loaded, state written, the measurement half done -- so on a build
+    // that let run 2 through, the wipe lands inside it and is recorded against
+    // it. `liveRun` returns to 0 the instant run 2 answers, so a stray released
+    // after a refusal is recorded as landing on a quiet partition. This is the
+    // assertion that went red before the fix.
+    //
+    // TWO CANARIES FIRST, because "no stray landed inside a run" is satisfied
+    // by a stray that never landed at all and by a reading that never moves.
+    check(
+      '  the stray really did land in the end, so the negative below is about WHEN and not WHETHER',
+      !!two?.firstStrayLandedAt,
+      short(two?.landed)
+    );
+    check(
+      '  and the partition really does record a clear against a run in flight',
+      (two?.landed || []).some((l) => l.whileRun > 1),
+      short(two?.landed)
+    );
+    const strayInsideARun = (two?.landed || []).filter((l) => l.clear <= 2 && l.whileRun > 1);
+    check(
+      '  and no clear run 1 abandoned ever landed inside a run that was measuring',
+      strayInsideARun.length === 0,
+      short({ landed: two?.landed, strayInsideARun, releasedMidMeasurement: two?.releasedMidMeasurement })
+    );
     check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
   }
 

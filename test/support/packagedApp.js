@@ -22,6 +22,9 @@ const { connectMcp } = require('./mcpWire.js');
 const { CACHE, ensureAstro } = require('../agent-canvas-fixture.js');
 const { projectFingerprint } = require('../../electron/mcp/agent/refs.js');
 const { createManifest, residueOfManifest, describeManifestResidue } = require('./ownership.js');
+// The evaluation harness's environment builder. See `contained` below for why
+// a test-support module depends on it rather than approximating it.
+const { containedEnv } = require('../../scripts/eval/heldout/host.js');
 
 const APP = path.join(__dirname, '..', '..', 'release', 'mac-universal', 'Stacki.app');
 const BINARY = path.join(APP, 'Contents', 'MacOS', 'Stacki');
@@ -111,6 +114,33 @@ async function startPackagedApp({
   project: given = null,
   // Which bundle to launch. See `binaryOf`.
   app = APP,
+  // WHETHER THIS APP IS PART OF A TRIAL, and must therefore be unable to reach
+  // GitHub.
+  //
+  // `git.publish` runs INSIDE THIS PROCESS, not inside the agent host. So a
+  // held-out trial that contained its agent and launched this with
+  // `{...process.env}` had a contained agent asking an UNCONTAINED app to
+  // create a repository — which is exactly the route that created a real one in
+  // an earlier campaign, and the reason test/support/fakeGh.js exists at all.
+  // The agent's `ghCallsDuringTrial` then proved what went through the agent's
+  // `gh` and nothing whatever about this app's.
+  //
+  // OPT-IN, NOT DEFAULT-ON, and the choice is deliberate. Eight callers start
+  // this app and only the evaluation runners are trials; the rest are ordinary
+  // packaged suites that legitimately run with the developer's environment.
+  // Containment does not merely remove credentials — it sets CI=1, repoints
+  // GIT_CONFIG_GLOBAL at a throwaway identity with no credential helper, and
+  // shadows `gh` — so switching it on by default would silently change what
+  // every one of those suites measures, and would hand each of them two temp
+  // directories they never allocated and must now tear down. A containment that
+  // changes the ordinary suites is a regression with a security rationale.
+  //
+  // The risk of opting in is that a future trial FORGETS. That is closed at the
+  // other end rather than here: `runHost` records `siblingsContained` and
+  // defaults it to false, so a runner that contains its host and forgets its
+  // app writes "the app was not contained" into its own results file. The
+  // omission speaks; it does not merely fail to be mentioned.
+  contained = false,
 } = {}) {
   if (!available(app)) throw new Error(`no packaged app at ${app}`);
   const binary = binaryOf(app);
@@ -144,17 +174,26 @@ async function startPackagedApp({
   manifest.path('userData', userData);
   manifest.port('mcp', port);
 
+  // Passed through `containedEnv`'s `env` channel rather than merged over its
+  // answer, so the harness sees what this caller deliberately set — and so a
+  // future STACKI_* name that happens to look credential-shaped is exempt from
+  // the shape strip for the right reason instead of by luck.
+  const appVars = {
+    STACKI_NO_DIALOGS: '1',
+    STACKI_HIDDEN_WINDOW: '1',
+    STACKI_MCP_PORT: String(port),
+    STACKI_AUTOMATION_PROJECT: project,
+    STACKI_AUTOMATION_MARKER: marker,
+  };
+  // Built before the spawn so a refusal happens before there is a process to
+  // clean up. `containedEnv` fails closed: if the fake `gh` did not take PATH,
+  // or a GitHub credential was passed in, it throws rather than launching.
+  const containment = contained ? containedEnv(appVars, { siblingsContained: true }) : null;
+
   const output = [];
   let exited = null;
   const child = spawn(binary, [`--user-data-dir=${userData}`], {
-    env: {
-      ...process.env,
-      STACKI_NO_DIALOGS: '1',
-      STACKI_HIDDEN_WINDOW: '1',
-      STACKI_MCP_PORT: String(port),
-      STACKI_AUTOMATION_PROJECT: project,
-      STACKI_AUTOMATION_MARKER: marker,
-    },
+    env: containment ? containment.env : { ...process.env, ...appVars },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (d) => output.push(String(d)));
@@ -164,21 +203,62 @@ async function startPackagedApp({
   });
   manifest.process('packaged app', child.pid);
 
-  let token = null;
-  for (let i = 0; i < 160 && token === null && exited === null; i += 1) {
-    await sleep(500);
-    try {
-      token = JSON.parse(fs.readFileSync(path.join(userData, 'mcp-token.json'), 'utf8')).token;
-    } catch {
-      /* not written yet */
-    }
-  }
-  if (!token) {
-    throw new Error(`the packaged app did not start its MCP server (exit=${exited})\n${output.join('').slice(-800)}`);
-  }
-
+  // A START THAT NEVER COMPLETES STILL OWNS THE CONTAINMENT IT BUILT.
+  //
+  // `stop()` is the only thing that tears the containment down, and there is no
+  // `stop()` to call when the app never answered — the caller gets a throw and
+  // nothing else. Left alone, an app that failed to start would leave a fake
+  // `gh` directory and a GH_CONFIG_DIR in os.tmpdir() on every attempt. This is
+  // the same defect `containedEnv` itself had to fix one round ago, in the same
+  // shape: teardown reachable only along the happy path.
   const url = `http://127.0.0.1:${port}/mcp`;
-  const { client, close } = await connectMcp({ url, token, era: 'modern', name: 'Stacki Phase A Agent' });
+  let token = null;
+  let client = null;
+  let close = null;
+  try {
+    for (let i = 0; i < 160 && token === null && exited === null; i += 1) {
+      await sleep(500);
+      try {
+        token = JSON.parse(fs.readFileSync(path.join(userData, 'mcp-token.json'), 'utf8')).token;
+      } catch {
+        /* not written yet */
+      }
+    }
+    if (!token) {
+      throw new Error(`the packaged app did not start its MCP server (exit=${exited})\n${output.join('').slice(-800)}`);
+    }
+    ({ client, close } = await connectMcp({ url, token, era: 'modern', name: 'Stacki Phase A Agent' }));
+  } catch (err) {
+    if (containment) {
+      try {
+        containment.cleanup();
+      } catch {
+        /* nothing to tear down */
+      }
+    }
+    // The app is dead or never answered; the process is killed for the case
+    // where it is running but silent, so its userData is not still held.
+    try {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+    // AND THE DIRECTORIES THIS FUNCTION MADE. `userData` has no other reference
+    // in the world — the caller never sees it, because the caller gets a throw
+    // instead of the object that names it — so leaving it behind leaves a
+    // directory nobody can ever identify as theirs. The fixture project goes
+    // the same way when this module built it; a project the CALLER handed over
+    // is the caller's to remove. Everything the error needs to be diagnosed is
+    // already in its message: the exit code and the tail of the app's output.
+    for (const dir of given ? [userData] : [userData, project]) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* still held; the parent's ownership sweep will report it */
+      }
+    }
+    throw err;
+  }
 
   const call = async (name, args = {}) =>
     (await client.callTool({ name, arguments: args }, { timeout: 240000 })).structuredContent;
@@ -306,6 +386,19 @@ async function startPackagedApp({
       }
     }
     if (child.exitCode === null) problems.push(`the app (pid ${child.pid}) is still running`);
+
+    // TORN DOWN ONLY ONCE THE APP IS DEAD, and what it saw travels with the
+    // answer. Removing the fake `gh` while the app could still call it would
+    // un-shadow the real one for whatever the app does on its way out.
+    let ghCallsDuringTrial = null;
+    if (containment) {
+      try {
+        ghCallsDuringTrial = containment.cleanup();
+      } catch (err) {
+        problems.push(`the app's containment would not tear down: ${err?.message || err}`);
+      }
+    }
+
     for (const dir of [userData, project]) {
       for (let attempt = 0; attempt < 6 && fs.existsSync(dir); attempt += 1) {
         try {
@@ -327,10 +420,45 @@ async function startPackagedApp({
     if (left.processes.length || left.ports.length || left.paths.length) {
       problems.push(describeManifestResidue(left));
     }
-    return { problems, pid: child.pid, port, project, userData, manifest: manifest.read() };
+    return {
+      problems,
+      pid: child.pid,
+      port,
+      project,
+      userData,
+      manifest: manifest.read(),
+      // NULL WHEN UNCONTAINED, never an empty list. `[]` from an app that was
+      // launched with the developer's real `gh` would read as "the app called
+      // gh zero times", which is precisely the false proof this exists to stop.
+      ghCallsDuringTrial,
+    };
   };
 
-  return { child, client, call, run, untilOpen, untilPreviewReady, claimDevServer, claimAll, manifest, stop, project, opened, userData, port, marker, output, url, token };
+  return {
+    child,
+    client,
+    call,
+    run,
+    untilOpen,
+    untilPreviewReady,
+    claimDevServer,
+    claimAll,
+    manifest,
+    stop,
+    project,
+    opened,
+    userData,
+    port,
+    marker,
+    output,
+    url,
+    token,
+    // What was CHECKED about this app's environment, available as soon as it is
+    // running rather than only at teardown, so a trial can record it beside the
+    // agent's. Null when the app was not contained — which is the truth, and is
+    // what a reader of the results should see.
+    containment: containment ? containment.assertions : null,
+  };
 }
 
 module.exports = { startPackagedApp, available, APP, BINARY, sleep, portTaken };

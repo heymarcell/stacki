@@ -1140,7 +1140,10 @@ async function suite() {
       projectPath: dir,
       branch: 'feature',
       choices: {},
-      expect: { head: clash.at.head, incoming: clash.at.incoming, digest: emptyDigest },
+      // `into` is carried through unchanged: the binding has to be a WHOLE
+      // binding or the guard-required refusal answers first, and this section is
+      // about the digest check, not about that one.
+      expect: { head: clash.at.head, incoming: clash.at.incoming, digest: emptyDigest, into: clash.at.into },
     });
     await refusedCleanly(
       'T15c-only a clean re-merge whose binding the digest check cannot reject',
@@ -1657,6 +1660,11 @@ async function suite() {
       ['an empty object', {}],
       ['only the head', { head: clash.at.head }],
       ['head and incoming but no digest', { head: clash.at.head, incoming: clash.at.incoming }],
+      // The one the handle used to be missing altogether. Without it a resolve
+      // knows which two commits it is between and not which branch it is
+      // landing on, which is how answers about `main` got committed onto a
+      // sibling at the same tip — see T27.
+      ['the two commits and the digest but no branch to merge into', { head: clash.at.head, incoming: clash.at.incoming, digest: clash.at.digest }],
       ['a string', 'stacki:not-an-observation'],
     ]) {
       const half = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs', 'theirs'] }, expect: partial });
@@ -2667,6 +2675,127 @@ async function suite() {
       textOf(path.join(twin, 'a.txt')) === textOf(path.join(dir, 'a.txt')),
       JSON.stringify({ whole: textOf(path.join(twin, 'a.txt')), perHunk: textOf(path.join(dir, 'a.txt')) })
     );
+  }
+
+  {
+    // T25 — THE BINDING PINNED TWO COMMITS AND NOT THE BRANCH BEING MERGED INTO.
+    //
+    // `into` is read fresh from `git rev-parse --abbrev-ref HEAD` at the top of
+    // resolveMerge, and the staleness checks compared `tipOf('HEAD')` against
+    // the handle. Two branches at one commit are completely ordinary — a branch
+    // cut and not yet committed on is exactly that — so a checkout to a sibling
+    // between the conflict and the resolve moved no commit, changed no file,
+    // and passed every check there was.
+    //
+    // MEASURED before the fix, with real git and real commits: the conflict
+    // taken on `main`, `git checkout release` where release had just been cut
+    // from main, and the resolve answered `{ok: true, into: "release",
+    // changed: true, resolved: 1}` over a two-parent merge commit on a branch
+    // the caller had never named. This is the PANEL's route — GitChip sends
+    // `expect: conflict.at` straight over IPC — and the panel then toasted
+    // "Merged feature into release" about a merge nobody had asked for.
+    //
+    // THE ORACLE IS THE COMMIT GRAPH, not the working tree. A sibling at the
+    // same tip has the same files, so `bytesOf` cannot see this one: what says
+    // it happened is a second parent on a branch that was never named.
+    const dir = await twoClashRepo('siblingtip');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T25: the caller is shown a conflict', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    check('T25: and the handle says which branch it was merging into', clash.at?.into === 'main', JSON.stringify(clash.at));
+
+    await sh(dir, 'branch', 'release');
+    await sh(dir, 'checkout', '-q', 'release');
+    check(
+      'T25: the sibling is at the very same commit, which is why the SHA check cannot see it',
+      (await sh(dir, 'rev-parse', 'release')) === (await sh(dir, 'rev-parse', 'main')),
+      `${await sh(dir, 'rev-parse', 'release')} vs ${await sh(dir, 'rev-parse', 'main')}`
+    );
+    const before = await repoState(dir);
+    const elsewhere = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'ours' },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T25 answers for one branch applied while the project is on a sibling at the same commit',
+      elsewhere,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.expected?.into === 'main' && r.current?.into === 'release' && /"main"/.test(String(r.message)) && /"release"/.test(String(r.message))
+    );
+    check(
+      'T25: AND NO MERGE COMMIT LANDED ON THE BRANCH NOBODY NAMED',
+      (await sh(dir, 'log', '-1', '--format=%P', 'release')).split(' ').length === 1,
+      await sh(dir, 'log', '-1', '--format=%P', 'release')
+    );
+    check(
+      'T25:   nor on the one the answers were about',
+      (await sh(dir, 'log', '-1', '--format=%P', 'main')).split(' ').length === 1,
+      await sh(dir, 'log', '-1', '--format=%P', 'main')
+    );
+
+    // A DETACHED HEAD AT THAT COMMIT IS THE SAME CASE, and a worse landing
+    // place: a merge committed there has no branch pointing at it afterwards.
+    // `rev-parse --abbrev-ref` answers "HEAD" when detached, which is not the
+    // branch name the handle carries, so the same guard catches it.
+    await sh(dir, 'checkout', '-q', '--detach', 'release');
+    const beforeDetached = await repoState(dir);
+    const detached = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'ours' },
+      expect: clash.at,
+    });
+    await refusedCleanly(
+      'T25 the same answers applied on a detached HEAD at that commit',
+      detached,
+      dir,
+      beforeDetached,
+      'stale_merge',
+      (r) => r.expected?.into === 'main' && r.current?.into !== 'main'
+    );
+
+    // THE CONTROL. Every check above is refusal-shaped, and a guard that
+    // refused every resolve would satisfy all of them. Back on the branch the
+    // conflict was about, the SAME handle and the SAME answers still merge.
+    await sh(dir, 'checkout', '-q', 'main');
+    const settled = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: { 'a.txt': 'ours' },
+      expect: clash.at,
+    });
+    check('T25 control: the same resolve on the branch it was for still merges', settled?.ok === true, JSON.stringify(settled).slice(0, 240));
+    check('T25 control:   into the branch the caller was told about', settled?.into === 'main', JSON.stringify({ into: settled?.into }));
+    check('T25 control:   as a two-parent merge commit on main', (await sh(dir, 'log', '-1', '--format=%P', 'main')).split(' ').length === 2, await sh(dir, 'log', '-1', '--format=%P', 'main'));
+    check('T25 control:   and the sibling was left alone', (await sh(dir, 'log', '-1', '--format=%P', 'release')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P', 'release'));
+    check('T25 control:   on a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+
+    // AND THE OTHER CONTROL, which is the one a guard like this gets wrong.
+    // Refusing a detached HEAD is right only when the binding was made
+    // somewhere else. A conflict taken WHILE detached and resolved from the
+    // same detached HEAD is one place, not two, and it has to still merge —
+    // `rev-parse --abbrev-ref` answers "HEAD" both times, so the comparison
+    // agrees with itself. Without this, a guard that simply refused every
+    // detached resolve would pass everything above.
+    const solo = await twoClashRepo('detachedboth');
+    cleanup.push(solo);
+    await sh(solo, 'checkout', '-q', '--detach', 'main');
+    const detachedClash = await mergeBranch(git, { projectPath: solo, branch: 'feature' });
+    check('T25 control: a conflict taken on a detached HEAD is reported', detachedClash.ok === false && detachedClash.conflicted === true, JSON.stringify(detachedClash).slice(0, 160));
+    check('T25 control:   with the handle naming where it was', detachedClash.at?.into === 'HEAD', JSON.stringify(detachedClash.at));
+    const settledSolo = await resolveMerge(git, {
+      projectPath: solo,
+      branch: 'feature',
+      choices: { 'a.txt': 'theirs' },
+      expect: detachedClash.at,
+    });
+    check('T25 control: and answering it from that same detached HEAD still merges', settledSolo?.ok === true, JSON.stringify(settledSolo).slice(0, 240));
+    check('T25 control:   as a two-parent commit', (await sh(solo, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(solo, 'log', '-1', '--format=%P'));
+    check('T25 control:   taking the side that was asked for', /TOP-feat/.test(String(textOf(path.join(solo, 'a.txt')))), JSON.stringify(textOf(path.join(solo, 'a.txt'))));
   }
 
 }

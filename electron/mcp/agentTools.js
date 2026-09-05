@@ -1059,14 +1059,11 @@ function registerAgentTools(server, { api }) {
         // Declaring `text` optional is what lets `value` be accepted; the cost
         // is that a call with NEITHER now reaches here instead of being refused
         // by the schema. Refused with a sentence that names both, which is what
-        // the Zod error should have said in the first place.
-        if (name === 'target' && action === 'set_text' && typeof shaped.text !== 'string') {
-          return answer({
-            ok: false,
-            code: 'bad_arguments',
-            operation: 'target.set_text',
-            message: 'set_text needs the new text. Send it as `text` — `value` is accepted too, because that is what the same operation is called inside `edit`.',
-          });
+        // the Zod error should have said in the first place — in BOTH forms of
+        // the operation. See `textlessSetText`.
+        if (name === 'target') {
+          const textless = textlessSetText(action, shaped);
+          if (textless) return answer(textless);
         }
         return answer(await api.run(name, action, shaped));
       }
@@ -1349,8 +1346,121 @@ const ToolRefusal = z.strictObject({
     .optional(),
 });
 
+/** Two JSON Schema fragments, compared as documents rather than as objects. */
+const sameFragment = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** A fragment's alternatives: the members of a bare `anyOf`, or the thing itself. */
+const alternativesOf = (spec) =>
+  spec && typeof spec === 'object' && Array.isArray(spec.anyOf) && Object.keys(spec).length === 1 ? spec.anyOf : [spec];
+
+/**
+ * THE UNION DELETED THE PUBLISHED SHAPE OF THE TOOLS IT WAS APPLIED TO.
+ *
+ * `z.union([Payload, ToolRefusal])` emits `{anyOf:[{…},{…}]}` and NOTHING at the
+ * top level — no `properties`, no `required`. Measured on all four tools that
+ * declare one: `get_context`, `capture`, `get_comments` and `comment` each went
+ * from publishing a named, typed field list to publishing two nested branches
+ * and a root with `$schema` and `anyOf` in it. A host that reads
+ * `outputSchema.properties` to render or to type a result — the same client
+ * class `summarised()` a few hundred lines up exists to serve — got nothing at
+ * all. Declaring the refusal made the declaration TRUER and the document LESS
+ * USEFUL, which is not a trade this surface has to make.
+ *
+ * So the branches are kept exactly as they are, and the fields they declare are
+ * ALSO published at the top level, where a client that has never heard of
+ * `anyOf` will look. Both readings stay true at once:
+ *
+ *   - a hoisted property is asserted against every answer, so it may only be
+ *     hoisted in a form BOTH branches satisfy. A name that appears once is
+ *     copied; a name both branches declare identically is copied once; a name
+ *     they declare DIFFERENTLY (`ok` is `boolean` in a payload and `const
+ *     false` in a refusal) is published as the alternatives side by side, which
+ *     is the only shape that accepts both. Nothing is narrowed and nothing that
+ *     used to validate stops validating.
+ *
+ *   - `required` CANNOT carry the payload's list, and this is the one place the
+ *     two readings genuinely cannot both hold. A top-level `required` is
+ *     asserted against every answer too, so publishing the payload's required
+ *     fields there would refuse every refusal — reinstating exactly the false
+ *     declaration `orRefusal` was written to end. What is published instead is
+ *     the INTERSECTION: the fields every possible answer really does carry.
+ *     For `get_comments` and `comment` that is `ok`, which is the useful half
+ *     anyway ("every answer says whether it worked"); for `get_context` and
+ *     `capture` the payload and the refusal share no field at all, so the
+ *     honest answer is that nothing is guaranteed, and `required` is omitted
+ *     rather than asserted falsely. The per-branch `required` lists are still
+ *     there, in the branches, for a client that reads them.
+ *
+ * The alternative — collapsing the two branches into one object with everything
+ * optional — would publish `properties` and `required` at the root and stop
+ * saying which COMBINATIONS are legal, so `{}` would validate against a tool
+ * that can never answer with it. That trades a true document for a readable
+ * one; this trades nothing.
+ */
+function hoistUnionProperties(doc) {
+  const branches = Array.isArray(doc?.anyOf) ? doc.anyOf : null;
+  const shaped = branches && branches.length > 1 && branches.every((b) => b && typeof b === 'object' && b.properties && typeof b.properties === 'object');
+  // Not a union of objects: hand back exactly what was converted. A shape this
+  // does not understand must not be half-rewritten.
+  if (!shaped) return doc;
+  const properties = {};
+  for (const branch of branches) {
+    for (const [name, spec] of Object.entries(branch.properties)) {
+      if (!(name in properties)) {
+        properties[name] = spec;
+        continue;
+      }
+      if (sameFragment(properties[name], spec)) continue;
+      const merged = [];
+      for (const alt of [...alternativesOf(properties[name]), ...alternativesOf(spec)]) {
+        if (!merged.some((m) => sameFragment(m, alt))) merged.push(alt);
+      }
+      properties[name] = { anyOf: merged };
+    }
+  }
+  const required = branches.reduce((kept, branch) => kept.filter((name) => (branch.required || []).includes(name)), [...(branches[0].required || [])]);
+  return { ...doc, type: 'object', properties, ...(required.length ? { required } : {}) };
+}
+
+/**
+ * A schema that VALIDATES as itself and PUBLISHES with its fields hoisted.
+ *
+ * Same shape as `advertised()` and for a related reason: the SDK reads
+ * `~standard` and nothing else, so the document a client is served can be
+ * improved without touching what the server actually checks an answer against.
+ * `validate` is delegated to the real schema rather than reimplemented, so a
+ * payload with a wrong-typed field is refused exactly as it was — that
+ * assertion exists in test/schema-strictness.js and it is still the same zod
+ * answering it.
+ */
+function publishedAs(schema, shapeDocument) {
+  const std = schema['~standard'];
+  const convert = std.jsonSchema || {
+    input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
+    output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+  };
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'stacki',
+      jsonSchema: {
+        input: (o) => shapeDocument(convert.input(o)),
+        output: (o) => shapeDocument(convert.output(o)),
+      },
+      validate: (value) => schema['~standard'].validate(value),
+    },
+    safeParse: (value) => schema.safeParse(value),
+    parse: (value) => schema.parse(value),
+    // The union itself, for the readers that need the schema rather than an
+    // answer from it — the refusal-branch derivation in
+    // test/schema-strictness.js finds the four tools by looking for
+    // `ToolRefusal` among a published union's options.
+    schema,
+  };
+}
+
 /** What a tool publishes when its answer is either a payload or a refusal. */
-const orRefusal = (payload) => z.union([payload, ToolRefusal]);
+const orRefusal = (payload) => publishedAs(z.union([payload, ToolRefusal]), hoistUnionProperties);
 
 /**
  * A CLAUSE, NOT A SENTENCE — THE FULL STOP THE ISSUE HAD ALREADY WRITTEN.
@@ -1568,6 +1678,70 @@ function normalise(domain, action, args) {
     };
   }
   return args;
+}
+
+/**
+ * THE ONE OPERATION THAT CAN ARRIVE WITH NO ARGUMENT AT ALL — IN EITHER FORM.
+ *
+ * `set_text` declares BOTH its spellings optional, which is the price of
+ * accepting `value` as an alias for `text`: see the note beside
+ * `action: "set_text"` in `TargetInput`. So a call carrying NEITHER is
+ * schema-legal in both shapes, and the check that closes that hole has to cover
+ * both — which it did not.
+ *
+ * Measured on the shipping surface, one ref, two calls:
+ *
+ *   target({action:"set_text", ref})                      → bad_arguments
+ *   target({action:"edit", ref, operations:[{type:"set_text"}]}) → {"ok":true}
+ *
+ * The second reached electron/mcp/agent/index.js, where `NORMALIZE.set_text` is
+ * `String(o.value ?? '')` — so the batch form ACCEPTED an operation with no
+ * text in it and replaced the element's words with the empty string. One
+ * surface, two answers, and the one that answered yes silently deleted what was
+ * there. An agent that has been refused the action form and reaches for the
+ * batch shape instead — which is exactly what the alias note records a real
+ * Claude Code doing — got a wipe and an `ok`.
+ *
+ * So both forms are refused HERE, by one function, in one shape: the same
+ * `bad_arguments` code, the same `target.<action>` operation naming, an issue
+ * pointing at the argument that is missing, and a sentence that names both
+ * spellings. A batch is refused whole, before `api.run`, so nothing in it is
+ * applied — a partly-applied batch would be a worse answer than either.
+ *
+ * An EMPTY STRING is not missing. `{text:""}` and `{value:""}` are a deliberate
+ * "make this element say nothing", and both forms have always taken them.
+ *
+ * @returns {object|null} the refusal, or null when there is nothing to refuse.
+ */
+function textlessSetText(action, shaped) {
+  if (action === 'set_text') {
+    if (typeof shaped.text === 'string') return null;
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      operation: 'target.set_text',
+      issues: [{ path: ['text'], message: 'set_text needs the new text' }],
+      message:
+        'set_text needs the new text. Send it as `text` — `value` is accepted too, because that is what the same operation is called inside `edit`.',
+    };
+  }
+  if (action === 'edit' && Array.isArray(shaped.operations)) {
+    // `normalise` has already run, so the surviving spelling on an operation is
+    // `value` whichever name the caller used. A set_text with neither is the
+    // one this finds.
+    const at = shaped.operations.findIndex((op) => op && op.type === 'set_text' && typeof op.value !== 'string');
+    if (at < 0) return null;
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      operation: 'target.edit',
+      issues: [{ path: ['operations', at, 'value'], message: 'set_text needs the new text' }],
+      message:
+        `operations.${at} is a set_text with no text in it. Send it as \`value\` — \`text\` is accepted too, because ` +
+        'that is what the same operation is called as an action. Nothing in this batch was applied.',
+    };
+  }
+  return null;
 }
 
 /**

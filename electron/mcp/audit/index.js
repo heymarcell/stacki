@@ -379,6 +379,22 @@ function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES) {
 const CANCELLED = Symbol('the audit was cancelled by its caller');
 
 /**
+ * WHY A CLEAR WAS LET GO OF, IN WORDS THE NEXT CALLER CAN USE.
+ *
+ * Two things end the awaits that `strand` is reached from, and only one of them
+ * is a budget. The other is the abort, which rejects with the symbol above --
+ * and `String(err?.message || err)` on a symbol is
+ * "Symbol(the audit was cancelled by its caller)", which is a module-private
+ * identity leaking on to the wire as if it were a reason. Named here so the
+ * refusal at the door can say what actually happened rather than assert a
+ * budget that was never reached.
+ */
+function strandReason(err) {
+  if (err === CANCELLED) return 'the audit that started it was cancelled while the clear was in flight';
+  return String(err?.message || err).slice(0, 200);
+}
+
+/**
  * A promise that rejects with CANCELLED the moment the signal aborts.
  *
  * `off` is not optional politeness. One viewport awaits a dozen times, and a
@@ -721,12 +737,34 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
   // itself when it finally settles, so the partition becomes usable again the
   // moment it is provably quiet -- and a LATER successful clear does not drop
   // it, because a clear that has not come back can still land after that one too.
-  let strandedCleanup = null;
+  //
+  // AND IT IS A SET, BECAUSE ONE SLOT LET THE SECOND ABANDONED CLEAR ERASE THE
+  // FIRST.
+  //
+  // This was a single `strandedCleanup` variable, and ONE RUN CAN STRAND TWICE:
+  // the opening reset is walked away from the moment its caller aborts, and the
+  // reset in that same run's `finally` then overruns its own budget on the way
+  // out. The second `strand` overwrote the first record, and because the mark
+  // was only dropped when it WAS the settling record, the second clear coming
+  // back cleared the mark while the FIRST was still loose on the partition. The
+  // next audit walked through a door that had been unlocked by the wrong key.
+  //
+  // Measured on the double, one engine, two runs, with the partition logging
+  // which run had a page on it: run 1 cancelled inside its opening clear, run
+  // 1's `finally` clear held until its 30,000ms box expired, that second clear
+  // then released -- and run 2 was NOT refused. It opened its window, answered
+  // `ok:true`, and run 1's opening clear landed in the middle of it:
+  //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},…,{clear:1,whileRun:2}]
+  //
+  // So every outstanding clear is held, and the partition is quiet only when the
+  // set is EMPTY. Each record removes itself, so nothing depends on the order
+  // they come back in -- which was the whole of the old bug.
+  const strandedCleanups = new Set();
   const strand = (clearing, err) => {
-    const record = { reason: String(err?.message || err).slice(0, 200) };
-    strandedCleanup = record;
+    const record = { reason: strandReason(err) };
+    strandedCleanups.add(record);
     const settled = () => {
-      if (strandedCleanup === record) strandedCleanup = null;
+      strandedCleanups.delete(record);
     };
     clearing.then(settled, settled);
   };
@@ -899,15 +937,24 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // inventing a code, because it is the same refusal for the same reason --
     // this audit cannot show that what it is about to measure is only its own --
     // and a client that already handles one handles this.
-    if (strandedCleanup) {
+    //
+    // AND IT ASKS THE SET, NOT A SLOT. The oldest record names the refusal --
+    // it is the clear that has been loose on the partition longest -- and any
+    // others are counted rather than dropped, because the caller is being told
+    // to wait for the partition to go quiet and "one of them settled" is not
+    // that.
+    if (strandedCleanups.size) {
+      const [oldest] = strandedCleanups;
+      const alsoOutstanding = strandedCleanups.size - 1;
       return {
         ok: false,
         code: 'session_not_isolated',
         message:
           'The audit could not start from a clean browser session: the previous audit\'s cleanup was abandoned ' +
-          `after it overran its budget (${strandedCleanup.reason}) and is still outstanding on the shared audit ` +
+          `(${oldest.reason}) and is still outstanding on the shared audit ` +
           'partition, so it could wipe this page\'s cookies and storage part way through the measurement. Nothing ' +
-          'was measured. Try again once it has settled.',
+          `was measured.${alsoOutstanding ? ` ${alsoOutstanding} further cleanup${alsoOutstanding === 1 ? ' is' : 's are'} outstanding on the same partition.` : ''} ` +
+          `Try again once ${strandedCleanups.size === 1 ? 'it has' : 'they have'} settled.`,
         route: safeRoute,
         runId,
       };

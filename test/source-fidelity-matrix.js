@@ -4011,6 +4011,233 @@ function theValueNobodyCanRead() {
 }
 
 /**
+ * T19 -- THE UTILITY CLASS AS TAILWIND ACTUALLY SPELLS IT.
+ *
+ * The class matcher was anchored to `(^|\s)whitespace-pre...(\s|$)`, which is
+ * the BARE utility and nothing else. Every ordinary spelling in a real project
+ * carries something on one end of it and every one of them read as NOT
+ * preserving: measured before the fix, a `<div class='md:whitespace-pre'>` moved
+ * across a nesting level came back with two spaces gone off its middle line --
+ * rendered text deleted, reported as success -- and the same four spellings
+ * failed to fire the acting flag, so an insert wrote the file's own indent as
+ * content inside an element that renders it.
+ *
+ * THE TABLE IS THE TEST, and it is deliberately not one column. The two flags
+ * are supposed to disagree about exactly one thing here: a VARIANT is a rule
+ * about some viewports, which is a fair could and is not the "known to render
+ * it" the acting flag writes on. A prefix and the important modifier are not
+ * variants -- they name a rule that applies whenever the element is on screen
+ * at all -- so both flags take them. `whitespace-pre-line` and `plain` are the
+ * negative controls that keep this a narrowing rather than a switch-off.
+ */
+const UTILITY_CLASS_SPELLINGS = [
+  { cls: 'whitespace-pre', wide: true, acts: true },
+  { cls: 'whitespace-pre-wrap', wide: true, acts: true },
+  { cls: 'whitespace-break-spaces', wide: true, acts: true },
+  // A variant: a could for the wide flag, not evidence for the acting one.
+  { cls: 'md:whitespace-pre', wide: true, acts: false },
+  { cls: 'lg:whitespace-break-spaces', wide: true, acts: false },
+  { cls: 'print:whitespace-pre-wrap', wide: true, acts: false },
+  { cls: 'md:!whitespace-pre-wrap', wide: true, acts: false },
+  // A configured prefix and the important modifier, v3's spelling and v4's.
+  { cls: 'tw-whitespace-pre', wide: true, acts: true },
+  { cls: '!whitespace-pre', wide: true, acts: true },
+  { cls: 'whitespace-pre!', wide: true, acts: true },
+  // The same tokens where a real page puts them: in a list, with layout classes
+  // either side, which is what the `(^|\s)...(\s|$)` anchors were there for.
+  { cls: 'p-4 whitespace-pre rounded-lg', wide: true, acts: true },
+  // The arbitrary property, which is the declaration itself and is the token
+  // whose own `:` must not be read as a variant separator.
+  { cls: '[white-space:pre]', wide: true, acts: true },
+  { cls: '[white-space:break-spaces]', wide: true, acts: true },
+  { cls: 'md:[white-space:pre-wrap]', wide: true, acts: false },
+  { cls: '[&:hover]:whitespace-pre', wide: true, acts: false },
+  { cls: 'p-4 md:whitespace-pre rounded-lg', wide: true, acts: false },
+  // A LIST THAT NAMES BOTH SPELLINGS, which nothing here can resolve -- Tailwind
+  // decides it by its own output order, and at a width where the variant fires
+  // it is `pre` whatever that order is. The two flags answer it the way each is
+  // allowed to be wrong: the wide one keeps the bytes, the acting one withholds
+  // the write.
+  { cls: 'md:whitespace-pre whitespace-normal', wide: true, acts: false },
+  { cls: 'whitespace-pre whitespace-normal', wide: true, acts: false },
+  // NEGATIVE CONTROLS. `pre-line` collapses runs of spaces, so a reindent is
+  // provably neutral and it is deliberately not in the preserving set; the
+  // other two are an element that says it does not preserve and one that says
+  // nothing at all.
+  { cls: 'whitespace-pre-line', wide: false, acts: false },
+  { cls: 'whitespace-normal', wide: false, acts: false },
+  { cls: 'plain', wide: false, acts: false },
+];
+
+function theUtilityClassAsTailwindSpellsIt() {
+  for (const { cls, wide, acts } of UTILITY_CLASS_SPELLINGS) {
+    const label = `[class '${cls}']`;
+    const quoted = cls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // THE WIDE FLAG: a move across a nesting level either keeps the block's
+    // authored bytes or reindents it by one level.
+    const inner = 'alpha\n        beta\ngamma';
+    const raised = 'alpha\n      beta\ngamma';
+    const wideSource = commentedPage(
+      `  <div class='outer'>\n    <div class='wrap'>\n      <div class='${cls}'>${inner}</div>\n    </div>\n  </div>\n`
+    );
+    const wideParsed = parsePage(wideSource);
+    if (!check(`${label} the wide-flag page parses`, wideParsed.editable === true, short(wideParsed.reason))) continue;
+    const wideModel = structuredClone(wideParsed.model);
+    const outer = wideModel.nodes[0].children.find((n) => n.name === 'div');
+    const wrap = outer?.children?.find((n) => n.name === 'div');
+    const moved = wrap?.children?.find((n) => n.name === 'div');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(wrap?.children?.map((n) => n.name)))) continue;
+    wrap.children = wrap.children.filter((n) => n !== moved);
+    outer.children.push(moved);
+    const wideAfter = anchoredSerialize(wideSource, wideModel);
+    // POSITIVE CONTROL: the move happened at all.
+    if (
+      !check(
+        `${label} the move empties the wrap`,
+        /<div class='wrap'>\s*<\/div>/.test(wideAfter),
+        short(changedSpan(wideSource, wideAfter))
+      )
+    ) {
+      continue;
+    }
+    const wideGot = new RegExp(`<div class='${quoted}'>([\\s\\S]*?)</div>`).exec(wideAfter);
+    check(
+      wide
+        ? `${label} the wide flag reads the spelling and holds the block's authored bytes`
+        : `${label} a class that preserves nothing still lets the block be reindented`,
+      !!wideGot && wideGot[1] === (wide ? inner : raised),
+      short({ want: wide ? inner : raised, got: wideGot ? wideGot[1] : null })
+    );
+
+    // THE ACTING FLAG: an insert into the element writes at column zero only
+    // when this element is KNOWN to render the indentation between its children.
+    const kept = `    <span class='kept'>one</span>`;
+    const actSource = commentedPage(`  <div class='${cls}'>\n${kept}\n  </div>\n`);
+    const actParsed = parsePage(actSource);
+    if (!check(`${label} the acting-flag page parses`, actParsed.editable === true, short(actParsed.reason))) continue;
+    const actModel = structuredClone(actParsed.model);
+    const box = actModel.nodes[0].children.find((n) => n.name === 'div');
+    if (!check(`${label} the div is where an insert can reach it`, !!box, short(actModel.nodes[0].children.map((n) => n.name)))) {
+      continue;
+    }
+    box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+    const actAfter = anchoredSerialize(actSource, actModel);
+    const held = new RegExp(`<div class='${quoted}'>([\\s\\S]*?)</div>`).exec(actAfter);
+    const got = held ? held[1] : null;
+    check(
+      acts
+        ? `${label} the acting flag writes the inserted sibling at column zero`
+        : `${label} a rule that applies only sometimes does not de-indent the markup around it`,
+      got === `\n${kept}\n${acts ? '' : '    '}<p>new</p>\n  `,
+      short({ got })
+    );
+  }
+
+  // AND THE VARIANT IS IGNORED, NOT DENIED. "Not evidence" is not "evidence
+  // against": a `md:whitespace-pre` inside a real `white-space: pre` must still
+  // inherit the acting answer from the ancestor, or the fix has turned a could
+  // into a `false` and started writing rendered spaces under a real `<pre>`.
+  const kept = `      <span class='kept'>one</span>`;
+  const source = commentedPage(
+    `  <div style='white-space: pre'>\n    <div class='md:whitespace-pre'>\n${kept}\n    </div>\n  </div>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check('[variant under a pre] the page parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const box = outer?.children?.find((n) => n.name === 'div');
+  if (!check('[variant under a pre] the inner div is where an insert can reach it', !!box, short(outer?.children?.map((n) => n.name)))) {
+    return;
+  }
+  box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+  const after = anchoredSerialize(source, model);
+  const held = /<div class='md:whitespace-pre'>([\s\S]*?)<\/div>/.exec(after);
+  check(
+    '[variant under a pre] a variant is not counter-evidence, so the ancestor still answers',
+    held && held[1] === `\n${kept}\n<p>new</p>\n    `,
+    short({ got: held ? held[1] : null })
+  );
+}
+
+/**
+ * T20 -- A COMPONENT CARRYING THE DECLARATION.
+ *
+ * The acting pass excluded components from the PRESERVING_TAGS test and from
+ * nothing else, so `<Card class='whitespace-pre'>` and `<Card style='white-space:
+ * pre'>` fell straight through to the `style` and `class` tests underneath and
+ * were treated as elements KNOWN to render the indentation between their
+ * children. Measured: a newly inserted child went in at COLUMN ZERO.
+ *
+ * A component is a function call. `class` and `style` reach it as props and
+ * what it does with them is in another file -- it may drop them, or spread them
+ * onto a wrapper that is not the parent of these children at all, or render the
+ * children into a slot several elements deeper. That is not evidence, and the
+ * acting flag is the one place a guess writes.
+ *
+ * THE PAIRED CONTROL IS THE POINT AGAIN: the identical attribute on a real
+ * `<div>` must STILL go to column zero, or the fix is a switch-off. And the
+ * WIDE flag deliberately keeps reading the attribute -- being wrong there only
+ * refuses a reindent, and a component that DOES forward `class` to the element
+ * around its slot is common -- so a subtree moved out of the component still
+ * travels as authored.
+ */
+function theComponentCarryingTheDeclaration() {
+  for (const attr of [`class='whitespace-pre'`, `style='white-space: pre'`]) {
+    const label = `[<Card ${attr}>]`;
+    const kept = `    <span class='kept'>one</span>`;
+    for (const [which, open] of [
+      ['component', 'Card'],
+      ['element', 'div'],
+    ]) {
+      const source = commentedPage(`  <${open} ${attr}>\n${kept}\n  </${open}>\n`);
+      const parsed = parsePage(source);
+      if (!check(`${label} the ${which} page parses`, parsed.editable === true, short(parsed.reason))) continue;
+      const model = structuredClone(parsed.model);
+      const box = model.nodes[0].children.find((n) => n.name === open);
+      if (!check(`${label} the ${which} is where an insert can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) {
+        continue;
+      }
+      // PREMISE: the parser really does tell the two apart, so the difference
+      // below is about `kind` and not about the attribute being read wrongly.
+      check(`${label} the parser calls <${open}> a ${which}`, box.kind === which, short({ kind: box.kind }));
+      box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+      const after = anchoredSerialize(source, model);
+      const held = new RegExp(`<${open} [^>]*>([\\s\\S]*?)</${open}>`).exec(after);
+      const got = held ? held[1] : null;
+      check(
+        which === 'element'
+          ? `${label} the real <div> with the same attribute still writes at column zero`
+          : `${label} a component carrying the declaration does not de-indent the markup around it`,
+        got === `\n${kept}\n${which === 'element' ? '' : '    '}<p>new</p>\n  `,
+        short({ got })
+      );
+    }
+
+    // AND THE WIDE FLAG, WHICH MAY STILL CALL IT A COULD.
+    const source = commentedPage(
+      `  <div class='outer'>\n    <Card ${attr}>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </Card>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the wide-flag page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const box = outer?.children?.find((n) => n.name === 'Card');
+    const moved = box?.children?.find((n) => n.name === 'div');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(box?.children?.map((n) => n.name)))) continue;
+    box.children = box.children.filter((n) => n !== moved);
+    outer.children.push(moved);
+    const after = anchoredSerialize(source, model);
+    const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(after);
+    check(
+      `${label} and the wide flag still holds the moved subtree's authored bytes`,
+      !!got && got[1] === 'alpha\n        beta\ngamma',
+      short({ got: got ? got[1] : null })
+    );
+  }
+}
+
+/**
  * T16 -- the stamp for a stylesheet the caller hands in.
  *
  * `knownTextOf` exists so `page:write` need not re-read the page it is about to
@@ -4091,6 +4318,8 @@ function theStampForAStylesheetHandedIn() {
   theReorderBesideAnInlineRun();
   theCascadeInsideOneStyleAttribute();
   theComponentNamedAfterATag();
+  theComponentCarryingTheDeclaration();
+  theUtilityClassAsTailwindSpellsIt();
   theValueNobodyCanRead();
   theStampForAStylesheetHandedIn();
   for (const shape of [

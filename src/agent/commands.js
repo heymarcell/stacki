@@ -430,15 +430,41 @@ export function createAgentCommands(getApp) {
     // open document is still worth reporting — a model undo IS about it — so it
     // stays, beside a `restored` that says what was actually put back.
     if (action === 'undo') {
-      const before = a.historyDepth();
       const restored = await a.undo();
-      // `undone` USED TO MEAN "THE STACK GOT SHORTER", WHICH IT ALWAYS DOES.
+      // `undone` IS ABOUT THIS CALL, NOT ABOUT HOW DEEP THE STACK IS.
       //
-      // The entry is popped before its inverse runs, so a command whose inverse
-      // threw shortened the stack exactly like one that worked, and this
-      // answered `ok: true, undone: true` for an undo that had not happened.
-      // The renderer now says so on the result; an undo that failed is a
-      // refusal, with the reason, rather than a success nobody can check.
+      // Two defects, one after the other, both of them the same mistake — the
+      // stack read as a proxy for what happened.
+      //
+      // First: the entry was popped before its inverse ran, so a command whose
+      // inverse threw shortened the stack exactly like one that worked, and
+      // this answered `ok: true, undone: true` for an undo that had not
+      // happened. The renderer says so on the result now, and the refusal
+      // below carries the reason.
+      //
+      // Then the stack depth itself, which survived that fix: `undone` was
+      // `historyDepth().past < before.past` with `before` read SYNCHRONOUSLY,
+      // before `a.undo()` joined the renderer's queue. The queue is what makes
+      // the step run later, so `before` describes the stack in front of the
+      // whole in-flight batch rather than in front of this step. Measured on
+      // the shipped renderer:
+      //
+      //   two `project.undo` calls in one Promise.all against ONE entry — both
+      //   answered `ok: true, undone: true`, and the second's `restored` was
+      //   null, so it claimed to have undone nothing;
+      //
+      //   three at once against two entries — all three claimed `undone: true`;
+      //
+      //   an undo and a redo together at {past: 1, future: 1} — the redo put
+      //   its change back on disk and answered `redone: false`, because
+      //   `future` was 1 before the pair and 1 after it.
+      //
+      // Serialising the calls fixed the STACK. It cannot fix a flag that is
+      // read across the queue, because there is no depth reading that says
+      // what one step of a batch did. `restored` does: the renderer returns
+      // null when there was nothing for THIS call to take off the stack, the
+      // entry with a `failed` on it when the inverse refused, and the entry
+      // otherwise. So that is what the flag is now — the entry, not the depth.
       if (restored && restored.failed) {
         return {
           ok: false,
@@ -452,16 +478,17 @@ export function createAgentCommands(getApp) {
       }
       return {
         ok: true,
-        undone: a.historyDepth().past < before.past,
+        undone: !!restored && !restored.failed,
         restored: restored || null,
         history: a.historyDepth(),
         document: documentOf(a),
       };
     }
     if (action === 'redo') {
-      const before = a.historyDepth();
       const restored = await a.redo();
-      // Same as undo: the stack shortens whatever the command did.
+      // Same as undo, for both halves of it: the stack moves whatever the
+      // command did, and `future` read before the call is the depth in front
+      // of the whole queued batch rather than in front of this step.
       if (restored && restored.failed) {
         return {
           ok: false,
@@ -475,7 +502,7 @@ export function createAgentCommands(getApp) {
       }
       return {
         ok: true,
-        redone: a.historyDepth().future < before.future,
+        redone: !!restored && !restored.failed,
         restored: restored || null,
         history: a.historyDepth(),
         document: documentOf(a),

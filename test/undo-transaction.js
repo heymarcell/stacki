@@ -365,6 +365,145 @@ const UNCOALESCED = 900;
       check('  with nothing left on past', drained.history?.past === 0, short(drained.history));
     }
 
+    // ── 1b. `undone` IS ABOUT THIS CALL, NOT ABOUT THE DEPTH OF THE STACK ────
+    //
+    // Section 1 above is about the STACK, and serialising the callers fixed it.
+    // The FLAG survived that fix untouched: `project.undo` computed `undone` as
+    // `historyDepth().past < before.past`, with `before` read SYNCHRONOUSLY —
+    // before `a.undo()` joined the queue that makes the step run later. So
+    // `before` describes the stack in front of the whole in-flight batch, and
+    // every caller in the batch compares against the same number.
+    //
+    // MEASURED against the shipped renderer, with the queue in place:
+    //
+    //   two `project.undo` in one Promise.all against ONE entry — BOTH answered
+    //   `ok: true, undone: true`, and the second's `restored` was null;
+    //
+    //   three against two entries — all three answered `undone: true`;
+    //
+    //   an undo and a redo together at {past: 1, future: 1} — the redo put its
+    //   change back on disk and answered `redone: false`, because `future` was
+    //   1 before the pair and 1 after it.
+    //
+    // THE INVARIANT, asserted on every call below rather than only on the ones
+    // whose depth happens to come out wrong: `undone === !!restored &&
+    // !restored.failed`. `restored` is what the renderer hands back for THIS
+    // step — null when there was nothing left for it to take off the stack, the
+    // entry with a `failed` on it when the inverse refused, the entry otherwise
+    // — and it was already right in every case measured above. No depth reading
+    // can say what one step of a batch did, so the flag is the entry.
+    //
+    // THE SURPLUS CALLER IS WHAT MAKES THE COUNT AN ASSERTION. Three undos
+    // against three entries would pass on the broken code too. Three against
+    // TWO cannot: one of them has nothing to undo and has to say so.
+    {
+      // Every answer this section takes, held to the invariant in one place, so
+      // a call added here cannot quietly skip it.
+      const honest = (label, r, flag) => {
+        const did = !!r.restored && !r.restored.failed;
+        check(`1b: ${label} says what IT did, not how deep the stack is`, r[flag] === did, short({ [flag]: r[flag], restored: r.restored }));
+      };
+
+      const siteWas = app.read('src/data/site.json');
+      const otherWas = app.read('src/data/other.json');
+      const readSite = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      const wroteSite = await run('content', 'cms_write', {
+        path: 'src/data/site.json',
+        data: { title: 'Fixture', tagline: 'ONE OF TWO, THREE CALLERS' },
+        ref: readSite.ref,
+      });
+      check('1b: the first of two writes lands', wroteSite.ok === true, short(wroteSite));
+      await H.settle(UNCOALESCED);
+      const readOther = await run('content', 'cms_read', { path: 'src/data/other.json' });
+      const wroteOther = await run('content', 'cms_write', {
+        path: 'src/data/other.json',
+        data: { note: 'TWO OF TWO, THREE CALLERS' },
+        ref: readOther.ref,
+      });
+      check('1b:   and so does the second', wroteOther.ok === true, short(wroteOther));
+      const siteEdited = app.read('src/data/site.json');
+      const otherEdited = app.read('src/data/other.json');
+      check('1b:   with both files really changed', siteEdited !== siteWas && otherEdited !== otherWas);
+
+      const depth = await probe('1b before three undos against two entries');
+      check('1b: two entries on the stack and three callers about to ask', same(depth, { past: 2, future: 0 }), short(depth));
+
+      const three = await Promise.all([run('project', 'undo'), run('project', 'undo'), run('project', 'undo')]);
+      await H.settle(300);
+      wire.push(...three);
+      check('1b: all three undos are answered', three.every((r) => r.ok === true), short(three.map((r) => ({ ok: r.ok, code: r.code }))));
+      check('1b:   and none of them reports a failed inverse', three.every((r) => !r.restored?.failed), short(three.map((r) => r.restored?.failed ?? null)));
+      three.forEach((r, i) => honest(`undo ${i} of three`, r, 'undone'));
+
+      // THE COUNT. Two entries, three callers: exactly two of them undid
+      // something and exactly one had nothing to undo.
+      const claimed = three.filter((r) => r.undone === true);
+      const surplus = three.filter((r) => r.undone === false);
+      check('1b: EXACTLY TWO OF THE THREE UNDID SOMETHING', claimed.length === 2, short(three.map((r) => r.undone)));
+      check('1b:   and the surplus caller says it did not', surplus.length === 1, short(three.map((r) => r.undone)));
+      check('1b:   with nothing restored to show for it', surplus.length === 1 && surplus[0].restored === null, short(surplus.map((r) => r.restored)));
+      check('1b:   while the two that did name what they put back', claimed.every((r) => filesOf(r).length > 0), short(claimed.map((r) => filesOf(r))));
+
+      // THE BYTES, which is what the flags are claims about.
+      check('1b: the second edit is undone, byte for byte', app.read('src/data/other.json') === otherWas, short(app.read('src/data/other.json')));
+      check('1b:   and so is the first', app.read('src/data/site.json') === siteWas, short(app.read('src/data/site.json')));
+
+      // ── AND AN UNDO AND A REDO IN THE SAME BATCH ──────────────────────────
+      //
+      // {past: 1, future: 1} reached by putting one of the two entries back.
+      // Both calls below have something real to do, so both have to answer
+      // true — and the pair converges on the same stack and the same bytes
+      // whichever order the queue runs them in, which is what makes the oracle
+      // stable rather than a coin toss.
+      const one = await run('project', 'redo');
+      await H.settle(300);
+      honest('the redo that sets the pair up', one, 'redone');
+      check('1b: the pair starts at one on each stack', same(one.history, { past: 1, future: 1 }), short(one.history));
+      const siteMid = app.read('src/data/site.json');
+      const otherMid = app.read('src/data/other.json');
+
+      const [pairUndo, pairRedo] = await Promise.all([run('project', 'undo'), run('project', 'redo')]);
+      await H.settle(300);
+      wire.push(pairUndo, pairRedo);
+      check('1b: both halves of the pair are answered', pairUndo.ok === true && pairRedo.ok === true, short({ pairUndo, pairRedo }));
+      check('1b:   and neither reports a failed inverse', !pairUndo.restored?.failed && !pairRedo.restored?.failed, short({ u: pairUndo.restored?.failed, r: pairRedo.restored?.failed }));
+      honest('the undo of the pair', pairUndo, 'undone');
+      honest('the redo of the pair', pairRedo, 'redone');
+      // Said again as the two sentences the defect was reported in, because
+      // those are the two shapes the depth reading produced and a reader should
+      // not have to derive them from the invariant above.
+      check(
+        '1b: NEITHER HALF CLAIMS TO HAVE MOVED SOMETHING IT DID NOT',
+        !(pairUndo.undone && !pairUndo.restored) && !(pairRedo.redone && !pairRedo.restored),
+        short({ undo: { undone: pairUndo.undone, restored: pairUndo.restored }, redo: { redone: pairRedo.redone, restored: pairRedo.restored } })
+      );
+      check(
+        '1b: AND NEITHER DENIES A CHANGE IT PUT BACK ON DISK',
+        !(pairUndo.undone === false && pairUndo.restored && !pairUndo.restored.failed) &&
+          !(pairRedo.redone === false && pairRedo.restored && !pairRedo.restored.failed),
+        short({ undo: { undone: pairUndo.undone, restored: pairUndo.restored }, redo: { redone: pairRedo.redone, restored: pairRedo.restored } })
+      );
+      // Whichever way round the queue ran them, one entry came off `past` and
+      // one came off `future`, so the stack and the files are where the pair
+      // found them.
+      const settled = pairUndo.history?.past === 1 && pairUndo.history?.future === 1 ? pairUndo.history : pairRedo.history;
+      check('1b: the pair leaves the stack where it found it', same(settled, { past: 1, future: 1 }), short({ undo: pairUndo.history, redo: pairRedo.history }));
+      check('1b:   and the files too', app.read('src/data/site.json') === siteMid && app.read('src/data/other.json') === otherMid, short({
+        site: app.read('src/data/site.json'),
+        other: app.read('src/data/other.json'),
+      }));
+
+      // Back to an empty `past` for the sections below, one step at a time.
+      const drained = await run('project', 'undo');
+      await H.settle(200);
+      honest('the drain', drained, 'undone');
+      check('1b: the fixture bytes are back', app.read('src/data/site.json') === siteWas && app.read('src/data/other.json') === otherWas, short({
+        site: app.read('src/data/site.json'),
+        other: app.read('src/data/other.json'),
+      }));
+      check('1b:   with nothing left on past', drained.history?.past === 0, short(drained.history));
+    }
+
     // ── 2. AN EDIT DURING AN UNDO ENDS THE REDO STACK ────────────────────────
     //
     // `pushHistory` and `pushCommand` empty `future` because a new edit is

@@ -73,6 +73,9 @@ const { AuditInput } = require('../electron/mcp/auditTool.js');
 // where that premise is actually declared. See the write_entry block below.
 const { MAX_BODY_BYTES } = require('../electron/mcp/server.js');
 const { startStrictnessWire } = require('./support/strictnessWire.js');
+// The SDK's own JSON Schema validator, so the delivered OUTPUT document is
+// graded by the thing a client grades it with rather than by a reading of it.
+const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 const { guardSuite } = require('./support/suiteGuard.js');
 
 // A HANG EXITS ZERO, and this suite awaits a wire. Every assertion below is
@@ -325,12 +328,32 @@ const EXTRA_TO_DISPATCH = {
   // its wire alias; a call with neither is refused by the handler with a
   // sentence naming both. See `domain()` in electron/mcp/agentTools.js.
   'target:set_text': { text: 'x' },
+  // AND THE SAME OPERATION INSIDE AN EDIT BATCH, which is refused by the same
+  // handler check for the same reason: `{type:"set_text"}` with neither
+  // spelling used to be ACCEPTED in the batch form while the action form was
+  // refused, and it reached the app as a set_text with no text — an element
+  // whose words were replaced with the empty string on an `ok:true`.
+  //
+  // A FUNCTION, because this argument is not at the top level. The generic
+  // builder mints operations from the schema's REQUIRED fields alone, so it
+  // produces a bare `{type:"set_text"}`; the value has to be added inside each
+  // operation without disturbing anything else the case put there — the
+  // injected unknown key of a strictness probe, or the other 29 operations of a
+  // bound probe.
+  'target:edit': (args) => ({
+    operations: (args?.operations || []).map((op) =>
+      op && op.type === 'set_text' && typeof op.value !== 'string' && typeof op.text !== 'string' ? { ...op, value: 'x' } : op
+    ),
+  }),
   // `create` needs something written in it: reviewTools.js `requirementProblem`
   // refuses an empty comment before the review ledger is touched.
   comment: { message: 'x' },
 };
 
-const extraFor = (tool, args) => EXTRA_TO_DISPATCH[`${tool}:${args?.action}`] || EXTRA_TO_DISPATCH[tool] || {};
+const extraFor = (tool, args) => {
+  const entry = EXTRA_TO_DISPATCH[`${tool}:${args?.action}`] || EXTRA_TO_DISPATCH[tool] || {};
+  return typeof entry === 'function' ? entry(args) : entry;
+};
 
 // ── what the app is allowed to add on the way through ────────────────────────
 //
@@ -491,6 +514,16 @@ const declaredDefaults = (json) => {
       const clean = value(json, loc.route, false);
       const dirty = value(json, loc.route, true);
       const extra = extraFor(loc.tool, clean);
+      // COMPUTED AGAIN FOR THE DIRTY CALL, because an extra may now be a
+      // FUNCTION of the arguments -- `target:edit` fills in the one operation
+      // whose required fields alone do not reach the app. Derived from `clean`
+      // once and spread over both, such an extra replaces `dirty`'s injected
+      // operation with a clean one: measured the first time this entry was
+      // added, thirteen operations positions answered `ok:true` because the
+      // unknown key they were supposed to be injecting had been overwritten
+      // before the call was made. Nothing changes for the object-valued
+      // entries, which do not depend on the arguments at all.
+      const dirtyExtra = extraFor(loc.tool, dirty);
       const where = `${loc.label} (${pathOf(loc.route).join('.') || 'top level'})`;
 
       // (1) THE CONTROL. The same call, spelled right, must get past the schema
@@ -518,7 +551,7 @@ const declaredDefaults = (json) => {
       }
 
       // (2) THE INJECTION, at exactly this depth.
-      const res = await wire.call(loc.tool, { ...dirty, ...extra });
+      const res = await wire.call(loc.tool, { ...dirty, ...dirtyExtra });
       exercised.add(loc.label);
       check(`${where}: an unknown key here is refused`, res.envelope?.ok === false, short(res.envelope));
       check(
@@ -793,6 +826,68 @@ const declaredDefaults = (json) => {
         '  and `text` alone still reaches it as an operation’s `value`',
         ((batchAlias.handedOver[0]?.args?.operations || [])[0] || {}).value === 'ONLY TEXT',
         short(batchAlias.handedOver[0]?.args?.operations)
+      );
+
+      // ── AND NEITHER SPELLING AT ALL, WHICH WAS TWO DIFFERENT ANSWERS ───────
+      //
+      // Accepting two names means BOTH are optional in the schema, so a call
+      // carrying neither is schema-legal in both shapes and only a handler
+      // check can refuse it. The action form had that check; the batch form did
+      // not. Measured on this wire, one ref, two calls:
+      //
+      //   {action:"set_text", ref}                             → bad_arguments
+      //   {action:"edit", ref, operations:[{type:"set_text"}]}  → {"ok":true}
+      //
+      // The second reached the app, where NORMALIZE.set_text is
+      // `String(o.value ?? '')` -- so an operation with no text in it replaced
+      // the element's words with the empty string and answered ok. The oracle
+      // is BOTH halves: the envelope, and that nothing was dispatched.
+      const neitherSingle = await wire.call('target', { action: 'set_text', ref: REF });
+      const neitherBatch = await wire.call('target', { action: 'edit', ref: REF, operations: [{ type: 'set_text' }] });
+      check('set_text with neither spelling is refused', neitherSingle.envelope?.code === 'bad_arguments', short(neitherSingle.envelope));
+      check(
+        '  AND THE SAME OPERATION IN A BATCH IS REFUSED THE SAME WAY',
+        neitherBatch.envelope?.code === 'bad_arguments',
+        short(neitherBatch.envelope)
+      );
+      check(
+        '  neither of them reaching the app, which is where the wipe happened',
+        neitherSingle.dispatched === 0 && neitherBatch.dispatched === 0,
+        short({ single: neitherSingle.handedOver, batch: neitherBatch.handedOver })
+      );
+      check(
+        '  and the batch refusal names which operation it was',
+        (neitherBatch.envelope?.issues || []).some((i) => JSON.stringify(i.path) === JSON.stringify(['operations', 0, 'value'])),
+        short(neitherBatch.envelope?.issues)
+      );
+      // AND THE BATCH IS REFUSED WHOLE. A batch that applied the operations in
+      // front of the bad one and then stopped would be a worse answer than
+      // either -- a half-edited document with an `ok:false` over it.
+      const mixed = await wire.call('target', {
+        action: 'edit',
+        ref: REF,
+        operations: [{ type: 'add_class', className: 'x' }, { type: 'set_text' }],
+      });
+      check(
+        '  a batch whose SECOND operation has no text is refused whole',
+        mixed.envelope?.code === 'bad_arguments' && mixed.dispatched === 0,
+        short({ envelope: mixed.envelope, handedOver: mixed.handedOver })
+      );
+      check(
+        '  naming the operation that was wrong rather than the first one',
+        (mixed.envelope?.issues || []).some((i) => JSON.stringify(i.path) === JSON.stringify(['operations', 1, 'value'])),
+        short(mixed.envelope?.issues)
+      );
+      // AND AN EMPTY STRING IS NOT A MISSING ONE. "Make this element say
+      // nothing" is a real edit, in both forms, and a guard that refused it
+      // would be refusing the operation rather than the mistake.
+      const emptySingle = await wire.call('target', { action: 'set_text', ref: REF, text: '' });
+      const emptyBatch = await wire.call('target', { action: 'edit', ref: REF, operations: [{ type: 'set_text', value: '' }] });
+      check('  while an EMPTY string still reaches the app in the action form', emptySingle.dispatched === 1 && emptySingle.handedOver[0]?.args?.text === '', short(emptySingle.handedOver));
+      check(
+        '  and in the batch form',
+        emptyBatch.dispatched === 1 && ((emptyBatch.handedOver[0]?.args?.operations || [])[0] || {}).value === '',
+        short(emptyBatch.handedOver)
       );
     }
 
@@ -1358,8 +1453,20 @@ const declaredDefaults = (json) => {
   // is checked without anybody adding it to a list, and the count is asserted
   // so the block cannot pass by finding none.
   {
+    // `orRefusal` no longer hands the union straight to `registerTool`: it
+    // wraps it so the payload's fields can be published at the TOP LEVEL beside
+    // the branches (see `hoistUnionProperties` in agentTools.js), and the union
+    // itself rides along on `.schema` exactly as `advertised()` carries an input
+    // schema. Both readings are tried, so this derivation keeps working whether
+    // a tool declares the union directly or through the wrapper.
+    const unionOptions = (declared) => {
+      for (const candidate of [declared, declared?.schema]) {
+        if (Array.isArray(candidate?.def?.options)) return candidate.def.options;
+      }
+      return null;
+    };
     const refusalTools = [...tools]
-      .filter(([, entry]) => Array.isArray(entry.config.outputSchema?.def?.options) && entry.config.outputSchema.def.options.includes(A.ToolRefusal))
+      .filter(([, entry]) => (unionOptions(entry.config.outputSchema) || []).includes(A.ToolRefusal))
       .map(([name]) => name);
     check(
       'the refusal branch is published by the four tools that answer with one',
@@ -1424,6 +1531,127 @@ const declaredDefaults = (json) => {
         `  and the delivered output document for ${name} carries the refusal branch closed`,
         !!refusal && refusal.additionalProperties === false,
         refusal ? short(refusal.additionalProperties) : `no refusal branch in ${short(Object.keys(doc || {}))}`
+      );
+    }
+
+    // ── AND THE SHAPE THE UNION USED TO DELETE ──────────────────────────────
+    //
+    // Declaring the refusal branch cost these four tools their published SHAPE.
+    // `z.union([Payload, ToolRefusal])` emits `{anyOf:[…]}` and nothing else, so
+    // the top-level `properties` and `required` a host reads to render or to
+    // type a result went to nothing at all -- measured on the wire, all four:
+    // `root keys: $schema,anyOf | properties? false | required? false`. The
+    // declaration got truer and the document got useless, which is not a trade
+    // this surface has to make.
+    //
+    // Both halves are asserted here, because a fix for either alone is easy and
+    // wrong: hoisting the payload's `required` to the root would refuse every
+    // refusal (reinstating the false declaration), and collapsing the branches
+    // into one all-optional object would publish a document that accepts `{}`.
+    const validator = new AjvJsonSchemaValidator();
+    const verdict = async (schema, value) => validator.getValidator(schema)(value);
+    // A CONTROL ON THE VALIDATOR ITSELF, before a single verdict is read.
+    {
+      const trivial = { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] };
+      check('the output validator says yes to what it should', (await verdict(trivial, { n: 1 })).valid === true, '');
+      check('  and no to what it should not', (await verdict(trivial, { n: 'x' })).valid === false, '');
+    }
+
+    for (const name of refusalTools) {
+      const doc = deliveredOutput.get(name);
+      const branches = Array.isArray(doc?.anyOf) ? doc.anyOf : [];
+      const payload = branches.find((b) => !(b?.properties?.ok?.const === false));
+      const refusal = branches.find((b) => b?.properties?.ok?.const === false);
+
+      // (1) THE FIELDS ARE READABLE AT THE TOP LEVEL AGAIN, which is the whole
+      // complaint: a client that has never heard of `anyOf` must still be able
+      // to see what this tool answers with.
+      const declaredAtRoot = Object.keys(doc?.properties || {});
+      const payloadFields = Object.keys(payload?.properties || {});
+      check(
+        `${name} publishes its payload's fields at the top level, not only inside a branch`,
+        payloadFields.length > 0 && payloadFields.every((f) => declaredAtRoot.includes(f)),
+        `root: ${declaredAtRoot.join(', ') || '(none)'}
+    payload: ${payloadFields.join(', ')}`
+      );
+
+      // (2) AND THEY ARE PUBLISHED IN A FORM BOTH BRANCHES SATISFY. A
+      // top-level `properties` entry is asserted against every answer, so a
+      // hoisted field that only fits the payload would refuse every refusal
+      // carrying that field -- `ok` is `boolean` in a payload and `const false`
+      // in a refusal, and two of these four declare both. Proved per key per
+      // branch rather than trusted: the hoisted fragment is either the
+      // branch's own, or an `anyOf` that contains it.
+      const narrowed = [];
+      for (const branch of branches) {
+        for (const [field, spec] of Object.entries(branch.properties || {})) {
+          const hoisted = doc?.properties?.[field];
+          const carries =
+            JSON.stringify(hoisted) === JSON.stringify(spec) ||
+            (Array.isArray(hoisted?.anyOf) && hoisted.anyOf.some((alt) => JSON.stringify(alt) === JSON.stringify(spec)));
+          if (!carries) narrowed.push(`${field}: ${short(hoisted, 120)} does not carry ${short(spec, 120)}`);
+        }
+      }
+      check(`  and narrows none of them on the way up`, narrowed.length === 0, narrowed.join('\n    '));
+
+      // (3) `required` AT THE ROOT IS TRUE OF EVERY ANSWER, not just of the
+      // payload. The intersection, or nothing at all when the two branches
+      // share no field -- which is the honest answer for get_context and
+      // capture, whose payloads and refusals have no key in common.
+      const rooted = doc?.required || [];
+      const inEvery = rooted.filter((f) => branches.every((b) => (b.required || []).includes(f)));
+      check(
+        `  and requires at the root only what EVERY answer carries`,
+        rooted.length === inEvery.length,
+        `root required: ${rooted.join(', ') || '(none)'}
+    payload: ${(payload?.required || []).join(', ')}
+    refusal: ${(refusal?.required || []).join(', ')}`
+      );
+
+      // (4) THE DOCUMENT A CLIENT VALIDATES WITH STILL ACCEPTS A REFUSAL. This
+      // is the assertion the whole union was declared for, and the one a naive
+      // hoist breaks.
+      const built = A.badToolArguments(name, A.ToolRefusal.safeParse({}).error);
+      const said = await verdict(doc, built);
+      check(`  and the delivered document still validates the refusal this surface builds`, said.valid === true, `${said.errorMessage || ''}\n    ${short(built)}`);
+
+      // (5) AND STILL REFUSES SOMETHING THAT IS NEITHER. Without this the fix
+      // could be a root that accepts any object at all, which would satisfy
+      // every assertion above it.
+      const neither = await verdict(doc, { stackiNotAnAnswer: 1 });
+      check(`  while refusing an object that is neither a payload nor a refusal`, neither.valid === false, short(neither));
+
+      // (6) AND THE RUNTIME HALF, WHICH IS A DIFFERENT OBJECT ENTIRELY.
+      //
+      // The document above is what a CLIENT validates with. The SERVER validates
+      // an answer through `~standard.validate` on the registered schema, and
+      // that is now a wrapper rather than the zod union itself (see
+      // `publishedAs` in agentTools.js). A wrapper that published a better
+      // document and quietly stopped checking anything — which is exactly what
+      // `advertised()` does on the INPUT side, deliberately, because the
+      // handler re-checks — would satisfy every assertion above it and turn off
+      // output validation for four tools with nothing to say so.
+      const declared = tools.get(name).config.outputSchema;
+      const validated = async (value) => declared['~standard'].validate(value);
+      const onRefusal = await validated(built);
+      check(
+        `  and the SERVER's own check accepts that refusal too`,
+        !(onRefusal?.issues || []).length,
+        short(onRefusal?.issues)
+      );
+      const onNonsense = await validated({ stackiNotAnAnswer: 1 });
+      check(
+        `  and refuses an answer that is neither, rather than waving everything through`,
+        (onNonsense?.issues || []).length > 0,
+        short(onNonsense)
+      );
+      // A WRONG-TYPED PAYLOAD, which is the assertion the union was strict for.
+      const wrongTyped = { ...built, code: 12 };
+      const onWrongType = await validated(wrongTyped);
+      check(
+        `  and refuses a refusal whose declared field has the wrong type`,
+        (onWrongType?.issues || []).length > 0,
+        short(onWrongType)
       );
     }
   }

@@ -1700,7 +1700,22 @@ const git = {
             'Those are two different merges and the answers to one are not answers to the other. Nothing was merged.'
         );
       }
-      return { projectPath: ctx.root, branch: bound.branch, choices: input.choices || {}, expect: bound.observed };
+      // AND THE BRANCH IT WAS BEING MERGED INTO, which this dropped.
+      //
+      // The ref has always carried it — mergeRef is minted with `{branch, into}`
+      // — and every fact that reached the handler came out of `observed`, which
+      // holds the two commits and the digest and nothing about the branch. So
+      // the handler compared `tipOf('HEAD')` and called that enough, and a
+      // checkout to a sibling branch at the same commit passed: the answers an
+      // agent gave about merging into `main` were committed onto the other
+      // branch, `{ok: true, into: "release"}`. The binding names it, so it goes
+      // through; gitBranches.js refuses the mismatch. See the guard there.
+      return {
+        projectPath: ctx.root,
+        branch: bound.branch,
+        choices: input.choices || {},
+        expect: { ...bound.observed, into: bound.into },
+      };
     },
     // A CHOICE THAT WAS NOT UNDERSTOOD IS NOT A RESOLUTION.
     //
