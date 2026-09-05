@@ -3431,7 +3431,23 @@ handle('page:write', async (_e, { pagePath, model }) => {
   } catch {
     /* a page being created has nothing to preserve */
   }
-  const text = anchoredSerialize(before, model);
+  // AND THE ONE THING THE PARSER CANNOT ASK FOR ITSELF.
+  //
+  // `white-space: pre` from a STYLESHEET makes an element's leading spaces
+  // rendered content just as an inline style does, and the parser is a pure
+  // function of (source, model, options) with no idea what a project is. So the
+  // project side of that question is answered here -- the class, id and tag
+  // tokens of every rule in this project's CSS that could preserve whitespace,
+  // cached on the files' own mtimes -- and handed in. The scanner never throws
+  // and answers `'*'` for anything it could not read or reduce, so a broken
+  // stylesheet costs an element its reindentation rather than its bytes.
+  //
+  // Required at the call site because this is the only place that asks; the
+  // module cache makes every save after the first a lookup.
+  const { preservingTokens } = require('./whitespaceRules');
+  const text = anchoredSerialize(before, model, {
+    preservingTokens: preservingTokens(openProjectRoot),
+  });
   writePageText(pagePath, text);
   writeChunks(model);
   // The bytes that are now on disk, so the renderer's copy of the source stays
@@ -6138,8 +6154,15 @@ handle('git:merge', async (_e, { projectPath, branch }) =>
 
 // Finishing a merge the user has chosen their way through. The conflicting
 // files come back from git:merge with both versions; this applies the answers.
-handle('git:resolveMerge', async (_e, { projectPath, branch, choices }) =>
-  resolveMerge(git, { projectPath, branch, choices })
+//
+// `expect` is the `at` block git:merge handed back with the conflict — the two
+// commit SHAs and a digest of what git actually wrote. It is passed straight
+// through, unsigned and unwrapped: this is Stacki's own IPC, where the caller
+// is the panel that was shown the conflict. The MCP side wraps the same three
+// fields in a signed ref before an agent ever sees them, because there the
+// caller is not trusted to have read anything.
+handle('git:resolveMerge', async (_e, { projectPath, branch, choices, expect }) =>
+  resolveMerge(git, { projectPath, branch, choices, expect })
 );
 
 handle('git:deleteBranch', async (_e, { projectPath, branch, force }) =>

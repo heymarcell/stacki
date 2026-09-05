@@ -45,6 +45,8 @@
 // property is developed; this borrows its oracle).
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const H = require('./agent-harness.js');
 const { parsePage, anchoredSerialize, applySplices } = require('../electron/astroParser.js');
 
@@ -1425,6 +1427,768 @@ function overlappingSplices() {
   );
 }
 
+// --- WHITESPACE THE PAGE RENDERS BECAUSE OF CSS ------------------------------
+//
+// A structural move is allowed to change a file's layout and is not allowed to
+// change what the page shows. `reindentBlock` slices the same prefix off every
+// line in the block that travels, and whether those leading spaces are layout
+// or content is a question about CSS -- which `whitespaceThePageRenders` above
+// asks only of the four tags where the answer is always "content".
+//
+// Everything below is one of the four ways the answer can be "content" without
+// one of those tags being anywhere near it. All four were measured at this
+// suite's own head, and the first two are silent data loss rather than a
+// missing feature:
+//
+//   * the declaration is in a STYLESHEET. `.preserved { white-space: pre }` is
+//     invisible to a parser with no cascade, and an authored
+//     `alpha\n      beta\ngamma` came back `alpha\n    beta\ngamma`, ok:true.
+//     In Blink that line went from 96.33px to 77.06px -- two monospace glyphs
+//     deleted from what the page shows.
+//   * `white-space` INHERITS. A node whose ANCESTOR declares it renders its own
+//     leading spaces while saying nothing about them, and the guard only looked
+//     DOWN. Damage runs both ways: spaces sliced off a block moved within such
+//     an ancestor, and spaces INSERTED in front of every line of a block moved
+//     into one.
+//   * a `<pre>` holding ELEMENT children was re-laid-out as an inline run, and
+//     the whole block collapsed to a single line. Nothing could save it: the
+//     reprint the fallback would produce collapses it identically.
+//   * and the value table, which is what keeps all of this a NARROWING.
+//     Measured in Blink: `pre`, `pre-wrap` and `break-spaces` render
+//     differently after a reindent; `pre-line`, `normal` and `nowrap` do not.
+//     An ordinary block still has to be raised -- that is the property the
+//     fixtures at the top of this file are about -- so every fixture here
+//     carries its own positive control.
+
+const WS = require('../electron/whitespaceRules.js');
+
+/** The two blocks that are the same bytes, one of which a stylesheet protects. */
+function preservedFixture({ ind, eol }) {
+  const i = (n) => ind.repeat(n);
+  // A middle line indented one step DEEPER than the element itself, so a raise
+  // of one level slices a whole unit off it and the loss is a whole unit wide.
+  const innerLines = ['alpha', `${i(3)}beta`, 'gamma'];
+  const inner = innerLines.join(eol);
+  const body =
+    `${i(1)}<div class='outer'>${eol}` +
+    `${i(2)}<div class='wrap'>${eol}` +
+    `${i(3)}<div class='preserved'>${inner}</div>${eol}` +
+    `${i(3)}<div class='ordinary'>${inner}</div>${eol}` +
+    `${i(2)}</div>${eol}` +
+    `${i(1)}</div>${eol}`;
+  const source =
+    `---${eol}// Layout import - the shell every page shares${eol}` +
+    `import Base from '../layouts/Base.astro';${eol}` +
+    `// Component imports${eol}import Card from '../components/Card.astro';${eol}---${eol}` +
+    `<Base>${eol}${body}</Base>${eol}`;
+  // What a raise of one nesting level does to those bytes: `reindentBlock`
+  // drops one indentation unit off every line that starts with one.
+  const raised = innerLines
+    .map((line, n) => (n === 0 || !line.startsWith(ind) ? line : line.slice(ind.length)))
+    .join(eol);
+  return { source, inner, raised };
+}
+
+const innerOf = (text, cls) => {
+  const hit = new RegExp(`<div class='${cls}'>([\\s\\S]*?)</div>`).exec(text);
+  return hit ? hit[1] : null;
+};
+
+/**
+ * Move the named block up one nesting level, through the whole product.
+ *
+ * The move is `target.move` on the real Agent API against a real project on
+ * disk, because the thing being tested is a question about that project's CSS
+ * and nothing shorter than the product can ask it.
+ */
+async function raiseThroughTheApp(app, cls) {
+  const run = (d, a, args = {}) => app.api.run(d, a, args);
+  const page = (await run('target', 'read')).target;
+  const outer = (page?.children || []).find((c) => c.tag === 'div');
+  if (!outer?.ref) return { ok: false, why: 'no <div class=outer>' };
+  const outerRead = (await run('target', 'read', { ref: outer.ref })).target;
+  const wrap = (outerRead?.children || []).find((c) => c.tag === 'div');
+  if (!wrap?.ref) return { ok: false, why: 'no <div class=wrap>' };
+  const wrapRead = (await run('target', 'read', { ref: wrap.ref })).target;
+  const kids = wrapRead?.children || [];
+  const which = cls === 'preserved' ? 0 : 1;
+  if (!kids[which]?.ref) return { ok: false, why: `no child ${which}` };
+  return run('target', 'move', { ref: kids[which].ref, to: { parentRef: outerRead.ref, index: 1 } });
+}
+
+/**
+ * T1 -- the documented residual, end to end, with the CSS on disk.
+ *
+ * PREMISES FIRST, so this cannot pass for the wrong reason: the rule really is
+ * in a file, opening the project really did not rewrite the page, the move
+ * really was accepted, and the file really did change. Only then the verdict.
+ */
+const RULE_IN = {
+  // A plain rule in a plain stylesheet -- the shape the residual named.
+  stylesheet: (files) => {
+    files['src/styles/site.css'] = `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space: pre; }\n`;
+    return ['src/styles/site.css', '.preserved { white-space: pre; }'];
+  },
+  // The same rule with an at-rule in front of it. Whether the media query
+  // matches is a question about a viewport, and this scan is not allowed to
+  // depend on one -- the rule is there, so the element could have it.
+  media: (files) => {
+    files['src/styles/site.css'] =
+      `${H.FIXTURE['src/styles/site.css']}\n@media screen and (min-width: 1px) {\n  .preserved { white-space: pre; }\n}\n`;
+    return ['src/styles/site.css', '@media screen and (min-width: 1px)'];
+  },
+  // AND A `<style>` BLOCK, which is not a stylesheet at all. `findStylesheets`
+  // walks `.css` files; a rule an author wrote in the layout that wraps every
+  // page is invisible to it, and was measured missing along with the rest.
+  'style-block': (files) => {
+    files['src/layouts/Base.astro'] = `${H.FIXTURE['src/layouts/Base.astro']}<style>\n.preserved { white-space: pre; }\n</style>\n`;
+    return ['src/layouts/Base.astro', '<style>'];
+  },
+};
+
+async function stylesheetPreservedWhitespace(shape, where = 'stylesheet') {
+  const label = `[css ${shape.id}/${where}]`;
+  const { source, inner, raised } = preservedFixture(shape);
+  const files = { [PAGE]: source };
+  const [ruleFile, ruleText] = RULE_IN[where](files);
+  const root = H.makeProject(files);
+  const app = await H.start(root, { agentMode: 'full' });
+  await H.settle(400);
+  try {
+    if (
+      !check(
+        `${label} the rule is in a file on disk`,
+        app.exists(ruleFile) && app.read(ruleFile).includes(ruleText) && app.read(ruleFile).includes('white-space: pre'),
+        short(app.read(ruleFile).slice(-80))
+      ) ||
+      !check(`${label} opening the project does not rewrite the page`, app.read(PAGE) === source, short(changedSpan(source, app.read(PAGE)))) ||
+      !check(`${label} the fixture's two blocks start as the same bytes`, innerOf(source, 'preserved') === inner && innerOf(source, 'ordinary') === inner, short({ inner }))
+    ) {
+      return;
+    }
+    const baselineSha = sha(source);
+
+    // --- THE ONE THE STYLESHEET PROTECTS.
+    const answer = await raiseThroughTheApp(app, 'preserved');
+    const after = app.read(PAGE);
+    if (
+      !check(`${label} the move is accepted`, answer?.ok === true, short(answer)) ||
+      !check(`${label} the file changed`, sha(after) !== baselineSha, tag(after))
+    ) {
+      return;
+    }
+    check(
+      `${label} the block a stylesheet preserves keeps its authored bytes`,
+      innerOf(after, 'preserved') === inner,
+      short({ want: inner, got: innerOf(after, 'preserved'), span: changedSpan(source, after) })
+    );
+    // POSITIVE CONTROL, in the same file and the same move: the block NO rule
+    // names is still reindented. Without this a fix that refuses every reindent
+    // passes.
+    check(
+      `${label}   and the block no rule names is untouched by that move`,
+      innerOf(after, 'ordinary') === inner,
+      short({ got: innerOf(after, 'ordinary') })
+    );
+    check(
+      `${label}   and the file's own indentation unit is still the only one in it`,
+      indentsIn(after).every((lead) => lead.split(shape.ind).every((part) => part === '')),
+      short({ unit: shape.ind, found: indentsIn(after) })
+    );
+
+    await app.api.run('project', 'undo', {});
+    if (!check(`${label} undo puts the baseline back`, sha(app.read(PAGE)) === baselineSha, tag(app.read(PAGE)))) return;
+
+    // --- THE POSITIVE CONTROL AS ITS OWN MOVE: the ordinary block RAISES.
+    const control = await raiseThroughTheApp(app, 'ordinary');
+    const afterControl = app.read(PAGE);
+    if (
+      !check(`${label} the control move is accepted`, control?.ok === true, short(control)) ||
+      !check(`${label} the control move changes the file`, sha(afterControl) !== baselineSha, tag(afterControl))
+    ) {
+      return;
+    }
+    check(
+      `${label} the ordinary block IS raised -- the fix is a narrowing, not a switch-off`,
+      innerOf(afterControl, 'ordinary') === raised && raised !== inner,
+      short({ want: raised, got: innerOf(afterControl, 'ordinary') })
+    );
+    check(
+      `${label}   and the preserved block, which did not move, still holds its bytes`,
+      innerOf(afterControl, 'preserved') === inner,
+      short({ got: innerOf(afterControl, 'preserved') })
+    );
+    check(
+      `${label}   and the file's own indentation unit is still the only one in it`,
+      indentsIn(afterControl).every((lead) => lead.split(shape.ind).every((part) => part === '')),
+      short({ unit: shape.ind, found: indentsIn(afterControl) })
+    );
+  } finally {
+    app.stop();
+    H.removeProject(root);
+  }
+}
+
+/**
+ * T5 -- the scanner's negative control.
+ *
+ * `nowrap` and `pre-line` are declarations about whitespace that a browser
+ * measurably does NOT render differently after a reindent. A scanner that keys
+ * on the PROPERTY rather than on its VALUE would disable reindentation for the
+ * whole project on one of them, which is the switch-off this must not become.
+ */
+async function neutralRulesChangeNothing(value) {
+  const label = `[css ${value}]`;
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner, raised } = preservedFixture(shape);
+  const css = `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space: ${value}; }\n`;
+  const root = H.makeProject({ [PAGE]: source, 'src/styles/site.css': css });
+  const app = await H.start(root, { agentMode: 'full' });
+  await H.settle(400);
+  try {
+    if (!check(`${label} opening the project does not rewrite the page`, app.read(PAGE) === source, short(changedSpan(source, app.read(PAGE))))) return;
+    const answer = await raiseThroughTheApp(app, 'preserved');
+    const after = app.read(PAGE);
+    if (
+      !check(`${label} the move is accepted`, answer?.ok === true, short(answer)) ||
+      !check(`${label} the file changed`, sha(after) !== sha(source), tag(after))
+    ) {
+      return;
+    }
+    check(
+      `${label} a rule that does not change the rendering does not stop the reindent`,
+      innerOf(after, 'preserved') === raised && raised !== inner,
+      short({ want: raised, got: innerOf(after, 'preserved') })
+    );
+  } finally {
+    app.stop();
+    H.removeProject(root);
+  }
+}
+
+/**
+ * T6 -- every failure resolves to keeping the bytes.
+ *
+ * A stylesheet postcss will not parse, and one the process cannot read. Neither
+ * is a stylesheet with no rules in it, and answering "no tokens" for either is
+ * how a permissions error would quietly re-enable a reindent that deletes
+ * rendered spaces. The write still has to SUCCEED -- a broken stylesheet is not
+ * a reason to refuse an edit -- and the bytes still have to be there.
+ */
+async function aStylesheetThatCannotBeReadOrParsed(kind) {
+  const label = `[css ${kind}]`;
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner } = preservedFixture(shape);
+  const root = H.makeProject({ [PAGE]: source });
+  const broken = path.join(root, 'src', 'styles', 'broken.css');
+  if (kind === 'unparseable') fs.writeFileSync(broken, '.preserved { white-space: pre\n@media {\n', 'utf8');
+  else {
+    fs.writeFileSync(broken, '.preserved { white-space: pre; }\n', 'utf8');
+    fs.chmodSync(broken, 0o000);
+  }
+  const app = await H.start(root, { agentMode: 'full' });
+  await H.settle(400);
+  try {
+    // THE PREMISE: the file really is unusable. A test whose broken input is
+    // quietly fine is a test of nothing.
+    if (kind === 'unparseable') {
+      let threw = false;
+      try {
+        require('postcss').parse(fs.readFileSync(broken, 'utf8'));
+      } catch {
+        threw = true;
+      }
+      if (!check(`${label} postcss really cannot parse the fixture`, threw, 'the fixture parsed')) return;
+    } else {
+      let readable = true;
+      try {
+        fs.readFileSync(broken, 'utf8');
+      } catch {
+        readable = false;
+      }
+      if (!check(`${label} the fixture really cannot be read`, !readable, 'the file was readable')) return;
+    }
+    const answer = await raiseThroughTheApp(app, 'ordinary');
+    const after = app.read(PAGE);
+    check(`${label} the write still succeeds`, answer?.ok === true, short(answer));
+    check(`${label} the file changed`, sha(after) !== sha(source), tag(after));
+    check(
+      `${label} and every block keeps its authored bytes`,
+      innerOf(after, 'ordinary') === inner && innerOf(after, 'preserved') === inner,
+      short({ want: inner, ordinary: innerOf(after, 'ordinary'), preserved: innerOf(after, 'preserved') })
+    );
+  } finally {
+    app.stop();
+    try {
+      fs.chmodSync(broken, 0o644);
+    } catch {
+      /* already gone */
+    }
+    H.removeProject(root);
+  }
+}
+
+/**
+ * T7 -- the bytes do not depend on a window.
+ *
+ * The live preview could answer the CSS question exactly, and answering it
+ * there would make what is written to disk depend on whether a window happens
+ * to be open, which route it happens to show and when the paint landed -- and
+ * it still could not answer about a destination that does not exist until after
+ * the write. So the same move is done twice over the same bytes: once inside a
+ * running app with its DOM mounted, and once by calling the writer directly in
+ * a process holding no app at all. Anyone wiring `getComputedStyle` into this
+ * path makes these two disagree.
+ */
+async function theSameBytesWithNoWindow() {
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner } = preservedFixture(shape);
+  const css = `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space: pre; }\n`;
+  const withWindow = H.makeProject({ [PAGE]: source, 'src/styles/site.css': css });
+  const noWindow = H.makeProject({ [PAGE]: source, 'src/styles/site.css': css });
+  const app = await H.start(withWindow, { agentMode: 'full' });
+  await H.settle(400);
+  let live = null;
+  try {
+    const answer = await raiseThroughTheApp(app, 'preserved');
+    live = app.read(PAGE);
+    if (!check('[no window] the move through the running app is accepted', answer?.ok === true, short(answer))) return;
+    check('[no window] the running app has a document to measure with', typeof globalThis.document?.createElement === 'function', String(typeof globalThis.document));
+  } finally {
+    app.stop();
+    H.removeProject(withWindow);
+  }
+
+  // The same edit with nothing mounted: parse, move the node, write.
+  const parsed = parsePage(source);
+  if (!check('[no window] the page parses outside the app', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const wrap = outer?.children?.find((n) => n.name === 'div');
+  const moved = wrap?.children?.find((n) => n.name === 'div');
+  if (!check('[no window] the block is where a move can reach it', !!moved, short(wrap?.children?.map((n) => n.name)))) return;
+  wrap.children = wrap.children.filter((n) => n !== moved);
+  outer.children.splice(1, 0, moved);
+  WS.forgetCache();
+  const headless = anchoredSerialize(source, model, { preservingTokens: WS.preservingTokens(noWindow) });
+  H.removeProject(noWindow);
+
+  check('[no window] the bytes a running app writes are the bytes a bare call writes', live === headless, short({ span: live === null ? null : changedSpan(live, headless) }));
+  check('[no window]   and both kept the authored whitespace', innerOf(headless, 'preserved') === inner, short({ want: inner, got: innerOf(headless, 'preserved') }));
+}
+
+/**
+ * T2 -- `white-space` INHERITS, and the guard used to look only DOWN.
+ *
+ * A page holding the same block twice, once inside an element that declares the
+ * property and once inside one that does not, and the move is the same move:
+ * up one nesting level, STAYING INSIDE the ancestor. Nothing here is in a
+ * stylesheet and nothing here is a `<pre>` -- this is entirely inside the scope
+ * the element-local guard already claimed to cover, and it lost two spaces.
+ */
+function inheritedWhitespace(attr, preserved) {
+  const label = `[inherited ${attr || 'nothing'}]`;
+  const inner = 'alpha\n      beta\ngamma';
+  const raised = 'alpha\n    beta\ngamma';
+  const outerTag = attr ? `<div ${attr}>` : `<div class='plain'>`;
+  const source = commentedPage(
+    `  ${outerTag}\n    <div class='wrap'>\n      <p>${inner}</p>\n    </div>\n` +
+      `    <span class='tail'>tail</span>\n  </div>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const wrap = outer?.children?.find((n) => n.name === 'div');
+  const p = wrap?.children?.find((n) => n.name === 'p');
+  if (!check(`${label} the block is where a move can reach it`, !!p, short(wrap?.children?.map((n) => n.name)))) return;
+  wrap.children = wrap.children.filter((n) => n !== p);
+  outer.children.splice(outer.children.indexOf(wrap) + 1, 0, p);
+  const after = anchoredSerialize(source, model);
+  // POSITIVE CONTROL: the move happened. Everything below is satisfied by a
+  // write that did nothing at all without it.
+  if (!check(`${label} the move empties the wrap`, /<div class='wrap'>\s*<\/div>/.test(after), short(changedSpan(source, after)))) return;
+  const got = /<p>([\s\S]*?)<\/p>/.exec(after);
+  check(
+    preserved
+      ? `${label} the block never left the ancestor, so it keeps every space that ancestor renders`
+      : `${label} an ordinary ancestor still lets the block be reindented`,
+    !!got && got[1] === (preserved ? inner : raised),
+    short({ want: preserved ? inner : raised, got: got ? got[1] : null, span: changedSpan(source, after) })
+  );
+  check(
+    `${label}   and the page was spliced to do it, not reprinted`,
+    /\/\/ Component imports\nimport Card/.test(after),
+    short(changedSpan(source, after))
+  );
+}
+
+/**
+ * T2, the other direction -- a block moved INTO a preserving element.
+ *
+ * Nothing about the block being moved can answer this: its own bytes are
+ * innocent and it declares nothing. The moment it lands inside an element that
+ * renders its whitespace, the indentation written in front of it becomes
+ * content -- measured, two spaces inserted, including in front of a line that
+ * had none. So the break goes in and the indent does not.
+ */
+function movedIntoPreservedWhitespace(attr, preserved) {
+  const label = `[into ${attr || 'nothing'}]`;
+  const source = commentedPage(
+    `  <div ${attr}>\n    <span class='kept'>one</span>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n  <p>alpha\nbeta</p>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const box = root.children.find((n) => n.name === 'div');
+  const p = root.children.find((n) => n.name === 'p');
+  if (!check(`${label} both are where a move can reach them`, !!box && !!p, short(root.children.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== p);
+  box.children.push(p);
+  const after = anchoredSerialize(source, model);
+  if (!check(`${label} the move puts the <p> inside the box`, /<span class='kept'>one<\/span>[\s\S]*<p>[\s\S]*<\/div>/.test(after), short(changedSpan(source, after)))) return;
+  const held = /<div [^>]*>([\s\S]*?)<\/div>/.exec(after);
+  const inserted = held ? held[1] : '';
+  check(
+    preserved
+      ? `${label} nothing is indented into the element that renders its whitespace`
+      : `${label} an ordinary element still gets the sibling's indentation`,
+    preserved
+      ? inserted === `\n    <span class='kept'>one</span>\n<p>alpha\nbeta</p>\n  `
+      : inserted === `\n    <span class='kept'>one</span>\n    <p>alpha\n  beta</p>\n  `,
+    short({ got: inserted })
+  );
+}
+
+/**
+ * T3 -- the value table, which is what keeps this a narrowing.
+ *
+ * Measured in a real Blink window over the same reindent: with `pre`,
+ * `pre-wrap` and `break-spaces` the rendered line moves; with `pre-line`,
+ * `normal` and `nowrap` it does not, because all three collapse runs of spaces
+ * and `pre-line` keeps only the newlines. `pre-line` used to refuse here. It
+ * was safe and it was wrong: a refusal costs the author their reindentation for
+ * no rendered difference at all.
+ *
+ * Asked twice, of the two places the answer has to agree: the declaration
+ * written on the element, and the scanner that reduces a project's stylesheets.
+ */
+const WHITESPACE_VALUES = [
+  { value: 'pre', refuses: true },
+  { value: 'pre-wrap', refuses: true },
+  { value: 'break-spaces', refuses: true },
+  { value: 'pre-line', refuses: false },
+  { value: 'normal', refuses: false },
+  { value: 'nowrap', refuses: false },
+  // A value nothing can read statically. Guessing it is `normal` is the guess
+  // that deletes bytes, so it counts as preserving.
+  { value: 'var(--ws)', refuses: true },
+];
+
+function theWhitespaceValueTable() {
+  const inner = 'alpha\n      beta\ngamma';
+  const raised = 'alpha\n    beta\ngamma';
+  for (const { value, refuses } of WHITESPACE_VALUES) {
+    const label = `[value ${value}]`;
+    const source = commentedPage(
+      `  <div class='outer'>\n    <div class='wrap'>\n      <p style='white-space: ${value}'>${inner}</p>\n    </div>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const wrap = outer?.children?.find((n) => n.name === 'div');
+    const p = wrap?.children?.find((n) => n.name === 'p');
+    if (!check(`${label} the block is where a move can reach it`, !!p, short(wrap?.children?.map((n) => n.name)))) continue;
+    wrap.children = wrap.children.filter((n) => n !== p);
+    outer.children.splice(1, 0, p);
+    const after = anchoredSerialize(source, model);
+    if (!check(`${label} the move empties the wrap`, /<div class='wrap'>\s*<\/div>/.test(after), short(changedSpan(source, after)))) continue;
+    const got = /<p [^>]*>([\s\S]*?)<\/p>/.exec(after);
+    check(
+      refuses
+        ? `${label} a value the browser renders differently after a reindent refuses it`
+        : `${label} a value the browser renders the SAME after a reindent still allows it`,
+      !!got && got[1] === (refuses ? inner : raised),
+      short({ want: refuses ? inner : raised, got: got ? got[1] : null })
+    );
+    // AND THE SCANNER'S HALF OF THE SAME TABLE. A reducer that keys on the
+    // property name rather than on its value answers the same for all six.
+    const tokens = WS.tokensInCss(`.card { white-space: ${value}; }`);
+    check(
+      `${label}   and the stylesheet scanner says the same thing`,
+      tokens.has('.card') === refuses && tokens.size === (refuses ? 1 : 0),
+      short([...tokens])
+    );
+  }
+}
+
+/**
+ * T4 -- THE CRITICAL ONE: a `<pre>` holding ELEMENT children.
+ *
+ * `printNode`'s refusal asks about the bytes of the node being MOVED, and here
+ * the node being moved is an innocent `<span>`. What holds the rendered spaces
+ * is the context it lives in, and re-laying the `<pre>`'s children out as an
+ * inline run collapsed the whole block onto one line: three lines of rendered
+ * text became `alpha beta gamma`.
+ *
+ * THE ORACLE IS THE AUTHORED BYTES, and it has to be. The readback in
+ * `anchoredSerialize` compares the splice against `serializePage` of the same
+ * model, and BOTH destroy this run -- the newlines between element children of
+ * a `<pre>` live in the model only as an as-written cache -- so the fallback
+ * produces the identical damage and the two agree about it.
+ */
+function elementChildrenInsideAPre() {
+  for (const tag of ['pre', 'div']) {
+    const label = `[children of <${tag}>]`;
+    const preserved = tag === 'pre';
+    const body = `  <${tag}><span class='wrap'><span class='moved'>alpha\n beta\ngamma</span></span><span class='tail'>tail</span></${tag}>\n`;
+    const source = commentedPage(body);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === tag);
+    const wrap = box?.children?.find((n) => n.name === 'span');
+    const moved = wrap?.children?.find((n) => n.name === 'span');
+    if (!check(`${label} the inner span is where a move can reach it`, !!moved, short(wrap?.children?.map((n) => n.name)))) continue;
+    // THE PREMISE: the bytes really do hold the newlines, and the MODEL really
+    // does not. If the parser ever starts carrying them in `value` this stops
+    // being the fixture and says so here rather than passing for free.
+    if (
+      !check(
+        `${label} the model collapsed the run the file spells across three lines`,
+        moved.children?.[0]?.value === 'alpha beta gamma' && moved.children?.[0]?.source === 'alpha\n beta\ngamma',
+        short(moved.children?.[0])
+      )
+    ) {
+      continue;
+    }
+    wrap.children = wrap.children.filter((n) => n !== moved);
+    box.children.splice(1, 0, moved);
+    const after = anchoredSerialize(source, model);
+    // POSITIVE CONTROL: the span really left the wrap.
+    if (!check(`${label} the move empties the wrap`, /<span class='wrap'><\/span>/.test(after), short(changedSpan(source, after)))) continue;
+    const want = commentedPage(
+      preserved
+        ? `  <${tag}><span class='wrap'></span><span class='moved'>alpha\n beta\ngamma</span><span class='tail'>tail</span></${tag}>\n`
+        : `  <${tag}><span class='wrap'></span><span class='moved'>alpha beta gamma</span><span class='tail'>tail</span></${tag}>\n`
+    );
+    check(
+      preserved
+        ? `${label} every space the browser renders in the run is still there`
+        : `${label} an ordinary inline run is still re-laid-out, as it always was`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+  }
+}
+
+/**
+ * T4, the destination side -- a block moved INTO a `<pre>`'s inline run.
+ *
+ * The same collapse as above, arriving from the other direction: the run the
+ * moved element joins is one `inlineString` would rewrite from the model, and
+ * the model is where the newlines have already gone. So the bytes that land are
+ * the bytes the file already held, joined by nothing -- inside a preserving
+ * element there is no layout to add.
+ */
+function movedIntoAPresInlineRun() {
+  for (const tag of ['pre', 'div']) {
+    const label = `[into <${tag}>'s run]`;
+    const preserved = tag === 'pre';
+    const source = commentedPage(
+      `  <${tag}><span class='a'>one</span><span class='b'>two</span></${tag}>\n` +
+        `  <div class='src'><span class='stay'>stay</span><span class='moved'>alpha\n beta</span></div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const root = model.nodes[0];
+    const box = root.children.find((n) => n.name === tag);
+    const src = root.children.filter((n) => n.name === 'div').pop();
+    const moved = src?.children?.[1];
+    if (!check(`${label} the span is where a move can reach it`, !!box && !!moved, short(root.children.map((n) => n.name)))) continue;
+    src.children = src.children.filter((n) => n !== moved);
+    box.children.splice(1, 0, moved);
+    const after = anchoredSerialize(source, model);
+    // POSITIVE CONTROL: the span really left the element it was in.
+    if (
+      !check(
+        `${label} the move takes the span out of the div it came from`,
+        /<div class='src'><span class='stay'>stay<\/span><\/div>/.test(after),
+        short(changedSpan(source, after))
+      )
+    ) {
+      continue;
+    }
+    const want = commentedPage(
+      `  <${tag}><span class='a'>one</span><span class='moved'>alpha${preserved ? '\n beta' : ' beta'}</span><span class='b'>two</span></${tag}>\n` +
+        `  <div class='src'><span class='stay'>stay</span></div>\n`
+    );
+    check(
+      preserved
+        ? `${label} the bytes that land are the bytes the file held, with nothing added between them`
+        : `${label} an ordinary inline run is still rewritten from the model, as it always was`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+  }
+}
+
+/**
+ * T4, once more where the preserving element is written as a BLOCK.
+ *
+ * A `<pre>`-like element does not have to hold an inline run: a
+ * `white-space: pre` `<div>` full of paragraphs is laid out over lines, and a
+ * run of its children replaced by a longer run goes through `rangeSplice`
+ * rather than through the insert. The indentation between those lines is
+ * content there exactly as it is anywhere else inside such an element, so the
+ * break goes in and the indent does not.
+ */
+function replacedInsidePreservedWhitespace(attr, preserved) {
+  const label = `[replaced in ${attr}]`;
+  const source = commentedPage(`  <div ${attr}>\n    <p>one</p>\n    <p>two</p>\n  </div>\n`);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const box = model.nodes[0].children.find((n) => n.name === 'div');
+  if (!check(`${label} the paragraphs are children of the box`, box?.children?.length === 2, short(box?.children?.map((n) => n.name)))) return;
+  const para = (word) => ({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: word }] });
+  box.children = [para('a'), para('b'), para('c')];
+  const after = anchoredSerialize(source, model);
+  if (!check(`${label} the three new paragraphs are in the file`, /<p>a<\/p>[\s\S]*<p>b<\/p>[\s\S]*<p>c<\/p>/.test(after), short(changedSpan(source, after)))) return;
+  const held = new RegExp(`<div ${attr}>([\\s\\S]*?)</div>`).exec(after);
+  check(
+    preserved
+      ? `${label} the replacement run is written with no indentation to render`
+      : `${label} an ordinary element still gets its own indentation on every line`,
+    (held ? held[1] : null) ===
+      (preserved ? '\n    <p>a</p>\n<p>b</p>\n<p>c</p>\n  ' : '\n    <p>a</p>\n    <p>b</p>\n    <p>c</p>\n  '),
+    short({ got: held ? held[1] : null })
+  );
+}
+
+/**
+ * The reducer, on its own -- what a selector is allowed to reduce to.
+ *
+ * It answers ONE question, "could this rule reach an element with these
+ * tokens?", and only the NO is ever acted on, so an over-approximation is
+ * sound and a shape it does not fully understand has to answer ANY. The point
+ * of asserting the exact sets is that ANY is not the answer to everything:
+ * a reducer that returned ANY for every selector would refuse every reindent
+ * in every project, which is the switch-off this must not become.
+ */
+function theSelectorReducer() {
+  const cases = [
+    ['.preserved { white-space: pre }', ['.preserved']],
+    // The SUBJECT is the rightmost compound: `.card p` styles the p.
+    ['.card p { white-space: pre }', ['p']],
+    ['#top.wide { white-space: pre }', ['#top', '.wide']],
+    ['.a, .b { white-space: pre }', ['.a', '.b']],
+    ['@media print { .m { white-space: pre } }', ['.m']],
+    // Shapes the reducer does not claim to understand.
+    ['* { white-space: pre }', ['*']],
+    ['[data-keep] { white-space: pre }', ['*']],
+    [':is(.a, .b) { white-space: pre }', ['*']],
+    ['.card:not(.flat) { white-space: pre }', ['*']],
+    // Cut in half by the split and still right: the subject survived it whole.
+    ['.a[data-x] .b { white-space: pre }', ['.b']],
+    ['[data-x="a b"] { white-space: pre }', ['*']],
+    // NEGATIVE CONTROLS: nothing here preserves anything, so nothing is
+    // contributed -- not even ANY.
+    ['.card { color: red }', []],
+    ['.card { white-space: nowrap }', []],
+    ['', []],
+  ];
+  for (const [css, want] of cases) {
+    const got = [...WS.tokensInCss(css)].sort();
+    check(
+      `[reducer] ${css || '(empty)'} -> ${want.length ? want.join(' ') : 'nothing'}`,
+      got.length === want.length && got.every((one, i) => one === [...want].sort()[i]),
+      short({ want, got })
+    );
+  }
+  // A text postcss cannot parse is a text whose rules are unknown, and unknown
+  // is the refusing answer rather than the permitting one.
+  check(
+    '[reducer] a stylesheet that will not parse contributes ANY',
+    WS.tokensInCss('.preserved { white-space: pre\n@media {\n').has('*'),
+    short([...WS.tokensInCss('.preserved { white-space: pre\n@media {\n')])
+  );
+  // A `<style>` block is not a stylesheet, and the scan has to find one.
+  check(
+    '[reducer] a <style> block is found in a component',
+    WS.styleBlocksIn('<div>x</div>\n<style>\n.a { color: red }\n</style>\n').join('').includes('.a { color: red }'),
+    short(WS.styleBlocksIn('<div>x</div>\n<style>\n.a { color: red }\n</style>\n'))
+  );
+  // AND THE DECISION ABOUT NO PROJECT AT ALL, asserted rather than assumed:
+  // a caller with nothing to scan gets nothing, not everything. The other
+  // reading would switch reindentation off for every caller that has no
+  // project, and this guard only earns its keep as a narrowing.
+  // A STYLESHEET TOO BIG TO BE WORTH READING IS STILL A STYLESHEET. Skipping it
+  // would answer "no rules in there" about a file nobody looked at, which is
+  // the one answer that costs bytes.
+  const big = H.makeProject({});
+  fs.writeFileSync(path.join(big, 'src', 'styles', 'big.css'), `/* ${'x'.repeat(3 * 1024 * 1024)} */\n`, 'utf8');
+  WS.forgetCache();
+  check(
+    '[reducer] a stylesheet too big to read contributes ANY',
+    WS.preservingTokens(big).has('*'),
+    short([...WS.preservingTokens(big)])
+  );
+  H.removeProject(big);
+  WS.forgetCache();
+  check(
+    '[reducer] no project to scan is an empty answer, not ANY',
+    WS.preservingTokens(null).size === 0 && WS.preservingTokens('').size === 0,
+    short([...WS.preservingTokens(null)])
+  );
+}
+
+/**
+ * T8 -- the coverage debt.
+ *
+ * `declaresRenderedSpace` looks DOWN, and until this fixture existed nothing in
+ * test/ could make it return true: the strings 'whitespace-pre' and
+ * 'white-space: pre' appeared in no fixture anywhere, so deleting the call from
+ * `printNode` left every suite green. Here the node that MOVES declares
+ * nothing, sits under no preserving ancestor and holds none of the four tags --
+ * the only thing that can save its bytes is the descendant three levels inside
+ * it that does declare the property.
+ */
+function aDescendantThatDeclaresIt() {
+  for (const attr of [`style='white-space: pre'`, `class='whitespace-pre'`, `class='plain'`]) {
+    const preserved = !attr.includes('plain');
+    const label = `[descendant ${attr}]`;
+    const inner = 'alpha\n      beta\ngamma';
+    const raised = 'alpha\n    beta\ngamma';
+    const source = commentedPage(
+      `  <div class='outer'>\n    <div class='wrap'>\n      <section>\n        <div ${attr}>${inner}</div>\n      </section>\n    </div>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const wrap = outer?.children?.find((n) => n.name === 'div');
+    const section = wrap?.children?.find((n) => n.name === 'section');
+    if (!check(`${label} the section is where a move can reach it`, !!section, short(wrap?.children?.map((n) => n.name)))) continue;
+    wrap.children = wrap.children.filter((n) => n !== section);
+    outer.children.splice(1, 0, section);
+    const after = anchoredSerialize(source, model);
+    if (!check(`${label} the move empties the wrap`, /<div class='wrap'>\s*<\/div>/.test(after), short(changedSpan(source, after)))) continue;
+    const got = new RegExp(`<div ${attr}>([\\s\\S]*?)</div>`).exec(after);
+    check(
+      preserved
+        ? `${label} a node whose DESCENDANT renders its spaces travels unshifted`
+        : `${label} a node with nothing inside it to protect is still reindented`,
+      !!got && got[1] === (preserved ? inner : raised),
+      short({ want: preserved ? inner : raised, got: got ? got[1] : null })
+    );
+  }
+}
+
 (async () => {
   for (const f of FIXTURES) await runFixture(f);
   importInsert();
@@ -1439,6 +2203,35 @@ function overlappingSplices() {
   trailingImportComment();
   moveRoundTrip();
   overlappingSplices();
+
+  // --- whitespace a page renders because of CSS, and not because of a tag.
+  for (const attr of ["style='white-space: pre'", "class='whitespace-pre'", null]) {
+    inheritedWhitespace(attr, attr !== null);
+  }
+  for (const attr of ["style='white-space: pre'", "class='whitespace-pre'", "class='plain'"]) {
+    movedIntoPreservedWhitespace(attr, !attr.includes('plain'));
+  }
+  theWhitespaceValueTable();
+  elementChildrenInsideAPre();
+  movedIntoAPresInlineRun();
+  for (const attr of ["style='white-space: pre'", "class='plain'"]) {
+    replacedInsidePreservedWhitespace(attr, !attr.includes('plain'));
+  }
+  aDescendantThatDeclaresIt();
+  theSelectorReducer();
+  for (const shape of [
+    { id: 'two-space', ind: '  ', eol: '\n' },
+    { id: 'tabs', ind: '\t', eol: '\n' },
+    { id: 'crlf', ind: '  ', eol: '\r\n' },
+  ]) {
+    await stylesheetPreservedWhitespace(shape);
+  }
+  for (const where of ['media', 'style-block']) {
+    await stylesheetPreservedWhitespace({ id: 'two-space', ind: '  ', eol: '\n' }, where);
+  }
+  for (const value of ['nowrap', 'pre-line']) await neutralRulesChangeNothing(value);
+  for (const kind of ['unparseable', 'unreadable']) await aStylesheetThatCannotBeReadOrParsed(kind);
+  await theSameBytesWithNoWindow();
 
   if (failures.length) {
     console.error(`source-fidelity-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

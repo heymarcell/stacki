@@ -1507,38 +1507,154 @@ const HOLDS_RENDERED_SPACE = /<(pre|textarea|script|style)[\s>]/i;
 // `anchoredSerialize` compares `<pre>`/`<textarea>` runs, so it could not see it
 // either.
 //
-// WHAT THIS COVERS, said plainly because the gap matters: the declaration has to
-// be ON the element, as an inline `style` or as one of the whitespace utility
-// classes. Whitespace preserved by a rule in a stylesheet -- `.card { white-space: pre }` --
-// is NOT detected here, because this parser has no cascade and inventing one
-// would be a second CSS engine. That residual is written down in
-// docs/mcp-v1.md rather than left to be discovered.
+// WHAT THIS COVERS ON ITS OWN, said plainly because the shape matters: the
+// declaration written ON the element, as an inline `style` or as one of the
+// whitespace utility classes. Two things it cannot see by itself are answered
+// elsewhere in this file and by the caller:
+//
+//   * `white-space` is an INHERITED property, so an element can render its
+//     spaces because an ANCESTOR asked for it. That is `preservingContext`
+//     below, which walks the base tree top-down instead of looking down from
+//     one node.
+//   * a rule in a stylesheet -- `.preserved { white-space: pre }` -- is a
+//     question about the PROJECT, and this file is a pure function of
+//     (source, model, options). The caller scans the project's CSS
+//     (electron/whitespaceRules.js) and hands the answer in as
+//     `options.preservingTokens`. No fs walk happens here, and nothing here
+//     knows what a project is.
+//
+// THE VALUES. Measured in a real Blink window: `pre`, `pre-wrap` and
+// `break-spaces` render differently after a reindent; `pre-line`, `normal` and
+// `nowrap` do not, because all three collapse runs of spaces. `pre-line` used
+// to be in this set and is deliberately gone: refusing on it was safe and
+// refused a reindent that is provably neutral, and this mechanism only earns
+// its keep while it stays a narrowing. A value that cannot be read statically
+// -- `white-space: var(--ws)` -- counts as preserving, because the only answer
+// this is allowed to get wrong is the one that refuses.
 //
 // Refusing is always the safe direction: the block travels as its author wrote
 // it and sits at its old inner indentation, which is cosmetic. The alternative
 // is silent data loss.
-const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(pre|pre-wrap|pre-line|break-spaces)/i;
-const PRESERVES_SPACE_CLASS = /(^|\s)(whitespace-pre(-wrap|-line)?|whitespace-break-spaces)(\s|$)/i;
+const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(?:(pre|pre-wrap|break-spaces)(?![\w-])|var\s*\()/i;
+const PRESERVES_SPACE_CLASS = /(^|\s)(whitespace-pre(-wrap)?|whitespace-break-spaces)(\s|$)/i;
+// And the two spellings that turn it back OFF. Inheritance is overridable, and
+// saying so is the only thing that stops one `white-space: pre` near the top of
+// a page from smearing the flag over every element under it.
+const DROPS_SPACE = /(^|[\s;])white-space\s*:\s*(normal|nowrap)(?![\w-])/i;
+const DROPS_SPACE_CLASS = /(^|\s)(whitespace-normal|whitespace-nowrap)(\s|$)/i;
 
-/** Does this node, or anything inside it, ask for its own whitespace to be kept? */
-function declaresRenderedSpace(node) {
-  if (!node || typeof node !== 'object') return false;
-  const props = node.props;
-  if (props && typeof props === 'object') {
-    const valueOf = (name) => {
-      const p = props[name];
-      if (p == null) return null;
-      // A prop is `{type, value}`; a bound expression has no literal to read and
-      // is deliberately not guessed at.
-      const v = typeof p === 'object' ? p.value : p;
-      return typeof v === 'string' ? v : null;
-    };
-    const style = valueOf('style');
-    if (style && PRESERVES_SPACE.test(style)) return true;
-    const cls = valueOf('class') || valueOf('className');
-    if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+// The four tags whose inner whitespace is content whatever the CSS says, as a
+// question about the tree rather than about bytes -- which is what
+// `HOLDS_RENDERED_SPACE` above asks the same thing of.
+const PRESERVING_TAGS = new Set(['pre', 'textarea', 'script', 'style']);
+
+/** One literal attribute value off a node, or null when there is nothing to read. */
+function litProp(node, name) {
+  const props = node && typeof node === 'object' ? node.props : null;
+  if (!props || typeof props !== 'object') return null;
+  const p = props[name];
+  if (p == null) return null;
+  // A prop is `{type, value}`; a bound expression has no literal to read and is
+  // deliberately not guessed at.
+  const v = typeof p === 'object' ? p.value : p;
+  return typeof v === 'string' ? v : null;
+}
+
+/**
+ * Could a preserving rule in the project's CSS be talking about THIS element?
+ *
+ * `tokens` is the over-approximation electron/whitespaceRules.js produces: the
+ * class, id and tag tokens of every preserving rule's subject, plus the
+ * sentinel `'*'` for any selector shape its reducer did not fully understand or
+ * any file it could not read. An EMPTY set is a real answer -- "this project
+ * has no rule that preserves whitespace" -- and no set at all is the same
+ * answer, which is the explicit decision recorded on `anchoredSerialize`.
+ */
+function matchesPreservingTokens(node, tokens) {
+  if (!tokens || typeof tokens.has !== 'function' || !tokens.size) return false;
+  if (tokens.has('*')) return true;
+  const name = typeof node?.name === 'string' ? node.name.toLowerCase() : null;
+  if (name && tokens.has(name)) return true;
+  const id = litProp(node, 'id');
+  if (id && tokens.has(`#${id.trim()}`)) return true;
+  const cls = litProp(node, 'class') || litProp(node, 'className');
+  if (cls) {
+    for (const one of cls.split(/\s+/)) if (one && tokens.has(`.${one}`)) return true;
   }
-  return Array.isArray(node.children) && node.children.some(declaresRenderedSpace);
+  return false;
+}
+
+/**
+ * What THIS element says about its own whitespace: true, false, or null for
+ * "it does not say, so ask its ancestors".
+ *
+ * The order is the cascade's, as far as this goes: the tag wins outright (a
+ * `<pre>` is a `<pre>`), then the element's own declaration, then a rule that
+ * could reach it from a stylesheet -- which an inline `white-space: normal`
+ * beats, exactly as it does in a browser.
+ */
+function ownWhitespaceRule(node, tokens) {
+  if (!node || typeof node !== 'object') return null;
+  const name = typeof node.name === 'string' ? node.name.toLowerCase() : null;
+  if (name && PRESERVING_TAGS.has(name)) return true;
+  const style = litProp(node, 'style');
+  if (style && DROPS_SPACE.test(style)) return false;
+  if (style && PRESERVES_SPACE.test(style)) return true;
+  const cls = litProp(node, 'class') || litProp(node, 'className');
+  if (cls && DROPS_SPACE_CLASS.test(cls)) return false;
+  if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+  if (matchesPreservingTokens(node, tokens)) return true;
+  return null;
+}
+
+/**
+ * Does this node, or anything inside it, ask for its own whitespace to be kept?
+ *
+ * LOOKING DOWN, which is a different question from `preservingContext`'s
+ * looking up, and both are needed: reindenting a `<div>` shifts every line of
+ * the `<pre>` nested three levels inside it just as surely as it shifts the
+ * lines of a `<pre>` that IS it.
+ */
+function declaresRenderedSpace(node, tokens) {
+  if (!node || typeof node !== 'object') return false;
+  const style = litProp(node, 'style');
+  if (style && PRESERVES_SPACE.test(style)) return true;
+  const cls = litProp(node, 'class') || litProp(node, 'className');
+  if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
+  if (matchesPreservingTokens(node, tokens)) return true;
+  return (
+    Array.isArray(node.children) && node.children.some((kid) => declaresRenderedSpace(kid, tokens))
+  );
+}
+
+/**
+ * THE PROPERTY IS INHERITED, SO IT HAS TO BE WALKED DOWN FROM THE ROOT.
+ *
+ * `white-space` inherits. An element whose ANCESTOR carries `white-space: pre`
+ * renders its own leading spaces without saying anything about them, and a
+ * guard that only looks INSIDE the node being moved cannot see that: measured,
+ * an authored `alpha\n        beta\ngamma` came back `alpha\n      beta\ngamma`
+ * on a move that never left the ancestor -- two spaces of rendered text gone,
+ * with no stylesheet anywhere in it. The same hole runs the other way and
+ * INSERTS spaces on a move INTO such an element, including in front of a line
+ * that had none.
+ *
+ * So: one top-down pass over the BASE tree before any splice is planned, and
+ * the answer for every node is membership of the set this returns.
+ */
+function preservingContext(nodes, tokens) {
+  const preserves = new Set();
+  const walk = (list, inherited) => {
+    for (const node of list || []) {
+      if (!node || typeof node !== 'object') continue;
+      const own = ownWhitespaceRule(node, tokens);
+      const here = own === null ? inherited : own;
+      if (here) preserves.add(node);
+      if (Array.isArray(node.children)) walk(node.children, here);
+    }
+  };
+  walk(nodes, false);
+  return preserves;
 }
 
 /**
@@ -1762,11 +1878,56 @@ function printNode(node, indent, ctx) {
     // reprinting the DOCUMENT, which keeps a `<pre>` perfectly well and tears
     // the frontmatter comments off the imports they annotate. Asking only about
     // the `<pre>` is how this line came to be deletable with nine suites green.
-    if (HOLDS_RENDERED_SPACE.test(held) || declaresRenderedSpace(twin)) return held;
+    //
+    // AND THE THREE QUESTIONS THIS ASKS, which are three different questions.
+    // `HOLDS_RENDERED_SPACE` and `declaresRenderedSpace` both look DOWN, at the
+    // bytes and at the tree of the node being copied. `ctx.preserves.has(twin)`
+    // looks UP: `white-space` inherits, so a node that says nothing renders its
+    // spaces when an ancestor asked for it, and a move that never leaves that
+    // ancestor used to be reindented anyway. `ctx.preserving` asks about the
+    // DESTINATION, which no property of the node can answer: dropping an
+    // ordinary block INTO such an element makes its indentation content the
+    // moment it lands.
+    if (
+      ctx.preserving ||
+      ctx.preserves.has(twin) ||
+      HOLDS_RENDERED_SPACE.test(held) ||
+      declaresRenderedSpace(twin, ctx.tokens)
+    ) {
+      return held;
+    }
     const copied = reindentBlock(held, lineIndentOf(ctx.source, twin.start), indent);
     if (copied !== null) return copied;
   }
   return withEol(nodeText(node, indent, ctx.step), ctx.eol);
+}
+
+/**
+ * A run of siblings INSIDE A PRESERVING ELEMENT, as the bytes the file holds.
+ *
+ * THE CRITICAL ONE, and it is not a reindent. When the children of a `<pre>`
+ * are an inline run, `inlineString` rewrites them from the model -- and the
+ * model is where a `<pre>`'s newlines have already been collapsed into `value`.
+ * Measured: a `<pre>` holding `<span class='wrap'><span class='moved'>alpha\n
+ * beta\ngamma</span></span>` and a `<span class='tail'>`, with the inner span
+ * moved up beside its uncle, came back as one line -- `alpha beta gamma` --
+ * every rendered space in the block gone. No CSS was involved, and the
+ * fallback could not save it: `serializePage` re-lays the same run out the same
+ * way, so REPRINTING the document produced the identical damage. The only text
+ * that has the spaces in it is the text on disk.
+ *
+ * So each sibling contributes the bytes its twin already has, joined by
+ * nothing: inside a preserving element there is no layout to add. A node the
+ * file has no bytes for is one an edit created, and it has no authored spaces
+ * to lose, so it is written the ordinary way.
+ */
+function preservedRun(nodes, ctx) {
+  let out = '';
+  for (const node of nodes) {
+    const twin = ctx.twin(node);
+    out += twin ? ctx.source.slice(twin.start, twin.end) : inlineString([node]);
+  }
+  return out;
 }
 
 /**
@@ -1801,18 +1962,23 @@ function childContext(base, next, ctx) {
     // reflowed onto the footer's own line, three lines becoming one, on an edit
     // that named neither of them -- and moving the `<pre>` back could not put
     // them apart again, so the round trip lost bytes it was never asked for.
+    // WHOSE CHILDREN THESE ARE, which is the question no child can answer about
+    // itself. `preserving` on the context is the DESTINATION's flag: every
+    // splice below is about the bytes between this element's tags, and inside a
+    // preserving element those bytes are content rather than layout.
+    const preserving = ctx.preserves.has(base);
     if (baseInline !== nextInline) {
       if (!laidOutAsBlock(base, ctx.source)) return null;
-      return { ...ctx, inline: false, structural: true };
+      return { ...ctx, inline: false, structural: true, preserving };
     }
-    return { ...ctx, inline: baseInline, structural: true };
+    return { ...ctx, inline: baseInline, structural: true, preserving };
   }
   // A loop, a condition and a branch keep the file's own block verbatim and
   // there is no rule here for putting a sibling INTO one, so only an aligned,
   // same-shaped child list is patched in place -- which is what this did
   // before, and it is what test/loop-source.js is about.
   if (base.kind === 'map' || base.kind === 'cond' || base.kind === 'branch') {
-    return { ...ctx, inline: false, structural: false };
+    return { ...ctx, inline: false, structural: false, preserving: ctx.preserves.has(base) };
   }
   return null;
 }
@@ -1844,6 +2010,11 @@ function spliceHead(source, base, next) {
 /** One node's whole span, replaced by what the model now says it is. */
 function replaceNodeSplice(source, base, next, ctx) {
   const { start, end } = base;
+  // Deliberately NOT asking about `ctx.preserving` here, unlike the two splices
+  // above. This branch is only reached for a node whose own meaning changed, so
+  // its twin cannot be its own bytes; it would be some OTHER node in the file
+  // that happens to mean the same, and copying THAT one's whitespace into a
+  // preserving element is the twin defect rather than a fix for it.
   if (ctx.inline) return [{ start, end, text: withEol(inlineString([next]), ctx.eol) }];
   // A TEXT NODE'S SPAN IS NOT ITS WORDS.
   //
@@ -1919,12 +2090,19 @@ function insertSplice(source, baseNodes, at, newNodes, ctx) {
   if (ctx.inline) {
     const anchor = at > 0 ? baseNodes[at - 1].end : baseNodes[0].start;
     if (typeof anchor !== 'number') return null;
+    if (ctx.preserving) return [{ start: anchor, end: anchor, text: preservedRun(newNodes, ctx) }];
     return [{ start: anchor, end: anchor, text: withEol(inlineString(newNodes), ctx.eol) }];
   }
   const anchorNode = at > 0 ? baseNodes[at - 1] : baseNodes[0];
   if (typeof anchorNode.start !== 'number' || typeof anchorNode.end !== 'number') return null;
-  const indent = lineIndentOf(source, anchorNode.start);
-  if (indent === null) return null;
+  const held = lineIndentOf(source, anchorNode.start);
+  if (held === null) return null;
+  // INSIDE A PRESERVING ELEMENT THE INDENT IS NOT LAYOUT. Written at the
+  // sibling's indent, a block moved INTO one arrives with spaces in front of
+  // every line of it that the page then renders -- measured, two of them, in
+  // front of a line that had none. The break has to be there, because the
+  // element is genuinely on a new line; the spaces do not.
+  const indent = ctx.preserving ? '' : held;
   const gaps = (node) => ctx.eol.repeat(1 + (node.blankBefore || 0));
   if (at > 0) {
     const text = newNodes.map((node) => gaps(node) + indent + printNode(node, indent, ctx)).join('');
@@ -1939,9 +2117,15 @@ function rangeSplice(source, baseRun, nextRun, ctx) {
   const start = baseRun[0].start;
   const end = baseRun[baseRun.length - 1].end;
   if (typeof start !== 'number' || typeof end !== 'number') return null;
-  if (ctx.inline) return [{ start, end, text: withEol(inlineString(nextRun), ctx.eol) }];
-  const indent = lineIndentOf(source, start);
-  if (indent === null) return null;
+  if (ctx.inline) {
+    if (ctx.preserving) return [{ start, end, text: preservedRun(nextRun, ctx) }];
+    return [{ start, end, text: withEol(inlineString(nextRun), ctx.eol) }];
+  }
+  const held = lineIndentOf(source, start);
+  if (held === null) return null;
+  // See `insertSplice`: inside a preserving element the indent between siblings
+  // is content, so the run is joined by the break alone.
+  const indent = ctx.preserving ? '' : held;
   const text = nextRun.map((node) => printNode(node, indent, ctx)).join(ctx.eol + indent);
   return [{ start, end, text }];
 }
@@ -2174,8 +2358,25 @@ function saysWhatTheModelSaid(readBack, model) {
  * Falls back to a full serialization whenever the change cannot be placed
  * confidently -- a different tree shape, a frontmatter edit, a node with no
  * recorded span, or a splice that does not read back as the model asked for.
+ *
+ * `options.preservingTokens` is the only thing this function knows about the
+ * project it is editing, and it is handed IN: a Set of the class, id and tag
+ * tokens whose elements some rule in the project's CSS could give rendered
+ * whitespace to, plus the sentinel `'*'` for anything the scanner did not
+ * understand (electron/whitespaceRules.js). This file does not read a
+ * stylesheet, does not know where one would be, and stays a pure function of
+ * (source, model, options).
+ *
+ * WHAT NO OPTIONS AT ALL MEANS, decided rather than left to fall out: no
+ * tokens, so only the tags, the element's own declaration and the inherited
+ * context decide. The other reading -- absent means unknown means refuse
+ * everything -- would switch reindentation off for every caller that has no
+ * project to scan, and this guard is only worth having while it is a
+ * narrowing. Every failure INSIDE the scanner still resolves to `'*'`, so the
+ * refusing answer is the one that survives a broken stylesheet; it is only the
+ * question never being asked that reads as "nothing to say".
  */
-function anchoredSerialize(source, model) {
+function anchoredSerialize(source, model, options = {}) {
   const canonical = serializePage(model);
   if (typeof source !== 'string' || !source) return canonical;
 
@@ -2203,6 +2404,7 @@ function anchoredSerialize(source, model) {
     edits.push(...imports);
   }
 
+  const tokens = options?.preservingTokens instanceof Set ? options.preservingTokens : null;
   const ctx = {
     source,
     eol,
@@ -2210,6 +2412,14 @@ function anchoredSerialize(source, model) {
     inline: false,
     structural: true,
     twin: twinFinder(base.model.nodes || []),
+    tokens,
+    // Every node of the BASE tree that renders its own leading spaces, walked
+    // down from the root once so inheritance is answered rather than guessed.
+    preserves: preservingContext(base.model.nodes || [], tokens),
+    // The destination for the page's own top-level children is the document,
+    // which preserves nothing. `childContext` sets this from the parent whose
+    // children it is about to print.
+    preserving: false,
   };
   const body = collectSplices(source, base.model.nodes || [], model.nodes || [], ctx);
   if (!body) return canonical;
@@ -2258,10 +2468,24 @@ function anchoredSerialize(source, model) {
   // That is the producer here, it is driven in test/source-fidelity-matrix.js
   // (theTwinThatIsNotTheSameBytes), and taking these three lines out turns that
   // suite red on its own.
+  //
+  // AND THE ONE DIRECTION THIS COMPARISON MUST NOT READ AS DAMAGE. `canonical`
+  // is not always the richer text. A `<pre>` whose children are ELEMENTS is
+  // re-laid-out by `serializePage` -- the newlines between them live in the
+  // model only as an as-written cache, and printing an inline run drops them --
+  // so on a move inside such a `<pre>` the reprint collapses the whole block to
+  // one line while the splice keeps every byte. Held to plain equality this
+  // gate threw the good answer away and returned the collapsed one. Where the
+  // reprint is EXACTLY the splice's run with its whitespace collapsed, the
+  // splice is the text that kept the bytes and the reprint is the one that lost
+  // them. Anything else -- a run whose words differ, or one that lost
+  // whitespace the reprint holds, which is what a twin copying the wrong bytes
+  // produces -- still refuses.
   const asked = renderedWhitespace(canonical);
   if (asked.length) {
     const got = renderedWhitespace(serializePage(check.model));
-    if (got.length !== asked.length || got.some((run, i) => run !== asked[i])) return canonical;
+    const kept = (run, want) => run === want || run.replace(/\s+/g, ' ') === want;
+    if (got.length !== asked.length || got.some((run, i) => !kept(run, asked[i]))) return canonical;
   }
   return spliced;
 }

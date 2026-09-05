@@ -199,10 +199,12 @@ Refusals an agent must expect and can act on:
 | `bad_arguments` | names the key that was wrong AND what that action does accept |
 | `bad_action` | no such action on this tool; lists the ones there are |
 | `merge_conflict` | the branches disagree; the merge was unwound, the clashing hunks travel, the whole files do not |
-| `working_tree_blocked` | uncommitted work is in the way of a switch or a merge; nothing was changed |
-| `bad_choices` | a `resolve_merge` choice could not be understood; nothing was written, and the message states the vocabulary |
+| `working_tree_blocked` | uncommitted work is in the way of a switch, a merge, or a `resolve_merge`; nothing was changed |
+| `bad_choices` | a `resolve_merge` choice does not describe the conflict: an unreadable value, a path git never reported as conflicting, a list of answers that is not one per disagreement, or `"merged"` where no combined version exists. Nothing was written, and the entry names the path and the reason |
+| `stale_merge` | the conflict the choices were made against is not the conflict that is there now — either branch has moved, or git reconciles the same two commits differently. Nothing was merged; the message names both branches and both short commits then and now, and the recovery is `git.merge` again |
+| `guard_required` | a `resolve_merge` with no `mergeRef`, or one carrying no observation. The handle `git.merge` hands back is what binds an answer to the conflict it answers |
 | `cancelled` | the caller went away mid-audit; says how many viewports had been measured and discarded |
-| `undo_failed` / `redo_failed` | the recorded inverse threw. The stack moved, the file did not |
+| `undo_failed` / `redo_failed` | the recorded inverse threw. Neither the project nor the history moved, so the same entry is still the one to retry |
 
 This table is the ones worth knowing rather than all of them; the surface has
 more, and `get_capabilities` lists every operation it can refuse.
@@ -412,11 +414,28 @@ because they are not sent), progress notifications, a stable client-identity
 label across protocol eras, cancellation of anything other than an audit, and
 compatibility with revisions older than 2025-11-25.
 
-**Known residual, stated rather than left to be found:** whitespace a page
-renders because of a rule in a STYLESHEET — `.card { white-space: pre }` — is
-not detected when a node is moved or duplicated. The guard covers the tags whose
-inner whitespace is always content (`pre`, `textarea`, `script`, `style`) and,
-since this revision, a `white-space` declaration written ON the element as an
-inline style or a whitespace utility class. Detecting it through the cascade
-would mean resolving CSS in the parser, which is a second CSS engine and is not
-something this surface is willing to become.
+**Whitespace a page renders, and what still gets past the guard.** A `move` or
+a `duplicate` across a nesting level reindents the block that travels, and where
+those leading spaces are rendered content that would be a silent edit to what
+the page shows. Four things are checked before a block is reindented: the tags
+whose inner whitespace is always content (`pre`, `textarea`, `script`, `style`);
+a `white-space` declaration written ON the element, as an inline style or a
+whitespace utility class; the same declaration on any ANCESTOR, because
+`white-space` inherits, and on the DESTINATION the block is moving into; and a
+rule anywhere in the project's stylesheets or its `<style>` blocks whose
+selector could reach the element. That last one is a one-sided static scan, not
+a cascade: a selector shape it does not fully understand, a stylesheet it cannot
+read and one it cannot parse all resolve to "could match anything", which costs
+an element its reindentation and never its bytes. `pre-line`, `normal` and
+`nowrap` are deliberately not in the refusing set — measured in a real browser,
+a reindent under those three renders identically.
+
+**Known residual, stated rather than left to be found:** the scan reads CSS that
+is in the project as text. It therefore does not see a rule that arrives from
+outside it — a stylesheet fetched from a URL or served out of `node_modules` —
+one injected at runtime by script, or a class name that only exists after a
+build step and is not written in the markup. It also cannot resolve a `class`
+whose value is an expression rather than a literal, and it never consults the
+live preview: doing so would make the bytes written to disk depend on whether a
+window is open and which route it shows, and could not answer about a
+destination that does not exist until after the write.
