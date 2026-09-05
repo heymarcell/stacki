@@ -51,6 +51,74 @@ const { parseConflict, renderResolved, clashCount, conflictAtEnd } = require('./
  */
 const conflictedPaths = (stdout) => String(stdout || '').split('\0').filter(Boolean);
 
+/**
+ * A BRANCH NAME IS AN ARGUMENT TO GIT, AND GIT READS ARGUMENTS.
+ *
+ * Every command in this file used to hand the caller's branch string to git as
+ * a bare argv token, with no `--` in front of it and nothing checked. A value
+ * beginning with `-` is therefore read as an OPTION, and the operation quietly
+ * becomes a different operation. Measured against a repository with a real
+ * upstream holding one commit:
+ *
+ *   `--strategy=ours` answered `{ok:true, into:"main", changed:true}` — HEAD had
+ *   moved and a two-parent merge commit existed that discarded every byte of the
+ *   upstream work. (`merge.defaultToUpstream` is on by default, so
+ *   `git merge --strategy=ours` merges the upstream with no ref named at all.)
+ *   The file the merge claimed to have brought in never arrived.
+ *
+ *   `--squash` answered `{ok:true, changed:false}` over a fully staged,
+ *   uncommitted merge sitting in the index — "nothing changed" about a mutated
+ *   repository.
+ *
+ *   `--detach` through the branch switch answered `{ok:true}` with HEAD
+ *   detached, so every commit Stacki made afterwards landed on nothing.
+ *
+ * Two things are needed and neither is enough alone. `--` before the ref stops
+ * git parsing it as an option; and the name is checked first, because `--` is
+ * not available everywhere (`git switch -c` reads what follows `--` as a start
+ * point, not as the new branch) and because a caller sending an option where a
+ * branch belongs has made a mistake worth naming rather than a mistake worth
+ * routing around.
+ *
+ * `git check-ref-format --branch` is the authority on the second half — the
+ * rules are git's, they are not restated here, and they will not drift from
+ * whichever git is actually running. A leading `-` is refused before git is
+ * asked at all: it is the shape that becomes an option, and no version of git
+ * may be relied upon to read it as a name rather than as a flag.
+ *
+ * NOTE what is deliberately still ACCEPTED: `refs/heads/main` and `heads/main`
+ * are valid branch names as far as check-ref-format is concerned, and the trunk
+ * guard in deleteBranch relies on git itself refusing them a moment later.
+ */
+async function usableBranchName(git, projectPath, branch) {
+  if (typeof branch !== 'string' || branch === '' || branch.startsWith('-')) return false;
+  try {
+    await git(projectPath, ['check-ref-format', '--branch', branch]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The refusal for a name git would not have read as a name.
+ *
+ * Returned rather than thrown wherever the caller already reads returned
+ * refusals, so it arrives with a code to branch on instead of as a bare string.
+ * The offending value is quoted back — it is the caller's own argument, and it
+ * carries no path from this machine.
+ */
+const badBranchName = (branch, extra = {}, undone = 'Nothing was changed.') => ({
+  ok: false,
+  code: 'bad_branch_name',
+  branch: typeof branch === 'string' ? branch : null,
+  ...extra,
+  message:
+    `${typeof branch === 'string' && branch ? `"${branch}"` : 'That'} is not a name git will accept for a branch, ` +
+    `so it was never given to git. ${undone} A name that begins with "-" is an option as far as git is ` +
+    'concerned, not a branch.',
+});
+
 /** Whether the working tree has anything uncommitted in it. */
 async function isDirty(git, projectPath) {
   const { stdout } = await git(projectPath, ['status', '--porcelain']);
@@ -65,19 +133,69 @@ async function currentBranch(git, projectPath) {
   }
 }
 
-/** The commit a revision names, or null when it names nothing. */
+/**
+ * The commit a revision names, or null when it names nothing.
+ *
+ * `--end-of-options` for the same reason as the `--` elsewhere: this takes a
+ * caller-supplied ref, and `rev-parse` reads a leading `-` as a flag. `--` is
+ * not the separator here — for rev-parse it means "paths follow" — so it is the
+ * one place the option-terminator has to be spelled the other way.
+ */
 async function tipOf(git, projectPath, rev) {
   try {
-    return (await git(projectPath, ['rev-parse', `${rev}^{commit}`])).stdout.trim() || null;
+    return (await git(projectPath, ['rev-parse', '--verify', '--end-of-options', `${rev}^{commit}`])).stdout.trim() || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * WHERE THE REPOSITORY ACTUALLY STARTS.
+ *
+ * The open project does not have to BE the repository. Stacki accepts a project
+ * that is a subdirectory of one — the ordinary monorepo layout — because
+ * `git:info` only asks `rev-parse --is-inside-work-tree`. Git then answers every
+ * question about paths in REPO-ROOT-relative terms, and every read and write in
+ * this file used to join those answers onto the PROJECT path instead. Measured,
+ * with the repository at <root> and the project at <root>/site and one real
+ * conflict in site/a.txt: the conflict came back with `parts: null`, so the
+ * panel said there was no text in it to compare about an ordinary text file;
+ * `conflictDigest` could not open a single conflicted file so it hashed the
+ * unreadable sentinel for all of them, and two genuinely different conflicts
+ * produced the SAME digest — a binding that had stopped measuring content while
+ * still looking like a measurement; a per-hunk resolve was refused as
+ * `not_splittable`; and a whole-file resolve died inside git on `pathspec
+ * 'site/a.txt' did not match any file(s) known to git`. The conflict was
+ * unresolvable by every route Stacki offers.
+ *
+ * So the root is asked for once and everything that resolves one of git's paths
+ * — reading, digesting, writing, and the pathspecs handed back to git — is
+ * resolved against it. A project that IS its repository gets the same path it
+ * always got.
+ *
+ * Falls back to the project path: a directory git will not answer for is one
+ * where nothing else here was going to work either, and a throw from this would
+ * turn a working merge into an error about a question nobody asked.
+ */
+async function repoRoot(git, projectPath) {
+  try {
+    return (await git(projectPath, ['rev-parse', '--show-toplevel'])).stdout.trim() || projectPath;
+  } catch {
+    return projectPath;
   }
 }
 
 // A CONFLICTED FILE THAT CANNOT BE READ IS NOT A CONFLICTED FILE THAT IS EMPTY.
 // Digesting the two the same way would let a binary clash and a blank one look
 // identical, which is the one thing a digest exists not to do.
-const UNREADABLE = '\0stacki:unreadable\0';
+//
+// AND ONE UNREADABLE REASON IS NOT ANOTHER. This was a single constant, so every
+// way of failing to open a file hashed to the same bytes: a conflicted submodule
+// (EISDIR) and a file whose permissions were taken away (EACCES) were one
+// measurement, and a path that changed from one to the other did not move the
+// digest. The reason is part of the sentinel, so two different unreadable
+// situations do not collide.
+const unreadable = (why) => `\0stacki:unreadable:${why || 'unknown'}\0`;
 
 /**
  * WHAT THE CONFLICT ACTUALLY IS, measured rather than argued from.
@@ -94,8 +212,12 @@ const UNREADABLE = '\0stacki:unreadable\0';
  * from the merge that hands the conflict out and from the resolve that applies
  * the answers, because two functions computing "the same" digest is a bug
  * waiting for the day they stop agreeing.
+ *
+ * `at` is the REPOSITORY ROOT, not the project — see repoRoot. Git's paths are
+ * repo-root-relative, and joining them onto a project that sits inside its
+ * repository opened nothing at all.
  */
-function conflictDigest(projectPath, files) {
+function conflictDigest(at, files) {
   const hash = crypto.createHash('sha256');
   // Sorted, so two runs that list the same clash in a different order are the
   // same conflict. Git's own order is stable in practice; relying on that
@@ -104,12 +226,14 @@ function conflictDigest(projectPath, files) {
     hash.update(file, 'utf8');
     hash.update('\0');
     let bytes = null;
+    let why = null;
     try {
-      bytes = fs.readFileSync(path.join(projectPath, file));
-    } catch {
+      bytes = fs.readFileSync(path.join(at, file));
+    } catch (err) {
       bytes = null;
+      why = err?.code || err?.errno || 'unknown';
     }
-    hash.update(bytes === null ? Buffer.from(UNREADABLE, 'utf8') : bytes);
+    hash.update(bytes === null ? Buffer.from(unreadable(why), 'utf8') : bytes);
     hash.update('\0');
   }
   return hash.digest('base64url').slice(0, 22);
@@ -126,10 +250,17 @@ function conflictDigest(projectPath, files) {
  * nothing: reporting "merged" there would suggest work arrived that was
  * already present.
  */
-/** One side of a conflicted file, or null when that side deleted it. */
+/**
+ * One side of a conflicted file, or null when that side deleted it.
+ *
+ * `:<n>:<path>` is resolved by git against the top of the working tree whatever
+ * the cwd is, so this is the one path-taking call that already worked from a
+ * project inside its repository. `--end-of-options` is here for the same reason
+ * as everywhere else in this file: nothing after it is read as a flag.
+ */
 async function stage(git, projectPath, n, file) {
   try {
-    return (await git(projectPath, ['show', `:${n}:${file}`])).stdout;
+    return (await git(projectPath, ['show', '--end-of-options', `:${n}:${file}`])).stdout;
   } catch {
     return null;
   }
@@ -148,6 +279,15 @@ async function stage(git, projectPath, n, file) {
  */
 async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const into = await currentBranch(git, projectPath);
+  // Before the binding, before the merge, before anything: a name git would
+  // read as an option is not a branch, and re-running the merge with one is how
+  // `--strategy=ours` got to commit. See usableBranchName.
+  if (!(await usableBranchName(git, projectPath, branch))) {
+    return badBranchName(branch, { from: into }, 'Nothing was merged.');
+  }
+  // Everything git says about a path, it says relative to the top of the
+  // working tree — which is not always the project. See repoRoot.
+  const at = await repoRoot(git, projectPath);
   // THE ANSWERS ARE ABOUT A CONFLICT, AND A CONFLICT IS A MOMENT.
   //
   // This re-runs the merge rather than having left one open, so the choices
@@ -229,7 +369,10 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // commits, and a fast-forward never conflicts — but --no-ff says so rather
     // than leaving it to be worked out, because a fast-forward is the one
     // merge --no-commit cannot stop and the one `merge --abort` cannot undo.)
-    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', branch]);
+    //
+    // `--` before the branch: everything after it is a ref, never a flag. See
+    // usableBranchName for what a bare `--strategy=ours` did here.
+    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', '--', branch]);
     clean = true;
   } catch (err) {
     /* expected — it clashes again, which is what the choices are for */
@@ -294,7 +437,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // AND THE CONFLICT ITSELF, not only the two commits it came from. See
   // conflictDigest: the commits are an argument about git's determinism, this
   // is a measurement of what git actually wrote.
-  const digestNow = conflictDigest(projectPath, left);
+  const digestNow = conflictDigest(at, left);
   if (digestNow !== bound.digest) {
     await abort();
     return stale(
@@ -352,7 +495,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     if (parsed.has(file)) return parsed.get(file);
     let parts = null;
     try {
-      parts = parseConflict(fs.readFileSync(path.join(projectPath, file), 'utf8'));
+      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'));
     } catch {
       // Binary, or one side deleted it: there is no marked-up text to split,
       // so the only answer this file can take is a whole-file one.
@@ -407,7 +550,27 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // Narrowed to `undefined`. An explicit null used to be read as an
     // omission, so "I have not decided about this file" and "I have decided,
     // and here is nothing" produced the same silent `--ours`.
-    if (choice === undefined) continue;
+    //
+    // AND THE DOCUMENTED DEFAULT IS A CHOICE, SO IT IS VALIDATED LIKE ONE.
+    //
+    // "A file you leave out entirely keeps this branch's version" is what the
+    // agent-facing contract promises, and it is `git checkout --ours` under the
+    // covers. On a modify/delete where THIS branch deleted the file there is no
+    // stage 2 for it to take, and the validator below — which knows exactly
+    // that — only ever looked at choices that had been GIVEN. Measured, with
+    // `choices: {}` against a clash where main deleted a.txt and feature edited
+    // it: resolve THREW git's own `error: path 'a.txt' does not have our
+    // version`, an unnamed failure about a default the caller never typed, and
+    // a.txt did not exist afterwards. The one job of a validator is to say no
+    // before anything is written; a default that cannot be carried out has to
+    // go through it too.
+    if (choice === undefined) {
+      const has = sidesOf(file);
+      if (!has.includes('ours')) {
+        unusable.push({ path: file, given: 'ours', reason: 'no_such_side', sides: has, expected: has, deletedBy: 'ours', byDefault: true });
+      }
+      continue;
+    }
     if (choice === null) {
       unusable.push({ path: file, given: 'null', reason: 'null', expected: [...WHOLE_FILE] });
       continue;
@@ -533,15 +696,19 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
         const sides = conflictAtEnd(parts)
           ? { ours: await stage(git, projectPath, 2, file), theirs: await stage(git, projectPath, 3, file) }
           : null;
-        fs.writeFileSync(path.join(projectPath, file), renderResolved(parts, choice, sides));
+        fs.writeFileSync(path.join(at, file), renderResolved(parts, choice, sides));
       } else {
         // One answer for the whole file. Defaults to keeping what is on this
         // branch: a missing choice must never silently prefer the incoming
         // version over the user's own work.
         const side = choice === 'theirs' ? '--theirs' : '--ours';
-        await git(projectPath, ['checkout', side, '--', file]);
+        // Run from the repository root, because that is what git's own path
+        // is relative to — from a project inside its repository this pathspec
+        // used to name <project>/<repo-relative path> and git answered
+        // "pathspec ... did not match any file(s) known to git".
+        await git(at, ['checkout', side, '--', file]);
       }
-      await git(projectPath, ['add', '--', file]);
+      await git(at, ['add', '--', file]);
     }
     // Everything git reconciled by itself is already staged; this commits the
     // whole merge, the chosen files included.
@@ -566,6 +733,15 @@ async function mergeBranch(git, { projectPath, branch }) {
   if (branch === into) {
     throw new Error(`"${branch}" is the branch you are on — there is nothing to merge into.`);
   }
+  // A name git would read as an option is not a branch. Checked before HEAD is
+  // even read: `--strategy=ours` merged the upstream and reported the merge the
+  // caller asked for. See usableBranchName.
+  if (!(await usableBranchName(git, projectPath, branch))) {
+    return badBranchName(branch, { from: into }, 'Nothing was merged.');
+  }
+  // Git's paths are relative to the top of the working tree, which is not
+  // always the project. See repoRoot.
+  const root = await repoRoot(git, projectPath);
   // No check for uncommitted work here.
   //
   // There used to be one, and it made the app refuse merges git would have
@@ -589,7 +765,7 @@ async function mergeBranch(git, { projectPath, branch }) {
     // tell which side actually changed each part, and so to default to the one
     // that did instead of asking about edits nobody disagrees over. Set with
     // -c so the user's own git config is not touched.
-    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-edit', branch]);
+    await git(projectPath, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-edit', '--', branch]);
   } catch (err) {
     // Which files git could not reconcile — asked of git rather than scraped
     // out of its prose, which comes in several shapes (content, modify/delete,
@@ -617,7 +793,7 @@ async function mergeBranch(git, { projectPath, branch }) {
         // other can say so.
         let parts = null;
         try {
-          parts = parseConflict(fs.readFileSync(path.join(projectPath, file), 'utf8'));
+          parts = parseConflict(fs.readFileSync(path.join(root, file), 'utf8'));
         } catch {
           // A binary file, or one side deleted it: there is no marked-up text
           // to read, and the choice is the whole file or nothing.
@@ -634,7 +810,7 @@ async function mergeBranch(git, { projectPath, branch }) {
       // still on disk — after the abort there is nothing left to measure, and
       // a digest taken from the copies above would be a digest of this code's
       // reading of git rather than of git.
-      const at = { head: before, incoming, digest: conflictDigest(projectPath, files) };
+      const at = { head: before, incoming, digest: conflictDigest(root, files) };
       // Unwound before returning. Conflict markers sitting in the files would
       // be read as markup by the editor a moment later, and the page would
       // come back broken with nothing to say why. So the tree goes back to
@@ -689,6 +865,14 @@ async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
   if (branch === here) {
     throw new Error(`"${branch}" is the branch you are on — switch to another one first.`);
   }
+  // THROWN, not returned, and this is the one place in the file where that is
+  // deliberate rather than habit. A delete that answers `{ok:false}` in any
+  // shape the MCP mapper does not recognise by name is turned into
+  // `{deleted: <branch>}` — a refusal reported as a success. There is no name
+  // to recognise here, because there is no branch: the caller sent an option.
+  if (!(await usableBranchName(git, projectPath, branch))) {
+    throw new Error(badBranchName(branch).message);
+  }
   // Git will delete main as readily as anything else — `git branch -d main`
   // succeeds the moment main is merged into wherever you are standing, which
   // after any ordinary merge it is. The button for this is hidden, and it is
@@ -702,7 +886,7 @@ async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
     );
   }
   try {
-    await git(projectPath, ['branch', force ? '-D' : '-d', branch]);
+    await git(projectPath, ['branch', force ? '-D' : '-d', '--', branch]);
   } catch (err) {
     const detail = String(err.stderr || err.message || '');
     if (/not fully merged/i.test(detail)) {
@@ -745,6 +929,14 @@ async function deleteBranch(git, { projectPath, branch, force, allowTrunk }) {
  */
 async function switchBranch(git, { projectPath, branch, create, parkFirst, park, unpark }) {
   const from = (await git(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+  // Before anything is parked. `--detach` went through here as a branch name
+  // and answered `{ok:true, from:"main"}` with HEAD detached, so every commit
+  // Stacki made afterwards landed on no branch at all. See usableBranchName —
+  // and note the check is what protects `switch -c`, where the `--` cannot go
+  // in front of the name.
+  if (!(await usableBranchName(git, projectPath, branch))) {
+    return badBranchName(branch, { from }, 'Nothing was changed and you are still on the branch you were on.');
+  }
   let parked = false;
   // Only when asked. Creating a branch carries the work onto it, which is what
   // starting a branch from what is in front of you means.
@@ -752,7 +944,7 @@ async function switchBranch(git, { projectPath, branch, create, parkFirst, park,
   // `switch`, not `checkout`: it does one thing, and it cannot silently detach
   // HEAD or restore a file over a mistyped branch name.
   try {
-    await git(projectPath, create ? ['switch', '-c', branch] : ['switch', branch]);
+    await git(projectPath, create ? ['switch', '-c', branch, '--'] : ['switch', '--', branch]);
   } catch (err) {
     // Put the work straight back rather than leaving it stashed behind a
     // branch change that never happened.

@@ -35,10 +35,19 @@
 // THE ORACLES ARE BYTES ON DISK, read by this process with fs, and the
 // `history` field of the envelope. Not what the app says it did.
 //
-// HOW A FAILURE IS PRODUCED. Nothing is stubbed and nothing is monkey-patched:
-// a file the inverse must write is made read-only, or a file the inverse must
-// rename onto is put back in the way. The real handlers refuse for the real
-// reason, exactly as they would if somebody else's editor held the file.
+// HOW A FAILURE IS PRODUCED. Nothing is stubbed: a file the inverse must write
+// is made read-only, or a file the inverse must rename onto is put back in the
+// way. The real handlers refuse for the real reason, exactly as they would if
+// somebody else's editor held the file.
+//
+// THE ONE EXCEPTION, AND IT IS ABOUT TIMING RATHER THAN BEHAVIOUR. Section 9b
+// is about what happens to an undo that is STILL RUNNING when the page it
+// belongs to is closed, and that interleave cannot be produced by asking
+// politely. So one save is held open at the door -- the real write still
+// happens, through the real handler, with the real bytes; only the moment it
+// returns is chosen, the way a slow volume chooses it. The hold is asserted
+// before the close is started, so a run that lost the race fails rather than
+// passes.
 //
 // HOW "UNCHANGED" IS MEASURED. `project.redo` with an empty `future` is a
 // no-op that still reports `history`, so it is the probe: it is taken
@@ -53,6 +62,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const H = require('./agent-harness.js');
+const { guardSuite } = require('./support/suiteGuard.js');
 
 // THE ROLLBACKS ARE READ OUT OF THE SHIPPED FILES, not reimplemented here.
 //
@@ -181,6 +191,16 @@ const PAGE = 'src/pages/index.astro';
 const UNCOALESCED = 900;
 
 (async () => {
+  // "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
+  //
+  // Everything in this file is an await, several of them against a whole
+  // renderer and a whole main process, and node exits 0 on an empty event loop
+  // — so an await that never settles prints nothing after the line it reached
+  // and the runner records a pass. `npm test` chains with && ; the whole run
+  // would go green with none of these assertions executed. See
+  // test/support/suiteGuard.js.
+  const suiteDone = guardSuite('undo-transaction');
+
   // ── 0. THE PANEL'S OWN INVERSES ──────────────────────────────────────────
   //
   // Run first, and in its own jsdom, because the harness below takes the DOM
@@ -903,6 +923,111 @@ const UNCOALESCED = 900;
       }
     }
 
+    // ── 9b. CLOSING A PAGE ENDS THE REDO BRANCH TOO ──────────────────────────
+    //
+    // `dropPageHistory` exists for one reason: a page snapshot describes ONE
+    // document, so when that document is closed the snapshot must not survive
+    // to be replayed onto another. It rebuilt both stacks with
+    // `filter(e => e.kind === 'cmd')` — and never bumped `redoEpoch`.
+    //
+    // The epoch is what an undo still in flight compares against. It takes its
+    // redo point — a snapshot of the page being closed — BEFORE its restore
+    // reaches disk and pushes it AFTER, guarded by `stillRedoable()`. With the
+    // epoch untouched that guard was true straight across the purge, so the
+    // snapshot the filter had just removed came back onto `future` a moment
+    // later, and the next redo applied a page's bytes to whatever document was
+    // open by then.
+    //
+    // MEASURED, against the shipped renderer with the epoch bump removed:
+    // `future: 1` after the undo, `project.redo` answering `redone: true`, and
+    // src/pages/about.astro on disk holding the whole of src/pages/index.astro.
+    //
+    // HOW THE INTERLEAVE IS MADE, and why it is not a stub. Nothing is
+    // reimplemented: the real undo runs the real restore through the real main
+    // handler. One save is HELD OPEN at the door — the way a slow volume holds
+    // one — so the page close happens while the undo is genuinely mid-flight
+    // rather than whenever the machine happens to schedule it. The hold is
+    // itself asserted: the navigation does not start until the save is known to
+    // be waiting, so a run in which the undo had already finished cannot pass
+    // here by accident.
+    {
+      const refs = require('../electron/mcp/agent/refs.js');
+      const ON_INDEX = { keys: ['src/pages/index.astro#0.2'], fingerprint: { tag: 'footer' }, page: { file: 'src/pages/index.astro' } };
+      const ON_ABOUT = { keys: ['src/pages/about.astro#0.0'], fingerprint: { tag: 'h1' }, page: { file: 'src/pages/about.astro' } };
+      const refFor = (anchor) => refs.mint('node', anchor, { projectRoot: root });
+
+      const opened = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      check('9b: the page to be closed is open', opened.ok === true && opened.target?.page?.file === 'src/pages/index.astro', short(opened.target?.page));
+      const indexWas = app.read('src/pages/index.astro');
+      const aboutWas = app.read('src/pages/about.astro');
+      const wrote = await run('target', 'set_text', { ref: opened.target.ref, text: 'EDITED ON INDEX' });
+      check('9b: an edit to it is recorded', wrote.ok === true, short(wrote));
+      await H.settle(200);
+      check('9b:   and is on disk', app.read('src/pages/index.astro').includes('EDITED ON INDEX'), short(app.read('src/pages/index.astro').slice(0, 120)));
+
+      // The door the restore goes through, held open once. The real handler
+      // still does the real write; only the moment it returns is chosen.
+      let opening = null;
+      const atTheDoor = new Promise((done) => {
+        opening = done;
+      });
+      let letGo = null;
+      const held = new Promise((done) => {
+        letGo = done;
+      });
+      const realWrite = global.avb.writePageRaw;
+      let holding = false;
+      global.avb.writePageRaw = async (arg) => {
+        if (!holding) {
+          holding = true;
+          opening();
+          await held;
+        }
+        return realWrite(arg);
+      };
+      let undone = null;
+      try {
+        const undoing = run('project', 'undo');
+        await atTheDoor;
+        check('9b: the undo is genuinely mid-restore when the page closes', holding === true);
+        // The page closes. This is the ordinary navigation — the same
+        // `selectPage` -> `openFile` -> `dropPageHistory` a person's click makes.
+        const moved = await run('target', 'read', { ref: refFor(ON_ABOUT) });
+        check('9b: a different document is open now', moved.ok === true && moved.target?.page?.file === 'src/pages/about.astro', short(moved.target?.page));
+        letGo();
+        undone = await undoing;
+        await H.settle(300);
+      } finally {
+        global.avb.writePageRaw = realWrite;
+      }
+
+      check('9b: the undo itself still happened', undone?.ok === true && undone?.undone === true, short(undone));
+      // THE ASSERTION THE DEFECT FAILS. The snapshot belonged to a page that is
+      // no longer open, so there is nothing for redo to be about.
+      check(
+        '9b: a snapshot of the closed page is not left on the redo stack',
+        undone?.history?.future === 0,
+        short(undone?.history)
+      );
+      const redone = await run('project', 'redo');
+      await H.settle(300);
+      check('9b: so redo has nothing to replay', redone.ok === true && redone.redone === false, short(redone));
+      // AND THE BYTES, which is what the whole guard is for: the other page's
+      // file must not hold the page the snapshot came from.
+      check(
+        '9b: the page that is open was not overwritten with the page that closed',
+        app.read('src/pages/about.astro') === aboutWas,
+        short(app.read('src/pages/about.astro').slice(0, 160))
+      );
+      check(
+        '9b:   and it is still the about page',
+        !app.read('src/pages/about.astro').includes('pricing-grid'),
+        short(app.read('src/pages/about.astro').slice(0, 160))
+      );
+      // The undo did what it said: the edit is off the page it was made on.
+      check('9b: the edit was taken back where it was made', app.read('src/pages/index.astro') === indexWas, short(app.read('src/pages/index.astro').slice(0, 160)));
+    }
+
     // ── 10. POSITIVE CONTROLS, WITH NOTHING WRONG AT ALL ──────────────────────
     //
     // Everything above is satisfied by an undo that refuses everything and a
@@ -950,6 +1075,7 @@ const UNCOALESCED = 900;
     process.exit(1);
   }
   console.log(`undo-transaction: ${checked} passed  [a failed undo moves neither the project nor the stack]`);
+  suiteDone();
 })().catch((err) => {
   console.error('undo-transaction: threw\n', err?.stack || err);
   process.exit(1);

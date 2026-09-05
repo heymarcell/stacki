@@ -401,11 +401,36 @@ function renderResolved(parts, picks = [], sides = null) {
     })
     .join('\n');
   if (!sides || typeof sides !== 'object' || !conflictAtEnd(parts) || !text.endsWith('\n')) return text;
-  // Whose last line this now is. 'both' and 'merged' both end on the incoming
-  // side; an answer that was never given keeps ours, the same default the
-  // renderer above applies.
+  // WHOSE LAST LINE THIS NOW IS — READ OFF THE TEXT, NOT OFF THE WORD.
+  //
+  // This used to map the ANSWER to a side: 'both' and 'merged' were taken to
+  // end on the incoming side because that is the side written last. But 'both'
+  // renders `[ours, theirs].filter(s => s !== '').join('\n')`, so when the
+  // incoming side of the LAST clash is empty the file ends on OURS while the
+  // terminator was still being read off `sides.theirs`. MEASURED, with ours
+  // `"head\nOURSLAST\n"` and theirs `"head"` with no terminator: `['both']`
+  // wrote `"head\nOURSLAST"` and `['ours']` wrote `"head\nOURSLAST\n"` — the
+  // same retained content, one byte apart, decided by which of two equivalent
+  // words the caller happened to use.
+  //
+  // So the side is the one the rendered text actually ENDS on. 'merged' is
+  // asked the same way, by suffix, because a combined version ends on whichever
+  // side contributed its last run and there is no word that says which.
+  const last = (parts || []).filter((part) => part.kind === 'clash')[clashCount(parts) - 1] || null;
   const pick = picks[clashCount(parts) - 1];
-  const source = pick === 'theirs' || pick === 'both' || pick === 'merged' ? sides.theirs : sides.ours;
+  let endsOn = 'ours';
+  if (pick === 'theirs') endsOn = 'theirs';
+  else if (pick === 'both') endsOn = last?.theirs !== '' ? 'theirs' : last?.ours !== '' ? 'ours' : null;
+  else if (pick === 'merged' && last?.merged != null) {
+    if (last.merged === '') endsOn = null;
+    else if (last.theirs !== '' && last.merged.endsWith(last.theirs)) endsOn = 'theirs';
+    else if (last.ours !== '' && last.merged.endsWith(last.ours)) endsOn = 'ours';
+    else endsOn = 'theirs';
+  }
+  // Neither side put anything at the end of the file, so there is no version's
+  // terminator to take: git's own newline is the only one there is.
+  if (endsOn === null) return text;
+  const source = endsOn === 'theirs' ? sides.theirs : sides.ours;
   // Null is a side that deleted the file. There is no version of it to take a
   // terminator from, so git's own is the only answer there is.
   if (typeof source !== 'string' || source === '' || source.endsWith('\n')) return text;

@@ -14,6 +14,15 @@
 // failed to parse.
 
 const { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, mergeInline } = require('../electron/conflicts.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
+// Nothing in this file awaits anything today, so the guard cannot fire today —
+// it is here because that is not a property of the file, it is a property of
+// what is in it right now, and the day one of these checks grows an await is
+// the day a suite that prints nothing starts exiting 0. See
+// test/support/suiteGuard.js.
+const suiteDone = guardSuite('conflicts');
 
 const failures = [];
 let checked = 0;
@@ -389,6 +398,66 @@ const conflicted = [
     JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: null }))
   );
 
+  // --- 'BOTH' DOES NOT ALWAYS END ON THE INCOMING SIDE ----------------------
+  //
+  // The rule above — "'both' and 'merged' end on the incoming side" — is a
+  // rule about the WORD, and the renderer's rule is about the TEXT: 'both' is
+  // `[ours, theirs].filter(s => s !== '').join('\n')`, so when the incoming
+  // side of the last clash is EMPTY the file ends on ours while the terminator
+  // was still being read off `sides.theirs`.
+  //
+  // MEASURED, with ours `"head\nOURSLAST\n"` and theirs `"head"` — no
+  // terminator on the incoming side, which is the side that has nothing to
+  // contribute here: `['both']` wrote `"head\nOURSLAST"` to disk and `['ours']`
+  // wrote `"head\nOURSLAST\n"`. The same retained content, one byte apart,
+  // decided by which of two equivalent words the caller happened to use.
+  {
+    // git's own markup for "this branch added a line at the end, the incoming
+    // branch has nothing there".
+    const oursOnly = parseConflict(['head', '<<<<<<< HEAD', 'OURSLAST', '=======', '>>>>>>> f', ''].join('\n'));
+    check('a clash whose incoming side is empty is still at the end of the file', conflictAtEnd(oursOnly) === true, JSON.stringify(oursOnly));
+    const sides = { ours: 'head\nOURSLAST\n', theirs: 'head' };
+    check(
+      '"both" with an empty incoming side reads the terminator off ours, which is where the text ends',
+      renderResolved(oursOnly, ['both'], sides) === 'head\nOURSLAST\n',
+      JSON.stringify(renderResolved(oursOnly, ['both'], sides))
+    );
+    // The point of the pair: two words for the same retained content must not
+    // produce two different files.
+    check(
+      'so "both" and "ours" agree byte for byte when both keep the same text',
+      renderResolved(oursOnly, ['both'], sides) === renderResolved(oursOnly, ['ours'], sides),
+      `${JSON.stringify(renderResolved(oursOnly, ['both'], sides))} vs ${JSON.stringify(renderResolved(oursOnly, ['ours'], sides))}`
+    );
+    // AND THE OTHER WAY ROUND, so this is not "always read ours". With the
+    // incoming side present it is the one the text ends on, and its missing
+    // terminator is the one that counts.
+    const both = parseConflict(['head', '<<<<<<< HEAD', 'MINE', '=======', 'YOURS', '>>>>>>> f', ''].join('\n'));
+    const twoSided = { ours: 'head\nMINE\n', theirs: 'head\nYOURS' };
+    check(
+      '"both" with a real incoming side still reads the terminator off theirs',
+      renderResolved(both, ['both'], twoSided) === 'head\nMINE\nYOURS',
+      JSON.stringify(renderResolved(both, ['both'], twoSided))
+    );
+    // And the ours-side terminator is not consulted when the file does not end
+    // on ours: theirs ends with one, so the file keeps it.
+    check(
+      'and leaves the newline alone when the side it ends on has one',
+      renderResolved(both, ['both'], { ours: 'head\nMINE', theirs: 'head\nYOURS\n' }) === 'head\nMINE\nYOURS\n',
+      JSON.stringify(renderResolved(both, ['both'], { ours: 'head\nMINE', theirs: 'head\nYOURS\n' }))
+    );
+    // A clash where NEITHER side put anything at the end has no version's
+    // terminator to take, so git's own newline is the only one there is.
+    const neither = parseConflict(['head', '<<<<<<< HEAD', '=======', '>>>>>>> f', ''].join('\n'));
+    if (conflictAtEnd(neither)) {
+      check(
+        'a clash both sides emptied keeps git’s own terminator',
+        renderResolved(neither, ['both'], { ours: 'head', theirs: 'head' }).endsWith('\n'),
+        JSON.stringify(renderResolved(neither, ['both'], { ours: 'head', theirs: 'head' }))
+      );
+    }
+  }
+
   // AND THE CASE THIS MUST NOT TOUCH. When the file ends with text both sides
   // agree on, the terminator is ordinary content and came through the markers
   // intact — trimming there would delete a real newline.
@@ -419,3 +488,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`conflicts: ${checked} passed`);
+suiteDone();

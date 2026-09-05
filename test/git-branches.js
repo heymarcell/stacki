@@ -20,7 +20,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('../electron/gitBranches.js');
+const { mergeBranch, deleteBranch, switchBranch, resolveMerge, conflictDigest } = require('../electron/gitBranches.js');
+const { guardSuite } = require('./support/suiteGuard.js');
 
 const failures = [];
 let checked = 0;
@@ -180,9 +181,23 @@ async function twoClashRepo(name) {
   return dir;
 }
 
-(async () => {
-  const cleanup = [];
+// Every fixture repository this file makes, at module scope so the cleanup can
+// live in a `finally` and in an exit handler rather than only on the path where
+// everything went right. SABOTAGE-PROVED, by inserting `await new
+// Promise(() => {})` into resolveMerge: the suite printed ZERO bytes, exited 0
+// — node's answer to an empty event loop — and left 62 fixture repositories in
+// the temp directory, while `npm test` chained on with && and reported the
+// whole run green with 355 assertions that had never executed.
+const cleanup = [];
+const removeFixtures = () => {
+  for (const dir of cleanup) fs.rmSync(dir, { recursive: true, force: true });
+};
+// The deadline's own exit, and any other way out that misses the finally below,
+// still takes the fixtures with it. rmSync is safe here: an exit handler may do
+// synchronous work and nothing else.
+process.on('exit', removeFixtures);
 
+async function suite() {
   // --- A merge that has somewhere to go ------------------------------------
   {
     const dir = await repo('ff');
@@ -1071,6 +1086,375 @@ async function twoClashRepo(name) {
   }
 
   {
+    // T15c-only — THE CLEAN-REMERGE GUARD, WITH NOTHING ELSE ABLE TO CATCH IT.
+    //
+    // T15c above is named for that guard and CANNOT FAIL WITHOUT IT. Deleting
+    // the whole `if (clean)` block from resolveMerge left the suite at 355
+    // passed: its fixture simply fell through to the DIGEST comparison one
+    // paragraph later, which returned a `stale_merge` satisfying every one of
+    // T15c's predicates. The test was measuring the digest check and reading
+    // the answer as though it came from the guard.
+    //
+    // What isolates the guard is a binding whose digest is the one the digest
+    // check CANNOT reject: `conflictDigest` over an empty list, which is what a
+    // clean re-merge produces. With the guard in place this is refused as
+    // `stale_merge` because there is no conflict left for the answers to be
+    // about. With the guard deleted, `left` is empty, the digest agrees with
+    // itself, `choices: {}` validates against no files at all, and the union
+    // merge is COMMITTED — `ok:true, resolved:0` over a merge commit holding
+    // both branches' lines that nobody chose. Verified both ways round.
+    const dir = await twoClashRepo('cleanonly');
+    cleanup.push(dir);
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T15c-only: the caller was shown a conflict to answer', clash.ok === false && clash.files?.length === 1, JSON.stringify(clash.files?.map((f) => f.path)));
+    fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '*.txt merge=union\n');
+    const before = await repoState(dir);
+    // The digest of no conflicting files at all — the value the comparison
+    // downstream of the guard would compute for a merge that came out clean.
+    // Taken from the shipped function, so it cannot drift from it.
+    const emptyDigest = conflictDigest(dir, []);
+    const answer = await resolveMerge(git, {
+      projectPath: dir,
+      branch: 'feature',
+      choices: {},
+      expect: { head: clash.at.head, incoming: clash.at.incoming, digest: emptyDigest },
+    });
+    await refusedCleanly(
+      'T15c-only a clean re-merge whose binding the digest check cannot reject',
+      answer,
+      dir,
+      before,
+      'stale_merge',
+      (r) => r.current?.head === r.expected?.head && r.current?.incoming === r.expected?.incoming
+    );
+    // The sentence has to be the GUARD's, not the digest comparison's. They are
+    // both `stale_merge`, and this is the only thing that tells them apart from
+    // the outside.
+    check(
+      'T15c-only: refused for the reason the guard exists — there is no conflict left to answer',
+      /reconciles them cleanly now/.test(String(answer?.message || '')),
+      JSON.stringify(answer?.message)
+    );
+    check('T15c-only: no merge commit happened', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+    const onDisk = fs.readFileSync(path.join(dir, 'a.txt'), 'utf8');
+    check(
+      'T15c-only: and the union of both branches was not committed behind the caller',
+      !onDisk.includes('TOP-feat') && !onDisk.includes('BOTTOM-feat'),
+      JSON.stringify(onDisk)
+    );
+  }
+
+  {
+    // T16 — A BRANCH NAME IS NOT A PLACE TO PUT AN OPTION.
+    //
+    // Every git call in gitBranches.js took the caller's branch string as a bare
+    // argv token, so a value starting with `-` was read by git as a FLAG and the
+    // operation silently became a different operation. Measured against a
+    // repository with a real upstream holding one commit — the whole point of
+    // the upstream being that `merge.defaultToUpstream` gives
+    // `git merge --strategy=ours` something to merge with no ref named at all:
+    //
+    //   "--strategy=ours" -> {ok:true, into:"main", changed:true}: HEAD MOVED,
+    //     a two-parent merge commit existed that discarded every byte of the
+    //     upstream work, and the upstream's file never arrived while the merge
+    //     commit said it had;
+    //   "--squash" -> {ok:true, changed:false}: "nothing changed" over an index
+    //     holding a fully staged, uncommitted merge;
+    //   "--detach" through the switch -> {ok:true} with HEAD DETACHED, so every
+    //     later Stacki commit would land on no branch at all.
+    //
+    // The oracles are the repository, not the answer: HEAD, the parent count,
+    // the index, and whether HEAD is still a branch.
+    const up = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-git-argv-up-'));
+    cleanup.push(up);
+    await sh(up, 'init', '-q', '-b', 'main', '.');
+    await sh(up, 'config', 'user.email', 'test@example.com');
+    await sh(up, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(up, 'a.txt'), 'base\n');
+    await sh(up, 'add', '-A');
+    await sh(up, 'commit', '-qm', 'first');
+    fs.writeFileSync(path.join(up, 'upstream-only.txt'), 'UPSTREAM WORK\n');
+    await sh(up, 'add', '-A');
+    await sh(up, 'commit', '-qm', 'upstream work');
+
+    /** A clone one commit behind its upstream, with main tracking it. */
+    const behind = async (name) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-git-${name}-`));
+      cleanup.push(dir);
+      await sh(dir, 'clone', '-q', up, '.');
+      await sh(dir, 'config', 'user.email', 'test@example.com');
+      await sh(dir, 'config', 'user.name', 'Test');
+      await sh(dir, 'reset', '-q', '--hard', 'HEAD~1');
+      return dir;
+    };
+
+    for (const option of ['--strategy=ours', '--squash', '-X', '--no-verify']) {
+      const dir = await behind('argv-merge');
+      const before = await repoState(dir);
+      const answer = await caught(() => mergeBranch(git, { projectPath: dir, branch: option }));
+      check(
+        `T16 merge "${option}" is refused rather than run as a flag`,
+        answer.value?.ok === false && answer.value?.code === 'bad_branch_name',
+        JSON.stringify(answer)
+      );
+      const after = await repoState(dir);
+      check(`T16 merge "${option}": HEAD did not move`, after.head === before.head, `${before.head} -> ${after.head}`);
+      check(`T16 merge "${option}": no merge commit was made`, (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1);
+      check(`T16 merge "${option}": nothing was staged`, after.status === '', after.status);
+      check(
+        `T16 merge "${option}": the upstream's work did not arrive`,
+        !fs.existsSync(path.join(dir, 'upstream-only.txt'))
+      );
+      const moved = Object.keys({ ...before.bytes, ...after.bytes }).filter((f) => before.bytes[f] !== after.bytes[f]);
+      check(`T16 merge "${option}": not one file changed`, moved.length === 0, moved.join(', '));
+    }
+
+    for (const option of ['--detach', '--orphan', '-d']) {
+      const dir = await behind('argv-switch');
+      const answer = await caught(() => switchBranch(git, { projectPath: dir, branch: option }));
+      check(
+        `T16 switch "${option}" is refused rather than run as a flag`,
+        answer.value?.ok === false && answer.value?.code === 'bad_branch_name',
+        JSON.stringify(answer)
+      );
+      // The one that matters: a detached HEAD is not visible in `{ok}` at all,
+      // and every commit Stacki made afterwards would land on nothing.
+      check(
+        `T16 switch "${option}": HEAD is still a branch`,
+        (await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')) === 'main',
+        await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')
+      );
+      const created = await caught(() => switchBranch(git, { projectPath: dir, branch: option, create: true }));
+      check(
+        `T16 switch -c "${option}" is refused too`,
+        created.value?.ok === false && created.value?.code === 'bad_branch_name',
+        JSON.stringify(created)
+      );
+      check(
+        `T16 switch -c "${option}": still on main`,
+        (await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')) === 'main'
+      );
+    }
+
+    {
+      // DELETE THROWS RATHER THAN RETURNING. The MCP mapper for delete_branch
+      // turns any `{ok:false}` it does not recognise by name into
+      // `{deleted: <branch>}` — a refusal reported as a success — so this is the
+      // one refusal in the file that has to be a throw.
+      const dir = await behind('argv-delete');
+      await sh(dir, 'branch', 'keepme');
+      const before = await repoState(dir);
+      const answer = await caught(() => deleteBranch(git, { projectPath: dir, branch: '-D' }));
+      check('T16 delete "-D" is refused', answer.value === null && /not a name git will accept/.test(String(answer.error)), JSON.stringify(answer));
+      const branches = await sh(dir, 'branch', '--format=%(refname:short)');
+      check('T16 delete "-D": every branch is still there', branches.split('\n').sort().join(',') === 'keepme,main', branches);
+      const after = await repoState(dir);
+      check('T16 delete "-D": HEAD did not move', after.head === before.head);
+      // AND THE REFUSAL SAYS NOTHING ABOUT THIS MACHINE.
+      check(
+        'T16 delete "-D": the sentence carries no filesystem path',
+        !/\/(Users|home|var|private|tmp)\//.test(String(answer.error)),
+        String(answer.error)
+      );
+    }
+
+    {
+      // AND THE CONTROL, so this is a refusal of options and not a refusal of
+      // branches. An ordinary name goes through every one of the three.
+      const dir = await behind('argv-control');
+      await sh(dir, 'checkout', '-qb', 'work');
+      fs.writeFileSync(path.join(dir, 'from-work.txt'), 'work\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'work');
+      const back = await switchBranch(git, { projectPath: dir, branch: 'main' });
+      check('T16 control: an ordinary name still switches', back.ok === true, JSON.stringify(back));
+      const merged = await mergeBranch(git, { projectPath: dir, branch: 'work' });
+      check('T16 control: and still merges', merged.ok === true && merged.changed === true, JSON.stringify(merged));
+      check('T16 control: bringing the work with it', fs.existsSync(path.join(dir, 'from-work.txt')));
+      const gone = await deleteBranch(git, { projectPath: dir, branch: 'work' });
+      check('T16 control: and still deletes', gone.ok === true, JSON.stringify(gone));
+      // And a name with a leading dash INSIDE it is not a leading dash.
+      const odd = await switchBranch(git, { projectPath: dir, branch: 'fix-thing', create: true });
+      check('T16 control: a name containing dashes is fine', odd.ok === true, JSON.stringify(odd));
+      check('T16 control: and is what got checked out', (await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')) === 'fix-thing');
+    }
+  }
+
+  {
+    // T17 — A PROJECT INSIDE ITS REPOSITORY.
+    //
+    // The ordinary monorepo layout: the repository is at <root> and the project
+    // Stacki has open is <root>/site. Stacki accepts it — `git:info` only asks
+    // `rev-parse --is-inside-work-tree` — and git then answers every question
+    // about paths relative to the REPOSITORY ROOT, while every read and write in
+    // gitBranches.js joined those answers onto the PROJECT path. Measured, with
+    // one real text conflict in site/a.txt:
+    //
+    //   merge -> files:[{p:"site/a.txt", ours:"OURS\n", parts:null}] — the panel
+    //     said there was no text in it to compare about an ordinary text file;
+    //   conflictDigest could not open ANY conflicted file, so it hashed the
+    //     unreadable sentinel for all of them and two genuinely DIFFERENT
+    //     conflicts produced the SAME digest;
+    //   per-hunk resolve -> bad_choices/not_splittable;
+    //   whole-file resolve -> THREW "pathspec 'site/a.txt' did not match any
+    //     file(s) known to git".
+    //
+    // The conflict was unresolvable by every route Stacki offers.
+    /** A repository at <root> whose project lives in <root>/site. */
+    const nested = async (name, ours, theirs) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-git-${name}-`));
+      cleanup.push(root);
+      await sh(root, 'init', '-q', '-b', 'main', '.');
+      await sh(root, 'config', 'user.email', 'test@example.com');
+      await sh(root, 'config', 'user.name', 'Test');
+      fs.mkdirSync(path.join(root, 'site'));
+      fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'base\n');
+      await sh(root, 'add', '-A');
+      await sh(root, 'commit', '-qm', 'first');
+      await sh(root, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(root, 'site', 'a.txt'), theirs);
+      await sh(root, 'add', '-A');
+      await sh(root, 'commit', '-qm', 'feature');
+      await sh(root, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(root, 'site', 'a.txt'), ours);
+      await sh(root, 'add', '-A');
+      await sh(root, 'commit', '-qm', 'main');
+      return { root, project: path.join(root, 'site') };
+    };
+
+    const one = await nested('nested-a', 'OURS\n', 'THEIRS\n');
+    const clash = await mergeBranch(git, { projectPath: one.project, branch: 'feature' });
+    check('T17: the conflict is reported', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    const file = clash.files?.[0];
+    check('T17: naming the path git named', file?.path === 'site/a.txt', JSON.stringify(clash.files?.map((f) => f.path)));
+    // THE HALF THAT WAS NULL. A text conflict with no `parts` is a panel saying
+    // "there is nothing in this file to compare" about a file with two lines in
+    // it, and it is also what made a per-hunk answer impossible.
+    check('T17: with the disagreement it actually contains', Array.isArray(file?.parts) && file.parts.some((p) => p.kind === 'clash'), JSON.stringify(file?.parts));
+    check('T17: and both sides of it', file?.ours === 'OURS\n' && file?.theirs === 'THEIRS\n', JSON.stringify({ ours: file?.ours, theirs: file?.theirs }));
+
+    // THE DIGEST STILL MEASURES CONTENT IN THIS LAYOUT. Two repositories laid
+    // out identically, differing only in the bytes that clash: when nothing
+    // could be opened, both hashed the same sentinel and the binding agreed
+    // about two different conflicts.
+    const two = await nested('nested-b', 'OURS-TWO\n', 'THEIRS-TWO\n');
+    const clash2 = await mergeBranch(git, { projectPath: two.project, branch: 'feature' });
+    check(
+      'T17: two conflicts whose CONTENT differs do not share a digest',
+      typeof clash.at?.digest === 'string' && clash.at.digest !== clash2.at?.digest,
+      `${clash.at?.digest} vs ${clash2.at?.digest}`
+    );
+
+    // A PER-HUNK ANSWER. Refused as `not_splittable` before, because the file
+    // it tried to parse was <project>/site/a.txt and there is no such file.
+    const perHunk = await caught(() =>
+      resolveMerge(git, { projectPath: one.project, branch: 'feature', choices: { 'site/a.txt': ['theirs'] }, expect: clash.at })
+    );
+    check('T17: a per-hunk answer is applied', perHunk.value?.ok === true && perHunk.value?.resolved === 1, JSON.stringify(perHunk));
+    check('T17: to the file inside the repository', fs.readFileSync(path.join(one.root, 'site', 'a.txt'), 'utf8') === 'THEIRS\n', JSON.stringify(fs.readFileSync(path.join(one.root, 'site', 'a.txt'), 'utf8')));
+    check('T17: as a two-parent merge commit', (await sh(one.root, 'log', '-1', '--format=%P')).split(' ').length === 2);
+    check('T17: with nothing left conflicted', (await sh(one.root, 'status', '--porcelain')) === '', await sh(one.root, 'status', '--porcelain'));
+
+    // AND A WHOLE-FILE ANSWER, which used to throw git's own pathspec error
+    // straight out of resolveMerge.
+    const whole = await caught(() =>
+      resolveMerge(git, { projectPath: two.project, branch: 'feature', choices: { 'site/a.txt': 'ours' }, expect: clash2.at })
+    );
+    check('T17: a whole-file answer does not throw', whole.error === null, String(whole.error));
+    check('T17: and is applied', whole.value?.ok === true && whole.value?.resolved === 1, JSON.stringify(whole));
+    check('T17: keeping this branch’s version', fs.readFileSync(path.join(two.root, 'site', 'a.txt'), 'utf8') === 'OURS-TWO\n', JSON.stringify(fs.readFileSync(path.join(two.root, 'site', 'a.txt'), 'utf8')));
+  }
+
+  {
+    // T18 — THE DOCUMENTED DEFAULT, ON A MODIFY/DELETE.
+    //
+    // "A file you leave out entirely keeps this branch's version" is what the
+    // agent-facing contract promises, and it is `git checkout --ours` underneath.
+    // On a clash where THIS branch deleted the file there is no stage 2 to take,
+    // and the `no_such_side` validator only ever inspected choices that had been
+    // GIVEN. Measured with `choices: {}`: resolve THREW git's raw
+    // `error: path 'a.txt' does not have our version`, an unnamed failure about
+    // a default the caller never typed.
+    const dir = await repo('modifydelete');
+    cleanup.push(dir);
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'feature edit\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'feature edits a.txt');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.unlinkSync(path.join(dir, 'a.txt'));
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'main deletes a.txt');
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T18: the modify/delete is reported as a conflict', clash.ok === false && clash.files?.[0]?.path === 'a.txt', JSON.stringify(clash.files?.map((f) => f.path)));
+    check('T18: with only the side that still exists', clash.files?.[0]?.ours === null && clash.files?.[0]?.theirs === 'feature edit\n', JSON.stringify({ ours: clash.files?.[0]?.ours, theirs: clash.files?.[0]?.theirs }));
+    const before = await repoState(dir);
+    const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: {}, expect: clash.at }));
+    check('T18: the default does not throw git’s own sentence', answer.error === null, String(answer.error));
+    await refusedCleanly(
+      'T18 a default this file has no version for',
+      answer.value,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r?.badChoices?.[0]?.reason === 'no_such_side' && r?.badChoices?.[0]?.path === 'a.txt' && r?.badChoices?.[0]?.given === 'ours'
+    );
+    check(
+      'T18: naming the side the file does have',
+      JSON.stringify(answer.value?.badChoices?.[0]?.sides) === JSON.stringify(['theirs']),
+      JSON.stringify(answer.value?.badChoices?.[0])
+    );
+    // AND THE CONTROL. The answer this file CAN take still works, so the
+    // refusal is about the missing side and not about modify/delete.
+    const kept = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'theirs' }, expect: clash.at }));
+    check('T18 control: "theirs" — the side that exists — still merges', kept.value?.ok === true, JSON.stringify(kept));
+    check('T18 control: and the edited file is on the branch', fs.readFileSync(path.join(dir, 'a.txt'), 'utf8') === 'feature edit\n');
+  }
+
+  {
+    // T19 — ONE UNREADABLE REASON IS NOT ANOTHER.
+    //
+    // conflictDigest hashed a single constant sentinel for every way of failing
+    // to open a conflicted file, so a conflicted submodule (EISDIR) and a file
+    // whose permissions had been taken away (EACCES) were the same measurement,
+    // and a path that moved from one to the other did not move the digest.
+    // THE PATH IS THE SAME IN ALL THREE. The name is hashed as well as the
+    // bytes, so two DIFFERENT paths would come out different whatever the
+    // sentinel said — comparing those would be a test that cannot fail. What
+    // has to differ is one path, unreadable for two different reasons.
+    const missingAt = await repo('unreadable-missing');
+    cleanup.push(missingAt);
+    const dirAt = await repo('unreadable-dir');
+    cleanup.push(dirAt);
+    fs.mkdirSync(path.join(dirAt, 'x'));
+    fs.writeFileSync(path.join(dirAt, 'x', 'inner.txt'), 'inner\n');
+    const lockedAt = await repo('unreadable-locked');
+    cleanup.push(lockedAt);
+    fs.writeFileSync(path.join(lockedAt, 'x'), 'secret\n');
+    fs.chmodSync(path.join(lockedAt, 'x'), 0o000);
+    try {
+      const missing = conflictDigest(missingAt, ['x']); // ENOENT
+      const directory = conflictDigest(dirAt, ['x']); // EISDIR — a conflicted submodule
+      const locked = conflictDigest(lockedAt, ['x']); // EACCES
+      check('T19: a path that is absent and one that is a directory do not hash alike', missing !== directory, `${missing} vs ${directory}`);
+      check('T19: nor does one whose permissions were taken away', locked !== missing && locked !== directory, `${locked} / ${missing} / ${directory}`);
+      // And every one of them is still distinct from a file that is simply
+      // empty, which is the collision the sentinel existed to prevent at all.
+      const emptyAt = await repo('unreadable-empty');
+      cleanup.push(emptyAt);
+      fs.writeFileSync(path.join(emptyAt, 'x'), '');
+      const empty = conflictDigest(emptyAt, ['x']);
+      check('T19: and none of them hashes like an empty file', empty !== missing && empty !== directory && empty !== locked, `${empty} / ${missing} / ${directory} / ${locked}`);
+    } finally {
+      // A fixture with an unreadable file in it is a fixture the cleanup may
+      // not be able to remove.
+      fs.chmodSync(path.join(lockedAt, 'x'), 0o644);
+    }
+  }
+
+  {
     // T15d — A CONFLICT IN A FILE WHOSE NAME GIT WILL NOT PRINT PLAINLY.
     //
     // `core.quotePath` defaults to true, so `git diff --name-only
@@ -1634,13 +2018,29 @@ async function twoClashRepo(name) {
     );
   }
 
-  for (const dir of cleanup) fs.rmSync(dir, { recursive: true, force: true });
+}
+
+(async () => {
+  // "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
+  // See test/support/suiteGuard.js: node exits 0 on an empty event loop, so an
+  // await that never settles reads as success everywhere that reads exit codes.
+  const done = guardSuite('git-branches');
+  try {
+    await suite();
+  } finally {
+    removeFixtures();
+  }
+  // Cleanup is a check, not a side effect. A `finally` that silently failed to
+  // remove a repository would leave the same litter the success-only path did.
+  const left = cleanup.filter((dir) => fs.existsSync(dir));
+  check(`every fixture repository was removed (${cleanup.length} made)`, left.length === 0, left.join(', '));
 
   if (failures.length) {
     console.error(`git-branches: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`git-branches: ${checked} passed`);
+  done();
 })().catch((err) => {
   console.error(err);
   process.exit(1);

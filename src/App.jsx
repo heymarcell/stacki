@@ -1101,10 +1101,34 @@ export default function App() {
 
   // Snapshots belong to one page, so they're dropped when that page closes;
   // commands carry their own inverse and stay.
+  //
+  // AND THE PURGE ENDS THE REDO BRANCH AS SURELY AS A NEW EDIT DOES.
+  //
+  // This filtered both stacks and left `redoEpoch` alone, so `stillRedoable()`
+  // was true straight across it — and an undo that was still running had
+  // already taken its redo point, a snapshot OF THE PAGE BEING CLOSED, before
+  // the filter ran. It pushed that snapshot onto `future` afterwards, so the
+  // one thing this function exists to prevent happened anyway: a page snapshot
+  // survived the close, and redo then applied it to whatever document was open
+  // by then — the other page's file rewritten with the bytes of a page it never
+  // held. The epoch is what an in-flight undo compares against; see the epoch
+  // note above `undo`, and `pushHistory` and `pushCommand`, which bump it for
+  // exactly this reason.
+  //
+  // (`undoStep`'s command branch pushes the entry it just undid, and a command
+  // survives the filter, so bumping here costs that one redo: the entry leaves
+  // `past` and does not reach `future`. That is the right way round. The
+  // command's inverse ran and the change it undid can simply be made again,
+  // whereas a snapshot replayed onto the wrong file cannot be got back.
+  //
+  // These two lines and `pushHistory`/`pushCommand` are the only places either
+  // stack is rewritten wholesale; `undoStep` and `redoStep` move one entry at a
+  // time and are the readers of the epoch, not writers of it.)
   const dropPageHistory = useCallback(() => {
     const h = historyRef.current;
     h.past = h.past.filter((e) => e.kind === 'cmd');
     h.future = h.future.filter((e) => e.kind === 'cmd');
+    h.redoEpoch += 1;
     h.lastKey = null;
     h.lastPush = 0;
   }, []);
