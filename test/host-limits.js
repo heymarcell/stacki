@@ -31,7 +31,7 @@
 
 const { createStackiMcpServer } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
-const { guardSuite } = require('./support/suiteGuard.js');
+const { guardSuite, freePort } = require('./support/suiteGuard.js');
 
 // A HANG MUST NOT REPORT A PASS. See test/support/suiteGuard.js: node exits 0
 // on an empty event loop, so an await that never settles reads as success.
@@ -52,10 +52,17 @@ const check = (what, condition, detail) => {
   return !!condition;
 };
 
-const PORT = 45201 + (process.pid % 60);
+// PROBED, NOT ASSUMED. A pid-derived port sits inside the span the wire rigs
+// allocate from, so two suites in one run can want the same number and the
+// loser fails on EADDRINUSE — the right direction, but noise. The rigs have
+// probed and retried for a while; this uses the same loop rather than a
+// fifth copy of it.
+let PORT = 45201 + (process.pid % 60);
 const TOKEN = 'host-limits-token-aaaaaaaaaaaaaaaa';
 
 (async () => {
+  PORT = await freePort(PORT);
+
   const server = createStackiMcpServer({
     port: PORT,
     token: TOKEN,

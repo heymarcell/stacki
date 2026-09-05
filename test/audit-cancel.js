@@ -57,11 +57,23 @@
 //                         `sessionIsolated` claims, read off a double that
 //                         models the state rather than counting nothing
 //   too late is harmless  aborting after the run finished changes nothing
+//   nothing is unbounded  including the reset on the way OUT, which was the one
+//                         await on the cancel path with no bound of any kind:
+//                         driven with a `clearStorageData` that never settles,
+//                         on an ordinary run and on a cancelled one, and a
+//                         reset that times out is REPORTED rather than swallowed
+//   nothing leaks a listener
+//                         counted with `getEventListeners`, the reading that
+//                         works on an EventTarget, with a canary that proves the
+//                         count can move before it is asked to mean anything
 //   the wire carries it   the real MCP tool handler passes the SDK's signal to
 //                         the engine, rather than the engine being told by a
 //                         test that reaches past it
 
+const { getEventListeners } = require('node:events');
+
 const { createAudit, liveWindowCount } = require('../electron/mcp/audit');
+const { guardSuite } = require('./support/suiteGuard.js');
 
 // AN EXIT CODE THAT IS NOT A REPORT IS NOT A PASS.
 //
@@ -74,18 +86,10 @@ const { createAudit, liveWindowCount } = require('../electron/mcp/audit');
 //
 // So: nothing but the report at the bottom may end this process cleanly, and a
 // run that takes longer than any of its cases could legitimately take is a
-// failure rather than a wait.
-let finished = false;
-const SUITE_DEADLINE_MS = 180000;
-const watchdog = setTimeout(() => {
-  console.error(`audit-cancel: the suite did not finish within ${SUITE_DEADLINE_MS}ms — an audit is still waiting on something`);
-  process.exit(1);
-}, SUITE_DEADLINE_MS);
-process.on('exit', (code) => {
-  if (finished || code !== 0) return;
-  console.error('audit-cancel: the process exited without finishing — an audit never answered, so nothing was reported');
-  process.exitCode = 1;
-});
+// failure rather than a wait. The guard was written here first and now lives in
+// test/support/suiteGuard.js, so the other suites that need it get this one
+// rather than a fourth paraphrase of it.
+const suiteDone = guardSuite('audit-cancel', 180000);
 
 const failures = [];
 let checked = 0;
@@ -287,6 +291,19 @@ const sessionFor = (log) => ({
     log.session.partitions.add(name);
     return {
       clearStorageData: async () => {
+        // A CLEAR THAT NEVER COMES BACK, WHICH IS WHAT THE REAL ONE CAN DO.
+        //
+        // `clearStorageData` is an IPC round trip to Chromium's network
+        // service, not a local write, and a round trip has no guarantee of
+        // returning. `log.session.holdClearFrom` makes the Nth call onwards
+        // hang for ever, so the engine's bounds on this call are measurable
+        // rather than merely present in the source. Counted BEFORE the hold
+        // and marked clean only AFTER it: a clear that never returned did not
+        // clean anything, and the double must not say it did.
+        log.session.attempted += 1;
+        if (log.session.holdClearFrom && log.session.attempted >= log.session.holdClearFrom) {
+          await log.session.holdClear.promise;
+        }
         log.session.storage += 1;
         log.session.dirty = false;
       },
@@ -334,7 +351,7 @@ const newLog = () => ({
   destroyRefusalsLeft: 0,
   encoded: 0,
   blockedOn: [],
-  session: { storage: 0, cache: 0, auth: 0, dirty: false, partitions: new Set() },
+  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holdClearFrom: 0, holdClear: null, dirty: false, partitions: new Set() },
 });
 
 /**
@@ -601,6 +618,49 @@ const engineWith = (log, opts = {}) =>
     cleanedUp('a one-viewport audit abandoned mid-load', log);
   }
 
+  // ---- CANCELLING IS NOT A WAY OF SKIPPING THE CLEANUP ----------------------
+  //
+  // The reset on the way out is bounded now, and the obvious way to bound it is
+  // the way every other await in this engine is bounded: `withTimeout(...,
+  // PROBE_TIMEOUT_MS, what, signal)`, with the signal racing beside the timer.
+  // On this one await that is not a bound but a bypass. By the time the
+  // `finally` runs on a cancelled audit the signal is ALREADY aborted, so the
+  // race is over before it starts: the cleanup is abandoned on its first tick
+  // and the cancelled run becomes the one run that leaves the shared partition
+  // holding a page's cookies for the next audit to read.
+  //
+  // So: a cancelled audit whose final clear is SLOW but real. The engine has to
+  // wait for it. A build that races the signal here answers before the clear
+  // lands, and the partition is still dirty when it does — which is the
+  // difference this case is made of, and the reason it is a separate case from
+  // the never-settling one below rather than a second assertion on it.
+  {
+    const log = newLog();
+    const slow = gate('a final clear that takes its time');
+    log.session.holdClear = slow;
+    log.session.holdClearFrom = 3;
+    const hang = gate('load');
+    const ac = new AbortController();
+    const engine = engineWith(log, {
+      gateFor: (phase) => (phase === 'load' ? hang : null),
+      onOpen: () => setImmediate(() => ac.abort()),
+    });
+    setTimeout(() => slow.release(), 200);
+    const started = Date.now();
+    const res = await answeredCancel('a cancelled audit whose final clear is slow', engine.run({ route: '/', viewports: ONE, rules: [] }, { signal: ac.signal }));
+    const took = Date.now() - started;
+    check('a cancelled audit still answers when its final clear is slow', res?.ok === false && res.code === 'cancelled', short(res));
+    check('  and waited for that clear rather than racing the signal past it', slow.released() === true && took >= 200, `${took}ms, released=${slow.released()}`);
+    check('  so all three clears actually completed', log.session.storage === 3, short({ attempted: log.session.attempted, storage: log.session.storage }));
+    check(
+      '  and the partition is clean when the cancelled run answers',
+      log.session.dirty === false,
+      'the page had already begun loading on the shared partition when the caller left; the next audit reads what it wrote'
+    );
+    check('  with its window destroyed', log.destroyed === 1, short(log));
+    check('  and none live', liveWindowCount() === 0, String(liveWindowCount()));
+  }
+
   // ---- TOO LATE -------------------------------------------------------------
   {
     const log = newLog();
@@ -620,12 +680,36 @@ const engineWith = (log, opts = {}) =>
   // of them: a listener left behind per await is a leak that announces itself
   // as MaxListenersExceededWarning on a six-viewport audit and then stops
   // announcing itself. Counted on a real AbortSignal, after a real run.
+  //
+  // COUNTED WITH THE ONE READING THAT CAN COME BACK NON-ZERO.
+  //
+  // This block used to read `ac.signal.listenerCount ? ac.signal.listenerCount('abort') : 0`
+  // on both sides. An `AbortSignal` is an EventTarget, not an EventEmitter, and
+  // it has NO `listenerCount` method — so both sides were the literal `0` and
+  // the assertion was `0 === 0` whatever the engine had done with the signal.
+  // Measured: adding five hundred abort listeners by hand left that expression
+  // at 0, while `getEventListeners(signal, 'abort').length` said 500. The file
+  // sold that as "counted on a real AbortSignal, after a real run"; it counted
+  // nothing at all.
+  //
+  // `require('node:events').getEventListeners` is the reading that works on an
+  // EventTarget, and the positive control below is what stops THIS reading
+  // going quietly to zero the way the last one did.
   {
     const log = newLog();
     const ac = new AbortController();
-    const before = ac.signal.listenerCount ? ac.signal.listenerCount('abort') : 0;
+    const listeners = () => getEventListeners(ac.signal, 'abort').length;
+    // THE ORACLE, PROVED TO MOVE, BEFORE IT IS ASKED A QUESTION. A count that
+    // cannot go up cannot detect a leak, and the previous version of this block
+    // is the whole reason that sentence is a test rather than a comment.
+    const canary = () => {};
+    ac.signal.addEventListener('abort', canary);
+    check('the listener count can see a listener at all', listeners() === 1, `${listeners()} after adding one by hand`);
+    ac.signal.removeEventListener('abort', canary);
+    const before = listeners();
+    check('  and goes back down when it is removed', before === 0, `${before}`);
     const res = await engineWith(log).run({ route: '/', viewports: THREE, rules: [], capture: true }, { signal: ac.signal });
-    const after = ac.signal.listenerCount ? ac.signal.listenerCount('abort') : 0;
+    const after = listeners();
     check('a full six-window-worth of awaits still ran', res?.ok === true, short(res));
     check('  and left no abort listener behind', after === before, `${before} -> ${after}`);
   }
@@ -639,19 +723,52 @@ const engineWith = (log, opts = {}) =>
   // never returns from either, and no caller is required to cancel -- a host
   // with no tool timeout simply waits, and so did the audit, for ever.
   //
+  // AND THE THIRD AWAIT WITH NO BOUND, WHICH WAS THE ONE ON THE WAY OUT.
+  //
+  // `runExclusive`'s outer `finally` did `cleanupReset = await
+  // resetAuditSession(session)` bare. The same call at the top of the run is
+  // wrapped in `withTimeout`, and so is the one between viewports; the one
+  // reached on EVERY path out -- including the cancel path this whole file is
+  // about -- was not. Reproduced on a double whose third `clearStorageData`
+  // never settles: the run had not answered after 40,000ms, so the caller
+  // waited for ever AND the queue behind it never reopened, which is the exact
+  // cost cancellation exists to avoid.
+  //
+  // Two cases, because the cleanup runs on two different kinds of exit and only
+  // one of them is a normal result: an ordinary audit, which has an isolation
+  // claim to withdraw, and a CANCELLED one, which is the path where the signal
+  // is already aborted and where a naive fix -- passing the signal to
+  // `withTimeout` here, as everywhere else -- would skip the cleanup entirely
+  // rather than bound it.
+  //
   // Proving a thirty-second budget costs thirty seconds, and there is no
   // cheaper oracle for it: an assertion that the code contains a timeout is not
-  // an assertion that the timeout fires. The two cases run on two engines at
-  // once, so the file pays for one of them rather than both. A build that drops
-  // either budget does not fail slowly here -- it never answers, and the
+  // an assertion that the timeout fires. All four cases run on four engines at
+  // once, so the file pays for one of them rather than four. A build that drops
+  // any of these budgets does not fail slowly here -- it never answers, and the
   // deadline below is what turns that into a red line rather than a hang.
   {
     const freezeLog = newLog();
     const freezeGate = gate('freeze');
     const captureLog = newLog();
     const captureGate = gate('capture');
+
+    // A one-viewport audit clears three times: before the run, before the
+    // viewport, and in the `finally`. Holding from the third is holding exactly
+    // the one on the way out, and leaving the first two alone is what makes the
+    // case about THIS await rather than about the two that were already bounded.
+    const outLog = newLog();
+    outLog.session.holdClear = gate('final clear');
+    outLog.session.holdClearFrom = 3;
+
+    const cancelLog = newLog();
+    cancelLog.session.holdClear = gate('final clear, on a cancelled run');
+    cancelLog.session.holdClearFrom = 3;
+    const cancelAc = new AbortController();
+    const cancelHang = gate('load');
+
     const started = Date.now();
-    const [freeze, picture] = await Promise.all([
+    const [freeze, picture, onTheWayOut, cancelledCleanup] = await Promise.all([
       boundDeadline(
         'a freeze that never returns',
         engineWith(freezeLog, { gateFor: (phase) => (phase === 'freeze' ? freezeGate : null) }).run({ route: '/', viewports: ONE, rules: [] }),
@@ -663,6 +780,19 @@ const engineWith = (log, opts = {}) =>
           { route: '/', viewports: ['phone'], rules: [], capture: true },
           {}
         ),
+        75000
+      ),
+      boundDeadline(
+        'a final session reset that never returns',
+        engineWith(outLog).run({ route: '/', viewports: ONE, rules: [] }),
+        75000
+      ),
+      boundDeadline(
+        'a cancelled audit whose final session reset never returns',
+        engineWith(cancelLog, {
+          gateFor: (phase) => (phase === 'load' ? cancelHang : null),
+          onOpen: () => setImmediate(() => cancelAc.abort()),
+        }).run({ route: '/', viewports: ONE, rules: [] }, { signal: cancelAc.signal }),
         75000
       ),
     ]);
@@ -683,6 +813,44 @@ const engineWith = (log, opts = {}) =>
     // other gave up on the photograph. Both leave the partition clean.
     cleanedUp('an audit whose freeze never returned', freezeLog);
     cleanedUp('an audit whose capture never returned', captureLog);
+
+    // THE CLEANUP ON THE WAY OUT, BOUNDED.
+    const outValue = onTheWayOut.value;
+    check('a final session reset that never returns does not hold the audit for ever', onTheWayOut.answered === true, short(outValue));
+    // AND REPORTED, NOT SWALLOWED. The isolation claim rests on this reset, so a
+    // reset that timed out has to come back as a refusal that says so -- not as
+    // an ordinary ok:true result with `sessionIsolated` still asserted, which is
+    // what a `.catch(() => {})` here would have produced.
+    check(
+      '  and refuses to call itself isolated, by code',
+      outValue?.ok === false && outValue?.code === 'session_not_cleaned',
+      short(outValue)
+    );
+    check('  and says the same thing in the engine block the property lives in', outValue?.engine?.sessionIsolated === false, short(outValue?.engine));
+    check(
+      '  and names the timeout rather than inventing a reason for it',
+      /clearing the audit session on the way out did not finish within 30000ms/.test(String(outValue?.message || '')),
+      short(outValue?.message)
+    );
+    check('  while still handing back the viewport it really did measure', Array.isArray(outValue?.viewports) && outValue.viewports.length === 1, short(outValue?.viewports?.length));
+    check('  and its window went anyway', outLog.destroyed === 1, short(outLog));
+    // AND ON THE CANCEL PATH, WHICH IS THE ONE THIS AWAIT IS REACHED ON MOST.
+    //
+    // The signal here is already aborted by the time the `finally` runs, which
+    // is why the bound on this one await must be the clock alone: a signal
+    // raced beside the timer would reject on its first tick and skip the
+    // cleanup, turning a cancelled audit into the one audit that leaves the
+    // shared partition dirty.
+    const cancelValue = cancelledCleanup.value;
+    check('a cancelled audit whose final reset never returns still answers', cancelledCleanup.answered === true, short(cancelValue));
+    check('  and answers as cancelled', cancelValue?.ok === false && cancelValue?.code === 'cancelled', short(cancelValue));
+    check(
+      '  having really attempted the clear on the way out rather than skipping it',
+      cancelLog.session.attempted === 3 && cancelLog.session.storage === 2,
+      short({ attempted: cancelLog.session.attempted, storage: cancelLog.session.storage })
+    );
+    check('  and destroyed its window', cancelLog.destroyed === 1, short(cancelLog));
+    check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
   }
 
   // ---- WHEN THE WINDOW CANNOT BE DESTROYED AT ALL --------------------------
@@ -768,16 +936,14 @@ const engineWith = (log, opts = {}) =>
     }
   }
 
-  finished = true;
-  clearTimeout(watchdog);
+  suiteDone();
   if (failures.length) {
     console.error(`audit-cancel: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`audit-cancel: ${checked} passed  [an abandoned audit stops mid-await, cleans up, and frees the queue]`);
 })().catch((err) => {
-  finished = true;
-  clearTimeout(watchdog);
+  suiteDone();
   console.error('audit-cancel: threw', err);
   process.exit(1);
 });

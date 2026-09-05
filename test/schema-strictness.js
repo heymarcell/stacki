@@ -73,6 +73,13 @@ const { AuditInput } = require('../electron/mcp/auditTool.js');
 // where that premise is actually declared. See the write_entry block below.
 const { MAX_BODY_BYTES } = require('../electron/mcp/server.js');
 const { startStrictnessWire } = require('./support/strictnessWire.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG EXITS ZERO, and this suite awaits a wire. Every assertion below is
+// downstream of a request somebody has to answer; an await that never settles
+// drains the loop, prints nothing, and node reports a pass. See
+// test/support/suiteGuard.js, and test/audit-cancel.js, where that happened.
+const suiteDone = guardSuite('schema-strictness', 300000);
 
 const failures = [];
 let checked = 0;
@@ -354,6 +361,11 @@ const declaredDefaults = (json) => {
   const tools = composed();
   const wire = await startStrictnessWire({ era: 'modern' });
   const problems = [];
+  // The OUTPUT half of the delivered document, kept for the refusal-branch
+  // block near the foot of this file. Read off the wire for the same reason the
+  // input half is: what a client validates against is what the transport sent,
+  // not what a converter run here would have produced.
+  const deliveredOutput = new Map();
   try {
     const listed = await wire.client.listTools();
 
@@ -369,6 +381,7 @@ const declaredDefaults = (json) => {
     // recomputed here, so the schema this suite injects into is byte-for-byte
     // the one a validating client would refuse the call against.
     const delivered = new Map(listed.tools.map((t) => [t.name, t.inputSchema]));
+    for (const t of listed.tools) if (t.outputSchema) deliveredOutput.set(t.name, t.outputSchema);
     // The two readings held equal. `$schema` and a top-level `type` are added
     // by the transport on the way out and are not the schema's own; everything
     // that decides whether a call is accepted has to be identical, or this
@@ -1234,14 +1247,177 @@ const declaredDefaults = (json) => {
     check('  and the scanner can find a construct that IS used', canary.length > 0, `${canary.length} files declare .optional(`);
   }
 
+  // ── THE REFUSAL BRANCH, WHICH WAS THE ONE OBJECT LEFT OPEN ───────────────
+  //
+  // Every input position above is closed. The OUTPUT side has one shared object
+  // in it — `ToolRefusal` — and it was `z.object`, which strips. Because
+  // `orRefusal(X)` is `z.union([X, ToolRefusal])`, that made the refusal branch
+  // a hole straight through the declared output schema of every tool that
+  // publishes one: any value carrying `{ok:false, code, message}` validated
+  // against it whatever else it held.
+  //
+  // The reason that matters here rather than only in principle: this surface
+  // has a rule that a refusal never carries a host absolute path, and a check
+  // that validates a refusal against the schema its own tool publishes was
+  // being told yes with the path still attached. An open branch on the output
+  // side is a broken ORACLE, not just a loose contract.
+  //
+  // The tools are DERIVED — every published tool whose output union actually
+  // contains this object — so a tool that starts publishing a refusal tomorrow
+  // is checked without anybody adding it to a list, and the count is asserted
+  // so the block cannot pass by finding none.
+  {
+    const refusalTools = [...tools]
+      .filter(([, entry]) => Array.isArray(entry.config.outputSchema?.def?.options) && entry.config.outputSchema.def.options.includes(A.ToolRefusal))
+      .map(([name]) => name);
+    check(
+      'the refusal branch is published by the four tools that answer with one',
+      same(refusalTools, ['get_context', 'capture', 'get_comments', 'comment']),
+      refusalTools.join(', ') || 'no published tool declares orRefusal(); this block would grade nothing'
+    );
+
+    // THE POSITIVE CONTROL FIRST. A branch that refused everything would
+    // satisfy every negative assertion below, and would break the four tools it
+    // is declared on.
+    const realRefusal = {
+      ok: false,
+      code: 'bad_arguments',
+      operation: 'get_context',
+      message: 'get_context could not run — styleDetail: Invalid option',
+      issues: [{ path: ['styleDetail'], message: 'Invalid option', code: 'invalid_value' }],
+    };
+    check(
+      'a real refusal still validates against the branch declared for it',
+      A.ToolRefusal.safeParse(realRefusal).success === true,
+      short(A.ToolRefusal.safeParse(realRefusal).error?.issues)
+    );
+    check(
+      '  and the refusal this surface actually builds does too, field for field',
+      A.ToolRefusal.safeParse(A.badToolArguments('get_context', A.ToolRefusal.safeParse({}).error)).success === true,
+      short(A.ToolRefusal.safeParse(A.badToolArguments('get_context', A.ToolRefusal.safeParse({}).error)).error?.issues)
+    );
+
+    // AND THE HOLE, at both depths it existed at.
+    const smuggled = { ...realRefusal, [UNKNOWN_KEY]: '/Users/somebody/Projects/thing' };
+    check(
+      'a refusal carrying a key nobody declared is refused by the branch',
+      A.ToolRefusal.safeParse(smuggled).success === false,
+      short(A.ToolRefusal.safeParse(smuggled).data)
+    );
+    const smuggledIssue = { ...realRefusal, issues: [{ ...realRefusal.issues[0], [UNKNOWN_KEY]: 1 }] };
+    check(
+      '  and so is one that hides it inside an issue, one level down',
+      A.ToolRefusal.safeParse(smuggledIssue).success === false,
+      short(A.ToolRefusal.safeParse(smuggledIssue).data)
+    );
+
+    // THROUGH THE UNION, which is the shape a tool actually declares: the
+    // payload branch must not catch what the refusal branch rejects.
+    for (const name of refusalTools) {
+      const declared = tools.get(name).config.outputSchema;
+      check(
+        `${name}'s declared output refuses a refusal with an undeclared key beside it`,
+        declared.safeParse(smuggled).success === false,
+        short(declared.safeParse(smuggled).data)
+      );
+    }
+
+    // AND THE SECOND, INDEPENDENT READING: the document the transport really
+    // sent. The two derivations agree or one of them is wrong — the same rule
+    // this file applies to the input side.
+    for (const name of refusalTools) {
+      const doc = deliveredOutput.get(name);
+      const branches = Array.isArray(doc?.anyOf) ? doc.anyOf : [];
+      const refusal = branches.find((b) => b?.properties?.code && b?.properties?.message && b?.properties?.ok?.const === false);
+      check(
+        `  and the delivered output document for ${name} carries the refusal branch closed`,
+        !!refusal && refusal.additionalProperties === false,
+        refusal ? short(refusal.additionalProperties) : `no refusal branch in ${short(Object.keys(doc || {}))}`
+      );
+    }
+  }
+
+  // ── A STRICT ROOT IS NOT A CLOSED SCHEMA ─────────────────────────────────
+  //
+  // `closedObject()` — the function `publishChecked` runs over the six
+  // non-domain tools' input schemas — used to hand back any object whose own
+  // catchall was already `never`, on the reasoning that it was closed already.
+  // It is not: strictness at the top says nothing about the objects underneath,
+  // which is the whole argument for `closeShape` over `z.strictObject` in the
+  // first place — "a mistyped field inside `node` is exactly as invisible as a
+  // mistyped field beside it, and rather more likely".
+  //
+  // Nothing on the shipping surface declares a strict root today, which is why
+  // no injection above could reach this: the defect is that the guard sat one
+  // `z.strictObject` away from silently reopening every nested object on a
+  // tool, on the day somebody closed a root by hand believing it made the tool
+  // safer. So this block declares that tool, through the real `publishChecked`.
+  //
+  // The oracle is not "was it refused". It is WHAT THE HANDLER RAN WITH: a
+  // stripped key is an argument the caller wrote and nobody ran, and the four
+  // measured retargets at the head of agentTools.js are all of that shape.
+  {
+    const z = require('zod');
+    const probe = (inputSchema) => {
+      let handler = null;
+      const ran = [];
+      A.publishChecked(
+        { registerTool: (_n, _c, fn) => { handler = fn; return { name: _n }; } },
+        'strict_root_probe',
+        { title: 'probe', description: 'a tool whose author closed its root by hand', inputSchema },
+        async (args) => { ran.push(args); return { content: [], structuredContent: { ok: true } }; }
+      );
+      return { call: (args) => handler(args), ran };
+    };
+
+    const shape = { node: z.object({ id: z.string(), tag: z.string().optional() }) };
+    const strictRoot = probe(z.strictObject(shape));
+    const looseRoot = probe(z.object(shape));
+
+    // POSITIVE CONTROL: a well-formed call still gets through both.
+    const good = { node: { id: 'n1' } };
+    await strictRoot.call(good);
+    await looseRoot.call(good);
+    check('a tool with a hand-closed root still runs a call that is right', strictRoot.ran.length === 1 && JSON.stringify(strictRoot.ran[0]) === JSON.stringify(good), short(strictRoot.ran));
+    check('  and so does the same tool with an open root', looseRoot.ran.length === 1, short(looseRoot.ran));
+
+    const wrong = { node: { id: 'n1', [UNKNOWN_KEY]: 'dropped' } };
+    const strictAnswer = await strictRoot.call(wrong);
+    const looseAnswer = await looseRoot.call(wrong);
+    check(
+      'an unknown key one level inside a hand-closed root is refused',
+      strictAnswer?.structuredContent?.ok === false && strictAnswer.structuredContent.code === 'bad_arguments',
+      short(strictAnswer?.structuredContent)
+    );
+    check(
+      `  and the refusal names ${UNKNOWN_KEY} rather than describing the object`,
+      JSON.stringify(strictAnswer?.structuredContent?.issues || []).includes(UNKNOWN_KEY),
+      short(strictAnswer?.structuredContent?.issues)
+    );
+    check(
+      '  and NOTHING RAN: the handler was never reached with arguments nobody wrote',
+      strictRoot.ran.length === 1,
+      `${strictRoot.ran.length} calls reached the handler; the second is ${short(strictRoot.ran[1])} — the key was stripped and the tool ran on what was left`
+    );
+    // The open root is the control: it was already refusing this, and if it
+    // ever stops, the assertion above is measuring the wrong mechanism.
+    check(
+      '  the same call on an open root is refused too, so the fence is the nesting and not the root',
+      looseAnswer?.structuredContent?.code === 'bad_arguments' && looseRoot.ran.length === 1,
+      short(looseAnswer?.structuredContent)
+    );
+  }
+
   check('the wire left nothing behind', problems.length === 0, problems.join('; '));
 
+  suiteDone();
   if (failures.length) {
     console.error(`schema-strictness: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`schema-strictness: ${checked} passed  [every closed object position injected at depth, refused, and proved to dispatch nothing]`);
 })().catch((err) => {
+  suiteDone();
   if (failures.length) console.error(`schema-strictness: ${failures.length} of ${checked} had already failed\n${failures.join('\n')}`);
   console.error('schema-strictness: threw\n', err?.stack || err);
   process.exit(1);

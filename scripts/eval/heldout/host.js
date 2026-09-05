@@ -65,7 +65,34 @@ const CREDENTIAL_VARS = [
 // matched: the child needs a working shell, and `claude` needs its own login
 // under HOME. That is stated as a residual below rather than papered over.
 const CREDENTIAL_SHAPE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|_KEY$|^KEY$|AUTH)/i;
-const CREDENTIAL_SHAPE_KEEP = new Set(['SSH_AUTH_SOCK', 'GH_CONFIG_DIR', 'PATH', 'HOME']);
+
+// AND THE ONES THE HOST ITSELF LOGS IN WITH, WHICH ARE NOT THE TRIAL'S TO LOSE.
+//
+// The shape rule above matches ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+// ANTHROPIC_AUTH_TOKEN, AWS_BEARER_TOKEN_BEDROCK and
+// GOOGLE_APPLICATION_CREDENTIALS as readily as it matches a GitHub PAT — and
+// stripping those does not contain the trial, it stops `claude` starting at
+// all. Worse, it fails ASYMMETRICALLY: on a developer machine with an
+// interactive ~/.claude login every trial runs, and on a CI runner or an
+// API-key machine every trial dies at startup while the grader still scores it,
+// so a harness that cannot authenticate is recorded as a Stacki failure.
+// `containedEnv` also sets CI=1, which is exactly the environment where the
+// HOME login is not there.
+//
+// These are the host's own credentials for the model API. They reach Anthropic,
+// not GitHub, and GitHub is what this containment is about.
+const HOST_AUTH_KEEP = new Set([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'AWS_BEARER_TOKEN_BEDROCK',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+]);
+const CREDENTIAL_SHAPE_KEEP = new Set(['SSH_AUTH_SOCK', 'GH_CONFIG_DIR', 'PATH', 'HOME', ...HOST_AUTH_KEEP]);
 
 /**
  * The other way to GitHub, which no GITHUB_* variable is involved in.
@@ -154,7 +181,16 @@ function containedEnv(extra = {}) {
       ghResolvesTo: fake.bin,
       ghConfigDir,
       gitConfigGlobal: env.GIT_CONFIG_GLOBAL,
-      gitCredentialHelperDisabled: true,
+      // ASKED OF GIT, NOT ASSERTED. This block is framed as what was CHECKED
+      // rather than what was intended, and a hardcoded `true` here was neither.
+      gitCredentialHelperDisabled: (() => {
+        try {
+          return execFileSync('git', ['config', '--get', 'credential.helper'], { env, encoding: 'utf8' }).trim() === '';
+        } catch {
+          // git exits 1 when the key is unset, which is the answer we want.
+          return true;
+        }
+      })(),
       fakeGhLogEmptyAtStart: true,
       // WHAT THIS DOES NOT CLOSE, recorded beside what it does, because a
       // containment block that lists only its successes reads as a proof.
@@ -164,7 +200,15 @@ function containedEnv(extra = {}) {
       // login. HOME is not overridden because `claude` needs its own. The fake
       // gh log therefore proves what went through `gh`, not that nothing else
       // did; `ghCallsDuringTrial` should be read that way.
-      residual: 'gh by absolute path with GH_CONFIG_DIR unset reaches the login under HOME; HOME is not overridden because the host binary needs it',
+      // NAMED IN FULL, because a residual listing one of three holes reads as a
+      // claim that there is one. Every part of this containment is an
+      // environment variable a child with a shell can unset for one command.
+      residual: [
+        'gh by absolute path with GH_CONFIG_DIR unset reaches the login under HOME',
+        'env -u GIT_CONFIG_GLOBAL restores the user\u2019s real global config and its credential helper',
+        'GIT_SSH_COMMAND binds git only: ssh/scp run directly still read ~/.ssh',
+        'HOME is not overridden because the host binary needs its own login there',
+      ].join('; '),
     },
     cleanup: () => {
       const calls = fake.calls();

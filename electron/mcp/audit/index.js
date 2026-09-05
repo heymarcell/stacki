@@ -1345,7 +1345,42 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // NOT `.catch(() => {})`. That swallowed exactly the failure the isolation
       // claim depends on -- an audit could leave a page's cookies behind for the
       // next one and still return an ordinary successful result.
-      cleanupReset = await resetAuditSession(session);
+      //
+      // AND THE ONE AWAIT ON THIS PATH THAT USED TO HAVE NO BOUND AT ALL.
+      //
+      // The reset at the top of the run is wrapped in `withTimeout`, and so is
+      // the one between viewports. This one -- reached on EVERY path out,
+      // including the cancel path the whole of this engine's abort machinery
+      // exists to make prompt -- was bare. `clearStorageData` is an IPC round
+      // trip to the network service on a partition every audit shares, and a
+      // round trip that does not come back left the audit with nothing to
+      // answer with and the queue behind it permanently shut: measured on a
+      // double whose third clear never settles, the run had not answered after
+      // 40,000ms, so an abandoned audit's caller waited for ever and every
+      // audit queued behind it waited with them.
+      //
+      // WITHOUT THE SIGNAL, DELIBERATELY. Everywhere else the signal is a racer
+      // beside the timer, because there is no point finishing work nobody wants.
+      // Here it would be the opposite: on the cancel path the signal is ALREADY
+      // aborted, so passing it would reject this await on its first tick and
+      // skip the cleanup exactly when the caller has walked away from a page
+      // that has already written to the shared partition. Cancelling an audit
+      // must not be a way of skipping its cleanup, so this one await races the
+      // clock only.
+      //
+      // A TIMEOUT IS REPORTED, NOT SWALLOWED. It lands in `cleanupReset` in the
+      // same shape a thrown `clearStorageData` does, which is what drives
+      // `sessionIsolated: false` and the `session_not_cleaned` verdict at the
+      // foot of this function -- the audit still hands back everything it
+      // measured and still refuses to call itself isolated. A run that returned
+      // earlier (cancelled, or failed) claims no isolation to withdraw, and the
+      // NEXT audit is covered by its own reset at the top of the run, which
+      // refuses with `session_not_isolated` rather than measuring a dirty page.
+      cleanupReset = await withTimeout(
+        resetAuditSession(session),
+        PROBE_TIMEOUT_MS,
+        'clearing the audit session on the way out'
+      ).catch((err) => ({ ok: false, reason: String(err?.message || err).slice(0, 200) }));
     }
 
     const sorted = sortFindings(findings);

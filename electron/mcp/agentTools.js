@@ -1209,15 +1209,34 @@ function issuesOf(error) {
 /**
  * The same object, with unknown keys refused rather than dropped.
  *
- * Only touches a plain object schema. Anything else — a union, something with
- * a refinement wrapped round it, a schema that is already strict — is handed
- * back untouched, because rebuilding one from `.shape` would lose whatever the
+ * Only touches a plain object schema. Anything that is not object-shaped — a
+ * union, something with a refinement wrapped round it — is handed back
+ * untouched, because rebuilding one from `.shape` would lose whatever the
  * wrapper was there to add.
+ *
+ * AN ALREADY-STRICT ROOT IS NOT A CLOSED SCHEMA, AND USED TO BE TREATED AS ONE.
+ *
+ * There was a second early return here: a schema whose own catchall is `never`
+ * was handed straight back. That reads as an optimisation and is a hole, because
+ * strictness at the top says nothing whatever about the objects underneath —
+ * which is the entire argument for `closeShape` over `z.strictObject` two
+ * functions up: "a mistyped field inside `node` is exactly as invisible as a
+ * mistyped field beside it, and rather more likely". Measured through
+ * `publishChecked` with `z.strictObject({ node: z.object({ a }) })`: the call
+ * `{node:{a:'x', stackiUnknownKey:1}}` was accepted, the key deleted, and the
+ * handler RAN with arguments nobody wrote. None of the six non-domain tools
+ * declares a strict root today, so nothing on the shipping surface was open —
+ * the defect was that the guard sat one `z.strictObject` away from silently
+ * reopening everything beneath it, on the day somebody closed a root by hand
+ * believing that made it safer.
+ *
+ * Rebuilding an already-strict object costs nothing it can lose: `closeShape`
+ * produces a strict object either way, and `carried()` puts the original's own
+ * checks and description back.
  */
 function closedObject(schema) {
   const shape = schema && typeof schema === 'object' ? schema.shape : null;
   if (!shape || typeof shape !== 'object') return schema;
-  if (schema.def?.catchall && schema.def.catchall.def?.type === 'never') return schema;
   // `closeShape`, not `z.strictObject`, so a nested argument is closed here for
   // the same reason it is inside a domain branch: `audit`'s `viewports` takes
   // objects, and a key added beside `width` and `height` was dropped without a
@@ -1260,14 +1279,36 @@ function closedObject(schema) {
  * without loosening the success half: a payload still has to be exactly a
  * payload. It is the move `audit` already made by declaring the four fields
  * its gate refusal carries.
+ *
+ * AND IT IS STRICT, ON A SURFACE WHOSE WHOLE SCHEMA MECHANISM EXISTS TO STOP AN
+ * OBJECT ACCEPTING KEYS IT DOES NOT DECLARE.
+ *
+ * This was `z.object`, which STRIPS. Because `orRefusal(X)` is
+ * `z.union([X, ToolRefusal])`, that made the refusal branch a hole straight
+ * through the declared output schema of the four tools that use it --
+ * get_context, capture, get_comments and comment: ANY value carrying
+ * `{ok:false, code, message}` validated against it no matter what else it held.
+ * Measured: a value carrying nothing but `ok`, a code, a message and a fourth
+ * key called `smuggled` parsed clean, with `smuggled` silently deleted from the
+ * parse result. The two things a
+ * refusal on this surface must never carry are an undeclared field and a host
+ * absolute path, and a contract check that validates a refusal against the
+ * schema its tool publishes was being answered yes either way.
+ *
+ * The advertised document does not change: zod already emits
+ * `additionalProperties: false` for a stripping object under `io: 'output'`,
+ * which is the direction the SDK converts an output schema in. What closes here
+ * is the gap between what that document says and what the schema accepts.
  */
-const ToolRefusal = z.object({
+const ToolRefusal = z.strictObject({
   ok: z.literal(false),
   code: z.string(),
   message: z.string(),
   operation: z.string().optional(),
   issues: z
-    .array(z.object({ path: z.array(z.union([z.string(), z.number()])), message: z.string(), code: z.string().optional() }))
+    .array(
+      z.strictObject({ path: z.array(z.union([z.string(), z.number()])), message: z.string(), code: z.string().optional() })
+    )
     .optional(),
 });
 

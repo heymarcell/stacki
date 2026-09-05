@@ -36,7 +36,7 @@ const path = require('node:path');
 
 const { createStackiMcpServer, CAPABILITIES, CACHE_HINTS } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
-const { guardSuite } = require('./support/suiteGuard.js');
+const { guardSuite, freePort } = require('./support/suiteGuard.js');
 
 // A HANG MUST NOT REPORT A PASS. See test/support/suiteGuard.js: node exits 0
 // on an empty event loop, so an await that never settles reads as success.
@@ -61,7 +61,9 @@ const short = (v) => {
 // `fetch` keeps its connections alive: pointed at one port twice, the second
 // server inherited a socket belonging to the first and the read reset. Ports
 // are cheap; debugging that is not.
-const BASE_PORT = 44961 + ((process.pid % 40) * 4);
+// PROBED, NOT ASSUMED — see the note in test/host-limits.js. Three consecutive
+// ports are needed, so the probe walks until it finds a free RUN of three.
+let BASE_PORT = 44961 + ((process.pid % 40) * 4);
 const TOKEN = 'cache-hints-token-aaaaaaaaaaaaaaaa';
 const urlFor = (port) => `http://127.0.0.1:${port}/mcp`;
 const MODERN = '2026-07-28';
@@ -121,6 +123,15 @@ async function modern(port, method, params = {}, extraHeaders = {}) {
 const readResource = (port, uri) => modern(port, 'resources/read', { uri }, { 'mcp-name': uri });
 
 (async () => {
+  // A free RUN of three: the suite binds BASE_PORT, +1 and +2.
+  for (let tries = 0; tries < 200; tries += 1) {
+    const start = await freePort(BASE_PORT);
+    if (start === (await freePort(start)) && start + 1 === (await freePort(start + 1)) && start + 2 === (await freePort(start + 2))) {
+      BASE_PORT = start;
+      break;
+    }
+    BASE_PORT = start + 3;
+  }
   const PORT = BASE_PORT;
   const server = build('full', PORT);
   await server.start();
