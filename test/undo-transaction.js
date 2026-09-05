@@ -736,16 +736,43 @@ const UNCOALESCED = 900;
       // ---- src/panels/VariablesView.jsx: putFiles, the panel's own twin ----
       const panelText = lift('src/panels/VariablesView.jsx', '    async (texts) => {', '\n    }');
       check('putFiles can be read out of src/panels/VariablesView.jsx', !!panelText && /const written = \[\]/.test(panelText), String(panelText).slice(0, 80));
-      if (panelText && /const written = \[\]/.test(panelText)) {
-        const UNKNOWN = Symbol('unreadable at capture');
-        const makePutFiles = (breaks) => {
+      // AND THE SENTINEL IS LIFTED TOO, because it is half of what is being
+      // graded.
+      //
+      // This used to declare its OWN `Symbol('unreadable at capture')` and pass
+      // it in, because the shipped `const UNKNOWN = ...` sits outside the
+      // lifted span. So the value the rollback compares against was this file's
+      // and the shipped one was never run: replacing it with
+      // `const UNKNOWN = null;` left this suite at 193 passed while the panel's
+      // rollback stopped being able to tell "there was no file" from "I could
+      // not look at the file", and started deleting sheets it had never read.
+      // The header of this file promises that a change to the closure the lift
+      // reads fails loudly rather than quietly testing nothing; lifting the
+      // declaration itself is what makes that true of this one.
+      //
+      // `src/App.jsx`'s lift above starts AT its own copy of this line, so the
+      // twin has been graded all along — which is exactly why the two must not
+      // drift.
+      const panelUnknown = lift('src/panels/VariablesView.jsx', 'const UNKNOWN =', ';');
+      check(
+        'the sentinel putFiles compares against is read out of the panel too',
+        /^const UNKNOWN = \S.*;$/.test(String(panelUnknown)),
+        String(panelUnknown)
+      );
+      if (panelText && /const written = \[\]/.test(panelText) && panelUnknown) {
+        const makePutFiles = (breaks, { readThrowsFor = null } = {}) => {
           const writer = truncatingWriter(abs(breaks)); // one writer, so it breaks once
           // The panel's `bridge`, which SWALLOWS whatever the handler threw and
           // answers `{ok:false, error}` — the reason a refused write used to
           // walk straight past the rollback.
           const bridge = async (name, payload) => {
             try {
-              if (name === 'readStyleFile') return { css: fs.readFileSync(String(payload), 'utf8') };
+              if (name === 'readStyleFile') {
+                if (readThrowsFor && String(payload) === abs(readThrowsFor)) {
+                  throw new Error('EACCES: permission denied, open');
+                }
+                return { css: fs.readFileSync(String(payload), 'utf8') };
+              }
               if (name === 'writeStyleFile') {
                 writer(payload.filePath, payload.css);
                 return { ok: true };
@@ -759,12 +786,13 @@ const UNCOALESCED = 900;
               return { ok: false, error: String(err?.message || err) };
             }
           };
+          // The shipped declaration runs INSIDE the closure the lift builds, so
+          // `UNKNOWN` in the lifted body is the shipped value and nothing else.
           // eslint-disable-next-line no-new-func
-          return new Function('bridge', 'project', 'refresh', 'UNKNOWN', `return (${panelText});`)(
+          return new Function('bridge', 'project', 'refresh', `${panelUnknown}\nreturn (${panelText});`)(
             bridge,
             { path: scratch },
-            async () => {},
-            UNKNOWN
+            async () => {}
           );
         };
 
@@ -791,6 +819,21 @@ const UNCOALESCED = 900;
         check('the panel’s rollback, with a sheet that did not exist at capture', /ENOSPC/.test(String(threw)), String(threw));
         check('  THE SHEET IT CREATED IS TAKEN AWAY AGAIN', !fs.existsSync(abs('made-up.css')), String(textAt('made-up.css')));
         check('  and the broken one is still put back', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        // The third capture state, the one the sentinel exists for, and the one
+        // `writeAllOrNone` above is already asked about. "There was no file" and
+        // "I could not look" must not be the same answer here either: deleting
+        // on the second throws away bytes nobody asked to lose.
+        seed({ 'unreadable.css': 'MINE', 'b.css': 'BBB' });
+        threw = null;
+        try {
+          await makePutFiles('b.css', { readThrowsFor: 'unreadable.css' })({ 'unreadable.css': 'U-NEW', 'b.css': 'B-NEW' });
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the panel’s rollback, with a sheet that could not be READ at capture', /ENOSPC/.test(String(threw)), String(threw));
+        check('  A SHEET IT COULD NOT READ IS NOT DELETED BY THE PANEL EITHER', fs.existsSync(abs('unreadable.css')), 'gone');
+        check('  and the broken one is put back all the same', textAt('b.css') === 'BBB', String(textAt('b.css')));
       }
 
       fs.rmSync(scratch, { recursive: true, force: true });
@@ -1026,6 +1069,230 @@ const UNCOALESCED = 900;
       );
       // The undo did what it said: the edit is off the page it was made on.
       check('9b: the edit was taken back where it was made', app.read('src/pages/index.astro') === indexWas, short(app.read('src/pages/index.astro').slice(0, 160)));
+    }
+
+    // ── 9c. AND SO DOES A REDO ───────────────────────────────────────────────
+    //
+    // 9b is the undo direction. The redo direction was left ungated on the
+    // reasoning that a redo which ran is undoable whatever happened next, and
+    // that reasoning is right about a COMMAND and wrong about a page SNAPSHOT.
+    //
+    // `redoStep` takes its undo point — a snapshot of the page that is open —
+    // before its restore reaches disk and pushes it after. `dropPageHistory`
+    // purges both stacks in between, because a snapshot replayed onto the
+    // wrong file cannot be got back. Measured on the shipped renderer with
+    // `project.redo` and `target.enter` in one `Promise.all`, three runs in
+    // three: the snapshot of src/pages/index.astro landed on `past` after the
+    // purge, and the `project.undo` after it wrote the whole of index.astro
+    // over src/layouts/Base.astro — answering `ok: true, undone: true` with
+    // `document: {file: "src/layouts/Base.astro"}`.
+    //
+    // The interleave is made the same way 9b makes it: one real save held at
+    // the real door, with the hold itself asserted before the page is closed,
+    // so a run that lost the race fails rather than passes.
+    {
+      const refs = require('../electron/mcp/agent/refs.js');
+      const ON_INDEX = { keys: ['src/pages/index.astro#0.2'], fingerprint: { tag: 'footer' }, page: { file: 'src/pages/index.astro' } };
+      const ON_ABOUT = { keys: ['src/pages/about.astro#0.0'], fingerprint: { tag: 'h1' }, page: { file: 'src/pages/about.astro' } };
+      const refFor = (anchor) => refs.mint('node', anchor, { projectRoot: root });
+
+      // Taken before anything is pushed, because what this section asserts is
+      // that the purge leaves the stack EXACTLY as deep as the commands on it
+      // — the snapshot in flight is not on it, and nor is the one the redo took.
+      const base = await probe('9c: before the held redo');
+
+      const opened = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      check('9c: the page the snapshot belongs to is open', opened.ok === true && opened.target?.page?.file === 'src/pages/index.astro', short(opened.target?.page));
+      const indexWas = app.read('src/pages/index.astro');
+      const aboutWas = app.read('src/pages/about.astro');
+      const wrote = await run('target', 'set_text', { ref: opened.target.ref, text: 'EDITED FOR THE REDO' });
+      check('9c: an edit to it is recorded', wrote.ok === true, short(wrote));
+      await H.settle(200);
+      const indexEdited = app.read('src/pages/index.astro');
+      check('9c:   and is on disk', indexEdited.includes('EDITED FOR THE REDO'), short(indexEdited.slice(0, 120)));
+      const undone = await run('project', 'undo');
+      await H.settle(200);
+      check('9c: it is undone, so there is something to redo', undone.ok === true && undone.history?.future === 1, short(undone.history));
+      check('9c:   and the page is back as it was', app.read('src/pages/index.astro') === indexWas, short(app.read('src/pages/index.astro').slice(0, 120)));
+
+      let opening = null;
+      const atTheDoor = new Promise((done) => {
+        opening = done;
+      });
+      let letGo = null;
+      const held = new Promise((done) => {
+        letGo = done;
+      });
+      const realWrite = global.avb.writePageRaw;
+      let holding = false;
+      global.avb.writePageRaw = async (arg) => {
+        if (!holding) {
+          holding = true;
+          opening();
+          await held;
+        }
+        return realWrite(arg);
+      };
+      let redone = null;
+      let moved = null;
+      try {
+        const redoing = run('project', 'redo');
+        await atTheDoor;
+        check('9c: the redo is genuinely mid-restore when the page closes', holding === true);
+        moved = await run('target', 'read', { ref: refFor(ON_ABOUT) });
+        check('9c: a different document is open now', moved.ok === true && moved.target?.page?.file === 'src/pages/about.astro', short(moved.target?.page));
+        letGo();
+        redone = await redoing;
+        await H.settle(300);
+      } finally {
+        global.avb.writePageRaw = realWrite;
+      }
+
+      check('9c: the redo itself still happened', redone?.ok === true && redone?.redone === true, short(redone));
+      // THE ASSERTION THE DEFECT FAILS. `past` may hold the commands earlier
+      // sections recorded — those survive the purge and are meant to — and
+      // nothing else. One more than that is the snapshot of the page that just
+      // closed, sitting where the next undo will find it.
+      check(
+        '9c: A SNAPSHOT OF THE CLOSED PAGE IS NOT LEFT ON THE UNDO STACK',
+        redone?.history?.past === base.past,
+        short({ base, after: redone?.history })
+      );
+      const after = await run('project', 'undo');
+      await H.settle(300);
+      check(
+        '9c: so the undo after it is not about a page that is no longer open',
+        after.ok === false || after.undone === false || after.restored?.kind === 'cmd',
+        short(after)
+      );
+      // AND THE BYTES, which is what the whole guard is for.
+      check(
+        '9c: the page that is open was not overwritten with the page that closed',
+        app.read('src/pages/about.astro') === aboutWas,
+        short(app.read('src/pages/about.astro').slice(0, 160))
+      );
+      check(
+        '9c:   and it is still the about page',
+        !app.read('src/pages/about.astro').includes('pricing-grid'),
+        short(app.read('src/pages/about.astro').slice(0, 160))
+      );
+      // The redo did what it said, and on the page the edit was made on.
+      check('9c: the redo was replayed where the edit was made', app.read('src/pages/index.astro') === indexEdited, short(app.read('src/pages/index.astro').slice(0, 160)));
+      // Back to the fixture's own bytes for what follows: `after` above already
+      // undid whatever command was on top, so this puts the page back by hand.
+      const back = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      if (back.ok) await run('target', 'set_text', { ref: back.target.ref, text: 'Made carefully.' });
+      await H.settle(200);
+    }
+
+    // ── 9d. AN UNDO AND AN EDIT AT ONCE ARE BOTH TRUE ────────────────────────
+    //
+    // `oneAtATime` serialised undo against undo and redo against undo. Nothing
+    // serialised either against an EDIT — and `applySnapshot` rewrites the
+    // WHOLE document from a state captured before the concurrent edit existed,
+    // so whichever save lost was discarded without a word.
+    //
+    // Measured on the shipped renderer, `project.undo` and `target.set_text` in
+    // one `Promise.all`, three runs in three: the undo landed, `target.set_text`
+    // answered `ok: true`, and its bytes were never on disk at all. Both calls
+    // reported success for a pair of changes only one of which had happened.
+    //
+    // The same held door as 9b and 9c, and it is what makes the ordering an
+    // assertion rather than a hope: the undo is parked inside its real write,
+    // and the edit is issued while it is parked. An edit that runs during that
+    // window is an edit racing a whole-document restore.
+    {
+      const refs = require('../electron/mcp/agent/refs.js');
+      const ON_INDEX = { keys: ['src/pages/index.astro#0.2'], fingerprint: { tag: 'footer' }, page: { file: 'src/pages/index.astro' } };
+      const refFor = (anchor) => refs.mint('node', anchor, { projectRoot: root });
+
+      // Read by ref to open the page and put the selection on the footer; then
+      // edit THROUGH THE SELECTION, with no ref. That is the shape the defect
+      // was measured in, and it is the shape that reaches the renderer: a ref
+      // carries the revision it was minted at and is refused as stale after the
+      // undo has moved it, which is a different (and correct) refusal that
+      // would answer this section's question by not asking it.
+      const opened = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      check('9d: the page is open', opened.ok === true && opened.target?.page?.file === 'src/pages/index.astro', short(opened.target?.page));
+      check('9d:   with the node to edit selected', opened.target?.tag === 'footer', short(opened.target?.tag));
+      const before = await run('target', 'set_text', { text: 'FIRST OF THE PAIR' });
+      check('9d: the edit that will be undone lands', before.ok === true, short(before));
+      await H.settle(UNCOALESCED);
+      check('9d:   and is on disk', app.read('src/pages/index.astro').includes('FIRST OF THE PAIR'), short(app.read('src/pages/index.astro').slice(0, 120)));
+
+      let opening = null;
+      const atTheDoor = new Promise((done) => {
+        opening = done;
+      });
+      let letGo = null;
+      const held = new Promise((done) => {
+        letGo = done;
+      });
+      const realWrite = global.avb.writePageRaw;
+      let holding = false;
+      global.avb.writePageRaw = async (arg) => {
+        if (!holding) {
+          holding = true;
+          opening();
+          await held;
+        }
+        return realWrite(arg);
+      };
+      let undone = null;
+      let edited = null;
+      let startedUnderTheUndo = null;
+      try {
+        const undoing = run('project', 'undo');
+        await atTheDoor;
+        check('9d: the undo is genuinely mid-restore when the edit arrives', holding === true);
+        let editSettled = false;
+        const editing = run('target', 'set_text', { text: 'SECOND OF THE PAIR' }).then((answer) => {
+          editSettled = true;
+          return answer;
+        });
+        // Long enough for an unserialised edit to run to the end: it writes
+        // through a different door (`writePage`, for a model) and nothing holds
+        // that one, so it settles here or it was made to wait.
+        await H.settle(300);
+        startedUnderTheUndo = editSettled;
+        letGo();
+        undone = await undoing;
+        edited = await editing;
+        await H.settle(400);
+      } finally {
+        global.avb.writePageRaw = realWrite;
+      }
+
+      // THE SERIALISATION ITSELF. An edit issued while a restore is parked
+      // inside its own write must wait for it, exactly as a second undo does.
+      check('9d: AN EDIT ISSUED DURING AN UNDO WAITS FOR IT', startedUnderTheUndo === false, short({ settledWhileHeld: startedUnderTheUndo }));
+      check('9d: the undo is answered', undone?.ok === true, short(undone));
+      check('9d: the edit is answered', edited?.ok === true, short(edited));
+      const now = app.read('src/pages/index.astro');
+      // THE BYTES, WHICH IS THE WHOLE POINT. Two changes were asked for and both
+      // of them have to be true of the file: the first is taken back and the
+      // second is written.
+      check('9d: THE EDIT MADE WHILE THE UNDO WAS IN FLIGHT IS ON DISK', now.includes('SECOND OF THE PAIR'), short(now.slice(0, 200)));
+      check('9d:   and the undone edit is gone from it', !now.includes('FIRST OF THE PAIR'), short(now.slice(0, 200)));
+      // AND NEITHER ANSWER CLAIMS SOMETHING THE FILE DOES NOT SAY. `undone` is
+      // computed as "the past stack got shorter", which is true whatever the
+      // bytes did; this is the sentence that ties it to them.
+      check(
+        '9d: `undone` is not reported for bytes that did not land',
+        undone?.undone !== true || !now.includes('FIRST OF THE PAIR'),
+        short({ undone: undone?.undone, holdsTheUndoneEdit: now.includes('FIRST OF THE PAIR') })
+      );
+      check(
+        '9d: `ok` is not reported for an edit that did not land',
+        edited?.ok !== true || now.includes('SECOND OF THE PAIR'),
+        short({ ok: edited?.ok, holdsTheEdit: now.includes('SECOND OF THE PAIR') })
+      );
+
+      // Back to the fixture's own words, so section 10 starts from a page
+      // nobody has left half-edited.
+      const back = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      if (back.ok) await run('target', 'set_text', { text: 'Made carefully.' });
+      await H.settle(200);
     }
 
     // ── 10. POSITIVE CONTROLS, WITH NOTHING WRONG AT ALL ──────────────────────

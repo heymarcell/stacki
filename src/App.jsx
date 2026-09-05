@@ -1162,10 +1162,79 @@ export default function App() {
   // So the outgoing state is captured first and put back on the way out. The
   // caller sees the rejection and decides what to do with the stack; what it
   // must not have to do is repair a page model that half moved.
+  //
+  // AND A SNAPSHOT IS ONLY EVER WRITTEN OVER THE DOCUMENT IT WAS TAKEN FROM,
+  // AT THE REVISION THE RESTORE STARTED FROM.
+  //
+  // Everything above is about a restore that could NOT be written. This is
+  // about one that could — over the wrong file, or over a document that has
+  // moved on since. Both were measured on the shipped renderer and both
+  // answered `ok: true`:
+  //
+  //   a redo still in flight when the page closed pushed its undo point onto
+  //   `past` AFTER `dropPageHistory` had purged both stacks, and the next undo
+  //   replayed a snapshot of src/pages/index.astro over src/layouts/Base.astro
+  //   — byte for byte, the layout file holding the whole of the page's source,
+  //   with `undone: true` and `document: {file: "src/layouts/Base.astro"}`;
+  //
+  //   an undo and an edit issued together each rewrote the WHOLE document from
+  //   a state captured before the other existed, and whichever save lost was
+  //   discarded without a word: `project.undo` and `target.set_text` both
+  //   answered ok and the file held neither change.
+  //
+  // The epoch guards on the two pushes keep the stacks tidy, and each of them
+  // guards ONE line. This is the invariant underneath them, checked where the
+  // damage is actually done: a snapshot names its file (see `snapshotOf`), and
+  // it goes back to that file or nowhere. Three questions, each asked at the
+  // first moment it can be answered:
+  //
+  //   BEFORE ANYTHING IS TOUCHED — is the snapshot's file the document that is
+  //   open? A page's bytes written over another page cannot be got back, so
+  //   this one refuses while memory is still untouched and there is nothing to
+  //   repair.
+  //
+  //   AFTER THE TURN OF THE LOOP, IMMEDIATELY BEFORE THE BYTES GO OUT — is it
+  //   STILL that document, and is it still the revision this restore started
+  //   from? `flushSave` reads the open page in its first statements, so the
+  //   check and the write are one stretch with no await between them. A
+  //   navigation or an edit that landed during that turn of the loop moves one
+  //   or the other, and the restore refuses rather than writing a whole
+  //   document over the top of work nobody has seen yet.
+  //
+  //   AND AFTER THE WRITE — are the snapshot's bytes what the file now holds?
+  //   `flushSave` returns without writing anything when `dirty` was cleared
+  //   under it, which is exactly what a racing save does, so "the save
+  //   resolved" is not the same claim as "the restore landed". This is the
+  //   question that makes `undone: true` mean the bytes are on disk.
+  //
+  // A refusal from the second or third question does NOT put `priorState` back
+  // the way a rejected save does. A rejected save leaves the document where it
+  // was, and the old state is then the truth; here something NEWER has arrived
+  // — another document, or another edit — and reinstating a state captured
+  // before it is the very mismatch being refused. The revision bump this call
+  // made is taken back, and nothing else is.
   const applySnapshot = useCallback(async (entry) => {
     const priorState = pageStateRef.current.pageState;
     const priorSelected = selectedIdRef.current;
     const priorRev = docRevRef.current;
+    // The file `flushSave` would write to, and only when the state in memory
+    // agrees that it is the one it is holding. Those two differ for a single
+    // render inside `openFile` — see the stamp note there — and half a
+    // navigation is not a moment to restore anything into.
+    const writesTo = () => {
+      const { currentPage: page, pageState: state } = pageStateRef.current;
+      return page?.path && state?.file === page.path ? page.path : null;
+    };
+    const openNow = () => writesTo() || 'no document';
+    const wrongDocument = () =>
+      new Error(
+        `That change was made in ${entry.file || 'a document Stacki cannot name'}, and ${openNow()} is open now.`
+      );
+    // `entry.file` is stamped by `snapshotOf` from the state's own file stamp,
+    // which every `setPageState` that builds a fresh state sets. A snapshot
+    // that cannot say where it came from cannot be shown to belong here, and
+    // an unprovable restore is refused rather than attempted.
+    if (typeof entry.file !== 'string' || entry.file !== writesTo()) throw wrongDocument();
     docRevRef.current += 1; // an undo is a change to the document like any other
     setPageState((s) => {
       if (!s) return s;
@@ -1191,6 +1260,27 @@ export default function App() {
       );
     }
     await new Promise((done) => setTimeout(done, 0));
+    // Only the bump this call made. Anything else that moved the document while
+    // this was in flight keeps its revision -- the point is that NOTHING
+    // changed here, not that this is the newest thing that happened.
+    const unbump = () => {
+      if (docRevRef.current === priorRev + 1) docRevRef.current = priorRev;
+    };
+    // THE TWO WAYS THE DOCUMENT CAN HAVE MOVED IN THAT TURN OF THE LOOP.
+    // A different file is open, or the same file is a revision further on than
+    // the one this restore was built against. Either way the snapshot in hand
+    // describes something that is no longer there, and `flushSave` would write
+    // the whole of it over whatever did arrive.
+    if (typeof entry.file !== 'string' || entry.file !== writesTo()) {
+      unbump();
+      throw wrongDocument();
+    }
+    if (docRevRef.current !== priorRev + 1) {
+      unbump();
+      throw new Error(
+        'Something else changed this document while that change was being taken back, so Stacki left it alone.'
+      );
+    }
     try {
       await flushSave();
     } catch (err) {
@@ -1201,12 +1291,35 @@ export default function App() {
       // rejection reaches the caller.
       setPageState(() => priorState);
       setSelectedId(priorSelected);
-      // Only the bump this call made. Anything else that moved the document
-      // while the save was in flight keeps its revision -- the point is that
-      // NOTHING changed here, not that this is the newest thing that happened.
-      if (docRevRef.current === priorRev + 1) docRevRef.current = priorRev;
+      unbump();
       await new Promise((done) => setTimeout(done, 0));
       throw err;
+    }
+    // AND THE BYTES ARE THE SNAPSHOT'S BYTES.
+    //
+    // `flushSave` writes nothing at all when it finds `dirty` already cleared,
+    // and returns exactly as it does after a write -- which is what happens
+    // when another save resolved between the `setPageState` above and here. It
+    // records what it wrote in `savedSource`, so that is the thing to read: a
+    // restore whose bytes are not the ones on disk did not happen, and the
+    // caller has to be told so rather than shown `undone: true`.
+    //
+    // Only for a snapshot that HAS bytes. A model whose source was never on
+    // disk (a UI typing burst -- see `snapshotOf`) has nothing to compare, and
+    // this claims nothing about it either way.
+    //
+    // And only while this is still the open document. `flushSave` read the file
+    // to write before its first await, so its bytes went to the right file
+    // whatever opened afterwards -- but `savedSource` is then the NEW
+    // document's, and reading it here would report a restore that landed as one
+    // that did not. Silence about a write that happened, rather than a wrong
+    // answer about it.
+    if (
+      entry.file === writesTo() &&
+      typeof entry.source === 'string' &&
+      pageStateRef.current.pageState?.savedSource !== entry.source
+    ) {
+      throw new Error('The restore did not reach the file; Stacki has not changed it.');
     }
   }, [flushSave]);
 
@@ -1343,6 +1456,27 @@ export default function App() {
     h.lastKey = null;
     h.lastPush = 0;
     const entry = h.future[h.future.length - 1];
+    // AND A REDO DOES NOT PUT BACK A SNAPSHOT THE PURGE THREW AWAY EITHER.
+    //
+    // `undoStep` above gates its redo point on this epoch and this one did not,
+    // on the reasoning that a redo which ran is undoable whatever else
+    // happened. That is true of a COMMAND, which carries its own inverse and
+    // can be asked for again; it is not true of a page SNAPSHOT.
+    // `dropPageHistory` empties both stacks precisely because a snapshot
+    // replayed onto the wrong file cannot be got back, and this function takes
+    // its undo point — a snapshot of the page that WAS open — before its
+    // restore reaches disk and pushed it after. Measured on the shipped
+    // renderer with `project.redo` and `target.enter` in one `Promise.all`, 3
+    // runs in 3: the snapshot of src/pages/index.astro landed on `past` after
+    // the purge, and the next `project.undo` wrote the whole of it over
+    // src/layouts/Base.astro answering `ok: true, undone: true`.
+    //
+    // `applySnapshot` refuses that write now whatever reaches it, which is the
+    // invariant; this is the other half — the snapshot never gets onto the
+    // stack, so the undo after it is about the right entry rather than about a
+    // refusal.
+    const redoEpoch = h.redoEpoch;
+    const stillUndoable = () => h.redoEpoch === redoEpoch;
     if (entry.kind === 'cmd') {
       // The same rule as `undo` above: a redo whose command threw did not
       // happen, and the caller has to be able to find that out -- and to ask
@@ -1355,6 +1489,10 @@ export default function App() {
         return { kind: 'cmd', files: entry.files || [], failed };
       }
       takeOut(h.future, entry);
+      // A command survives the purge and its inverse is a function, not a
+      // snapshot of a document, so it goes back on `past` regardless — the
+      // mirror of `undoStep`'s command branch, and for the reason set out
+      // there.
       h.past.push(entry);
       return { kind: 'cmd', files: entry.files || [] };
     }
@@ -1370,7 +1508,7 @@ export default function App() {
       return { kind: entry.kind, files, failed };
     }
     takeOut(h.future, entry);
-    h.past.push(undoPoint);
+    if (stillUndoable()) h.past.push(undoPoint);
     return { kind: entry.kind, files };
   }, [applySnapshot, showToast]);
 
@@ -5179,7 +5317,11 @@ export default function App() {
      *   a document it does not      `pageState.source` is the truth already.
      *                               This is exactly what the code editor does.
      */
-    writeOpenSource: async (text) => {
+    // Queued with `commit` and with undo and redo, for the reason set out
+    // there: this rewrites the open document too, and an undo running under it
+    // would be restoring a state neither of them ever held.
+    writeOpenSource: async (text) => oneAtATime(() => agentAppRef.current.writeOpenSourceNow(text)),
+    writeOpenSourceNow: async (text) => {
       const { currentPage: page, pageState: state } = pageStateRef.current;
       if (!page || !state) return { ok: false, code: 'not_open', message: 'Stacki has no document open.' };
       const before = state.editable ? { kind: 'model', model: state.model } : { kind: 'source', source: state.source };
@@ -5285,8 +5427,25 @@ export default function App() {
      * already run against a copy by the caller and refused as a set if any of
      * them could not be done — this is the commit, and it saves before it
      * answers so whoever asked can read the file that resulted.
+     *
+     * AND IT TAKES ITS TURN BEHIND UNDO AND REDO.
+     *
+     * `oneAtATime` serialised undo against undo and redo against undo, and
+     * nothing serialised either against an EDIT — while `applySnapshot`
+     * rewrites the WHOLE document from a state captured before the concurrent
+     * edit existed. Measured with `project.undo` and `target.set_text` in one
+     * `Promise.all`, 3 runs in 3: the undo landed, the edit answered
+     * `ok: true`, and the edit's bytes were never on disk at all.
+     *
+     * `applySnapshot` refuses that write now, which is the invariant and the
+     * safety net. But a refusal is not what either caller asked for, and there
+     * is nothing here that has to be refused: run one after the other, an undo
+     * and an edit both do exactly what they say. So this joins the same queue —
+     * the two doors an agent has into the open document, `commit` and
+     * `writeOpenSource`, alongside the two that take it back.
      */
-    commit: async (operations, { label } = {}) => {
+    commit: async (operations, { label } = {}) => oneAtATime(() => agentAppRef.current.commitNow(operations, { label })),
+    commitNow: async (operations, { label } = {}) => {
       // Resolved BEFORE the mutation, because the mutation cannot await: this
       // is the one place a component an agent places can be given the import
       // it needs, and an insert that cannot have one is refused here rather
