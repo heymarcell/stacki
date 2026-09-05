@@ -62,6 +62,12 @@
 //                         driven with a `clearStorageData` that never settles,
 //                         on an ordinary run and on a cancelled one, and a
 //                         reset that times out is REPORTED rather than swallowed
+//   an abandoned clear is not a finished one
+//                         a time box stops the WAITING, not the clear, so the
+//                         audit behind one that timed out refuses at the door
+//                         rather than measuring a partition that clear may wipe
+//                         underneath it -- and the audit after it lands is
+//                         measured normally, so the refusal is not permanent
 //   nothing leaks a listener
 //                         counted with `getEventListeners`, the reading that
 //                         works on an EventTarget, with a canary that proves the
@@ -300,8 +306,19 @@ const sessionFor = (log) => ({
         // rather than merely present in the source. Counted BEFORE the hold
         // and marked clean only AFTER it: a clear that never returned did not
         // clean anything, and the double must not say it did.
+        //
+        // `holdClearOnly` holds exactly ONE call instead, which is what a wedged
+        // IPC round trip really looks like -- that message never came back, and
+        // the next one may be answered perfectly well. It is what makes the
+        // audit AFTER the one that timed out observable at all: with every
+        // subsequent clear hanging too, the next run merely times out again, and
+        // whether it measured the page on a partition a stray clear was about to
+        // wipe cannot be seen.
         log.session.attempted += 1;
-        if (log.session.holdClearFrom && log.session.attempted >= log.session.holdClearFrom) {
+        const held = log.session.holdClearOnly
+          ? log.session.attempted === log.session.holdClearOnly
+          : log.session.holdClearFrom && log.session.attempted >= log.session.holdClearFrom;
+        if (held) {
           await log.session.holdClear.promise;
         }
         log.session.storage += 1;
@@ -351,7 +368,7 @@ const newLog = () => ({
   destroyRefusalsLeft: 0,
   encoded: 0,
   blockedOn: [],
-  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holdClearFrom: 0, holdClear: null, dirty: false, partitions: new Set() },
+  session: { storage: 0, cache: 0, auth: 0, attempted: 0, holdClearFrom: 0, holdClearOnly: 0, holdClear: null, dirty: false, partitions: new Set() },
 });
 
 /**
@@ -767,8 +784,50 @@ const engineWith = (log, opts = {}) =>
     const cancelAc = new AbortController();
     const cancelHang = gate('load');
 
+    // AND THE FIFTH, WHICH IS ABOUT THE AUDIT AFTER THE ONE THAT TIMED OUT.
+    //
+    // A TIME BOX IS NOT A CANCELLATION. `withTimeout` stops WAITING for the
+    // clear; nothing stops the clear. It is an IPC round trip to the network
+    // service on the one partition every audit shares, and when the box expires
+    // it is still outstanding -- so it can land at any moment afterwards,
+    // including inside the next audit, after that audit has loaded its page.
+    //
+    // Reproduced on this double before the fix, one engine, two runs, with the
+    // partition logging which run had a page on it: `run1 ANSWERED false
+    // session_not_cleaned after 30254ms`, `run2: page LOADED on the partition`,
+    // `run2 ANSWERED true`, and then `clear#3 LANDED while liveRun=2`. The
+    // isolation claim broken the other way about: not a partition left dirty for
+    // the next run, but one wiped underneath a run that was using it and still
+    // reporting `ok: true` with `sessionIsolated` asserted.
+    //
+    // Three runs on ONE engine, because the state under test is the engine's:
+    // the run that strands the clear, the run that must refuse rather than
+    // measure, and -- the positive control that stops "refuse everything for
+    // ever" satisfying this -- the run after the stranded clear has landed,
+    // which must audit the page normally.
+    const strandedLog = newLog();
+    strandedLog.session.holdClear = gate('a cleanup its own run abandoned');
+    strandedLog.session.holdClearOnly = 3;
+    const strandedEngine = engineWith(strandedLog);
+    const strandedStory = (async () => {
+      const first = await strandedEngine.run({ route: '/', viewports: ONE, rules: [] });
+      const openedAfterFirst = strandedLog.opened;
+      const at = Date.now();
+      const second = await strandedEngine.run({ route: '/', viewports: ONE, rules: [] });
+      return {
+        first,
+        second,
+        openedAfterFirst,
+        openedAfterSecond: strandedLog.opened,
+        secondTook: Date.now() - at,
+        // Read at the moment the second run answered: a refusal that arrived
+        // after the stray clear had already landed would prove nothing.
+        clearStillOutstanding: strandedLog.session.holdClear.released() === false,
+      };
+    })();
+
     const started = Date.now();
-    const [freeze, picture, onTheWayOut, cancelledCleanup] = await Promise.all([
+    const [freeze, picture, onTheWayOut, cancelledCleanup, stranded] = await Promise.all([
       boundDeadline(
         'a freeze that never returns',
         engineWith(freezeLog, { gateFor: (phase) => (phase === 'freeze' ? freezeGate : null) }).run({ route: '/', viewports: ONE, rules: [] }),
@@ -795,6 +854,7 @@ const engineWith = (log, opts = {}) =>
         }).run({ route: '/', viewports: ONE, rules: [] }, { signal: cancelAc.signal }),
         75000
       ),
+      boundDeadline('an audit whose abandoned cleanup outlives it', strandedStory, 75000),
     ]);
     const took = Date.now() - started;
     check('a freeze that never returns does not hold the audit for ever', freeze.answered === true, short(freeze.value));
@@ -850,6 +910,41 @@ const engineWith = (log, opts = {}) =>
       short({ attempted: cancelLog.session.attempted, storage: cancelLog.session.storage })
     );
     check('  and destroyed its window', cancelLog.destroyed === 1, short(cancelLog));
+    check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
+
+    // AND THE AUDIT BEHIND THE ONE WHOSE CLEANUP WAS ABANDONED.
+    const story = stranded.value;
+    check('an audit whose cleanup is abandoned still answers', stranded.answered === true, short(story));
+    check('  and refuses to call itself cleaned', story?.first?.code === 'session_not_cleaned', short(story?.first));
+    check('  and it really did open its window and load a page on the partition', story?.openedAfterFirst === 1, short(story?.openedAfterFirst));
+    check(
+      'the NEXT audit refuses rather than measuring a partition a stray clear may still wipe',
+      story?.second?.ok === false && story?.second?.code === 'session_not_isolated',
+      short(story?.second)
+    );
+    check(
+      '  naming the abandoned cleanup rather than inventing a reason',
+      /previous audit's cleanup was abandoned/.test(String(story?.second?.message || '')) &&
+        /did not finish within 30000ms/.test(String(story?.second?.message || '')),
+      short(story?.second?.message)
+    );
+    check('  and opens no window at all', story?.openedAfterSecond === story?.openedAfterFirst, short({ before: story?.openedAfterFirst, after: story?.openedAfterSecond }));
+    check('  and says so at once rather than waiting the stray clear out', story?.secondTook < ANSWER_BY_MS, `${story?.secondTook}ms`);
+    check('  while that clear really was still outstanding', story?.clearStillOutstanding === true, short(story));
+
+    // AND THE PARTITION COMES BACK when the stray clear finally lands. Without
+    // this the fix could be "refuse every audit after the first timeout, for the
+    // life of the process", which satisfies everything above it.
+    strandedLog.session.holdClear.release();
+    // `auth` is the last counter the double moves inside a reset, so waiting for
+    // it is waiting for the whole abandoned clear to have finished; one more
+    // turn lets the engine's own `then` on it run.
+    for (let i = 0; i < 5000 && strandedLog.session.auth < 3; i += 1) await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    const third = await boundDeadline('the audit after the stray clear landed', strandedEngine.run({ route: '/', viewports: ONE, rules: [] }), 75000);
+    check('an audit run after the stray clear has landed is measured normally', third.value?.ok === true, short(third.value));
+    check('  and opened its window', strandedLog.opened === story?.openedAfterFirst + 1, short(strandedLog.opened));
+    check('  and claims isolation again', third.value?.engine?.sessionIsolated === true, short(third.value?.engine));
     check('  and left none live', liveWindowCount() === 0, String(liveWindowCount()));
   }
 

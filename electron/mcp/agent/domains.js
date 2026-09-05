@@ -1540,6 +1540,59 @@ const git = {
         // the clip below measures characters, and a conflict in a CJK or
         // emoji-carrying file is up to four bytes for each of them.
         let spent = 0;
+        // THE GIT DOMAIN SPEAKS A DIFFERENT PATH SPACE FROM THE REST OF THE
+        // SURFACE, AND NOTHING SAID SO.
+        //
+        // Every other path an agent handles here — source.read, source.write,
+        // asset and page paths — is PROJECT-relative and is resolved by
+        // resolveInProject, which refuses anything outside the project. Git's
+        // are relative to the REPOSITORY ROOT, and the project does not have to
+        // be the repository: with the repo at <root> and the project at
+        // <root>/site, this refusal named "site/a.txt", `choices` had to be
+        // keyed "site/a.txt", and `badChoices[].expected` listed "site/a.txt" —
+        // while source.read("site/a.txt") looks for <root>/site/site/a.txt.
+        // Undocumented, an agent reading a conflicted path and handing it
+        // straight to source.read got a refusal, or — where a repository has
+        // <root>/x and <root>/site/x — the WRONG FILE, silently.
+        //
+        // Translating everything to project-relative was the tempting fix and
+        // it is not safe: a conflict can land anywhere in the repository, and a
+        // file above the project has no project-relative spelling that any
+        // other tool in this surface would accept ("../README.md" is refused as
+        // outside_project, correctly). Pretending otherwise would move the lie
+        // rather than remove it.
+        //
+        // So the two spaces are both named, per file, and the envelope says
+        // which is which. `path` is git's, and it is the ONE that goes back in
+        // `choices` — unchanged, or the resolve is refused as unknown_path.
+        // `sourcePath` is the same file spelled the way the rest of the surface
+        // spells it, and it is null exactly when the file lies outside the open
+        // project, which is the case no translation can serve.
+        //
+        // BOTH ROOTS THROUGH realpath, OR THE COMPARISON IS A COIN TOSS. Git
+        // answers `rev-parse --show-toplevel` with a resolved path and Stacki's
+        // project path is whatever opened the project, so on any machine where
+        // one leg of the path is a symlink — /tmp -> /private/tmp on macOS, a
+        // home directory on a mounted volume, a repository reached through a
+        // link — the two spellings of the same directory do not share a prefix.
+        // The containment test would then answer "outside the project" for
+        // every file and `sourcePath` would be null for all of them: not a
+        // wrong path, but the useful half of this silently switched off.
+        const realOf = (p) => {
+          try {
+            return fs.realpathSync(p);
+          } catch {
+            return path.resolve(p);
+          }
+        };
+        const repoRoot = typeof raw.root === 'string' && raw.root ? realOf(raw.root) : null;
+        const projectRoot = ctx?.root ? realOf(ctx.root) : null;
+        const sourcePathOf = (p) => {
+          if (!repoRoot || !projectRoot || typeof p !== 'string' || !p) return null;
+          const abs = path.resolve(repoRoot, p);
+          if (abs !== projectRoot && !abs.startsWith(projectRoot + path.sep)) return null;
+          return toPosix(path.relative(projectRoot, abs)) || null;
+        };
         const files = take(all, MAX_LIST).map((f) => {
           // ONLY THE REGIONS THAT ACTUALLY CLASH.
           //
@@ -1555,6 +1608,7 @@ const git = {
           if (fits) spent += bytes;
           return {
             path: f?.path ?? null,
+            sourcePath: sourcePathOf(f?.path),
             hunks: fits ? clashes : null,
             hunksOmitted: !fits,
           };
@@ -1578,7 +1632,7 @@ const git = {
               'apply the result with git.resolve_merge, passing the `mergeRef` below back unchanged \u2014 it says which ' +
               'conflict your answers are about, and a resolve without it is refused. `choices` takes "ours" or ' +
               '"theirs" per file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per hunk, ' +
-              'exactly as many as the hunks listed here, in this order.'
+              'exactly as many as the hunks listed here, in this order, keyed by `path` exactly as given below.'
           ).error,
           branch: input.branch,
           into: raw.from ?? null,
@@ -1586,11 +1640,22 @@ const git = {
           conflictCount: all.length,
           files,
           filesOmitted: Math.max(0, all.length - files.length),
+          // THE ONE FIELD THAT SAYS WHICH OF THE TWO PATH SPACES `path` IS IN.
+          // See sourcePathOf above: git spells its paths from the repository
+          // root and everything else in this surface spells them from the
+          // project, and those are the same string only when the project IS the
+          // repository.
+          pathsRelativeTo: 'repository-root',
           // Said out loud rather than left to be discovered: the panel gets the
           // whole of both sides, and this does not.
           note:
             'Each side\'s complete file is not included here. Read the conflicting hunks above, or the files ' +
-            'themselves with source.read — the merge was unwound, so they hold the pre-merge bytes.',
+            'themselves — the merge was unwound, so they hold the pre-merge bytes. Mind the two path spaces: ' +
+            '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
+            '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
+            'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +
+            'and `sourcePath` is null for a conflicting file outside the project altogether — that one can still ' +
+            'be answered in `choices`, but not read through this surface.',
         };
       }
       if (raw?.ok === false && raw.dirty) {
@@ -1657,7 +1722,15 @@ const git = {
         // src/pages/abot.astro could not be understood" sends an agent looking
         // at the value; the file is spelled wrong.
         const why = {
-          unknown_path: `"${first.path}" is not one of the files this merge could not reconcile, so nothing would have answered for it`,
+          // AND THE COMMONEST WAY TO SPELL ONE WRONG IS NOT A TYPO. git.merge
+          // reports repo-root-relative paths and everything else in this surface
+          // is project-relative, so an agent that re-spelled a conflicted path
+          // the way source.read wants it lands here. The refusal names the space
+          // rather than leaving the agent to re-check the letters.
+          unknown_path:
+            `"${first.path}" is not one of the files this merge could not reconcile, so nothing would have answered ` +
+            'for it — note that a `choices` key is the `path` git.merge reported, which is relative to the ' +
+            'REPOSITORY root and not to the project, and `expected` below lists them exactly as they must be sent',
           wrong_length: `"${first.path}" has ${first.hunks} conflicting ${first.hunks === 1 ? 'hunk' : 'hunks'} and ${first.given} ${first.given === 1 ? 'answer' : 'answers'} were given for it`,
           no_merged: `"${first.path}" hunk ${first.hunk} has no combined version, so "merged" is not one of its answers`,
           empty: `"${first.path}" was given an empty list of answers, which answers none of its hunks`,
@@ -1688,12 +1761,18 @@ const git = {
             `Nothing was merged: ${raw.badChoices.length} of the choices could not be used, starting with the ` +
               `first \u2014 ${why}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
               '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk and exactly as many ' +
-              'entries as that file has hunks, in the order git.merge listed them. Every key must be a path ' +
-              "git.merge reported. A file you leave out entirely keeps this branch's version."
+              'entries as that file has hunks, in the order git.merge listed them. Every key must be a `path` ' +
+              'git.merge reported, spelled exactly as it reported it — those are relative to the REPOSITORY ' +
+              'root, not to the project, and are not the paths source.read takes. A file you leave out entirely ' +
+              "keeps this branch's version."
           ).error,
           branch: input.branch,
           into: raw.from ?? null,
           badChoices: take(raw.badChoices, MAX_LIST),
+          // The same declaration git.merge's conflict carries, on the refusal
+          // that is most often ABOUT the path space. `badChoices[].expected`
+          // holds git's own spellings.
+          pathsRelativeTo: 'repository-root',
         };
       }
       return raw;

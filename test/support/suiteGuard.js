@@ -17,6 +17,24 @@
 const net = require('node:net');
 
 /**
+ * ONLY A REFUSAL PROVES A PORT IS FREE, AND EVERY OTHER ERROR USED TO SAY SO.
+ *
+ * This was `socket.once('error', () => settle(false))`: every connect error read
+ * as "nothing is listening, take it". ECONNREFUSED does mean that. The others do
+ * not, and each one is a port the caller then cannot bind:
+ *
+ *   EACCES        the port is administratively closed to this process
+ *   EMFILE/ENFILE the probe ran out of descriptors; it learned nothing at all
+ *   EADDRNOTAVAIL the local address is gone, so the connect never reached a port
+ *   EHOSTUNREACH  no route; again, nothing was asked of the port
+ *
+ * A probe that cannot ask the question must answer TAKEN, for the same reason
+ * silence does below: `freePort` skips a port it is unsure about, which costs a
+ * number, and hands back a port it is wrong about, which costs a suite.
+ */
+const errorMeansFree = (err) => (err && err.code) === 'ECONNREFUSED';
+
+/**
  * Whether something is listening on a loopback port.
  *
  * Silence is read as TAKEN, not as free: on 127.0.0.1 a live listener connects
@@ -32,7 +50,7 @@ const portTaken = (port) =>
       done(taken);
     };
     socket.once('connect', () => settle(true));
-    socket.once('error', () => settle(false));
+    socket.once('error', (err) => settle(!errorMeansFree(err)));
     setTimeout(() => settle(true), 500).unref?.();
   });
 

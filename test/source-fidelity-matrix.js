@@ -2740,6 +2740,15 @@ function theTokenThatNamesEveryDiv() {
  *
  * The same `else` is why a FIFO named `site.css` was READ: see
  * `theEntryThatIsNotAFile`.
+ *
+ * AND THE FIX FOR IT WAS A REGRESSION WORSE THAN THE HOLE, which is why the
+ * link here now resolves INSIDE the project. Following any directory link at
+ * all, with no containment and no bound, on the Electron MAIN process inside
+ * `page:write`, is the FIFO failure by another road: one ordinary `src/docs ->
+ * ~/Documents` blocks the whole app on every save. The link that matters -- the
+ * monorepo `src/styles -> ../../packages/ui/styles` -- resolves back inside the
+ * project once the project is the repo, and that is the shape asserted here.
+ * The link that leaves is `theLinkOutOfTheProject`.
  */
 function theStylesheetBehindASymlink() {
   const rule = '.preserved { white-space: pre; }\n';
@@ -2747,24 +2756,37 @@ function theStylesheetBehindASymlink() {
   const { source, inner, raised } = preservedFixture(shape);
 
   const root = H.makeProject({ [PAGE]: source });
-  // The shared package the link points at, OUTSIDE the scanned tree, because
-  // that is what makes the link the only way in.
-  const shared = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'stacki-shared-'));
   let real = [];
   let linked = [];
   let text = null;
   try {
-    fs.mkdirSync(path.join(shared, 'styles'), { recursive: true });
-    fs.writeFileSync(path.join(shared, 'styles', 'shared.css'), rule, 'utf8');
+    // The shared package the link points at: inside the project, reached only
+    // through the link, and out of the way of the walk's own roots -- `..` in
+    // the target on purpose, so a containment test that compares written paths
+    // rather than resolved ones fails here.
+    fs.mkdirSync(path.join(root, 'packages', 'ui', 'styles'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'packages', 'ui', 'styles', 'shared.css'), rule, 'utf8');
     // PREMISE: the same rule in a real directory in the project is found, so a
     // failure below is about the link and not about the rule.
-    fs.mkdirSync(path.join(root, 'src', 'proof'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'src', 'proof', 'shared.css'), rule, 'utf8');
     WS.forgetCache();
     real = [...WS.preservingTokens(root)];
-    fs.rmSync(path.join(root, 'src', 'proof'), { recursive: true, force: true });
+    fs.rmSync(path.join(root, 'packages'), { recursive: true, force: true });
 
-    fs.symlinkSync(path.join(shared, 'styles'), path.join(root, 'src', 'vendored'));
+    // Rebuilt somewhere the walk cannot reach on foot, so the link really is
+    // the only way to the rule.
+    const hidden = path.join(root, '.vendor', 'ui', 'styles');
+    fs.mkdirSync(hidden, { recursive: true });
+    fs.writeFileSync(path.join(hidden, 'shared.css'), rule, 'utf8');
+    // PREMISE: the directory it points at is one the walk skips on its own, so
+    // `.preserved` below can only have come through the link.
+    WS.forgetCache();
+    const withoutLink = [...WS.preservingTokens(root)];
+    check(
+      '[symlink] the rule is unreachable without the link',
+      !withoutLink.includes('.preserved') && !withoutLink.includes('*'),
+      short(withoutLink)
+    );
+    fs.symlinkSync(path.join('..', '.vendor', 'ui', 'styles'), path.join(root, 'src', 'vendored'));
     const entry = fs
       .readdirSync(path.join(root, 'src'), { withFileTypes: true })
       .find((e) => e.name === 'vendored');
@@ -2779,14 +2801,124 @@ function theStylesheetBehindASymlink() {
     text = raiseHeadless(source, 'preserved', tokens);
   } finally {
     H.removeProject(root);
-    H.removeProject(shared);
   }
   check('[symlink] the rule is found in a real directory', real.includes('.preserved'), short(real));
-  check('[symlink] a symlinked directory is walked, not silently dropped', linked.includes('.preserved'), short(linked));
+  check(
+    '[symlink] a link that lands INSIDE the project is walked, not silently dropped',
+    linked.includes('.preserved'),
+    short(linked)
+  );
   check(
     '[symlink] and the move under it keeps the bytes that rule protects',
     !!text && innerOf(text, 'preserved') === inner && raised !== inner,
     short({ want: inner, got: text === null ? null : innerOf(text, 'preserved') })
+  );
+}
+
+/**
+ * T12b -- THE WALK, ROUND FOUR: the link that LEAVES the project, and the bound.
+ *
+ * Following any directory symlink was added so the monorepo shape above would
+ * be scanned, and it was added with no containment and no time bound, running
+ * SYNCHRONOUSLY on the Electron main process inside `page:write`. One ordinary
+ * link in a project -- `src/docs -> ~/Documents`, `public/assets -> ~/Dropbox`
+ * -- then walked somebody's home directory on every save: no repaint, no IPC,
+ * the write neither completing nor refusing, which is exactly the FIFO failure
+ * this file already has a test for.
+ *
+ * BOTH ENDS, because either alone is a defect. Not walking out is the fix; not
+ * walking out QUIETLY is the `[]` that reads as "nothing in this project
+ * preserves whitespace" and deletes rendered bytes -- the same silent skip the
+ * unreadable-directory case was written for. So the link out contributes ANY.
+ *
+ * THE ORACLE FOR THE HANG IS TIME, and it is measured on a tree big enough that
+ * walking it is visible and small enough to build: the walk that used to follow
+ * the link read every stylesheet under it, and the one that refuses reads none.
+ * The claim checked is the one that matters to a user -- the answer arrives,
+ * and it is the refusing one -- not a stopwatch threshold that a slow machine
+ * would flake on.
+ *
+ * AND THE BOUND ON ITS OWN, because containment does not cover a project that
+ * is simply enormous, or one on a disk that answers slowly. `MAX_ENTRIES` is
+ * 20000; a directory holding more than that is walked no further and says ANY.
+ */
+function theLinkOutOfTheProject() {
+  const rule = '.preserved { white-space: pre; }\n';
+  const shape = { id: 'two-space', ind: '  ', eol: '\n' };
+  const { source, inner, raised } = preservedFixture(shape);
+
+  const root = H.makeProject({ [PAGE]: source });
+  const outside = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'stacki-elsewhere-'));
+  let tokens = null;
+  let read = [];
+  let text = null;
+  try {
+    // Somebody's Documents: a hundred stylesheets the project has no business
+    // reading, each with a rule in it, so "did the walk go out there" is
+    // answerable by which files were opened rather than by a clock.
+    fs.mkdirSync(path.join(outside, 'notes'), { recursive: true });
+    for (let i = 0; i < 100; i += 1) {
+      fs.writeFileSync(path.join(outside, 'notes', `n${i}.css`), rule, 'utf8');
+    }
+    fs.symlinkSync(outside, path.join(root, 'src', 'docs'));
+    const realRead = fs.readFileSync;
+    fs.readFileSync = (p, ...rest) => {
+      if (typeof p === 'string') read.push(p);
+      return realRead(p, ...rest);
+    };
+    WS.forgetCache();
+    try {
+      tokens = WS.preservingTokens(root);
+    } finally {
+      fs.readFileSync = realRead;
+    }
+    text = raiseHeadless(source, 'preserved', tokens);
+  } finally {
+    H.removeProject(root);
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+  const wentOut = read.filter((p) => p.includes('stacki-elsewhere-') || p.includes(`${path.sep}docs${path.sep}`));
+  check(
+    '[outside] a link that resolves outside the project is not followed',
+    wentOut.length === 0,
+    short({ opened: wentOut.slice(0, 3), of: wentOut.length })
+  );
+  check(
+    '[outside] and it contributes ANY rather than being silently skipped',
+    !!tokens && tokens.has('*'),
+    short(tokens ? [...tokens] : null)
+  );
+  // AND THE ANY IS LOAD-BEARING: read as the empty set, the move under it
+  // deletes two spaces the page renders. This is the same byte oracle the
+  // unreadable-directory case uses, on the same fixture.
+  check(
+    '[outside] and the move under it still keeps the bytes nobody could rule out',
+    !!text && innerOf(text, 'preserved') === inner && raised !== inner,
+    short({ want: inner, got: text === null ? null : innerOf(text, 'preserved') })
+  );
+
+  // --- THE BOUND, with no link in it at all.
+  const wide = H.makeProject({});
+  const room = path.join(wide, 'src', 'many');
+  fs.mkdirSync(room, { recursive: true });
+  fs.writeFileSync(path.join(room, 'keeps.css'), rule, 'utf8');
+  WS.forgetCache();
+  const underCap = [...WS.preservingTokens(wide)];
+  for (let i = 0; i < 20100; i += 1) fs.writeFileSync(path.join(room, `f${i}.txt`), '');
+  WS.forgetCache();
+  const overCap = [...WS.preservingTokens(wide)];
+  H.removeProject(wide);
+  // PREMISE: under the cap the same tree answers with the rule and no sentinel,
+  // so the ANY below is the cap and not something else in the fixture.
+  check(
+    '[bound] under the entry cap the tree answers with its rule and no sentinel',
+    underCap.includes('.preserved') && !underCap.includes('*'),
+    short(underCap)
+  );
+  check(
+    '[bound] a tree with more entries than the cap contributes ANY',
+    overCap.includes('*'),
+    short(overCap)
   );
 }
 
@@ -2972,6 +3104,244 @@ function theReorderInsideAPre() {
 }
 
 /**
+ * T15b -- THE SAME REORDER, ONE SHAPE ALONG, WHERE THE FIX ABOVE COULD NOT RUN.
+ *
+ * `reorderedInPlace` is reached from `replaceNodeSplice`, and `nodeSplices`
+ * reaches `replaceNodeSplice` only when the DESCENT came back null. T15's spans
+ * are a shape the descent refuses. Block-laid-out children are not: the moment
+ * `alignChildren` can pair them up, `nodeSplices` returns `deeper` and the
+ * preserving branch below it is dead code for the whole shape.
+ *
+ * So the reorder went out through the child splices instead, and those write
+ * the layout AROUND each child. Inside a preserving element `indentIsContent`
+ * is deliberately true and `rangeSplice` deliberately writes no indent -- right
+ * for a node being INSERTED, wrong for one whose indentation is already in the
+ * file and is rendered content. Measured before the fix on this exact fixture:
+ * the moved `<p>` came back at COLUMN ZERO, six rendered spaces gone, `ok`, no
+ * fallback, nothing downstream noticing.
+ *
+ * THE ORACLE IS THE WHOLE FILE, byte for byte, for T15's reason: the fallback
+ * reprint is damaged too, so "not the reprint" would pass on the same bytes
+ * arriving by another road. And the four shapes are run because the defect is
+ * about the DESCENT succeeding, which depends on whether the children's heads
+ * match -- two `<p>`s with the same head descend one way, two `<div>`s with
+ * different classes another, and both were damaged.
+ */
+function theReorderOfBlockChildrenInsideAPre() {
+  const shapes = [
+    { id: 'same head', ind: '      ', a: `<p>alpha</p>`, b: `<p>beta</p>` },
+    { id: 'different class', ind: '  ', a: `<div class='a'>alpha\n    one</div>`, b: `<div class='b'>beta\n    two</div>` },
+    { id: 'no indent at all', ind: '', a: `<div>alpha\n    one</div>`, b: `<div>beta\n    two</div>` },
+    { id: 'textarea', ind: '    ', a: `<p>alpha</p>`, b: `<p class='b'>beta</p>`, tag: 'textarea' },
+  ];
+  for (const shape of shapes) {
+    const label = `[reorder blocks in pre/${shape.id}]`;
+    const tag = shape.tag || 'pre';
+    const body = `  <${tag}>\n${shape.ind}${shape.a}\n${shape.ind}${shape.b}\n</${tag}>\n`;
+    const source = commentedPage(body);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === tag);
+    const kids = box?.children || [];
+    // The gap between two children arrives as a whitespace-only text node or as
+    // nothing at all, depending on whether the run reads as inline. Either way
+    // it is the file's own bytes and it stays where it is; what swaps is the
+    // two nodes that are not it.
+    const real = kids.map((n, i) => [n, i]).filter(([n]) => !(n.kind === 'text' && !String(n.value ?? '').trim()));
+    if (!check(`${label} both children are where a reorder can reach them`, real.length === 2, short(kids.map((n) => n.kind + ':' + n.name)))) {
+      continue;
+    }
+    // PREMISE: the element really is one whose inner whitespace is rendered
+    // content, which is what makes the deleted indent a deleted glyph rather
+    // than a cosmetic change.
+    check(`${label} the container is a whitespace-preserving tag`, tag === 'pre' || tag === 'textarea', tag);
+    const [ia, ib] = real.map(([, i]) => i);
+    const swap = kids[ia];
+    kids[ia] = kids[ib];
+    kids[ib] = swap;
+    const after = anchoredSerialize(source, model);
+    const want = commentedPage(`  <${tag}>\n${shape.ind}${shape.b}\n${shape.ind}${shape.a}\n</${tag}>\n`);
+    if (
+      !check(
+        `${label} the two children really did swap`,
+        after.indexOf(shape.b.split('\n')[0]) < after.indexOf(shape.a.split('\n')[0]),
+        short({ span: changedSpan(source, after) })
+      )
+    ) {
+      continue;
+    }
+    check(
+      `${label} and every rendered space the file wrote is still in it, byte for byte`,
+      after === want,
+      short({ span: changedSpan(want, after) })
+    );
+  }
+}
+
+/**
+ * T17 -- A COMPONENT IS NOT THE HTML ELEMENT WITH THE SAME NAME.
+ *
+ * `rendersIndent` is the one flag documented as "evidence rather than a
+ * superset" -- the single place the whitespace answer is used to ACT, by
+ * writing a splice's surrounding layout at COLUMN ZERO, rather than to abstain.
+ * `ownWhitespaceRule` lowercased `node.name` into `PRESERVING_TAGS` and never
+ * looked at `node.kind`, so `<Textarea>` -- shadcn/ui's exact component name,
+ * and `<Pre>`, `<Script>`, `<Style>` with it -- was treated as the HTML
+ * element. What that component renders lives in another file and is quite
+ * ordinarily a `<div>` with a label; a component name is not evidence about
+ * anybody's whitespace.
+ *
+ * THE PAIRED CONTROL IS THE POINT. A fix that stopped looking at tags would
+ * pass the component half and lose the mechanism, so the same insert is done
+ * into the real lowercase element and must STILL go to column zero.
+ *
+ * AND THE WIDE FLAG IS DELIBERATELY LEFT ALONE: being wrong there only refuses
+ * a reindent, so a `<Pre>` still holds its children's authored bytes. That is
+ * the third check.
+ */
+function theComponentNamedAfterATag() {
+  for (const name of ['Textarea', 'Pre', 'Script', 'Style']) {
+    const label = `[component <${name}>]`;
+    const lower = name.toLowerCase();
+    const kept = `    <span class='kept'>one</span>`;
+    const build = (open) =>
+      `---\n// Layout import - the shell every page shares\nimport Base from '../layouts/Base.astro';\n` +
+      `// Component imports\nimport ${name} from '../components/${name}.astro';\n---\n` +
+      `<Base>\n  <${open}>\n${kept}\n  </${open}>\n</Base>\n`;
+    const added = { kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] };
+
+    // `<script>` and `<style>` are `kind: 'raw'` -- `parsePage` captures their
+    // inner text verbatim and gives them no children at all -- so there is no
+    // insert to make into the real element, and their acting-flag membership is
+    // not observable from here. The paired control runs for the two that CAN
+    // hold element children; the component half runs for all four, because
+    // `<Script>` and `<Style>` are ordinary components with ordinary children
+    // and that is exactly the confusion.
+    const pairs = [['component', name]];
+    if (lower === 'pre' || lower === 'textarea') pairs.push(['element', lower]);
+    for (const [which, open] of pairs) {
+      const source = build(open);
+      const parsed = parsePage(source);
+      if (!check(`${label} the ${which} page parses`, parsed.editable === true, short(parsed.reason))) continue;
+      const model = structuredClone(parsed.model);
+      const box = model.nodes[0].children.find((n) => n.name === open);
+      if (!check(`${label} the ${which} is where an insert can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) {
+        continue;
+      }
+      // PREMISE: the parser really does tell the two apart, so a difference
+      // below is about `kind` and not about the name being read wrongly.
+      check(`${label} the parser calls <${open}> a ${which}`, box.kind === which, short({ kind: box.kind }));
+      box.children.push(structuredClone(added));
+      const after = anchoredSerialize(source, model);
+      const inner = new RegExp(`<${open}>([\\s\\S]*?)</${open}>`).exec(after);
+      const got = inner ? inner[1] : null;
+      if (which === 'element') {
+        check(
+          `${label} the real <${lower}> still writes the inserted sibling at column zero`,
+          got === `\n${kept}\n<p>new</p>\n  `,
+          short({ got })
+        );
+      } else {
+        check(
+          `${label} a component named after a tag does not de-indent the markup around it`,
+          got === `\n${kept}\n    <p>new</p>\n  `,
+          short({ got })
+        );
+      }
+    }
+
+    // AND THE WIDE FLAG, WHICH MAY STILL CALL IT A COULD: the subtree moved out
+    // of the component travels as authored rather than reindented.
+    const source =
+      `---\n// Layout import - the shell every page shares\nimport Base from '../layouts/Base.astro';\n` +
+      `// Component imports\nimport ${name} from '../components/${name}.astro';\n---\n` +
+      `<Base>\n  <div class='outer'>\n    <${name}>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </${name}>\n  </div>\n</Base>\n`;
+    const parsed = parsePage(source);
+    if (!check(`${label} the wide-flag page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const box = outer?.children?.find((n) => n.name === name);
+    const moved = box?.children?.find((n) => n.name === 'div');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(box?.children?.map((n) => n.name)))) continue;
+    box.children = box.children.filter((n) => n !== moved);
+    outer.children.push(moved);
+    const after = anchoredSerialize(source, model);
+    const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(after);
+    check(
+      `${label} and the wide flag still holds the moved subtree's authored bytes`,
+      !!got && got[1] === 'alpha\n        beta\ngamma',
+      short({ got: got ? got[1] : null })
+    );
+  }
+}
+
+/**
+ * T18 -- `white-space: var(--anything)` FIRING THE ACTING FLAG.
+ *
+ * The file documents that branch as an admission: a value that cannot be read
+ * statically counts as preserving, "because the only answer this is allowed to
+ * get wrong is the one that refuses". That is true of the wide flag and exactly
+ * false of the acting one, which writes the surrounding layout at column zero
+ * on the strength of it. The variable's value may perfectly well be `normal`;
+ * nothing in this file can know, and an unreadable value is not evidence.
+ *
+ * THE PAIRED CONTROL AGAIN: the readable `white-space: pre` on the same element
+ * must still act, or the fix is a switch-off rather than a narrowing. And the
+ * wide flag still reads the `var()` as a could, so the subtree moved out of the
+ * element travels unreindented.
+ */
+function theValueNobodyCanRead() {
+  const kept = `    <span class='kept'>one</span>`;
+  const build = (style) => commentedPage(`  <div style='${style}'>\n${kept}\n  </div>\n`);
+  for (const [style, acts] of [
+    ['white-space: var(--ws)', false],
+    ['white-space: var( --ws , pre )', false],
+    ['white-space: pre', true],
+  ]) {
+    const label = `[unreadable ${style}]`;
+    const source = build(style);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === 'div');
+    if (!check(`${label} the div is where an insert can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) continue;
+    box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+    const after = anchoredSerialize(source, model);
+    const inner = /<div [^>]*>([\s\S]*?)<\/div>/.exec(after);
+    const got = inner ? inner[1] : null;
+    check(
+      acts
+        ? `${label} a value this file CAN read still writes the sibling at column zero`
+        : `${label} a value this file cannot read does not de-indent the markup around it`,
+      got === `\n${kept}\n${acts ? '' : '    '}<p>new</p>\n  `,
+      short({ got })
+    );
+  }
+  // AND THE WIDE FLAG: the `var()` is still a could, so a block moved out of
+  // the element keeps its authored indentation rather than being reindented.
+  const source = commentedPage(
+    `  <div class='outer'>\n    <div style='white-space: var(--ws)'>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </div>\n  </div>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check('[unreadable] the wide-flag page parses', parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const box = outer?.children?.find((n) => n.name === 'div');
+  const moved = box?.children?.find((n) => n.name === 'div');
+  if (!check('[unreadable] the block is where a move can reach it', !!moved, short(box?.children?.map((n) => n.name)))) return;
+  box.children = box.children.filter((n) => n !== moved);
+  outer.children.push(moved);
+  const after = anchoredSerialize(source, model);
+  const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(after);
+  check(
+    "[unreadable] and the wide flag still holds a var()'d element's subtree as authored",
+    !!got && got[1] === 'alpha\n        beta\ngamma',
+    short({ got: got ? got[1] : null })
+  );
+}
+
+/**
  * T16 -- the stamp for a stylesheet the caller hands in.
  *
  * `knownTextOf` exists so `page:write` need not re-read the page it is about to
@@ -3040,9 +3410,13 @@ function theStampForAStylesheetHandedIn() {
   theWalkThatCameBackShort();
   theTokenThatNamesEveryDiv();
   theStylesheetBehindASymlink();
+  theLinkOutOfTheProject();
   theEntryThatIsNotAFile();
   theRunTheReprintCollapsed();
   theReorderInsideAPre();
+  theReorderOfBlockChildrenInsideAPre();
+  theComponentNamedAfterATag();
+  theValueNobodyCanRead();
   theStampForAStylesheetHandedIn();
   for (const shape of [
     { id: 'two-space', ind: '  ', eol: '\n' },

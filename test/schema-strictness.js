@@ -746,6 +746,56 @@ const declaredDefaults = (json) => {
       }
     }
 
+    // ── THE ONE ARGUMENT WITH TWO NAMES, AND ONE PRECEDENCE ──────────────────
+    //
+    // `set_text` takes `text` as an action and `value` inside an `edit` batch,
+    // and the wire accepts both spellings in both forms so an agent reading two
+    // schemas side by side cannot lose a call to the difference. Accepting two
+    // names means deciding which wins when BOTH arrive, and the two branches of
+    // `normalise` decided it opposite ways: the action preferred `text`, the
+    // batch preferred `value`. So one pair of arguments wrote two different
+    // words into the same element depending on the shape the caller happened to
+    // reach for, and both answered ok.
+    //
+    // The oracle is not the envelope — both shapes succeed either way. It is
+    // WHAT REACHED THE APP, read at the dispatch seam, which is the only place
+    // the two forms can be compared with each other.
+    {
+      const REF = 'refrefrefrefrefref';
+      const single = await wire.call('target', { action: 'set_text', ref: REF, text: 'FROM TEXT', value: 'FROM VALUE' });
+      check('set_text with both spellings dispatches', single.dispatched === 1, short(single.envelope));
+      const singleArgs = single.handedOver[0]?.args || {};
+      check('  the action form takes `text`', singleArgs.text === 'FROM TEXT', short(singleArgs));
+      check('  and does not carry the loser through', !('value' in singleArgs), short(singleArgs));
+
+      const batch = await wire.call('target', {
+        action: 'edit',
+        ref: REF,
+        operations: [{ type: 'set_text', text: 'FROM TEXT', value: 'FROM VALUE' }],
+      });
+      check('the same pair inside an edit batch dispatches too', batch.dispatched === 1, short(batch.envelope));
+      const op = (batch.handedOver[0]?.args?.operations || [])[0] || {};
+      check('  THE BATCH FORM TAKES THE SAME ONE', op.value === 'FROM TEXT', short(op));
+      check('  under the name the operation declares', !('text' in op), short(op));
+      check(
+        '  so one pair of arguments cannot mean two different things',
+        singleArgs.text === op.value,
+        short({ action: singleArgs.text, batch: op.value })
+      );
+
+      // AND THE ALIAS STILL WORKS ALONE, in both directions — a precedence made
+      // to agree by ignoring one of the two names would satisfy everything
+      // above while breaking the thing the alias exists for.
+      const aliasOnly = await wire.call('target', { action: 'set_text', ref: REF, value: 'ONLY VALUE' });
+      check('  `value` alone still reaches the app as `text`', (aliasOnly.handedOver[0]?.args || {}).text === 'ONLY VALUE', short(aliasOnly.handedOver[0]?.args));
+      const batchAlias = await wire.call('target', { action: 'edit', ref: REF, operations: [{ type: 'set_text', text: 'ONLY TEXT' }] });
+      check(
+        '  and `text` alone still reaches it as an operation’s `value`',
+        ((batchAlias.handedOver[0]?.args?.operations || [])[0] || {}).value === 'ONLY TEXT',
+        short(batchAlias.handedOver[0]?.args?.operations)
+      );
+    }
+
     // ── AND THE ONE BOUND ANOTHER FILE'S ARGUMENT RESTS ON ───────────────────
     //
     // `MAX_BODY_BYTES` in electron/mcp/server.js is sized from "the largest

@@ -167,7 +167,12 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
     // THE ISOLATION CLAIM, CHECKED RATHER THAN ASSERTED. In `mcp-only` the
     // model has no built-in tools at all, so any built-in call means the flag
     // did not take and the trial's MCP counts are not the whole story.
-    result.isolationHeld = task.mode !== 'mcp-only' || host.builtinToolCalls === 0;
+    // NULL RATHER THAN A VERDICT WHEN THERE WAS NO RUN. A host that never
+    // started has no built-in calls because it has no calls at all, and
+    // `0 === 0` would report that as isolation HOLDING just as surely as an
+    // earlier shape reported it as isolation FAILING. Neither is true.
+    result.isolationHeld =
+      host.ok === false && host.error ? null : task.mode !== 'mcp-only' || host.builtinToolCalls === 0;
 
     result.wire = summarise(wirePath);
     const wireRows = fs
@@ -179,7 +184,30 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
 
     const previewUrl = previewUrlOf(projectDir) || previewBefore;
     result.previewUrl = previewUrl;
-    result.oracle = await task.check({
+
+    // A TRIAL WHOSE HOST NEVER STARTED IS NOT A TRIAL, AND MUST NOT BE GRADED.
+    //
+    // `runHost` resolves `{ok:false, error}` when `claude` could not be spawned
+    // at all — not on PATH, EACCES, or killed before it said anything. Every
+    // count in that answer is zero because nothing happened, and grading it
+    // scores those zeros: the oracle fails, `result.ok` is false, and the run
+    // lands in the results file beside real failures with nothing to say it was
+    // the harness rather than the product. That is the same shape as the
+    // `isolationHeld` defect below it — a derived answer computed without
+    // asking whether there was anything to derive it from.
+    // NOT an early `return`: `result.elapsedMs` and the write of result.json
+    // happen after the `finally` below, and returning from here would skip both
+    // — leaving the run with no record at all, which is a worse answer than the
+    // wrong one this is fixing.
+    const hostRan = !(host.ok === false && host.error);
+    if (!hostRan) {
+      result.hostUnavailable = host.error;
+      result.oracle = { pass: null, why: `the host never ran: ${host.error}` };
+      result.ok = null;
+      log(`${id}/${arm}: NOT GRADED — the host never ran (${host.error})`);
+    }
+
+    if (hostRan) result.oracle = await task.check({
       app,
       root: projectDir,
       previewUrl,
@@ -190,7 +218,7 @@ async function runTrial({ id, arm, appPath, outDir, trial, model, effort, log })
       // assert that nothing at all changed rather than that one string survived.
       projectHash: result.projectHash,
     });
-    result.ok = result.oracle?.pass === true;
+    if (hostRan) result.ok = result.oracle?.pass === true;
   } catch (err) {
     result.error = String(err?.stack || err?.message || err);
   } finally {

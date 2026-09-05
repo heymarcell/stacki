@@ -567,6 +567,63 @@ const conflicted = [
   );
 }
 
+// --- a conflict that ends the file ON TEXT BOTH SIDES HAVE -------------------
+//
+// The split inside a block is the reason this shape exists: two sides that end
+// the same way come back as a clash and then the run they agree on, so the
+// trailing empty part is no longer preceded by the clash and `conflictAtEnd`
+// used to answer false. The terminator correction then never ran, and the
+// rebuilt file gained git's own newline over a side that had none.
+//
+// THE MARKED-UP TEXT HERE IS REAL GIT'S, not a hand-drawn approximation:
+// base "head\nBASE\ntail\n", ours "head\nOURS\ntail\n", theirs
+// "head\nTHEIRS\ntail" with no terminator, merged with
+// merge.conflictStyle=diff3 — the missing newline makes the last lines differ,
+// so git marks up the tail as well. Measured before the fix: `['theirs']`
+// committed "head\nTHEIRS\ntail\n" while `'theirs'` — the same decision, whole
+// file — committed the blob exactly, both answering ok.
+{
+  const sharedTail = parseConflict(
+    'head\n<<<<<<< HEAD\nOURS\ntail\n||||||| 40b9761\nBASE\ntail\n=======\nTHEIRS\ntail\n>>>>>>> feature\n'
+  );
+  check('the shared tail comes back as its own agreed run', clashCount(sharedTail) === 1, JSON.stringify(sharedTail));
+  check(
+    '  stamped as having come from inside the markers',
+    sharedTail[sharedTail.length - 2]?.kind === 'same' && sharedTail[sharedTail.length - 2]?.inClash === true,
+    JSON.stringify(sharedTail)
+  );
+  check('AND THE CONFLICT STILL ENDS THE FILE', conflictAtEnd(sharedTail) === true, JSON.stringify(sharedTail));
+  const bothSides = { ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail' };
+  check(
+    'the incoming side with no terminator does not gain one',
+    renderResolved(sharedTail, ['theirs'], bothSides) === 'head\nTHEIRS\ntail',
+    JSON.stringify(renderResolved(sharedTail, ['theirs'], bothSides))
+  );
+  check(
+    '  while this branch, which has one, keeps exactly one',
+    renderResolved(sharedTail, ['ours'], bothSides) === 'head\nOURS\ntail\n',
+    JSON.stringify(renderResolved(sharedTail, ['ours'], bothSides))
+  );
+  // The other way round, so the answer cannot be "always strip".
+  const mirrored = { ours: 'head\nOURS\ntail', theirs: 'head\nTHEIRS\ntail\n' };
+  check(
+    'and with the terminators swapped the answers swap with them',
+    renderResolved(sharedTail, ['ours'], mirrored) === 'head\nOURS\ntail' &&
+      renderResolved(sharedTail, ['theirs'], mirrored) === 'head\nTHEIRS\ntail\n',
+    JSON.stringify([renderResolved(sharedTail, ['ours'], mirrored), renderResolved(sharedTail, ['theirs'], mirrored)])
+  );
+  // 'both' has no line of its own at the end here — the last line is the one
+  // both versions carry — and reads the terminator the way it always has, off
+  // the side of the clash that was actually written. What must not happen is
+  // the shape going unrecognised again and git's own newline surviving.
+  check(
+    'keeping both is read off a version too, not left with git’s newline',
+    renderResolved(sharedTail, ['both'], bothSides) === 'head\nOURS\nTHEIRS\ntail' &&
+      renderResolved(sharedTail, ['both'], mirrored) === 'head\nOURS\nTHEIRS\ntail\n',
+    JSON.stringify([renderResolved(sharedTail, ['both'], bothSides), renderResolved(sharedTail, ['both'], mirrored)])
+  );
+}
+
 if (failures.length) {
   console.error(`conflicts: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
   process.exit(1);

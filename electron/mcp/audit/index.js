@@ -691,6 +691,46 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
   // run, which is the unbounded thing being avoided.
   let queue = Promise.resolve();
 
+  // A CLEANUP THAT WAS ABANDONED IS STILL RUNNING.
+  //
+  // The reset on the way out is time-boxed, which stopped a wedged
+  // `clearStorageData` holding its caller and the queue behind it for ever. But
+  // a time box is not a cancellation: `withTimeout` stops WAITING for the clear,
+  // it cannot stop the clear. The IPC round trip is still outstanding against
+  // the network service on the one `stacki-audit` partition every audit shares,
+  // and it can land at any moment afterwards.
+  //
+  // Measured on the double, one engine, two runs: the first run's third clear
+  // hangs, the run answers `session_not_cleaned` after 30,254ms, the queue
+  // releases, the NEXT audit starts and loads its page -- and then `clear#3
+  // LANDED while liveRun=2`. That is the isolation claim broken in the other
+  // direction: not a partition left dirty for the next run, but one wiped
+  // underneath a run that is using it, whose cookies and localStorage vanish
+  // between one viewport and the next while it reports `ok: true`.
+  //
+  // WHY NOT HOLD THE QUEUE UNTIL THE CLEAR SETTLES. Because a clear that never
+  // settles is exactly the case the time box exists for, and chaining the queue
+  // onto it would reinstate the permanent shutdown the box removed -- every
+  // audit behind the wedged one waiting for ever, the cost written up in the
+  // `finally` below.
+  //
+  // So the partition is marked SUSPECT instead, and the next audit refuses at
+  // the door rather than measuring a page a stray clear may wipe. Nothing waits:
+  // the budget the abandoned clear has already overrun is not spent again on a
+  // caller who did not incur it. The mark is dropped by the abandoned clear
+  // itself when it finally settles, so the partition becomes usable again the
+  // moment it is provably quiet -- and a LATER successful clear does not drop
+  // it, because a clear that has not come back can still land after that one too.
+  let strandedCleanup = null;
+  const strand = (clearing, err) => {
+    const record = { reason: String(err?.message || err).slice(0, 200) };
+    strandedCleanup = record;
+    const settled = () => {
+      if (strandedCleanup === record) strandedCleanup = null;
+    };
+    clearing.then(settled, settled);
+  };
+
   /**
    * What an audit answers when the caller stopped waiting.
    *
@@ -850,6 +890,28 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // a checkpoint -- and the catch that turns it into a refusal has to be able
     // to say how much of the page had been measured before the caller left.
     let measured = 0;
+
+    // AND THE DOOR THE SUSPECT PARTITION IS REFUSED AT.
+    //
+    // Above `try` on purpose: a run that measures nothing has nothing to clean,
+    // and the `finally` would otherwise fire a fourth clear at a partition that
+    // has one outstanding already. It reuses `session_not_isolated` rather than
+    // inventing a code, because it is the same refusal for the same reason --
+    // this audit cannot show that what it is about to measure is only its own --
+    // and a client that already handles one handles this.
+    if (strandedCleanup) {
+      return {
+        ok: false,
+        code: 'session_not_isolated',
+        message:
+          'The audit could not start from a clean browser session: the previous audit\'s cleanup was abandoned ' +
+          `after it overran its budget (${strandedCleanup.reason}) and is still outstanding on the shared audit ` +
+          'partition, so it could wipe this page\'s cookies and storage part way through the measurement. Nothing ' +
+          'was measured. Try again once it has settled.',
+        route: safeRoute,
+        runId,
+      };
+    }
 
     try {
       // BEFORE: nothing this audit sees was put there by the last one -- and if
@@ -1376,11 +1438,17 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // earlier (cancelled, or failed) claims no isolation to withdraw, and the
       // NEXT audit is covered by its own reset at the top of the run, which
       // refuses with `session_not_isolated` rather than measuring a dirty page.
-      cleanupReset = await withTimeout(
-        resetAuditSession(session),
-        PROBE_TIMEOUT_MS,
-        'clearing the audit session on the way out'
-      ).catch((err) => ({ ok: false, reason: String(err?.message || err).slice(0, 200) }));
+      //
+      // AND THE TIMEOUT HANDS THE CLEAR ON RATHER THAN FORGETTING IT. A bound is
+      // not a cancellation: the round trip is still live against the shared
+      // partition when this await gives up on it, so the promise is passed to
+      // `strand` -- see the top of `createAudit` -- and the next audit refuses at
+      // its door instead of measuring a page this clear may wipe underneath it.
+      const clearing = resetAuditSession(session);
+      cleanupReset = await withTimeout(clearing, PROBE_TIMEOUT_MS, 'clearing the audit session on the way out').catch((err) => {
+        strand(clearing, err);
+        return { ok: false, reason: String(err?.message || err).slice(0, 200) };
+      });
     }
 
     const sorted = sortFindings(findings);

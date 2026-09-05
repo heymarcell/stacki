@@ -24,9 +24,11 @@
 // rather than implied, because "every failure also contributes ANY" was written
 // here while one of them did the opposite: a file that will not read, a
 // DIRECTORY that will not list, a stylesheet postcss will not parse, one too
-// big to be worth reading, a walk that hit its depth cap, a symlink that will
-// not resolve, and an entry with a stylesheet's NAME that is not a regular file
-// at all. Being wrong in that direction costs an element its reindentation,
+// big to be worth reading, a walk that hit its depth cap or its entry or time
+// budget, a symlink that will not resolve, a symlink that resolves OUTSIDE the
+// project and is deliberately not followed, and an entry with a stylesheet's
+// NAME that is not a regular file at all. Being wrong in that direction costs
+// an element its reindentation,
 // which is cosmetic. Being wrong the other way deletes bytes the page shows.
 //
 // AND ANY IS NOT "EVERY ELEMENT PRESERVES ITS WHITESPACE". THE SENTINEL DAMAGED
@@ -69,6 +71,23 @@ const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '.astro', '.stacki'])
 // promise: a directory below it is a part of the project nobody looked at, and
 // hitting it is a failure that contributes ANY rather than a quiet stop.
 const MAX_DEPTH = 12;
+
+// AND THE TWO BOUNDS THE DEPTH CAP IS NOT.
+//
+// `MAX_DEPTH` bounds how DEEP the walk goes and nothing else -- twelve levels
+// of a home directory is still every photo, every checkout and every download
+// somebody has. This scan runs SYNCHRONOUSLY on the Electron MAIN process
+// inside `page:write`, so a walk with no bound on its WIDTH is the same failure
+// class as the FIFO named below: no repaint, no IPC, the write neither
+// completing nor refusing. Twenty thousand entries is far more than a
+// hand-written source tree holds once `SKIP_DIRS` has taken `node_modules`,
+// `dist` and the build output out of it, and the wall-clock budget is the same
+// bound for a tree that is slow rather than numerous -- a network mount, a
+// spun-down disk, a directory whose listing itself takes a second. Hitting
+// either is a part of the project nobody looked at, so it contributes ANY like
+// every other failure here rather than quietly shortening the file list.
+const MAX_ENTRIES = 20000;
+const MAX_MS = 2000;
 
 // Every file whose text could hold a rule. Stylesheets, and the `<style>`
 // blocks of pages, layouts and components.
@@ -282,6 +301,27 @@ const MISSING = (err) => !!err && (err.code === 'ENOENT' || err.code === 'ENOTDI
  * pointing at its own ancestor can be reached for ever, so each directory is
  * walked once, keyed on its resolved path.
  *
+ * AND FOLLOWING THEM AT ALL IS ONLY DEFENSIBLE INSIDE THE PROJECT. That is the
+ * half the monorepo fix above did not write, and without it the fix was worse
+ * than the hole it closed: the walk followed ANY directory link, with no
+ * containment and no bound, synchronously on the main process. One ordinary
+ * `src/docs -> ~/Documents` or `public/assets -> ~/Dropbox` -- a link nothing
+ * is wrong with -- then blocked the whole app for tens of seconds on every
+ * save, which is the FIFO failure again by another road.
+ *
+ * So the link is resolved FIRST and classified by where it lands. Inside the
+ * project it is ordinary project source and is walked, which is the monorepo
+ * shape that mattered. Outside it, it is not followed -- and it contributes ANY
+ * rather than being skipped, because a link out of the project is a part of the
+ * project this scan deliberately did not look at, and the silent skip is
+ * exactly the `[]` that reads as "nothing here preserves whitespace" and
+ * deletes rendered bytes. Containment, then the bound, then the honest answer.
+ *
+ * Containment is asked of the RESOLVED path against the RESOLVED project root,
+ * because `/tmp/p/link -> /tmp/p/../p/styles` is inside and a prefix test on
+ * the written path cannot tell. The separator is part of the test: `/tmp/proj`
+ * must not contain `/tmp/project-two`.
+ *
  * AND AN ENTRY WITH A STYLESHEET'S NAME THAT IS NOT A FILE. The walk classified
  * with `isDirectory()` and an `else`, so anything else whose name matched --
  * a FIFO, a socket, a device -- was added to the list. `preservingTokens` runs
@@ -304,7 +344,23 @@ function sourcesOf(projectPath) {
   const files = [];
   let failed = false;
   const walked = new Set();
+  // The bound, spent across the whole walk rather than per directory. `stopped`
+  // is separate from `failed` because the walk has to unwind out of every
+  // recursion once the budget is gone, not merely record that it was.
+  let seen = 0;
+  let stopped = false;
+  const deadline = Date.now() + MAX_MS;
+  // A path that will not resolve leaves `root` as the written one, which the
+  // `readdirSync` below then fails on in the one place that reports it.
+  let root;
+  try {
+    root = fs.realpathSync(projectPath);
+  } catch {
+    root = path.resolve(projectPath);
+  }
+  const inside = (real) => real === root || real.startsWith(root + path.sep);
   const walk = (dir, depth) => {
+    if (stopped) return;
     if (depth > MAX_DEPTH) {
       failed = true;
       return;
@@ -328,10 +384,29 @@ function sourcesOf(projectPath) {
       return;
     }
     for (const entry of entries) {
+      seen += 1;
+      if (seen > MAX_ENTRIES || Date.now() > deadline) {
+        failed = true;
+        stopped = true;
+        return;
+      }
       if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
       const full = path.join(dir, entry.name);
       let what = entry;
       if (entry.isSymbolicLink()) {
+        let real;
+        try {
+          real = fs.realpathSync(full);
+        } catch (err) {
+          if (!MISSING(err)) failed = true;
+          continue;
+        }
+        // The link leaves the project. Not followed, and NOT silently dropped:
+        // whatever rules are over there went unread, and unread is ANY.
+        if (!inside(real)) {
+          failed = true;
+          continue;
+        }
         try {
           what = fs.statSync(full);
         } catch (err) {

@@ -315,7 +315,15 @@ function parseConflict(text) {
         );
     for (const run of split) {
       if (run.common) {
-        parts.push({ kind: 'same', text: run.common.join('\n') });
+        // AGREED TEXT THAT CAME OUT FROM BETWEEN THE MARKERS, MARKED AS SUCH.
+        //
+        // Agreed text is agreed text either way, but WHERE it came from is the
+        // difference between a terminator git invented and one both branches
+        // wrote. Everything inside a conflict block that ends the file ran to
+        // the end of that file — whether the split left a clash sitting there
+        // or a run the two sides happen to agree on — and `conflictAtEnd`
+        // could only recognise the first of those. See its note.
+        parts.push({ kind: 'same', text: run.common.join('\n'), inClash: true });
         continue;
       }
       const clash = {
@@ -360,14 +368,36 @@ const clashCount = (parts) => (parts || []).filter((p) => p.kind === 'clash').le
  * from the marked-up file alone cannot tell an invented one from a real one.
  *
  * Recognised as a shape rather than guessed at: the parse ends with the empty
- * `same` part that a file-ending newline always produces, and the part before
- * it is the clash.
+ * `same` part that a file-ending newline always produces, and what comes
+ * before it is the conflict block.
+ *
+ * AND THE BLOCK IS NOT ALWAYS A CLASH BY THE TIME IT GETS HERE.
+ *
+ * `parseConflict` splits git's block into the runs the two sides actually
+ * disagree on, so a conflict whose sides END THE SAME WAY comes back as a
+ * clash followed by the agreed run — and the empty part was then preceded by
+ * `same`, not by `clash`, and this answered false. MEASURED with real git,
+ * base "head\nBASE\ntail\n", ours "head\nOURS\ntail\n", theirs
+ * "head\nTHEIRS\ntail" with NO terminator: git conflicts the whole tail
+ * (the last lines differ by that missing newline), the parse is
+ * [same "head", clash, same "tail", same ""], and `{'a.txt': ['theirs']}`
+ * committed "head\nTHEIRS\ntail\n" — a newline neither branch wrote — while
+ * `{'a.txt': 'theirs'}`, the same decision in the other shape, committed the
+ * blob exactly. `ok: true, resolved: 1` both times.
+ *
+ * So the walk back skips the agreed runs that came from INSIDE the block —
+ * `inClash`, stamped by the split — and asks whether the block itself is what
+ * the file ends in. Runs of ordinary agreed text after the block (a common
+ * suffix git never marked up) carry no stamp and still stop the walk, because
+ * a terminator out there is one the file really has.
  */
 function conflictAtEnd(parts) {
   const list = parts || [];
   const last = list[list.length - 1];
   if (!last || last.kind !== 'same' || last.text !== '') return false;
-  const before = list[list.length - 2];
+  let at = list.length - 2;
+  while (at >= 0 && list[at].kind === 'same' && list[at].inClash) at -= 1;
+  const before = list[at];
   return !!before && before.kind === 'clash';
 }
 
@@ -481,8 +511,18 @@ function renderResolved(parts, picks = [], sides = null) {
   // So the side is the one the rendered text actually ENDS on. 'merged' is
   // asked the same way, by suffix, because a combined version ends on whichever
   // side contributed its last run and there is no word that says which.
-  const last = (parts || []).filter((part) => part.kind === 'clash')[clashCount(parts) - 1] || null;
+  const list = parts || [];
+  const last = list.filter((part) => part.kind === 'clash')[clashCount(parts) - 1] || null;
   const pick = picks[clashCount(parts) - 1];
+  // The last line is sometimes neither side's — it is BOTH sides'. A conflict
+  // block whose two versions end the same way splits into a clash and the
+  // agreed run after it (see `conflictAtEnd`), so the file can end on text that
+  // is in both versions. The question is unchanged: the terminator behind that
+  // line is in one version and not the other, and the answer names the version
+  // to read it off. 'ours' and 'theirs' name one outright; 'both' and 'merged'
+  // fall through to the same readings as everywhere else, which is where they
+  // belong — with no line of its own at the end of the file, neither word
+  // claims anything this could be more precise about.
   let endsOn = 'ours';
   if (pick === 'theirs') endsOn = 'theirs';
   // Asked by line count, the same question the `both` render above asks, so

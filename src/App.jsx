@@ -202,19 +202,108 @@ function holdsInlineText(node) {
  * answers null for "no file", THROWS for "cannot say", and a capture that threw
  * is left alone on the way out.
  *
+ * AND A FILE THAT COULD NOT BE CAPTURED IS NOT WRITTEN AT ALL.
+ *
+ * Being left alone on the way out is only half an answer, because the file was
+ * still WRITTEN on the way in. So the one file this cannot undo was the one
+ * file it went ahead and changed, and the rollback then put every other file
+ * back around it: not the state before the operation and not the state after
+ * it, with the unrepairable difference sitting in the file nobody could read.
+ * "All or nothing" cannot be promised over a file whose "before" is unknown,
+ * and the moment to say so is BEFORE anything is written — an operation that
+ * could not be undone should not be started. The whole set is refused, by the
+ * same throw the caller already handles, and every file is exactly as it was
+ * because none of them was touched.
+ *
  * TWIN: src/panels/VariablesView.jsx has the same function, for the same
  * reason, over its own stylesheet bridge. Fix one and fix the other.
  */
+/**
+ * What a finished save may say about the document it finds when it returns.
+ *
+ * A SAVE CLEARS `dirty` FOR THE STATE IT WROTE, AND ONLY FOR THAT ONE.
+ *
+ * `flushSave` reads the open document, writes it, and then records the outcome
+ * through `setPageState` — and between those two the state can have moved: the
+ * write is IPC, and a person editing on the canvas does not queue behind it.
+ * The updater used to clear `dirty` on whatever it was handed, so an edit that
+ * landed during the write was marked saved without ever having been written.
+ * It stayed on the screen, it was never on disk, and nothing was left to put it
+ * there — the flag that would have made the next save write it had just been
+ * cleared. `savedSource` went the same way: it recorded the bytes of the OLD
+ * model as the bytes of the new one, which is what `applySnapshot`'s
+ * bytes-landed check reads to decide whether a restore happened.
+ *
+ * So the state at the write is compared with the state now, by identity of the
+ * things a save is ABOUT — which file, which model, which source, which pending
+ * restore. Every one of those is replaced wholesale by the code that changes it
+ * (`mutateModel` clones, `setRawSource` assigns, `applySnapshot` sets the
+ * restore), so identity is exactly the right question and an unrelated
+ * `setPageState` that spreads the same model over a new object does not read as
+ * a change.
+ *
+ * A state that moved is returned UNTOUCHED: still dirty, with its own pending
+ * save already scheduled by whoever changed it, and with `savedSource` still
+ * saying what it said. The bytes this call wrote did land — but they are not
+ * this document's current bytes any more, and claiming them would be claiming
+ * the newer edit was saved.
+ *
+ * (The agent's four doors into the open document are serialised by
+ * `oneAtATime`, so this is not the guard for them; it is the guard for the
+ * person, who is not on that queue and never will be.)
+ */
+function settledSave(now, written, source) {
+  if (!now) return now;
+  const moved =
+    now.file !== written.file ||
+    now.model !== written.model ||
+    now.source !== written.source ||
+    now.restoreSource !== written.restoreSource;
+  if (moved) return now;
+  return {
+    ...now,
+    dirty: false,
+    restoreSource: null,
+    savedSource: typeof source === 'string' ? source : now.savedSource,
+  };
+}
+
+/**
+ * Whether two undo entries are about the same set of files.
+ *
+ * Order and repetition are not part of the question — a burst that names the
+ * same two stylesheets in the other order is the same burst. See `pushCommand`,
+ * which will not collapse two commands into one step unless this says yes.
+ */
+const sameFiles = (a, b) => {
+  const one = new Set(a || []);
+  const two = new Set(b || []);
+  return one.size === two.size && [...one].every((file) => two.has(file));
+};
+
 const UNKNOWN = Symbol('unreadable at capture');
 async function writeAllOrNone(entries, { read, write, remove }) {
   const before = new Map();
+  const unreadable = [];
   for (const [rel] of entries) {
     if (before.has(rel)) continue;
     try {
       before.set(rel, await read(rel));
-    } catch {
+    } catch (err) {
       before.set(rel, UNKNOWN); // cannot say what was here, so cannot put it back
+      unreadable.push({ rel, err });
     }
+  }
+  if (unreadable.length) {
+    // The first one's own error is kept as the cause: it is the thing that
+    // actually went wrong, and it is what says whether this is a permission, a
+    // disappearing volume or something else.
+    const names = unreadable.map((u) => u.rel).join(', ');
+    const why = String(unreadable[0].err?.message || unreadable[0].err || '').trim();
+    throw new Error(
+      `Stacki could not read ${names} before rewriting ${unreadable.length === 1 ? 'it' : 'them'}, so this change ` +
+        `could not be undone if part of it failed${why ? ` — ${why}` : ''}. Nothing was written.`
+    );
   }
   const written = [];
   try {
@@ -637,16 +726,14 @@ export default function App() {
         // unchanged -- and writing only those left the chunk holding the edit
         // for ever while undo answered `undone: true`.
         await window.avb.writePageRaw({ pagePath: page.path, source: text, model: state.model });
-        setPageState((s) => (s ? { ...s, dirty: false, savedSource: text, restoreSource: null } : s));
+        setPageState((s) => settledSave(s, state, text));
       } else {
         const wrote = await window.avb.writePage({ pagePath: page.path, model: state.model });
-        setPageState((s) =>
-          s ? { ...s, dirty: false, savedSource: typeof wrote?.text === 'string' ? wrote.text : s.savedSource } : s
-        );
+        setPageState((s) => settledSave(s, state, typeof wrote?.text === 'string' ? wrote.text : undefined));
       }
     } else {
       await window.avb.writePageRaw({ pagePath: page.path, source: state.source });
-      setPageState((s) => (s ? { ...s, dirty: false, savedSource: state.source } : s));
+      setPageState((s) => settledSave(s, state, state.source));
     }
     // AND THE STATE THAT SAYS SO IS SETTLED BEFORE THIS RETURNS.
     //
@@ -1068,6 +1155,29 @@ export default function App() {
   // the same burst collapse into one step, so a slider drag or a run of live
   // CSS writes is a single ⌘Z — the first one's `undo` (the oldest state) is
   // kept and the newest `redo` replaces the previous.
+  //
+  // AND ONLY WHILE THE BURST IS ABOUT THE SAME FILES, WHICH IT IS NOT ALWAYS.
+  //
+  // Keeping the FIRST command's `undo` and the LAST one's `redo` is only an
+  // inverse while every command in the burst touched the same files. Where they
+  // did not, one ⌘Z restored the first command's files and left the second
+  // command's applied — while reporting the union of both as undone — and the
+  // redo that followed re-applied only the second. The entry described a change
+  // nobody had made, in both directions.
+  //
+  // Reachable, and not from the panels: every UI key names its own file
+  // (`css:<path>`, `cms:<rel>`, `var:<file>:<name>`), but the Agent API's
+  // recordUndo keys a burst `agent:<domain>.<action>` — see
+  // electron/mcp/agent/index.js — so two agent writes of one action to two
+  // different files inside 800 ms were one entry. Measured through the MCP
+  // surface, two `content.cms_write` calls to two files: `{past: 1}`, and the
+  // undo answered `ok: true` naming both files with only the first one's bytes
+  // back on disk.
+  //
+  // So a command whose files are not the ones the burst has been about starts
+  // its own step. A burst over one file — which is what coalescing exists for —
+  // is untouched, and the union below becomes what it always claimed to be:
+  // one list, of one set of files.
   const pushCommand = useCallback((cmd) => {
     const h = historyRef.current;
     const now = Date.now();
@@ -1077,13 +1187,14 @@ export default function App() {
       cmd.coalesceKey === h.lastKey &&
       now - h.lastPush < 800 &&
       prev?.kind === 'cmd' &&
-      prev.coalesceKey === cmd.coalesceKey;
+      prev.coalesceKey === cmd.coalesceKey &&
+      sameFiles(prev.files, cmd.files);
     if (coalesce) {
       prev.redo = cmd.redo;
       prev.label = cmd.label ?? prev.label;
-      // One ⌘Z, so one list of what it puts back — and a burst of variable
-      // writes can reach a different stylesheet on its second call than on its
-      // first.
+      // One ⌘Z, so one list of what it puts back. The sets are equal by the
+      // test above; this keeps the entry's own list authoritative rather than
+      // depending on that having been asked.
       prev.files = [...new Set([...(prev.files || []), ...(cmd.files || [])])];
     } else {
       h.past.push({ kind: 'cmd', ...cmd });
@@ -5141,7 +5252,28 @@ export default function App() {
     // The same operation the menu item runs — file, import, derived props and
     // the markup replaced by the instance. An agent arrives with a ref rather
     // than a selection, so the node comes in explicitly.
-    extractComponent,
+    //
+    // AND IT TAKES ITS TURN, LIKE THE OTHER THREE DOORS INTO THE OPEN DOCUMENT.
+    //
+    // `commit`, `writeOpenSource`, `undo` and `redo` all go through
+    // `oneAtATime`; this rewrote the whole page model and did not, which made it
+    // the one agent operation that could land INSIDE a restore. MEASURED on the
+    // harness, with `project.undo` parked in its real `writePageRaw` and a
+    // `page.component_create` issued while it was parked (its ref minted during
+    // the undo, so the ref guard has nothing to say):
+    //
+    //   component_create answered `{ok: true, replaced: true}` and wrote
+    //   src/components/PricingGrid.astro; the PAGE on disk kept the inline
+    //   markup and gained no import, because the restore's bytes were written
+    //   over it afterwards; and the model in memory held the extraction, so the
+    //   canvas showed a component the file did not have and nothing was ever
+    //   going to save it. The project was left with a component file nothing
+    //   imports.
+    //
+    // Queued, the two operations do exactly what they say, one after the other.
+    // Nothing inside `extractComponent` joins this queue, so there is no way
+    // for it to wait on itself.
+    extractComponent: (node, name, options) => oneAtATime(() => extractComponent(node, name, options)),
     preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
     // THE SAME START AND STOP THE APP ITSELF USES.
     //

@@ -1536,6 +1536,18 @@ const HOLDS_RENDERED_SPACE = /<(pre|textarea|script|style)[\s>]/i;
 // it and sits at its old inner indentation, which is cosmetic. The alternative
 // is silent data loss.
 const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(?:(pre|pre-wrap|break-spaces)(?![\w-])|var\s*\()/i;
+// AND THE SAME QUESTION WITH THE ADMISSION TAKEN OUT OF IT.
+//
+// The paragraph above is honest about `var(--ws)` and it is honest about ONE of
+// the two readers. `preserves` only ever keeps bytes the file already has, so
+// counting an unreadable value as preserving costs a reindent. `rendersIndent`
+// does the opposite: it writes the layout around a splice at COLUMN ZERO, and
+// on `white-space: var(--ws)` -- a variable whose value may perfectly well be
+// `normal`, and which this file cannot resolve -- that is an active edit to
+// markup nobody named, decided by something nobody read. An unreadable value is
+// not evidence. It is not counter-evidence either, so it falls through to the
+// inherited answer rather than to `false`.
+const PRESERVES_SPACE_READ = /(^|[\s;])white-space\s*:\s*(pre|pre-wrap|break-spaces)(?![\w-])/i;
 const PRESERVES_SPACE_CLASS = /(^|\s)(whitespace-pre(-wrap)?|whitespace-break-spaces)(\s|$)/i;
 // And the two spellings that turn it back OFF. Inheritance is overridable, and
 // saying so is the only thing that stops one `white-space: pre` near the top of
@@ -1601,14 +1613,44 @@ function matchesPreservingTokens(node, tokens) {
  * `<pre>` is a `<pre>`), then the element's own declaration, then a rule that
  * could reach it from a stylesheet -- which an inline `white-space: normal`
  * beats, exactly as it does in a browser.
+ *
+ * `acting` SAYS WHICH OF THE TWO CALLERS IS ASKING, and it is not a tuning
+ * knob. `preservingContext` runs this twice over the same tree for two
+ * different questions -- "might a reindent here lose bytes", which only ever
+ * holds bytes the file has, and "is this element KNOWN to render the
+ * indentation between its children", which writes the surrounding layout at
+ * column zero. The first is allowed to be a superset. The second is evidence or
+ * it is nothing, and two things that are fair evidence for the first are not
+ * evidence at all for the second:
+ *
+ *   * A COMPONENT IS NOT THE HTML ELEMENT WITH THE SAME NAME. `node.name` was
+ *     lowercased and looked up in `PRESERVING_TAGS` with no glance at
+ *     `node.kind`, so `<Textarea>` -- shadcn/ui's exact component name, and
+ *     `<Pre>`, `<Script>`, `<Style>` with it -- was treated as the HTML
+ *     `<textarea>`. What that component renders is in another file; it is quite
+ *     ordinarily a `<div>` with a label. Being wrong about it in the wide
+ *     direction only refuses a reindent, so the wide pass still counts it as a
+ *     could; the acting pass wants the tag itself, and asks for `kind ===
+ *     'element'`.
+ *   * `white-space: var(--ws)` is an unreadable value, and the reasoning for
+ *     counting it as preserving is written on `PRESERVES_SPACE_READ` above.
+ *
+ * Neither is turned into a `false`. "Not evidence" is not "evidence against",
+ * so both fall through to the inherited answer -- a `<Textarea>` inside a real
+ * `<pre>` still renders its indentation because the `<pre>` does.
  */
-function ownWhitespaceRule(node, tokens) {
+function ownWhitespaceRule(node, tokens, acting = false) {
   if (!node || typeof node !== 'object') return null;
   const name = typeof node.name === 'string' ? node.name.toLowerCase() : null;
-  if (name && PRESERVING_TAGS.has(name)) return true;
+  // `raw` is `<script>`/`<style>` -- `parsePage` gives those a kind of their own
+  // because their inner text is captured verbatim, and they are HTML elements
+  // exactly as `element` is. `component` is the kind that is somebody else's
+  // file, and it is the only one excluded here.
+  const isTag = !acting || node.kind === 'element' || node.kind === 'raw';
+  if (name && isTag && PRESERVING_TAGS.has(name)) return true;
   const style = litProp(node, 'style');
   if (style && DROPS_SPACE.test(style)) return false;
-  if (style && PRESERVES_SPACE.test(style)) return true;
+  if (style && (acting ? PRESERVES_SPACE_READ : PRESERVES_SPACE).test(style)) return true;
   const cls = litProp(node, 'class') || litProp(node, 'className');
   if (cls && DROPS_SPACE_CLASS.test(cls)) return false;
   if (cls && PRESERVES_SPACE_CLASS.test(cls)) return true;
@@ -1654,15 +1696,17 @@ function declaresRenderedSpace(node, tokens) {
  * Run TWICE over the same tree -- see `anchoredSerialize`. The question is the
  * same one; what differs is who is allowed to answer it. The wide pass lets a
  * rule the project's SCANNER found say yes, because everything gated on it only
- * keeps bytes; the narrow one is handed no tokens at all, because what it gates
- * is an edit to markup nobody named.
+ * keeps bytes; the narrow one is handed no tokens at all, and `acting` on top of
+ * that, because what it gates is an edit to markup nobody named. The three
+ * things the two passes disagree about are named on `ownWhitespaceRule`; the
+ * stylesheet tokens are only the loudest of them.
  */
-function preservingContext(nodes, tokens) {
+function preservingContext(nodes, tokens, acting = false) {
   const preserves = new Set();
   const walk = (list, inherited) => {
     for (const node of list || []) {
       if (!node || typeof node !== 'object') continue;
-      const own = ownWhitespaceRule(node, tokens);
+      const own = ownWhitespaceRule(node, tokens, acting);
       const here = own === null ? inherited : own;
       if (here) preserves.add(node);
       if (Array.isArray(node.children)) walk(node.children, here);
@@ -2174,6 +2218,17 @@ function replaceNodeSplice(source, base, next, ctx) {
   // the branch that keeps `<label>Name: <input /></label>` intact -- and
   // refusing there would send an ordinary text edit inside a `<pre>` through
   // the whole-document reprint, which is the very text that collapses it.
+  //
+  // AND THIS IS NOW A BACKSTOP RATHER THAN THE PATH, said out loud because a
+  // branch that quietly stopped running is what put the same defect here twice.
+  // `nodeSplices` asks `reorderedInPlace` the identical question with the
+  // identical arguments BEFORE it descends, because the descent succeeds for
+  // block-laid-out children and this call sits below it. Instrumented across
+  // test/source-fidelity-matrix.js: `reorderedInPlace` is entered 43 times and
+  // answers 5, all of them from `nodeSplices`; this call site is reached zero
+  // times, and when it is reached it can only return null, having already been
+  // asked. It stays because `replaceNodeSplice` must not reprint a preserving
+  // subtree for a caller that has not asked -- not because it is doing work.
   if (
     base.kind !== 'text' &&
     Array.isArray(base.children) &&
@@ -2340,6 +2395,33 @@ function nodeSplices(source, base, next, ctx) {
   if (!(start >= 0 && end > start && end <= source.length)) return null;
 
   const hasKids = Array.isArray(base.children) && Array.isArray(next.children);
+  // A REORDER INSIDE A PRESERVING ELEMENT IS ANSWERED HERE OR NOWHERE.
+  //
+  // `reorderedInPlace` was written for exactly this shape and never ran for
+  // most of it. It sits below, in `replaceNodeSplice`, which this function
+  // reaches only when the descent came back null -- and the descent succeeds
+  // whenever `alignChildren` can pair the children up, which for BLOCK-laid-out
+  // children is the ordinary case. So the reorder went through the child
+  // splices instead, and those write the layout AROUND each child: inside a
+  // preserving element `indentIsContent` is true, `rangeSplice` and
+  // `insertSplice` deliberately write no indent, and the moved child landed at
+  // COLUMN ZERO. Measured on `<pre>\n      <p>alpha</p>\n      <p>beta</p>\n
+  // </pre>`: the swap came back with the second `<p>` at column zero, six
+  // rendered spaces deleted, `ok` and no fallback -- the same damage the
+  // preserving branch exists to prevent, arriving from above it.
+  //
+  // Asked BEFORE the descent, and only of a node that is itself preserving. It
+  // is not a widening: `reorderedInPlace` returns null for anything that is not
+  // a pure permutation of this element's own anchored children -- a child
+  // added, dropped, retagged, edited, or one this file has no offsets for --
+  // and every one of those falls straight through to the code that ran before.
+  // What it answers with is the file's OWN bytes, every gap where the author
+  // put it, which is the safe direction of the wide `preserves` flag rather
+  // than the acting one.
+  if (hasKids && base.kind !== 'text' && base.children.length > 0 && ctx.preserves?.has(base)) {
+    const permuted = reorderedInPlace(source, base, next, ctx);
+    if (permuted) return permuted;
+  }
   const inner = hasKids ? childContext(base, next, ctx) : null;
   const deeper = inner ? collectSplices(source, base.children, next.children, inner) : null;
   // Only the subtree differs: go further in, so the span replaced is as small
@@ -2642,7 +2724,15 @@ function anchoredSerialize(source, model, options = {}) {
     // ancestor that said one of those, because the property inherits. That is
     // evidence rather than a superset, and where there is none the file's own
     // indent goes in, which changes nothing.
-    rendersIndent: preservingContext(base.model.nodes || [], null),
+    //
+    // AND "NO TOKENS" WAS NOT THE WHOLE OF IT. Two things reached this walk
+    // that are not evidence either and had nothing to do with the scanner: a
+    // COMPONENT named after one of the four tags (`<Textarea>` is shadcn/ui's
+    // own component name, and it is a `<div>` with a label), and a
+    // `white-space` whose value is a `var()` this file cannot resolve. Both are
+    // fair "coulds" for the wide pass and neither is evidence for this one, so
+    // this pass is `acting` as well as tokenless -- see `ownWhitespaceRule`.
+    rendersIndent: preservingContext(base.model.nodes || [], null, true),
     // The destination for the page's own top-level children is the document,
     // which preserves nothing. `childContext` sets this from the parent whose
     // children it is about to print.

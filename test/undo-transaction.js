@@ -720,17 +720,108 @@ const UNCOALESCED = 900;
         check('  THE FILE THE ROLLBACK CREATED IS TAKEN AWAY AGAIN', !fs.existsSync(abs('made-up.css')), String(textAt('made-up.css')));
         check('  and the broken file is still put back', textAt('b.css') === 'BBB', String(textAt('b.css')));
 
+        // AND A FILE WHOSE "BEFORE" IS UNKNOWN IS NOT WRITTEN AT ALL.
+        //
+        // The capture recorded UNKNOWN and the forward pass wrote the file
+        // anyway, so the one file the rollback could never repair was the one
+        // file the operation had definitely changed — and everything around it
+        // was then put back, leaving a project in neither the state before the
+        // change nor the state after it, with the unrepairable difference in
+        // the file nobody could read. "All or nothing" cannot be promised over
+        // bytes that were never captured, so the whole set is refused BEFORE
+        // anything is written.
+        //
+        // THE OTHER WRITE HERE WOULD HAVE SUCCEEDED: nothing breaks the writer
+        // in this case, so "nothing was written" is a decision this made and
+        // not a failure it ran into.
         seed({ 'unreadable.css': 'MINE', 'b.css': 'BBB' });
         threw = null;
         try {
-          await writeAllOrNone([['unreadable.css', 'U-NEW'], ['b.css', 'B-NEW']], doors('b.css', { readThrowsFor: 'unreadable.css' }));
+          await writeAllOrNone([['unreadable.css', 'U-NEW'], ['b.css', 'B-NEW']], doors('nothing-breaks.css', { readThrowsFor: 'unreadable.css' }));
         } catch (err) {
           threw = String(err?.message || err);
         }
-        check('the same, with a file that could not be READ at capture', /ENOSPC/.test(String(threw)), String(threw));
+        check('a file that could not be READ at capture refuses the whole write', !!threw, 'it went through');
+        check('  naming the file it could not read', /unreadable\.css/.test(String(threw)), String(threw));
+        check('  and saying nothing was written', /nothing was written/i.test(String(threw)), String(threw));
+        check('  keeping the original error as the reason', /EACCES/.test(String(threw)), String(threw));
         // "There was no file" and "I could not look" must not be the same
         // answer: deleting on the second destroys bytes nobody asked to lose.
         check('  A FILE IT COULD NOT READ IS NOT DELETED', fs.existsSync(abs('unreadable.css')), 'gone');
+        check('  NOR WRITTEN OVER', textAt('unreadable.css') === 'MINE', String(textAt('unreadable.css')));
+        check('  and the file it COULD have written is untouched', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        // The same refusal when the unreadable file is second in the list: the
+        // capture pass is over the whole set before any of it is written, so
+        // the order the entries arrive in cannot decide whether a file moves.
+        seed({ 'a.css': 'AAA', 'unreadable.css': 'MINE' });
+        threw = null;
+        try {
+          await writeAllOrNone([['a.css', 'A-NEW'], ['unreadable.css', 'U-NEW']], doors('nothing-breaks.css', { readThrowsFor: 'unreadable.css' }));
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the same when the unreadable file is not the first entry', !!threw, 'it went through');
+        check('  and the file BEFORE it in the list never moved', textAt('a.css') === 'AAA', String(textAt('a.css')));
+      }
+
+      // ---- src/App.jsx: settledSave, WHAT A FINISHED SAVE MAY CLAIM ----
+      //
+      // `flushSave` reads the open document, writes it over IPC, and records
+      // the outcome afterwards. Between those two the state can have moved —
+      // and the person editing on the canvas is not on the queue that
+      // serialises the agent's four doors, so it is a UI edit that gets in
+      // here. The updater used to clear `dirty` on whatever it was handed, so
+      // an edit that arrived during the write was marked saved without ever
+      // being written: on screen, not on disk, and with the one flag that
+      // would have made the next save write it now cleared. `savedSource` went
+      // the same way, recording the OLD model's bytes as the new model's —
+      // which is what `applySnapshot`'s bytes-landed check reads to decide
+      // whether a restore actually happened.
+      //
+      // LIFTED RATHER THAN DRIVEN, and this is the reason: the harness has no
+      // canvas and no person, so the one door that reaches this cannot be
+      // opened from here. Section 9f drives the door that CAN be opened — an
+      // agent operation racing a restore — through the whole stack. This is the
+      // shipped function itself, run against the two states it has to tell
+      // apart, so a change to it fails here rather than quietly nowhere.
+      {
+        const saveText = lift('src/App.jsx', 'function settledSave(now, written, source) {', '\n}\n');
+        check('settledSave can be read out of src/App.jsx', !!saveText && /const moved =/.test(String(saveText)), String(saveText).slice(0, 80));
+        if (saveText && /const moved =/.test(saveText)) {
+          // eslint-disable-next-line no-new-func
+          const settledSave = new Function(`${saveText}\nreturn settledSave;`)();
+          const model = { nodes: [{ id: 'a' }] };
+          const written = { file: 'src/pages/index.astro', model, source: 'OLD', savedSource: 'OLD', restoreSource: null, dirty: true, editable: true };
+
+          // NOTHING MOVED: the ordinary save, which must still settle.
+          const settled = settledSave({ ...written }, written, 'WHAT WAS WRITTEN');
+          check('a save over a document nobody touched clears dirty', settled.dirty === false, short(settled));
+          check('  and records the bytes it wrote', settled.savedSource === 'WHAT WAS WRITTEN', short(settled.savedSource));
+          check('  and clears the pending restore', settled.restoreSource === null, short(settled.restoreSource));
+
+          // A MODEL THAT MOVED UNDER THE WRITE: a canvas edit during the IPC.
+          const edited = { ...written, model: { nodes: [{ id: 'a' }, { id: 'b' }] }, dirty: true };
+          const afterEdit = settledSave(edited, written, 'WHAT WAS WRITTEN');
+          check('AN EDIT THAT LANDED DURING THE WRITE IS NOT MARKED SAVED', afterEdit.dirty === true, short(afterEdit));
+          check('  so the save it scheduled still has something to write', afterEdit.model === edited.model, short(afterEdit.model));
+          check('  and the older bytes are not recorded as this document’s', afterEdit.savedSource === 'OLD', short(afterEdit.savedSource));
+
+          // THE OTHER TWO THINGS A SAVE IS ABOUT, each on its own.
+          const navigated = settledSave({ ...written, file: 'src/pages/about.astro' }, written, 'WHAT WAS WRITTEN');
+          check('a document that changed under the write is not marked saved either', navigated.dirty === true, short(navigated));
+          const retyped = settledSave({ ...written, source: 'NEWER' }, written, 'WHAT WAS WRITTEN');
+          check('nor is a raw source that moved', retyped.dirty === true && retyped.source === 'NEWER', short(retyped));
+          const restoring = settledSave({ ...written, restoreSource: 'A RESTORE ARRIVED' }, written, 'WHAT WAS WRITTEN');
+          check('nor is a restore that arrived during it', restoring.dirty === true && restoring.restoreSource === 'A RESTORE ARRIVED', short(restoring));
+
+          // A save that reports no bytes keeps what the state already had —
+          // `writePage` answering without text is not a claim about the file.
+          const noText = settledSave({ ...written }, written, undefined);
+          check('a write that reported no bytes leaves savedSource as it was', noText.dirty === false && noText.savedSource === 'OLD', short(noText));
+          // And a document that closed under the write is not resurrected.
+          check('a document that closed under the write stays closed', settledSave(null, written, 'X') === null, 'a state appeared from nowhere');
+        }
       }
 
       // ---- src/panels/VariablesView.jsx: putFiles, the panel's own twin ----
@@ -1293,6 +1384,189 @@ const UNCOALESCED = 900;
       const back = await run('target', 'read', { ref: refFor(ON_INDEX) });
       if (back.ok) await run('target', 'set_text', { text: 'Made carefully.' });
       await H.settle(200);
+    }
+
+    // ── 9f. THE FOURTH DOOR INTO THE OPEN DOCUMENT ───────────────────────────
+    //
+    // 9d proves an EDIT waits for a restore. It proves it about `commit`, which
+    // is one of the doors `oneAtATime` covers. `page.component_create` is the
+    // other kind: it rewrites the WHOLE page model — the markup replaced by an
+    // instance, plus the import — through `extractComponent`, and that was
+    // handed to the agent surface unqueued.
+    //
+    // MEASURED before the fix, with the undo parked inside its real
+    // `writePageRaw` and the component made while it was parked:
+    //
+    //   component_create answered `{ok: true, replaced: true}` and wrote
+    //   src/components/PricingGrid.astro; the PAGE on disk still held the inline
+    //   markup and had gained no import, because the restore's bytes landed over
+    //   it; and the model in memory held the extraction, so the canvas showed a
+    //   component the file did not have. A component file nothing imports, an
+    //   edit reported ok that was never saved, and nothing left to save it.
+    //
+    // THE REF IS MINTED DURING THE HOLD, deliberately. A ref taken before the
+    // undo is stale by the time this runs and `component_create` refuses it —
+    // correctly, and that refusal would answer this section's question by not
+    // asking it. An agent that reads and then acts, both while a restore is in
+    // flight, has a ref with nothing wrong with it.
+    {
+      const refs = require('../electron/mcp/agent/refs.js');
+      const ON_INDEX = { keys: ['src/pages/index.astro#0.2'], fingerprint: { tag: 'footer' }, page: { file: 'src/pages/index.astro' } };
+      const refFor = (anchor) => refs.mint('node', anchor, { projectRoot: root });
+
+      const opened = await run('target', 'read', { ref: refFor(ON_INDEX) });
+      check('9f: the page is open', opened.ok === true && opened.target?.page?.file === PAGE, short(opened.target?.page));
+      const first = await run('target', 'set_text', { text: 'FIRST, TO BE TAKEN BACK' });
+      check('9f: the edit that will be undone lands', first.ok === true, short(first));
+      await H.settle(UNCOALESCED);
+      check('9f:   and is on disk', app.read(PAGE).includes('FIRST, TO BE TAKEN BACK'), short(app.read(PAGE).slice(0, 120)));
+
+      let opening = null;
+      const atTheDoor = new Promise((done) => {
+        opening = done;
+      });
+      let letGo = null;
+      const held = new Promise((done) => {
+        letGo = done;
+      });
+      const realWrite = global.avb.writePageRaw;
+      let holding = false;
+      global.avb.writePageRaw = async (arg) => {
+        if (!holding) {
+          holding = true;
+          opening();
+          await held;
+        }
+        return realWrite(arg);
+      };
+      let undone = null;
+      let created = null;
+      let startedUnderTheUndo = null;
+      try {
+        const undoing = run('project', 'undo');
+        await atTheDoor;
+        check('9f: the undo is genuinely mid-restore', holding === true);
+        // A ref READ right here, for the node this is about — the page's
+        // `<div class="pricing-grid">`. Read rather than hand-minted, because a
+        // WRITE is refused through a ref that recorded no version; and read HERE
+        // rather than before the undo, because a ref that recorded the version
+        // before the restore is stale by now and `component_create` refuses it —
+        // correctly, and that refusal would answer this section's question by
+        // never letting the race happen. An agent that reads and then writes,
+        // both while a restore is in flight, holds a ref with nothing wrong.
+        const fresh = await run('target', 'read', {
+          ref: refFor({ keys: [`${PAGE}#0.1`], fingerprint: { tag: 'div' }, page: { file: PAGE } }),
+        });
+        const gridRef = fresh.target?.ref;
+        check('9f: a ref for the node to extract can still be read', fresh.ok === true && typeof gridRef === 'string', short({ ok: fresh.ok, tag: fresh.target?.tag }));
+        let settled = false;
+        const creating = run('page', 'component_create', { ref: gridRef, name: 'PricingGrid' }).then((answer) => {
+          settled = true;
+          return answer;
+        });
+        // Long enough for an unqueued extraction to run to the end: its own save
+        // goes through `writePage`, which nothing here holds.
+        await H.settle(400);
+        startedUnderTheUndo = settled;
+        letGo();
+        undone = await undoing;
+        created = await creating;
+        await H.settle(600);
+      } finally {
+        global.avb.writePageRaw = realWrite;
+      }
+
+      check('9f: MAKING A COMPONENT DURING AN UNDO WAITS FOR IT', startedUnderTheUndo === false, short({ settledWhileHeld: startedUnderTheUndo }));
+      check('9f: the undo is answered', undone?.ok === true && undone?.undone === true, short(undone));
+      check('9f: the component is made', created?.ok === true && created?.replaced === true, short(created));
+      const now = app.read(PAGE);
+      // THE BYTES. Both operations were asked for and both have to be true of
+      // the file: the edit is taken back, and the extraction is IN THE PAGE.
+      check('9f:   the undone edit is gone from the page', !now.includes('FIRST, TO BE TAKEN BACK'), short(now.slice(0, 200)));
+      check('9f:   THE EXTRACTION IS ON DISK, not only on the canvas', /<PricingGrid/.test(now), short(now.slice(0, 400)));
+      check('9f:   with the import the instance needs', /import PricingGrid from/.test(now), short(now.slice(0, 400)));
+      check('9f:   and the component file it points at', app.exists('src/components/PricingGrid.astro'), 'no component file');
+      // The failure this closes, stated as itself: a component file with
+      // nothing importing it is what the unqueued version left behind.
+      check(
+        '9f: no component was left standing that the page does not use',
+        !app.exists('src/components/PricingGrid.astro') || /import PricingGrid from/.test(now),
+        short(now.slice(0, 400))
+      );
+      await H.settle(UNCOALESCED);
+    }
+
+    // ── 9e. A BURST IS ONE STEP ONLY WHILE IT IS ABOUT ONE SET OF FILES ──────
+    //
+    // `pushCommand` collapses commands that share a coalesceKey inside 800 ms,
+    // keeping the FIRST one's `undo` and the LAST one's `redo`. That is an
+    // inverse only while every command in the burst touched the same files.
+    // The Agent API keys a burst `agent:<domain>.<action>` — see recordUndo in
+    // electron/mcp/agent/index.js — with no file in the key at all, so two
+    // writes of one action to two DIFFERENT files inside the window were one
+    // entry whose `undo` restored the first file, whose `redo` re-applied the
+    // second, and whose `files` listed both. One ⌘Z then reported two files
+    // undone with one file's bytes back.
+    //
+    // Measured before the fix, exactly the pair below: `{past: 1}`, the undo
+    // answering `ok: true` and naming both files, `other.json` still holding
+    // its edit.
+    //
+    // THE CONTROL IS WHAT MAKES THE TIMING AN ASSERTION. A pair that is two
+    // steps because the calls were slower than 800 ms would satisfy the first
+    // half of this on any code at all — so the same pair of round trips is run
+    // against ONE file first, and has to still collapse. If the window were
+    // shut, that would be one step too many.
+    {
+      const siteWas = app.read('src/data/site.json');
+      const otherWas = app.read('src/data/other.json');
+
+      // (a) THE CONTROL: two writes, one file, no pause. Still one step.
+      const beforeSame = await probe('before a same-file burst');
+      const readOne = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      await run('content', 'cms_write', { path: 'src/data/site.json', data: { title: 'Fixture', tagline: 'BURST ONE' }, ref: readOne.ref });
+      const readTwo = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      const secondSame = await run('content', 'cms_write', { path: 'src/data/site.json', data: { title: 'Fixture', tagline: 'BURST TWO' }, ref: readTwo.ref });
+      check('9e: both writes to one file land', secondSame.ok === true, short(secondSame));
+      const afterSame = await probe('after a same-file burst');
+      const collapsed = afterSame.past === beforeSame.past + 1;
+      check('9e: A BURST OVER ONE FILE IS STILL ONE STEP', collapsed, short({ before: beforeSame, after: afterSame }));
+      // Everything below only means something if that burst really was inside
+      // the coalescing window, which `collapsed` is the evidence for.
+      const undoneSame = await run('project', 'undo');
+      check('9e:   and one undo takes the whole burst back', undoneSame.ok === true && app.read('src/data/site.json') === siteWas, short(app.read('src/data/site.json')));
+
+      // (b) THE SAME BURST OVER TWO FILES.
+      //
+      // The stack is read off the undo above rather than probed: `probe` is a
+      // `project.redo`, and there is something to redo here now.
+      const beforeSplit = undoneSame.history;
+      const readA = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      await run('content', 'cms_write', { path: 'src/data/site.json', data: { title: 'Fixture', tagline: 'SPLIT ONE' }, ref: readA.ref });
+      const readB = await run('content', 'cms_read', { path: 'src/data/other.json' });
+      const wroteB = await run('content', 'cms_write', { path: 'src/data/other.json', data: { note: 'SPLIT TWO' }, ref: readB.ref });
+      check('9e: both writes to two files land', wroteB.ok === true, short(wroteB));
+      const siteSplit = app.read('src/data/site.json');
+      const otherSplit = app.read('src/data/other.json');
+      check('9e:   with both files really changed', siteSplit !== siteWas && otherSplit !== otherWas, short({ site: siteSplit.length, other: otherSplit.length }));
+      const afterSplit = await probe('after a two-file burst');
+      check(
+        '9e: TWO FILES IN ONE BURST ARE TWO STEPS',
+        afterSplit.past === beforeSplit.past + 2,
+        short({ before: beforeSplit, after: afterSplit })
+      );
+
+      // AND THE BYTES. One undo is one step: the file that step was about comes
+      // back, and the other one does not move.
+      const undoneSplit = await run('project', 'undo');
+      check('9e: the first undo is answered', undoneSplit.ok === true && undoneSplit.undone === true, short(undoneSplit));
+      check('9e:   it names only the file it put back', JSON.stringify(filesOf(undoneSplit)) === JSON.stringify(['src/data/other.json']), short(filesOf(undoneSplit)));
+      check('9e:   THE FILE IT NAMED IS THE FILE THAT MOVED', app.read('src/data/other.json') === otherWas, short(app.read('src/data/other.json')));
+      check('9e:   and the other one still holds its edit', app.read('src/data/site.json') === siteSplit, short(app.read('src/data/site.json')));
+      const undoneRest = await run('project', 'undo');
+      check('9e: the second undo takes the other file back', undoneRest.ok === true && app.read('src/data/site.json') === siteWas, short(app.read('src/data/site.json')));
+      check('9e:   and it named that file', JSON.stringify(filesOf(undoneRest)) === JSON.stringify(['src/data/site.json']), short(filesOf(undoneRest)));
+      await H.settle(UNCOALESCED);
     }
 
     // ── 10. POSITIVE CONTROLS, WITH NOTHING WRONG AT ALL ──────────────────────

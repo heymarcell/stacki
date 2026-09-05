@@ -52,6 +52,31 @@ const { parseConflict, renderResolved, clashCount, conflictAtEnd } = require('./
 const conflictedPaths = (stdout) => String(stdout || '').split('\0').filter(Boolean);
 
 /**
+ * The paths git could not reconcile, ALWAYS SPELLED FROM THE REPOSITORY ROOT.
+ *
+ * ONE PATH SPACE, ASKED FOR RATHER THAN ASSUMED. Everything downstream of this
+ * list — `conflictDigest`, the reads and writes under `repoRoot`, the `choices`
+ * keys the validator enumerates, the stage sets `sidesOf` looks up — treats
+ * these names as repo-root-relative, and every one of them is silently wrong
+ * about a DIFFERENT file if they are not.
+ *
+ * `git diff --name-only` prints repo-root-relative names whatever the cwd, but
+ * only until somebody sets `diff.relative`, which is an ordinary user config
+ * and is not Stacki's to have an opinion about. Measured, repository at <root>
+ * and project at <root>/site with one conflict in site/a.txt: with
+ * `diff.relative=true` and cwd=site the same command printed `a.txt`. Nothing
+ * downstream would have noticed — `conflictDigest` would have opened
+ * <root>/a.txt (absent, so the unreadable sentinel), and a resolve keyed
+ * `site/a.txt` would have been refused as `unknown_path`.
+ *
+ * A later `-c` wins over an earlier one and over the config file, so this is
+ * not a request: it pins the answer for this one invocation and touches nothing
+ * of the user's.
+ */
+const unmergedPaths = async (git, cwd) =>
+  conflictedPaths((await git(cwd, ['-c', 'diff.relative=false', 'diff', '--name-only', '--diff-filter=U', '-z'])).stdout);
+
+/**
  * A BRANCH NAME IS AN ARGUMENT TO GIT, AND GIT READS ARGUMENTS.
  *
  * Every command in this file used to hand the caller's branch string to git as
@@ -346,12 +371,78 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       `"${branch}" was at ${short(bound.incoming)} and is now at ${short(incomingNow)}`
     );
   }
+  /**
+   * Put the trial merge back, AND SAY SO WHEN IT WOULD NOT GO BACK.
+   *
+   * Everything below this point that refuses does it AFTER the trial merge has
+   * run, so every one of those refusals is a claim about the tree as well as
+   * about the answers: "nothing was merged and the branch is exactly as it
+   * was". The unwind is what makes that claim true, and it used to be fired
+   * into a `catch {}` — so a merge --abort that failed left the claim
+   * standing over a working tree full of conflict markers.
+   *
+   * MEASURED, with real git and a real repository: `.git/MERGE_HEAD` removed
+   * between the merge and the abort — which is what a second git process, a
+   * crash, or an editor plugin's own `git merge --abort` does — makes the
+   * abort exit non-zero with "fatal: There is no merge to abort". The answer
+   * was `bad_choices`, "Nothing was merged", while `git status` said `UU
+   * a.txt`, the index held three stages, and the file on disk held
+   * `<<<<<<< HEAD`. Stacki parses that file as markup a moment later, and the
+   * page comes back broken with nothing to say why.
+   *
+   * So the failure is MEASURED rather than assumed in either direction. An
+   * abort that fails because there was nothing to abort has left nothing
+   * behind and the original refusal is still the true one; an abort that fails
+   * with a merge still in progress has, and that is a different answer with a
+   * name of its own. Asked of the index, not of the exit code: unmerged
+   * entries, or a MERGE_HEAD git is still holding.
+   */
+  const midMerge = async () => {
+    try {
+      const left = await unmergedPaths(git, projectPath);
+      if (left.length) return left;
+      await git(projectPath, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+      return [];
+    } catch (err) {
+      // `rev-parse --verify` on a MERGE_HEAD that is not there exits 1 with
+      // nothing on stderr, which is the ordinary "it unwound" answer. Anything
+      // that actually said something is a repository that would not answer the
+      // question, and after a failed abort the honest reading of that is the
+      // cautious one.
+      return String(err?.stderr || '').trim() ? [] : null;
+    }
+  };
   const abort = async () => {
+    let refused = null;
     try {
       await git(projectPath, ['merge', '--abort']);
-    } catch {
-      /* already unwound */
+      return null;
+    } catch (err) {
+      refused = err;
     }
+    const left = await midMerge();
+    if (left === null) return null; // nothing to abort, and nothing left behind
+    const said = String(refused?.stderr || refused?.message || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !/^(hint|warning):/i.test(line))
+      .join(' ')
+      .replace(/\.+$/, '');
+    return {
+      ok: false,
+      code: 'merge_stuck',
+      from: into,
+      branch,
+      gitSaid: said || null,
+      files: left,
+      message:
+        `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
+        `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
+        `${left.length ? ` and ${left.length} ${left.length === 1 ? 'file holds' : 'files hold'} conflict markers: ${left.slice(0, 10).join(', ')}` : ''}. ` +
+        'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
+        'finish the merge there by hand), then ask Stacki again.',
+    };
   };
   let blocked = null;
   let clean = false;
@@ -399,14 +490,17 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // finding, and it is refused by name with the merge unwound and HEAD where it
   // was.
   if (clean) {
-    await abort();
+    // A clean --no-commit merge has staged its result and written MERGE_HEAD,
+    // so this refusal is as dependent on the unwind as the conflicted ones.
+    const stuck = await abort();
+    if (stuck) return stuck;
     return stale(
       { head: headNow, incoming: incomingNow, digest: null },
       'both branches are where they were, but git reconciles them cleanly now — there is no conflict left for ' +
         'those answers to be about, and applying them would have discarded them in silence'
     );
   }
-  const left = conflictedPaths((await git(projectPath, ['diff', '--name-only', '--diff-filter=U', '-z'])).stdout);
+  const left = await unmergedPaths(git, projectPath);
   if (!left.length) {
     // THE MERGE NEVER STARTED, and until this it had no name. Unsaved work in
     // one of the conflicting files stops git before it writes anything, so
@@ -433,23 +527,80 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
           'start it. Commit them, park them, or discard them first — nothing was merged.',
       };
     }
+    // A MERGE THAT COULD NOT RUN IS NOT A CONFLICT THAT WENT AWAY.
+    //
+    // Everything below this point reasons about what git PRODUCED. Reaching
+    // here means git produced nothing at all: the merge above threw, and there
+    // is not one unmerged entry in the index — so git did not get as far as
+    // writing a conflict, and the reason is in its own sentence rather than in
+    // anything this code can measure.
+    //
+    // It used to fall through anyway. `conflictDigest(at, [])` is sha256 of an
+    // empty list, and the answer went out as `stale_merge` with
+    // `current.digest: "47DEQpj8HBSa-_TImW-5JC"` — base64url(sha256("")), a
+    // constant, published in the field that exists to say what was measured —
+    // and with the sentence "both branches are where they were, but git
+    // produced no conflict to answer this time". MEASURED against an ordinary
+    // `.git/index.lock` left by a second git process, which is what a user with
+    // a terminal open does several times an hour: that is the answer, and it is
+    // wrong twice. Nothing was hashed, and the remedy it gives — run git.merge
+    // again and answer the new conflict — is the one thing that cannot work,
+    // because the next merge is holding the same lock. An agent following it
+    // loops.
+    //
+    // So the failure gets its own name and carries git's own words. The binding
+    // is still good: neither branch moved and nothing was written, so the SAME
+    // call with the SAME mergeRef is what to retry once whatever held the
+    // repository has let go.
+    //
+    // No `merge --abort` here, for the same reason the working-tree refusal
+    // above does not: an empty unmerged list is the evidence that this merge
+    // wrote nothing, and firing an abort into a repository another process is
+    // in the middle of using is the one way to turn a wait into damage.
+    const said = String(blocked?.stderr || blocked?.message || blocked?.stdout || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !/^(hint|warning):/i.test(line))
+      // AND NOT THE COMMAND LINE ECHOED BACK. `err.message` from execFile is
+      // "Command failed: git -c merge.conflictStyle=diff3 merge …" with git's
+      // own words underneath it, and quoting the first line at an agent is the
+      // failure the working-tree refusal above was written to stop being — a
+      // sentence about a command nobody ran.
+      .filter((line) => !/^Command failed:/i.test(line))
+      .join(' ')
+      // Git ends its own sentence, and quoting it inside one of ours put two
+      // full stops together — "Unable to write index.. Nothing was merged".
+      .replace(/\.+$/, '');
+    return {
+      ok: false,
+      code: 'merge_blocked',
+      from: into,
+      branch,
+      // Git's sentence, kept whole and attributed, rather than folded into the
+      // message as though Stacki had worked it out.
+      gitSaid: said || null,
+      message:
+        `Finishing the merge of "${branch}" could not be started${said ? ` — git said: ${said}` : ''}. Nothing was ` +
+        'merged and nothing was written, and the conflict those answers are about is still the current one. This is ' +
+        'usually another git process holding the repository for a moment; wait and send exactly this call again ' +
+        'with the same mergeRef.',
+    };
   }
   // AND THE CONFLICT ITSELF, not only the two commits it came from. See
   // conflictDigest: the commits are an argument about git's determinism, this
   // is a measurement of what git actually wrote.
+  //
+  // `left` is non-empty by here — the empty case is answered above by name,
+  // because a digest of no files is a constant and not a measurement.
   const digestNow = conflictDigest(at, left);
   if (digestNow !== bound.digest) {
-    await abort();
+    const stuck = await abort();
+    if (stuck) return stuck;
     return stale(
       { head: headNow, incoming: incomingNow, digest: digestNow },
-      left.length
-        ? `both branches are where they were, but git reconciles them differently now — ${left.length} conflicting ` +
-          `${left.length === 1 ? 'file' : 'files'} rather than the ones you were shown`
-        : // Both commits are the ones the caller was shown and git produced no
-          // conflict at all — and not because unsaved work was in the way,
-          // which is answered above by name. What is said is what was
-          // measured: there is nothing here for these answers to be about.
-          'both branches are where they were, but git produced no conflict to answer this time'
+      `both branches are where they were, but git reconciles them differently now — ${left.length} conflicting ` +
+        `${left.length === 1 ? 'file' : 'files'} rather than the ones you were shown`
     );
   }
   // WHAT A CHOICE IS ALLOWED TO SAY, CHECKED BEFORE ANYTHING IS WRITTEN.
@@ -513,16 +664,68 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // ask whether it exists. `ls-files -u` is the index itself, and -z for the
   // same reason conflictedPaths uses it: NUL-terminated names are verbatim, so
   // the name matched against `left` here is the name git reported there.
+  //
+  // AND IT WAS ASKED IN THE WRONG PATH SPACE, WHICH MADE THE WHOLE VALIDATOR
+  // INERT IN THE ONE LAYOUT repoRoot EXISTS FOR.
+  //
+  // `left` comes from `git diff`, which spells its names from the REPOSITORY
+  // ROOT. `git ls-files` is CWD-SCOPED in both directions: it prints names
+  // relative to the cwd, and it OMITS everything outside the cwd. Run from the
+  // project, in a repository at <root> with the project at <root>/site, the two
+  // lists could not meet — `left` said "site/a.txt" and the index map was keyed
+  // "a.txt". Every lookup missed, `sidesOf` fell through to its "no evidence of
+  // absence" default of [ours, theirs], and the validator whose one job is to
+  // say no BEFORE anything is written passed everything. MEASURED, main deletes
+  // site/a.txt, feature edits it, `choices: {}`: at the repo root this refuses
+  // cleanly as `bad_choices`/`no_such_side`; from <root>/site it THREW
+  // `error: path 'site/a.txt' does not have our version` — the exact failure
+  // the last change was written to close, still live one layout over.
+  //
+  // WORSE THAN INERT: MIS-BOUND. In that same layout a conflict at <root>/x.txt
+  // and one at <root>/site/x.txt both key "x.txt" — one from `diff`, one from
+  // the cwd-relative `ls-files` — so one file's stage set answered for the
+  // other. Measured, x.txt a two-sided content clash and site/x.txt a
+  // modify/delete: `{"x.txt":"ours"}`, which x.txt certainly has, was REFUSED
+  // as no_such_side with `sides:["theirs"]` (site/x.txt's stages), while
+  // `{"site/x.txt":"ours"}`, which genuinely has no ours, was PASSED. The
+  // validator answered about the wrong file in both directions.
+  //
+  // Two things, and neither is enough alone. The cwd is the repository root, so
+  // nothing is omitted; and `--full-name` pins the names to the root whatever
+  // the cwd, so the fix does not quietly depend on `at` having resolved.
+  //
+  // AND THEN IT IS CHECKED, BECAUSE A MIS-BINDING IS WORSE THAN AN ABSENCE.
+  //
+  // Dropping the keys that are not in `left` is NOT enough and was measured not
+  // to be: in the collision above the wrong-space name for site/x.txt is
+  // "x.txt", which IS in `left` — it is the other conflicted file. A per-key
+  // test cannot tell a right answer from a wrong one; only the shape of the
+  // whole list can.
+  //
+  // `ls-files -u` and `diff --diff-filter=U` enumerate the same thing — the
+  // unmerged entries of one index — so the set of names has to be EQUAL. A
+  // difference means these two commands are not talking about the same paths,
+  // and there is no per-file repair for that. So the map is built to one side
+  // and adopted only if it covers `left` exactly; otherwise it is abandoned and
+  // every file falls to `sidesOf`'s permissive default. That is the old bug —
+  // a validator that stops adding refusals — and it is the failure to prefer:
+  // the apply loop's own catch still unwinds, whereas a stage set bound to the
+  // wrong file makes this refuse the merge that was fine and pass the one that
+  // was not.
   const sidesByFile = new Map();
   try {
-    for (const row of (await git(projectPath, ['ls-files', '-u', '-z'])).stdout.split('\0')) {
+    const found = new Map();
+    for (const row of (await git(at, ['ls-files', '-u', '-z', '--full-name'])).stdout.split('\0')) {
       // "<mode> <object> <stage>\t<path>"
       const tab = row.indexOf('\t');
       if (tab === -1) continue;
       const stage = Number(row.slice(0, tab).trim().split(/\s+/)[2]);
       const file = row.slice(tab + 1);
-      if (!sidesByFile.has(file)) sidesByFile.set(file, new Set());
-      sidesByFile.get(file).add(stage);
+      if (!found.has(file)) found.set(file, new Set());
+      found.get(file).add(stage);
+    }
+    if (found.size === left.length && left.every((file) => found.has(file))) {
+      for (const [file, stages] of found) sidesByFile.set(file, stages);
     }
   } catch {
     /* no index to ask — every side reads as present, and the apply loop's own
@@ -648,11 +851,14 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     unusable.push({ path: file, given: typeof choice, reason: 'bad_shape', expected: [...WHOLE_FILE] });
   }
   if (unusable.length) {
-    try {
-      await git(projectPath, ['merge', '--abort']);
-    } catch {
-      /* already unwound */
-    }
+    const stuck = await abort();
+    // The choices are still wrong, but they are no longer the thing that has to
+    // be said: a tree left mid-merge is a state nothing else here can read.
+    // WITHOUT `badChoices` on it — the MCP mapper recognises a resolve refusal
+    // by that field and would rewrite this one as `bad_choices`, which is the
+    // answer that is being corrected. What could not be used is in `unusable`
+    // and is the smaller problem; `merge_stuck` names the bigger one.
+    if (stuck) return stuck;
     // A sentence as well as the list, because this crosses IPC to a panel as
     // well as to the MCP mapper, and a refusal with nothing to show a person is
     // a red box quoting a field name. The mapper composes a longer one from the
@@ -715,15 +921,12 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     await git(projectPath, ['commit', '--no-edit']);
   } catch (err) {
     // Leave nothing half-merged behind — a tree stuck mid-merge is a state the
-    // rest of the app has no way to draw.
-    try {
-      await git(projectPath, ['merge', '--abort']);
-    } catch {
-      /* already unwound */
-    }
-    throw new Error(
-      String(err.stderr || err.message || '').trim() || `Could not finish merging "${branch}".`
-    );
+    // rest of the app has no way to draw. And when it cannot be helped, SAY SO
+    // in the same sentence: this is a throw rather than an envelope, so the
+    // only place the caller will ever read it is the message.
+    const stuck = await abort();
+    const why = String(err.stderr || err.message || '').trim() || `Could not finish merging "${branch}".`;
+    throw new Error(stuck ? `${why.replace(/\.+$/, '')}. ${stuck.message}` : why);
   }
   return { ok: true, into, changed: true, resolved: left.length };
 }
@@ -773,7 +976,7 @@ async function mergeBranch(git, { projectPath, branch }) {
     // clears it.
     let files = [];
     try {
-      files = conflictedPaths((await git(projectPath, ['diff', '--name-only', '--diff-filter=U', '-z'])).stdout);
+      files = await unmergedPaths(git, projectPath);
     } catch {
       /* no index to ask about — the merge never started */
     }
@@ -822,7 +1025,14 @@ async function mergeBranch(git, { projectPath, branch }) {
       } catch {
         /* already unwound */
       }
-      return { ok: false, conflicted: true, from: into, branch, files: clashes, at };
+      // WHICH PATH SPACE THOSE `path`s ARE IN, said rather than left to be
+      // worked out. Every `path` above is repo-root-relative, and the project
+      // is not always the repository — so a caller that wants to open one of
+      // these files, or to tell an agent a path it can hand to a tool that
+      // takes project-relative ones, needs the root they are relative to. The
+      // MCP git domain translates with it; the panel, which is Stacki and reads
+      // whole files off `ours`/`theirs`, ignores it.
+      return { ok: false, conflicted: true, from: into, branch, files: clashes, at, root };
     }
     try {
       await git(projectPath, ['merge', '--abort']);

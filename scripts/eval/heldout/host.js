@@ -563,4 +563,17 @@ function runHost({
   });
 }
 
-module.exports = { runHost, writeConfig, claudeBinary, claudeVersion, TOOLSET };
+// EXPORTED, because the containment protects more than the agent's child.
+//
+// `runHost` contains the process it spawns. It is not the only process in a
+// trial that can reach GitHub: `git.publish` runs inside the ELECTRON APP, and
+// test/support/packagedApp.js spawns that app with `{...process.env}`. A caller
+// that reuses only `runHost` therefore gets a contained agent talking to an
+// UNCONTAINED app holding the developer's real `gh` and real token — which is
+// the exact route that created a real repository in an earlier campaign, and
+// the reason the fake exists at all.
+//
+// So the environment builder is part of the public surface of this module: a
+// harness that launches anything else in a trial is expected to build that
+// process's environment with it too, not to approximate it.
+module.exports = { runHost, writeConfig, claudeBinary, claudeVersion, TOOLSET, containedEnv, CREDENTIAL_VARS };

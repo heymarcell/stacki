@@ -36,7 +36,7 @@ const path = require('node:path');
 
 const { createStackiMcpServer, CAPABILITIES, CACHE_HINTS } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
-const { guardSuite, freePort } = require('./support/suiteGuard.js');
+const { guardSuite, freePort, portTaken } = require('./support/suiteGuard.js');
 
 // A HANG MUST NOT REPORT A PASS. See test/support/suiteGuard.js: node exits 0
 // on an empty event loop, so an await that never settles reads as success.
@@ -122,16 +122,96 @@ async function modern(port, method, params = {}, extraHeaders = {}) {
 
 const readResource = (port, uri) => modern(port, 'resources/read', { uri }, { 'mcp-name': uri });
 
-(async () => {
-  // A free RUN of three: the suite binds BASE_PORT, +1 and +2.
-  for (let tries = 0; tries < 200; tries += 1) {
-    const start = await freePort(BASE_PORT);
+/**
+ * A free RUN of three: the suite binds `from`, +1 and +2.
+ *
+ * A LOOP THAT FALLS OUT OF ITS OWN BOTTOM IS NOT A SEARCH. This was a `for` with
+ * a `break` on success and no `else`: after two hundred failures it left
+ * BASE_PORT at `start + 3` -- a number the probe had never looked at, chosen
+ * because it happened to be where the walk stopped -- and the suite bound it
+ * anyway. The failure it was meant to prevent then arrived as EADDRINUSE from
+ * inside `server.start()`, blaming the server for the port picker's silence.
+ * `freePort` throws when it runs out; so does this.
+ */
+async function freeRunOfThree(from, tries = 200) {
+  let at = from;
+  for (let n = 0; n < tries; n += 1) {
+    const start = await freePort(at);
     if (start === (await freePort(start)) && start + 1 === (await freePort(start + 1)) && start + 2 === (await freePort(start + 2))) {
-      BASE_PORT = start;
-      break;
+      return start;
     }
-    BASE_PORT = start + 3;
+    at = start + 3;
   }
+  throw new Error(`no free run of three ports in ${from}..${at} after ${tries} tries`);
+}
+
+(async () => {
+  // ---- THE PROBE THIS SUITE PICKS ITS OWN PORTS WITH ----------------------
+  //
+  // Three servers are bound below on numbers `freePort` chose, so a probe that
+  // answers "free" about a port it could not ask about does not fail here as a
+  // wrong answer -- it fails as EADDRINUSE inside `server.start()`, which reads
+  // like a bug in the server. It is graded here rather than in a suite of its
+  // own because this is the suite that depends on it hardest: three ports in a
+  // row rather than one.
+  //
+  // `net.connect` is replaced for the duration, which is the only way to make a
+  // real EACCES or EMFILE appear on demand: the module holds `net` by reference,
+  // so the probe under test is the shipped one, called normally.
+  {
+    const net = require('node:net');
+    const { EventEmitter } = require('node:events');
+    const realConnect = net.connect;
+    const withConnectError = async (code) => {
+      net.connect = () => {
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        const err = new Error(`connect ${code} 127.0.0.1:1`);
+        err.code = code;
+        setImmediate(() => socket.emit('error', err));
+        return socket;
+      };
+      try {
+        return await portTaken(1);
+      } finally {
+        net.connect = realConnect;
+      }
+    };
+    // The canary: the probe CAN say "free", so the four readings below are a
+    // distinction it draws rather than a constant it returns.
+    check('a refused connection means the port is free', (await withConnectError('ECONNREFUSED')) === false);
+    for (const code of ['EACCES', 'EMFILE', 'EADDRNOTAVAIL', 'EHOSTUNREACH']) {
+      check(
+        `  and ${code} does not: a probe that could not ask the question must not answer "take it"`,
+        (await withConnectError(code)) === true,
+        `${code} was read as a free port`
+      );
+    }
+    // And a port something really is listening on, through the real socket.
+    const listener = net.createServer(() => {});
+    await new Promise((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(0, '127.0.0.1', resolve);
+    });
+    const busy = listener.address().port;
+    check('a port with a listener on it reads as taken', (await portTaken(busy)) === true, String(busy));
+    await new Promise((resolve) => listener.close(resolve));
+    check('  and the same port reads as free once the listener has gone', (await portTaken(busy)) === false, String(busy));
+
+    // AND A SEARCH THAT RUNS OUT SAYS SO RATHER THAN GUESSING. Driven with a
+    // budget of zero tries, which is the same exit the two-hundredth failure
+    // takes; the old loop reached it silently and the suite bound whatever
+    // number the walk had stopped on.
+    let ranOut = null;
+    try {
+      await freeRunOfThree(BASE_PORT, 0);
+    } catch (err) {
+      ranOut = String(err?.message || err);
+    }
+    check('a port search that runs out of tries throws rather than handing back an unprobed number', /no free run of three ports/.test(ranOut || ''), short(ranOut));
+  }
+
+  BASE_PORT = await freeRunOfThree(BASE_PORT);
   const PORT = BASE_PORT;
   const server = build('full', PORT);
   await server.start();

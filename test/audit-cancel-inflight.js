@@ -68,6 +68,7 @@ app.on('window-all-closed', () => {});
 const { createAudit, liveWindowCount } = require('../electron/mcp/audit');
 const { createStackiMcpServer } = require('../electron/mcp/server.js');
 const { connectMcp } = require('./support/mcpWire.js');
+const { freePort } = require('./support/suiteGuard.js');
 
 // AN EXIT CODE THAT IS NOT A REPORT IS NOT A PASS.
 //
@@ -171,8 +172,20 @@ const fixture = http.createServer((req, res) => {
   res.end('<!doctype html><html lang="en"><body>no</body></html>');
 });
 
-/** Document requests for one route that arrived after a moment. */
-const servedAfter = (route, at) => served.filter((s) => s.route === route && s.at > at);
+/**
+ * How many documents the fixture has served for one route.
+ *
+ * A COUNT, NOT A TIMESTAMP COMPARISON. This used to be `servedAfter(route, at)`,
+ * and the assertion built on it -- "no LATER viewport loads the page again" --
+ * counted any document request whose clock reading was later than the abort.
+ * Nothing in that ties a request to a VIEWPORT: a run that had loaded the page
+ * for two of its three viewports before the abort satisfied it, and a run that
+ * loaded the page for its FIRST viewport a moment after the abort failed it,
+ * which is the only thing a fixed 600ms abort could reliably produce on a fast
+ * machine. Three viewports asked for and one document served is a statement
+ * about viewports; a timestamp is a statement about the clock.
+ */
+const servedCount = (route) => served.filter((s) => s.route === route).length;
 
 // --- a wire that counts ------------------------------------------------------
 //
@@ -304,7 +317,14 @@ function sampleWindows(everyMs = 100) {
   const TOKEN = 'audit-cancel-inflight-token-aaaaaaaa';
   // A port nobody else in this repository starts on, chosen per process so two
   // suites at once do not collide.
-  const ENDPOINT_PORT = 45300 + (process.pid % 200);
+  //
+  // PROBED, NOT ASSUMED. `45300 + (process.pid % 200)` was bound straight, with
+  // no probe and no retry, while the two sibling suites added beside it use the
+  // `freePort` helper written for exactly this: pid spans overlap the ones the
+  // wire rigs allocate from, so two suites in one run can want the same number
+  // and the loser dies on EADDRINUSE. That is noise here rather than a finding,
+  // and this suite is the expensive one to re-run.
+  const ENDPOINT_PORT = await freePort(45300 + (process.pid % 200));
   const server = createStackiMcpServer({
     port: ENDPOINT_PORT,
     token: TOKEN,
@@ -445,14 +465,37 @@ function sampleWindows(everyMs = 100) {
     // after the abort would show up in the fixture's own log.
     {
       const encodesBefore = encodes.length;
+      const wedgesBefore = servedCount('/wedge');
       const ac = new AbortController();
       const watch = sampleWindows();
-      setTimeout(() => ac.abort(), 600);
+      // THE ABORT FOLLOWS THE RUN'S PROGRESS RATHER THAN A CLOCK.
+      //
+      // It was `setTimeout(() => ac.abort(), 600)`, a guess at how long the
+      // engine takes to clear its session, open an offscreen window and get a
+      // document out of the fixture. Guessing wrong in either direction changes
+      // what this case is about: too early and the abort lands before the page
+      // is requested, too late and it lands after the wedge has ended. So the
+      // fixture's own log is the trigger -- the abort is fired once the page has
+      // actually been asked for, plus a moment for `load` to fire and the spin
+      // to start, which is still SPIN_MS minus that moment inside the wedge.
+      //
+      // `wedgeDocAt` reads the moment THIS run's first /wedge document was asked
+      // for, by index
+      // rather than by "the last thing the fixture saw": an abort that fired
+      // before the page was requested must leave this null, so the guard below
+      // catches it rather than reading a request some earlier case made.
+      const wedgeDocAt = (n) => served.filter((s) => s.route === '/wedge')[n]?.at ?? null;
+      const abortInsideTheWedge = (async () => {
+        for (let i = 0; i < 2000 && servedCount('/wedge') === wedgesBefore; i += 1) await wait(10);
+        await wait(400);
+        ac.abort();
+      })();
       const started = Date.now();
       const out = await callAudit(
         { route: '/wedge', viewports: ['phone', 'tablet', 'desktop'], rules: [], capture: true },
         { signal: ac.signal }
       );
+      await abortInsideTheWedge;
       for (let i = 0; i < 3000 && lastRun().answeredAt === null; i += 1) await wait(20);
       const settled = lastRun();
       // A few more samples after the answer, so "the window reached zero" is
@@ -479,11 +522,25 @@ function sampleWindows(everyMs = 100) {
         `${lateEncodes.length} encode(s) after the signal (was 1); ${encodes.length - encodesBefore} in this run`
       );
 
-      // 6 — the checkpoint that already worked, kept honest.
+      // 6 — the checkpoint that already worked, kept honest, and now counted.
+      //
+      // Three viewports were asked for and each one loads the page once, so the
+      // number this run is entitled to is ONE: the viewport that was already
+      // loading when the caller left. Two is the second viewport starting after
+      // the abort, three is the whole run finishing. That is a claim about
+      // viewports; `servedAfter(route, abortedAt) === 0`, which this replaces,
+      // was a claim about which side of a timestamp a request happened to fall.
+      const wedgeLoads = servedCount('/wedge') - wedgesBefore;
       check(
-        '  and no LATER viewport loads the page again',
-        servedAfter('/wedge', abortedAt).length === 0,
-        short(servedAfter('/wedge', abortedAt))
+        '  and no LATER viewport loads the page again: one document served for a three-viewport run',
+        wedgeLoads === 1,
+        `${wedgeLoads} document request(s) for /wedge, for 3 viewports`
+      );
+      const firstWedgeAt = wedgeDocAt(wedgesBefore);
+      check(
+        '  and the abort really did land after that first load, so the case is the one it says it is',
+        firstWedgeAt !== null && abortedAt !== null && abortedAt > firstWedgeAt,
+        `page served at ${firstWedgeAt}, signal at ${abortedAt}`
       );
 
       // 4, again, on the case that used to track the wedge exactly.

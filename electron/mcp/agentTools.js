@@ -865,7 +865,11 @@ const GitInput = closed(z.discriminatedUnion('action', [
     choices: z
       .record(z.string(), z.unknown())
       .describe(
-        'How to settle each conflicting file, keyed by its project-relative path. A value is either "ours" or ' +
+        'How to settle each conflicting file, keyed by the `path` git.merge reported for it, spelled exactly as ' +
+          'it reported it. THOSE PATHS ARE RELATIVE TO THE REPOSITORY ROOT and not to the open project, so they ' +
+          'are not the paths source.read and the rest of this surface take \u2014 the two differ whenever the project ' +
+          'sits inside a larger repository, and every conflicting file git.merge reports carries both: `path` to ' +
+          'send back here, `sourcePath` to read the file with. A value is either "ours" or ' +
           '"theirs" for the whole file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per ' +
           'conflicting hunk, in the order git reports them, which is the order git.merge listed them in, and ' +
           'exactly as many entries as that file has hunks. Every key must be a path git.merge reported, and ' +
@@ -1450,22 +1454,41 @@ function acceptedBy(domain, action) {
  * property of the wire, where an agent chooses argument names from two schemas
  * that disagreed, and it stops there. `text` wins when both are sent, because
  * `text` is what the action's own schema names first.
+ *
+ * AND IT HAS TO WIN IN BOTH FORMS, WHICH IS THE WHOLE POINT OF AN ALIAS.
+ *
+ * The batch branch used to copy `text` across only when `value` was NOT a
+ * string, so a call sending both got `text` from the single form and `value`
+ * from the batch — two precedences for one pair of names, on the one operation
+ * this alias exists because agents already confuse. An agent that filled both
+ * in (a client that maps a field twice, a retry that adds the other spelling
+ * to a call that was refused) wrote different words in the same element
+ * depending on which shape it happened to reach for, and both answered ok.
+ *
+ * So both branches read the same way: `text` if it is a string, `value`
+ * otherwise, and the name the layer underneath uses is the one that goes out —
+ * `text` for the action, `value` for the operation. The other spelling is
+ * removed rather than left riding along, so nothing downstream can pick the
+ * loser back up.
  */
+const preferredText = (args) => (typeof args.text === 'string' ? args.text : args.value);
+
 function normalise(domain, action, args) {
   if (domain !== 'target') return args;
   if (action === 'set_text') {
-    const text = typeof args.text === 'string' ? args.text : args.value;
+    const text = preferredText(args);
     const { value, ...rest } = args;
     return { ...rest, ...(typeof text === 'string' ? { text } : {}) };
   }
   if (action === 'edit' && Array.isArray(args.operations)) {
     return {
       ...args,
-      operations: args.operations.map((op) =>
-        op && op.type === 'set_text' && typeof op.value !== 'string' && typeof op.text === 'string'
-          ? { ...op, value: op.text }
-          : op
-      ),
+      operations: args.operations.map((op) => {
+        if (!op || op.type !== 'set_text') return op;
+        const value = preferredText(op);
+        const { text, ...rest } = op;
+        return { ...rest, ...(typeof value === 'string' ? { value } : {}) };
+      }),
     };
   }
   return args;
