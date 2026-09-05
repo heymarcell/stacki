@@ -2283,8 +2283,33 @@ function insertSplice(source, baseNodes, at, newNodes, ctx) {
     const text = newNodes.map((node) => gaps(node) + indent + printNode(node, indent, ctx)).join('');
     return [{ start: anchorNode.end, end: anchorNode.end, text }];
   }
-  const text = newNodes.map((node) => printNode(node, indent, ctx) + gaps(node) + indent).join('');
-  return [{ start: anchorNode.start, end: anchorNode.start, text }];
+  // AT INDEX 0 THE SPLICE MOVES A NODE THE OPERATION NEVER NAMED.
+  //
+  // Every other branch here writes only bytes in front of the node being put
+  // in. This one has a second node in it: the element's PREVIOUS FIRST CHILD,
+  // which the new node is being pushed in front of. Inserting at
+  // `anchorNode.start` leaves that child's authored leading whitespace where it
+  // is -- in front of the NEW node -- and hands the old first child whatever
+  // `indent` says instead. In an ordinary element the two are the same string
+  // and nothing moves. Inside a `<pre>`, a `<textarea>`, a raw `<script>` or
+  // `<style>`, an element carrying `white-space: pre`, or any descendant of one,
+  // `indent` is deliberately empty -- and the old first child went to COLUMN
+  // ZERO. Measured: `\n    <span class='kept'>one</span>` came back as
+  // `\n<span class='kept'>one</span>`, four rendered spaces deleted from a node
+  // the caller only asked to insert BEFORE.
+  //
+  // So the write goes in at the START OF THE LINE instead of at the anchor's
+  // own offset. The anchor's authored bytes then stay in the source, untouched,
+  // still in front of the anchor; the new node gets `indent` written for it,
+  // which is the whole indentation decision this function is allowed to make.
+  // When `indent === held` -- every ordinary element -- the resulting file is
+  // byte-for-byte what the old arrangement produced, which is why the ordinary
+  // rows of test/source-fidelity-matrix.js (insertedInFrontOfTheFirstChild)
+  // still read the sibling's indentation, and stay green under the mutation
+  // that turns the preserving ones red.
+  const lineStart = anchorNode.start - held.length;
+  const text = newNodes.map((node) => indent + printNode(node, indent, ctx) + gaps(node)).join('');
+  return [{ start: lineStart, end: lineStart, text }];
 }
 
 /** A run of siblings replaced by a run of a different length -- one span, whole. */

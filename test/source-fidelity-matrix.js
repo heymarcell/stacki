@@ -1933,6 +1933,152 @@ function movedIntoPreservedWhitespace(attr, preserved) {
 }
 
 /**
+ * T2c -- THE SAME MOVE, TO INDEX 0, WHERE A SECOND NODE IS IN THE WAY.
+ *
+ * `movedIntoPreservedWhitespace` above appends: the only bytes written are the
+ * ones in front of the node being put in, and the element's other children are
+ * not touched at all. Inserting at index 0 is not that operation. The new node
+ * goes in AHEAD of the element's previous first child, and `insertSplice` wrote
+ * it at that child's own offset -- so the authored spaces in front of the old
+ * first child ended up in front of the NEW one, and the old first child was
+ * handed whatever the indent decision said instead.
+ *
+ * Inside a preserving element that decision is deliberately the empty string,
+ * and it is deliberately the empty string ONLY FOR THE NODE BEING INSERTED.
+ * Applied to the node that was already there, it is a deletion of content:
+ * measured, `\n    <span class='kept'>one</span>` came back as
+ * `\n<span class='kept'>one</span>` -- four spaces the page renders, gone from
+ * an element the caller named only as the thing to insert BEFORE. Nothing
+ * downstream catches it either: `renderedWhitespace` reads the inner bytes of
+ * `<pre>` and `<textarea>` only, so a `white-space: pre` `<div>` walks straight
+ * through the readback gate, and `sameMeaning` cannot see indentation at all.
+ *
+ * The oracle is the whole file. The positive control is the ordinary element on
+ * the same fixture, where the indent and the authored bytes are the same string
+ * and the result must be exactly what it always was; the unproven project is
+ * here for the same reason it is in `movedIntoAnUnprovenElement`, because "we
+ * could not scan it" must not start moving markup to column zero.
+ */
+// `lead` is the indent written on the line the moved block lands on -- the
+// decision this fix is about. `block` is the moved block's OWN bytes, which is
+// a different decision made by `printNode` and is spelled out here so the two
+// cannot be confused for each other: the last row has them disagreeing.
+const INDEX_ZERO_CASES = [
+  { id: "style='white-space: pre'", open: "<div style='white-space: pre'>", close: '</div>', tag: 'div', preserved: true, lead: '', block: 'alpha\nbeta' },
+  { id: "class='whitespace-pre'", open: "<div class='whitespace-pre'>", close: '</div>', tag: 'div', preserved: true, lead: '', block: 'alpha\nbeta' },
+  { id: '<pre>', open: '<pre>', close: '</pre>', tag: 'pre', preserved: true, lead: '', block: 'alpha\nbeta' },
+  { id: "class='plain'", open: "<div class='plain'>", close: '</div>', tag: 'div', preserved: false, lead: '    ', block: 'alpha\n  beta' },
+  // A project whose scan failed, and the row where the two decisions point
+  // opposite ways. `preserves` says yes -- so the moved block's own bytes
+  // travel unshifted -- while `rendersIndent` says no, so the line it lands on
+  // still gets the file's own indent and the span in front of which it lands
+  // still keeps all four of its spaces.
+  {
+    id: 'unproven project',
+    open: "<div class='plain'>",
+    close: '</div>',
+    tag: 'div',
+    preserved: false,
+    lead: '    ',
+    block: 'alpha\nbeta',
+    tokens: new Set(['*']),
+  },
+];
+
+function insertedInFrontOfTheFirstChild({ id, open, close, tag, preserved, lead, block, tokens }) {
+  const label = `[index 0 of ${id}]`;
+  const tail = `  <footer class='end'>end</footer>\n  <p>alpha\nbeta</p>\n`;
+  const source = commentedPage(`  ${open}\n    <span class='kept'>one</span>\n  ${close}\n${tail}`);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const box = root.children.find((n) => n.name === tag);
+  const p = root.children.find((n) => n.name === 'p');
+  if (!check(`${label} both are where a move can reach them`, !!box && !!p, short(root.children.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== p);
+  box.children.unshift(p);
+  const after = anchoredSerialize(source, model, tokens ? { preservingTokens: tokens } : {});
+  // POSITIVE CONTROL: the <p> really is inside the box, and really is first.
+  if (
+    !check(
+      `${label} the move puts the <p> in front of the span`,
+      new RegExp(`<${tag}[^>]*>[\\s\\S]*<p>[\\s\\S]*</p>[\\s\\S]*<span class='kept'>`).test(after),
+      short(changedSpan(source, after))
+    )
+  ) {
+    return;
+  }
+  // THE CLAIM, on its own, in the bytes the reviewer named: the node that used
+  // to be first is not part of this edit, so its line is untouched.
+  check(
+    `${label} the sibling it was inserted in front of keeps every authored space`,
+    after.includes(`\n    <span class='kept'>one</span>`),
+    short({ span: changedSpan(source, after) })
+  );
+  const want = commentedPage(
+    `  ${open}\n${lead}<p>${block}</p>\n    <span class='kept'>one</span>\n  ${close}\n` +
+      tail.slice(0, tail.indexOf('  <p>'))
+  );
+  check(
+    preserved
+      ? `${label} the insert writes no indent of its own and moves nobody else's`
+      : `${label} an ordinary element still indents a node inserted at index 0`,
+    after === want,
+    short({ span: changedSpan(want, after) })
+  );
+}
+
+/**
+ * T2d -- the same insert where the destination INHERITS the property.
+ *
+ * The element being inserted into declares nothing; its parent does. That is
+ * the case no property of the destination itself can answer, and it is the one
+ * that reaches `insertSplice` through two levels of `childContext` -- so the
+ * flag has to survive the walk down as well as be read correctly at the bottom.
+ */
+function insertedInFrontOfTheFirstChildOfADescendant() {
+  const label = '[index 0 of an inherited element]';
+  const tail = `  <footer class='end'>end</footer>\n  <p>alpha\nbeta</p>\n`;
+  const box = `  <div style='white-space: pre'>\n    <div class='inner'>\n      <span class='kept'>one</span>\n    </div>\n  </div>\n`;
+  const source = commentedPage(box + tail);
+  const parsed = parsePage(source);
+  if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) return;
+  const model = structuredClone(parsed.model);
+  const root = model.nodes[0];
+  const outer = root.children.find((n) => n.name === 'div');
+  const inner = outer?.children?.find((n) => n.name === 'div');
+  const p = root.children.find((n) => n.name === 'p');
+  if (!check(`${label} both are where a move can reach them`, !!inner && !!p, short(outer?.children?.map((n) => n.name)))) return;
+  root.children = root.children.filter((n) => n !== p);
+  inner.children.unshift(p);
+  const after = anchoredSerialize(source, model);
+  if (
+    !check(
+      `${label} the move puts the <p> in front of the span`,
+      /<div class='inner'>[\s\S]*<p>[\s\S]*<\/p>[\s\S]*<span class='kept'>/.test(after),
+      short(changedSpan(source, after))
+    )
+  ) {
+    return;
+  }
+  const want = commentedPage(
+    `  <div style='white-space: pre'>\n    <div class='inner'>\n<p>alpha\nbeta</p>\n      <span class='kept'>one</span>\n    </div>\n  </div>\n` +
+      `  <footer class='end'>end</footer>\n`
+  );
+  check(
+    `${label} the six spaces the inherited element renders in front of the span are still six`,
+    after.includes(`\n      <span class='kept'>one</span>`),
+    short({ span: changedSpan(source, after) })
+  );
+  check(
+    `${label} and the rest of the file is byte for byte what it was`,
+    after === want,
+    short({ span: changedSpan(want, after) })
+  );
+}
+
+/**
  * T2b -- THE SAME MOVE INTO AN ELEMENT NOBODY COULD MEASURE.
  *
  * The destination declares nothing at all; what is unknown is the PROJECT --
@@ -2880,6 +3026,8 @@ function theStampForAStylesheetHandedIn() {
   for (const attr of ["style='white-space: pre'", "class='whitespace-pre'", "class='plain'"]) {
     movedIntoPreservedWhitespace(attr, !attr.includes('plain'));
   }
+  for (const c of INDEX_ZERO_CASES) insertedInFrontOfTheFirstChild(c);
+  insertedInFrontOfTheFirstChildOfADescendant();
   movedIntoAnUnprovenElement();
   theWhitespaceValueTable();
   elementChildrenInsideAPre();
