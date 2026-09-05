@@ -81,7 +81,7 @@ async function main() {
       }
       case 'call': {
         const args = rest[1] ? JSON.parse(rest[1]) : {};
-        const r = await client.callTool({ name: rest[0], arguments: args }, undefined, { timeout: 180000 });
+        const r = await client.callTool({ name: rest[0], arguments: args }, { timeout: 180000 });
         answer = r.structuredContent ?? (r.content || []).map((c) => c.text).join('\n');
         break;
       }

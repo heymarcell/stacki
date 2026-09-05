@@ -151,7 +151,7 @@ const brief = (v, n = 220) => {
 
     // ── a capture, by the hash of its own bytes ───────────────────────────
     const shot = async () => {
-      const res = await app.client.callTool({ name: 'capture', arguments: { target: 'viewport', format: 'png' } }, undefined, { timeout: 240000 });
+      const res = await app.client.callTool({ name: 'capture', arguments: { target: 'viewport', format: 'png' } }, { timeout: 240000 });
       const img = (res.content || []).find((c) => c.type === 'image');
       return {
         meta: res.structuredContent,

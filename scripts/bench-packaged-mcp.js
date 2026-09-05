@@ -63,7 +63,7 @@ const quantile = (values, q) => {
       return { ms, bytes };
     };
 
-    const rawTool = (name, args) => app.client.callTool({ name, arguments: args }, undefined, { timeout: 240000 });
+    const rawTool = (name, args) => app.client.callTool({ name, arguments: args }, { timeout: 240000 });
 
     const CASES = [
       ['server/discover', 'MCP transport', () => app.client.request({ method: 'server/discover', params: {} })],

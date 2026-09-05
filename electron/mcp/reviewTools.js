@@ -29,7 +29,7 @@
 
 const z = require('zod');
 // One refusal shape for every tool on this endpoint. See auditTool.js.
-const { answer } = require('./agentTools');
+const { answer, orRefusal } = require('./agentTools');
 
 const nullableString = z.string().nullable();
 const nullableInt = z.number().int().nullable();
@@ -438,7 +438,7 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
               'may be fewer than asked for and `truncated` says the list was cut.'
           ),
       }),
-      outputSchema: CommentsOutput,
+      outputSchema: orRefusal(CommentsOutput),
       annotations: READ_ONLY,
     },
     async (args) => {
@@ -512,7 +512,7 @@ function registerReviewTools(server, { getComments, comment, clientName = null }
               'the text and never fetches it.'
           ),
       }),
-      outputSchema: ActionOutput,
+      outputSchema: orRefusal(ActionOutput),
       annotations: MUTATES,
     },
     async (args) => {

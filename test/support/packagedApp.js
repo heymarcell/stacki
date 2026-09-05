@@ -181,7 +181,7 @@ async function startPackagedApp({
   const { client, close } = await connectMcp({ url, token, era: 'modern', name: 'Stacki Phase A Agent' });
 
   const call = async (name, args = {}) =>
-    (await client.callTool({ name, arguments: args }, undefined, { timeout: 240000 })).structuredContent;
+    (await client.callTool({ name, arguments: args }, { timeout: 240000 })).structuredContent;
   const run = async (domain, action, args = {}) => {
     const answer = await call(domain, { action, ...args });
     // A project action can start, restart or stop a server. Re-claiming after

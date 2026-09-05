@@ -29,7 +29,7 @@ const z = require('zod');
 const { registerReviewTools } = require('./reviewTools');
 const { registerResources, registerPrompts } = require('./intelligence');
 const { registerAuditTool } = require('./auditTool');
-const { registerAgentTools, publishChecked } = require('./agentTools');
+const { registerAgentTools, publishChecked, orRefusal } = require('./agentTools');
 
 const INSTRUCTIONS = [
   'Stacki is the Astro project open in the Stacki desktop app: this server reports its live visual state and',
@@ -198,7 +198,7 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
               'is ever about; "full" is every computed property the engine has; "none" skips the round trip.'
           ),
       }),
-      outputSchema: ContextOutput,
+      outputSchema: orRefusal(ContextOutput),
       annotations: READ_ONLY,
     },
     async ({ styleDetail }) => {
@@ -239,7 +239,7 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
           .describe('Context to leave around a selection capture, in CSS pixels. Ignored for "viewport".'),
         format: z.enum(['png', 'jpeg']).default('png').describe('Image encoding.'),
       }),
-      outputSchema: CaptureOutput,
+      outputSchema: orRefusal(CaptureOutput),
       annotations: READ_ONLY,
     },
     async ({ target, paddingPx, format }) => {

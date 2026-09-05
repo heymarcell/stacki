@@ -1510,7 +1510,19 @@ const rawPost = (hostHeader, body) =>
       check('a summary read of the same ledger stays small', JSON.stringify(slim).length < 200_000, `${Math.round(JSON.stringify(slim).length / 1024)}KB`);
 
       // Every key the implementation sends must be DECLARED.
-      check('the published get_comments schema is a closed one', published.get_comments?.additionalProperties === false);
+      //
+      // The tool publishes `anyOf: [payload, refusal]` rather than the payload
+      // alone: its refusal is `{ok:false, code, issues}`, which no payload shape
+      // can hold, and that answer used to be delivered only because the SDK
+      // skips output validation when `isError` is set. What must not slip is the
+      // PAYLOAD half — a union whose success branch had been loosened would
+      // satisfy the four validations below and declare nothing at all. So the
+      // closure is asserted on the branch that carries the keys.
+      const commentsBranches = published.get_comments?.anyOf || [published.get_comments];
+      const commentsPayload = commentsBranches.find((b) => b?.properties?.threads || b?.properties?.total);
+      check('the published get_comments schema still offers a payload shape', !!commentsPayload, JSON.stringify(commentsBranches.map((b) => Object.keys(b?.properties || {}))));
+      check('  and that payload shape is a closed one', commentsPayload?.additionalProperties === false);
+      check('  and the other branch is the refusal, so a refusal is inside the contract too', commentsBranches.length === 2 && commentsBranches.some((b) => b?.properties?.code && b?.properties?.ok), JSON.stringify(commentsBranches.map((b) => Object.keys(b?.properties || {}))));
       for (const shape of [
         ['a full read', { status: 'all', detail: 'full', limit: 3 }],
         ['a summary read', { status: 'open', detail: 'summary', limit: 50 }],

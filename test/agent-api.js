@@ -860,6 +860,12 @@ const PINNED_RISK = {
       const covered = [
         'asset:ref',
         'content:ref',
+        // The one ref on the surface that does not name a file: the conflict a
+        // merge reported, so the answers to it cannot be applied to a later
+        // one. Covered in test/ref-concurrency.js block 8, including the
+        // observation being non-null, the stale case, the forged case and one
+        // merge's handle paired with another merge's branch.
+        'git:mergeRef',
         'page:ref',
         'source:ref',
         'style:ref',

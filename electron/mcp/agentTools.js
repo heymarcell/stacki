@@ -92,7 +92,7 @@ const DocumentState = z
 
 const Envelope = z.looseObject({
   ok: z.boolean().describe('Whether the operation happened. False is a status with a code, never a crash.'),
-  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, bound_value, not_editable, no_project, bad_request, …'),
+  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, bound_value, not_editable, no_project, bad_request, …'),
   message: z.string().nullable().optional(),
 
   // --- what a mutation answers with ---------------------------------------
@@ -252,7 +252,34 @@ function closeField(field) {
   if (def.type === 'union' && Array.isArray(def.options)) {
     const rebuilt = def.options.map(closeField);
     if (rebuilt.every((o, i) => o === def.options[i])) return field;
-    return withDescription(z.union(rebuilt), field);
+    // A DISCRIMINATED UNION REBUILT AS A PLAIN ONE STOPS NAMING THE KEY.
+    //
+    // A discriminated union in zod 4 IS a union with `discriminator` on its
+    // def, so `Operation` -- the batch's own union on `type` -- matched this
+    // branch, every option was rebuilt, and what went back was a plain
+    // `z.union` with the discriminator dropped on the way past. The cost is
+    // not validation, which still refuses: it is the ANSWER. A plain union
+    // fails as `invalid_union` with "Invalid input" and buries the thirteen
+    // real sub-errors in `errors[]`, which `issuesOf()` does not read -- so a
+    // mistyped key inside an edit batch came back as `operations.0: Invalid
+    // input`, the one shape on this surface an agent cannot act on,
+    // reintroduced one level down by the fix for the level above.
+    return withDescription(
+      def.discriminator ? z.discriminatedUnion(def.discriminator, rebuilt) : z.union(rebuilt),
+      field
+    );
+  }
+  // A RECORD'S VALUES ARE STILL SHAPES, and the wrapper walk below could not
+  // see them: a record holds its inner type under `valueType`, not `innerType`
+  // or `element`, so it was returned untouched and every object inside it
+  // stayed open. `props` on a node spec is the one that mattered -- its KEYS
+  // are attribute names the author chooses and are rightly open, but its VALUE
+  // is a declared `{type, value}` shape an agent has to construct, and a
+  // mistyped key in it was dropped and the insert ran.
+  if (def.type === 'record' && def.valueType) {
+    const closedValue = closeField(def.valueType);
+    if (closedValue === def.valueType) return field;
+    return withDescription(z.record(def.keyType, closedValue), field);
   }
   // One inner type, held under a name that differs by wrapper.
   const innerKey = def.type === 'array' ? 'element' : 'innerType';
@@ -729,14 +756,28 @@ const GitInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
   z.object({
     action: z.literal('resolve_merge'),
-    branch: z.string().max(300),
+    mergeRef: Ref.describe(
+      'The `mergeRef` git.merge handed back with the conflict, unchanged. It says WHICH conflict these answers ' +
+        'are about \u2014 the two commits and what git made of them \u2014 and the branch is taken from IT rather ' +
+        'than from `branch`. Required: applying the answers re-runs the merge, so a resolve that cannot say which ' +
+        'conflict it is settling is refused with guard_required, and one whose conflict has moved since is refused ' +
+        'with stale_merge. Nothing is merged either way \u2014 run git.merge again and answer what it reports now.'
+    ),
+    branch: z
+      .string()
+      .max(300)
+      .optional()
+      .describe('The branch being merged in. Cross-checked against the mergeRef rather than used, so naming a different one is refused.'),
     choices: z
       .record(z.string(), z.unknown())
       .describe(
         'How to settle each conflicting file, keyed by its project-relative path. A value is either "ours" or ' +
           '"theirs" for the whole file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per ' +
-          'conflicting hunk, in the order git reports them, which is the order git.merge listed them in. A file ' +
-          'you leave out keeps this branch\'s version. Anything else is refused with nothing changed.'
+          'conflicting hunk, in the order git reports them, which is the order git.merge listed them in, and ' +
+          'exactly as many entries as that file has hunks. Every key must be a path git.merge reported, and ' +
+          '"merged" is only an answer where that hunk offered one. A file you leave out keeps this branch\'s ' +
+          'version. Anything else \u2014 a misspelt path, a short or long list, an empty one, an explicit null \u2014 ' +
+          'is refused with bad_choices and nothing changed.'
       ),
   }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
@@ -1120,6 +1161,35 @@ function closedObject(schema) {
  * They have no `action` to be wrong about, so there is no bad_action half; the
  * envelope is otherwise the domain one, down to the `issues` vocabulary.
  */
+/**
+ * THE SHAPE OF A REFUSAL, DECLARED RATHER THAN RELIED UPON.
+ *
+ * The five non-domain tools publish the PAYLOAD they answer with when they
+ * work, and `badToolArguments` below answers something else entirely: no
+ * `revision`, no `timestamp`, and two fields those payloads never declare. That
+ * shipped only because both the SDK server and the official client skip output
+ * validation when `isError` is set -- so the declared contract was false, and
+ * the day either stops skipping, an argument mistake on those tools answers
+ * with nothing at all rather than with something wrong.
+ *
+ * Publishing `z.union([Payload, ToolRefusal])` makes the declaration true
+ * without loosening the success half: a payload still has to be exactly a
+ * payload. It is the move `audit` already made by declaring the four fields
+ * its gate refusal carries.
+ */
+const ToolRefusal = z.object({
+  ok: z.literal(false),
+  code: z.string(),
+  message: z.string(),
+  operation: z.string().optional(),
+  issues: z
+    .array(z.object({ path: z.array(z.union([z.string(), z.number()])), message: z.string(), code: z.string().optional() }))
+    .optional(),
+});
+
+/** What a tool publishes when its answer is either a payload or a refusal. */
+const orRefusal = (payload) => z.union([payload, ToolRefusal]);
+
 function badToolArguments(tool, error) {
   const issues = issuesOf(error);
   return {
@@ -1286,6 +1356,8 @@ function answer(result, { spaces = 2, images = [] } = {}) {
 
 module.exports = {
   registerAgentTools,
+  ToolRefusal,
+  orRefusal,
   // Exported so the two tools that live outside this file can refuse in exactly
   // the same shape rather than in one that resembles it. See auditTool.js.
   answer,
