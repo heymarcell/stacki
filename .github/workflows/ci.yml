@@ -272,6 +272,14 @@ jobs:
       - name: an undo is not done until its restore is on disk, in the bundle
         run: npm run test:packagedundo
 
+      # The same class as the suite above: it needs a packaged app, so it could
+      # never be in `npm test`, and it was in no CI job either. It guards a build
+      # quietly reaching the official update feed — which succeeds, and only fails
+      # later when Squirrel refuses to stage what it downloaded. It counts
+      # requests rather than watching for an error dialog.
+      - name: an unsigned build asks nobody for an update
+        run: npm run test:updatefeed
+
       # Phase B and Phase C, from the bundle rather than from source. This is
       # the only job that can catch axe-core not being packaged: the engine is
       # required lazily out of node_modules, so a packaging config that drops it

@@ -91,6 +91,20 @@ const HOST_AUTH_KEEP = new Set([
   'AWS_SECRET_ACCESS_KEY',
   'AWS_SESSION_TOKEN',
   'GOOGLE_APPLICATION_CREDENTIALS',
+  // AND THE ONES THAT SOURCE A CREDENTIAL RATHER THAN BEING ONE. Keeping
+  // AWS_ACCESS_KEY_ID while stripping AWS_WEB_IDENTITY_TOKEN_FILE keeps the
+  // login that a laptop uses and drops the one every containerised runner uses
+  // — IRSA on EKS, a task role on ECS, OIDC in GitHub Actions, a gcloud token
+  // on Vertex. The failure is invisible and asymmetric: trials pass here and
+  // die at startup there, and the grader scores them either way, so a runner
+  // that cannot authenticate is recorded as a Stacki failure.
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+  'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE',
+  'AWS_SHARED_CREDENTIALS_FILE',
+  'CLOUDSDK_AUTH_ACCESS_TOKEN',
+  'GOOGLE_OAUTH_ACCESS_TOKEN',
 ]);
 const CREDENTIAL_SHAPE_KEEP = new Set(['SSH_AUTH_SOCK', 'GH_CONFIG_DIR', 'PATH', 'HOME', ...HOST_AUTH_KEEP]);
 
@@ -428,6 +442,13 @@ function runHost({
       } catch {
         /* nothing to tear down */
       }
+      // THE SAME SHAPE AS A RUN THAT HAPPENED, because run.js derives from these
+      // keys without asking whether the host started. `isolationHeld` was
+      // computed as `builtinToolCalls === 0`, and `undefined === 0` is false —
+      // so a trial whose `claude` could not be spawned at all was written into
+      // the results file as an isolation VIOLATION, a purity failure that never
+      // happened, sitting beside real ones. Every count is zero here and says
+      // so; `ok:false` with `error` is what distinguishes this from a real run.
       resolve({
         ok: false,
         code: null,
@@ -436,10 +457,21 @@ function runHost({
         events,
         stderr: stderr.join(''),
         result: null,
+        text: null,
+        structured: null,
+        turns: null,
+        usage: null,
+        costUsd: null,
+        permissionDenials: 0,
+        toolUse: {},
         used: {},
         mcpUsed: {},
         resourceUsed: {},
         escaped: {},
+        mcpToolCalls: 0,
+        resourceToolCalls: 0,
+        builtinToolCalls: 0,
+        builtinUsed: {},
         containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
       });
     });
