@@ -1230,12 +1230,30 @@ function renameVariables(projectPath, { renames, markWrite }) {
   // anywhere declaring what it references. So each file that was written is put
   // back before the original error — the one that says WHY the rename could not
   // happen — is re-thrown.
+  //
+  // AND THE FILE THE WRITE ACTUALLY BROKE IS ONE OF THEM, WHICH IT WAS NOT.
+  //
+  // `written.push(abs)` ran AFTER `writeFileSync` returned, so the single file
+  // whose own write threw was the single file the rollback never touched — and
+  // `writeFileSync` opens with `w`, which TRUNCATES before it writes. A failure
+  // past that point (out of space, an I/O error, a volume pulled) therefore
+  // left that stylesheet empty or half written while every stylesheet around it
+  // was put back: the worst state of the three, and the one the paragraph above
+  // exists to rule out. The bytes it went in with are already in `writes`; only
+  // this ordering kept them from being used. Recorded BEFORE the call instead,
+  // so a file the write never opened is simply written back the bytes it still
+  // holds, which costs a write and settles the case that matters.
+  //
+  // Every entry in `writes` was read off the disk a few lines up, so each one
+  // has its prior text and there is no "this file did not exist" case to answer
+  // here — the renderer's twins carry that branch because their restores can
+  // name a file the person has since deleted.
   const written = [];
   try {
     for (const [abs, next] of writes) {
+      written.push(abs);
       markWrite?.(abs);
       fs.writeFileSync(abs, next, 'utf8');
-      written.push(abs);
     }
   } catch (err) {
     const priorOf = new Map(writes.map(([abs, , text]) => [abs, text]));

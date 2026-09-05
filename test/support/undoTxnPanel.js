@@ -220,26 +220,66 @@ async function assetsPanelInverses({ check, makeProject, removeProject, callMain
       check('the drop moved the file, around the collision', at('public/img/logo-1.svg') === ORIGINAL, String(at('public/img/logo-1.svg')));
       check('  leaving the file that was already there alone', at('public/img/logo.svg') === OTHER, String(at('public/img/logo.svg')));
 
-      // Whatever it recorded, running it must not touch the OTHER file. There
-      // is no one-step inverse for a move that also renamed, so the honest
-      // answer is not to record one — but the assertion is about what running
-      // it does, not about how many there are.
+      // There is no one-step inverse for a move that also renamed, so the
+      // honest answer is not to record one.
+      //
+      // AND THIS USED TO CLAIM MORE THAN IT PROVED. The sentence was "the
+      // pre-existing file is still where it was, WHATEVER THE UNDO DID", over a
+      // `for (const entry of recorded)` that ran ZERO times — the line under it
+      // asserts `recorded.length === 0` — so nothing but the move handler had
+      // ever touched that folder and no undo was run against it at all. What
+      // the move alone establishes is claimed here; the undo that has to leave
+      // the pre-existing file alone is driven for real underneath, by a move
+      // that DOES record an inverse.
+      check('  nothing is recorded, because no single move puts that name back', recorded.length === 0, String(recorded.length));
+      check(
+        '  and the move itself left the file that was already there alone',
+        at('public/img/logo.svg') === OTHER,
+        String(at('public/img/logo.svg'))
+      );
+
+      // ── AND A RECORDED INVERSE, RUN AGAINST THAT SAME FOLDER ───────────────
+      //
+      // panel.svg — back under its own name from the rename section above —
+      // dropped into public/img, where nothing collides with it. The panel
+      // records a move inverse for that, and running it has to bring the file
+      // back and leave the logo.svg that was already living there untouched.
+      await draw();
+      const intoImg = [...container.querySelectorAll('.asset-folder')].find((el) => el.textContent.includes('img'));
+      check('the img folder is still on screen for a second drop', !!intoImg, [...container.querySelectorAll('.asset-folder')].map((e) => e.textContent).join(','));
+      if (intoImg) {
+        await act(async () => {
+          const event = new dom.window.Event('drop', { bubbles: true, cancelable: true });
+          event.dataTransfer = {
+            types: ['avb/asset'],
+            files: [],
+            getData: (kind) => (kind === 'avb/asset' ? 'public/panel.svg' : ''),
+          };
+          intoImg.dispatchEvent(event);
+          await settle(150);
+        });
+      }
+      check('a move with nothing in its way lands under its own name', at('public/img/panel.svg') === ORIGINAL, String(at('public/img/panel.svg')));
+      check('  and this one IS recorded', recorded.length === 1, String(recorded.length));
+      let ran = 0;
       for (const entry of recorded) {
         await act(async () => {
           try {
             await entry.undo();
+            ran += 1;
           } catch {
             /* an inverse that refuses is not the failure this is about */
           }
           await settle(80);
         });
       }
+      check('  the recorded inverse really ran', ran === 1, String(ran));
+      check('  and put the file back where it came from', at('public/panel.svg') === ORIGINAL && at('public/img/panel.svg') === null, String(at('public/panel.svg')));
       check(
-        'THE PRE-EXISTING FILE IS STILL WHERE IT WAS, whatever the undo did',
+        'THE PRE-EXISTING FILE IS STILL WHERE IT WAS, with a real undo run over that folder',
         at('public/img/logo.svg') === OTHER,
         String(at('public/img/logo.svg'))
       );
-      check('  and nothing was recorded that cannot put the name back', recorded.length === 0, String(recorded.length));
     }
 
     // ── POSITIVE CONTROL ───────────────────────────────────────────────────

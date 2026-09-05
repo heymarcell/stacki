@@ -58,6 +58,11 @@ export function friendlyError(err) {
   return /No handler registered/i.test(text) ? RESTART : text;
 }
 
+// What `putFiles` records for a file it could not read at capture time, as
+// distinct from one that was not there. A rollback deletes on "not there" and
+// must leave "cannot say" alone; one `null` cannot mean both.
+const UNKNOWN = Symbol('unreadable at capture');
+
 async function bridge(name, payload) {
   const call = window.avb?.[name];
   if (typeof call !== 'function') {
@@ -398,6 +403,24 @@ export default function VariablesView({ project, selected, hidden, onClose, show
   // declares — a state it was never in, and one the undo stack cannot get out
   // of, because the entry is gone from `past` by then.
   //
+  // AND THE FILE WHOSE OWN WRITE FAILED IS PUT BACK TOO.
+  //
+  // `written.push(rel)` ran AFTER the write resolved, so the one file the write
+  // actually broke was the one file the rollback never touched. A write is not
+  // atomic — `fs.writeFileSync` opens with `w`, which TRUNCATES before it
+  // writes — so a failure past that point (out of space, an I/O error, a volume
+  // pulled) leaves that sheet empty or half written while every sheet around it
+  // is put back. Its bytes were already in hand; only the ordering kept them
+  // from being used. Recorded before the await instead: restoring a file that
+  // was never opened writes back the bytes it already holds, which costs
+  // nothing.
+  //
+  // AND A SHEET THAT DID NOT EXIST IS TAKEN AWAY AGAIN, rather than left
+  // standing after a rollback to a project that never had it — which needs
+  // three capture states and not two, because `null` was saying both "there was
+  // no file" and "the file could not be read", and deleting on the second would
+  // throw away bytes nobody asked to lose.
+  //
   // TWIN: `writeAllOrNone` in src/App.jsx does this for the Agent API's version
   // of the same undo, over `src:writeText` instead of `style:writeFile`. Fix
   // one and fix the other.
@@ -406,25 +429,43 @@ export default function VariablesView({ project, selected, hidden, onClose, show
       const entries = Object.entries(texts).filter(([, css]) => css != null);
       const before = new Map();
       for (const [rel] of entries) {
-        try {
-          before.set(rel, await fileText(rel));
-        } catch {
-          before.set(rel, null); // unreadable now is unrestorable later
-        }
+        // Read through the bridge rather than `fileText`, which answers null
+        // for every unhappy ending it has: the rollback DELETES on null, so
+        // "there was no file" has to be told apart from "the file could not be
+        // read" before it gets that far.
+        const answer = await bridge('readStyleFile', `${project.path}/${rel}`);
+        if (typeof answer?.css === 'string') before.set(rel, answer.css);
+        else if (/ENOENT/.test(String(answer?.error || ''))) before.set(rel, null);
+        else before.set(rel, UNKNOWN);
       }
       const written = [];
-      const write = (rel, css) => bridge('writeStyleFile', { filePath: `${project.path}/${rel}`, css });
+      // A REFUSED WRITE HAS TO COME BACK AS ONE. `bridge` catches whatever the
+      // handler threw and answers `{ok:false, error}`, so every write here
+      // "succeeded" however the disk had answered: the loop ran to the end,
+      // nothing was ever rolled back, and the panel's undo reported success
+      // over a stylesheet it had not written. Everything below is only
+      // reachable because of this line.
+      const write = async (rel, css) => {
+        const answer = await bridge('writeStyleFile', { filePath: `${project.path}/${rel}`, css });
+        if (answer && answer.ok === false) throw new Error(answer.error || `${rel} could not be written.`);
+        return answer;
+      };
       try {
         for (const [rel, css] of entries) {
-          await write(rel, css);
           written.push(rel);
+          await write(rel, css);
         }
       } catch (err) {
         for (const rel of written.reverse()) {
           const was = before.get(rel);
-          if (typeof was !== 'string') continue;
+          if (was === UNKNOWN) continue;
           try {
-            await write(rel, was);
+            if (typeof was === 'string') await write(rel, was);
+            // The renderer's only deletion door covers the asset roots; a
+            // stylesheet under src/ that has to be taken away again needs a
+            // channel that does not exist yet, and this refuses in band for one
+            // rather than pretending it worked.
+            else await bridge('deleteAsset', { projectPath: project.path, rel });
           } catch {
             /* the disk is already refusing; there is nothing further to try */
           }
@@ -440,7 +481,7 @@ export default function VariablesView({ project, selected, hidden, onClose, show
         /* the write landed; the view catches up on its next read */
       }
     },
-    [project.path, refresh, fileText]
+    [project.path, refresh]
   );
   /**
    * Run an edit and put it on the undo stack, as the text of the files it

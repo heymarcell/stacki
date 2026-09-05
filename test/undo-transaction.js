@@ -50,8 +50,53 @@
 // that simply refuses every undo fails this file.
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const H = require('./agent-harness.js');
+
+// THE ROLLBACKS ARE READ OUT OF THE SHIPPED FILES, not reimplemented here.
+//
+// Section 8 asks what happens to the file whose OWN write failed, and the only
+// honest way to produce that is a writer that truncates and then throws --
+// which is what a full disk or a dying volume does, and which no chmod can
+// imitate: `open(w)` on a read-only file fails BEFORE the truncate, so the file
+// it could not write is byte-identical either way and the defect is invisible.
+// So the two renderer helpers are lifted out of their files as text and run
+// against real files in a temporary folder with that writer injected. A rename
+// of either function, or a change to the closure it reads, fails the lift
+// loudly rather than quietly testing nothing.
+const lift = (rel, from, to) => {
+  const source = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+  const start = source.indexOf(from);
+  if (start < 0) return null;
+  const end = source.indexOf(to, start);
+  if (end < 0) return null;
+  return source.slice(start, end + to.length);
+};
+
+/**
+ * A writer that TRUNCATES one file and then fails, the way a full disk does.
+ *
+ * ONCE, because the rollback writes through the same door and a door that
+ * refuses for ever refuses the restore too — which is the "the disk is already
+ * refusing; there is nothing further to try" case all three rollbacks call best
+ * effort, and it makes the fix and the defect indistinguishable. A transient
+ * failure (an I/O error, a volume that came back, space freed by something
+ * else) is the case where the rollback can act, so it is the case to measure.
+ */
+const truncatingWriter = (abs) => {
+  let broken = false;
+  return (target, text) => {
+    if (!broken && path.resolve(target) === path.resolve(abs)) {
+      broken = true;
+      fs.writeFileSync(target, '', 'utf8'); // the truncate `open(w)` does
+      const err = new Error('ENOSPC: no space left on device, write');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    fs.writeFileSync(target, text, 'utf8');
+  };
+};
 
 const failures = [];
 let checked = 0;
@@ -66,6 +111,41 @@ const same = (a, b) => !!a && !!b && a.past === b.past && a.future === b.future;
 // wire; the names are what this file asks about.
 const filesOf = (envelope) =>
   (envelope?.restored?.files || []).map((entry) => (typeof entry === 'string' ? entry : entry?.file)).filter(Boolean);
+
+/**
+ * Every way a payload could name a place on this machine.
+ *
+ * The oracle here used to be `JSON.stringify(envelope).includes(root)` and
+ * nothing more, which on macOS misses the spelling the operating system
+ * actually hands back: the fixture root is `/var/folders/…` and its realpath is
+ * `/private/var/folders/…`, so a refusal naming the resolved path of the very
+ * file the test locked would have gone through unremarked. The temp and home
+ * directories go the same way, and the shape rule catches a path from somewhere
+ * none of the four covers.
+ *
+ * The same function, at the same strength, as `hostPathsIn` in
+ * test/refusal-contract.js.
+ */
+function hostPathsIn(payload, root) {
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? null);
+  const hits = [];
+  const named = [
+    ['the fixture root', root],
+    ['the fixture root, resolved', fs.realpathSync(root)],
+    ['the temp directory', os.tmpdir()],
+    ['the home directory', os.homedir()],
+  ];
+  for (const [what, needle] of named) {
+    if (needle && needle !== '/' && text.includes(needle)) hits.push(`${what} (${needle})`);
+  }
+  // And the shape, anchored on a quote or a space so that a project-relative
+  // `src/pages/index.astro` -- which these refusals are expected to name -- is
+  // not mistaken for one.
+  for (const m of text.matchAll(/(?:^|["\s(])(\/(?:Users|home|var|private|tmp|opt|etc|Applications|Library)\/[^"\s)]{2,})/g)) {
+    hits.push(`an absolute path: ${m[1].slice(0, 80)}`);
+  }
+  return hits;
+}
 
 const ASSET = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>\n';
 const COLLIDER = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="2"/></svg>\n';
@@ -91,7 +171,14 @@ const TWO = `:root {
 }
 `;
 
+const OTHER_JSON = `${JSON.stringify({ note: 'the second file' }, null, 2)}\n`;
+
 const PAGE = 'src/pages/index.astro';
+
+// The gap two recorded commands need between them to be two steps rather than
+// one: `pushCommand` collapses a burst that shares a coalesceKey inside 800 ms,
+// and every `content.cms_write` shares one.
+const UNCOALESCED = 900;
 
 (async () => {
   // ── 0. THE PANEL'S OWN INVERSES ──────────────────────────────────────────
@@ -109,6 +196,10 @@ const PAGE = 'src/pages/index.astro';
     'public/keep.svg': ASSET,
     'src/styles/one.css': ONE,
     'src/styles/two.css': TWO,
+    // A SECOND content file, so that two recorded commands can touch two
+    // different files. Section 1 needs to be able to say WHICH of two entries
+    // an undo ran, and it can only say that if they do not overlap on disk.
+    'src/data/other.json': OTHER_JSON,
   });
   const app = await H.start(root, { agentMode: 'full' });
   const run = (domain, action, args = {}) => app.api.run(domain, action, args);
@@ -122,13 +213,18 @@ const PAGE = 'src/pages/index.astro';
     fs.chmodSync(path.join(root, rel), 0o444);
     locked.add(rel);
   };
+  // THE DELETE BELONGS TO THE CHMOD THAT WORKED, and used to happen either way.
+  // It sat outside the try, so the set emptied itself whatever the chmod did —
+  // which made "every chmod was lifted" at the bottom of this file an assertion
+  // that could not fail: a chmod that threw left the file read-only on disk and
+  // `locked` empty all the same. Inside the try, the set says what it means.
   const unlock = (rel) => {
     try {
       fs.chmodSync(path.join(root, rel), 0o644);
+      locked.delete(rel);
     } catch {
-      /* already gone */
+      /* still read-only, and the set goes on saying so */
     }
-    locked.delete(rel);
   };
 
   // Envelopes that a person must never be able to read this machine's layout
@@ -147,7 +243,175 @@ const PAGE = 'src/pages/index.astro';
     const start = await probe('at the start');
     check('the stack starts empty', same(start, { past: 0, future: 0 }), short(start));
 
-    // ── 1. A FAILED UNDO DOES NOT MOVE THE STACK ─────────────────────────────
+    // ── 1. TWO UNDOS AT ONCE ARE TWO UNDOS ───────────────────────────────────
+    //
+    // The transactionality above is bought by PEEKING the top entry, running
+    // its inverse, and moving the stack only once that resolves. Between the
+    // peek and the move there is a window, and a second undo arriving inside it
+    // used to peek THE SAME ENTRY: both ran its inverse, the first `takeOut`
+    // removed it, the second found nothing to remove, and both pushed it onto
+    // `future`. Measured before this section existed, with these exact two
+    // writes and one `Promise.all`:
+    //
+    //   past: {past:1, future:2}, `src/data/other.json` named by BOTH calls,
+    //   `src/data/site.json` still holding the edit nobody had undone, and both
+    //   calls answering `ok: true, undone: true` — because `project.undo` reads
+    //   success as `past` having got shorter, which it had, once, for two
+    //   callers. Nothing serialised these: ⌘Z is `void undo()` and the MCP
+    //   server does not queue either.
+    //
+    // Two files rather than one, so "which entry did this undo run" is a
+    // question the BYTES can answer. Both inverses are byte restores and are
+    // idempotent, so running the wrong one twice does not fail — it just leaves
+    // the other change applied, which is the defect.
+    {
+      const siteWas = app.read('src/data/site.json');
+      const otherWas = app.read('src/data/other.json');
+
+      const readSite = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      const wroteSite = await run('content', 'cms_write', {
+        path: 'src/data/site.json',
+        data: { title: 'Fixture', tagline: 'THE FIRST OF TWO' },
+        ref: readSite.ref,
+      });
+      check('the first of two writes lands', wroteSite.ok === true, short(wroteSite));
+      await H.settle(UNCOALESCED);
+      const readOther = await run('content', 'cms_read', { path: 'src/data/other.json' });
+      const wroteOther = await run('content', 'cms_write', {
+        path: 'src/data/other.json',
+        data: { note: 'THE SECOND OF TWO' },
+        ref: readOther.ref,
+      });
+      check('  and so does the second', wroteOther.ok === true, short(wroteOther));
+      const siteEdited = app.read('src/data/site.json');
+      const otherEdited = app.read('src/data/other.json');
+      check('  with both files really changed', siteEdited !== siteWas && otherEdited !== otherWas);
+
+      const before = await probe('before the concurrent undos');
+      check('  and two separate steps on the stack', same(before, { past: 2, future: 0 }), short(before));
+
+      const [first, second] = await Promise.all([run('project', 'undo'), run('project', 'undo')]);
+      await H.settle(300);
+      wire.push(first, second);
+      check('both concurrent undos are answered', first.ok === true && second.ok === true, short({ first, second }));
+      check('  neither reports a failed inverse', !first.restored?.failed && !second.restored?.failed, short({ a: first.restored?.failed, b: second.restored?.failed }));
+
+      // THE BYTES, WHICH IS THE WHOLE POINT. Two undos were asked for and two
+      // different changes have to have come back.
+      check('THE SECOND WRITE IS UNDONE, byte for byte', app.read('src/data/other.json') === otherWas, short(app.read('src/data/other.json')));
+      check('AND SO IS THE FIRST, which the racing undo used to skip', app.read('src/data/site.json') === siteWas, short(app.read('src/data/site.json')));
+
+      const after = second.history?.past === 0 ? second.history : first.history;
+      check('  the stack is emptied and the redo stack holds two', same(after, { past: 0, future: 2 }), short({ first: first.history, second: second.history }));
+
+      // AND THEY WERE TWO DIFFERENT ENTRIES. Both racers used to name the same
+      // file, because both had run the same inverse.
+      const named = [filesOf(first), filesOf(second)];
+      check(
+        '  the two undos put back two different files',
+        named.some((list) => list.includes('src/data/site.json')) && named.some((list) => list.includes('src/data/other.json')),
+        short(named)
+      );
+
+      // AND SO DOES `future`: two concurrent redos have to bring both edits
+      // back, which they cannot if the same entry is on it twice.
+      const [redoA, redoB] = await Promise.all([run('project', 'redo'), run('project', 'redo')]);
+      await H.settle(300);
+      wire.push(redoA, redoB);
+      check('both concurrent redos are answered', redoA.ok === true && redoB.ok === true, short({ redoA, redoB }));
+      check('  the first edit is back, byte for byte', app.read('src/data/site.json') === siteEdited, short(app.read('src/data/site.json')));
+      check('  and so is the second', app.read('src/data/other.json') === otherEdited, short(app.read('src/data/other.json')));
+      const redone = redoB.history?.future === 0 ? redoB.history : redoA.history;
+      check('  with the stack back where it started', same(redone, { past: 2, future: 0 }), short({ redoA: redoA.history, redoB: redoB.history }));
+      const redoNames = [filesOf(redoA), filesOf(redoB)];
+      check(
+        '  and the two redos replayed two different entries',
+        redoNames.some((list) => list.includes('src/data/site.json')) && redoNames.some((list) => list.includes('src/data/other.json')),
+        short(redoNames)
+      );
+
+      // Back to an empty `past` and the fixture's own bytes, one step at a
+      // time, for the sections below. `probe` cannot be used to read the stack
+      // here: it IS a redo, and with two entries on `future` it would replay
+      // one of them.
+      await run('project', 'undo');
+      await H.settle(150);
+      const drained = await run('project', 'undo');
+      await H.settle(150);
+      check('the two files are as the fixture wrote them again', app.read('src/data/site.json') === siteWas && app.read('src/data/other.json') === otherWas, short({
+        site: app.read('src/data/site.json'),
+        other: app.read('src/data/other.json'),
+      }));
+      check('  with nothing left on past', drained.history?.past === 0, short(drained.history));
+    }
+
+    // ── 2. AN EDIT DURING AN UNDO ENDS THE REDO STACK ────────────────────────
+    //
+    // `pushHistory` and `pushCommand` empty `future` because a new edit is
+    // where the redo branch stops. The undo's redo point is pushed AFTER its
+    // inverse resolves, so an edit that landed while the inverse was running
+    // cleared `future` and the resolving undo then filled it back in — redo
+    // live again, pointing at a snapshot taken before that edit existed.
+    // Measured: `past: [S1]` with `future: [S1]`, and the redo replaying bytes
+    // the person had since written over.
+    //
+    // THE INTERLEAVE IS ITSELF AN ASSERTION. If the write finished after the
+    // undo had already resolved, everything below would pass for the wrong
+    // reason — `pushCommand` clears `future` either way — so whether the race
+    // really happened is checked rather than assumed.
+    {
+      const siteWas = app.read('src/data/site.json');
+      const otherWas = app.read('src/data/other.json');
+      const readSite = await run('content', 'cms_read', { path: 'src/data/site.json' });
+      const wrote = await run('content', 'cms_write', {
+        path: 'src/data/site.json',
+        data: { title: 'Fixture', tagline: 'THE ONE BEING UNDONE' },
+        ref: readSite.ref,
+      });
+      check('the write that will be undone lands', wrote.ok === true, short(wrote));
+      await H.settle(UNCOALESCED);
+
+      let undoSettled = false;
+      const undoing = run('project', 'undo').then((answer) => {
+        undoSettled = true;
+        return answer;
+      });
+      const readOther = await run('content', 'cms_read', { path: 'src/data/other.json' });
+      const during = await run('content', 'cms_write', {
+        path: 'src/data/other.json',
+        data: { note: 'WRITTEN WHILE THE UNDO WAS RUNNING' },
+        ref: readOther.ref,
+      });
+      const raced = !undoSettled;
+      const undone = await undoing;
+      await H.settle(300);
+
+      check('the new edit landed while the inverse was still in flight', raced, short({ undoSettled }));
+      check('  and it landed', during.ok === true && app.read('src/data/other.json') !== otherWas, short(during));
+      check('the undo still happened', undone.ok === true && app.read('src/data/site.json') === siteWas, short(app.read('src/data/site.json')));
+
+      // Read off the undo's OWN envelope, which reports the stack as the undo
+      // left it. Asking `project.redo` first would answer about the stack after
+      // the redo, and a redo that should not have been possible would have
+      // emptied `future` on its way through and reported zero.
+      check('THE REDO STACK THE NEW EDIT CLEARED STAYS CLEARED', undone.history?.future === 0, short(undone.history));
+      const answer = await run('project', 'redo');
+      wire.push(answer);
+      check('  so there is nothing to redo', answer.redone === false, short({ redone: answer.redone }));
+      check('  and the stack still says so', answer.history.future === 0, short(answer.history));
+      check('  and the new edit is still what is on disk', app.read('src/data/other.json') !== otherWas, short(app.read('src/data/other.json')));
+
+      // The new edit is the only thing on the stack now; take it back off, so
+      // the sections below start from the fixture's own bytes again. Read
+      // through the undo's own answer rather than `probe`, which is a redo and
+      // would replay what this just put back.
+      const drained = await run('project', 'undo');
+      await H.settle(200);
+      check('the interleaved edit is undone too', app.read('src/data/other.json') === otherWas, short(app.read('src/data/other.json')));
+      check('  with an empty past again', drained.history?.past === 0, short(drained.history));
+    }
+
+    // ── 3. A FAILED UNDO DOES NOT MOVE THE STACK ─────────────────────────────
     //
     // Two commands, so that "the next undo skipped to the one underneath" is
     // observable rather than a matter of opinion.
@@ -202,7 +466,7 @@ const PAGE = 'src/pages/index.astro';
       check('  and the stack moved exactly one step', same(retried.history, { past: 1, future: 1 }), short(retried.history));
     }
 
-    // ── 2. THE MIRROR, FOR REDO ──────────────────────────────────────────────
+    // ── 4. THE MIRROR, FOR REDO ──────────────────────────────────────────────
     //
     // The asset rename undone above is on `future` now. Put the obstruction
     // back at the name the REDO has to rename onto.
@@ -230,7 +494,7 @@ const PAGE = 'src/pages/index.astro';
       check('  and the stack moved exactly one step', same(retried.history, { past: 2, future: 0 }), short(retried.history));
     }
 
-    // ── 3. NO PARTIAL FILE STATE ─────────────────────────────────────────────
+    // ── 5. NO PARTIAL FILE STATE ─────────────────────────────────────────────
     //
     // One rename across two stylesheets, undone with one of them read-only.
     // Run twice, once with each file locked, because which of the two the
@@ -284,7 +548,7 @@ const PAGE = 'src/pages/index.astro';
       // does on its own.
     }
 
-    // ── 4. NO MODEL/DISK DIVERGENCE ──────────────────────────────────────────
+    // ── 6. NO MODEL/DISK DIVERGENCE ──────────────────────────────────────────
     //
     // The snapshot branch. A page edit, the page made read-only, and an undo
     // whose save cannot land. What must not happen is the editor moving to the
@@ -331,13 +595,13 @@ const PAGE = 'src/pages/index.astro';
       check('  and the stack one step shorter', retried.history.past === baseline.past - 1 && retried.history.future === baseline.future + 1, short({ before: baseline, after: retried.history }));
     }
 
-    // ── 5. AND THE FORWARD OPERATION IS ALL-OR-NOTHING TOO ───────────────────
+    // ── 7. AND THE FORWARD OPERATION IS ALL-OR-NOTHING TOO ───────────────────
     //
     // `cssVars.renameVariables` checks everything before it writes anything,
     // and then writes in a loop that can still stop halfway. Its own comment
     // says a half-applied rename is worse than a refused one; this is that
     // sentence as a test. Both files are locked in turn for the same reason as
-    // section 3.
+    // section 5.
     for (const lockRel of ['src/styles/one.css', 'src/styles/two.css']) {
       lock(lockRel);
       const refused = await run('style', 'rename_variables', { renames: [{ from: '--alpha', to: '--alpha-y' }] });
@@ -364,24 +628,282 @@ const PAGE = 'src/pages/index.astro';
       check('  and undoing it puts both stylesheets back exactly', back.ok === true && app.read('src/styles/one.css') === preOne && app.read('src/styles/two.css') === preTwo, short(back));
     }
 
-    // ── 6. NOBODY'S FILESYSTEM ───────────────────────────────────────────────
+    // ── 8. THE FILE WHOSE OWN WRITE FAILED IS ROLLED BACK TOO ────────────────
+    //
+    // Everything above sabotages a write by making a file read-only, and that
+    // catches the rollback's first hole and not its second. `open(w)` on a
+    // read-only file fails BEFORE it truncates, so the file that could not be
+    // written is byte-identical whether or not anybody put it back.
+    //
+    // A disk that fills up, an I/O error, a volume unplugged mid-write: those
+    // fail AFTER the truncate, and `fs.writeFileSync` opens with `w`. All three
+    // rollbacks recorded the file in `written` only once its write had
+    // RESOLVED, so the one file the write had actually broken was the one file
+    // the rollback skipped — left empty or half written while every file around
+    // it was restored. Its bytes were already in hand; the ordering was the
+    // whole defect.
+    //
+    // And a file that did not exist when the bytes were captured was created by
+    // the forward pass and then skipped by `typeof was !== 'string'` — a
+    // rollback that leaves a new file standing has not rolled back.
+    //
+    // The writer here truncates and then throws, which is what those failures
+    // do. The oracle is the bytes on disk, read by this process.
+    {
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-rollback-'));
+      const abs = (name) => path.join(scratch, name);
+      const textAt = (name) => (fs.existsSync(abs(name)) ? fs.readFileSync(abs(name), 'utf8') : null);
+      const seed = (files) => {
+        fs.rmSync(scratch, { recursive: true, force: true });
+        fs.mkdirSync(scratch, { recursive: true });
+        for (const [name, body] of Object.entries(files)) fs.writeFileSync(abs(name), body, 'utf8');
+      };
+
+      // ---- src/App.jsx: writeAllOrNone, as the Agent API's undo calls it ----
+      const appText = lift('src/App.jsx', "const UNKNOWN = Symbol('unreadable at capture');", '\n}\n');
+      check('writeAllOrNone can be read out of src/App.jsx', !!appText && /async function writeAllOrNone/.test(appText), String(appText).slice(0, 80));
+      if (appText && /async function writeAllOrNone/.test(appText)) {
+        // eslint-disable-next-line no-new-func
+        const writeAllOrNone = new Function(`${appText}\nreturn writeAllOrNone;`)();
+        const doors = (breaks, { readThrowsFor = null } = {}) => {
+          const writer = truncatingWriter(abs(breaks)); // one writer, so it breaks once
+          return {
+            read: async (rel) => {
+              if (rel === readThrowsFor) throw new Error('EACCES: permission denied, open');
+              if (!fs.existsSync(abs(rel))) return null;
+              return fs.readFileSync(abs(rel), 'utf8');
+            },
+            write: async (rel, text) => writer(abs(rel), text),
+            remove: async (rel) => fs.rmSync(abs(rel), { force: true }),
+          };
+        };
+
+        seed({ 'a.css': 'AAA', 'b.css': 'BBB' });
+        let threw = null;
+        try {
+          await writeAllOrNone([['a.css', 'A-NEW'], ['b.css', 'B-NEW']], doors('b.css'));
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('a write that fails halfway comes out as the original error', /ENOSPC/.test(String(threw)), String(threw));
+        check('  the file that was written first is put back', textAt('a.css') === 'AAA', String(textAt('a.css')));
+        check('  AND SO IS THE FILE THE WRITE ITSELF BROKE', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        seed({ 'b.css': 'BBB' });
+        threw = null;
+        try {
+          await writeAllOrNone([['made-up.css', 'BRAND NEW'], ['b.css', 'B-NEW']], doors('b.css'));
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the same, with a file that did not exist at capture', /ENOSPC/.test(String(threw)), String(threw));
+        check('  THE FILE THE ROLLBACK CREATED IS TAKEN AWAY AGAIN', !fs.existsSync(abs('made-up.css')), String(textAt('made-up.css')));
+        check('  and the broken file is still put back', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        seed({ 'unreadable.css': 'MINE', 'b.css': 'BBB' });
+        threw = null;
+        try {
+          await writeAllOrNone([['unreadable.css', 'U-NEW'], ['b.css', 'B-NEW']], doors('b.css', { readThrowsFor: 'unreadable.css' }));
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the same, with a file that could not be READ at capture', /ENOSPC/.test(String(threw)), String(threw));
+        // "There was no file" and "I could not look" must not be the same
+        // answer: deleting on the second destroys bytes nobody asked to lose.
+        check('  A FILE IT COULD NOT READ IS NOT DELETED', fs.existsSync(abs('unreadable.css')), 'gone');
+      }
+
+      // ---- src/panels/VariablesView.jsx: putFiles, the panel's own twin ----
+      const panelText = lift('src/panels/VariablesView.jsx', '    async (texts) => {', '\n    }');
+      check('putFiles can be read out of src/panels/VariablesView.jsx', !!panelText && /const written = \[\]/.test(panelText), String(panelText).slice(0, 80));
+      if (panelText && /const written = \[\]/.test(panelText)) {
+        const UNKNOWN = Symbol('unreadable at capture');
+        const makePutFiles = (breaks) => {
+          const writer = truncatingWriter(abs(breaks)); // one writer, so it breaks once
+          // The panel's `bridge`, which SWALLOWS whatever the handler threw and
+          // answers `{ok:false, error}` — the reason a refused write used to
+          // walk straight past the rollback.
+          const bridge = async (name, payload) => {
+            try {
+              if (name === 'readStyleFile') return { css: fs.readFileSync(String(payload), 'utf8') };
+              if (name === 'writeStyleFile') {
+                writer(payload.filePath, payload.css);
+                return { ok: true };
+              }
+              if (name === 'deleteAsset') {
+                fs.rmSync(path.join(payload.projectPath, payload.rel), { force: true });
+                return { ok: true };
+              }
+              return { ok: true };
+            } catch (err) {
+              return { ok: false, error: String(err?.message || err) };
+            }
+          };
+          // eslint-disable-next-line no-new-func
+          return new Function('bridge', 'project', 'refresh', 'UNKNOWN', `return (${panelText});`)(
+            bridge,
+            { path: scratch },
+            async () => {},
+            UNKNOWN
+          );
+        };
+
+        seed({ 'a.css': 'AAA', 'b.css': 'BBB' });
+        let threw = null;
+        try {
+          await makePutFiles('b.css')({ 'a.css': 'A-NEW', 'b.css': 'B-NEW' });
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        // The panel's bridge never throws, so a refused write reported success
+        // and the rollback below this was unreachable code.
+        check('the panel’s putFiles raises a refused write instead of swallowing it', /ENOSPC/.test(String(threw)), String(threw));
+        check('  the sheet it wrote first is put back', textAt('a.css') === 'AAA', String(textAt('a.css')));
+        check('  AND SO IS THE SHEET THE WRITE ITSELF BROKE', textAt('b.css') === 'BBB', String(textAt('b.css')));
+
+        seed({ 'b.css': 'BBB' });
+        threw = null;
+        try {
+          await makePutFiles('b.css')({ 'made-up.css': 'BRAND NEW', 'b.css': 'B-NEW' });
+        } catch (err) {
+          threw = String(err?.message || err);
+        }
+        check('the panel’s rollback, with a sheet that did not exist at capture', /ENOSPC/.test(String(threw)), String(threw));
+        check('  THE SHEET IT CREATED IS TAKEN AWAY AGAIN', !fs.existsSync(abs('made-up.css')), String(textAt('made-up.css')));
+        check('  and the broken one is still put back', textAt('b.css') === 'BBB', String(textAt('b.css')));
+      }
+
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+
+    // ── 8b. AND THE MAIN PROCESS'S OWN COMMIT LOOP ───────────────────────────
+    //
+    // `cssVars.renameVariables` is the third copy of the same rollback, and it
+    // is called directly rather than lifted: it is an ordinary module in this
+    // process, so the seam is `fs.writeFileSync` itself. Patched to truncate
+    // and throw on its FIRST write, whichever file the walk reaches first —
+    // which makes the assertion independent of the walk order, unlike the
+    // read-only sabotage in section 7.
+    {
+      const scratch = H.makeProject({
+        'src/styles/one.css': ONE,
+        'src/styles/two.css': TWO,
+      });
+      const { renameVariables } = require('../electron/cssVars.js');
+      const wasOne = fs.readFileSync(path.join(scratch, 'src/styles/one.css'), 'utf8');
+      const wasTwo = fs.readFileSync(path.join(scratch, 'src/styles/two.css'), 'utf8');
+      const real = fs.writeFileSync;
+      let broke = null;
+      fs.writeFileSync = function (target, data, encoding) {
+        if (!broke && String(target).startsWith(scratch) && /\.css$/.test(String(target))) {
+          broke = String(target);
+          real.call(fs, target, '', 'utf8'); // the truncate `open(w)` does
+          const err = new Error('ENOSPC: no space left on device, write');
+          err.code = 'ENOSPC';
+          throw err;
+        }
+        return real.call(fs, target, data, encoding);
+      };
+      let threw = null;
+      try {
+        renameVariables(scratch, { renames: [{ from: '--alpha', to: '--alpha-q' }] });
+      } catch (err) {
+        threw = String(err?.message || err);
+      } finally {
+        fs.writeFileSync = real;
+      }
+      check('a rename whose first write fails after truncating is refused', /ENOSPC/.test(String(threw)), String(threw));
+      check('  and it did break a file, so the rollback had something to do', !!broke && /\.css$/.test(String(broke)), String(broke));
+      check(
+        '  BOTH STYLESHEETS ARE BYTE-IDENTICAL, INCLUDING THE ONE IT TRUNCATED',
+        fs.readFileSync(path.join(scratch, 'src/styles/one.css'), 'utf8') === wasOne &&
+          fs.readFileSync(path.join(scratch, 'src/styles/two.css'), 'utf8') === wasTwo,
+        short({
+          one: fs.readFileSync(path.join(scratch, 'src/styles/one.css'), 'utf8').slice(0, 60),
+          two: fs.readFileSync(path.join(scratch, 'src/styles/two.css'), 'utf8').slice(0, 60),
+        })
+      );
+      check('  so nothing declares --alpha-q', !`${fs.readFileSync(path.join(scratch, 'src/styles/one.css'), 'utf8')}${fs.readFileSync(path.join(scratch, 'src/styles/two.css'), 'utf8')}`.includes('--alpha-q'));
+      H.removeProject(scratch);
+    }
+
+    // ── 9. NOBODY'S FILESYSTEM ───────────────────────────────────────────────
     //
     // Every refusal above was built somewhere that had an absolute path in its
     // hands. `message` was scrubbed; `restored.failed` was not, and it is the
     // field that carries the reason.
+    //
+    // THE ORACLE USED TO BE ONE SPELLING OF ONE STRING. `includes(root)` and
+    // nothing else, and on macOS the fixture root is `/var/folders/…` while its
+    // realpath is `/private/var/folders/…` — so a refusal naming the RESOLVED
+    // spelling of the very same file passed unremarked, as would one naming the
+    // home directory, the temp directory, or any absolute path from somewhere
+    // else entirely. It is the same oracle test/refusal-contract.js uses, and
+    // it is here at the same strength.
     {
-      const carrying = wire.filter((envelope) => JSON.stringify(envelope ?? null).includes(root));
+      const carrying = wire.map((envelope) => [envelope, hostPathsIn(envelope, root)]).filter(([, hits]) => hits.length);
       check(
-        `none of the ${wire.length} refusals names this machine's filesystem`,
+        `none of the ${wire.length} envelopes names this machine's filesystem`,
         carrying.length === 0,
-        carrying.map((envelope) => short(envelope, 400)).join('\n    ')
+        carrying.map(([envelope, hits]) => `${hits.join('; ')} :: ${short(envelope, 300)}`).join('\n    ')
       );
       const reasons = wire.map((envelope) => envelope?.restored?.failed).filter(Boolean);
       check('and the ones that explain a failed inverse said something', reasons.length >= 3, short(reasons));
-      check('  in project-relative terms', reasons.every((reason) => !reason.includes(root)), short(reasons));
+      check('  in project-relative terms', reasons.every((reason) => hostPathsIn(reason, root).length === 0), short(reasons));
+
+      // AND THE ORACLE CAN SEE A PATH WHEN THERE IS ONE. Every assertion above
+      // is an absence, so an oracle that had stopped looking would satisfy all
+      // of them. Four spellings, each of which has to be caught. (The resolved
+      // root is the weakest of the four on macOS, where realpath prefixes
+      // `/private` and the old one-string oracle caught it as a substring by
+      // luck; the home directory and a path from somewhere else are the two it
+      // genuinely could not see, and narrowing this back turns both red.)
+      for (const [what, needle] of [
+        ['the fixture root', root],
+        ['the resolved fixture root', fs.realpathSync(root)],
+        ['the home directory', os.homedir()],
+        ['a path from somewhere else', '/Applications/Something.app/Contents'],
+      ]) {
+        // A space in front, which is what the shape rule anchors on: a
+        // project-relative `src/pages/index.astro` must not be mistaken for an
+        // absolute path, so the rule cannot simply look for a leading slash.
+        check(`  the oracle catches ${what}`, hostPathsIn({ restored: { failed: `open ${needle}/x.css` } }, root).length > 0, needle);
+      }
+
+      // ── THE SCRUBBER ITSELF, ON THE TWO SHAPES A WALK CAN GET WRONG ────────
+      //
+      // `scrubHostPaths` kept a set of every object it had visited and answered
+      // `return value` — the ORIGINAL — on a second visit. That is not a cycle
+      // guard, it is a de-duplicator, and it fired for an ordinary graph: one
+      // error object carried under two fields of a refusal. Electron's IPC uses
+      // structured clone, which PRESERVES shared references, so the first field
+      // went out project-relative and the second went out with the host path
+      // intact — the exact thing the function exists to stop. Neither shape can
+      // be ordered up from an end-to-end refusal, because the renderer builds
+      // the object, so the function is asked directly.
+      {
+        const { scrubHostPaths } = require('../electron/mcp/agent');
+        const shared = { failed: `EACCES: open '${root}/src/styles/one.css'` };
+        const both = scrubHostPaths({ ok: false, restored: shared, cause: shared, all: [shared] }, root);
+        check('a scrubbed refusal says the first reference project-relative', both.restored.failed === "EACCES: open 'src/styles/one.css'", String(both.restored.failed));
+        check('  AND THE SECOND REFERENCE TO THE SAME OBJECT TOO', both.cause.failed === "EACCES: open 'src/styles/one.css'", String(both.cause.failed));
+        check('  and a third from inside an array', both.all[0].failed === "EACCES: open 'src/styles/one.css'", String(both.all[0].failed));
+        check('  so nothing in it names this machine', hostPathsIn(both, root).length === 0, short(both));
+        check('  with the sharing preserved, not the host path', both.restored === both.cause, 'the two fields are separate copies');
+
+        // And a real cycle still terminates — the reason the visited set was
+        // there at all — onto the SCRUBBED copy rather than the original.
+        const loop = { message: `EACCES: open '${root}/src/styles/two.css'` };
+        loop.self = loop;
+        loop.list = [loop];
+        const walked = scrubHostPaths(loop, root);
+        check('a cycle is walked without a stack overflow', walked.message === "EACCES: open 'src/styles/two.css'", String(walked.message));
+        check('  and closes onto the scrubbed copy', walked.self === walked && walked.list[0] === walked, 'the loop reopened the original');
+        check('  so a cycle names this machine nowhere either', hostPathsIn(walked.message, root).length === 0, String(walked.message));
+      }
     }
 
-    // ── 7. POSITIVE CONTROLS, WITH NOTHING WRONG AT ALL ──────────────────────
+    // ── 10. POSITIVE CONTROLS, WITH NOTHING WRONG AT ALL ──────────────────────
     //
     // Everything above is satisfied by an undo that refuses everything and a
     // stack that never moves. These are the same operations with nothing in

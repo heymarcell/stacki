@@ -44,16 +44,39 @@ const { digestOf } = require('./digest');
  * 'src/styles/site.css'" and `restored.failed` said "open
  * '/var/folders/vq/…/src/styles/site.css'". Naming the second field would have
  * left the third one to find later, so the walk is over the whole answer.
+ *
+ * AND A SECOND REFERENCE TO THE SAME OBJECT IS SCRUBBED TOO.
+ *
+ * The visited set answered `return value` — THE ORIGINAL, UNSCRUBBED OBJECT —
+ * the second time a reference was reached, and it was a set of everything ever
+ * visited rather than of what is on the path being walked, so it fired for an
+ * ordinary graph and not only for a cycle. One error object carried under two
+ * fields of a refusal is that graph, and Electron's IPC uses structured clone,
+ * which PRESERVES shared references: the first field went out project-relative
+ * and the second went out with the host path intact — the exact defect this
+ * function was written to close. Measured on `{restored: e, cause: e}`:
+ * `restored.failed` said "open 'src/styles/one.css'" and `cause.failed` said
+ * "open '/var/folders/…/src/styles/one.css'".
+ *
+ * So the SCRUBBED copy is memoised and handed back on a second visit. A cycle
+ * still terminates — the copy goes into the map before its own fields are
+ * walked, so the reference that closes the loop finds it there — and the loop
+ * now closes onto the scrubbed object rather than reopening the unscrubbed one.
  */
-function scrubHostPaths(value, root, seen = new WeakSet()) {
+function scrubHostPaths(value, root, seen = new WeakMap()) {
   if (typeof value === 'string') return withoutHostPaths(value, root);
-  if (Array.isArray(value)) return value.map((item) => scrubHostPaths(item, root, seen));
   if (!value || typeof value !== 'object') return value;
   // A refusal is plain data, but it is data this process did not build, so a
   // cycle in it must not be a stack overflow on the way to the wire.
-  if (seen.has(value)) return value;
-  seen.add(value);
+  if (seen.has(value)) return seen.get(value);
+  if (Array.isArray(value)) {
+    const list = [];
+    seen.set(value, list);
+    for (const item of value) list.push(scrubHostPaths(item, root, seen));
+    return list;
+  }
   const out = {};
+  seen.set(value, out);
   for (const [key, item] of Object.entries(value)) out[key] = scrubHostPaths(item, root, seen);
   return out;
 }
@@ -1699,4 +1722,9 @@ function createAgentApi({
 // batch `Operation` union or the registry — implemented, dispatched, and
 // reachable by no client. Nothing checked that the three agreed, so the
 // discrepancy was invisible; test/schema-dispatch-contract.js now does.
-module.exports = { createAgentApi, NORMALIZE, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };
+// AND `scrubHostPaths` IS EXPORTED SO ITS EDGES CAN BE ASKED ABOUT DIRECTLY.
+// A shared reference and a cycle are shapes an end-to-end refusal cannot be
+// made to have on demand — the renderer builds the object — so the only honest
+// test of either is one that hands this function the shape itself.
+// test/undo-transaction.js does, beside the wire assertions it belongs with.
+module.exports = { createAgentApi, scrubHostPaths, NORMALIZE, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };

@@ -177,31 +177,58 @@ function holdsInlineText(node) {
  * error that comes out is the ORIGINAL one, because that is the one that says
  * why the operation could not happen.
  *
+ * AND THE ROLLBACK COVERS THE FILE THAT FAILED, WHICH IT DID NOT.
+ *
+ * `written.push(rel)` ran AFTER the write resolved, so the one file whose own
+ * write threw was the one file the rollback never touched. A write is not
+ * atomic: `fs.writeFileSync` opens with `w`, which TRUNCATES, so a failure
+ * after that point -- out of space, an I/O error, a volume pulled -- leaves
+ * that file empty or half written while every file around it is put back. Its
+ * bytes were already in `before`; only the ordering kept them from being used.
+ * So the rel is recorded BEFORE the await: a file that may have been touched
+ * is restored, and restoring one that was never opened writes back the bytes
+ * it already holds.
+ *
+ * AND A FILE THAT DID NOT EXIST IS TAKEN AWAY AGAIN RATHER THAN LEFT BEHIND.
+ *
+ * `if (typeof was !== 'string') continue` skipped exactly the file the forward
+ * pass had CREATED, so a rollback could leave a new file standing in a project
+ * it was rolling back to a state that never had one. Putting back "there was no
+ * file here" means removing it.
+ *
+ * Which needs THREE capture states, not two, because `null` was carrying two
+ * different facts: the file was not there, and the file could not be read.
+ * Deleting on the second would destroy bytes nobody asked to lose. So `read`
+ * answers null for "no file", THROWS for "cannot say", and a capture that threw
+ * is left alone on the way out.
+ *
  * TWIN: src/panels/VariablesView.jsx has the same function, for the same
  * reason, over its own stylesheet bridge. Fix one and fix the other.
  */
-async function writeAllOrNone(entries, { read, write }) {
+const UNKNOWN = Symbol('unreadable at capture');
+async function writeAllOrNone(entries, { read, write, remove }) {
   const before = new Map();
   for (const [rel] of entries) {
     if (before.has(rel)) continue;
     try {
       before.set(rel, await read(rel));
     } catch {
-      before.set(rel, null); // unreadable now is unrestorable later; say so by having nothing
+      before.set(rel, UNKNOWN); // cannot say what was here, so cannot put it back
     }
   }
   const written = [];
   try {
     for (const [rel, text] of entries) {
-      await write(rel, text);
       written.push(rel);
+      await write(rel, text);
     }
   } catch (err) {
     for (const rel of written.reverse()) {
       const was = before.get(rel);
-      if (typeof was !== 'string') continue;
+      if (was === UNKNOWN) continue;
       try {
-        await write(rel, was);
+        if (typeof was === 'string') await write(rel, was);
+        else await remove?.(rel);
       } catch {
         /* the disk is already refusing; there is nothing further to try */
       }
@@ -956,7 +983,11 @@ export default function App() {
     refreshGit();
   }, [refreshGit, refreshKey]);
 
-  const historyRef = useRef({ past: [], future: [], lastPush: 0, lastKey: null });
+  // `redoEpoch` counts the times the redo stack has been THROWN AWAY by a new
+  // edit. Read before an inverse runs and again after it, it is how `undo`
+  // knows whether the `future` it is about to push onto is still the one it
+  // started with. See the epoch note above `undo`.
+  const historyRef = useRef({ past: [], future: [], lastPush: 0, lastKey: null, redoEpoch: 0 });
 
   // How many times the open document has changed.
   //
@@ -1019,7 +1050,14 @@ export default function App() {
       h.past.push(snapshotOf(state));
       if (h.past.length > 100) h.past.shift();
     }
+    // A NEW EDIT ENDS THE REDO STACK, AND HAS TO BE ABLE TO SAY SO LATER.
+    // Emptying the array is not enough on its own: an undo whose inverse is
+    // still running took its redo point before this ran and pushes it after,
+    // which put a snapshot of a document that no longer exists back on a
+    // `future` this line had just cleared. The counter is what an in-flight
+    // undo compares against; see the epoch note above `undo`.
     h.future = [];
+    h.redoEpoch += 1;
     h.lastKey = coalesceKey;
     h.lastPush = now;
   }, []);
@@ -1051,7 +1089,10 @@ export default function App() {
       h.past.push({ kind: 'cmd', ...cmd });
       if (h.past.length > 100) h.past.shift();
     }
+    // The same as `pushHistory`: a command recorded while an undo is still
+    // running is a new edit, and the undo must not put the redo stack back.
     h.future = [];
+    h.redoEpoch += 1;
     h.lastKey = cmd.coalesceKey ?? null;
     h.lastPush = now;
   }, []);
@@ -1179,13 +1220,56 @@ export default function App() {
     if (at >= 0) stack.splice(at, 1);
   };
 
-  const undo = useCallback(async () => {
+  // ONE UNDO AT A TIME, AND REDO WAITS FOR IT TOO.
+  //
+  // Peeking the entry and moving the stack only after the inverse resolves is
+  // what makes a failed undo leave nothing behind — and it opened a window
+  // between the peek and the takeOut in which a SECOND undo peeks the same
+  // entry. Both then run the same inverse, the first takeOut removes it, the
+  // second finds nothing to remove, and both push it onto `future`: measured
+  // with two `project.undo` calls in one `Promise.all`, the newest change was
+  // undone twice, the one underneath it was not undone at all, `future` held
+  // the same entry twice, and both calls answered `undone: true` — because
+  // `src/agent/commands.js` reads success as `past` having got shorter, which
+  // it had, once, for two callers. Nothing serialises these: ⌘Z is `void
+  // undo()` with no in-flight guard and the MCP server does not queue either.
+  //
+  // So both go through one promise chain. The queued call starts only once the
+  // one before it has finished with the stack, and therefore reads the stack
+  // that call left behind. The chain is advanced with the outcome SWALLOWED —
+  // an inverse that rejects must not leave every later undo waiting on a
+  // rejected promise — while the caller still gets the original result.
+  const historyGateRef = useRef(Promise.resolve());
+  const oneAtATime = useCallback((step) => {
+    const started = historyGateRef.current.then(step, step);
+    historyGateRef.current = started.then(
+      () => undefined,
+      () => undefined
+    );
+    return started;
+  }, []);
+
+  const undoStep = useCallback(async () => {
     setHistoryTick((n) => n + 1);
     const h = historyRef.current;
     if (!h.past.length) return null;
     h.lastKey = null;
     h.lastPush = 0;
     const entry = h.past[h.past.length - 1];
+    // AN UNDO DOES NOT BRING BACK A REDO STACK A NEW EDIT THREW AWAY.
+    //
+    // The redo point is pushed after the inverse resolves, and an edit
+    // recorded WHILE it was running has already emptied `future` by then --
+    // `pushHistory` and `pushCommand` both do, because a new edit is where the
+    // redo branch ends. Pushing anyway made redo live again, pointing at a
+    // snapshot taken before that edit existed: measured, `past: [S1]` with
+    // `future: [S1]` after `pushHistory` had cleared it mid-await, and the
+    // redo replayed bytes the person had since written over. The undo itself
+    // still happened, so the entry still leaves `past`; only the redo point is
+    // dropped. Serialising undo against undo does not cover this -- the thing
+    // that cleared the stack is an edit, not another undo.
+    const redoEpoch = h.redoEpoch;
+    const stillRedoable = () => h.redoEpoch === redoEpoch;
     if (entry.kind === 'cmd') {
       // AN INVERSE THAT THREW IS NOT AN UNDO, AND USED TO REPORT AS ONE.
       //
@@ -1202,7 +1286,7 @@ export default function App() {
         return { kind: 'cmd', files: entry.files || [], failed };
       }
       takeOut(h.past, entry);
-      h.future.push(entry);
+      if (stillRedoable()) h.future.push(entry);
       return { kind: 'cmd', files: entry.files || [] };
     }
     const state = pageStateRef.current.pageState;
@@ -1224,11 +1308,11 @@ export default function App() {
       return { kind: entry.kind, files, failed };
     }
     takeOut(h.past, entry);
-    h.future.push(redoPoint);
+    if (stillRedoable()) h.future.push(redoPoint);
     return { kind: entry.kind, files };
   }, [applySnapshot, showToast]);
 
-  const redo = useCallback(async () => {
+  const redoStep = useCallback(async () => {
     setHistoryTick((n) => n + 1);
     const h = historyRef.current;
     if (!h.future.length) return null;
@@ -1265,6 +1349,12 @@ export default function App() {
     h.past.push(undoPoint);
     return { kind: entry.kind, files };
   }, [applySnapshot, showToast]);
+
+  // The doors everything else uses. Every caller — ⌘Z, the app menu, the Agent
+  // API's `project.undo` and `project.redo` — goes through the queue, because
+  // two of them arriving together is exactly the case the queue exists for.
+  const undo = useCallback(() => oneAtATime(undoStep), [oneAtATime, undoStep]);
+  const redo = useCallback(() => oneAtATime(redoStep), [oneAtATime, redoStep]);
 
   // Discrete edits (dropdown, checkbox, drag, delete) save immediately;
   // typing batches keystrokes for 300 ms so the preview doesn't rebuild
@@ -4972,11 +5062,27 @@ export default function App() {
             .filter(([, pair]) => typeof pair?.[which] === 'string')
             .map(([rel, pair]) => [rel, pair[which]]);
           await writeAllOrNone(entries, {
+            // Null means THERE IS NO FILE HERE, and nothing else: the rollback
+            // deletes on that answer, so "the read failed" must not arrive
+            // wearing the same face. A missing file is the one case this can
+            // tell apart from a bad one, and anything else is left to throw.
             read: async (rel) => {
-              const answer = await window.avb.readSourceText({ projectPath: project.path, rel });
-              return typeof answer?.text === 'string' ? answer.text : null;
+              try {
+                const answer = await window.avb.readSourceText({ projectPath: project.path, rel });
+                return typeof answer?.text === 'string' ? answer.text : null;
+              } catch (err) {
+                if (/ENOENT/.test(String(err?.message || err))) return null;
+                throw err;
+              }
             },
             write: (rel, text) => window.avb.writeSourceText({ projectPath: project.path, rel, text }),
+            // THE ONLY DELETION DOOR THE RENDERER HAS. It covers the asset
+            // roots, which is where a restore's text files live; a src/ file
+            // that has to be taken away again needs a `src:delete` channel that
+            // does not exist yet, and this refuses in band for one rather than
+            // pretending. The rollback swallows that, as it swallows every
+            // other way the disk can say no on the way out.
+            remove: (rel) => window.avb.deleteAsset({ projectPath: project.path, rel }),
           });
         } else if (restore.kind === 'asset_rename') {
           const step = which === 'before' ? restore.back : restore.forward;
