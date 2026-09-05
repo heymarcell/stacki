@@ -388,15 +388,59 @@ export default function VariablesView({ project, selected, hidden, onClose, show
     },
     [project.path]
   );
+  // ALL OF THEM OR NONE OF THEM.
+  //
+  // This wrote the files in a loop with nothing between the writes, so one that
+  // could not be written stopped the loop with the earlier ones already
+  // rewritten. Measured with a variable renamed across two stylesheets and the
+  // second one read-only: the first went back to the old name and the second
+  // kept the new one, leaving the project referencing a variable no file
+  // declares — a state it was never in, and one the undo stack cannot get out
+  // of, because the entry is gone from `past` by then.
+  //
+  // TWIN: `writeAllOrNone` in src/App.jsx does this for the Agent API's version
+  // of the same undo, over `src:writeText` instead of `style:writeFile`. Fix
+  // one and fix the other.
   const putFiles = useCallback(
     async (texts) => {
-      for (const [rel, css] of Object.entries(texts)) {
-        if (css == null) continue;
-        await bridge('writeStyleFile', { filePath: `${project.path}/${rel}`, css });
+      const entries = Object.entries(texts).filter(([, css]) => css != null);
+      const before = new Map();
+      for (const [rel] of entries) {
+        try {
+          before.set(rel, await fileText(rel));
+        } catch {
+          before.set(rel, null); // unreadable now is unrestorable later
+        }
       }
-      await refresh();
+      const written = [];
+      const write = (rel, css) => bridge('writeStyleFile', { filePath: `${project.path}/${rel}`, css });
+      try {
+        for (const [rel, css] of entries) {
+          await write(rel, css);
+          written.push(rel);
+        }
+      } catch (err) {
+        for (const rel of written.reverse()) {
+          const was = before.get(rel);
+          if (typeof was !== 'string') continue;
+          try {
+            await write(rel, was);
+          } catch {
+            /* the disk is already refusing; there is nothing further to try */
+          }
+        }
+        throw err; // the ORIGINAL reason, not whatever the rollback ran into
+      }
+      // Out of the failure window on purpose: every file is written by here,
+      // and a sheet re-read that throws must not be reported as an undo that
+      // did not happen.
+      try {
+        await refresh();
+      } catch {
+        /* the write landed; the view catches up on its next read */
+      }
     },
-    [project.path, refresh]
+    [project.path, refresh, fileText]
   );
   /**
    * Run an edit and put it on the undo stack, as the text of the files it

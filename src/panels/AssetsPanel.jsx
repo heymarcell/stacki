@@ -142,14 +142,29 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
       if (payload.rel === destRel || parentOf(payload.rel) === destRel) return;
       const fromDir = parentOf(payload.rel);
       const name = payload.rel.slice(payload.rel.lastIndexOf('/') + 1);
-      const landedRel = destRel ? `${destRel}/${name}` : name;
       const move = (fromRel, toDirRel) =>
         window.avb.moveAsset({ projectPath: project.path, fromRel, toDirRel });
       act(async () => {
-        await move(payload.rel, destRel);
+        const moved = await move(payload.rel, destRel);
+        // WHERE THE FILE ACTUALLY WENT, never where the drop asked for it.
+        //
+        // `assets:move` renames around a collision, so a file dropped into a
+        // folder that already holds that name lands as `logo-1.svg` and the
+        // inverse this used to build — `destRel/name` — named a path the file
+        // is not at. Measured through the same handler on the Agent API side:
+        // the undo moved a DIFFERENT, pre-existing file back over the original,
+        // destroying one and stranding the other, and reported success.
+        // test/asset-undo.js is that defect; this is the panel's half of it.
+        const landed = typeof moved?.rel === 'string' && moved.rel ? moved.rel : null;
+        if (!landed) return; // no landing path, no inverse — a gap in the stack beats a wrong entry
+        // AND A MOVE THAT ALSO RENAMED HAS NO ONE-STEP INVERSE. Putting the
+        // file back where it came from would leave it under the collision's
+        // name, which is not the state ⌘Z promises. Not recorded, the same
+        // answer electron/mcp/agent/index.js gives for the same case.
+        if (landed.slice(landed.lastIndexOf('/') + 1) !== name) return;
         onRecordUndo?.({
           label: `move ${name}`,
-          undo: () => move(landedRel, fromDir),
+          undo: () => move(landed, fromDir),
           redo: () => move(payload.rel, destRel),
         });
       });
@@ -174,15 +189,21 @@ export default function AssetsPanel({ project, showToast, onOpenFile, pick, onPi
     setRenaming(null);
     const clean = value.trim();
     if (!clean || clean === entry.name) return;
-    const dir = parentOf(entry.rel);
-    const toRel = dir ? `${dir}/${clean}` : clean;
     const rename = (rel, newName) => window.avb.renameAsset({ projectPath: project.path, rel, newName });
     act(async () => {
-      await rename(entry.rel, clean);
+      const renamed = await rename(entry.rel, clean);
+      // THE NAME THE FILE IS UNDER, not the name that was typed. `assets:rename`
+      // strips `/` and `\` out of the name, so 'sub/KEEP.svg' lands as
+      // 'subKEEP.svg' and an inverse built from the typed value names a file
+      // that does not exist — an undo that refuses, or worse, finds something
+      // else there. The handler reports where it put it; this reads that.
+      const landed = typeof renamed?.rel === 'string' && renamed.rel ? renamed.rel : null;
+      if (!landed) return; // no landing path, no inverse — a gap in the stack beats a wrong entry
+      const landedName = landed.slice(landed.lastIndexOf('/') + 1);
       onRecordUndo?.({
-        label: `rename to ${clean}`,
-        undo: () => rename(toRel, entry.name),
-        redo: () => rename(entry.rel, clean),
+        label: `rename to ${landedName}`,
+        undo: () => rename(landed, entry.name),
+        redo: () => rename(entry.rel, landedName),
       });
     });
   };

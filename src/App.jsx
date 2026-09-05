@@ -160,6 +160,56 @@ function holdsInlineText(node) {
   return isInlineOnly(kids) || !Array.isArray(kids) || kids.length === 0;
 }
 
+/**
+ * Write a set of files as ONE step, or leave every one of them as it was.
+ *
+ * A HALF-APPLIED INVERSE IS A STATE THE PROJECT WAS NEVER IN. An undo that
+ * spans several files wrote them in a loop with nothing between the writes, so
+ * a file that could not be written stopped the loop with the earlier ones
+ * already rewritten. Measured with one variable renamed across two stylesheets
+ * and the sheet written SECOND made read-only: the first went back to the old
+ * name and the second kept the new one, so the project referenced a variable
+ * no file declared. Neither the state before the edit nor the state after it,
+ * and with the entry off `past` by then, undo could never finish the job.
+ *
+ * So the bytes are read first and put back on the way out. The restore is best
+ * effort -- if the disk is refusing writes it may refuse these too -- and the
+ * error that comes out is the ORIGINAL one, because that is the one that says
+ * why the operation could not happen.
+ *
+ * TWIN: src/panels/VariablesView.jsx has the same function, for the same
+ * reason, over its own stylesheet bridge. Fix one and fix the other.
+ */
+async function writeAllOrNone(entries, { read, write }) {
+  const before = new Map();
+  for (const [rel] of entries) {
+    if (before.has(rel)) continue;
+    try {
+      before.set(rel, await read(rel));
+    } catch {
+      before.set(rel, null); // unreadable now is unrestorable later; say so by having nothing
+    }
+  }
+  const written = [];
+  try {
+    for (const [rel, text] of entries) {
+      await write(rel, text);
+      written.push(rel);
+    }
+  } catch (err) {
+    for (const rel of written.reverse()) {
+      const was = before.get(rel);
+      if (typeof was !== 'string') continue;
+      try {
+        await write(rel, was);
+      } catch {
+        /* the disk is already refusing; there is nothing further to try */
+      }
+    }
+    throw err;
+  }
+}
+
 export default function App() {
   const [project, setProject] = useState(null); // {path, name}
   const [scan, setScan] = useState({ pages: [], layouts: [], components: [] });
@@ -1032,7 +1082,25 @@ export default function App() {
   // write. The turn of the loop before it is the same one and for the same
   // reason: `setPageState`'s updater is where the state actually changes, and
   // `flushSave` reads it through the ref React updates before effects run.
+  //
+  // AND A SAVE THAT REJECTED LEAVES NOTHING BEHIND IT.
+  //
+  // The two halves of this function are not the same kind of thing: the
+  // `setPageState` below changes MEMORY and cannot fail, and the `flushSave`
+  // under it changes DISK and can. Applied in that order with nothing guarding
+  // the second, a rejected save left the editor holding the restored model
+  // while the file still held the edit -- measured with the open page chmod
+  // 0444: `target.read` answered the pristine digest and the bytes on disk
+  // still said `id="edit-a"`, so every subsequent ref and digest check was
+  // answering from the wrong side of the disagreement.
+  //
+  // So the outgoing state is captured first and put back on the way out. The
+  // caller sees the rejection and decides what to do with the stack; what it
+  // must not have to do is repair a page model that half moved.
   const applySnapshot = useCallback(async (entry) => {
+    const priorState = pageStateRef.current.pageState;
+    const priorSelected = selectedIdRef.current;
+    const priorRev = docRevRef.current;
     docRevRef.current += 1; // an undo is a change to the document like any other
     setPageState((s) => {
       if (!s) return s;
@@ -1058,7 +1126,23 @@ export default function App() {
       );
     }
     await new Promise((done) => setTimeout(done, 0));
-    await flushSave();
+    try {
+      await flushSave();
+    } catch (err) {
+      // The document as it was, model and dirty flag and pending restore bytes
+      // together, because it is the disagreement between them that does the
+      // damage. Restored through the same one-turn wait `flushSave` makes, so
+      // the ref the rest of this file reads is the old state again before the
+      // rejection reaches the caller.
+      setPageState(() => priorState);
+      setSelectedId(priorSelected);
+      // Only the bump this call made. Anything else that moved the document
+      // while the save was in flight keeps its revision -- the point is that
+      // NOTHING changed here, not that this is the newest thing that happened.
+      if (docRevRef.current === priorRev + 1) docRevRef.current = priorRev;
+      await new Promise((done) => setTimeout(done, 0));
+      throw err;
+    }
   }, [flushSave]);
 
   const scheduleSaveRef = useRef(null);
@@ -1068,37 +1152,80 @@ export default function App() {
   // its own polling to notice.
   const [historyTick, setHistoryTick] = useState(0);
 
+  // A FAILED UNDO IS NOT HALF AN UNDO. The stack moves with the project or it
+  // does not move at all.
+  //
+  // Both of these used to `pop()` the entry and `push()` it onto the other side
+  // BEFORE running the inverse, so an inverse that threw left the project
+  // untouched and the history already rewound: measured, {past:2,future:0}
+  // became {past:1,future:1} with not one byte different on disk. Three things
+  // followed from that one line, and only the first was ever visible:
+  //
+  //   the next undo undid the command UNDERNEATH the failed one -- the caller
+  //   asked twice for an asset rename to come back and Stacki reverted a
+  //   content edit instead, while the rename stayed applied;
+  //
+  //   once whatever blocked the inverse cleared, the failed entry was on
+  //   `future` and unreachable from `past` for ever, so `project.undo` answered
+  //   "there is nothing to undo" about a change that was still applied;
+  //
+  //   and `redo` could replay a command that had never been undone.
+  //
+  // So the entry is PEEKED, its inverse is run, and the stack moves only after
+  // that resolves. The entry is removed by identity rather than by popping the
+  // end, because the await is long enough for something else to have pushed.
+  const takeOut = (stack, entry) => {
+    const at = stack.lastIndexOf(entry);
+    if (at >= 0) stack.splice(at, 1);
+  };
+
   const undo = useCallback(async () => {
     setHistoryTick((n) => n + 1);
     const h = historyRef.current;
     if (!h.past.length) return null;
     h.lastKey = null;
     h.lastPush = 0;
-    const entry = h.past.pop();
+    const entry = h.past[h.past.length - 1];
     if (entry.kind === 'cmd') {
-      h.future.push(entry);
       // AN INVERSE THAT THREW IS NOT AN UNDO, AND USED TO REPORT AS ONE.
       //
       // The toast tells the person, and a person can see the file did not
       // change. An agent cannot: `project.undo` measured success by whether the
-      // history stack got shorter, and it got shorter at `pop()` above whatever
-      // the inverse did -- so a failed undo answered `ok: true, undone: true`.
+      // history stack got shorter, and it got shorter whatever the inverse did.
       // The failure is carried back on the result instead, where the caller can
       // read it, and the toast is unchanged.
-      let failed = null;
       try {
         await entry.undo();
       } catch (err) {
-        failed = cleanError(err);
+        const failed = cleanError(err);
         showToast(`Couldn’t undo${entry.label ? ` ${entry.label}` : ''}: ${failed}`, 'error');
+        return { kind: 'cmd', files: entry.files || [], failed };
       }
-      return { kind: 'cmd', files: entry.files || [], ...(failed ? { failed } : {}) };
+      takeOut(h.past, entry);
+      h.future.push(entry);
+      return { kind: 'cmd', files: entry.files || [] };
     }
     const state = pageStateRef.current.pageState;
     if (!state) return null; // its page is gone — nothing to restore onto
-    h.future.push(snapshotOf(state));
-    await applySnapshot(entry);
-    return { kind: entry.kind, files: [entry.file || state.file].filter(Boolean) };
+    // The redo point is taken from the state as it is NOW, before anything is
+    // applied, and pushed only if the restore lands. Taking it early and
+    // pushing it late is the whole of the difference: this branch had no
+    // try/catch at all, so a rejected save threw straight out of `undo` past a
+    // `future` that had already grown, and `project.undo` answered
+    // `command_failed` -- not the documented `undo_failed` -- about an entry
+    // nothing could reach any more.
+    const redoPoint = snapshotOf(state);
+    const files = [entry.file || state.file].filter(Boolean);
+    try {
+      await applySnapshot(entry);
+    } catch (err) {
+      const failed = cleanError(err);
+      showToast(`Couldn’t undo: ${failed}`, 'error');
+      return { kind: entry.kind, files, failed };
+    }
+    takeOut(h.past, entry);
+    h.future.push(redoPoint);
+    return { kind: entry.kind, files };
   }, [applySnapshot, showToast]);
 
   const redo = useCallback(async () => {
@@ -1107,25 +1234,36 @@ export default function App() {
     if (!h.future.length) return null;
     h.lastKey = null;
     h.lastPush = 0;
-    const entry = h.future.pop();
+    const entry = h.future[h.future.length - 1];
     if (entry.kind === 'cmd') {
-      h.past.push(entry);
       // The same rule as `undo` above: a redo whose command threw did not
-      // happen, and the caller has to be able to find that out.
-      let failed = null;
+      // happen, and the caller has to be able to find that out -- and to ask
+      // again for the SAME command once the reason is gone.
       try {
         await entry.redo();
       } catch (err) {
-        failed = cleanError(err);
+        const failed = cleanError(err);
         showToast(`Couldn’t redo${entry.label ? ` ${entry.label}` : ''}: ${failed}`, 'error');
+        return { kind: 'cmd', files: entry.files || [], failed };
       }
-      return { kind: 'cmd', files: entry.files || [], ...(failed ? { failed } : {}) };
+      takeOut(h.future, entry);
+      h.past.push(entry);
+      return { kind: 'cmd', files: entry.files || [] };
     }
     const state = pageStateRef.current.pageState;
     if (!state) return null;
-    h.past.push(snapshotOf(state));
-    await applySnapshot(entry);
-    return { kind: entry.kind, files: [entry.file || state.file].filter(Boolean) };
+    const undoPoint = snapshotOf(state);
+    const files = [entry.file || state.file].filter(Boolean);
+    try {
+      await applySnapshot(entry);
+    } catch (err) {
+      const failed = cleanError(err);
+      showToast(`Couldn’t redo: ${failed}`, 'error');
+      return { kind: entry.kind, files, failed };
+    }
+    takeOut(h.future, entry);
+    h.past.push(undoPoint);
+    return { kind: entry.kind, files };
   }, [applySnapshot, showToast]);
 
   // Discrete edits (dropdown, checkbox, drag, delete) save immediately;
@@ -4830,10 +4968,16 @@ export default function App() {
       if (!restore || !project?.path) return false;
       const put = async (which) => {
         if (restore.kind === 'files') {
-          for (const [rel, pair] of Object.entries(restore.files || {})) {
-            if (typeof pair?.[which] !== 'string') continue;
-            await window.avb.writeSourceText({ projectPath: project.path, rel, text: pair[which] });
-          }
+          const entries = Object.entries(restore.files || {})
+            .filter(([, pair]) => typeof pair?.[which] === 'string')
+            .map(([rel, pair]) => [rel, pair[which]]);
+          await writeAllOrNone(entries, {
+            read: async (rel) => {
+              const answer = await window.avb.readSourceText({ projectPath: project.path, rel });
+              return typeof answer?.text === 'string' ? answer.text : null;
+            },
+            write: (rel, text) => window.avb.writeSourceText({ projectPath: project.path, rel, text }),
+          });
         } else if (restore.kind === 'asset_rename') {
           const step = which === 'before' ? restore.back : restore.forward;
           await window.avb.renameAsset({ projectPath: project.path, rel: step.rel, newName: step.name });
@@ -4845,8 +4989,20 @@ export default function App() {
         }
         // The panels reload after their own undo for the same reason: the file
         // it rewrote may be the one on screen.
-        setRefreshKey((k) => k + 1);
-        await reloadOpenPageRef.current?.();
+        //
+        // AND IT CANNOT REPORT A COMPLETED INVERSE AS A FAILED ONE. Every write
+        // above has landed by the time this runs; what is left is the editor
+        // catching up with them. A reload that throws -- the page was deleted,
+        // the parse now fails, the canvas is mid-navigation -- used to come out
+        // of `put` indistinguishable from a write that never happened, so undo
+        // refused, kept the entry, and left the caller retrying an inverse that
+        // had already been applied.
+        try {
+          setRefreshKey((k) => k + 1);
+          await reloadOpenPageRef.current?.();
+        } catch (err) {
+          showToast(`Undone, but the view could not be refreshed: ${cleanError(err)}`, 'error');
+        }
       };
       // WHAT THIS PUTS BACK. Already in hand at every branch of `put` above,
       // and the only place it is known: a command entry carries its inverse and

@@ -1210,16 +1210,46 @@ function renameVariables(projectPath, { renames, markWrite }) {
     });
     if (!hits) continue;
     occurrences += hits;
-    writes.push([abs, next]);
+    // The bytes it went in with travel with it. Cheap here — the file has just
+    // been read — and the only thing that can put it back further down.
+    writes.push([abs, next, text]);
   }
 
   // Written only once every file has been read and rewritten in memory: a
   // half-applied rename is worse than a refused one. Each file is announced as
   // the app's own write just before it happens, so the watcher does not read it
   // back as somebody editing the project from outside.
-  for (const [abs, next] of writes) {
-    markWrite?.(abs);
-    fs.writeFileSync(abs, next, 'utf8');
+  //
+  // AND THAT SENTENCE APPLIES TO THE COMMIT LOOP TOO, WHICH IT DID NOT.
+  //
+  // Checking everything first only rules out the failures this function can see
+  // coming. The loop below can still stop halfway on an I/O error — a file made
+  // read-only, a volume that has gone away — and leave the project in exactly
+  // the state the comment above calls worse than a refused one: one stylesheet
+  // declaring `--gap-large`, another still referencing `--gap`, and nothing
+  // anywhere declaring what it references. So each file that was written is put
+  // back before the original error — the one that says WHY the rename could not
+  // happen — is re-thrown.
+  const written = [];
+  try {
+    for (const [abs, next] of writes) {
+      markWrite?.(abs);
+      fs.writeFileSync(abs, next, 'utf8');
+      written.push(abs);
+    }
+  } catch (err) {
+    const priorOf = new Map(writes.map(([abs, , text]) => [abs, text]));
+    for (const abs of written.reverse()) {
+      const was = priorOf.get(abs);
+      if (typeof was !== 'string') continue;
+      try {
+        markWrite?.(abs);
+        fs.writeFileSync(abs, was, 'utf8');
+      } catch {
+        /* the disk is already refusing writes; there is nothing further to try */
+      }
+    }
+    throw err;
   }
   return { ok: true, files: writes.length, occurrences };
 }

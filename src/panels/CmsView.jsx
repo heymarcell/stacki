@@ -174,8 +174,18 @@ export default function CmsView({
         const put = async (data) => {
           await window.avb.writeCms({ projectPath: project.path, rel, data });
           onDiskRef.current = data;
-          await load();
-          onSaved?.();
+          // THE VIEW CATCHING UP IS NOT PART OF THE UNDO. The bytes are on disk
+          // at the line above; everything after it is this panel re-reading
+          // them. A reload that throws — the collection was deleted, the file
+          // no longer parses — used to come out of `put` looking exactly like a
+          // write that never happened, so `project.undo` refused an undo that
+          // had already been applied and offered to do it again.
+          try {
+            await load();
+            onSaved?.();
+          } catch {
+            /* the write landed; the next read of the collection catches up */
+          }
         };
         onRecordUndo({
           label: 'content edit',

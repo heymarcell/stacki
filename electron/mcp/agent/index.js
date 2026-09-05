@@ -32,6 +32,32 @@ const { patchBetween } = require('./patch');
 const { relativeTo } = require('./paths');
 const { digestOf } = require('./digest');
 
+/**
+ * Every string in a refusal, said the way `withoutHostPaths` says one.
+ *
+ * THE HOLE WAS THAT IT WAS APPLIED TO ONE FIELD. A renderer refusal is an
+ * object, and `message` is only the sentence a person reads; the machinery
+ * beside it carries text too. `project.undo` answers a failed inverse with
+ * `restored.failed`, built in the renderer from `cleanError`, which knows about
+ * ANSI and about Electron's IPC prefix and nothing at all about paths —
+ * measured side by side in one envelope, `message` said "open
+ * 'src/styles/site.css'" and `restored.failed` said "open
+ * '/var/folders/vq/…/src/styles/site.css'". Naming the second field would have
+ * left the third one to find later, so the walk is over the whole answer.
+ */
+function scrubHostPaths(value, root, seen = new WeakSet()) {
+  if (typeof value === 'string') return withoutHostPaths(value, root);
+  if (Array.isArray(value)) return value.map((item) => scrubHostPaths(item, root, seen));
+  if (!value || typeof value !== 'object') return value;
+  // A refusal is plain data, but it is data this process did not build, so a
+  // cycle in it must not be a stack overflow on the way to the wire.
+  if (seen.has(value)) return value;
+  seen.add(value);
+  const out = {};
+  for (const [key, item] of Object.entries(value)) out[key] = scrubHostPaths(item, root, seen);
+  return out;
+}
+
 // What the editor's operations actually take.
 //
 // One normalizer, used by both doors. The single-operation actions are the
@@ -125,6 +151,11 @@ function createAgentApi({
       // with a read, and the observation to check a write against.
       sourceRef: (rel) => sourceRef(rel),
       refObservation: (ref, expectedPath) => refObservation(ref, expectedPath),
+      // And the same pair for a conflicted merge, which is a moment rather
+      // than a file. Minted only here, on the MCP side of the boundary: the
+      // panel gets the plain observation over IPC and never sees a ref.
+      mergeRef: (data, observed) => mergeRef(data, observed),
+      mergeBinding: (ref) => mergeBinding(ref),
       // And how text reaches a file, which is not always the same door.
       writeText: (rel, text) => writeProjectText(rel, text),
     };
@@ -301,6 +332,63 @@ function createAgentApi({
     const ctx = context();
     if (!ctx.root || !rel) return null;
     return refs.mint('source', { path: rel }, { projectRoot: ctx.root, observed: fileObservation(rel) });
+  }
+
+  /**
+   * A ref for the conflict a merge just reported.
+   *
+   * `at` is what the merge measured before it unwound: the two commits it was
+   * between, and a digest of the bytes git wrote for the clash. It goes in the
+   * OBSERVATION, which is exactly what an observation is for — and the branch
+   * goes in the DATA, so resolving takes the branch out of the ref rather than
+   * out of the call. An agent holding two conflicts cannot then answer one of
+   * them into the other by pairing the wrong pair of arguments.
+   *
+   * Minted with no observation, this would be a ref that proves nothing and
+   * refuses nothing — the same hole a writable node ref with no document
+   * behind it was. So it is not minted at all rather than minted hollow.
+   */
+  function mergeRef(data, observed) {
+    const ctx = context();
+    if (!ctx.root || !data?.branch) return null;
+    if (!observed || typeof observed !== 'object' || !observed.head || !observed.incoming || !observed.digest) return null;
+    return refs.mint(
+      'merge',
+      { branch: data.branch, into: data.into ?? null },
+      { projectRoot: ctx.root, observed: { head: observed.head, incoming: observed.incoming, digest: observed.digest } }
+    );
+  }
+
+  /**
+   * What a merge ref binds a resolve to, or the refusal that says why not.
+   *
+   * Absent is `guard_required` rather than `bad_ref`: "you did not say which
+   * conflict" and "that is not a ref" send an agent to two different places,
+   * and only one of them is where the answer is.
+   */
+  function mergeBinding(ref) {
+    if (ref === undefined || ref === null || ref === '') {
+      return {
+        error: no(
+          'guard_required',
+          'Finishing a merge has to say which conflict the choices answer. Run git.merge, and pass the `mergeRef` ' +
+            'its conflict handed you back here, unchanged. Nothing was merged.'
+        ),
+      };
+    }
+    const parsed = readRef(ref, 'merge');
+    if (!parsed.ok) return { error: parsed };
+    const seen = parsed.observed;
+    if (!seen || !seen.head || !seen.incoming || !seen.digest) {
+      return {
+        error: no(
+          'guard_required',
+          'That mergeRef carries no record of the conflict it was made for, so there is nothing to check these ' +
+            'choices against. Run git.merge again and use the ref it hands back. Nothing was merged.'
+        ),
+      };
+    }
+    return { branch: parsed.data?.branch || null, into: parsed.data?.into ?? null, observed: seen };
   }
 
   /**
@@ -482,9 +570,10 @@ function createAgentApi({
     //
     // Applied to the whole class rather than to that one message, because the
     // next renderer-built refusal would have the same hole and no reason to
-    // remember it.
-    if (answer && typeof answer === 'object' && answer.ok === false && typeof answer.message === 'string') {
-      return { ...answer, message: withoutHostPaths(answer.message, context().root) };
+    // remember it — and to the whole ANSWER rather than to `message`, for the
+    // same reason one field down. See `scrubHostPaths`.
+    if (answer && typeof answer === 'object' && answer.ok === false) {
+      return scrubHostPaths(answer, context().root);
     }
     return answer;
   }
