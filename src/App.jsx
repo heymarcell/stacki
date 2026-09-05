@@ -5271,8 +5271,18 @@ export default function App() {
     //   imports.
     //
     // Queued, the two operations do exactly what they say, one after the other.
-    // Nothing inside `extractComponent` joins this queue, so there is no way
-    // for it to wait on itself.
+    //
+    // AND NOTHING RE-ENTERS IT. `extractComponent` awaits four things —
+    // component:create, page:importPathFor, page:delete and the rescan — and
+    // every one of them is main doing filesystem work; none of them asks the
+    // renderer anything back, so this cannot end up waiting on itself. The
+    // PERSON's route is off the queue entirely: `createComponentFromSelection`
+    // (the Components panel, ⌘⇧A) calls `extractComponent` DIRECTLY, so
+    // somebody extracting a component never takes a turn, and neither does ⌘⌫
+    // on the canvas. Only the agent door queues, and a second agent call
+    // arrives as its own MCP request and WAITS, which is the point. Keep it
+    // that way: putting the menu path through `oneAtATime` as well would give
+    // the queue a caller that a queued operation can be waiting for.
     extractComponent: (node, name, options) => oneAtATime(() => extractComponent(node, name, options)),
     preview: () => ({ status: devStatus, url: devUrl || null, device, inPreview }),
     // THE SAME START AND STOP THE APP ITSELF USES.

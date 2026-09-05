@@ -375,6 +375,42 @@ async function startWireRig({
     return { envelope: res.structuredContent, raw: res };
   };
 
+  // THE OTHER HAND ON THE DOCUMENT: the person at the keyboard.
+  //
+  // Every `call()` above is an AGENT, and the four agent doors into the open
+  // document — commit, writeOpenSource, undo/redo and extractComponent — are on
+  // the renderer's serialising queue, so one agent call can no longer land
+  // inside another. That is the point of the queue, and it means an agent call
+  // is no longer able to play the part of a concurrent change arriving DURING
+  // an operation.
+  //
+  // A person still is. ⌘⌫ on the canvas is a `keydown` on the document, handled
+  // by the App's own shortcut effect, which calls `removeNode` -> `mutateModel`
+  // and takes no queue at all — the same unqueued path the menu's "make a
+  // component" uses. So a scenario that needs a real edit to land mid-operation
+  // presses the key, exactly as the user would.
+  //
+  // The window is captured HERE rather than read off `global` at press time:
+  // `H.start` puts its jsdom on the globals, and a later rig would otherwise
+  // steer this one's keystrokes into someone else's document.
+  const win = global.window;
+  const doc = global.document;
+  /** One keystroke, on the document, where the App's shortcut effect listens. */
+  const press = (key, init = {}) => {
+    doc.dispatchEvent(new win.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init }));
+  };
+  /**
+   * Delete whatever is selected in Stacki, the way a person does.
+   *
+   * Then wait: `removeNode` schedules the save rather than awaiting one, so
+   * without a turn of the loop the removal is in the model and not yet on disk,
+   * and a scenario reading the file would be told the person had done nothing.
+   */
+  const deleteSelection = async (ms = 120) => {
+    press('Backspace');
+    await H.settle(ms);
+  };
+
   let stopped = false;
   let stopProblems = [];
   const stop = async () => {
@@ -434,7 +470,7 @@ async function startWireRig({
     return { problems: stopProblems };
   };
 
-  return { root, harness, client, call, tool, stop, url, token, port, withDeps, realDevServer };
+  return { root, harness, client, call, tool, press, deleteSelection, stop, url, token, port, withDeps, realDevServer };
 }
 
 module.exports = { startWireRig, astroCached };
