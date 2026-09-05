@@ -24,6 +24,10 @@ const fs = require('node:fs');
 const { resolveInProject, relativeTo, toPosix } = require('./paths');
 const { digestOf, digestOfFile, checkDigest } = require('./digest');
 const { originOf, projectOriginTest } = require('../../projectOrigin.js');
+// Only for `unreadMarkers`: whether a conflicted file's markers were actually
+// read. See the git.merge conflict envelope, which used to describe a file git
+// reported as conflicting as having zero conflicting hunks.
+const { unreadMarkers } = require('../../conflicts.js');
 
 const problem = (code, message, extra = {}) => ({ error: { ok: false, code, message, ...extra } });
 
@@ -1601,7 +1605,29 @@ const git = {
           // not carry twice. A conflict in one line of a three-hundred-line page
           // is one clash and three hundred lines of settled text; the settled
           // text is already on disk, unchanged, because the merge was unwound.
-          const clashes = Array.isArray(f?.parts) ? f.parts.filter((part) => part && part.kind === 'clash') : null;
+          //
+          // AND AN EMPTY LIST OF HUNKS IS A CLAIM, NOT AN ABSENCE OF ONE.
+          //
+          // `parts` is a forgiving parse: anything it cannot read as a conflict
+          // block it keeps verbatim as agreed text, so a file whose markers it
+          // could not read comes back with NO clashes in it — and this then
+          // sent `{hunks: [], hunksOmitted: false}` for a file git had just
+          // reported as conflicting, under an instruction telling the agent to
+          // send "exactly as many entries as the hunks listed here". Zero, for
+          // a file that has some. MEASURED with `*.txt text eol=crlf`, whose
+          // markers carry the file's '\r' and defeated the marker regexes
+          // outright; those are fixed, and this is the shape rather than the
+          // cause, because no list of parser fixes can promise the shape will
+          // not recur.
+          //
+          // So such a file says so. `hunks: null` — the same "there is no list
+          // to answer here" the binary case already gives — plus the field that
+          // separates the two, because their remedies differ: a binary file
+          // takes a whole-file word, and this one cannot be answered through
+          // resolve_merge at all (it refuses the path by name).
+          const parts = Array.isArray(f?.parts) ? f.parts : null;
+          const unread = parts ? unreadMarkers(parts) : false;
+          const clashes = parts && !unread ? parts.filter((part) => part && part.kind === 'clash') : null;
           const encoded = JSON.stringify(clashes ?? null);
           const bytes = Buffer.byteLength(encoded, 'utf8');
           const fits = bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES;
@@ -1611,6 +1637,7 @@ const git = {
             sourcePath: sourcePathOf(f?.path),
             hunks: fits ? clashes : null,
             hunksOmitted: !fits,
+            markersUnread: unread,
           };
         });
         // THE HANDLE THAT SAYS WHICH CONFLICT THIS IS.
@@ -1650,7 +1677,10 @@ const git = {
           // whole of both sides, and this does not.
           note:
             'Each side\'s complete file is not included here. Read the conflicting hunks above, or the files ' +
-            'themselves — the merge was unwound, so they hold the pre-merge bytes. Mind the two path spaces: ' +
+            'themselves — the merge was unwound, so they hold the pre-merge bytes. A file whose ' +
+            '`markersUnread` is true is one git reports as conflicting whose markers could not be read: it has ' +
+            'no hunk list to answer and git.resolve_merge refuses every answer for it, so that one has to be ' +
+            'finished in the project by hand. Mind the two path spaces: ' +
             '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
             '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
             'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +
@@ -1792,6 +1822,17 @@ const git = {
           empty: `"${first.path}" was given an empty list of answers, which answers none of its hunks`,
           null: `"${first.path}" was given null, which is neither an answer nor leaving the file out`,
           not_splittable: `"${first.path}" has no hunks to answer one at a time \u2014 it takes "ours" or "theirs" for the whole file`,
+          // THE ONE REFUSAL THAT HAS NO ANSWER TO SUGGEST. The file still holds
+          // conflict markers this could not read, so the hunk list it was
+          // described with was empty for a file git says is conflicted — and
+          // every word in the vocabulary would be answering that false
+          // description, the deliberate "theirs" as much as the whole-file
+          // default the panel used to fabricate. `markersUnread` on the
+          // git.merge envelope names the same files in advance.
+          unreadable_conflict:
+            `"${first.path}" still holds conflict markers Stacki could not read, so it was listed with no hunks ` +
+            'while git reports it as conflicting \u2014 nothing that can be sent for that path would be answering the ' +
+            'real file, and this merge has to be finished in the project by hand',
           bad_pick: `"${first.given}" is not one of the answers a hunk of "${first.path}" can take`,
           bad_value: `"${first.given}" is not one of the answers "${first.path}" can take`,
           bad_shape: `the choice for "${first.path}" is a ${first.given}, which is neither a word nor a list of them`,

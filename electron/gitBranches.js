@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('node:crypto');
-const { parseConflict, renderResolved, clashCount, conflictAtEnd } = require('./conflicts');
+const { parseConflict, renderResolved, clashCount, conflictAtEnd, unreadMarkers } = require('./conflicts');
 
 // Merging a branch and deleting one.
 //
@@ -341,9 +341,29 @@ function conflictDigest(at, files) {
  * project inside its repository. `--end-of-options` is here for the same reason
  * as everywhere else in this file: nothing after it is read as a flag.
  */
+/**
+ * AND THE READ IS NOT ALLOWED TO GIVE UP QUIETLY AT ONE MEGABYTE.
+ *
+ * The runner underneath is `child_process.execFile`, whose `maxBuffer` defaults
+ * to 1 MiB — and this shells out with no options at all, so a conflicting file
+ * whose side is bigger than that rejected with
+ * ERR_CHILD_PROCESS_STDIO_MAXBUFFER and the `catch` below turned it into the
+ * same `null` a DELETED side answers with. The two are not the same thing. A
+ * null here switches off renderResolved's final-newline correction, silently,
+ * for exactly the files most likely to be a person's real work; the only
+ * symptom is a merge commit one byte different from the branch it came from.
+ *
+ * A megabyte is not a large source file by accident of anything — a generated
+ * data file, a bundled asset committed by hand, a long page — so the bound is
+ * raised to something no text file a person edits will reach, and it is stated
+ * here rather than inherited from a default nobody chose. `opts` is the third
+ * argument main.js's runner already takes; a runner that takes two ignores it.
+ */
+const STAGE_MAX_BUFFER = 64 * 1024 * 1024;
+
 async function stage(git, projectPath, n, file) {
   try {
-    return (await git(projectPath, ['show', '--end-of-options', `:${n}:${file}`])).stdout;
+    return (await git(projectPath, ['show', '--end-of-options', `:${n}:${file}`], { maxBuffer: STAGE_MAX_BUFFER })).stdout;
   } catch {
     return null;
   }
@@ -755,10 +775,45 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // call with the SAME mergeRef is what to retry once whatever held the
     // repository has let go.
     //
-    // No `merge --abort` here, for the same reason the working-tree refusal
-    // above does not: an empty unmerged list is the evidence that this merge
-    // wrote nothing, and firing an abort into a repository another process is
-    // in the middle of using is the one way to turn a wait into damage.
+    // AND AN EMPTY UNMERGED LIST IS NOT EVIDENCE THAT THIS MERGE WROTE
+    // NOTHING.
+    //
+    // That is what the comment here used to claim, and the sentence below —
+    // "Nothing was merged and nothing was written" — rested on it. It is false.
+    // `git merge --no-commit --no-ff` writes the merged WORKING TREE first and
+    // can fail partway through doing it: a directory it cannot write into, a
+    // full disk, a file something else has locked. What it leaves behind is the
+    // files it had already created, with not one unmerged entry in the index —
+    // which is precisely the shape that lands here.
+    //
+    // MEASURED, real git, no stubs: `feature` adds `src/pages/incoming.astro`
+    // and a file under a directory chmod 500, `main` and `feature` also clash
+    // in a.txt. The trial merge died on `error: unable to create file
+    // zz/locked.txt: Permission denied`, `diff --diff-filter=U` was EMPTY, and
+    // this answered `merge_blocked` — "Nothing was merged and nothing was
+    // written" — over a working tree that now contained
+    // `src/pages/incoming.astro`, a file from the incoming branch that Stacki's
+    // own page scan lists as a page of the CURRENT branch and that the next
+    // `git add -A` commits onto it. The remedy the sentence gives cannot work
+    // for this cause either: the same failure recurs on every retry and each
+    // one leaves more behind.
+    //
+    // So this path is measured like every other post-trial-merge refusal:
+    // `treeBefore` against `treeNow()`, and `merge_stuck` when they differ.
+    //
+    // The abort is still CONDITIONAL on that difference, and the old reasoning
+    // is why. When git wrote nothing there is nothing to unwind, and firing
+    // `merge --abort` into a repository another process is holding — the
+    // ordinary `index.lock` case, which is what this refusal is mostly for — is
+    // the one way to turn a wait into damage. A tree that differs is the
+    // evidence that there IS something to unwind, and only then is it asked
+    // for. `abort` re-measures afterwards, so a merge that unwinds cleanly
+    // falls through to the sentence below with the sentence now true.
+    const residue = changedSince(treeBefore, await treeNow());
+    if (residue.length) {
+      const stuck = await abort();
+      if (stuck) return stuck;
+    }
     const said = String(blocked?.stderr || blocked?.message || blocked?.stdout || '')
       .split('\n')
       .map((line) => line.trim())
@@ -986,6 +1041,49 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   }
   for (const file of left) {
     const choice = choices?.[file];
+    // A FILE GIT MARKED UP THAT THIS COULD NOT READ IS A REFUSAL, NOT AN
+    // "ours".
+    //
+    // Everything below decides what a caller is allowed to SAY. Nothing below
+    // asks whether the description the caller was answering was true — and
+    // when the parse cannot read git's markers it is not: the file comes back
+    // as one agreed run, clashCount() is 0, and both surfaces then describe a
+    // file git reported as conflicting as having no conflicting hunks. The
+    // panel's choicesForSend() turns an empty hunk list into the whole-file
+    // word "ours" (list[0] of an empty list), which is legal vocabulary, so the
+    // all-or-nothing validator — whose stated job is to stop exactly this —
+    // passed it, `git checkout --ours` ran, and the incoming branch's work was
+    // committed away under `{ok: true, resolved: 1}` with the branch then
+    // recorded as merged so safe-delete stopped protecting it. MEASURED end to
+    // end with `*.txt text eol=crlf`; see the marker regexes in conflicts.js,
+    // which is where that particular way of arriving here was fixed.
+    //
+    // The regexes are the cause that was found. This is the class: a whole-file
+    // default must never be reached BECAUSE the file could not be read, and no
+    // list of parser fixes can promise that on its own. So the shape is refused
+    // by name, for every answer alike — the deliberate "theirs" as much as the
+    // silent default, because the caller who typed it was answering the same
+    // false description of the file.
+    if (unreadMarkers(partsOf(file))) {
+      unusable.push({
+        path: file,
+        given:
+          choice === undefined
+            ? 'ours'
+            : Array.isArray(choice)
+              ? `${choice.length} answers`
+              : typeof choice === 'string'
+                ? choice
+                : typeof choice,
+        reason: 'unreadable_conflict',
+        // Nothing can be sent for this path. Left empty deliberately: an
+        // `expected` listing words that will be refused again is worse than
+        // none.
+        expected: [],
+        ...(choice === undefined ? { byDefault: true } : {}),
+      });
+      continue;
+    }
     // Narrowed to `undefined`. An explicit null used to be read as an
     // omission, so "I have not decided about this file" and "I have decided,
     // and here is nothing" produced the same silent `--ours`.
@@ -1107,7 +1205,11 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // or, in the second case, it has none, and the vocabulary cannot say
     // anything about it at all. See noSide.
     const also =
-      first.reason === 'no_such_side'
+      first.reason === 'unreadable_conflict'
+        ? ` "${first.path}" still holds conflict markers Stacki could not read, so it was described as having ` +
+          'no disagreements when git says it has some. Nothing that could be sent for it would be answering ' +
+          'the real file. Finish that one in the project by hand.'
+        : first.reason === 'no_such_side'
         ? ` "${first.path}" exists on only one branch here — the other deleted it — so it takes ` +
           `${(first.sides || []).map((side) => `"${side}"`).join(' or ')} and nothing else, ` +
           'and accepting the deletion means keeping the file now and deleting it in a commit of its own.'
@@ -1145,6 +1247,31 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
         const sides = conflictAtEnd(parts)
           ? { ours: await stage(git, projectPath, 2, file), theirs: await stage(git, projectPath, 3, file) }
           : null;
+        // AND A SIDE THAT IS THERE BUT WOULD NOT READ IS NOT A SIDE THAT IS NOT
+        // THERE.
+        //
+        // `stage` answers null for both, and renderResolved reads null as "that
+        // side deleted the file, so git's own terminator is the only one there
+        // is" — which silently switches the final-newline correction off. For a
+        // deletion that is right. For a read that failed it is a merge commit
+        // one byte away from the branch it came from, with nothing anywhere
+        // saying so. The index knows which of the two this is, and it was
+        // already asked: `sidesByFile` is the stage map the validator built,
+        // and it is consulted only when it was ADOPTED, so a repository that
+        // would not answer still merges rather than being refused on a guess.
+        //
+        // Raising the read's bound (see STAGE_MAX_BUFFER) is what makes this
+        // rare; saying so out loud is what makes it not silent.
+        const unread = sides && sidesByFile.has(file)
+          ? ['ours', 'theirs'].find((side) => sides[side] === null && sidesOf(file).includes(side))
+          : null;
+        if (unread) {
+          throw new Error(
+            `Could not read the ${unread === 'theirs' ? 'incoming' : 'current'} branch's version of "${file}" out of ` +
+              'the merge, and the conflict runs to the end of that file — so whether it ends in a newline could not ' +
+              'be settled without guessing.'
+          );
+        }
         fs.writeFileSync(path.join(at, file), renderResolved(parts, choice, sides));
       } else {
         // One answer for the whole file. Defaults to keeping what is on this

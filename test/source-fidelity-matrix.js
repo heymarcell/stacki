@@ -1574,7 +1574,7 @@ const RULE_IN = {
   // A plain rule in a plain stylesheet -- the shape the residual named.
   stylesheet: (files) => {
     files['src/styles/site.css'] = `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space: pre; }\n`;
-    return ['src/styles/site.css', '.preserved { white-space: pre; }'];
+    return ['src/styles/site.css', '.preserved { white-space: pre; }', 'white-space: pre'];
   },
   // The same rule with an at-rule in front of it. Whether the media query
   // matches is a question about a viewport, and this scan is not allowed to
@@ -1582,14 +1582,31 @@ const RULE_IN = {
   media: (files) => {
     files['src/styles/site.css'] =
       `${H.FIXTURE['src/styles/site.css']}\n@media screen and (min-width: 1px) {\n  .preserved { white-space: pre; }\n}\n`;
-    return ['src/styles/site.css', '@media screen and (min-width: 1px)'];
+    return ['src/styles/site.css', '@media screen and (min-width: 1px)', 'white-space: pre'];
   },
   // AND A `<style>` BLOCK, which is not a stylesheet at all. `findStylesheets`
   // walks `.css` files; a rule an author wrote in the layout that wraps every
   // page is invisible to it, and was measured missing along with the rest.
   'style-block': (files) => {
     files['src/layouts/Base.astro'] = `${H.FIXTURE['src/layouts/Base.astro']}<style>\n.preserved { white-space: pre; }\n</style>\n`;
-    return ['src/layouts/Base.astro', '<style>'];
+    return ['src/layouts/Base.astro', '<style>', 'white-space: pre'];
+  },
+  // AND THE LONGHAND THE SCANNER KEYED PAST. `white-space-collapse: preserve`
+  // is what the shorthand in every shape above EXPANDS to, and it renders the
+  // same leading spaces -- measured in Blink, 115.59px against 96.33px over the
+  // same reindent. The reducer asked for the property NAME, so this rule
+  // contributed no token at all and the scan's answer for the whole project was
+  // the empty set, which is read as the positive "nothing here preserves
+  // whitespace". This is the same end-to-end byte oracle as the shorthand, on
+  // the same fixture, through the same running app.
+  longhand: (files) => {
+    files['src/styles/site.css'] =
+      `${H.FIXTURE['src/styles/site.css']}\n.preserved { white-space-collapse: preserve; }\n`;
+    return [
+      'src/styles/site.css',
+      '.preserved { white-space-collapse: preserve; }',
+      'white-space-collapse: preserve',
+    ];
   },
 };
 
@@ -1597,7 +1614,7 @@ async function stylesheetPreservedWhitespace(shape, where = 'stylesheet') {
   const label = `[css ${shape.id}/${where}]`;
   const { source, inner, raised } = preservedFixture(shape);
   const files = { [PAGE]: source };
-  const [ruleFile, ruleText] = RULE_IN[where](files);
+  const [ruleFile, ruleText, ruleDecl] = RULE_IN[where](files);
   const root = H.makeProject(files);
   const app = await H.start(root, { agentMode: 'full' });
   await H.settle(400);
@@ -1605,7 +1622,7 @@ async function stylesheetPreservedWhitespace(shape, where = 'stylesheet') {
     if (
       !check(
         `${label} the rule is in a file on disk`,
-        app.exists(ruleFile) && app.read(ruleFile).includes(ruleText) && app.read(ruleFile).includes('white-space: pre'),
+        app.exists(ruleFile) && app.read(ruleFile).includes(ruleText) && app.read(ruleFile).includes(ruleDecl),
         short(app.read(ruleFile).slice(-80))
       ) ||
       !check(`${label} opening the project does not rewrite the page`, app.read(PAGE) === source, short(changedSpan(source, app.read(PAGE)))) ||
@@ -2624,7 +2641,17 @@ async function theScanThatRanOnEverySave() {
  * it that does declare the property.
  */
 function aDescendantThatDeclaresIt() {
-  for (const attr of [`style='white-space: pre'`, `class='whitespace-pre'`, `class='plain'`]) {
+  // `white-space-collapse: preserve` is in here because looking DOWN is a third
+  // reader with a fourth regex -- `PRESERVES_SPACE`, asked of the whole
+  // attribute -- and it keyed on the property name like the rest. Measured
+  // before the fix: the section moved out with the longhand two levels below it
+  // came back reindented, and the descendant's rendered spaces went with it.
+  for (const attr of [
+    `style='white-space: pre'`,
+    `style='white-space-collapse: preserve'`,
+    `class='whitespace-pre'`,
+    `class='plain'`,
+  ]) {
     const preserved = !attr.includes('plain');
     const label = `[descendant ${attr}]`;
     const inner = 'alpha\n      beta\ngamma';
@@ -4364,6 +4391,365 @@ function theStampForAStylesheetHandedIn() {
   );
 }
 
+/**
+ * T19 -- `white-space-collapse`, THE PROPERTY THE WHOLE GUARD KEYED PAST.
+ *
+ * Every reader in this mechanism asked for the property NAME `white-space`: the
+ * inline `style` attribute and the arbitrary property in a class list in
+ * electron/astroParser.js, and the stylesheet scan in
+ * electron/whitespaceRules.js. `white-space` is a SHORTHAND in CSS Text 4 and
+ * `white-space-collapse` is the longhand that decides THIS question, so
+ * `white-space-collapse: preserve` -- the same statement, and what the
+ * shorthand expands to -- was read as the positive answer "this element does
+ * not preserve its whitespace". Measured at this suite's own head, on the same
+ * fixture the shorthand half uses: a move out of `<div style='white-space-
+ * collapse: preserve'>` came back `alpha\n      beta\ngamma` from an authored
+ * `alpha\n        beta\ngamma`, two rendered spaces deleted with `ok: true`; an
+ * insert into it wrote four spaces of rendered content in front of the new
+ * child; and `tokensInCss('.preserved { white-space-collapse: preserve }')`
+ * answered `[]`, which is not "unknown" but "no rule in this project preserves
+ * whitespace".
+ *
+ * AND THE VALUE TABLE IS THE LONGHAND'S OWN, which is what a fix that merely
+ * adds the new property NAME gets wrong in the other direction. Measured in a
+ * real Blink window over the same reindent, with the same range-width oracle
+ * that produced 115.59px against 96.33px for the shorthand: `preserve` and
+ * `break-spaces` move the line, `collapse` and `preserve-breaks` -- the
+ * longhand spelling of `pre-line` -- leave it at 38.53px either way.
+ * `preserve-spaces` is in the spec, preserves spaces by definition, and is not
+ * implemented in this Electron's Blink at all; it refuses anyway, because that
+ * error costs a reindent and the other costs bytes.
+ *
+ * Asked of both flags, because they are wrong in opposite directions: the wide
+ * one deletes rendered spaces out of a block it reindents, the acting one
+ * writes four spaces of rendered content in front of a new child.
+ */
+const COLLAPSE_VALUES = [
+  { value: 'preserve', refuses: true },
+  { value: 'preserve-spaces', refuses: true },
+  { value: 'break-spaces', refuses: true },
+  { value: 'collapse', refuses: false },
+  { value: 'preserve-breaks', refuses: false },
+  // The same admission the shorthand makes, for the same reason: a value
+  // nothing can read statically counts as preserving for the wide flag.
+  { value: 'var(--ws)', refuses: true },
+];
+
+/**
+ * THE SHORTHAND AND THE LONGHAND IN ONE ATTRIBUTE ARE ONE PROPERTY, resolved
+ * once. Reading only `white-space` missed the longhand outright; reading the
+ * two apart gets their order backwards. Every row was measured in the Blink
+ * window described above, on the same reindent.
+ */
+const COLLAPSE_CASCADE = [
+  ['white-space: pre; white-space-collapse: collapse', false],
+  ['white-space-collapse: collapse; white-space: pre', true],
+  ['white-space-collapse: preserve; white-space: normal', false],
+  ['white-space: normal; white-space-collapse: preserve', true],
+  ['white-space-collapse: collapse !important; white-space: pre', false],
+  ['white-space: pre; white-space-collapse: collapse !important', false],
+  // The OTHER longhand of the same shorthand, which cannot reach this question
+  // at all: wrapping is not collapsing, and Blink still measured 115.59px.
+  ['white-space: pre; text-wrap: wrap', true],
+  ['white-space: pre; text-wrap-mode: wrap', true],
+];
+
+/** The wide flag: does a block moved OUT of this element travel as authored? */
+function widelyHolds(style, label) {
+  const source = commentedPage(
+    `  <div class='outer'>\n    <div style='${style}'>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </div>\n  </div>\n`
+  );
+  const parsed = parsePage(source);
+  if (!check(`${label} the wide-flag page parses`, parsed.editable === true, short(parsed.reason))) return null;
+  const model = structuredClone(parsed.model);
+  const outer = model.nodes[0].children.find((n) => n.name === 'div');
+  const box = outer?.children?.find((n) => n.name === 'div');
+  const moved = box?.children?.find((n) => n.name === 'div');
+  if (!check(`${label} the block is where a move can reach it`, !!moved, short(box?.children?.map((n) => n.name)))) return null;
+  box.children = box.children.filter((n) => n !== moved);
+  outer.children.push(moved);
+  const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(anchoredSerialize(source, model));
+  return got ? got[1] : null;
+}
+
+function theLonghandTheGuardKeyedPast() {
+  const inner = 'alpha\n      beta\ngamma';
+  const raised = 'alpha\n    beta\ngamma';
+  const kept = `    <span class='kept'>one</span>`;
+
+  for (const { value, refuses } of COLLAPSE_VALUES) {
+    const label = `[collapse ${value}]`;
+    // --- THE WIDE FLAG, on the same fixture and the same move as T3.
+    const source = commentedPage(
+      `  <div class='outer'>\n    <div class='wrap'>\n      <p style='white-space-collapse: ${value}'>${inner}</p>\n    </div>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const wrap = outer?.children?.find((n) => n.name === 'div');
+    const p = wrap?.children?.find((n) => n.name === 'p');
+    if (!check(`${label} the block is where a move can reach it`, !!p, short(wrap?.children?.map((n) => n.name)))) continue;
+    wrap.children = wrap.children.filter((n) => n !== p);
+    outer.children.splice(1, 0, p);
+    const after = anchoredSerialize(source, model);
+    if (!check(`${label} the move empties the wrap`, /<div class='wrap'>\s*<\/div>/.test(after), short(changedSpan(source, after)))) continue;
+    const got = /<p [^>]*>([\s\S]*?)<\/p>/.exec(after);
+    check(
+      refuses
+        ? `${label} a longhand value the browser renders differently after a reindent refuses it`
+        : `${label} a longhand value the browser renders the SAME after a reindent still allows it`,
+      !!got && got[1] === (refuses ? inner : raised),
+      short({ want: refuses ? inner : raised, got: got ? got[1] : null })
+    );
+
+    // --- AND THE SCANNER'S HALF OF THE SAME TABLE, which contributed nothing
+    //     at all for every one of these values.
+    const tokens = WS.tokensInCss(`.card { white-space-collapse: ${value}; }`);
+    check(
+      `${label}   and the stylesheet scanner says the same thing`,
+      tokens.has('.card') === refuses && tokens.size === (refuses ? 1 : 0),
+      short([...tokens])
+    );
+  }
+
+  // --- THE ACTING FLAG, which writes rather than abstains. A `var()` is a
+  //     could and not evidence, exactly as it is for the shorthand.
+  for (const [value, acts] of [
+    ['preserve', true],
+    ['break-spaces', true],
+    ['collapse', false],
+    ['preserve-breaks', false],
+    ['var(--ws)', false],
+  ]) {
+    const label = `[collapse acting ${value}]`;
+    const style = `white-space-collapse: ${value}`;
+    const source = commentedPage(`  <div style='${style}'>\n${kept}\n  </div>\n`);
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const box = model.nodes[0].children.find((n) => n.name === 'div');
+    if (!check(`${label} the div is where an insert can reach it`, !!box, short(model.nodes[0].children.map((n) => n.name)))) continue;
+    box.children.push({ kind: 'element', name: 'p', props: {}, children: [{ kind: 'text', value: 'new' }] });
+    const after = anchoredSerialize(source, model);
+    const held = /<div [^>]*>([\s\S]*?)<\/div>/.exec(after);
+    check(
+      acts
+        ? `${label} an element KNOWN to render its children's indentation takes the insert at column zero`
+        : `${label} an element not known to render it takes the file's own indent`,
+      (held ? held[1] : null) === `\n${kept}\n${acts ? '' : '    '}<p>new</p>\n  `,
+      short({ got: held ? held[1] : null })
+    );
+  }
+
+  // --- THE SHORTHAND AND THE LONGHAND TOGETHER, against what Blink measured.
+  for (const [style, holds] of COLLAPSE_CASCADE) {
+    const label = `[collapse cascade ${style}]`;
+    const got = widelyHolds(style, label);
+    if (got === null) continue;
+    check(
+      holds
+        ? `${label} resolves to a preserving value, so the moved block travels as authored`
+        : `${label} resolves to a dropping value, so the moved block is reindented`,
+      got === (holds ? 'alpha\n        beta\ngamma' : 'alpha\n      beta\ngamma'),
+      short({ got })
+    );
+  }
+
+  // --- AND THE VALUE THAT TURNS INHERITANCE BACK OFF, which is the same table
+  //     read the other way and had no assertion of its own at all: a mutation
+  //     putting `normal|nowrap` back where `collapse` now stands -- so that
+  //     nothing could ever match, because the shorthand is expanded before it
+  //     is classified -- left the whole suite green. Inheritance is overridable,
+  //     and an element that says `collapse` under an ancestor that says
+  //     `preserve` renders no leading spaces of its own; without this the safe
+  //     direction quietly becomes the only direction and the mechanism stops
+  //     being a narrowing. The `class='plain'` row is the positive control: with
+  //     nothing to cancel the ancestor, the same block travels as authored.
+  for (const [attr, cancels] of [
+    [`style='white-space: normal'`, true],
+    [`style='white-space: nowrap'`, true],
+    [`style='white-space-collapse: collapse'`, true],
+    [`class='plain'`, false],
+  ]) {
+    const label = `[collapse cancels ${attr}]`;
+    const source = commentedPage(
+      `  <div style='white-space: pre'>\n    <section ${attr}>\n      <div class='wrap'>\n        <p>alpha\n        beta\ngamma</p>\n      </div>\n    </section>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const section = outer?.children?.find((n) => n.name === 'section');
+    const wrap = section?.children?.find((n) => n.name === 'div');
+    const moved = wrap?.children?.find((n) => n.name === 'p');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(wrap?.children?.map((n) => n.name)))) continue;
+    wrap.children = wrap.children.filter((n) => n !== moved);
+    section.children.splice(1, 0, moved);
+    const got = /<p>([\s\S]*?)<\/p>/.exec(anchoredSerialize(source, model));
+    check(
+      cancels
+        ? `${label} cancels the ancestor's preserved whitespace, so the block is reindented`
+        : `${label} says nothing, so the ancestor's answer still holds the block's bytes`,
+      !!got && got[1] === (cancels ? 'alpha\n      beta\ngamma' : 'alpha\n        beta\ngamma'),
+      short({ got: got ? got[1] : null })
+    );
+  }
+
+  // --- AND THE DECLARATION SPELLED INTO A CLASS LIST. Tailwind's arbitrary
+  //     property is CSS, not a named utility, and it is unconditional -- so it
+  //     is evidence for both flags, exactly as `[white-space:pre]` is.
+  for (const [cls, holds] of [
+    ['[white-space-collapse:preserve]', true],
+    ['[white-space-collapse:break-spaces]', true],
+    ['[white-space-collapse:collapse]', false],
+  ]) {
+    const label = `[collapse class ${cls}]`;
+    const source = commentedPage(
+      `  <div class='outer'>\n    <div class='${cls}'>\n      <div class='moved'>alpha\n        beta\ngamma</div>\n    </div>\n  </div>\n`
+    );
+    const parsed = parsePage(source);
+    if (!check(`${label} the page parses`, parsed.editable === true, short(parsed.reason))) continue;
+    const model = structuredClone(parsed.model);
+    const outer = model.nodes[0].children.find((n) => n.name === 'div');
+    const box = outer?.children?.find((n) => n.name === 'div');
+    const moved = box?.children?.find((n) => n.name === 'div');
+    if (!check(`${label} the block is where a move can reach it`, !!moved, short(box?.children?.map((n) => n.name)))) continue;
+    box.children = box.children.filter((n) => n !== moved);
+    outer.children.push(moved);
+    const got = /<div class='moved'>([\s\S]*?)<\/div>/.exec(anchoredSerialize(source, model));
+    check(
+      holds
+        ? `${label} the arbitrary property in a class list is read as the declaration it is`
+        : `${label} and its dropping value is not read as a preserving one`,
+      !!got && got[1] === (holds ? 'alpha\n        beta\ngamma' : 'alpha\n      beta\ngamma'),
+      short({ got: got ? got[1] : null })
+    );
+  }
+}
+
+/**
+ * T20 -- THE WALK WAS BOUNDED AND THE WORK WAS NOT.
+ *
+ * `MAX_ENTRIES` and `MAX_MS` bound the DIRECTORY WALK. The phase that does the
+ * actual work -- a `statSync`, a `readFileSync` and a `postcss.parse` for every
+ * file the walk handed back -- had no entry bound and no time bound at all, and
+ * it runs on the same synchronous Electron-main-process `page:write` path. A
+ * walk that stops at twenty thousand entries can still hand back twenty
+ * thousand stylesheets, and the app then blocks reading and parsing all of
+ * them: no repaint, no IPC, the write neither completing nor refusing. That is
+ * the same failure class as the FIFO in T13 and the symlinked home directory in
+ * T12, reached by a third road.
+ *
+ * BOTH HALVES ARE ASSERTED, and both must contribute ANY rather than a partial
+ * answer: a short file list is not a project with few rules, it is the positive
+ * claim "nothing here preserves whitespace", which is the claim that reindents
+ * rendered content away.
+ *
+ *   * the COUNT, driven with real files, and pinned to the file cap rather than
+ *     the walk's entry cap by a premise on how many entries the fixture has;
+ *   * the TIME, driven by making every read of this fixture genuinely slow,
+ *     which is the shape the budget exists for -- a network mount or a
+ *     spun-down disk, where no count bounds the work. The oracle is that the
+ *     answer STOPPED SHORT: it carries the sentinel and is missing tokens the
+ *     same tree hands back when its reads are fast.
+ */
+function theWorkTheWalkDidNotBound() {
+  const { source, inner, raised } = preservedFixture({ ind: '  ', eol: '\n' });
+
+  // --- THE COUNT.
+  const root = H.makeProject({});
+  const room = path.join(root, 'src', 'many');
+  fs.mkdirSync(room, { recursive: true });
+  fs.writeFileSync(path.join(room, 'keeps.css'), '.preserved { white-space: pre; }\n', 'utf8');
+  WS.forgetCache();
+  const underCap = [...WS.preservingTokens(root)];
+  for (let i = 0; i < 2100; i += 1) fs.writeFileSync(path.join(room, `f${i}.css`), '');
+  const entries = fs.readdirSync(room).length;
+  WS.forgetCache();
+  const tokens = WS.preservingTokens(root);
+  const overCap = [...tokens];
+  const text = raiseHeadless(source, 'preserved', tokens);
+  H.removeProject(root);
+  // PREMISE: the same tree under the cap answers with its rule and no sentinel,
+  // so the ANY below is the cap and not something else in the fixture.
+  check(
+    '[work-bound] under the file cap the tree answers with its rule and no sentinel',
+    underCap.includes('.preserved') && !underCap.includes('*'),
+    short(underCap)
+  );
+  // PREMISE: and it is nowhere near the WALK's entry cap, so what trips below
+  // is the bound on the work rather than the bound the walk already had.
+  check(
+    '[work-bound] the fixture stays far under the walk’s own entry cap',
+    entries > 2000 && entries < 20000,
+    short({ entries })
+  );
+  check(
+    '[work-bound] more source files than the read-and-parse phase may be handed contributes ANY',
+    overCap.includes('*'),
+    short(overCap.slice(0, 4))
+  );
+  // AND THE ANY IS LOAD-BEARING: read as the empty set, the move under it
+  // deletes two spaces the page renders.
+  check(
+    '[work-bound] and the move under it keeps the bytes nobody could rule out',
+    !!text && innerOf(text, 'preserved') === inner && raised !== inner,
+    short({ want: inner, got: text === null ? null : innerOf(text, 'preserved') })
+  );
+
+  // --- THE TIME, with a handful of files and every read of them slow.
+  const slowRoot = H.makeProject({});
+  const NAMES = ['aaa', 'bbb', 'ccc', 'ddd', 'eee'];
+  for (const name of NAMES) {
+    fs.writeFileSync(
+      path.join(slowRoot, 'src', 'styles', `${name}.css`),
+      `.${name} { white-space: pre; }\n`,
+      'utf8'
+    );
+  }
+  WS.forgetCache();
+  const fast = [...WS.preservingTokens(slowRoot)];
+  const realRead = fs.readFileSync;
+  let slow = null;
+  try {
+    // Only this fixture's own reads are slowed, so nothing else in the process
+    // pays for it. A busy wait rather than a sleep, because the phase being
+    // bounded is synchronous and there is nothing to await.
+    fs.readFileSync = function slowReadFileSync(where, ...rest) {
+      if (typeof where === 'string' && where.startsWith(slowRoot)) {
+        const until = Date.now() + 700;
+        while (Date.now() < until) {
+          /* the spun-down disk this budget exists for */
+        }
+      }
+      return realRead.call(fs, where, ...rest);
+    };
+    WS.forgetCache();
+    slow = [...WS.preservingTokens(slowRoot)];
+  } finally {
+    fs.readFileSync = realRead;
+    H.removeProject(slowRoot);
+  }
+  // PREMISE: with fast reads the same tree answers for all five files and needs
+  // no sentinel, so what changes below is the time and nothing else.
+  check(
+    '[work-bound] with fast reads the tree answers for every file and no sentinel',
+    NAMES.every((n) => fast.includes(`.${n}`)) && !fast.includes('*'),
+    short(fast)
+  );
+  check(
+    '[work-bound] a tree whose reads outlast the budget contributes ANY',
+    !!slow && slow.includes('*'),
+    short(slow)
+  );
+  check(
+    '[work-bound] and it stopped short rather than answering for files it never read',
+    !!slow && NAMES.some((n) => !slow.includes(`.${n}`)),
+    short(slow)
+  );
+}
+
 (async () => {
   for (const f of FIXTURES) await runFixture(f);
   importInsert();
@@ -4417,6 +4803,8 @@ function theStampForAStylesheetHandedIn() {
   theUtilityClassAsTailwindSpellsIt();
   theValueNobodyCanRead();
   theStampForAStylesheetHandedIn();
+  theLonghandTheGuardKeyedPast();
+  theWorkTheWalkDidNotBound();
   for (const shape of [
     { id: 'two-space', ind: '  ', eol: '\n' },
     { id: 'tabs', ind: '\t', eol: '\n' },
@@ -4424,7 +4812,7 @@ function theStampForAStylesheetHandedIn() {
   ]) {
     await stylesheetPreservedWhitespace(shape);
   }
-  for (const where of ['media', 'style-block']) {
+  for (const where of ['media', 'style-block', 'longhand']) {
     await stylesheetPreservedWhitespace({ id: 'two-space', ind: '  ', eol: '\n' }, where);
   }
   for (const value of ['nowrap', 'pre-line']) await neutralRulesChangeNothing(value);

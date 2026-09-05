@@ -1554,7 +1554,44 @@ const HOLDS_RENDERED_SPACE = /<(pre|textarea|script|style)[\s>]/i;
 // Refusing is always the safe direction: the block travels as its author wrote
 // it and sits at its old inner indentation, which is cosmetic. The alternative
 // is silent data loss.
-const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(?:(pre|pre-wrap|break-spaces)(?![\w-])|var\s*\()/i;
+//
+// AND THE PROPERTY NAME WAS NOT THE QUESTION. `white-space` is a SHORTHAND in
+// CSS Text 4, and the half of it that decides this one is the longhand
+// `white-space-collapse`. Every reader here and in electron/whitespaceRules.js
+// keyed on the string `white-space`, so `white-space-collapse: preserve` --
+// which is exactly what `white-space: pre` expands to -- was read as the
+// positive statement "this element does not preserve its whitespace", and a
+// structural move under it reindented rendered content away and reported
+// success. Measured in the same real Blink window that produced the numbers
+// above, over the same reindent of `alpha\n        beta\ngamma`:
+//
+//   white-space: pre                        115.59px -> 96.33px   preserves
+//   white-space-collapse: preserve          115.59px -> 96.33px   preserves
+//   white-space-collapse: break-spaces      115.59px -> 96.33px   preserves
+//   white-space-collapse: collapse           38.53px -> 38.53px   does not
+//   white-space-collapse: preserve-breaks    38.53px -> 38.53px   does not
+//
+// So the longhand is read too, and with its OWN value table worked out from
+// what the values MEAN rather than from the property's name: `preserve`,
+// `preserve-spaces` and `break-spaces` keep a leading run of spaces;
+// `collapse` and `preserve-breaks` do not -- `preserve-breaks` is the longhand
+// spelling of `pre-line` and sits out for the same reason `pre-line` does.
+// `preserve-spaces` is in the spec and is NOT implemented in this Electron's
+// Blink (measured: the declaration does not parse at all, so the element
+// computes to `collapse`); it is listed anyway, because refusing a reindent in
+// a browser that ignores the value is the cheap error and deleting rendered
+// bytes in a browser that ships it is not.
+//
+// THE NEIGHBOURS, asked in the same window and deliberately absent.
+// `text-wrap` / `text-wrap-mode` is the OTHER half of the shorthand and cannot
+// reach this question at all: `white-space: pre; text-wrap: wrap` still
+// measured 115.59px -> 96.33px, because wrapping is not collapsing.
+// `white-space-trim` only ever DISCARDS whitespace at an element's edges, so
+// the most it can do is make an already-preserved run render less -- an error
+// in the direction that costs a reindent, never a byte -- and it is
+// implemented nowhere yet (measured: the declaration does not parse either).
+const PRESERVES_SPACE =
+  /(^|[\s;])(?:white-space\s*:\s*(?:(?:pre|pre-wrap|break-spaces)(?![\w-])|var\s*\()|white-space-collapse\s*:\s*(?:(?:preserve-spaces|preserve|break-spaces)(?![\w-])|var\s*\())/i;
 // AND THE SAME QUESTION WITH THE ADMISSION TAKEN OUT OF IT.
 //
 // The paragraph above is honest about `var(--ws)` and it is honest about ONE of
@@ -1572,7 +1609,17 @@ const PRESERVES_SPACE = /(^|[\s;])white-space\s*:\s*(?:(pre|pre-wrap|break-space
 // `resolvedWhiteSpace` below. These three are the same three answers asked of
 // ONE declaration's value, after the cascade has picked which declaration that
 // is.
-const PRESERVES_SPACE_VALUE = /^(pre|pre-wrap|break-spaces)$/i;
+//
+// AND THEY ARE ASKED IN THE LONGHAND'S VALUE SPACE, NOT THE SHORTHAND'S, which
+// is what lets one table answer for both spellings instead of two tables that
+// can drift apart. `resolvedWhiteSpace` expands a `white-space` value the way
+// the browser does and hands back a `white-space-collapse` value; these read
+// that. Measured in Blink, which is where the expansion comes from rather than
+// from memory: `white-space: pre` computes `white-space-collapse: preserve`,
+// `pre-wrap` computes `preserve`, `pre-line` computes `preserve-breaks`,
+// `normal` and `nowrap` compute `collapse`, and `break-spaces` computes
+// itself.
+const PRESERVES_SPACE_VALUE = /^(preserve|preserve-spaces|break-spaces)$/i;
 const UNREADABLE_SPACE_VALUE = /^var\s*\(/i;
 // THE UTILITY, AFTER TAILWIND HAS FINISHED SPELLING IT.
 //
@@ -1606,10 +1653,16 @@ const CLASS_PRESERVES_UTILITY = /^(?:[A-Za-z0-9_]+-)?whitespace-(?:pre|pre-wrap|
 // it is the reason the variant split below counts brackets instead of taking
 // the last `:` in the token, which would have read this one as a variant named
 // `[white-space` and a utility named `pre]`.
-const CLASS_PRESERVES_ARBITRARY = /^\[white-space:(?:pre|pre-wrap|break-spaces)\]$/i;
-// And the two spellings that turn it back OFF. Inheritance is overridable, and
-// saying so is the only thing that stops one `white-space: pre` near the top of
-// a page from smearing the flag over every element under it.
+// The longhand is spellable there too -- `class='[white-space-collapse:preserve]'`
+// is the same declaration by the same route -- and it was invisible for the
+// same reason everything else here was.
+const CLASS_PRESERVES_ARBITRARY =
+  /^\[(?:white-space:(?:pre|pre-wrap|break-spaces)|white-space-collapse:(?:preserve|preserve-spaces|break-spaces))\]$/i;
+// And the value that turns it back OFF -- one value now rather than two
+// spellings, because `normal` and `nowrap` both expand to it. Inheritance is
+// overridable, and saying so is the only thing that stops one `white-space:
+// pre` near the top of a page from smearing the flag over every element under
+// it.
 //
 // THIS ONE IS DELIBERATELY LEFT BARE, and the asymmetry is the point. A missed
 // PRESERVING spelling costs bytes, which is why the one above was widened. A
@@ -1619,7 +1672,7 @@ const CLASS_PRESERVES_ARBITRARY = /^\[white-space:(?:pre|pre-wrap|break-spaces)\
 // that can cost bytes -- an invented drop cancels an ancestor's real `pre` and
 // hands the wide pass a licence to reindent -- so `tw-whitespace-normal` in a
 // project that configured no such prefix stays unread rather than believed.
-const DROPS_SPACE_VALUE = /^(normal|nowrap)$/i;
+const DROPS_SPACE_VALUE = /^collapse$/i;
 const DROPS_SPACE_CLASS = /(^|\s)(whitespace-normal|whitespace-nowrap)(\s|$)/i;
 
 /**
@@ -1704,27 +1757,67 @@ function classWhitespaceRule(cls, acting) {
  * So the declaration is resolved the way a browser resolves it, and only twice:
  * LAST ONE WINS, and an `!important` beats every non-important one whatever the
  * order. Origin, specificity and inheritance do not come into it -- there is
- * one origin and one subject inside a single `style` attribute -- and neither
- * does shorthand expansion, because `white-space` has no shorthand that reaches
- * it in the CSS this file is allowed to assume.
+ * one origin and one subject inside a single `style` attribute.
  *
- * What comes back is the winning value with `!important` stripped, for the two
- * readers above to classify. Deciding WHAT the value means is deliberately not
- * done here: the wide reader and the acting one disagree about exactly one
- * value, and that disagreement belongs where it is documented.
+ * AND SHORTHAND EXPANSION DOES COME INTO IT, WHICH IS WHAT THIS USED TO DENY.
+ * `white-space` IS a shorthand in CSS Text 4 -- for `white-space-collapse` and
+ * `text-wrap-mode` -- and the collapse longhand is the whole of this question.
+ * Reading only the string `white-space` therefore missed the longhand outright
+ * AND got the two together backwards. Measured in a real Blink window, over
+ * the same reindent, with the same 115.59px/38.53px oracle as the value table:
+ *
+ *   white-space: pre; white-space-collapse: collapse      does NOT preserve
+ *   white-space-collapse: collapse; white-space: pre      preserves
+ *   white-space: normal; white-space-collapse: preserve   preserves
+ *   white-space-collapse: preserve; white-space: normal   does NOT preserve
+ *   white-space-collapse: collapse !important; white-space: pre   does NOT
+ *
+ * -- which is one property resolved once, not two properties resolved apart.
+ * So both spellings go through the SAME last-one-wins, important-beats-the-rest
+ * resolution, and a `white-space` value is expanded to the longhand it sets
+ * before it competes. `text-wrap` is the other half of the shorthand and is
+ * deliberately not read: measured, `white-space: pre; text-wrap: wrap` still
+ * preserved, because wrapping is not collapsing.
+ *
+ * What comes back is the winning value AS A `white-space-collapse` VALUE, with
+ * `!important` stripped, for the two readers above to classify. A value this
+ * cannot expand -- `var(--ws)`, `inherit`, a typo -- comes back as it was
+ * written, which is what leaves `UNREADABLE_SPACE_VALUE` something to match.
+ * Deciding WHAT the value means is deliberately not done here: the wide reader
+ * and the acting one disagree about exactly one value, and that disagreement
+ * belongs where it is documented.
  */
+// A Map rather than an object literal, because the key here is arbitrary text
+// out of somebody's `style` attribute and `__proto__`, `constructor` and
+// `toString` are all things an author can type into one.
+const WHITE_SPACE_EXPANDS = new Map([
+  ['normal', 'collapse'],
+  ['pre', 'preserve'],
+  ['pre-wrap', 'preserve'],
+  ['pre-line', 'preserve-breaks'],
+  ['nowrap', 'collapse'],
+  ['break-spaces', 'break-spaces'],
+]);
+
 function resolvedWhiteSpace(style) {
   if (typeof style !== 'string' || !style) return null;
   // The same left edge the attribute-wide regexes use, so a property that merely
   // ENDS in `white-space` is still not one: `[^;]*` then takes the value up to
   // the declaration's own terminator, which is the only thing that can end it.
-  const re = /(?:^|[\s;])white-space\s*:\s*([^;]*)/gi;
+  // The longer name is tried first, or `white-space-collapse` would be read as
+  // a `white-space` whose colon never arrives.
+  const re = /(?:^|[\s;])(white-space-collapse|white-space)\s*:\s*([^;]*)/gi;
   let winner = null;
   let hit;
   while ((hit = re.exec(style))) {
-    let value = hit[1].trim();
+    let value = hit[2].trim();
     const important = /!\s*important$/i.test(value);
     if (important) value = value.replace(/!\s*important$/i, '').trim();
+    // The shorthand sets the longhand, so it is expanded into the longhand's
+    // value space before the two compete. An unrecognised value is left alone.
+    if (hit[1].toLowerCase() === 'white-space') {
+      value = WHITE_SPACE_EXPANDS.get(value.toLowerCase()) || value;
+    }
     // Later beats earlier, and important beats non-important either way round.
     if (!winner || important || !winner.important) winner = { value, important };
   }
@@ -1862,9 +1955,11 @@ function ownWhitespaceRule(node, tokens, acting = false) {
     // The one value the two readers disagree about, exactly as before: a
     // `var()` the file cannot resolve is a fair "could" and is not evidence.
     if (!acting && UNREADABLE_SPACE_VALUE.test(ws)) return true;
-    // Anything else it names -- `pre-line`, `inherit`, a typo -- says nothing
-    // either way and falls through to the class and the stylesheet tokens,
-    // which is where a bare `white-space: pre-line` always went.
+    // Anything else it names -- `preserve-breaks` (which is what both
+    // `pre-line` and the longhand's own spelling expand to), `inherit`, a typo
+    // -- says nothing either way and falls through to the class and the
+    // stylesheet tokens, which is where a bare `white-space: pre-line` always
+    // went.
   }
   const cls = litProp(node, 'class') || litProp(node, 'className');
   const byClass = classWhitespaceRule(cls, acting);

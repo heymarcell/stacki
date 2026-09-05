@@ -25,11 +25,12 @@
 // here while one of them did the opposite: a file that will not read, a
 // DIRECTORY that will not list, a stylesheet postcss will not parse, one too
 // big to be worth reading, a walk that hit its depth cap or its entry or time
-// budget, a symlink that will not resolve, a symlink that resolves OUTSIDE the
-// project and is deliberately not followed, and an entry with a stylesheet's
-// NAME that is not a regular file at all. Being wrong in that direction costs
-// an element its reindentation,
-// which is cosmetic. Being wrong the other way deletes bytes the page shows.
+// budget, a FILE LIST that hit its cap, a READ PHASE that ran out of time, a
+// symlink that will not resolve, a symlink that resolves OUTSIDE the project
+// and is deliberately not followed, and an entry with a stylesheet's NAME that
+// is not a regular file at all. Being wrong in that direction costs an element
+// its reindentation, which is cosmetic. Being wrong the other way deletes bytes
+// the page shows.
 //
 // AND ANY IS NOT "EVERY ELEMENT PRESERVES ITS WHITESPACE". THE SENTINEL DAMAGED
 // LAYOUT WHILE IT WAS READ THAT WAY. "We cannot prove a reindent here is safe"
@@ -89,6 +90,35 @@ const MAX_DEPTH = 12;
 const MAX_ENTRIES = 20000;
 const MAX_MS = 2000;
 
+// AND THE TWO BOUNDS THE WALK'S BOUNDS ARE NOT.
+//
+// `MAX_ENTRIES` and `MAX_MS` bound the DIRECTORY WALK and stop there. The phase
+// that does the actual work -- a `statSync`, a `readFileSync` and a
+// `postcss.parse` for every file the walk handed back -- had no entry bound and
+// no time bound at all, and it runs on the same synchronous main-process
+// `page:write` path as the walk does. Twenty thousand entries can be twenty
+// thousand stylesheets: the walk stops, hands back the list, and the app then
+// blocks reading and parsing all of it, which is the FIFO and the symlinked home
+// directory again by a third road -- no repaint, no IPC, the write neither
+// completing nor refusing.
+//
+// So the file list is capped where it is built, which bounds the stamp's stats
+// as well as the reads, and the read-and-parse loop carries a wall-clock budget
+// of its own for a tree that is slow rather than numerous. Two thousand
+// hand-written stylesheets, pages, layouts and components is far more than a
+// project has once `SKIP_DIRS` has taken `node_modules` and the build output
+// out; the budget is the backstop for media where each read is slow rather than
+// each file being large, which is the case no count can bound.
+//
+// HITTING EITHER CONTRIBUTES ANY, and that is the whole point of bounding it
+// here rather than by truncating the list. A short list is not a short project:
+// it is the positive answer "nothing in here preserves whitespace", which is
+// the answer that reindents rendered content away. The bound has to say "I
+// could not tell", so the cap sets the walk's own `failed` flag and the budget
+// adds the sentinel directly.
+const MAX_FILES = 2000;
+const MAX_READ_MS = 2000;
+
 // Every file whose text could hold a rule. Stylesheets, and the `<style>`
 // blocks of pages, layouts and components.
 const SOURCE_FILE = /\.(css|astro|svelte|vue|html)$/i;
@@ -102,6 +132,38 @@ const SOURCE_FILE = /\.(css|astro|svelte|vue|html)$/i;
 // and the point of this whole mechanism is to be a narrowing rather than a
 // switch-off.
 const PRESERVING_VALUE = /^(pre|pre-wrap|break-spaces)$/i;
+
+// AND THE LONGHAND THE WHOLE GUARD COULD NOT SEE.
+//
+// `white-space` is a SHORTHAND in CSS Text 4 and `white-space-collapse` is the
+// half of it that decides this question. This reducer asked for the property
+// NAME `white-space` and nothing else, so `.preserved { white-space-collapse:
+// preserve }` -- the same statement as `.preserved { white-space: pre }`, and
+// what that shorthand expands to -- contributed NO token at all. An empty token
+// set is not "unknown": it is the positive answer "no rule in this project
+// preserves whitespace", so a structural move under that class reindented and
+// deleted rendered content, `ok: true`. Measured: `tokensInCss('.preserved {
+// white-space-collapse: preserve }')` answered `[]`, and the authored
+// `alpha\n      beta\ngamma` came back two spaces shorter.
+//
+// THE VALUE TABLE IS THE LONGHAND'S OWN, not the property name standing in for
+// an answer. Measured in a real Blink window over the same reindent of
+// `alpha\n        beta\ngamma`, the same 115.59px/38.53px oracle as above:
+// `preserve` and `break-spaces` move the line, `collapse` and `preserve-breaks`
+// do not -- `preserve-breaks` being the longhand spelling of `pre-line`, absent
+// here for exactly the reason `pre-line` is. `preserve-spaces` is in the spec,
+// preserves spaces by definition, and is NOT implemented in this Electron's
+// Blink (measured: the declaration does not parse, so nothing was rendered
+// differently); it is listed anyway, because over-refusing costs a reindent and
+// under-refusing costs bytes.
+//
+// The neighbours, checked and deliberately absent: `text-wrap` /
+// `text-wrap-mode` is the OTHER longhand of the shorthand and cannot reach this
+// question (measured: `white-space: pre; text-wrap: wrap` still preserves,
+// because wrapping is not collapsing), and `white-space-trim` only DISCARDS
+// whitespace, so the most it can do is make a preserved run render less, which
+// is the direction that costs a reindent rather than a byte.
+const PRESERVING_COLLAPSE_VALUE = /^(preserve|preserve-spaces|break-spaces)$/i;
 
 /**
  * The tokens the SUBJECT of one selector can match, or `[ANY]`.
@@ -146,15 +208,23 @@ function tokensOfSelector(selector) {
  * wins. A value this cannot read statically (`var(--ws)`, a value built by
  * something else) is treated as preserving, because the answer this function is
  * allowed to be wrong about is only the one that refuses a reindent.
+ *
+ * TWO PROPERTIES, TWO VALUE TABLES, ONE QUESTION -- see
+ * `PRESERVING_COLLAPSE_VALUE` above for why the second one had to exist and
+ * what a real Blink window says about each of its values. No cascade is done
+ * here and none is wanted: this scan asks "could ANY rule in this project make
+ * this element's whitespace into content", so a single preserving declaration
+ * anywhere in a rule is enough, whatever else the rule also says.
  */
 function declarationPreserves(decl) {
   if (!decl || decl.prop == null) return false;
-  if (String(decl.prop).trim().toLowerCase() !== 'white-space') return false;
+  const prop = String(decl.prop).trim().toLowerCase();
+  if (prop !== 'white-space' && prop !== 'white-space-collapse') return false;
   const value = String(decl.value || '')
     .replace(/!\s*important\s*$/i, '')
     .trim();
   if (/var\s*\(/i.test(value)) return true;
-  return PRESERVING_VALUE.test(value);
+  return prop === 'white-space' ? PRESERVING_VALUE.test(value) : PRESERVING_COLLAPSE_VALUE.test(value);
 }
 
 // THE DECLARATION SPELLED AS A UTILITY NAME INSIDE A RULE.
@@ -170,6 +240,12 @@ function declarationPreserves(decl) {
 // The variants are matched loosely on purpose: a configured prefix
 // (`tw-whitespace-pre`) or a variant (`md:whitespace-pre`) is still the same
 // utility, and over-matching here only ever refuses a reindent.
+//
+// THE LONGHAND HAS NO UTILITY TO SPELL, which is why it is not in here. Tailwind
+// ships `whitespace-*` for the shorthand and nothing for `white-space-collapse`,
+// so the only way to `@apply` the longhand is an arbitrary property the utility
+// scanner sees as CSS -- and CSS is what `declarationPreserves` above reads.
+// Inventing a name here would be matching a spelling nobody writes.
 const APPLY_PRESERVES = /whitespace-(pre(-wrap)?|break-spaces)(?![\w-])/i;
 
 // AND THE SPELLINGS WHOSE UTILITY LIST IS NOT IN THE TEXT need no branch here,
@@ -416,8 +492,18 @@ function sourcesOf(projectPath) {
       }
       if (what.isDirectory()) walk(full, depth + 1);
       else if (!SOURCE_FILE.test(entry.name)) continue;
-      else if (what.isFile()) files.push(full);
-      else failed = true;
+      else if (what.isFile()) {
+        files.push(full);
+        // The cap on the WORK, spent here because this is the only place that
+        // knows how much of it there will be -- see `MAX_FILES`. Duplicates
+        // are still in the list at this point, so this can stop a walk slightly
+        // early; erring towards the sentinel is the direction that keeps bytes.
+        if (files.length > MAX_FILES) {
+          failed = true;
+          stopped = true;
+          return;
+        }
+      } else failed = true;
     }
   };
   walk(projectPath, 0);
@@ -504,6 +590,7 @@ function preservingTokens(projectPath, options = {}) {
   } catch {
     return new Set([ANY]);
   }
+  const readStart = Date.now();
   const stamp = `${projectPath}\n${scan.failed ? 'unwalkable\n' : ''}${stampOf(scan.files, known)}`;
   if (cached && cached.stamp === stamp) return cached.tokens;
   scans += 1;
@@ -514,7 +601,19 @@ function preservingTokens(projectPath, options = {}) {
   // every stylesheet under it out of the file list, and an empty list is the
   // positive answer "nothing here preserves whitespace".
   if (scan.failed) tokens.add(ANY);
+  // Started after the walk, which spends a budget of its own, and covering the
+  // stamp's stats as well as the reads: a stamp that already took the whole
+  // budget leaves the first file to trip this, which is the honest answer
+  // rather than a partial one. See `MAX_READ_MS`.
+  const deadline = readStart + MAX_READ_MS;
   for (const abs of scan.files) {
+    // A FILE THIS RAN OUT OF TIME FOR IS A FILE NOBODY READ. Stopping here and
+    // keeping the tokens gathered so far would hand back a SHORTER answer that
+    // reads as a complete one; the sentinel is what makes it "I cannot tell".
+    if (Date.now() > deadline) {
+      tokens.add(ANY);
+      break;
+    }
     let text = knownTextOf(known, abs);
     if (text === null) {
       try {

@@ -22,6 +22,10 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge, conflictDigest } = require('../electron/gitBranches.js');
 const { guardSuite } = require('./support/suiteGuard.js');
+// The one reading of a parsed conflict T31 needs: whether the clash runs to the
+// end of the file, which is the only place the final newline is not in the
+// marked-up text.
+const { conflictAtEnd } = require('../electron/conflicts.js');
 // The project-relative resolver the rest of the MCP surface puts every path
 // through. T22 checks the git domain's `sourcePath` against IT rather than by
 // joining strings here: a spelling this file agrees with but resolveInProject
@@ -98,6 +102,134 @@ const caught = async (fn) => {
     return { value: null, error: String(err.message || err) };
   }
 };
+
+// --- what the PANEL sends, out of the panel ----------------------------------
+//
+// THE VALUE THAT DISCARDED A BRANCH WAS COMPOSED IN THE MODAL AND SHOWN TO
+// NOBODY.
+//
+// GitChip's choicesForSend() turns the modal's state into the `choices`
+// resolveMerge is given. Its bug was that a file with no readable hunks took
+// `list[0]` of an EMPTY list and sent the whole-file word "ours" on the
+// strength of `undefined !== 'theirs'` — a decision nothing on screen showed
+// and nobody made. Re-implementing that function beside a test would prove
+// nothing about it, so the real component is bundled and rendered against a
+// real conflict, and what its Merge button hands out is read off the callback.
+//
+// The bundle and the DOM are built once, on first use, so a suite run that
+// never reaches this pays nothing for it.
+let panelEnv = null;
+async function renderMergeModal(conflict) {
+  if (!panelEnv) {
+    const esbuild = require('esbuild');
+    const buildDir = path.join(__dirname, '..', 'node_modules', '.stacki-test');
+    fs.mkdirSync(buildDir, { recursive: true });
+    const bundlePath = path.join(buildDir, 'gitchip.bundle.js');
+    await esbuild.build({
+      entryPoints: [path.join(__dirname, '..', 'src', 'panels', 'GitChip.jsx')],
+      outfile: bundlePath,
+      bundle: true,
+      format: 'cjs',
+      platform: 'node',
+      jsx: 'automatic',
+      external: ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime'],
+      loader: { '.css': 'empty', '.svg': 'empty', '.png': 'empty' },
+      logLevel: 'silent',
+    });
+    const { JSDOM } = require('jsdom');
+    // pretendToBeVisual, because the code viewer inside the modal is a real
+    // CodeMirror and asks the window for animation frames.
+    const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
+      url: 'http://localhost/',
+      pretendToBeVisual: true,
+    });
+    global.window = dom.window;
+    global.document = dom.window.document;
+    global.navigator = dom.window.navigator;
+    global.HTMLElement = dom.window.HTMLElement;
+    global.Element = dom.window.Element;
+    global.Node = dom.window.Node;
+    global.Window = dom.window.Window;
+    global.getComputedStyle = dom.window.getComputedStyle;
+    global.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
+    global.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window);
+    global.MutationObserver = dom.window.MutationObserver;
+    global.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    dom.window.ResizeObserver = global.ResizeObserver;
+    dom.window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+    global.IS_REACT_ACT_ENVIRONMENT = true;
+    panelEnv = {
+      dom,
+      React: require('react'),
+      createRoot: require('react-dom/client').createRoot,
+      // React.act, not ReactDOMTestUtils.act — the latter logs a deprecation
+      // warning through console.error, which is the same channel the render
+      // errors below are caught on.
+      act: require('react').act || require('react-dom/test-utils').act,
+      MergeConflictModal: require(bundlePath).MergeConflictModal,
+    };
+  }
+  const { dom, React, createRoot, act, MergeConflictModal } = panelEnv;
+  const host = dom.window.document.createElement('div');
+  dom.window.document.body.appendChild(host);
+  let sent;
+  let sends = 0;
+  const root = createRoot(host);
+  // React reports a render error to console.error rather than throwing it
+  // where a test can see it, so a modal that died on the way up would
+  // otherwise read as "the button was not there".
+  const errors = [];
+  const realError = console.error;
+  console.error = (...args) => errors.push(args.map((a) => (a && a.stack) || String(a)).join(' '));
+  try {
+    act(() => {
+      root.render(
+        React.createElement(MergeConflictModal, {
+          conflict,
+          busy: null,
+          onCancel() {},
+          onResolve: (choices) => {
+            sends += 1;
+            sent = choices;
+          },
+        })
+      );
+    });
+  } finally {
+    console.error = realError;
+  }
+  const buttons = () => [...host.querySelectorAll('button')];
+  // Returns whether the button was there to click. A missing one is a
+  // FAILURE, not an exception: throwing out of the helper takes the suite down
+  // before the checks it had already collected are printed, and "the panel
+  // never drew that choice" is exactly the shape this is here to catch.
+  const click = (text) => {
+    const button = buttons().find((b) => b.textContent === text);
+    if (!button) return false;
+    act(() => {
+      button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+    return true;
+  };
+  return {
+    labels: () => buttons().map((b) => b.textContent),
+    click,
+    merge: () => {
+      click('Merge with these choices');
+      return sent;
+    },
+    sends: () => sends,
+    errors,
+    close: () => {
+      act(() => root.unmount());
+      host.remove();
+    },
+  };
+}
 
 // --- what a refusal is measured against --------------------------------------
 //
@@ -3257,6 +3389,427 @@ async function suite() {
     check('T27 control:   and still saying the other branch deleted it', /the other deleted it/.test(String(mdAnswer.value?.message || '')), String(mdAnswer.value?.message));
     const mdMapped = await DOMAINS.git.resolve_merge.result(mdAnswer.value, { branch: 'feature' }, { root: md });
     check('T27 control MCP: still says which branch deleted it', /was deleted on the current branch/.test(String(mdMapped?.message || '')), String(mdMapped?.message));
+  }
+
+  {
+    // T28 — A CRLF CONFLICT PARSED AS ZERO HUNKS, AND THE PANEL COMMITTED THE
+    // INCOMING BRANCH AWAY WITHOUT SHOWING ANYBODY A CHOICE.
+    //
+    // Git writes its conflict markers with the FILE'S own line ending, so in a
+    // repository that stores a file CRLF — Windows, core.autocrlf, or a
+    // .gitattributes `text eol=crlf`, all completely ordinary — the marker line
+    // is `<<<<<<< HEAD\r`. The patterns in electron/conflicts.js could not match
+    // that: in JavaScript `.` does not match a carriage return and `$` without
+    // the `m` flag matches only at the end of the string. So the whole
+    // marked-up file came back as ONE agreed part, clashCount() was 0, and
+    // GitChip's choicesForSend() then took `list[0]` of an empty list and sent
+    // the whole-file word "ours". resolveMerge validated that as legal
+    // vocabulary — it is — ran `git checkout --ours`, and committed a real
+    // two-parent merge with `{ok: true, resolved: 1}`. MEASURED: the incoming
+    // work was not in the tree afterwards, and the branch was now recorded as
+    // merged, so the safe-delete guard stopped protecting it.
+    const dir = await repo('crlf');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, '.gitattributes'), '*.astro text eol=crlf\n');
+    fs.mkdirSync(path.join(dir, 'src', 'pages'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), 'head\nBASE\ntail\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'a page this repository stores with CRLF');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), 'head\r\nINCOMING-WORK\r\ntail\r\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'the incoming work');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'src/pages/about.astro'), 'head\r\nOURS\r\ntail\r\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'this branch');
+
+    const PAGE = 'src/pages/about.astro';
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T28: the CRLF page conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    // THE FIXTURE IS REALLY CRLF — asked of git rather than of the bytes this
+    // test wrote, because a .gitattributes that was not picked up would make
+    // every assertion below pass for the wrong reason.
+    check('T28: git stores that page with LF and checks it out with CRLF', (await sh(dir, 'show', 'HEAD:src/pages/about.astro')).indexOf('\r') === -1 && textOf(path.join(dir, PAGE)).includes('\r\n'), JSON.stringify(textOf(path.join(dir, PAGE))));
+    const file = (clash.files || []).find((f) => f.path === PAGE) || {};
+    const hunks = (file.parts || []).filter((part) => part.kind === 'clash');
+    check('T28: THE CONFLICT IS READ AS ONE DISAGREEMENT, NOT AS NONE', hunks.length === 1, JSON.stringify(file.parts));
+    check('T28:   with the file’s own line ending carried through both sides', hunks[0]?.ours === 'OURS\r' && hunks[0]?.theirs === 'INCOMING-WORK\r', JSON.stringify(hunks[0]));
+
+    // WHAT THE PANEL SENDS, out of the panel. This is the value that used to
+    // discard the branch, and nothing on screen ever showed it.
+    const panel = await renderMergeModal(clash);
+    check('T28: the modal renders the conflict without error', panel.errors.length === 0, panel.errors[0]);
+    check('T28:   and offers a decision for it', panel.labels().some((l) => /1 to decide/.test(l)), JSON.stringify(panel.labels()));
+    const asShown = panel.merge();
+    check('T28: THE PANEL SENDS AN ANSWER PER HUNK, NOT A WHOLE-FILE WORD', Array.isArray(asShown?.[PAGE]) && asShown[PAGE].length === 1, JSON.stringify(asShown));
+    check('T28:   and the hunk offers the incoming branch as a choice', panel.click('feature'), JSON.stringify(panel.labels()));
+    const chosen = panel.merge();
+    check('T28:   and choosing the incoming branch is what reaches the caller', JSON.stringify(chosen) === JSON.stringify({ [PAGE]: ['theirs'] }), JSON.stringify(chosen));
+    panel.close();
+
+    const applied = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: chosen, expect: clash.at });
+    check('T28: the merge goes through', applied?.ok === true && applied?.resolved === 1, JSON.stringify(applied));
+    check('T28: THE INCOMING WORK IS IN THE TREE AFTERWARDS, BYTE FOR BYTE', textOf(path.join(dir, PAGE)) === 'head\r\nINCOMING-WORK\r\ntail\r\n', JSON.stringify(textOf(path.join(dir, PAGE))));
+    check('T28:   as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(dir, 'log', '-1', '--format=%P'));
+
+    // THE CONTROL, so the answers are not simply "always theirs": the same
+    // fixture answered the other way keeps this branch's CRLF bytes exactly.
+    const keep = await repo('crlfkeep');
+    cleanup.push(keep);
+    fs.writeFileSync(path.join(keep, '.gitattributes'), '*.astro text eol=crlf\n');
+    fs.mkdirSync(path.join(keep, 'src', 'pages'), { recursive: true });
+    fs.writeFileSync(path.join(keep, 'src/pages/about.astro'), 'head\nBASE\ntail\n');
+    await sh(keep, 'add', '-A');
+    await sh(keep, 'commit', '-qm', 'page');
+    await sh(keep, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(keep, 'src/pages/about.astro'), 'head\r\nINCOMING-WORK\r\ntail\r\n');
+    await sh(keep, 'add', '-A');
+    await sh(keep, 'commit', '-qm', 'incoming');
+    await sh(keep, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(keep, 'src/pages/about.astro'), 'head\r\nOURS\r\ntail\r\n');
+    await sh(keep, 'add', '-A');
+    await sh(keep, 'commit', '-qm', 'ours');
+    const keepClash = await mergeBranch(git, { projectPath: keep, branch: 'feature' });
+    const kept = await resolveMerge(git, { projectPath: keep, branch: 'feature', choices: { [PAGE]: ['ours'] }, expect: keepClash.at });
+    check('T28 control: the other answer also merges', kept?.ok === true, JSON.stringify(kept));
+    check('T28 control:   keeping this branch’s CRLF bytes exactly', textOf(path.join(keep, PAGE)) === 'head\r\nOURS\r\ntail\r\n', JSON.stringify(textOf(path.join(keep, PAGE))));
+
+    // AND WHAT AN AGENT IS TOLD, which said the same untruth in its own words:
+    // a file git had just reported as conflicting, described as having no
+    // conflicting hunks, under an instruction to send exactly as many entries
+    // as the hunks listed.
+    const { DOMAINS: MAPPERS } = require('../electron/mcp/agent/domains.js');
+    const env = await MAPPERS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'ref' });
+    const entry = (env?.files || []).find((f) => f.path === PAGE) || {};
+    check('T28 MCP: the conflicting file is listed with its one hunk', Array.isArray(entry.hunks) && entry.hunks.length === 1, JSON.stringify(entry).slice(0, 300));
+    check('T28 MCP:   and is not marked unreadable', entry.markersUnread === false, JSON.stringify(entry).slice(0, 300));
+  }
+
+  {
+    // T29 — A FILE GIT SAYS IS CONFLICTED, DESCRIBED AS HAVING NOTHING TO
+    // CHOOSE, ANSWERED WITH A WHOLE-FILE DEFAULT.
+    //
+    // The CRLF markers above were one way to reach that shape and they are
+    // fixed. This is the shape itself, reached by another road no parser change
+    // can close: a custom merge driver — git's own documented mechanism, set up
+    // here in the fixture's own config — that leaves a conflict marker it never
+    // closes. parseConflict keeps every one of those lines, correctly, as
+    // agreed text; clashCount() is then 0; and the whole-file default "ours"
+    // used to sail through the choices validator as legal vocabulary and commit
+    // the incoming branch away.
+    const dir = await repo('unreadable');
+    cleanup.push(dir);
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'INCOMING-WORK\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'incoming');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'OURS\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'ours');
+    // The driver and the attributes live inside .git, so nothing here is a
+    // tracked file and the "not one byte changed" oracle below is about the
+    // repository the user would see.
+    const driver = path.join(dir, '.git', 'unclosed.sh');
+    fs.writeFileSync(driver, '#!/bin/sh\nprintf "<<<<<<< HEAD\\nOURS\\n" > "$1"\nexit 1\n');
+    fs.chmodSync(driver, 0o755);
+    fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '*.txt merge=unclosed\n');
+    await sh(dir, 'config', 'merge.unclosed.name', 'leaves a marker it never closes');
+    await sh(dir, 'config', 'merge.unclosed.driver', `${driver} %A`);
+
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T29: the fixture conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    const file = (clash.files || [])[0] || {};
+    check('T29: and the parse finds no hunks in it', (file.parts || []).filter((p) => p.kind === 'clash').length === 0, JSON.stringify(file.parts));
+    check('T29:   with git’s marker still sitting in the text it calls agreed', (file.parts || []).some((p) => p.kind === 'same' && p.text.includes('<<<<<<<')), JSON.stringify(file.parts));
+
+    const before = await repoState(dir);
+    const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+    check('T29: the resolve does not throw', answer.error === null, String(answer.error));
+    await refusedCleanly(
+      'T29: a whole-file answer to a file whose markers went unread',
+      answer.value,
+      dir,
+      before,
+      'bad_choices',
+      (r) => r?.badChoices?.[0]?.path === 'a.txt' && r?.badChoices?.[0]?.reason === 'unreadable_conflict'
+    );
+    check('T29:   with nothing to suggest sending instead', JSON.stringify(answer.value?.badChoices?.[0]?.expected) === '[]', JSON.stringify(answer.value?.badChoices?.[0]));
+    check('T29:   and a sentence that says the markers could not be read', /could not read/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T29:   and sends the person to the project', /by hand/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T29: THE INCOMING WORK IS STILL ON ITS BRANCH', (await sh(dir, 'show', 'feature:a.txt')) === 'INCOMING-WORK', await sh(dir, 'show', 'feature:a.txt'));
+    check('T29:   and nothing was merged into this one', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+
+    // THE OTHER THREE WAYS OF ANSWERING IT, refused the same way — the
+    // deliberate "theirs" as much as the default nobody typed, because every
+    // one of them was decided against a description of the file that was false.
+    for (const [what, choices] of [
+      ['the incoming side named outright', { 'a.txt': 'theirs' }],
+      ['the documented default, left out entirely', {}],
+      ['a per-hunk list', { 'a.txt': ['ours'] }],
+    ]) {
+      const also = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices, expect: clash.at }));
+      check(`T29: ${what} is refused too`, also.value?.ok === false && also.value?.badChoices?.[0]?.reason === 'unreadable_conflict', JSON.stringify(also.value?.badChoices || also.error));
+    }
+    check('T29:   and after all of them the default answer was recorded', answer.value?.badChoices?.[0]?.given === 'ours', JSON.stringify(answer.value?.badChoices?.[0]));
+
+    // WHAT AN AGENT IS TOLD ABOUT SUCH A FILE, on both surfaces.
+    const { DOMAINS: MAPPERS } = require('../electron/mcp/agent/domains.js');
+    const env = await MAPPERS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'ref' });
+    const entry = (env?.files || [])[0] || {};
+    check('T29 MCP: the file is NOT described as having zero conflicting hunks', entry.hunks !== null ? false : true, JSON.stringify(entry));
+    check('T29 MCP:   and is not passed off as omitted for size', entry.hunksOmitted === false, JSON.stringify(entry));
+    check('T29 MCP:   it says the markers went unread', entry.markersUnread === true, JSON.stringify(entry));
+    // AND THE ENVELOPE SAYS WHAT THAT FIELD MEANS. The same envelope tells the
+    // agent to send "exactly as many entries as the hunks listed here", and for
+    // this file there are none to count — a field it has to guess the meaning
+    // of would send it back to that instruction.
+    check('T29 MCP:   and the note explains what that means for the answer', /markersUnread/.test(String(env?.note || '')) && /by hand/.test(String(env?.note || '')), String(env?.note));
+    const mapped = await MAPPERS.git.resolve_merge.result(answer.value, { branch: 'feature' }, { root: dir });
+    check('T29 MCP: the refusal is still bad_choices', mapped?.code === 'bad_choices', JSON.stringify({ code: mapped?.code }));
+    check('T29 MCP:   naming the unread markers rather than the vocabulary', /markers Stacki could not read/.test(String(mapped?.message || '')), String(mapped?.message));
+
+    // THE CONTROL: a file with no markers because there is genuinely nothing
+    // marked up — a modify/delete — still takes a whole-file answer. The
+    // refusal above must be about markers that went unread, not about every
+    // file that reports no hunks.
+    const md = await repo('unreadablecontrol');
+    cleanup.push(md);
+    await sh(md, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(md, 'a.txt'), 'EDITED-ON-FEATURE\n');
+    await sh(md, 'add', '-A');
+    await sh(md, 'commit', '-qm', 'edited on feature');
+    await sh(md, 'checkout', '-q', 'main');
+    await sh(md, 'rm', '-q', 'a.txt');
+    await sh(md, 'commit', '-qm', 'deleted on main');
+    const mdClash = await mergeBranch(git, { projectPath: md, branch: 'feature' });
+    check('T29 control: the modify/delete fixture conflicts with no hunks', mdClash.conflicted === true && (mdClash.files?.[0]?.parts || []).filter((p) => p.kind === 'clash').length === 0, JSON.stringify(mdClash.files?.[0]?.parts));
+    const mdKept = await caught(() => resolveMerge(git, { projectPath: md, branch: 'feature', choices: { 'a.txt': 'theirs' }, expect: mdClash.at }));
+    check('T29 control: a whole-file answer to it still merges', mdKept.value?.ok === true && mdKept.value?.resolved === 1, JSON.stringify(mdKept.value || mdKept.error));
+    check('T29 control:   keeping the incoming version', textOf(path.join(md, 'a.txt')) === 'EDITED-ON-FEATURE\n', JSON.stringify(textOf(path.join(md, 'a.txt'))));
+
+    // AND THE PANEL CAN SAY IT. A file with `parts` but no hunks fell between
+    // the modal's two halves: the whole-file chooser was drawn only for files
+    // with NO parts at all, so this one got the per-hunk half — a header with
+    // "All main" / "All feature" buttons that mapped over an empty list and did
+    // nothing, no hunks under it, and a choicesForSend() that sent "ours" every
+    // time whatever was clicked. There was no way to ask for the incoming
+    // version of a modify/delete from the panel at all.
+    const mdPanel = await renderMergeModal(mdClash);
+    check('T29 control panel: the modal renders it', mdPanel.errors.length === 0, mdPanel.errors[0]);
+    check('T29 control panel:   offering a whole-file choice', mdPanel.labels().includes('feature') && mdPanel.labels().includes('main'), JSON.stringify(mdPanel.labels()));
+    check('T29 control panel:   which defaults to keeping this branch', JSON.stringify(mdPanel.merge()) === JSON.stringify({ 'a.txt': 'ours' }), JSON.stringify(mdPanel.merge()));
+    check('T29 control panel:   with the incoming branch there to click', mdPanel.click('feature'), JSON.stringify(mdPanel.labels()));
+    check('T29 control panel: AND ASKING FOR THE INCOMING VERSION IS WHAT GETS SENT', JSON.stringify(mdPanel.merge()) === JSON.stringify({ 'a.txt': 'theirs' }), JSON.stringify(mdPanel.merge()));
+    mdPanel.close();
+  }
+
+  {
+    // T30 — `merge_blocked` SAID "NOTHING WAS WRITTEN" OVER FILES THE TRIAL
+    // MERGE HAD ALREADY WRITTEN.
+    //
+    // It was the one post-trial-merge refusal that never looked at the tree: no
+    // `abort()`, and no comparison of `treeBefore` with `treeNow()`. Its
+    // reasoning was that an empty unmerged list proves the merge wrote nothing,
+    // and that is false — `git merge --no-commit --no-ff` writes the merged
+    // WORKING TREE first and can fail partway through, leaving the files it had
+    // already created with not one unmerged entry in the index.
+    //
+    // The residue is not inert: a leftover `src/pages/*.astro` is a file
+    // Stacki's own page scan lists as a page of the CURRENT branch, and the next
+    // `git add -A` commits the incoming branch's work onto it. The remedy the
+    // message gave — send exactly this call again — cannot work for this cause
+    // either: the same failure recurs and each retry leaves more behind.
+    const dir = await repo('blockedresidue');
+    cleanup.push(dir);
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'THEIRS\n');
+    fs.mkdirSync(path.join(dir, 'src', 'pages'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src/pages/incoming.astro'), '<h1>incoming</h1>\n');
+    // Sorts after src/, so the merge has already written the page by the time
+    // it dies here.
+    fs.mkdirSync(path.join(dir, 'zz'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'zz/locked.txt'), 'incoming\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'incoming');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'OURS\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'ours');
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T30: the fixture conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    const PAGE = path.join(dir, 'src/pages/incoming.astro');
+    check('T30: and the incoming page is not in the tree before the resolve', fs.existsSync(PAGE) === false);
+
+    // The failure, made real rather than stubbed: a directory the merge has to
+    // write into that it cannot. `git merge` dies on it AFTER it has written
+    // everything that sorts before it.
+    fs.mkdirSync(path.join(dir, 'zz'), { recursive: true });
+    fs.chmodSync(path.join(dir, 'zz'), 0o500);
+    let answer;
+    try {
+      answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+    } finally {
+      fs.chmodSync(path.join(dir, 'zz'), 0o700);
+    }
+    check('T30: the resolve does not throw', answer.error === null, String(answer.error));
+    check('T30: the trial merge really did leave the incoming page behind', fs.existsSync(PAGE), await sh(dir, 'status', '--porcelain'));
+    check('T30: THE REFUSAL DOES NOT CLAIM NOTHING WAS WRITTEN', !/nothing was written/i.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T30: it is merge_stuck, not merge_blocked', answer.value?.code === 'merge_stuck', JSON.stringify({ code: answer.value?.code, message: answer.value?.message }));
+    check('T30:   naming the file the merge left behind', JSON.stringify(answer.value?.files) === JSON.stringify(['src/pages/incoming.astro']), JSON.stringify(answer.value?.files));
+    check('T30:   and saying there is no merge left to abort', answer.value?.mergeInProgress === false, JSON.stringify({ mergeInProgress: answer.value?.mergeInProgress }));
+    check('T30:   with the remedy that fits — put the file back, not retry', /git checkout HEAD --/.test(String(answer.value?.message || '')) && !/send exactly this call again/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T30: and nothing was committed', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
+    const { DOMAINS: MAPPERS } = require('../electron/mcp/agent/domains.js');
+    const mapped = await MAPPERS.git.resolve_merge.result(answer.value, { branch: 'feature' }, { root: dir });
+    check('T30 MCP: passed through as merge_stuck', mapped?.code === 'merge_stuck', JSON.stringify({ code: mapped?.code }));
+
+    // THE CONTROL, AND THE REASON THE UNWIND IS STILL CONDITIONAL. The case
+    // this refusal exists for is another git process holding the repository —
+    // an ordinary `index.lock` — and there git stops before writing anything.
+    // Firing `merge --abort` into that is the one way to turn a wait into
+    // damage, so a tree that did not move must still answer merge_blocked, with
+    // the sentence intact.
+    const held = await repo('blockedlock');
+    cleanup.push(held);
+    await sh(held, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(held, 'a.txt'), 'THEIRS\n');
+    await sh(held, 'add', '-A');
+    await sh(held, 'commit', '-qm', 'incoming');
+    await sh(held, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(held, 'a.txt'), 'OURS\n');
+    await sh(held, 'add', '-A');
+    await sh(held, 'commit', '-qm', 'ours');
+    const heldClash = await mergeBranch(git, { projectPath: held, branch: 'feature' });
+    check('T30 control: the fixture conflicts', heldClash.conflicted === true, JSON.stringify(heldClash).slice(0, 160));
+    const beforeHeld = await repoState(held);
+    fs.writeFileSync(path.join(held, '.git', 'index.lock'), '');
+    const lockAnswer = await caught(() => resolveMerge(git, { projectPath: held, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: heldClash.at }));
+    fs.rmSync(path.join(held, '.git', 'index.lock'), { force: true });
+    check('T30 control: a merge that wrote nothing is still merge_blocked', lockAnswer.value?.code === 'merge_blocked', JSON.stringify({ code: lockAnswer.value?.code, error: lockAnswer.error, message: lockAnswer.value?.message }));
+    check('T30 control:   still telling the caller to wait and send the same call', /send exactly this call again/.test(String(lockAnswer.value?.message || '')), String(lockAnswer.value?.message));
+    check('T30 control:   and quoting git rather than a command line', typeof lockAnswer.value?.gitSaid === 'string' && !/^Command failed/i.test(lockAnswer.value.gitSaid), String(lockAnswer.value?.gitSaid));
+    const afterHeld = await repoState(held);
+    check('T30 control:   with HEAD unmoved and the tree untouched', afterHeld.head === beforeHeld.head && JSON.stringify(afterHeld.bytes) === JSON.stringify(beforeHeld.bytes), `${beforeHeld.head} -> ${afterHeld.head}`);
+    // And the same answers still merge once the lock is gone, so the control is
+    // a refusal about the moment rather than about the repository.
+    const freed = await caught(() => resolveMerge(git, { projectPath: held, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: heldClash.at }));
+    check('T30 control:   and the very same call merges once the lock is gone', freed.value?.ok === true && freed.value?.resolved === 1, JSON.stringify(freed.value || freed.error));
+  }
+
+  {
+    // T31 — THE FINAL-NEWLINE CORRECTION SWITCHED ITSELF OFF, SILENTLY, ON ANY
+    // CONFLICTING FILE OVER A MEGABYTE.
+    //
+    // `stage()` reads one side of a conflict with `git show :2:path`. The
+    // runner underneath is child_process.execFile, whose maxBuffer defaults to
+    // 1 MiB, and stage() shelled out with no options at all — so a bigger file
+    // rejected with ERR_CHILD_PROCESS_STDIO_MAXBUFFER and the catch turned that
+    // into the same `null` a DELETED side answers with. renderResolved reads
+    // null as "that side is gone, so git's own terminator is the only one there
+    // is" and keeps the newline git invented. The result is a merge commit one
+    // byte different from the branch it came from, reported as
+    // `{ok: true, resolved: 1}`, with nothing anywhere saying so.
+    //
+    // THE RUNNER HERE IS THE PRODUCTION ONE'S SHAPE. main.js passes an `opts`
+    // third argument through to execFile; the two-argument runner the rest of
+    // this file uses would swallow the bound being raised and prove nothing, so
+    // this one forwards it — and forwards NOTHING when nothing is given, which
+    // is where the 1 MiB default lives.
+    const opting = (cwd, args, opts = {}) =>
+      new Promise((resolve, reject) => {
+        execFile('git', args, { cwd, ...opts }, (err, stdout, stderr) => {
+          if (err) {
+            err.stdout = stdout;
+            err.stderr = stderr;
+            reject(err);
+          } else resolve({ stdout: String(stdout), stderr: String(stderr) });
+        });
+      });
+
+    const dir = await repo('bigside');
+    cleanup.push(dir);
+    // Over a megabyte, which is not a large source file — a generated data
+    // file, a long page, a committed bundle. The clash is at the END of it,
+    // because that is the one place the terminator matters.
+    const pad = Array.from({ length: 30000 }, (_, i) => `line ${i} of ordinary padding text in this file`).join('\n');
+    fs.writeFileSync(path.join(dir, 'a.txt'), `${pad}\nBASE\n`);
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'a big file');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    // No terminator on the incoming side: this is what the correction exists
+    // for, and what its silent absence puts back.
+    fs.writeFileSync(path.join(dir, 'a.txt'), `${pad}\nTHEIRS`);
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'incoming, with no newline at the end');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), `${pad}\nOURS\n`);
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'ours');
+    check('T31: the fixture is bigger than execFile’s default buffer', fs.statSync(path.join(dir, 'a.txt')).size > 1024 * 1024, String(fs.statSync(path.join(dir, 'a.txt')).size));
+
+    const clash = await mergeBranch(opting, { projectPath: dir, branch: 'feature' });
+    check('T31: it conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+    const hunks = (clash.files?.[0]?.parts || []).filter((p) => p.kind === 'clash').length;
+    check('T31: with the clash running to the end of the file', hunks === 1 && conflictAtEnd(clash.files[0].parts) === true, JSON.stringify({ hunks }));
+    const applied = await caught(() =>
+      resolveMerge(opting, { projectPath: dir, branch: 'feature', choices: { 'a.txt': Array(hunks).fill('theirs') }, expect: clash.at })
+    );
+    check('T31: the resolve does not throw', applied.error === null, String(applied.error));
+    check('T31: it merges', applied.value?.ok === true && applied.value?.resolved === 1, JSON.stringify(applied.value));
+    check(
+      'T31: AND THE COMMITTED FILE IS THE INCOMING ONE, BYTE FOR BYTE',
+      textOf(path.join(dir, 'a.txt')) === `${pad}\nTHEIRS`,
+      JSON.stringify({ endsWithNewline: textOf(path.join(dir, 'a.txt'))?.endsWith('\n'), bytes: textOf(path.join(dir, 'a.txt'))?.length })
+    );
+    check('T31:   with no newline neither branch wrote', textOf(path.join(dir, 'a.txt'))?.endsWith('\n') === false, JSON.stringify(textOf(path.join(dir, 'a.txt'))?.slice(-12)));
+
+    // AND WHEN THE READ REALLY DOES FAIL, IT IS SAID RATHER THAN GUESSED AT.
+    // A side the index says is there that comes back unreadable is not the same
+    // thing as a side that is not there, and reading it as one is what made the
+    // byte above go missing in silence. The runner below refuses exactly that
+    // one read — which is what a maxBuffer overflow is, at whatever size the
+    // bound sits.
+    const small = await repo('unreadableside');
+    cleanup.push(small);
+    await sh(small, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(small, 'a.txt'), 'head\nTHEIRS');
+    await sh(small, 'add', '-A');
+    await sh(small, 'commit', '-qm', 'incoming');
+    await sh(small, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(small, 'a.txt'), 'head\nOURS\n');
+    await sh(small, 'add', '-A');
+    await sh(small, 'commit', '-qm', 'ours');
+    const smallClash = await mergeBranch(git, { projectPath: small, branch: 'feature' });
+    const smallHunks = (smallClash.files?.[0]?.parts || []).filter((p) => p.kind === 'clash').length;
+    check('T31: the small fixture clashes to the end of the file too', smallHunks === 1 && conflictAtEnd(smallClash.files[0].parts) === true, JSON.stringify(smallClash.files?.[0]?.parts));
+    const refusing = async (cwd, args) => {
+      if (args[0] === 'show' && String(args[2] || '').startsWith(':3:')) {
+        const err = new Error('stdout maxBuffer length exceeded');
+        err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+        throw err;
+      }
+      return git(cwd, args);
+    };
+    const beforeSmall = await repoState(small);
+    const said = await caught(() =>
+      resolveMerge(refusing, { projectPath: small, branch: 'feature', choices: { 'a.txt': Array(smallHunks).fill('theirs') }, expect: smallClash.at })
+    );
+    check('T31: a side that would not read stops the merge instead of guessing', said.error !== null, JSON.stringify(said.value));
+    check('T31:   naming the file and which side of it', /a\.txt/.test(String(said.error)) && /incoming branch/.test(String(said.error)), String(said.error));
+    const afterSmall = await repoState(small);
+    check('T31:   with HEAD unmoved', afterSmall.head === beforeSmall.head, `${beforeSmall.head} -> ${afterSmall.head}`);
+    check('T31:   the tree back as it was', JSON.stringify(afterSmall.bytes) === JSON.stringify(beforeSmall.bytes), afterSmall.status);
+    check('T31:   and no merge left in progress', afterSmall.mergeHead === false);
+    // THE CONTROL: with the read working, the same fixture and the same answer
+    // merge, and the terminator correction still happens. Without it a guard
+    // that simply refused every resolve would pass everything above.
+    const settled = await caught(() =>
+      resolveMerge(git, { projectPath: small, branch: 'feature', choices: { 'a.txt': Array(smallHunks).fill('theirs') }, expect: smallClash.at })
+    );
+    check('T31 control: the same answer merges when the side can be read', settled.value?.ok === true, JSON.stringify(settled.value || settled.error));
+    check('T31 control:   with the incoming bytes exactly', textOf(path.join(small, 'a.txt')) === 'head\nTHEIRS', JSON.stringify(textOf(path.join(small, 'a.txt'))));
   }
 
 }

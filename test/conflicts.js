@@ -13,7 +13,7 @@
 // cannot understand must keep all of its lines rather than losing the parts it
 // failed to parse.
 
-const { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, mergeInline } = require('../electron/conflicts.js');
+const { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, mergeInline, unreadMarkers } = require('../electron/conflicts.js');
 const { guardSuite } = require('./support/suiteGuard.js');
 
 // "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
@@ -622,6 +622,146 @@ const conflicted = [
       renderResolved(sharedTail, ['both'], mirrored) === 'head\nOURS\nTHEIRS\ntail\n',
     JSON.stringify([renderResolved(sharedTail, ['both'], bothSides), renderResolved(sharedTail, ['both'], mirrored)])
   );
+}
+
+// --- A conflicted file that does not use LF ----------------------------------
+//
+// GIT WRITES ITS MARKERS WITH THE FILE'S OWN LINE ENDING, AND THE MARKER
+// PATTERNS COULD NOT SEE PAST A CARRIAGE RETURN.
+//
+// `<<<<<<< HEAD\r` is what a CRLF file gets — anything authored on Windows,
+// anything under core.autocrlf, anything a .gitattributes marks
+// `text eol=crlf`. In JavaScript `.` does not match '\r' and `$` without the
+// `m` flag matches only at the very end of the string, so `/^<<<<<<< ?(.*)$/`
+// matched no marker in such a file at all: the whole marked-up thing came back
+// as ONE agreed part, clashCount() was 0, and the panel then sent the
+// whole-file word "ours" for a file it had shown the user nothing about. The
+// bytes below are real git output, `merge.conflictStyle=diff3`, taken from a
+// repository with `*.txt text eol=crlf`.
+{
+  const marked =
+    'head\r\n<<<<<<< HEAD\r\nOURS\r\n||||||| 77ebd51\r\nBASE\r\n=======\r\nTHEIRS\r\n>>>>>>> feature\r\ntail\r\n';
+  const parts = parseConflict(marked);
+  check('a CRLF conflict is a disagreement, not one agreed file', clashCount(parts) === 1, JSON.stringify(parts));
+  check(
+    '  and not one marker is left in the text called agreed',
+    !parts.some((p) => p.kind === 'same' && /(?:^|\n)(?:<{7}|\|{7}|={7}|>{7})/.test(p.text)),
+    JSON.stringify(parts)
+  );
+  // THE ROUND TRIP, BYTE FOR BYTE. The two branch versions below are the files
+  // git checks out for `--ours` and `--theirs` in that repository, CRLF and
+  // all, so anything this rebuilds that is not one of them is a byte nobody
+  // wrote.
+  check(
+    'keeping this branch rebuilds its CRLF file exactly',
+    renderResolved(parts, ['ours']) === 'head\r\nOURS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['ours']))
+  );
+  check(
+    '  and keeping the incoming branch rebuilds its CRLF file exactly',
+    renderResolved(parts, ['theirs']) === 'head\r\nTHEIRS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['theirs']))
+  );
+  check(
+    '  and keeping both keeps CRLF between them',
+    renderResolved(parts, ['both']) === 'head\r\nOURS\r\nTHEIRS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['both']))
+  );
+  // The same file with LF, so the CRLF answers above cannot be right by
+  // accident of some rule that ignores the ending altogether.
+  const lf = parseConflict('head\n<<<<<<< HEAD\nOURS\n||||||| 77ebd51\nBASE\n=======\nTHEIRS\n>>>>>>> feature\ntail\n');
+  check(
+    'CONTROL: the LF file of the same shape still rebuilds with LF',
+    renderResolved(lf, ['theirs']) === 'head\nTHEIRS\ntail\n' && clashCount(lf) === 1,
+    JSON.stringify(renderResolved(lf, ['theirs']))
+  );
+}
+
+// --- The final newline, in a file whose newline is two bytes -----------------
+//
+// THE CORRECTION TOOK OFF ONE CHARACTER, AND A CRLF TERMINATOR IS TWO.
+//
+// When the conflict runs to the end of the file git writes a terminator after
+// the chosen side whether or not that side had one, and renderResolved takes
+// it back off when the side it ends on has none. Slicing exactly one character
+// out of a CRLF file removes the '\n' and leaves the '\r' — a byte NEITHER
+// BRANCH WROTE, on the last line, invisible in every editor that draws it.
+// MEASURED with real git, ours "head\r\nOURS\r\n" and theirs
+// "head\r\nTHEIRS" with no terminator: `['theirs']` rendered
+// "head\r\nTHEIRS\r" and `['both']` rendered "head\r\nOURS\r\nTHEIRS\r",
+// both written, staged and committed as ok.
+{
+  const parts = parseConflict('head\r\n<<<<<<< HEAD\r\nOURS\r\n=======\r\nTHEIRS\r\n>>>>>>> feature\r\n');
+  check('the CRLF conflict that ends the file is recognised as one', conflictAtEnd(parts) === true, JSON.stringify(parts));
+  // Stages 2 and 3 as `git show` gives them — the index blob, which for an
+  // `eol=crlf` file is stored with LF. Whether it ends in a terminator is the
+  // only thing read off it, and normalisation does not change that.
+  const sides = { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' };
+  check(
+    'the incoming side with no terminator gains neither a newline nor a stray CR',
+    renderResolved(parts, ['theirs'], sides) === 'head\r\nTHEIRS',
+    JSON.stringify(renderResolved(parts, ['theirs'], sides))
+  );
+  check(
+    '  while this branch, which has one, keeps the whole CRLF pair',
+    renderResolved(parts, ['ours'], sides) === 'head\r\nOURS\r\n',
+    JSON.stringify(renderResolved(parts, ['ours'], sides))
+  );
+  check(
+    '  and keeping both ends on the incoming side, terminator and all',
+    renderResolved(parts, ['both'], sides) === 'head\r\nOURS\r\nTHEIRS',
+    JSON.stringify(renderResolved(parts, ['both'], sides))
+  );
+  // CONTROL, AND THE REASON THIS IS ASKED OF THE SIDE RATHER THAN OF THE TEXT.
+  // A '\r' at the end of the last line is not always part of a line ending: an
+  // LF-terminated file can carry one as content. The side git is holding says
+  // which this is, and stripping two bytes there would eat a byte the branch
+  // really wrote.
+  const carried = { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS\r' };
+  check(
+    'CONTROL: a CR the incoming side really ends on is not taken for a line ending',
+    renderResolved(parts, ['theirs'], carried) === 'head\r\nTHEIRS\r',
+    JSON.stringify(renderResolved(parts, ['theirs'], carried))
+  );
+  // And the LF file of the same shape is unmoved by any of it.
+  const lf = parseConflict('head\n<<<<<<< HEAD\nOURS\n=======\nTHEIRS\n>>>>>>> feature\n');
+  check(
+    'CONTROL: the LF file still loses exactly its one newline',
+    renderResolved(lf, ['theirs'], { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' }) === 'head\nTHEIRS',
+    JSON.stringify(renderResolved(lf, ['theirs'], { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' }))
+  );
+}
+
+// --- Markers that survived into the text this called agreed ------------------
+//
+// A MARKED-UP FILE THAT PARSES TO NOTHING LOOKS EXACTLY LIKE A FILE WITH
+// NOTHING TO CHOOSE, AND THE DIFFERENCE IS THE WHOLE MERGE.
+//
+// parseConflict keeps anything it cannot read as `same` text, which is right —
+// no line is ever dropped — but `same` means "both branches agree on this" and
+// a `<<<<<<<` line is git saying the opposite. Every caller reads
+// clashCount() === 0 as "no disagreements", so the shape has to be
+// recognisable on its own. The CRLF markers above were one way to reach it;
+// this is the shape rather than that cause.
+{
+  const readable = parseConflict('a\n<<<<<<< HEAD\nO\n=======\nT\n>>>>>>> f\nb\n');
+  check('a conflict that was read carries no unread markers', unreadMarkers(readable) === false, JSON.stringify(readable));
+  const crlf = parseConflict('a\r\n<<<<<<< HEAD\r\nO\r\n=======\r\nT\r\n>>>>>>> f\r\nb\r\n');
+  check('  nor does the CRLF one, now that it is read', unreadMarkers(crlf) === false, JSON.stringify(crlf));
+  const plain = parseConflict('a file with no markers in it at all\n');
+  check('  and a file with no markers has none unread either', unreadMarkers(plain) === false, JSON.stringify(plain));
+  // The two shapes that do reach it: a block nobody closed, and a marker whose
+  // opener this could not match at all. Both leave the opener in agreed text.
+  const unclosed = parseConflict('a\n<<<<<<< HEAD\nO\n=======\nT\n');
+  check('an unclosed block is nought hunks AND says its markers went unread', clashCount(unclosed) === 0 && unreadMarkers(unclosed) === true, JSON.stringify(unclosed));
+  check(
+    '  with every one of its lines still in the parse',
+    renderResolved(unclosed) === 'a\n<<<<<<< HEAD\nO\n=======\nT\n',
+    JSON.stringify(renderResolved(unclosed))
+  );
+  // Not a marker: seven is the count git writes, and a longer run of the same
+  // character is somebody's own text.
+  check('a longer run of the same character is not a marker', unreadMarkers(parseConflict('a\n<<<<<<<<\nb\n')) === false);
 }
 
 if (failures.length) {

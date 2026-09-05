@@ -230,10 +230,36 @@ function whoChanged(ours, theirs, base) {
   return 'both';
 }
 
-const START = /^<<<<<<< ?(.*)$/;
+// GIT WRITES ITS MARKERS WITH THE FILE'S OWN LINE ENDING, AND NEITHER `.` NOR
+// `$` COULD SEE PAST A CARRIAGE RETURN.
+//
+// A conflicted file that uses CRLF — anything authored on Windows, anything
+// under `core.autocrlf`, anything a .gitattributes marks `text eol=crlf` — has
+// its marker written as `<<<<<<< HEAD\r`. These lines are cut on '\n', so the
+// '\r' is still on the end of each one, and in JavaScript `.` does not match a
+// carriage return while `$` without the `m` flag matches only at the very end
+// of the string. `/^<<<<<<< ?(.*)$/` therefore could not match ANY marker in
+// such a file.
+//
+// The consequence was not a worse parse, it was no parse: the whole marked-up
+// file — markers, both sides, the ancestor — came back as one `{kind:'same'}`
+// part, clashCount() was 0, and the panel's choicesForSend() then took its
+// `!list.length` branch and sent the whole-file word "ours" (list[0] being
+// undefined). MEASURED end to end against real git with `*.txt text eol=crlf`:
+// resolveMerge validated "ours" as legal vocabulary, ran `git checkout --ours`,
+// committed a real two-parent merge and answered
+// `{ok: true, changed: true, resolved: 1}` — with the incoming branch's work
+// nowhere in the tree and the branch now recorded as merged, so the
+// safe-delete guard stopped protecting it. On the MCP side the same file went
+// out as `{hunks: [], hunksOmitted: false}`: a file git had reported as
+// conflicting, described to the agent as having no conflicting hunks.
+//
+// So every marker tolerates the terminator its file uses. MIDDLE already did,
+// by accident of `\s*` — `\s` matches '\r' — and is left spelled the way it was.
+const START = /^<<<<<<< ?(.*?)\r?$/;
 const MIDDLE = /^=======\s*$/;
-const BASE = /^\|\|\|\|\|\|\| ?(.*)$/; // only present under diff3 conflict style
-const END = /^>>>>>>> ?(.*)$/;
+const BASE = /^\|\|\|\|\|\|\| ?(.*?)\r?$/; // only present under diff3 conflict style
+const END = /^>>>>>>> ?(.*?)\r?$/;
 
 /**
  * A conflicted file as a list of parts.
@@ -541,7 +567,53 @@ function renderResolved(parts, picks = [], sides = null) {
   // Null is a side that deleted the file. There is no version of it to take a
   // terminator from, so git's own is the only answer there is.
   if (typeof source !== 'string' || source === '' || source.endsWith('\n')) return text;
-  return text.slice(0, -1);
+  // AND THE TERMINATOR TAKEN OFF IS THE FILE'S OWN, WHICH IS NOT ALWAYS ONE
+  // BYTE.
+  //
+  // This used to slice exactly one character. In a CRLF file that removes the
+  // '\n' of a '\r\n' pair and leaves the '\r' behind — a byte NEITHER BRANCH
+  // WROTE, on the last line of the file, invisible in every editor that draws
+  // it. MEASURED with real git and `*.txt text eol=crlf`, ours
+  // "head\r\nOURS\r\n" and theirs "head\r\nTHEIRS" with no terminator: the
+  // answer `['theirs']` rendered "head\r\nTHEIRS\r" where git's own checkout
+  // of that side is "head\r\nTHEIRS", and `['both']` rendered
+  // "head\r\nOURS\r\nTHEIRS\r". Written, staged and committed as
+  // `{ok: true, resolved: 1}`.
+  //
+  // How much to take is asked of the SIDE, not guessed from the text: the
+  // chosen version has no terminator (that is what got us here), so a '\r'
+  // immediately before the invented newline belongs to the line ending unless
+  // that side's own last line really ends in one. Both readings are evidence
+  // rather than convention — the rendered bytes and the blob git is holding.
+  const crlf = text.endsWith('\r\n') && !source.endsWith('\r');
+  return text.slice(0, crlf ? -2 : -1);
 }
 
-module.exports = { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, lineDiff, mergeInline };
+/**
+ * A conflict marker still sitting in text this parse called AGREED.
+ *
+ * A MARKED-UP FILE THAT PARSES TO NOTHING IS INDISTINGUISHABLE FROM A FILE
+ * WITH NOTHING TO CHOOSE, AND THE DIFFERENCE IS THE WHOLE MERGE.
+ *
+ * `parseConflict` is deliberately forgiving: anything it cannot read as a
+ * conflict block it keeps, verbatim, as `{kind: 'same'}` text — which is right,
+ * because nothing is ever silently dropped. But `same` means "both branches
+ * agree on this", and a `<<<<<<<` line is git saying the exact opposite. Every
+ * caller downstream reads clashCount() === 0 as "no disagreements here", and
+ * for such a file that is false: the disagreement is still in there, unread.
+ *
+ * The CRLF markers above were one way to arrive at that shape and are fixed;
+ * a block whose opener and closer disagree about their line endings, or one a
+ * person hand-edited and left unclosed, are others, and there is no reason to
+ * believe the list is complete. So the shape itself is recognisable, and the
+ * callers that would otherwise answer for such a file — resolveMerge's
+ * validator, and the MCP git domain describing hunks to an agent — ask here.
+ *
+ * Only the OPENER is looked for: a block always starts with one, so a marker
+ * this could not read leaves that line in the agreed text whichever half of it
+ * failed.
+ */
+const unreadMarkers = (parts) =>
+  (parts || []).some((part) => part && part.kind === 'same' && /(?:^|\n)<{7}(?=[ \t\r]|$)/.test(part.text || ''));
+
+module.exports = { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, lineDiff, mergeInline, unreadMarkers };
