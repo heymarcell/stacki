@@ -78,41 +78,45 @@ N reads — the price of never writing over somebody's change.
 ## A merge conflict is a moment, and its ref says which one
 
 git.merge that clashes answers \`merge_conflict\` with a \`mergeRef\` beside the
-hunks. Applying your answers RE-RUNS the merge, so they answer only the conflict
-you were shown, and the ref proves it is still that one: both branch tips and a
-digest of what git actually wrote.
+hunks. Applying answers RE-RUNS the merge, so they answer only the conflict you
+were shown, and the ref proves it is still that one: both branch tips and a
+digest of what git wrote.
 
   git.resolve_merge { mergeRef, choices }   the branch comes out of the ref, so
-                                            one merge's answers cannot be paired
-                                            with another's branch.
+                                            one merge's answers cannot be
+                                            paired with another's branch.
 
-Nine refusals. Eight merge nothing and leave the branch as it was:
+Twelve refusals. Eleven merge nothing and leave the branch as it was.
 
-  guard_required   no mergeRef, or one recording no conflict
-  bad_ref          not a mergeRef Stacki issued, or can still read
-  wrong_target     that ref is for a merge other than the one \`branch\` names
-                   — all three: run git.merge and use the ref it hands back
+Six are about the handle and all six mean the same thing to do — run git.merge
+and pass back the \`mergeRef\` it hands you, unchanged: guard_required (none sent,
+or recording no conflict), bad_ref (not one Stacki issued, or altered),
+stale_ref (expired), wrong_project, wrong_kind (not a merge ref), wrong_target
+(a different merge from the one \`branch\` names).
+
+The other five are about the merge:
+
   stale_merge      a commit landed on either branch, or git reconciles them
-                   differently now; both SHAs are named then and now. Run
-                   git.merge again and answer THAT, never re-send old answers
-  bad_choices      a key that is not a conflicting path, a list not exactly as
-                   long as that file's hunks, "merged" where the hunk offered
-                   none. The message says which and why
+                   differently now; both SHAs are named. Run git.merge again and
+                   answer THAT, never re-send old answers
+  bad_choices      a key that is not a conflicting path, a list not as long as
+                   that file's hunks, "merged" where the hunk offered none. The
+                   message says which and why
   merge_blocked    git would not start the re-merge, usually another process
-                   holding the repository. gitSaid has git's own words; send
-                   the same call again
-  working_tree_blocked   it must write a file holding uncommitted changes.
+                   holding the repository. gitSaid has git's words; send it
+                   again
+  working_tree_blocked   it must write a file with uncommitted changes in it.
                    Commit, park or discard them and send the call again
-  bad_branch_name  the branch that ref names is gone, or git will not take it
+  bad_branch_name  that branch is gone, or is not a name git takes
 
-The ninth has NOT left the project as it was, and it is the only refusal on this
-surface that says so:
+The twelfth has NOT left the project as it was, and it is the only refusal on
+this surface that says so:
 
   merge_stuck      the re-merge ran and the unwind did not take. Nothing was
                    committed and the branch did not move, but \`files\` names what
-                   differs, from the REPOSITORY root. \`mergeInProgress\` picks the
-                   remedy: true, \`git merge --abort\`; false, nothing to abort and
-                   it takes \`git checkout HEAD -- <path>\`. Do not retry; ask.
+                   differs, from the REPOSITORY root. \`mergeInProgress\`: true,
+                   \`git merge --abort\`; false, nothing to abort and it takes
+                   \`git checkout HEAD -- <path>\`. Do not retry; ask.
 
 ## Semantic first, source as the fallback
 
@@ -125,13 +129,13 @@ Prefer the operation that names what you mean:
   a design token              style.set_variable
   structure                   target.insert_before / append_child / move / remove
 
-Reach for source.read and source.write when the thing you need to change is not
-in Stacki's model — a script, a config, a utility module, arbitrary frontmatter
-logic. Replacing a file by path needs the ref you read it with, or its
-expectedDigest, for the same reason a ref does.
+Reach for source.read and source.write when the thing to change is not in
+Stacki's model — a script, a config, a utility module, frontmatter logic.
+Replacing a file by path needs the ref you read it with, or its expectedDigest,
+for the same reason a ref does.
 
-The model is a fast path, not a fence. Nothing stops you using your own file
-tools; you will just be re-deriving things Stacki has already parsed.
+The model is a fast path, not a fence. Your own file tools still work; you will
+just be re-deriving what Stacki has already parsed.
 
 ## Things that are true and surprise people
 

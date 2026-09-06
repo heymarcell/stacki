@@ -435,6 +435,19 @@ async function stage(git, projectPath, n, file) {
  * refusal, never a commit.
  */
 const MARKER_SIZE_BATCH = 64;
+// How many caller-named paths are worth asking git about before the merge has
+// said which ones are real. A conflict with more conflicting files than this is
+// vanishingly rare and loses nothing by it: the rest are asked about afterwards.
+const MARKER_SIZE_ASK_MAX = 256;
+// The longest a name worth asking git about can be: git's own path limit, so
+// nothing a repository can really contain is dropped.
+const MAX_PATH_CHARS = 4096;
+// And the longest one worth REPEATING back. A refusal names the key so the
+// caller can find its mistake, and five hundred characters is far past any path
+// in an Astro project while keeping the answer smaller than the question. A
+// longer one is shown clipped, with its real length, which is what was wrong
+// with it.
+const MAX_SHOWN_PATH_CHARS = 512;
 
 async function conflictMarkerSizes(git, root, files) {
   const sizes = new Map();
@@ -489,6 +502,220 @@ async function conflictMarkerSizes(git, root, files) {
     }
   }
   return sizes;
+}
+
+/**
+ * THE ONE PLACE THAT DECIDES WHETHER A TRIAL MERGE CAME BACK OUT.
+ *
+ * Both callers here run a merge they mean to unwind — `mergeBranch` to show the
+ * conflict, `resolveMerge` to apply answers to it — and both then tell the
+ * caller the project is as it was. Only one of them CHECKED, and the other's
+ * sentence was the more detailed of the two.
+ *
+ * MEASURED, with an `index.lock` held by a second git process at the moment the
+ * abort ran: `mergeBranch` answered `merge_conflict` — "The merge was unwound,
+ * so the project is exactly as it was", and again in its note, "the merge was
+ * unwound, so they hold the pre-merge bytes" — over a working tree that was
+ * still `UU a.txt`, with MERGE_HEAD present, three stages in the index and
+ * `<<<<<<< HEAD` in the file. `source.read` on the very `sourcePath` that
+ * envelope had just handed the agent returned those marked-up bytes. The
+ * guide's "merge_stuck is the only refusal on this surface that says so" was
+ * true only because the other refusal did not look.
+ *
+ * So the measurement is one function and both use it. `treeNow()` is read the
+ * instant before git is asked to merge and handed to `setBefore`; `abort()`
+ * unwinds and answers either null — nothing left behind — or the `merge_stuck`
+ * refusal, which is the same shape from either caller because it is the same
+ * fact about the same tree.
+ */
+function unwindGuard(git, { projectPath, at, into, branch }) {
+/**
+ * Put the trial merge back, AND SAY SO WHEN IT WOULD NOT GO BACK.
+ *
+ * Everything below this point that refuses does it AFTER the trial merge has
+ * run, so every one of those refusals is a claim about the tree as well as
+ * about the answers: "nothing was merged and the branch is exactly as it
+ * was". The unwind is what makes that claim true, and it used to be fired
+ * into a `catch {}` — so a merge --abort that failed left the claim
+ * standing over a working tree full of conflict markers.
+ *
+ * MEASURED, with real git and a real repository: `.git/MERGE_HEAD` removed
+ * between the merge and the abort — which is what a second git process, a
+ * crash, or an editor plugin's own `git merge --abort` does — makes the
+ * abort exit non-zero with "fatal: There is no merge to abort". The answer
+ * was `bad_choices`, "Nothing was merged", while `git status` said `UU
+ * a.txt`, the index held three stages, and the file on disk held
+ * `<<<<<<< HEAD`. Stacki parses that file as markup a moment later, and the
+ * page comes back broken with nothing to say why.
+ *
+ * So the failure is MEASURED rather than assumed in either direction. An
+ * abort that fails because there was nothing to abort has left nothing
+ * behind and the original refusal is still the true one; an abort that fails
+ * with a merge still in progress has, and that is a different answer with a
+ * name of its own. Asked of the index, not of the exit code: unmerged
+ * entries, or a MERGE_HEAD git is still holding.
+ */
+const midMerge = async () => {
+  try {
+    const left = await unmergedPaths(git, projectPath);
+    if (left.length) return left;
+    await git(projectPath, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+    return [];
+  } catch (err) {
+    // `rev-parse --verify` on a MERGE_HEAD that is not there exits 1 with
+    // nothing on stderr, which is the ordinary "it unwound" answer. Anything
+    // that actually said something is a repository that would not answer the
+    // question, and after a failed abort the honest reading of that is the
+    // cautious one.
+    return String(err?.stderr || '').trim() ? [] : null;
+  }
+};
+/**
+ * THE WORKING TREE, WHICH IS WHERE THE DAMAGE IS AND THE ONE PLACE THE
+ * UNWIND NEVER LOOKED.
+ *
+ * `midMerge` above asks the INDEX and the metadata: unmerged entries, or a
+ * MERGE_HEAD git is still holding. Its own docstring names the scenario it
+ * was written for — MERGE_HEAD removed between the merge and the abort by a
+ * second git process, a crash, or an editor plugin's own `merge --abort` —
+ * and it was only ever measured for the half of that scenario where the
+ * unmerged ENTRIES survive. A plain `git reset` (mixed) clears MERGE_HEAD
+ * AND the stages while leaving the working tree exactly as the trial merge
+ * wrote it, and that is the blind spot: `unmergedPaths` answers [],
+ * `rev-parse -q --verify MERGE_HEAD` exits 1 with EMPTY stderr because of
+ * the -q, so `midMerge` read "it unwound" and `abort` answered "nothing to
+ * abort, and nothing left behind".
+ *
+ * MEASURED 3/3, no stubs, the only extra thing being one ordinary `git
+ * reset` run at the moment `merge --abort` would have run:
+ *
+ *   bad_choices    "Nothing was merged: 1 of the choices could not be
+ *                  used…" while a.txt on disk held `<<<<<<< HEAD … |||||||
+ *                  … ======= … >>>>>>> feature`
+ *   unknown_path   the same sentence over the same file
+ *   clean re-merge `stale_merge`, "…Nothing was merged and "main" is exactly
+ *                  as it was.", while a.txt held "OURS\nkeep\nTHEIRS\nkeep\n"
+ *                  — bytes NEITHER BRANCH HAS
+ *
+ * HEAD really was unmoved in all three, so the half of the claim this file
+ * already checked was true and the half about the tree was not. Stacki
+ * parses that file as markup a moment later.
+ *
+ * WHAT IS COMPARED, AND THE FALSE POSITIVE IT IS SHAPED AROUND. A caller may
+ * legitimately have unrelated uncommitted work open, and refusing because of
+ * THAT would be a new defect worse than the one being fixed. So this is a
+ * difference between two readings, not a dirtiness test: `diff --name-only
+ * HEAD` names the paths whose WORKING TREE bytes differ from the commit HEAD
+ * is on and `ls-files --others` adds the ones git is not tracking; both are
+ * read once before the trial merge and once after the unwind, and a path in
+ * both readings is the caller's own business. MEASURED with an unrelated
+ * modified file and an untracked file in the tree: the ordinary refusal is
+ * still `bad_choices`, both files survive byte for byte, and the same
+ * answers still merge.
+ *
+ * `diff HEAD` rather than `status` because status splits its answer between
+ * the index and the tree, and this claim is about the tree — the file Stacki
+ * is about to parse as markup.
+ *
+ * The same path-space pins as everywhere else in this file: `diff.relative`
+ * is an ordinary user config and is pinned for the invocation, `--full-name`
+ * with a cwd of the repository root stops `ls-files` answering about the
+ * project only, and -z means these names are spelled the way every other
+ * list in this refusal is.
+ */
+const treeNow = async () => {
+  try {
+    const changed = conflictedPaths(
+      (await git(at, ['-c', 'diff.relative=false', 'diff', '--name-only', '-z', 'HEAD'])).stdout
+    );
+    const untracked = conflictedPaths(
+      (await git(at, ['ls-files', '-z', '--others', '--exclude-standard', '--full-name'])).stdout
+    );
+    return [...new Set([...changed, ...untracked])].sort();
+  } catch {
+    // A repository that will not answer is not evidence that something was
+    // left behind, and refusing on it would turn a working merge into a
+    // refusal. The index and MERGE_HEAD are still asked below.
+    return null;
+  }
+};
+/** The paths this call left different, out of two `treeNow` readings. */
+const changedSince = (was, is) => {
+  if (!was || !is) return [];
+  const before = new Set(was);
+  const after = new Set(is);
+  return [...new Set([...is.filter((f) => !before.has(f)), ...was.filter((f) => !after.has(f))])].sort();
+};
+// Read immediately before the trial merge, below. Declared here so `abort`
+// can close over it; `abort` is only ever called after that merge has run.
+let treeBefore = null;
+const abort = async () => {
+  let refused = null;
+  try {
+    await git(projectPath, ['merge', '--abort']);
+  } catch (err) {
+    refused = err;
+  }
+  // TWO QUESTIONS, AND THE ANSWER TO THE FIRST IS NOT THE ANSWER TO THE
+  // SECOND. Is a merge still in progress — asked only when the abort
+  // refused, because an abort that returned 0 concluded the merge by
+  // definition — and is the working tree back where it was.
+  const mid = refused ? await midMerge() : null;
+  const touched = changedSince(treeBefore, await treeNow());
+  if (mid === null && !touched.length) return null; // nothing left behind
+  const said = String(refused?.stderr || refused?.message || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^(hint|warning):/i.test(line))
+    .join(' ')
+    .replace(/\.+$/, '');
+  // WHAT TO NAME. A merge still in progress is named by its unmerged
+  // entries; when there is none of that left to point at, the paths the tree
+  // itself differs at are what a person has to go and look at.
+  const files = mid && mid.length ? mid : touched;
+  const one = files.length === 1;
+  const list = files.slice(0, 10).join(', ');
+  return {
+    ok: false,
+    code: 'merge_stuck',
+    from: into,
+    branch,
+    // WHICH OF THE TWO SHAPES THIS IS, because the remedy differs and the
+    // advice for one of them cannot reach the other: a caller who runs `git
+    // merge --abort` on the second shape is told there is no merge to abort
+    // and is no further forward.
+    mergeInProgress: mid !== null,
+    gitSaid: said || null,
+    files,
+    message:
+      mid !== null
+        ? `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
+          `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
+          `${files.length ? ` and ${files.length} ${one ? 'file holds' : 'files hold'} conflict markers: ${list}` : ''}. ` +
+          'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
+          'finish the merge there by hand), then ask Stacki again.'
+        : `Nothing of "${branch}" was committed and "${into}" did not move, but the merge Stacki ran to check ` +
+          `those answers did not come back out of the working tree${said ? ` — git said: ${said}` : ''}: ` +
+          `${files.length} ${one ? 'file is' : 'files are'} not as ${one ? 'it was' : 'they were'} before it ` +
+          `ran — ${list}. ${one ? 'It may hold' : 'They may hold'} conflict markers, or bytes neither branch ` +
+          'wrote. There is no merge left in progress, so `git merge --abort` will not clear this: look at ' +
+          `${one ? 'that file' : 'those files'} in the project and put back what you did not want ` +
+          '(`git checkout HEAD -- <path>` — nothing was committed, so HEAD still holds the version this ' +
+          'started from), then ask Stacki again.',
+  };
+};
+
+  return {
+    treeNow,
+    abort,
+    midMerge,
+    changedSince,
+    setBefore: (seen) => {
+      treeBefore = seen;
+    },
+    residue: async () => changedSince(treeBefore, await treeNow()),
+  };
 }
 
 /**
@@ -607,189 +834,15 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       `"${branch}" was at ${short(bound.incoming)} and is now at ${short(incomingNow)}`
     );
   }
-  /**
-   * Put the trial merge back, AND SAY SO WHEN IT WOULD NOT GO BACK.
-   *
-   * Everything below this point that refuses does it AFTER the trial merge has
-   * run, so every one of those refusals is a claim about the tree as well as
-   * about the answers: "nothing was merged and the branch is exactly as it
-   * was". The unwind is what makes that claim true, and it used to be fired
-   * into a `catch {}` — so a merge --abort that failed left the claim
-   * standing over a working tree full of conflict markers.
-   *
-   * MEASURED, with real git and a real repository: `.git/MERGE_HEAD` removed
-   * between the merge and the abort — which is what a second git process, a
-   * crash, or an editor plugin's own `git merge --abort` does — makes the
-   * abort exit non-zero with "fatal: There is no merge to abort". The answer
-   * was `bad_choices`, "Nothing was merged", while `git status` said `UU
-   * a.txt`, the index held three stages, and the file on disk held
-   * `<<<<<<< HEAD`. Stacki parses that file as markup a moment later, and the
-   * page comes back broken with nothing to say why.
-   *
-   * So the failure is MEASURED rather than assumed in either direction. An
-   * abort that fails because there was nothing to abort has left nothing
-   * behind and the original refusal is still the true one; an abort that fails
-   * with a merge still in progress has, and that is a different answer with a
-   * name of its own. Asked of the index, not of the exit code: unmerged
-   * entries, or a MERGE_HEAD git is still holding.
-   */
-  const midMerge = async () => {
-    try {
-      const left = await unmergedPaths(git, projectPath);
-      if (left.length) return left;
-      await git(projectPath, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
-      return [];
-    } catch (err) {
-      // `rev-parse --verify` on a MERGE_HEAD that is not there exits 1 with
-      // nothing on stderr, which is the ordinary "it unwound" answer. Anything
-      // that actually said something is a repository that would not answer the
-      // question, and after a failed abort the honest reading of that is the
-      // cautious one.
-      return String(err?.stderr || '').trim() ? [] : null;
-    }
-  };
-  /**
-   * THE WORKING TREE, WHICH IS WHERE THE DAMAGE IS AND THE ONE PLACE THE
-   * UNWIND NEVER LOOKED.
-   *
-   * `midMerge` above asks the INDEX and the metadata: unmerged entries, or a
-   * MERGE_HEAD git is still holding. Its own docstring names the scenario it
-   * was written for — MERGE_HEAD removed between the merge and the abort by a
-   * second git process, a crash, or an editor plugin's own `merge --abort` —
-   * and it was only ever measured for the half of that scenario where the
-   * unmerged ENTRIES survive. A plain `git reset` (mixed) clears MERGE_HEAD
-   * AND the stages while leaving the working tree exactly as the trial merge
-   * wrote it, and that is the blind spot: `unmergedPaths` answers [],
-   * `rev-parse -q --verify MERGE_HEAD` exits 1 with EMPTY stderr because of
-   * the -q, so `midMerge` read "it unwound" and `abort` answered "nothing to
-   * abort, and nothing left behind".
-   *
-   * MEASURED 3/3, no stubs, the only extra thing being one ordinary `git
-   * reset` run at the moment `merge --abort` would have run:
-   *
-   *   bad_choices    "Nothing was merged: 1 of the choices could not be
-   *                  used…" while a.txt on disk held `<<<<<<< HEAD … |||||||
-   *                  … ======= … >>>>>>> feature`
-   *   unknown_path   the same sentence over the same file
-   *   clean re-merge `stale_merge`, "…Nothing was merged and "main" is exactly
-   *                  as it was.", while a.txt held "OURS\nkeep\nTHEIRS\nkeep\n"
-   *                  — bytes NEITHER BRANCH HAS
-   *
-   * HEAD really was unmoved in all three, so the half of the claim this file
-   * already checked was true and the half about the tree was not. Stacki
-   * parses that file as markup a moment later.
-   *
-   * WHAT IS COMPARED, AND THE FALSE POSITIVE IT IS SHAPED AROUND. A caller may
-   * legitimately have unrelated uncommitted work open, and refusing because of
-   * THAT would be a new defect worse than the one being fixed. So this is a
-   * difference between two readings, not a dirtiness test: `diff --name-only
-   * HEAD` names the paths whose WORKING TREE bytes differ from the commit HEAD
-   * is on and `ls-files --others` adds the ones git is not tracking; both are
-   * read once before the trial merge and once after the unwind, and a path in
-   * both readings is the caller's own business. MEASURED with an unrelated
-   * modified file and an untracked file in the tree: the ordinary refusal is
-   * still `bad_choices`, both files survive byte for byte, and the same
-   * answers still merge.
-   *
-   * `diff HEAD` rather than `status` because status splits its answer between
-   * the index and the tree, and this claim is about the tree — the file Stacki
-   * is about to parse as markup.
-   *
-   * The same path-space pins as everywhere else in this file: `diff.relative`
-   * is an ordinary user config and is pinned for the invocation, `--full-name`
-   * with a cwd of the repository root stops `ls-files` answering about the
-   * project only, and -z means these names are spelled the way every other
-   * list in this refusal is.
-   */
-  const treeNow = async () => {
-    try {
-      const changed = conflictedPaths(
-        (await git(at, ['-c', 'diff.relative=false', 'diff', '--name-only', '-z', 'HEAD'])).stdout
-      );
-      const untracked = conflictedPaths(
-        (await git(at, ['ls-files', '-z', '--others', '--exclude-standard', '--full-name'])).stdout
-      );
-      return [...new Set([...changed, ...untracked])].sort();
-    } catch {
-      // A repository that will not answer is not evidence that something was
-      // left behind, and refusing on it would turn a working merge into a
-      // refusal. The index and MERGE_HEAD are still asked below.
-      return null;
-    }
-  };
-  /** The paths this call left different, out of two `treeNow` readings. */
-  const changedSince = (was, is) => {
-    if (!was || !is) return [];
-    const before = new Set(was);
-    const after = new Set(is);
-    return [...new Set([...is.filter((f) => !before.has(f)), ...was.filter((f) => !after.has(f))])].sort();
-  };
-  // Read immediately before the trial merge, below. Declared here so `abort`
-  // can close over it; `abort` is only ever called after that merge has run.
-  let treeBefore = null;
-  const abort = async () => {
-    let refused = null;
-    try {
-      await git(projectPath, ['merge', '--abort']);
-    } catch (err) {
-      refused = err;
-    }
-    // TWO QUESTIONS, AND THE ANSWER TO THE FIRST IS NOT THE ANSWER TO THE
-    // SECOND. Is a merge still in progress — asked only when the abort
-    // refused, because an abort that returned 0 concluded the merge by
-    // definition — and is the working tree back where it was.
-    const mid = refused ? await midMerge() : null;
-    const touched = changedSince(treeBefore, await treeNow());
-    if (mid === null && !touched.length) return null; // nothing left behind
-    const said = String(refused?.stderr || refused?.message || '')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .filter((line) => !/^(hint|warning):/i.test(line))
-      .join(' ')
-      .replace(/\.+$/, '');
-    // WHAT TO NAME. A merge still in progress is named by its unmerged
-    // entries; when there is none of that left to point at, the paths the tree
-    // itself differs at are what a person has to go and look at.
-    const files = mid && mid.length ? mid : touched;
-    const one = files.length === 1;
-    const list = files.slice(0, 10).join(', ');
-    return {
-      ok: false,
-      code: 'merge_stuck',
-      from: into,
-      branch,
-      // WHICH OF THE TWO SHAPES THIS IS, because the remedy differs and the
-      // advice for one of them cannot reach the other: a caller who runs `git
-      // merge --abort` on the second shape is told there is no merge to abort
-      // and is no further forward.
-      mergeInProgress: mid !== null,
-      gitSaid: said || null,
-      files,
-      message:
-        mid !== null
-          ? `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
-            `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
-            `${files.length ? ` and ${files.length} ${one ? 'file holds' : 'files hold'} conflict markers: ${list}` : ''}. ` +
-            'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
-            'finish the merge there by hand), then ask Stacki again.'
-          : `Nothing of "${branch}" was committed and "${into}" did not move, but the merge Stacki ran to check ` +
-            `those answers did not come back out of the working tree${said ? ` — git said: ${said}` : ''}: ` +
-            `${files.length} ${one ? 'file is' : 'files are'} not as ${one ? 'it was' : 'they were'} before it ` +
-            `ran — ${list}. ${one ? 'It may hold' : 'They may hold'} conflict markers, or bytes neither branch ` +
-            'wrote. There is no merge left in progress, so `git merge --abort` will not clear this: look at ' +
-            `${one ? 'that file' : 'those files'} in the project and put back what you did not want ` +
-            '(`git checkout HEAD -- <path>` — nothing was committed, so HEAD still holds the version this ' +
-            'started from), then ask Stacki again.',
-    };
-  };
+  const guard = unwindGuard(git, { projectPath, at, into, branch });
+  const abort = guard.abort;
   let blocked = null;
   let clean = false;
   // The reading every "nothing was merged" below is measured against. Taken
   // here rather than at the top of the function so it is the tree as it was
   // the instant before git touched it, and taken on every path that runs a
   // trial merge rather than only on the ones that expect to unwind.
-  treeBefore = await treeNow();
+  guard.setBefore(await guard.treeNow());
   // HOW WIDE GIT WRITES THE MARKERS FOR THE PATHS THIS CALL IS ABOUT, asked
   // BEFORE the trial merge — because a merge that rewrites `.gitattributes`
   // rewrites the answer, and the answer that matters is the one git itself
@@ -797,7 +850,23 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // here; anything else git turns out to have conflicted is asked about
   // afterwards, below, where the worst case is the refusal this whole guard
   // exists to produce. See conflictMarkerSizes.
-  const namedSizes = await conflictMarkerSizes(git, at, Object.keys(choices || {}));
+  //
+  // AND BOUNDED, BECAUSE THESE NAMES ARE THE CALLER'S. `choices` is a record
+  // with no cap on how many keys it has or how long they are, and this runs
+  // BEFORE any key has been checked against the conflicting set — so a call can
+  // decide how many `git check-attr` processes Stacki starts. MEASURED: 200
+  // keys of 100,000 characters each, with an out-of-repository name in every
+  // batch to force the per-name retry, held the git side of the editor for 87
+  // SECONDS. The same 200 keys, short and valid, take 336ms.
+  //
+  // So only names that could be a path git reported are asked about at all, and
+  // only the first `MARKER_SIZE_ASK_MAX` of them. Anything dropped here is
+  // asked about again after the merge against git's own list, where the worst
+  // case is the refusal this guard exists to produce — never a wrong parse.
+  const askable = Object.keys(choices || {}).filter(
+    (key) => key.length <= MAX_PATH_CHARS && !key.includes('\0') && !path.isAbsolute(key) && !key.split('/').includes('..')
+  );
+  const namedSizes = await conflictMarkerSizes(git, at, askable.slice(0, MARKER_SIZE_ASK_MAX));
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
@@ -939,7 +1008,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // evidence that there IS something to unwind, and only then is it asked
     // for. `abort` re-measures afterwards, so a merge that unwinds cleanly
     // falls through to the sentence below with the sentence now true.
-    const residue = changedSince(treeBefore, await treeNow());
+    const residue = await guard.residue();
     if (residue.length) {
       const stuck = await abort();
       if (stuck) return stuck;
@@ -1037,7 +1106,9 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     if (parsed.has(file)) return parsed.get(file);
     let parts = null;
     try {
-      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'), markerSizes.get(file));
+      // `true`: this markup came from a merge run with `merge.conflictStyle=diff3`
+      // — see the trial merge above — so its ancestor line is not optional.
+      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'), markerSizes.get(file), true);
     } catch {
       // Binary, or one side deleted it: there is no marked-up text to split,
       // so the only answer this file can take is a whole-file one.
@@ -1169,9 +1240,17 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // be completely invisible: the file the caller meant is still down there
   // waiting to take its default.
   const conflictedList = [...conflicted].slice(0, 20);
+  // CLIPPED, BOTH TIMES IT IS ECHOED. `path` and `given` are the caller's own
+  // string here — that is the whole point of the refusal — and nothing bounded
+  // either of them. MEASURED: a 20 MB request of 200 hundred-thousand-character
+  // keys came back as a 40 MB refusal, sent twice by the envelope, so ~80 MB
+  // reached the client from one schema-legal call. A name too long to be a path
+  // is named at the length that shows what was wrong with it.
+  const shown = (key) =>
+    key.length <= MAX_SHOWN_PATH_CHARS ? key : `${key.slice(0, MAX_SHOWN_PATH_CHARS)}… (${key.length} characters)`;
   for (const key of Object.keys(choices || {})) {
     if (conflicted.has(key)) continue;
-    unusable.push({ path: key, given: key, reason: 'unknown_path', expected: conflictedList });
+    unusable.push({ path: shown(key), given: shown(key), reason: 'unknown_path', expected: conflictedList });
   }
   for (const file of left) {
     const choice = choices?.[file];
@@ -1462,6 +1541,11 @@ async function mergeBranch(git, { projectPath, branch }) {
   // is what a conflict is a conflict BETWEEN, and resolveMerge refuses to apply
   // answers across a move in either of them.
   const incoming = await tipOf(git, projectPath, branch);
+  // WHAT THE TREE LOOKED LIKE BEFORE GIT TOUCHED IT, so the unwind below can be
+  // measured rather than asserted. See unwindGuard: this refusal's own sentence
+  // says the project is exactly as it was, and until this it never checked.
+  const guard = unwindGuard(git, { projectPath, at: root, into, branch });
+  guard.setBefore(await guard.treeNow());
   try {
     // --no-edit: a merge commit here must not open an editor nobody is sitting
     // at. Git still fast-forwards when it can.
@@ -1537,11 +1621,17 @@ async function mergeBranch(git, { projectPath, branch }) {
       // exactly how it was and the choice is made against the copies above;
       // applying it re-runs the merge (see resolveMerge), which keeps the
       // markers from ever existing while anyone is looking at the app.
-      try {
-        await git(projectPath, ['merge', '--abort']);
-      } catch {
-        /* already unwound */
-      }
+      // THE UNWIND, MEASURED. This used to be `try { merge --abort } catch {}`
+      // and the envelope below said "the merge was unwound, so the project is
+      // exactly as it was" whether or not it had. MEASURED with an `index.lock`
+      // held by a second git process: that sentence, and the note's "they hold
+      // the pre-merge bytes", went out over a tree that was still `UU a.txt`
+      // with MERGE_HEAD present and `<<<<<<< HEAD` in the file — and
+      // `source.read` on the `sourcePath` this same envelope had just handed
+      // the agent returned those bytes. See unwindGuard, which resolveMerge has
+      // always used and this did not.
+      const stuck = await guard.abort();
+      if (stuck) return stuck;
       // AND ONLY NOW, HOW WIDE GIT WROTE THOSE MARKERS.
       //
       // The unwind put the working tree back exactly as it was before the merge,
@@ -1557,7 +1647,10 @@ async function mergeBranch(git, { projectPath, branch }) {
         // file would have been checked against seven there and reported
         // `markersUnread: false` however the parse had gone.
         clash.markerSize = markerSizes.get(clash.path) ?? DEFAULT_MARKER_SIZE;
-        clash.parts = clash.text === null ? null : parseConflict(clash.text, clash.markerSize);
+        // `true` for the same reason resolveMerge passes it: this markup came
+        // from a `merge.conflictStyle=diff3` merge, and git writes the ancestor
+        // line into every block of one. See parseConflict.
+        clash.parts = clash.text === null ? null : parseConflict(clash.text, clash.markerSize, true);
         // The raw marked-up bytes were a working value, not something to put on
         // the wire: the panel reads `ours`/`theirs`, the MCP envelope reads
         // `parts`, and nothing wants a third copy of the file.
@@ -1572,11 +1665,11 @@ async function mergeBranch(git, { projectPath, branch }) {
       // whole files off `ours`/`theirs`, ignores it.
       return { ok: false, conflicted: true, from: into, branch, files: clashes, at, root };
     }
-    try {
-      await git(projectPath, ['merge', '--abort']);
-    } catch {
-      /* not a conflict, or already unwound — nothing to undo */
-    }
+    // Measured for the same reason as the conflicted path above: `dirty` and the
+    // throw below both tell the caller nothing moved, and an abort that did not
+    // take makes both of them untrue.
+    const stuck = await guard.abort();
+    if (stuck) return stuck;
     // Unsaved work in a file the merge needs to write. Git stops without
     // moving anything, so this is a question — park it, or commit it — rather
     // than an error, and it comes back shaped like the same question from a
@@ -1749,4 +1842,13 @@ async function switchBranch(git, { projectPath, branch, create, parkFirst, park,
   return { ok: true, from, parked };
 }
 
-module.exports = { mergeBranch, deleteBranch, switchBranch, resolveMerge, conflictDigest };
+module.exports = {
+  // Exported for test/git-branches.js, which pins the per-name retry: a name git
+  // will not answer for must not cost the names beside it their width.
+  conflictMarkerSizes,
+  mergeBranch,
+  deleteBranch,
+  switchBranch,
+  resolveMerge,
+  conflictDigest,
+};

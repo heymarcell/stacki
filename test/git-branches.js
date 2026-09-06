@@ -20,7 +20,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const { mergeBranch, deleteBranch, switchBranch, resolveMerge, conflictDigest } = require('../electron/gitBranches.js');
+const {
+  mergeBranch,
+  deleteBranch,
+  switchBranch,
+  resolveMerge,
+  conflictDigest,
+  conflictMarkerSizes,
+} = require('../electron/gitBranches.js');
 const { guardSuite } = require('./support/suiteGuard.js');
 // The one reading of a parsed conflict T31 needs: whether the clash runs to the
 // end of the file, which is the only place the final newline is not in the
@@ -65,6 +72,10 @@ async function repo(name) {
   await sh(dir, 'init', '-q', '-b', 'main', '.');
   await sh(dir, 'config', 'user.email', 'test@example.com');
   await sh(dir, 'config', 'user.name', 'Test');
+  // A developer with `commit.gpgsign = true` set globally would have every
+  // fixture in this file fail at its first commit, on a machine where nothing
+  // is wrong. The identity above is set for the same reason.
+  await sh(dir, 'config', 'commit.gpgsign', 'false');
   fs.writeFileSync(path.join(dir, 'a.txt'), 'base\n');
   await sh(dir, 'add', '-A');
   await sh(dir, 'commit', '-qm', 'first');
@@ -4139,10 +4150,13 @@ async function suite() {
     // text — at the default width it wrote a second `<<<<<<< HEAD` directly
     // under the one already in the file.
     //
-    // At the DEFAULT width the two are indistinguishable, to git as much as to
-    // this, and the behaviour is unchanged by anything here: the authored block
-    // is read as a disagreement like any other. That is recorded rather than
-    // asserted to be right.
+    // At the DEFAULT width the two look alike character for character — but
+    // they are not indistinguishable, because Stacki merges with
+    // `merge.conflictStyle=diff3` and git writes an ancestor line into every
+    // block of such a merge. The authored one, written in the ordinary `merge`
+    // style anybody documenting a conflict would use, has none. See
+    // parseConflict: it is kept whole and the path is refused, which is the
+    // same treatment the custom-width case below gets and for the same reason.
     //
     // At a CUSTOM width they are distinguishable, and the answer is the one this
     // whole change is built on: the authored seven-wide block is NOT read as a
@@ -4160,9 +4174,20 @@ async function suite() {
       const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
       const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
       const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
-      // Recorded, not endorsed: at the same width there is nothing to tell them
-      // apart with, and git has the same limitation.
-      check('T32 authored markers, default width: the authored block reads as a hunk too', hunks.length === 2, JSON.stringify(f.parts));
+      check('T32 authored markers, default width: only git’s own block is read', hunks.length === 1, JSON.stringify(f.parts));
+      check(
+        'T32 authored markers, default width:   with the authored one kept verbatim',
+        (f.parts || []).some((part) => part.kind === 'same' && part.text.includes('<<<<<<< HEAD')),
+        JSON.stringify(f.parts).slice(0, 300)
+      );
+      const defaultMcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const defaultFile = (defaultMcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 authored markers, default width:   and the agent is told so', defaultFile.markersUnread === true && defaultFile.hunks === null, JSON.stringify(defaultFile));
+      const beforeDefault = await repoState(dir);
+      const defaultAnswer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'theirs' }, expect: clash.at }));
+      await refusedCleanly('T32 authored markers, default width: answering it', defaultAnswer.value, dir, beforeDefault, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
 
       const wide = await widthRepo('w32-authored-markers', '*.txt conflict-marker-size=32\n', {
         base: `${DOC}status: BASE\n`,
@@ -4530,6 +4555,135 @@ async function suite() {
       );
     }
 
+    // A PAGE THAT SHOWS A READER WHAT A CONFLICT LOOKS LIKE.
+    //
+    // The three shapes T33 covers are all lines INSIDE git's block. This is the
+    // fourth, and it is the one that reads as an ordinary conflict: prose
+    // containing a complete `<<<<<<< / ======= / >>>>>>>` example — the DEFAULT
+    // conflict style, which is what anybody writing such a page writes —
+    // identical on both branches, so git leaves it outside its markers
+    // altogether. MEASURED: the authored block parsed as a conflict of its own,
+    // TWO hunks were reported where git wrote one, `markersUnread` was false,
+    // and answering them committed the prose rewritten — a file equal to
+    // neither branch — as `{ok: true, resolved: 1}`.
+    //
+    // Git under diff3 writes an ancestor line into every block it makes, and
+    // Stacki merges with nothing else, so a block without one is not one of
+    // git's. See parseConflict.
+    {
+      const PROSE = ['A merge conflict looks like this:', '<<<<<<< HEAD', 'yours', '=======', 'theirs', '>>>>>>> other', ''].join('\n');
+      const dir = await collide('authored-example', {
+        base: `${PROSE}Intro\nBASE\nEnd\n`,
+        ours: `${PROSE}Intro\nOURS\nEnd\n`,
+        theirs: `${PROSE}Intro\nTHEIRS\nEnd\n`,
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T33 authored example: the agent is told the markers went unread', mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
+      check(
+        'T33 authored example:   with the prose still in the parse, verbatim',
+        (f.parts || []).some((part) => part.kind === 'same' && part.text.includes('<<<<<<< HEAD')),
+        JSON.stringify(f.parts).slice(0, 300)
+      );
+      const before = await repoState(dir);
+      for (const answer of [{ 'a.txt': ['ours', 'ours'] }, { 'a.txt': ['theirs', 'theirs'] }, { 'a.txt': 'theirs' }, {}]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: answer, expect: clash.at }));
+        await refusedCleanly(`T33 authored example: ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+        );
+      }
+    }
+
+    // A SEPARATOR THE COMMON ANCESTOR ITSELF CONTAINS, which no authored marker
+    // is needed for: a Markdown setext underline or a divider comment in the
+    // version both branches started from, and both branches changing the lines
+    // around it. Git then writes TWO separators into one block, and taking the
+    // first bound the ancestor's own lines and a conflict separator to the
+    // incoming branch.
+    {
+      const dir = await collide('ancestor-separator', {
+        base: 'top\nX\n=======\nY\nbottom\n',
+        ours: 'top\nOURS\nbottom\n',
+        theirs: 'top\nTHEIRS\nbottom\n',
+      });
+      await sh(dir, '-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', '--', 'feature').catch(() => {});
+      const markup = textOf(path.join(dir, 'a.txt')) || '';
+      await sh(dir, 'merge', '--abort').catch(() => {});
+      check(
+        'T33 ancestor separator: git really writes two separators into one block',
+        (markup.match(/(?:^|\n)={7}(?:\n|$)/g) || []).length === 2 && (markup.match(/(?:^|\n)<{7} /g) || []).length === 1,
+        JSON.stringify(markup)
+      );
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T33 ancestor separator: reported unread rather than split at the wrong line', mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
+      const before = await repoState(dir);
+      for (const answer of [{ 'a.txt': ['theirs'] }, { 'a.txt': 'theirs' }, {}]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: answer, expect: clash.at }));
+        await refusedCleanly(`T33 ancestor separator: ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+        );
+      }
+    }
+
+    // ONE NAME GIT WILL NOT ANSWER FOR MUST NOT COST THE NAMES BESIDE IT.
+    //
+    // `check-attr` dies on the whole invocation for a path outside the
+    // repository — MEASURED: `check-attr … -- a.txt ../outside` exits 128 having
+    // already printed a.txt's row — so a batch containing one such name used to
+    // take git's default width for every real conflict in it. Asked one at a
+    // time after a batch fails, the bad name costs only itself.
+    {
+      const dir = await widthRepo('retry-batch', '*.txt conflict-marker-size=32\n', { base: BASE, ours: OURS, theirs: THEIRS });
+      const clean = await conflictMarkerSizes(git, dir, ['a.txt']);
+      check('T33 per-name retry: a list git can answer for is answered', clean.get('a.txt') === 32, JSON.stringify([...clean]));
+      // The same list with a name git refuses in it. Without the retry the whole
+      // batch is lost and a.txt is absent from the map.
+      const poisoned = await conflictMarkerSizes(git, dir, ['a.txt', '../outside.txt']);
+      check('T33 per-name retry: and still answered when a bad name is beside it', poisoned.get('a.txt') === 32, JSON.stringify([...poisoned]));
+      check('T33 per-name retry:   with the bad name simply absent', !poisoned.has('../outside.txt'), JSON.stringify([...poisoned]));
+    }
+
+    // A REFUSAL MUST NOT BE BIGGER THAN THE CALL THAT PROVOKED IT, AND MUST NOT
+    // DECIDE HOW MANY GIT PROCESSES STACKI STARTS.
+    //
+    // `choices` is a record with no cap on how many keys it has or how long they
+    // are, and the pre-merge width read runs BEFORE any key has been checked
+    // against the conflicting set. MEASURED before this was bounded: 200 keys of
+    // 100,000 characters, with one out-of-repository name to force the per-name
+    // retry, held the git side of the editor for 87 SECONDS and answered with a
+    // 40 MB refusal — twice the request — which the envelope then sends twice.
+    {
+      const dir = await widthRepo('hostile-choices', '*.txt conflict-marker-size=32\n', { base: BASE, ours: OURS, theirs: THEIRS });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      const choices = { 'a.txt': 'ours' };
+      for (let n = 0; n < 200; n += 1) choices[`${'x'.repeat(100000)}${n}`] = 'ours';
+      choices['../outside.txt'] = 'ours';
+      const askedBytes = Buffer.byteLength(JSON.stringify(choices));
+      const began = Date.now();
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices, expect: clash.at }));
+      const took = Date.now() - began;
+      const answerBytes = Buffer.byteLength(JSON.stringify(answer.value ?? answer.error ?? null));
+      check(`T33 hostile choices: answered in ${took}ms rather than a minute and a half`, took < 20000, `${took}ms`);
+      check(
+        `T33 hostile choices: the refusal is smaller than the request (${answerBytes} vs ${askedBytes} bytes)`,
+        answerBytes < askedBytes,
+        `${answerBytes} vs ${askedBytes}`
+      );
+      check(
+        'T33 hostile choices:   with no echoed key longer than the clip',
+        (answer.value?.badChoices || []).every((bad) => String(bad.path).length <= 600 && String(bad.given).length <= 600),
+        JSON.stringify((answer.value?.badChoices || []).map((bad) => String(bad.path).length).slice(0, 5))
+      );
+      await refusedCleanly('T33 hostile choices: the call itself', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unknown_path')
+      );
+    }
+
     // THE WIDTH IS ASKED FROM THE REPOSITORY ROOT, and the layout that proves it
     // is the one repoRoot exists for. `check-attr` spells and scopes its paths
     // from the cwd; git's conflicting paths are spelled from the repository
@@ -4541,7 +4695,13 @@ async function suite() {
       const dir = await repo('w32-subdir');
       cleanup.push(dir);
       fs.mkdirSync(path.join(dir, 'site'), { recursive: true });
-      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
+      // ANCHORED TO THE SUBDIRECTORY, which is the only shape in which the cwd
+      // changes git's answer. `*.txt` matches at any depth, so check-attr says
+      // 32 for `site/page.txt` from the repository root AND from the project —
+      // and the mutation this fixture exists to catch stayed green. With
+      // `site/*.txt`, asking from `<root>/site` means `<root>/site/site/page.txt`
+      // and the answer is "unspecified".
+      fs.writeFileSync(path.join(dir, '.gitattributes'), 'site/*.txt conflict-marker-size=32\n');
       fs.writeFileSync(path.join(dir, 'site/page.txt'), BASE);
       await sh(dir, 'add', '-A');
       await sh(dir, 'commit', '-qm', 'a project inside a larger repository');
@@ -4632,6 +4792,75 @@ async function suite() {
         (a.badChoices || []).some((b) => b.path === '__proto__')
       );
     }
+  }
+
+  {
+    // T34 — "THE MERGE WAS UNWOUND, SO THE PROJECT IS EXACTLY AS IT WAS", SAID
+    // BY THE ONE REFUSAL THAT NEVER LOOKED.
+    //
+    // resolveMerge has measured its unwind since T30: `merge --abort` is fired,
+    // and if a merge is still in progress or the working tree is not back where
+    // it was, the answer is `merge_stuck` instead of the refusal it was going to
+    // give. mergeBranch — which runs the same trial merge, for the same reason,
+    // and whose envelope makes the MORE detailed claim — fired the same command
+    // into a bare `catch {}`.
+    //
+    // MEASURED with the abort made to fail the way T30's does, MERGE_HEAD
+    // removed at the moment it runs: the envelope said `merge_conflict`,
+    // "The merge was unwound, so the project is exactly as it was", and its
+    // `note` said the files "hold the pre-merge bytes", over a tree that was
+    // still `UU` with `<<<<<<< HEAD` in the page — and `sourcePath`, which that
+    // same envelope hands the agent to read the file with, pointed straight at
+    // those bytes. The guide's "merge_stuck is the only refusal on this surface
+    // that says so" was true only because this one did not look.
+    const dir = await repo('merge-unwind');
+    cleanup.push(dir);
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nBASE\ntail\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'base');
+    await sh(dir, 'checkout', '-qb', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nTHEIRS\ntail\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'theirs');
+    await sh(dir, 'checkout', '-q', 'main');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nOURS\ntail\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'ours');
+    const headBefore = await sh(dir, 'rev-parse', 'HEAD');
+
+    // The same shape T30 uses: the abort is really attempted and really fails,
+    // with the marked-up tree still there.
+    let aborts = 0;
+    const abortRefusingGit = async (cwd, args) => {
+      if (args[0] === 'merge' && args[1] === '--abort') {
+        aborts += 1;
+        fs.rmSync(path.join(dir, '.git', 'MERGE_HEAD'), { force: true });
+      }
+      return git(cwd, args);
+    };
+    const answer = await caught(() => mergeBranch(abortRefusingGit, { projectPath: dir, branch: 'feature' }));
+    check('T34: the unwind really was attempted', aborts === 1, String(aborts));
+    check(
+      'T34: git.merge says merge_stuck rather than describing a conflict',
+      answer.value?.ok === false && answer.value?.code === 'merge_stuck',
+      JSON.stringify(answer.value || answer.error).slice(0, 300)
+    );
+    check('T34:   and does NOT claim the project is as it was', !/exactly as it was/.test(String(answer.value?.message || '')), String(answer.value?.message).slice(0, 200));
+    check('T34:   naming the file that still holds markers', (answer.value?.files || []).includes('a.txt'), JSON.stringify(answer.value?.files));
+    check('T34:   and saying a merge is still in progress', answer.value?.mergeInProgress === true, JSON.stringify(answer.value?.mergeInProgress));
+    // The tree really is in the state the refusal describes — this is the check
+    // that says the refusal is true rather than merely differently worded.
+    check('T34:   the file really does still hold markers', /<<<<<<< /.test(textOf(path.join(dir, 'a.txt')) || ''), JSON.stringify(textOf(path.join(dir, 'a.txt'))));
+    check('T34:   with HEAD unmoved', (await sh(dir, 'rev-parse', 'HEAD')) === headBefore);
+    // And what the agent is told. The mapper passes an unrecognised git refusal
+    // through, so this is the sentence a client actually reads.
+    const mapped = DOMAINS.git.merge.result(answer.value, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+    check('T34 MCP: the client is told merge_stuck too', mapped?.code === 'merge_stuck', JSON.stringify(mapped).slice(0, 200));
+    check('T34 MCP:   and is not handed a hunk list for a tree in that state', !Array.isArray(mapped?.files) || !mapped.files.some((f) => f && typeof f === 'object'), JSON.stringify(mapped?.files));
+
+    // Put the fixture back so the cleanup accounting is honest.
+    await sh(dir, 'merge', '--abort').catch(() => {});
+    await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
   }
 
 }

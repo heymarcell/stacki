@@ -1620,11 +1620,28 @@ const git = {
           // cause, because no list of parser fixes can promise the shape will
           // not recur.
           //
-          // So such a file says so. `hunks: null` — the same "there is no list
-          // to answer here" the binary case already gives — plus the field that
-          // separates the two, because their remedies differ: a binary file
-          // takes a whole-file word, and this one cannot be answered through
-          // resolve_merge at all (it refuses the path by name).
+          // So such a file says so, with `hunks: null` and a field that says
+          // WHY it is null, because the three shapes that produce it have three
+          // different remedies:
+          //
+          //   markersUnread   git says the path conflicts and the markers could
+          //                   not be read. No answer is accepted; finish it in
+          //                   the project.
+          //   hunksOmitted    the hunks were read and were too large to carry.
+          //                   A whole-file "ours" or "theirs" is accepted.
+          //   neither         there was no marked-up text to split at all —
+          //                   `parts` is null because the file could not be read
+          //                   as text from the working tree, which is the shape
+          //                   a path with no version of its own has (both
+          //                   branches renaming it leaves stage 1 alone under
+          //                   that name). resolve_merge answers `no_sides` for
+          //                   it, and no `choices` value can help.
+          //
+          // A BINARY file is NOT one of these: it reads as text, splits into no
+          // disagreement, and comes back with `hunks: []` and both flags false —
+          // which this comment used to cite as the precedent for `hunks: null`,
+          // wrongly. It takes a whole-file word like any other unsplittable
+          // file.
           const parts = Array.isArray(f?.parts) ? f.parts : null;
           // At the width git wrote them, which travels on the file beside the
           // parts: this surface has no repository to ask and seven is only git's
@@ -1686,7 +1703,11 @@ const git = {
             'finished in the project by hand. A file whose `hunksOmitted` is true is a different thing and takes ' +
             'a different answer: its hunks were read but were too large to carry here, so `hunks` is null for ' +
             'size rather than for doubt. Read that file yourself and send a whole-file "ours" or "theirs" for ' +
-            'it, or reconcile it in the project. Mind the two path spaces: ' +
+            'it, or reconcile it in the project. `hunks: null` with BOTH of those false is a third thing again: ' +
+            'there was no text to split, which is what a path with no version of its own looks like (both ' +
+            'branches renaming the same file leaves only the version the merge started from under that name). ' +
+            'No `choices` value answers that one either. A file with `hunks: []` is splittable text with no ' +
+            'disagreement in it, or a binary file, and takes a whole-file word. Mind the two path spaces: ' +
             '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
             '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
             'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +

@@ -543,20 +543,29 @@ async function measureOriginFence() {
     const handler = between(branches, 'async function resolveMerge(', 'async function mergeBranch(');
     check('the resolve_merge handler was found to read', handler.length > 2000, String(handler.length));
     const found = codesIn(handler);
-    // The helpers it returns THROUGH, which carry codes of their own.
+    // The helpers it returns THROUGH, which carry codes of their own. The list
+    // is a list because a helper that moves takes its codes out of the sweep
+    // with it — which is exactly what happened to `merge_stuck` when `abort`
+    // was lifted out of resolveMerge into unwindGuard, and what the positive
+    // control below is for.
     for (const [call, where, from, to] of [
       ['badBranchName(', branches, 'const badBranchName =', '\nasync function isDirty'],
       ['stale(', branches, 'const stale =', '\nasync function resolveMerge'],
+      ['guard.abort', branches, 'function unwindGuard(', '\n/**\n * Finish a merge'],
+      ['abort()', branches, 'function unwindGuard(', '\n/**\n * Finish a merge'],
     ]) {
       if (handler.includes(call)) for (const code of codesIn(between(where, from, to))) found.add(code);
     }
     // And the two the mapper answers before the handler is ever called.
     for (const code of codesIn(between(domains, '  resolve_merge: {', '\n  },\n'))) found.add(code);
-    // `mergeBinding` is where a missing or unreadable ref is turned away.
+    // `mergeBinding` is where a missing or unreadable ref is turned away — and
+    // it turns away through `readRef`, which is `refs.parse`, which has FOUR
+    // codes of its own. Hardcoding `bad_ref` for that layer, as this used to,
+    // made the completeness check below a tautology over an incomplete set:
+    // `stale_ref`, `wrong_project` and `wrong_kind` are all reachable from a
+    // resolve_merge call and none of them was in it.
     for (const code of codesIn(between(agentIndex, 'function mergeBinding(', '\n  }\n'))) found.add(code);
-    // A ref that will not read at all answers from readRef, which every guarded
-    // operation shares; the merge one reaches it through mergeBinding.
-    found.add('bad_ref');
+    for (const code of codesIn(between(readRepo('electron/mcp/agent/refs.js'), 'function parse(', '\nmodule.exports'))) found.add(code);
 
     // A POSITIVE CONTROL ON THE SWEEP ITSELF, so a scanner that stopped matching
     // cannot turn the completeness check below into a tautology over nothing.
@@ -568,6 +577,9 @@ async function measureOriginFence() {
       ['guard_required', 'mergeBinding, before the handler runs'],
       ['working_tree_blocked', 'the handler, on a re-merge git will not start'],
       ['bad_branch_name', 'the badBranchName() helper'],
+      ['stale_ref', 'refs.parse, which mergeBinding reaches through readRef'],
+      ['wrong_kind', 'refs.parse — and it is in no document but this one'],
+      ['wrong_project', 'refs.parse'],
     ]) {
       check(`the merge-refusal sweep found ${code} — ${why}`, found.has(code), [...found].sort().join(', '));
     }

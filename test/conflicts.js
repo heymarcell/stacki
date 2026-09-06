@@ -23,6 +23,8 @@ const {
   unreadMarkers,
   markerWidth,
   MAX_MARKER_SIZE,
+  MARKER_CACHE_MAX,
+  markerCacheSize,
 } = require('../electron/conflicts.js');
 const { guardSuite } = require('./support/suiteGuard.js');
 
@@ -1014,6 +1016,89 @@ const conflicted = [
   check('  and it answers correctly: no block, so no unread marker', answer === false);
 }
 
+// --- one of each marker, and not two -----------------------------------------
+{
+  // A SECOND SEPARATOR, which an ordinary repository produces on its own: the
+  // COMMON ANCESTOR contains a `=======` line — a Markdown setext underline, a
+  // divider comment — and both branches change the lines around it. MEASURED,
+  // real git: `<<< HEAD / OURS / ||| sha / X / ======= / Y / ======= / THEIRS /
+  // >>> feature`, two separators in one block. Taking the FIRST bound the
+  // ancestor's own lines and a conflict separator to the incoming branch, and
+  // answering that committed "top\nY\n=======\nTHEIRS\nbottom\n" — equal to
+  // neither branch, with a marker written into the source, as ok:true.
+  const twoSeparators = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'Y', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('a block with two separators is not read', clashCount(parseConflict(twoSeparators)) === 0, JSON.stringify(parseConflict(twoSeparators)));
+  check('  and says so', unreadMarkers(parseConflict(twoSeparators)) === true);
+  check('  keeping every line', renderResolved(parseConflict(twoSeparators)) === twoSeparators, JSON.stringify(renderResolved(parseConflict(twoSeparators))));
+  // The control: exactly one separator in the same shape IS read, so the rule
+  // above is "not two" rather than "not any".
+  const one = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('  while one separator in the same shape is an ordinary conflict', clashCount(parseConflict(one)) === 1, JSON.stringify(parseConflict(one)));
+
+  // A SECOND OPENER. Git does not nest its blocks, so an opener inside one is
+  // the same evidence: this is not a block git wrote.
+  const nested = ['top', '<<<<<<< HEAD', '<<<<<<< quoted in the page', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  // The outer block is refused and its opener stays in the agreed text, where
+  // the backstop finds it; the parse then carries on from the line after, so
+  // the inner block — which IS the shape git writes — is read. The file is
+  // refused either way, which is the point: the opener that began the outer
+  // block was never asked whether it was git's, and now it is.
+  const nestedParts = parseConflict(nested);
+  check('a block with a second opener inside it is not read as that block', unreadMarkers(nestedParts) === true, JSON.stringify(nestedParts));
+  check(
+    '  with the opener that began it left in the agreed text',
+    nestedParts.some((part) => part.kind === 'same' && part.text.includes('<<<<<<< HEAD')),
+    JSON.stringify(nestedParts)
+  );
+  check(
+    '  and the hunk it did read is the inner one, not a fabricated outer one',
+    !nestedParts.some((part) => part.kind === 'clash' && part.ours.includes('<<<<<<<')),
+    JSON.stringify(nestedParts.filter((part) => part.kind === 'clash'))
+  );
+}
+
+// --- the ancestor line, where git puts it and where it never does ------------
+{
+  // UNDER diff3 THE ANCESTOR LINE IS NOT OPTIONAL, and that is what tells git's
+  // block from one somebody typed into the page. MEASURED over the six shapes
+  // that might plausibly lack one — an ordinary content clash, add/add with no
+  // common ancestor at all, both branches appending at end of file, one side
+  // deleting what the other changed, a criss-cross with two merge bases, and a
+  // region whose ancestor is empty — all six: one block, one `|||||||` line.
+  const authored = ['prose', '<<<<<<< HEAD', 'yours', '=======', 'theirs', '>>>>>>> other', 'more', ''].join('\n');
+  check('a default-style block is an ordinary conflict to a caller that did not merge', clashCount(parseConflict(authored)) === 1, JSON.stringify(parseConflict(authored)));
+  check('  and is NOT one in markup that came from a diff3 merge', clashCount(parseConflict(authored, 7, true)) === 0, JSON.stringify(parseConflict(authored, 7, true)));
+  check('  which says so rather than going quiet', unreadMarkers(parseConflict(authored, 7, true)) === true);
+  check('  with every line of it kept', renderResolved(parseConflict(authored, 7, true)) === authored, JSON.stringify(renderResolved(parseConflict(authored, 7, true))));
+  // And the block git DOES write is still read, from the same caller.
+  const real = ['a', '<<<<<<< HEAD', 'O', '||||||| 1234567', 'B', '=======', 'T', '>>>>>>> f', 'z', ''].join('\n');
+  check('git’s own diff3 block is read by that caller', clashCount(parseConflict(real, 7, true)) === 1, JSON.stringify(parseConflict(real, 7, true)));
+
+  // THE ANCESTOR LINE AFTER THE SEPARATOR. Git never writes that — its own
+  // order is opener, ancestor, separator, closer — so a block in that order is
+  // one this did not read. Reachable only from the ordinary `merge` style,
+  // which is why it is asked of the parser directly rather than through a merge.
+  const inverted = ['a', '<<<<<<< HEAD', 'O', '=======', 'T', '||||||| 1234567', 'B', '>>>>>>> f', 'z', ''].join('\n');
+  check('an ancestor line AFTER the separator is not a block git wrote', clashCount(parseConflict(inverted)) === 0, JSON.stringify(parseConflict(inverted)));
+  check('  and it says so', unreadMarkers(parseConflict(inverted)) === true);
+  check('  keeping every line', renderResolved(parseConflict(inverted)) === inverted, JSON.stringify(renderResolved(parseConflict(inverted))));
+}
+
+// --- the marker cache is a convenience, not a store --------------------------
+{
+  // The widths come from a file inside the repository being merged, and a
+  // .gitattributes can name a different one for every path in it. MARKER_CACHE_MAX
+  // is what keeps that from growing for as long as the app is open.
+  for (let width = 1; width <= MARKER_CACHE_MAX * 3; width++) parseConflict('x\n', width);
+  check(
+    `the marker cache stays inside its bound after ${MARKER_CACHE_MAX * 3} distinct widths`,
+    markerCacheSize() <= MARKER_CACHE_MAX,
+    `${markerCacheSize()} entries, bound ${MARKER_CACHE_MAX}`
+  );
+  // And it is still a cache: the width asked for is the width used.
+  check('and a width used after the reset still parses at that width', clashCount(parseConflict(['a', '<<< H', 'O', '||| b', 'B', '===', 'T', '>>> f'].join('\n'), 3)) === 1);
+}
+
 // --- blocks this could not read, and the lines it used to lose ---------------
 {
   // A BLOCK WITH NO SEPARATOR IS NOT A ONE-SIDED CONFLICT. Everything from the
@@ -1060,6 +1145,7 @@ const conflicted = [
   const MARKER_CHARS = ['<', '=', '|', '>'];
   let broken = 0;
   let tried = 0;
+  let withClashes = 0;
   let firstBad = null;
   for (let i = 0; i < 4000; i++) {
     const lines = [];
@@ -1074,10 +1160,30 @@ const conflicted = [
       } else if (roll < 0.6) lines.push('');
       else lines.push(`text${line}${next() < 0.2 ? '\r' : ''}`);
     }
+    // AND A WELL-FORMED BLOCK, OFTEN. Without one the generator could only
+    // produce files with no block in them at all, every parse came back as a
+    // single `same` part, and `renderResolved` of a single `same` part is its
+    // own text — so the assertion below was an IDENTITY and could not fail. It
+    // reported `broken: 0` over twelve thousand inputs with the dropped-block
+    // defect restored, which is the defect the property exists for.
+    if (next() < 0.55) {
+      const width = [1, 3, 7, 32][Math.floor(next() * 4)];
+      const at = Math.floor(next() * (lines.length + 1));
+      const body = [`${'<'.repeat(width)} HEAD`];
+      if (next() < 0.5) body.push(`OURS${next() < 0.3 ? '\r' : ''}`);
+      if (next() < 0.6) body.push(`${'|'.repeat(width)} 1234567`, 'BASE');
+      body.push('='.repeat(width));
+      if (next() < 0.5) body.push('THEIRS');
+      body.push(`${'>'.repeat(width)} feature`);
+      lines.splice(at, 0, ...body);
+    }
     const text = lines.join('\n') + (next() < 0.5 ? '\n' : '');
     for (const width of [3, 7, 32]) {
       const parts = parseConflict(text, width);
-      if (clashCount(parts) !== 0) continue;
+      if (clashCount(parts) !== 0) {
+        withClashes++;
+        continue;
+      }
       tried++;
       if (renderResolved(parts) !== text) {
         broken++;
@@ -1089,6 +1195,14 @@ const conflicted = [
     `a parse that finds no disagreement rebuilds the file byte for byte (${tried} generated inputs)`,
     broken === 0 && tried > 1000,
     firstBad || `only ${tried} inputs reached the check`
+  );
+  // THE CONTROL ON THE GENERATOR. Without this the check above passes over
+  // inputs the parse never found a block in, which is a tautology however many
+  // of them there are.
+  check(
+    `and the generator really does produce parseable conflicts (${withClashes} of them)`,
+    withClashes > 200,
+    `${withClashes} inputs parsed to a disagreement`
   );
 }
 

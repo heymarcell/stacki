@@ -301,13 +301,22 @@ const DEFAULT_MARKER_SIZE = 7;
 
 // The largest width git itself will take. MEASURED: `conflict-marker-size=5000`
 // and `=100000` are both honoured — git writes a marker that many characters
-// wide — and `=2147483647` is accepted as a number but produces a conflicted
-// path with no markers written into it at all. Above that, at 4294967296 and at
-// twenty digits, git says `warning: invalid marker-size '...', expecting an
-// integer` and uses SEVEN. `check-attr` reports the raw string either way, so
-// reading it without this bound would take a width git had just refused, match
-// nothing against the seven-character markers it really wrote, and refuse an
-// entirely ordinary merge.
+// wide. ABOVE that, at 4294967296 and at twenty digits, git says
+// `warning: invalid marker-size '...', expecting an integer` and uses SEVEN;
+// `check-attr` reports the raw string either way, so reading it without this
+// bound would take a width git had just refused, match nothing against the
+// seven-character markers it really wrote, and refuse an entirely ordinary
+// merge. That is what the bound is for.
+//
+// AND WHAT THE BOUND IS NOT FOR. This comment used to say `=2147483647` "is
+// accepted as a number but produces a conflicted path with no markers written
+// into it at all". It does not: re-measured on git 2.50.1 (Apple Git-155),
+// `=2147483647` and `=1073741824` both kill git with SIGBUS trying to allocate
+// the marker, and it leaves NO conflict behind — no unmerged path, no
+// MERGE_HEAD, the file untouched. Stacki then answers the unnamed `failed` with
+// git's own words, which is a git crash reported as a git crash. Nothing here
+// prevents it and nothing here should pretend to: the bound is about the width
+// git REFUSES, not about the width that kills it.
 const MAX_MARKER_SIZE = 2147483647;
 
 /** Git's own reading of the attribute: a positive integer it can use, or seven. */
@@ -372,7 +381,7 @@ function markersFor(size) {
  * text. Left out, it is git's own default of seven, which is what git uses when
  * the attribute is unset or unusable. See markersFor.
  */
-function parseConflict(text, markerSize) {
+function parseConflict(text, markerSize, fromDiff3 = false) {
   const { START, MIDDLE, BASE, END } = markersFor(markerSize);
   const lines = String(text ?? '').split('\n');
   const parts = [];
@@ -423,6 +432,7 @@ function parseConflict(text, markerSize) {
     let j = i + 1;
     const middles = [];
     const bases = [];
+    const opens = [];
     for (; j < lines.length; j++) {
       const line = lines[j];
       if (END.test(line)) {
@@ -434,6 +444,26 @@ function parseConflict(text, markerSize) {
       // a third choice — it is what both started FROM — but it is what says
       // which side actually changed, so it is kept and never offered.
       else if (BASE.test(line)) bases.push(j);
+      // AND THE OPENER, WHICH IS THE ONE MARKER NOTHING WAS COUNTING.
+      //
+      // The other three are found by scanning INSIDE a block, so counting them
+      // was natural. The opener is what BEGINS the block, and the line that
+      // began this one was never asked whether it was git's. MEASURED, real
+      // git, a page whose prose shows a reader what a conflict looks like —
+      // six identical lines on both branches, so git leaves them outside its
+      // markers entirely — with a real conflict further down: the AUTHORED
+      // `<<<<<<< HEAD` opened a block, git's real closer closed it, and the
+      // block between them had exactly one separator and one ancestor line, so
+      // every structural rule passed. Two hunks were reported where git wrote
+      // one, `markersUnread` was false, and answering them committed
+      // "A merge conflict looks like this:\ntheirs\nIntro\nTHEIRS\nEnd\n" —
+      // the prose gone, a line of it replaced by half of the example — as
+      // `{ok: true, resolved: 1}`. Equal to neither branch.
+      //
+      // Git does not nest its blocks. A second opener inside one is therefore
+      // the same evidence the other three are: this is not a block git wrote,
+      // and it is kept whole rather than guessed at.
+      else if (START.test(line)) opens.push(j);
     }
     // A BLOCK THIS DID NOT FULLY READ IS KEPT WHOLE, NEVER HALF-READ.
     //
@@ -446,14 +476,51 @@ function parseConflict(text, markerSize) {
     //
     // Git writes one shape and only one: an opener, an optional ancestor line
     // under diff3, a separator, a closer, every one of them at the same width
-    // and in that order. A block that is not that shape — unclosed, without a
-    // separator, with more than one of either, or with the ancestor line after
-    // the separator — is not a block git wrote at this width, and the honest
-    // answer is that it was not read. Its lines stay verbatim in the agreed
+    // and in that order, and never nested. A block that is not that shape —
+    // unclosed, without a separator, with a second opener, a second separator
+    // or a second ancestor line inside it, or with the ancestor line after the
+    // separator — is not a block git wrote at this width, and the honest answer
+    // is that it was not read. Its lines stay verbatim in the agreed
     // text, where `unreadMarkers` finds the opener still sitting in them and
     // every caller downstream refuses the path by name rather than answering
     // for it.
-    if (!closed || middles.length !== 1 || bases.length > 1 || (bases.length === 1 && bases[0] > middles[0])) {
+    // AND UNDER diff3, THE ANCESTOR LINE IS NOT OPTIONAL — WHICH IS WHAT TELLS
+    // GIT'S BLOCK FROM ONE SOMEBODY TYPED.
+    //
+    // Counting the markers inside a block cannot see a block that is WELL
+    // FORMED and simply is not git's. MEASURED, real git, a page whose prose
+    // shows a reader what a conflict looks like — the ordinary
+    // `<<<<<<< HEAD / ======= / >>>>>>> branch` of the DEFAULT conflict style,
+    // six lines identical on both branches so git leaves them outside its
+    // markers entirely — with a real conflict further down: the authored block
+    // parsed as a conflict of its own, `markersUnread` was false, TWO hunks were
+    // reported where git wrote one, and answering them committed
+    // "A merge conflict looks like this:\ntheirs\nIntro\nTHEIRS\nEnd\n" as
+    // `{ok: true, resolved: 1}` — the prose rewritten, and equal to neither
+    // branch.
+    //
+    // Stacki merges with `-c merge.conflictStyle=diff3` and nothing else, and
+    // git under diff3 writes the ancestor line into EVERY block. MEASURED over
+    // the shapes that might not have one: an ordinary content clash, add/add
+    // with no common ancestor at all, both branches appending at end of file,
+    // one side deleting what the other changed, a criss-cross with two merge
+    // bases, and a region whose ancestor is empty — all six, one block, one
+    // `|||||||` line. So a block without one, in markup that came from such a
+    // merge, is not a block that merge wrote.
+    //
+    // `fromDiff3` is passed by the two callers that know how the markup was
+    // made and by nobody else: a caller handing this ordinary `merge`-style
+    // text — which is what every fixture in test/conflicts.js does — still gets
+    // the forgiving reading, because for that caller the ancestor line really is
+    // optional.
+    if (
+      !closed ||
+      opens.length ||
+      middles.length !== 1 ||
+      bases.length > 1 ||
+      (bases.length === 1 && bases[0] > middles[0]) ||
+      (fromDiff3 && bases.length !== 1)
+    ) {
       same.push(lines[i]);
       i++;
       continue;
@@ -877,5 +944,8 @@ module.exports = {
   unreadMarkers,
   DEFAULT_MARKER_SIZE,
   MAX_MARKER_SIZE,
+  MARKER_CACHE_MAX,
+  // Only so the bound can be asserted; nothing reads it to decide anything.
+  markerCacheSize: () => markerCache.size,
   markerWidth,
 };
