@@ -112,8 +112,15 @@ jobs:
       # there, which is exactly the kind of thing CI is for.
       - run: npm run build
 
-      # The whole chain: 178 `npm run` entries, covering 182 files. The three
+      # The whole chain: 180 `npm run` entries, covering 182 files. The three
       # named above print a skip line and say why; everything else runs.
+      #
+      # THOSE TWO NUMBERS ARE CHECKED, because they had already drifted. This
+      # said 131 once and then 178, and 178 was wrong on the commit that wrote
+      # it — the chain was 180 entries by then. A comment nobody can be wrong
+      # about out loud is a comment that goes quietly stale, so test/packaging.js
+      # counts the chain in package.json and reads these numbers back out of
+      # this file. Change the chain and that suite says so.
       #
       # AND ONE SUITE THIS BRANCH ADDED THAT IS DELIBERATELY NOT AMONG THEM.
       #

@@ -664,6 +664,53 @@ check(
   pkg.main
 );
 
+// ── What CI says it runs is what `npm test` runs ────────────────────────────
+//
+// A NUMBER IN A COMMENT IS A CLAIM, AND THIS ONE HAD ALREADY DRIFTED TWICE.
+//
+// .github/workflows/ci.yml describes the chain it runs — "N `npm run` entries,
+// covering M files" — and that sentence is the only place anybody reads to find
+// out what CI covers. It said 131 when the chain was 131; it was rewritten to
+// 178 on a commit where the chain was already 180. Nothing noticed, because
+// nothing was looking.
+//
+// So the two numbers are counted here from package.json and compared with the
+// ones the workflow states. This is a grep of a comment, deliberately: the
+// comment IS the artefact under test, and there is nothing else about it that
+// behaviour could be observed through.
+{
+  const ci = fs.readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  const said = ci.match(/The whole chain: (\d+) `npm run` entries, covering (\d+) files/);
+  check('ci.yml still describes the chain it runs', !!said, ci.slice(0, 200));
+  if (said) {
+    const chain = String(pkg.scripts?.test || '')
+      .split('&&')
+      .map((step) => step.trim())
+      .filter(Boolean);
+    check(
+      'every step of `npm test` is an `npm run`, which is what the sentence counts',
+      chain.every((step) => step.startsWith('npm run ')),
+      JSON.stringify(chain.filter((step) => !step.startsWith('npm run ')))
+    );
+    // Every file any of those entries reaches, following `npm run` chains into
+    // the scripts they name — which is how one entry can cover two files.
+    const seen = new Set();
+    const covered = new Set();
+    const reach = (name) => {
+      if (seen.has(name)) return;
+      seen.add(name);
+      for (const part of String(pkg.scripts?.[name] || '').split('&&')) {
+        const step = part.trim();
+        if (step.startsWith('npm run ')) reach(step.slice('npm run '.length).trim());
+        else for (const hit of step.matchAll(/test\/[\w./-]+\.js/g)) covered.add(hit[0]);
+      }
+    };
+    for (const step of chain) reach(step.slice('npm run '.length).trim());
+    check(`ci.yml says ${said[1]} entries and \`npm test\` has ${chain.length}`, Number(said[1]) === chain.length);
+    check(`ci.yml says ${said[2]} files and those entries reach ${covered.size}`, Number(said[2]) === covered.size, [...covered].sort().slice(0, 6).join(', '));
+  }
+}
+
 if (failures.length) {
   console.error(`\npackaging: ${failures.length} failed, ${checked - failures.length} passed\n`);
   console.error(failures.join('\n') + '\n');
