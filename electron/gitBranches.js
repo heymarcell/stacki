@@ -559,6 +559,27 @@ async function mergeAttributes(git, root, files) {
   const sizes = new Map();
   // The paths git did NOT merge itself. See the `merge` branch below.
   const driven = new Set();
+  // AND THE DRIVER NAMED IN CONFIG RATHER THAN IN AN ATTRIBUTE.
+  //
+  // `merge.default` names the low-level driver for every path that has no
+  // `merge` attribute of its own, and check-attr answers "unspecified" for
+  // those paths — so asking the attribute alone finds none of them. MEASURED:
+  // with `merge.default=twomark` the driver ran and wrote its two-marker block,
+  // `check-attr merge -- a.txt` said unspecified, the ancestor-line rule
+  // refused it, and EVERY answer for the path came back `unreadable_conflict`
+  // — verbatim the failure the attribute lookup was added to close, one config
+  // key over.
+  //
+  // Asked once for the whole call, not per path: it is a repository-wide
+  // setting and this already runs a process per batch of sixty-four.
+  let byDefault = null;
+  try {
+    byDefault = String((await git(root, ['config', '--get', 'merge.default'])).stdout || '').trim() || null;
+  } catch {
+    // Unset is exit 1, which is an answer: no default driver.
+    byDefault = null;
+  }
+  const isDriver = (value) => !!value && !['unspecified', 'unset', 'set', 'text'].includes(value);
   const list = (files || []).filter((file) => typeof file === 'string' && file);
   const ask = async (batch) => {
     // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
@@ -591,7 +612,9 @@ async function mergeAttributes(git, root, files) {
         // "nothing was said" and for the two built-in settings; `union` and
         // `binary` are drivers as much as a project's own script is, and
         // neither writes diff3 markup.
-        if (value && !['unspecified', 'unset', 'set', 'text'].includes(value)) driven.add(fields[at]);
+        // `unspecified` means the path has no attribute of its own, and then
+        // `merge.default` — if there is one — is what git used. See byDefault.
+        if (isDriver(value) || (value === 'unspecified' && byDefault)) driven.add(fields[at]);
         continue;
       }
       // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
@@ -1410,7 +1433,12 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const ownMarkers = async (file) => {
     if (ownMarkersCache.has(file)) return ownMarkersCache.get(file);
     const [ourSide, theirSide] = await Promise.all([stage(git, projectPath, 2, file), stage(git, projectPath, 3, file)]);
-    const held = sidesHoldMarkers(markerSizes.get(file), ourSide, theirSide);
+    // Both answers, from one pair of reads: whether either side holds a marker
+    // AT THE WIDTH IN FORCE (which makes the file's markers indistinguishable
+    // from git's), and the sides themselves, which `unreadMarkers` needs to
+    // tell a marker-shaped line the AUTHOR wrote from one GIT wrote at a width
+    // this was told wrongly. See its opener arm.
+    const held = { own: sidesHoldMarkers(markerSizes.get(file), ourSide, theirSide), sides: [ourSide, theirSide] };
     ownMarkersCache.set(file, held);
     return held;
   };
@@ -1492,7 +1520,8 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // by name, for every answer alike — the deliberate "theirs" as much as the
     // silent default, because the caller who typed it was answering the same
     // false description of the file.
-    if (unreadMarkers(partsOf(file), markerSizes.get(file)) || (await ownMarkers(file))) {
+    const own = await ownMarkers(file);
+    if (own.own || unreadMarkers(partsOf(file), markerSizes.get(file), ...own.sides)) {
       unusable.push({
         path: file,
         given:
@@ -1638,7 +1667,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
           'described as having no disagreements when git says it has some. Nothing that could be sent for it ' +
           'would be answering the real file. That merge has been unwound, so the file on disk is the one this ' +
           'started from and holds no markers now — finish that one in the project by hand (`git merge ' +
-          `"${branch}"` + ' there and edit it), or, if the file has a line of its own shaped like a conflict ' +
+          `"${branch}"\`` + ' there and edit it), or, if the file has a line of its own shaped like a conflict ' +
           'marker, widen the markers for it so the two cannot be confused: `' + `${first.path} conflict-marker-size=32` +
           '` in .gitattributes.'
         : first.reason === 'no_such_side'
@@ -1775,6 +1804,34 @@ async function mergeBranch(git, { projectPath, branch }) {
   // says the project is exactly as it was, and until this it never checked.
   const guard = unwindGuard(git, { projectPath, at: root, into, branch, ran: 'to find out what conflicts' });
   guard.setBefore(await guard.treeNow());
+  // A MERGE ALREADY IN PROGRESS IS SOMEBODY ELSE'S, AND IS SAID SO BEFORE
+  // ANYTHING IS TRIED.
+  //
+  // Git refuses to begin a second merge while MERGE_HEAD exists, so without
+  // this the attempt below throws and the error path runs — which used to
+  // `merge --abort` unconditionally and END THE USER'S MERGE. MEASURED, with a
+  // hand resolution already staged: a.txt went from "HAND-RESOLVED BY THE USER"
+  // back to "MAIN", MERGE_HEAD gone, `git status` clean, and the refusal
+  // described a merge Stacki had run and failed to unwind — a merge that never
+  // started. The abort is conditional now; this is the other half, because a
+  // throw carrying git's sentence is still not an answer a caller can act on.
+  //
+  // `midMerge` answers the unmerged paths, `[]` for a MERGE_HEAD with none, and
+  // null for a repository that would not answer — so the question is "is it
+  // not null", not "is it truthy": an empty array is a merge in progress.
+  if ((await guard.midMerge()) !== null) {
+    return {
+      ok: false,
+      code: 'merge_blocked',
+      from: into,
+      branch,
+      gitSaid: null,
+      message:
+        `"${into}" is already in the middle of a merge that Stacki did not start, so nothing of "${branch}" was ` +
+        'tried and nothing was written. Finish that one in the project first — `git merge --continue` when it is ' +
+        'resolved, or `git merge --abort` to drop it — and then ask again.',
+    };
+  }
   try {
     // --no-edit: a merge commit here must not open an editor nobody is sitting
     // at. Git still fast-forwards when it can.
@@ -1902,7 +1959,25 @@ async function mergeBranch(git, { projectPath, branch }) {
     // Measured for the same reason as the conflicted path above: `dirty` and the
     // throw below both tell the caller nothing moved, and an abort that did not
     // take makes both of them untrue.
-    const stuck = await guard.abort();
+    //
+    // ONLY WHERE THERE IS SOMETHING TO UNWIND, which is the condition
+    // resolveMerge's equivalent path already applies and this one did not.
+    // `merge --abort` into a merge STACKI DID NOT START ends somebody else's
+    // work: git refuses to begin a second merge while MERGE_HEAD exists, so the
+    // throw here is often "You have not concluded your merge" — and the
+    // unconditional abort then succeeded, destroying a hand resolution the user
+    // had already staged. MEASURED: a.txt went from "HAND-RESOLVED BY THE USER"
+    // back to "MAIN", MERGE_HEAD gone, `git status` clean, and the refusal said
+    // the merge Stacki ran had not come back out — a merge that never ran —
+    // with `gitSaid: null`, because the abort had succeeded so there was
+    // nothing left to quote. Worse than saying nothing.
+    //
+    // A tree that differs from the one this measured before its own merge is
+    // the evidence that there IS something of Stacki's to unwind. Nothing
+    // differing means the merge never started, and then git's own sentence
+    // below is the whole answer.
+    const leftBehind = await guard.residue();
+    const stuck = leftBehind.length ? await guard.abort() : null;
     if (stuck) return stuck;
     // Unsaved work in a file the merge needs to write. Git stops without
     // moving anything, so this is a question — park it, or commit it — rather
@@ -2081,6 +2156,13 @@ module.exports = {
   // will not answer for must not cost the names beside it their width.
   conflictMarkerSizes,
   mergeAttributes,
+  // Exported for the suite, which has to be able to put a FIFO, a directory or
+  // a device at a path and ask this directly: git refuses to re-run a merge
+  // over a path whose type it does not support ("unsupported file type"), so a
+  // test that goes through resolveMerge is answered by THAT refusal and never
+  // reaches the reader at all. See T35.
+  conflictText,
+  openNoFollow,
   mergeBranch,
   deleteBranch,
   switchBranch,

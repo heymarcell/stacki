@@ -1655,7 +1655,14 @@ const git = {
           // conflict-marker line present in either side's COMMITTED version is
           // not one git wrote, and a file holding one cannot have its own markers
           // told from git's by any rule about their shape.
-          const unread = parts ? unreadMarkers(parts, f?.markerSize) || f?.sidesHoldMarkers === true : false;
+          // `f.ours`/`f.theirs` are the two sides the merge carried out with it,
+          // and unreadMarkers needs them for the same reason resolveMerge passes
+          // them: a marker-shaped line the AUTHOR wrote is not evidence that
+          // this read the width wrongly, and one git wrote is. See its opener
+          // arm.
+          const unread = parts
+            ? unreadMarkers(parts, f?.markerSize, f?.ours, f?.theirs) || f?.sidesHoldMarkers === true
+            : false;
           // AND NOT FOR A FILE OUTSIDE THE OPEN PROJECT.
           //
           // A clash carries `ours` and `theirs` — the disputed regions of both

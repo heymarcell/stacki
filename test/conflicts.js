@@ -1104,9 +1104,20 @@ const conflicted = [
   check('  which is the shape five structural rules cannot tell from git’s', clashCount(parseConflict(diff3Marker, 7, true)) === 1, JSON.stringify(parseConflict(diff3Marker, 7, true)));
   check('two ordinary sides are not', sidesHoldMarkers(7, ordinary, ordinary) === false);
   check('  nor is a missing side', sidesHoldMarkers(7, null, undefined) === false);
-  // The same width rule the backstop uses: the width in force, or seven and up.
+  // THE WIDTH IN FORCE, AND — AT GIT'S DEFAULT — SEVEN AND UP.
+  //
+  // This asked for seven-and-up at EVERY width, which made the remedy this
+  // refusal offers useless: a project told to widen its markers got the
+  // identical refusal, because the authored seven-wide line still matched.
+  // MEASURED end to end, an authored `<<<<<<< HEAD` in prose: byte-identical
+  // refusals at 7, at 32 and at 64. Seven is git's default and so the width
+  // this falls back to when it was not told the real one; at an explicit width
+  // git writes exactly that width and nothing else is confusable with it.
   check('a marker at the width in force is seen', sidesHoldMarkers(3, 'a\n<<< HEAD\nb\n') === true);
-  check('  and one at seven or more whatever the width', sidesHoldMarkers(3, `a\n${'<'.repeat(9)} HEAD\nb\n`) === true);
+  check('  and at seven or more when seven is what is in force', sidesHoldMarkers(7, `a\n${'<'.repeat(9)} HEAD\nb\n`) === true);
+  check('  but NOT at nine when three is in force — git writes three', sidesHoldMarkers(3, `a\n${'<'.repeat(9)} HEAD\nb\n`) === false);
+  check('  nor at seven when thirty-two is in force, which is the remedy working', sidesHoldMarkers(32, 'a\n<<<<<<< HEAD\nb\n') === false);
+  check('  while thirty-two at thirty-two still is', sidesHoldMarkers(32, `a\n${'<'.repeat(32)} HEAD\nb\n`) === true);
   // And the shapes that are NOT markers stay content, so this does not refuse
   // an ordinary file: a bare run, and a rule of angle brackets.
   check('a bare run in a side is not a marker', sidesHoldMarkers(7, 'a\n<<<<<<<\nb\n') === false);

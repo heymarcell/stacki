@@ -958,7 +958,7 @@ function trimTerminator(text, ...sources) {
  * the text, which is how git writes one and is not how a rule of angle
  * brackets or a line of somebody's ASCII art is written.
  */
-const unreadMarkers = (parts, markerSize) => {
+const unreadMarkers = (parts, markerSize, ...sides) => {
   const n = markerWidth(markerSize);
   // WALKED LINE BY LINE, NOT MATCHED WITH A REGEX OVER THE WHOLE TEXT.
   //
@@ -1000,6 +1000,7 @@ const unreadMarkers = (parts, markerSize) => {
       const marker = markerOf(line);
       if (!marker) continue;
       const { ch, width } = marker;
+      const raw = line;
       // THE OPENER, AND THE CLOSER TOO — a block has both, and the one this
       // used to look for is not always the one left behind.
       //
@@ -1029,7 +1030,30 @@ const unreadMarkers = (parts, markerSize) => {
       // is still checked at the width in force, which is the shape that matters:
       // git's own closer, left in the agreed text because a labelled closer in
       // somebody's source ended the block early.
-      if (ch === '<' && (width === n || width >= 7)) return true;
+      //
+      // AND A WIDE HIT IS ONLY EVIDENCE IF THE LINE IS GIT'S.
+      //
+      // The wide arm is what catches a marker git wrote at a width this was
+      // told wrongly — MEASURED, `.gitattributes` itself in the conflict: git
+      // merged under this branch's 40 and check-attr, asked afterwards, said
+      // 12, so 40-wide markers sat in text the parse called agreed. Without the
+      // wide arm they are invisible and the documented default commits over
+      // them. It must stay.
+      //
+      // But it also fired for a line the FILE has always contained, at every
+      // width — so a project that took this file's own advice and widened its
+      // markers got the identical refusal back, the remedy having changed
+      // nothing. MEASURED, an authored `<<<<<<< HEAD` in prose: byte-identical
+      // refusals at 7, at 32 and at 64.
+      //
+      // The two are the same shape and are told apart the only way they can be:
+      // git's markers are in no blob. A wide-arm line that appears in a side is
+      // the author's and is not evidence of a misread width; one that appears
+      // in neither is git's. `sides` is how the caller says so — without it
+      // this keeps the cautious reading, because a caller that cannot show the
+      // blobs has not shown the line is authored.
+      const authored = (line) => sides.some((side) => typeof side === 'string' && side.split('\n').includes(line));
+      if (ch === '<' && (width === n || (width >= 7 && !authored(raw)))) return true;
       if (ch === '>' && width === n) return true;
       // AND THE ONE SHAPE THOSE TWO CANNOT SEE. Every way of being handed the
       // wrong width ends in a refusal except one: a real width BELOW seven,
@@ -1083,14 +1107,15 @@ const sidesHoldMarkers = (markerSize, ...sides) => {
   const n = markerWidth(markerSize);
   for (const side of sides) {
     if (typeof side !== 'string' || !side) continue;
-    // The same reading `unreadMarkers` takes of an opener: the run at the width
-    // in force or at seven-or-more, and then the separating space git always
-    // writes. The closer is not asked for — an opener is what begins a block,
-    // and a file with one has already answered the question.
+    // The same reading `unreadMarkers` takes of an opener, including where it
+    // casts wider than the width in force and why: at git's default seven this
+    // may not be the real width, at an explicit width it is. The closer is not
+    // asked for — an opener is what begins a block, and a file with one has
+    // already answered the question.
     for (const line of side.split('\n')) {
       const run = /^(<+)[ \t]/.exec(line);
       if (!run) continue;
-      if (run[1].length === n || run[1].length >= 7) return true;
+      if (run[1].length === n || (n === DEFAULT_MARKER_SIZE && run[1].length >= 7)) return true;
     }
   }
   return false;

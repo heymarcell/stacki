@@ -4081,6 +4081,73 @@ function theComponentNamedAfterATag() {
  * wide flag still reads the `var()` as a could, so the subtree moved out of the
  * element travels unreindented.
  */
+/**
+ * EVERY SPELLING OF A STYLESHEET A PROJECT CAN HOLD.
+ *
+ * The scan read `.css` alone, so a rule in `site.scss` was not seen — and not
+ * seen is not "I could not tell": the project answered the EMPTY SET, which is
+ * the positive "nothing here preserves whitespace", the answer that reindents
+ * rendered content away. Astro takes all of these natively.
+ *
+ * MEASURED, the same rule and the same move: `site.css` held
+ * "alpha\n      beta"; `site.scss` gave "alpha\n    beta" — two rendered spaces
+ * deleted under ok: true.
+ *
+ * THREE ANSWERS, AND WHICH FILE GETS WHICH IS THE POINT.
+ *
+ *   the token, for a spelling postcss reads and a value this can evaluate;
+ *   ANY, for a file that cannot be read at all — the indented syntaxes, which
+ *     are not CSS and are not handed to a parser that sometimes accepts them
+ *     and finds nothing (a `.sass` file opening with `@use 'sass:math'` parses
+ *     cleanly and yields no rule, which is the empty set again);
+ *   and the token again for a value the reducer cannot evaluate — `$ws`, `@ws`,
+ *     `map-get(...)` — which is read as preserving over a selector that is
+ *     perfectly readable, and which contributed NOTHING until the widening made
+ *     those files visible.
+ *
+ * The empty set is the one answer none of them may give.
+ */
+async function everySpellingOfAStylesheet() {
+  const RULE = { css: '.preserved { white-space: pre }\n' };
+  const cases = [
+    ['site.css', RULE.css, 'token'],
+    ['site.pcss', RULE.css, 'token'],
+    ['site.scss', RULE.css, 'token'],
+    ['site.less', RULE.css, 'token'],
+    // A value the reducer cannot evaluate is read as PRESERVING — and its
+    // selector is perfectly readable, so the answer is the token, not ANY. That
+    // is the better of the two safe answers: it refuses the reindent for that
+    // element and leaves the rest of the project alone. What it must never be
+    // is the empty set, which is what all three gave until the widening made
+    // these files visible and `declarationPreserves` was asked the other way
+    // round.
+    ['site.scss', '$ws: pre;\n.preserved { white-space: $ws }\n', 'token'],
+    ['site.less', '@ws: pre;\n.preserved { white-space: @ws }\n', 'token'],
+    ['site.scss', '.preserved { white-space: map-get($m, ws) }\n', 'token'],
+    ['site.sass', '@use \'sass:math\'\n\n.preserved\n  white-space: pre\n', 'any'],
+    ['site.sass', '.preserved\n  white-space: pre\n', 'any'],
+    ['site.styl', '.preserved\n  white-space pre\n', 'any'],
+    // THE NEGATIVE CONTROL, without which "answer ANY for everything" passes
+    // every line above: a stylesheet with no preserving rule in it must still
+    // answer the empty set, or no reindent ever happens anywhere.
+    ['site.css', '.preserved { white-space: normal }\n', 'empty'],
+    ['site.scss', '.preserved { white-space: nowrap }\n', 'empty'],
+  ];
+  for (const [file, body, want] of cases) {
+    const label = `[stylesheet ${file} ${want}]`;
+    const dir = H.makeProject();
+    try {
+      fs.writeFileSync(path.join(dir, 'src', file), body);
+      WS.forgetCache();
+      const tokens = [...(await WS.preservingTokens(dir))];
+      const got = tokens.length === 0 ? 'empty' : tokens.includes('*') ? 'any' : 'token';
+      check(`${label} answers ${want}, never the empty set by accident`, got === want, short({ tokens }));
+    } finally {
+      H.removeProject(dir);
+    }
+  }
+}
+
 function theValueNobodyCanRead() {
   const kept = `    <span class='kept'>one</span>`;
   const build = (style) => commentedPage(`  <div style='${style}'>\n${kept}\n  </div>\n`);
@@ -4823,6 +4890,7 @@ function theWorkTheWalkDidNotBound() {
   for (const kind of ['unparseable', 'unreadable']) await aStylesheetThatCannotBeReadOrParsed(kind);
   await theSameBytesWithNoWindow();
   await theScanThatRanOnEverySave();
+  await everySpellingOfAStylesheet();
 
   if (failures.length) {
     console.error(`source-fidelity-matrix: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);

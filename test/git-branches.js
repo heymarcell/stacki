@@ -27,6 +27,8 @@ const {
   resolveMerge,
   conflictDigest,
   conflictMarkerSizes,
+  conflictText,
+  openNoFollow,
 } = require('../electron/gitBranches.js');
 const { guardSuite } = require('./support/suiteGuard.js');
 // The one reading of a parsed conflict T31 needs: whether the clash runs to the
@@ -103,6 +105,15 @@ const textOf = (at) => {
     return fs.readFileSync(at, 'utf8');
   } catch {
     return null;
+  }
+};
+
+/** The synchronous twin of `caught`, for the readers that do not await. */
+const caughtSync = (fn) => {
+  try {
+    return { value: fn(), error: null };
+  } catch (error) {
+    return { value: null, error };
   }
 };
 
@@ -4290,23 +4301,43 @@ async function suite() {
       const wideClash = await mergeBranch(git, { projectPath: wide, branch: 'feature' });
       const wf = (wideClash.files || []).find((x) => x.path === 'a.txt') || {};
       const wideHunks = (wf.parts || []).filter((p) => p.kind === 'clash');
-      check('T32 authored markers, width 32: the authored block is NOT one of git’s', wideHunks.length <= 1, JSON.stringify(wf.parts));
+      check('T32 authored markers, width 32: the authored block is NOT one of git’s', wideHunks.length === 1, JSON.stringify(wf.parts));
       // NOT ONE LINE OF THE AUTHORED BLOCK IS LOST. The parse keeps what it did
-      // not read, verbatim, which is what makes the refusal below safe advice.
+      // not read, verbatim — which is what makes it safe to MERGE this one.
       const agreed = (wf.parts || []).filter((p) => p.kind === 'same').map((p) => p.text).join('\n');
       check(
         'T32 authored markers, width 32:   and every line of it is still in the parse',
         agreed.includes('<<<<<<< HEAD') && agreed.includes('=======') && agreed.includes('>>>>>>> other-branch'),
         JSON.stringify(agreed).slice(0, 300)
       );
+      // AND THIS ONE IS ANSWERABLE, WHICH IS THE WHOLE POINT OF THE ATTRIBUTE.
+      //
+      // These assertions used to say the opposite — refused, `markersUnread`
+      // true — over a comment that already said "at a CUSTOM width they are
+      // distinguishable". Distinguishable means answerable, and the refusal
+      // this file's own `unreadable_conflict` sentence offers as the way out is
+      // this exact attribute. MEASURED before this: byte-identical refusals at
+      // 7, at 32 and at 64, each naming conflict-marker-size, so a project that
+      // followed the advice looped. Git writes 32-wide markers here; a 7-wide
+      // authored line is content and nothing else. See sidesHoldMarkers, where
+      // the wide arm is now scoped to git's default width — the one width this
+      // may have fallen back to without being told the real one.
       const mcp = DOMAINS.git.merge.result(wideClash, { branch: 'feature' }, { root: wide, mergeRef: () => 'REF' });
       const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
-      check('T32 authored markers, width 32: the agent is told the markers went unread', mcpFile.markersUnread === true, JSON.stringify(mcpFile));
-      const before = await repoState(wide);
-      const answer = await caught(() => resolveMerge(git, { projectPath: wide, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: wideClash.at }));
-      await refusedCleanly('T32 authored markers, width 32: answering it at all', answer.value, wide, before, 'bad_choices', (a) =>
-        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      check('T32 authored markers, width 32: the agent is given the hunk', Array.isArray(mcpFile.hunks) && mcpFile.hunks.length === 1, JSON.stringify(mcpFile));
+      check('T32 authored markers, width 32:   and is NOT told the markers went unread', mcpFile.markersUnread === false, JSON.stringify(mcpFile));
+      const answer = await resolveMerge(git, { projectPath: wide, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: wideClash.at });
+      check('T32 authored markers, width 32: answering it merges', answer?.ok === true && answer.resolved === 1, JSON.stringify(answer));
+      const committed = await sh(wide, 'show', 'HEAD:a.txt');
+      check('T32 authored markers, width 32:   into the side it asked for', /status: OURS/.test(committed), JSON.stringify(committed.slice(-60)));
+      // THE BYTES OF THE AUTHORED BLOCK, in the commit, unchanged — this is
+      // what makes merging it correct rather than merely permitted.
+      check(
+        'T32 authored markers, width 32:   with the authored block byte-for-byte intact',
+        committed.includes('<<<<<<< HEAD\nyour version\n=======\ntheir version\n>>>>>>> other-branch'),
+        JSON.stringify(committed.slice(0, 160))
       );
+      check('T32 authored markers, width 32:   over a clean tree', (await sh(wide, 'status', '--porcelain')) === '', await sh(wide, 'status', '--porcelain'));
     }
 
     // AND THE WIDTH TRAVELS WITH THE PARTS, because the surface that describes
@@ -5409,31 +5440,102 @@ async function suite() {
       check('T35 escape:   and STILL did not write outside', fs.readFileSync(away, 'utf8') === NOTES);
     }
 
-    // A FIFO AT A CONFLICTED PATH. What is on disk when the resolve runs is
-    // whatever is on disk, not what git put there — and opening a FIFO for
-    // reading BLOCKS until somebody opens the other end. Without O_NONBLOCK
-    // this held the editor's git path forever; whitespaceRules.js records the
-    // same measurement for its own reader (`mkfifo site.css`).
+    // A PATH THAT IS NOT A REGULAR FILE, ASKED OF THE READER DIRECTLY.
+    //
+    // Not through resolveMerge: git refuses to re-run a merge over a path whose
+    // type it does not support ("error: a.txt: unsupported file type"), so a
+    // test that goes that way is answered by THAT refusal and conflictText is
+    // never called. MEASURED: the earlier version of this block asserted only
+    // `ok === false` and passed with both guards removed — a check that cannot
+    // fail. So the reader is asked directly, at a path holding each shape.
     {
-      const dir = await collide('fifo-path', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
-      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
-      check('T35 fifo: the fixture conflicts to begin with', clashCount((clash.files || [])[0]?.parts || []) === 1);
-      // Replace the marked-up file with a FIFO between the merge and the
-      // answer, which is the only window in which this can happen.
-      const at = path.join(dir, 'a.txt');
-      fs.rmSync(at, { force: true });
-      const made = await caught(() => new Promise((done, fail) => execFile('mkfifo', [at], (err) => (err ? fail(err) : done(true)))));
+      const dir = await repo('not-a-regular-file');
+      cleanup.push(dir);
+      const at = (name) => path.join(dir, name);
+
+      // A FIFO WITH NO WRITER. Opening one for reading BLOCKS until somebody
+      // opens the other end — this holds the editor's git path while it does,
+      // which is the measurement whitespaceRules.js records for its own reader.
+      // O_NONBLOCK is what makes the open return; the regular-file gate is what
+      // makes the answer null rather than "an empty conflicted file".
+      const made = await caught(
+        () => new Promise((done, fail) => execFile('mkfifo', [at('pipe')], (err) => (err ? fail(err) : done(true))))
+      );
       if (made.error === null) {
         const answered = await Promise.race([
-          caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at })),
-          new Promise((done) => setTimeout(() => done({ error: null, value: { code: 'BLOCKED FOREVER' } }), 15000)),
+          Promise.resolve().then(() => ({ read: conflictText(dir, 'pipe') })),
+          new Promise((done) => setTimeout(() => done({ read: 'BLOCKED FOREVER' }), 10000)),
         ]);
-        check('T35 fifo: the resolve answers rather than blocking on the open', answered.value?.code !== 'BLOCKED FOREVER', JSON.stringify(answered.value).slice(0, 200));
-        check('T35 fifo:   and refuses, because a FIFO has no text to split', answered.value?.ok === false, JSON.stringify(answered.value).slice(0, 200));
+        check('T35 fifo: the reader returns rather than blocking on the open', answered.read !== 'BLOCKED FOREVER', JSON.stringify(answered));
+        check('T35 fifo:   with no text — a pipe is not a file with no rules in it', answered.read === null, JSON.stringify(answered));
+        fs.rmSync(at('pipe'), { force: true });
       }
-      fs.rmSync(at, { force: true });
-      await sh(dir, 'merge', '--abort').catch(() => {});
-      await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+
+      // A DIRECTORY, which git can genuinely leave at a conflicted path.
+      fs.mkdirSync(at('adir'));
+      check('T35 directory: reads as no text', conflictText(dir, 'adir') === null);
+
+      // A DEVICE. Reading /dev/zero never returns; the gate answers before the
+      // read is attempted.
+      const dev = await Promise.race([
+        Promise.resolve().then(() => ({ read: conflictText('/dev', 'zero') })),
+        new Promise((done) => setTimeout(() => done({ read: 'BLOCKED FOREVER' }), 10000)),
+      ]);
+      check('T35 device: reads as no text, and returns', dev.read === null, JSON.stringify(dev));
+
+      // A PATH THAT IS NOT THERE.
+      check('T35 missing: reads as no text', conflictText(dir, 'nothing-here.txt') === null);
+
+      // AND THE CONTROLS. An ordinary file reads; one whose bytes are not UTF-8
+      // does not; a symlink to a perfectly readable file does not.
+      fs.writeFileSync(at('plain.txt'), 'head\nBODY\ntail\n');
+      check('T35 control: an ordinary file reads back exactly', conflictText(dir, 'plain.txt') === 'head\nBODY\ntail\n', JSON.stringify(conflictText(dir, 'plain.txt')));
+      fs.writeFileSync(at('latin.txt'), Buffer.from('caf\xE9\n', 'latin1'));
+      check('T35 control: bytes that are not UTF-8 read as no text', conflictText(dir, 'latin.txt') === null, JSON.stringify(conflictText(dir, 'latin.txt')));
+      fs.symlinkSync('plain.txt', at('link.txt'));
+      check('T35 control: a symlink to a readable file is not followed', conflictText(dir, 'link.txt') === null, JSON.stringify(conflictText(dir, 'link.txt')));
+
+      // THE WRITE SIDE, ASKED THE SAME WAY. The rebuild opens with O_NOFOLLOW
+      // too, so a link put at the path AFTER the read — the race the read's own
+      // check cannot see — is not followed either. `openNoFollow` is what both
+      // sides share, so it is what is asked.
+      const opened = caughtSync(() => openNoFollow(dir, 'link.txt', fs.constants.O_WRONLY | fs.constants.O_TRUNC));
+      check('T35 write: opening a symlink for writing is refused', opened.error !== null, String(opened.error?.code));
+      check('T35 write:   as ELOOP, which is O_NOFOLLOW and not something else', opened.error?.code === 'ELOOP', String(opened.error?.code));
+      check('T35 write:   and the file it points at is untouched', fs.readFileSync(at('plain.txt'), 'utf8') === 'head\nBODY\ntail\n');
+      const plain = caughtSync(() => openNoFollow(dir, 'plain.txt', fs.constants.O_WRONLY | fs.constants.O_TRUNC));
+      check('T35 write: CONTROL — an ordinary file still opens for writing', plain.error === null, String(plain.error));
+      if (plain.error === null) fs.closeSync(plain.value);
+    }
+
+    // AND THE DIGEST READS THE LINK, NOT WHAT IT POINTS AT.
+    //
+    // `conflictDigest` is what `stale_merge` compares, so a link that changed
+    // target while the answers were being made has to move it. Reading THROUGH
+    // the link made the digest a digest of the target file: repoint the link at
+    // a different name and nothing moves. Asked of one repository, twice, so
+    // the two commit SHAs cannot be what differs.
+    {
+      const dir = await repo('digest-reads-the-link');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, 'target.txt'), 'unchanged\n');
+      fs.writeFileSync(path.join(dir, 'other.txt'), 'unchanged\n');
+      fs.symlinkSync('target.txt', path.join(dir, 'link'));
+      const first = conflictDigest(dir, ['link']);
+      fs.rmSync(path.join(dir, 'link'));
+      fs.symlinkSync('other.txt', path.join(dir, 'link'));
+      const second = conflictDigest(dir, ['link']);
+      check('T35 digest: repointing a link at an identical file moves the digest', first !== second, `${first} vs ${second}`);
+      // THE CONTROL: the two targets really are byte-identical, so the digest
+      // moved because the LINK moved and not because the bytes did.
+      check(
+        'T35 digest:   and the two targets are byte-identical, so it was the link',
+        fs.readFileSync(path.join(dir, 'target.txt'), 'utf8') === fs.readFileSync(path.join(dir, 'other.txt'), 'utf8')
+      );
+      // AND AN ORDINARY FILE STILL MOVES IT when its bytes change.
+      const was = conflictDigest(dir, ['target.txt']);
+      fs.writeFileSync(path.join(dir, 'target.txt'), 'changed\n');
+      check('T35 digest:   an ordinary file still moves it', conflictDigest(dir, ['target.txt']) !== was);
     }
 
     // THE DIGEST MEASURED THE WRONG FILE TOO. conflictDigest read through the
@@ -5806,6 +5908,157 @@ async function suite() {
     // The code is still reachable from the caller that supplies its own branch.
     const bad = await caught(() => resolveMerge(git, { projectPath: dir, branch: '--strategy=ours', choices: {}, expect: clash.at }));
     check('T40:   while the code itself is still live for the panel', bad.value?.code === 'bad_branch_name', JSON.stringify(bad.value).slice(0, 160));
+  }
+
+  // T41 — THE REMEDY A REFUSAL OFFERS HAS TO LIFT IT.
+  //
+  // `unreadable_conflict` ends by naming conflict-marker-size as the way out.
+  // For an authored CLOSER it worked. For an authored OPENER — the shape
+  // conflicts.js cites three times as the motivating example, "a page whose
+  // prose shows a reader what a conflict looks like" — it did not, because the
+  // opener arm fired for any run of seven or more AT EVERY CONFIGURED WIDTH.
+  // MEASURED: byte-identical refusal at 7, at 32 and at 64, each one naming
+  // conflict-marker-size. A project with a CONTRIBUTING.md that documents merge
+  // conflicts could never merge that file and was told to do something that
+  // changed nothing.
+  //
+  // Seven is git's default and so the width this falls back to when it could
+  // not be told the real one; that is the only width where casting wider buys
+  // anything. At an explicit width git writes exactly it.
+  {
+    const authored = async (name, width) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      const prose = 'A conflict looks like:\n<<<<<<< HEAD\nours line\n';
+      if (width) fs.writeFileSync(path.join(dir, '.gitattributes'), `doc.md conflict-marker-size=${width}\n`);
+      const put = (body) => fs.writeFileSync(path.join(dir, 'doc.md'), `${prose}Intro\n${body}\nEnd\n`);
+      put('BASE');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      put('OURS');
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      put('THEIRS');
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      return dir;
+    };
+
+    // THE REFUSAL, AND THE SENTENCE THAT OFFERS THE REMEDY.
+    {
+      const dir = await authored('remedy-before', null);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'doc.md': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T41 authored opener at the default width', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
+      const said = String(out.value?.message || '');
+      check('T41:   and the sentence names conflict-marker-size', /conflict-marker-size=32/.test(said), said.slice(-220));
+      // A CLIENT RENDERS THIS. An unclosed backtick swallowed half the sentence
+      // into one code span — measured, four backticks with the first unpaired.
+      check('T41:   with its backticks balanced', (said.match(/`/g) || []).length % 2 === 0, said.slice(-260));
+    }
+
+    // AND FOLLOWING IT MERGES. Two widths, so the assertion is about widening
+    // rather than about the number 32.
+    for (const width of [32, 64]) {
+      const dir = await authored(`remedy-${width}`, width);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'doc.md') || {};
+      check(`T41 widened to ${width}: git's own width is what was read`, file.markerSize === width, String(file.markerSize));
+      check(`T41 widened to ${width}:   and the authored line is no longer confusable`, file.sidesHoldMarkers === false, String(file.sidesHoldMarkers));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'doc.md': 'ours' }, expect: clash.at });
+      check(`T41 widened to ${width}:   so the merge the remedy promised happens`, out?.ok === true, JSON.stringify(out).slice(0, 200));
+      check(`T41 widened to ${width}:   over a clean tree`, (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+    }
+
+    // THE CONTROL THIS MUST NOT COST: at the default width a marker-shaped line
+    // in a side is still what it always was. Covered above by
+    // `remedy-before`, and again here for a marker WIDER than seven, which is
+    // the arm that was narrowed.
+    {
+      const dir = await collide('wide-banner-default', {
+        base: '<<<<<<<<<<<<<<<< NOTE\nIntro\nBASE\nEnd\n',
+        ours: '<<<<<<<<<<<<<<<< NOTE\nIntro\nOURS\nEnd\n',
+        theirs: '<<<<<<<<<<<<<<<< NOTE\nIntro\nTHEIRS\nEnd\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T41 control: a sixteen-wide banner still refuses at the default width', file.sidesHoldMarkers === true, JSON.stringify(file.sidesHoldMarkers));
+    }
+  }
+
+  // T42 — A MERGE STACKI DID NOT START IS NOT STACKI'S TO ABORT.
+  //
+  // The error path fired `git merge --abort` unconditionally. Git refuses to
+  // begin a second merge while MERGE_HEAD exists, so the ordinary way to reach
+  // it is a merge the USER has in progress — and the abort then succeeded,
+  // ending it. MEASURED, with a hand resolution already `git add`ed: a.txt went
+  // from "HAND-RESOLVED BY THE USER" back to "MAIN", MERGE_HEAD gone, `git
+  // status` clean, and the refusal said the merge Stacki ran had not come back
+  // out of the working tree — a merge that never ran — with `gitSaid: null`,
+  // because the abort had succeeded so there was nothing left to quote.
+  {
+    const dir = await collide('someone-elses-merge', { base: 'head\nBASE\ntail\n', ours: 'head\nMAIN\ntail\n', theirs: 'head\nFEATURE\ntail\n' });
+    await git(dir, ['merge', '--no-ff', '--no-commit', 'feature']).catch(() => {});
+    const HAND = 'head\nHAND-RESOLVED BY THE USER\ntail\n';
+    fs.writeFileSync(path.join(dir, 'a.txt'), HAND);
+    await sh(dir, 'add', 'a.txt');
+    check('T42: the fixture really is mid-merge', fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')));
+    const out = await caught(() => mergeBranch(git, { projectPath: dir, branch: 'feature' }));
+    check('T42: it refuses rather than throwing', out.error === null, String(out.error));
+    check('T42:   as merge_blocked', out.value?.code === 'merge_blocked', JSON.stringify(out.value).slice(0, 200));
+    check('T42:   saying whose merge it is', /did not start/.test(String(out.value?.message || '')), String(out.value?.message || '').slice(0, 220));
+    check('T42:   and naming both ways out of it', /--continue/.test(String(out.value?.message || '')) && /--abort/.test(String(out.value?.message || '')));
+    // THE BYTES, WHICH IS THE WHOLE POINT.
+    check('T42: the hand resolution is untouched', fs.readFileSync(path.join(dir, 'a.txt'), 'utf8') === HAND, JSON.stringify(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8')));
+    check('T42:   and the merge is still in progress', fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')));
+    check('T42:   with it still staged', (await sh(dir, 'diff', '--cached', '--name-only')).includes('a.txt'), await sh(dir, 'diff', '--cached', '--name-only'));
+    await sh(dir, 'merge', '--abort').catch(() => {});
+    await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+    // AND THE CONTROL: with no merge in progress the same call still merges.
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T42 control: an ordinary conflict is still reported', clash?.conflicted === true, JSON.stringify(clash).slice(0, 120));
+    const ok = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
+    check('T42 control:   and still merges', ok?.ok === true, JSON.stringify(ok));
+  }
+
+  // T43 — A MERGE DRIVER NAMED IN CONFIG IS A MERGE DRIVER.
+  //
+  // `merge.default` names the low-level driver for every path with no `merge`
+  // attribute, and check-attr answers "unspecified" for those — so asking the
+  // attribute alone found none of them. MEASURED: with `merge.default=twomark`
+  // the driver ran and wrote its two-marker block, the ancestor-line rule
+  // refused it, and every answer came back `unreadable_conflict`. That is
+  // verbatim the failure the attribute lookup was added to close, one config
+  // key over. See T36 for the attribute half.
+  {
+    const dir = await repo('driver-in-config');
+    cleanup.push(dir);
+    await sh(dir, 'config', 'merge.twomark.name', 'a driver named in config');
+    await sh(dir, 'config', 'merge.twomark.driver', 'printf "head\\n<<<<<<< ours\\nOURS\\n=======\\nTHEIRS\\n>>>>>>> theirs\\ntail\\n" > %A; exit 1');
+    await sh(dir, 'config', 'merge.default', 'twomark');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nBASE\ntail\n');
+    await sh(dir, 'add', '-A');
+    await sh(dir, 'commit', '-qm', 'base');
+    await sh(dir, 'branch', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nOURS\ntail\n');
+    await sh(dir, 'commit', '-qam', 'ours');
+    await sh(dir, 'checkout', '-q', 'feature');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nTHEIRS\ntail\n');
+    await sh(dir, 'commit', '-qam', 'theirs');
+    await sh(dir, 'checkout', '-q', 'main');
+    // THE PREMISE: the attribute really does say nothing, so this is the config
+    // half and not a second copy of T36.
+    check('T43 premise: the path has no merge attribute of its own', (await sh(dir, 'check-attr', 'merge', '--', 'a.txt')) === 'a.txt: merge: unspecified', await sh(dir, 'check-attr', 'merge', '--', 'a.txt'));
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+    check('T43: the driver`s two-marker block reads as one disagreement', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
+    const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
+    check('T43:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
+    check('T43:   into the bytes it asked for', (await sh(dir, 'show', 'HEAD:a.txt')) === 'head\nTHEIRS\ntail', JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
   }
 }
 
