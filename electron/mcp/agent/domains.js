@@ -1626,7 +1626,10 @@ const git = {
           // takes a whole-file word, and this one cannot be answered through
           // resolve_merge at all (it refuses the path by name).
           const parts = Array.isArray(f?.parts) ? f.parts : null;
-          const unread = parts ? unreadMarkers(parts) : false;
+          // At the width git wrote them, which travels on the file beside the
+          // parts: this surface has no repository to ask and seven is only git's
+          // default, not the only width it writes. See conflictMarkerSizes.
+          const unread = parts ? unreadMarkers(parts, f?.markerSize) : false;
           const clashes = parts && !unread ? parts.filter((part) => part && part.kind === 'clash') : null;
           const encoded = JSON.stringify(clashes ?? null);
           const bytes = Buffer.byteLength(encoded, 'utf8');

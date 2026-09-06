@@ -254,12 +254,86 @@ function whoChanged(ours, theirs, base) {
 // out as `{hunks: [], hunksOmitted: false}`: a file git had reported as
 // conflicting, described to the agent as having no conflicting hunks.
 //
-// So every marker tolerates the terminator its file uses. MIDDLE already did,
-// by accident of `\s*` — `\s` matches '\r' — and is left spelled the way it was.
-const START = /^<<<<<<< ?(.*?)\r?$/;
-const MIDDLE = /^=======\s*$/;
-const BASE = /^\|\|\|\|\|\|\| ?(.*?)\r?$/; // only present under diff3 conflict style
-const END = /^>>>>>>> ?(.*?)\r?$/;
+// So every marker tolerates the terminator its file uses.
+//
+// AND SEVEN IS NOT THE ONLY WIDTH GIT WRITES.
+//
+// `conflict-marker-size=<n>` in .gitattributes is a documented per-path
+// property, and git obeys it for ANY positive integer. MEASURED, git 2.50.1,
+// `*.txt conflict-marker-size=32`: git writes a thirty-two-character opener,
+// ancestor line, separator and closer, and reports the path unmerged exactly as
+// it always does. Sizes 1 through 200 all came out at the width asked for; 0,
+// a negative and a non-integer fall back to seven (git warns on the last).
+//
+// Against markers of a width these regexes did not know about, the parse failed
+// in TWO different ways, and neither of them was a refusal:
+//
+//   WIDER than seven. `^<<<<<<<` matched the first seven characters of a
+//   thirty-two-character opener and `(.*?)` swallowed the other twenty-five as
+//   the label — so the opener, the ancestor line and the closer all still
+//   matched, and only the SEPARATOR did not: `/^=======\s*$/` cannot match
+//   thirty-two '=' because `\s*$` has nothing to eat the surplus with. The
+//   separator line and everything after it therefore fell into the ANCESTOR
+//   bucket, and the incoming side came out EMPTY. MEASURED end to end with real
+//   git at sizes 9 and 32, LF and CRLF alike: the file was described — to the
+//   panel and to the agent, with `markersUnread: false` — as one hunk whose
+//   incoming side deletes those lines, which is a FALSE description rather than
+//   a missing one, and answering it `['theirs']` wrote `"head\ntail\n"`, bytes
+//   NEITHER BRANCH EVER WROTE, staged them and committed a real two-parent
+//   merge as `{ok: true, changed: true, resolved: 1}` over a clean tree. Both
+//   branches' work gone, in silence, from a choice the caller made against a
+//   description that was not true.
+//
+//   NARROWER than seven. `<<< HEAD` matched nothing at all, so the whole
+//   marked-up file came back as one agreed part — clashCount() 0 — and
+//   `unreadMarkers`, whose exact-seven pattern is the class backstop, did not
+//   see it either. MEASURED at size 3: `choices: {}` committed this branch's
+//   version and answered `{ok: true, resolved: 1}`, the incoming branch's work
+//   committed away under a description that said there was nothing to decide.
+//
+// So the width is a PARAMETER, taken from git's own answer for that path (see
+// conflictMarkerSizes in gitBranches.js, which asks `git check-attr`), and the
+// markers are matched at EXACTLY that width — `(?!<)` after the run, so a
+// longer one is not a match by prefix and a shorter one is not a match at all.
+// Seven is the default for every caller that does not say, which is what git
+// itself does with an unset or unusable attribute.
+const DEFAULT_MARKER_SIZE = 7;
+
+/** Git's own reading of the attribute: a positive integer, or seven. */
+const markerWidth = (size) => (Number.isInteger(size) && size > 0 ? size : DEFAULT_MARKER_SIZE);
+
+// Compiled once per width. A merge touches one width almost always, and
+// rebuilding four regexes per file for the sake of it is the kind of cost that
+// only ever shows up on the conflict with three hundred files in it.
+const markerCache = new Map();
+
+function markersFor(size) {
+  const n = markerWidth(size);
+  const cached = markerCache.get(n);
+  if (cached) return cached;
+  // EXACTLY n of the character and no more. Without the negative lookahead a
+  // width-7 pattern matches the first seven characters of a width-32 marker and
+  // reads the remaining twenty-five as a label — which is the shape that
+  // committed bytes neither branch wrote. See above.
+  const run = (ch) => {
+    const one = ch === '|' ? '\\|' : ch;
+    return `${one}{${n}}(?!${one})`;
+  };
+  const built = {
+    size: n,
+    // ` ?(.*?)\r?$`: git writes "<<<<<<< HEAD", and a bare marker with no label
+    // is tolerated the way it always was. `\r?` so a CRLF file's terminator is
+    // part of the marker rather than part of the label.
+    START: new RegExp(`^${run('<')} ?(.*?)\\r?$`),
+    // `\s*` matches '\r' as well as trailing spaces, which is how the separator
+    // survived CRLF before any of this was deliberate.
+    MIDDLE: new RegExp(`^${run('=')}\\s*$`),
+    BASE: new RegExp(`^${run('|')} ?(.*?)\\r?$`), // only present under diff3 conflict style
+    END: new RegExp(`^${run('>')} ?(.*?)\\r?$`),
+  };
+  markerCache.set(n, built);
+  return built;
+}
 
 /**
  * A conflicted file as a list of parts.
@@ -273,8 +347,14 @@ const END = /^>>>>>>> ?(.*?)\r?$/;
  *
  * A file with no markers comes back as a single `same` part, which is the
  * honest answer: there is nothing to choose.
+ *
+ * `markerSize` is the width git wrote its markers at for THIS path — the
+ * `conflict-marker-size` attribute, asked of git rather than guessed from the
+ * text. Left out, it is git's own default of seven, which is what git uses when
+ * the attribute is unset or unusable. See markersFor.
  */
-function parseConflict(text) {
+function parseConflict(text, markerSize) {
+  const { START, MIDDLE, BASE, END } = markersFor(markerSize);
   const lines = String(text ?? '').split('\n');
   const parts = [];
   let same = [];
@@ -320,12 +400,28 @@ function parseConflict(text) {
       }
       (sawMiddle ? theirs : sawBase ? base : ours).push(line);
     }
-    if (!closed) {
+    // A BLOCK THIS DID NOT FULLY READ IS KEPT WHOLE, NEVER HALF-READ.
+    //
+    // `closed` was the only test here, and a block missing its SEPARATOR still
+    // passed it: everything from the opener to the closer went into `ours` (or,
+    // under diff3, into the ancestor once the ancestor line had been seen) and
+    // the incoming side came out empty — a hunk saying "the other branch
+    // deleted this", which is a claim, not a gap. That is exactly the shape a
+    // wider-than-seven marker produced before the width became a parameter, and
+    // it committed bytes neither branch wrote. See the marker note above.
+    //
+    // Git writes all four markers or none: an opener, an optional ancestor line
+    // under diff3, a separator and a closer, every one of them at the same
+    // width. A block missing any of the three that are never optional is
+    // therefore not a block git wrote at this width, and the honest answer is
+    // that it was not read — so its lines stay verbatim in the agreed text,
+    // where `unreadMarkers` finds the opener still sitting in them and every
+    // caller downstream refuses the path by name rather than answering for it.
+    if (!closed || !sawMiddle) {
       same.push(lines[i]);
       i++;
       continue;
     }
-    flushSame();
     // One of git's conflicts is often several decisions wearing one coat.
     // Comparing the two sides line by line separates them, so the lines they
     // agree on stop being part of the choice and each run they disagree on
@@ -339,6 +435,27 @@ function parseConflict(text) {
       : lineDiff(ours, theirs).map((r) =>
           r.common ? r : { ...r, changedBy: whoChanged(r.ours.join('\n'), r.theirs.join('\n'), null) }
         );
+    // AND A BLOCK THAT SPLITS INTO NO DISAGREEMENT AT ALL IS NOT A BLOCK EITHER.
+    //
+    // Git does not write a conflict whose two sides are identical — it has
+    // nothing to ask about — so a block whose split holds no clash is one this
+    // did not understand. It used to be DROPPED: the flush ran, the empty split
+    // contributed nothing, and the opener, separator and closer left the parse
+    // entirely. MEASURED on the three-line block `<<<<<<< HEAD / ======= /
+    // >>>>>>> x` a person had typed into a page: clashCount() 0, no unread
+    // marker to find, and rebuilding the file returned it three lines shorter
+    // than it went in — silent deletion out of the one function whose comment
+    // promises nothing is ever silently dropped.
+    //
+    // Kept whole instead, for the same reason and with the same consequence as
+    // the shapes above: the opener stays in the agreed text and the path is
+    // refused rather than answered.
+    if (!split.some((run) => !run.common)) {
+      same.push(lines[i]);
+      i++;
+      continue;
+    }
+    flushSame();
     for (const run of split) {
       if (run.common) {
         // AGREED TEXT THAT CAME OUT FROM BETWEEN THE MARKERS, MARKED AS SUCH.
@@ -602,9 +719,10 @@ function renderResolved(parts, picks = [], sides = null) {
  * caller downstream reads clashCount() === 0 as "no disagreements here", and
  * for such a file that is false: the disagreement is still in there, unread.
  *
- * The CRLF markers above were one way to arrive at that shape and are fixed;
- * a block whose opener and closer disagree about their line endings, or one a
- * person hand-edited and left unclosed, are others, and there is no reason to
+ * The CRLF markers were one way to arrive at that shape and are fixed; a block
+ * whose opener and closer disagree about their line endings, one missing its
+ * separator, one whose sides split into no disagreement at all, and one a
+ * person hand-edited and left unclosed are others, and there is no reason to
  * believe the list is complete. So the shape itself is recognisable, and the
  * callers that would otherwise answer for such a file — resolveMerge's
  * validator, and the MCP git domain describing hunks to an agent — ask here.
@@ -612,8 +730,72 @@ function renderResolved(parts, picks = [], sides = null) {
  * Only the OPENER is looked for: a block always starts with one, so a marker
  * this could not read leaves that line in the agreed text whichever half of it
  * failed.
+ *
+ * TWO WIDTHS ARE LOOKED FOR, AND THE SECOND ONE IS THE POINT.
+ *
+ * `markerSize` is what git says it wrote for this path, and an opener of
+ * exactly that width in agreed text is the direct finding. But the reason this
+ * function exists is that the parse can be wrong in ways nobody has thought of
+ * yet — including being handed the WRONG width, if the attribute that decides
+ * it changed between the merge and the read. So a run of SEVEN OR MORE is
+ * caught as well, whatever the configured width: seven is git's default and
+ * every larger width is a deliberate `conflict-marker-size`, and a line of that
+ * shape sitting unread in a file git has just called conflicting is not
+ * something to answer a merge over. That is a refusal Stacki can be wrong
+ * about safely; the alternative was measured committing bytes neither branch
+ * wrote.
+ *
+ * What it deliberately does NOT do is treat a long run as a marker on its own.
+ * The run has to be followed by a space, a tab, a carriage return or the end of
+ * the text, which is how git writes one and is not how a rule of angle
+ * brackets or a line of somebody's ASCII art is written.
  */
-const unreadMarkers = (parts) =>
-  (parts || []).some((part) => part && part.kind === 'same' && /(?:^|\n)<{7}(?=[ \t\r]|$)/.test(part.text || ''));
+const unreadMarkers = (parts, markerSize) => {
+  const n = markerWidth(markerSize);
+  // `<{n}(?!<)` for the width git actually used, `<{7,}` for the default and
+  // every wider one. When n is seven or more the first alternative is already
+  // covered by the second; when it is smaller — sizes 1 to 6 are all legal —
+  // it is the only one of the two that can see the marker at all.
+  const opener = new RegExp(`(?:^|\\n)(?:<{${n}}(?!<)|<{7,})(?=[ \\t\\r]|$)`);
+  const texts = (parts || []).filter((part) => part && part.kind === 'same').map((part) => part.text || '');
+  if (texts.some((text) => opener.test(text))) return true;
+  // AND THE ONE MIS-READING THE OPENER ALONE CANNOT CATCH.
+  //
+  // Every way of being handed the wrong width ends in a refusal except one. Too
+  // small a width leaves the real, wider opener unread and the `<{7,}` arm
+  // finds it; too large a width leaves a seven-wide opener unread and the same
+  // arm finds that. But a real width BELOW seven, read as seven, leaves `<<<
+  // HEAD` sitting in agreed text that neither arm can see — and that is the
+  // shape that was measured committing this branch's version over the incoming
+  // one under `{ok: true, resolved: 1}`.
+  //
+  // Guessing at short openers on their own is not the answer: a line beginning
+  // `< ` is ordinary in diff output, in quoted mail and in documentation, and
+  // refusing every conflicted file that contains one would be a false refusal
+  // invented rather than inherited. What is NOT ordinary is a whole block —
+  // opener, separator and closer, all the same width, in that order, with the
+  // separator alone on its line. Git writes exactly that and little else does.
+  //
+  // Only widths one to six are looked for here. Seven and above are already
+  // answered by the opener arm above, which is both cheaper and stricter.
+  for (let width = 1; width < 7; width++) {
+    const block = new RegExp(
+      `(?:^|\\n)<{${width}}(?!<)[ \\t][\\s\\S]*?\\n={${width}}(?!=)[ \\t\\r]*\\n[\\s\\S]*?\\n>{${width}}(?!>)[ \\t]`
+    );
+    if (texts.some((text) => block.test(text))) return true;
+  }
+  return false;
+};
 
-module.exports = { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, lineDiff, mergeInline, unreadMarkers };
+module.exports = {
+  parseConflict,
+  renderResolved,
+  clashCount,
+  conflictAtEnd,
+  threeWay,
+  lineDiff,
+  mergeInline,
+  unreadMarkers,
+  DEFAULT_MARKER_SIZE,
+  markerWidth,
+};

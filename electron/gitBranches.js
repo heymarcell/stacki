@@ -1,7 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('node:crypto');
-const { parseConflict, renderResolved, clashCount, conflictAtEnd, unreadMarkers } = require('./conflicts');
+const {
+  parseConflict,
+  renderResolved,
+  clashCount,
+  conflictAtEnd,
+  unreadMarkers,
+  DEFAULT_MARKER_SIZE,
+} = require('./conflicts');
 
 // Merging a branch and deleting one.
 //
@@ -367,6 +374,66 @@ async function stage(git, projectPath, n, file) {
   } catch {
     return null;
   }
+}
+
+/**
+ * How wide git wrote each conflicting path's markers, ASKED OF GIT.
+ *
+ * `conflict-marker-size=<n>` is a documented per-path gitattribute, and git
+ * obeys any positive integer: `*.txt conflict-marker-size=32` gets
+ * thirty-two-character markers, and sizes as small as one are legal. The
+ * parser used to know only about seven, and the two ways it then failed are
+ * written out beside the marker regexes in conflicts.js — one of them wrote
+ * bytes neither branch had, staged them and committed a real merge.
+ *
+ * Read from git rather than counted off the file, for the reason every other
+ * fact in this file is: a source file may legitimately CONTAIN a line that
+ * looks like a marker — a page documenting what a conflict looks like is the
+ * obvious one — and the widest run of angle brackets in the text is no evidence
+ * at all about what the merge machinery wrote. `check-attr` is the same lookup
+ * git's own merge did, over the same attribute files, a moment earlier.
+ *
+ * Run from the REPOSITORY ROOT with root-relative names, for the same reason
+ * `ls-files -u --full-name` is: check-attr spells and scopes its paths from the
+ * cwd, and `left` is spelled from the root. `-z` so the names come back
+ * verbatim and match the ones asked about, byte for byte, whatever is in them.
+ *
+ * A path this cannot answer for is simply absent from the map, and every reader
+ * falls back to git's own default of seven. That is deliberate: a repository
+ * that will not answer a `check-attr` still has to be able to merge, and being
+ * given the wrong width is not silent — it leaves the real markers unread in
+ * the agreed text, where `unreadMarkers` finds them and the path is refused by
+ * name. Wrong here costs a refusal, never a commit.
+ */
+const MARKER_SIZE_BATCH = 64;
+
+async function conflictMarkerSizes(git, root, files) {
+  const sizes = new Map();
+  const list = (files || []).filter((file) => typeof file === 'string' && file);
+  for (let from = 0; from < list.length; from += MARKER_SIZE_BATCH) {
+    // Batched because a merge can conflict in hundreds of paths and a command
+    // line has a length. Nothing here depends on the batches agreeing.
+    const batch = list.slice(from, from + MARKER_SIZE_BATCH);
+    let out = '';
+    try {
+      out = (await git(root, ['check-attr', '-z', 'conflict-marker-size', '--', ...batch])).stdout;
+    } catch {
+      continue; // this batch keeps git's default; see above
+    }
+    // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
+    // "unspecified" where the attribute is not set.
+    const fields = String(out || '').split('\0');
+    for (let at = 0; at + 2 < fields.length; at += 3) {
+      const value = fields[at + 2];
+      // Git's own reading: only a positive integer means anything. It warns and
+      // falls back to seven for everything else, and so does this by leaving
+      // the path out of the map.
+      if (!/^[0-9]+$/.test(value)) continue;
+      const width = Number(value);
+      if (Number.isInteger(width) && width > 0) sizes.set(fields[at], width);
+    }
+  }
+  return sizes;
 }
 
 /**
@@ -895,6 +962,11 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const WHOLE_FILE = new Set(['ours', 'theirs']);
   const PER_HUNK = new Set(['ours', 'theirs', 'both', 'merged']);
   const conflicted = new Set(left);
+  // HOW WIDE GIT WROTE THE MARKERS, per path, before anything reads one. The
+  // trial merge above is the one whose output these answers are applied to, so
+  // this is asked after it and about the same working tree. See
+  // conflictMarkerSizes.
+  const markerSizes = await conflictMarkerSizes(git, at, left);
   // Parsed once and kept. The apply loop below reads the same answer rather
   // than opening the file a second time — and, more to the point, rather than
   // deciding a length against one parse and applying it against another.
@@ -903,7 +975,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     if (parsed.has(file)) return parsed.get(file);
     let parts = null;
     try {
-      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'));
+      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'), markerSizes.get(file));
     } catch {
       // Binary, or one side deleted it: there is no marked-up text to split,
       // so the only answer this file can take is a whole-file one.
@@ -1064,7 +1136,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // by name, for every answer alike — the deliberate "theirs" as much as the
     // silent default, because the caller who typed it was answering the same
     // false description of the file.
-    if (unreadMarkers(partsOf(file))) {
+    if (unreadMarkers(partsOf(file), markerSizes.get(file))) {
       unusable.push({
         path: file,
         given:
@@ -1357,6 +1429,9 @@ async function mergeBranch(git, { projectPath, branch }) {
       // sending someone to a terminal, which for most of the people this
       // editor is for is the same as refusing.
       const clashes = [];
+      // The widths git used, asked while the merge is still in progress and so
+      // about the attributes it actually merged under. See conflictMarkerSizes.
+      const markerSizes = await conflictMarkerSizes(git, root, files);
       for (const file of files) {
         // The file as git left it, both versions in it and marked. Parsing
         // that rather than diffing the two sides here means the three-way
@@ -1366,7 +1441,7 @@ async function mergeBranch(git, { projectPath, branch }) {
         // other can say so.
         let parts = null;
         try {
-          parts = parseConflict(fs.readFileSync(path.join(root, file), 'utf8'));
+          parts = parseConflict(fs.readFileSync(path.join(root, file), 'utf8'), markerSizes.get(file));
         } catch {
           // A binary file, or one side deleted it: there is no marked-up text
           // to read, and the choice is the whole file or nothing.
@@ -1377,6 +1452,12 @@ async function mergeBranch(git, { projectPath, branch }) {
           ours: await stage(git, projectPath, 2, file),
           theirs: await stage(git, projectPath, 3, file),
           parts,
+          // WHICH WIDTH `parts` WAS READ AT, carried with them. The MCP git
+          // domain asks `unreadMarkers` about these same parts on the way out
+          // and cannot re-derive the width — it has no repository to ask — so a
+          // custom-width file would have been checked against seven there and
+          // reported `markersUnread: false` however the parse had gone.
+          markerSize: markerSizes.get(file) ?? DEFAULT_MARKER_SIZE,
         });
       }
       // WHICH CONFLICT THIS IS. Computed here, while the marked-up files are

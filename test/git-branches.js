@@ -3812,6 +3812,459 @@ async function suite() {
     check('T31 control:   with the incoming bytes exactly', textOf(path.join(small, 'a.txt')) === 'head\nTHEIRS', JSON.stringify(textOf(path.join(small, 'a.txt'))));
   }
 
+  {
+    // T32 — SEVEN IS NOT THE ONLY WIDTH GIT WRITES ITS CONFLICT MARKERS AT, AND
+    // THE TWO WAYS THE PARSE FAILED AGAINST OTHER WIDTHS WERE BOTH ok:true.
+    //
+    // `conflict-marker-size=<n>` is a documented per-path gitattribute. MEASURED
+    // against git 2.50.1: every positive integer from 1 to 200 comes out at
+    // exactly the width asked for, on both LF and CRLF files and under all three
+    // conflict styles; 0, a negative and a non-integer fall back to seven. So
+    // `*.txt conflict-marker-size=32` is an ordinary repository setting, and the
+    // patterns in electron/conflicts.js knew only about seven.
+    //
+    // WIDER THAN SEVEN — THE ONE THAT WROTE BYTES NEITHER BRANCH HAD.
+    // `/^<<<<<<< ?(.*?)\r?$/` matched the first seven characters of a
+    // thirty-two-character opener and read the other twenty-five as the label,
+    // and the ancestor line and closer matched the same way. Only the SEPARATOR
+    // did not: `/^=======\s*$/` has nothing to eat thirty-two '=' with. So the
+    // separator line and the whole incoming side fell into the ANCESTOR bucket
+    // and `theirs` came out EMPTY — a hunk claiming the other branch deleted
+    // those lines. MEASURED end to end at sizes 9 and 32, LF and CRLF: the panel
+    // and the MCP envelope both described it that way with
+    // `markersUnread: false`, and answering `['theirs']` wrote "head\ntail\n" —
+    // in neither branch — staged it and committed a real two-parent merge as
+    // `{ok: true, changed: true, resolved: 1}` over a clean tree. Both branches'
+    // work gone, from a choice made against a description that was not true.
+    //
+    // NARROWER THAN SEVEN — THE SHAPE THE CRLF FIX WAS WRITTEN TO CLOSE, STILL
+    // OPEN. `<<< HEAD` matched nothing, so the marked-up file came back as one
+    // agreed part, clashCount() was 0, and `unreadMarkers` — the class backstop,
+    // whose pattern was exactly seven '<' — did not see it either. MEASURED at
+    // size 3: `choices: {}` committed this branch's version and answered
+    // `{ok: true, resolved: 1}`, the incoming branch's work discarded under a
+    // description that said there was nothing to decide.
+    //
+    // The width is now a parameter, read from git's own `check-attr` for that
+    // path (see conflictMarkerSizes) and matched exactly, and a width that turns
+    // out to be wrong leaves the real markers unread where the backstop finds
+    // them — a refusal, never a commit. Every claim above is checked here
+    // against real repositories.
+
+    // A BLOB, EXACTLY. `sh` trims, which is right for a rev-parse and wrong for
+    // the oracle of this whole block: the final newline is the byte three of the
+    // defects in this file were about, and a comparison that trims it cannot see
+    // any of them.
+    const blob = async (dir, rev) => (await git(dir, ['show', '--end-of-options', rev])).stdout;
+
+    // A repository that clashes in one file, at whatever marker width its
+    // .gitattributes asks for.
+    const widthRepo = async (name, attrs, { base, ours, theirs, file = 'a.txt' }) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      if (attrs) fs.writeFileSync(path.join(dir, '.gitattributes'), attrs);
+      fs.writeFileSync(path.join(dir, file), base);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'the version both branches start from');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, file), theirs);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'the incoming work');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, file), ours);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'this branch');
+      return dir;
+    };
+
+    // WHAT GIT ACTUALLY WROTE, read off a real merge rather than assumed. A
+    // .gitattributes that was not picked up would make every assertion below
+    // pass for the wrong reason — see T28, which asks git the same way.
+    const widthGitWrote = async (dir, file) => {
+      await sh(dir, '-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', '--', 'feature').catch(() => {});
+      const text = textOf(path.join(dir, file)) || '';
+      const opener = (text.match(/(?:^|\n)(<+)/) || [])[1] || '';
+      const middle = (text.match(/(?:^|\n)(=+)/) || [])[1] || '';
+      const ancestor = (text.match(/(?:^|\n)(\|+)/) || [])[1] || '';
+      const closer = (text.match(/(?:^|\n)(>+)/) || [])[1] || '';
+      await sh(dir, 'merge', '--abort').catch(() => {});
+      return { opener: opener.length, middle: middle.length, ancestor: ancestor.length, closer: closer.length };
+    };
+
+    const BASE = 'head\nBASE\ntail\n';
+    const OURS = 'head\nOURS\ntail\n';
+    const THEIRS = 'head\nTHEIRS\ntail\n';
+
+    // 1-4 + a fifth width, and every one of them under the diff3 style Stacki
+    // merges with — so the ancestor line is in the markup too and is matched at
+    // the same width as the rest.
+    const widths = [
+      { name: 'w7lf', label: 'default width, LF', attrs: null, size: 7, crlf: false },
+      { name: 'w7crlf', label: 'default width, CRLF', attrs: '*.txt text eol=crlf\n', size: 7, crlf: true },
+      { name: 'w32lf', label: 'conflict-marker-size=32, LF', attrs: '*.txt conflict-marker-size=32\n', size: 32, crlf: false },
+      { name: 'w32crlf', label: 'conflict-marker-size=32, CRLF', attrs: '*.txt conflict-marker-size=32\n*.txt text eol=crlf\n', size: 32, crlf: true },
+      { name: 'w9lf', label: 'conflict-marker-size=9, LF', attrs: '*.txt conflict-marker-size=9\n', size: 9, crlf: false },
+      { name: 'w3lf', label: 'conflict-marker-size=3, LF', attrs: '*.txt conflict-marker-size=3\n', size: 3, crlf: false },
+    ];
+
+    for (const w of widths) {
+      // THE FIXTURE IS REALLY THAT WIDTH. Asked of git, on a real merge, before
+      // anything below reads a marker.
+      const probe = await widthRepo(`${w.name}-probe`, w.attrs, { base: BASE, ours: OURS, theirs: THEIRS });
+      const wrote = await widthGitWrote(probe, 'a.txt');
+      check(
+        `T32 ${w.label}: git writes all four markers ${w.size} characters wide`,
+        wrote.opener === w.size && wrote.middle === w.size && wrote.ancestor === w.size && wrote.closer === w.size,
+        JSON.stringify(wrote)
+      );
+
+      const read = await widthRepo(`${w.name}-read`, w.attrs, { base: BASE, ours: OURS, theirs: THEIRS });
+      const clash = await mergeBranch(git, { projectPath: read, branch: 'feature' });
+      check(`T32 ${w.label}: the file conflicts`, clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
+      check(`T32 ${w.label}: ONE disagreement, not none and not a false one`, hunks.length === 1, JSON.stringify(f.parts));
+      // The two sides, exactly — this is what caught the wider-than-seven
+      // failure, whose `theirs` was the empty string.
+      const eol = w.crlf ? '\r' : '';
+      check(
+        `T32 ${w.label}:   with both sides read`,
+        hunks[0]?.ours === `OURS${eol}` && hunks[0]?.theirs === `THEIRS${eol}`,
+        JSON.stringify(hunks[0])
+      );
+      check(`T32 ${w.label}:   and the width git used carried with them`, f.markerSize === w.size, String(f.markerSize));
+      // THE ANCESTOR LINE WAS MATCHED TOO, at the same width — which is what
+      // makes `changedBy` a three-way answer rather than a guess between two
+      // sides. Both branches moved off BASE here, so it is 'both'.
+      check(`T32 ${w.label}:   read three-way, against the ancestor git wrote`, hunks[0]?.changedBy === 'both', JSON.stringify(hunks[0]));
+      // AND THE AGENT IS TOLD THE SAME THING. `markersUnread` is the field that
+      // said `false` over a file described with an empty incoming side.
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: read, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check(
+        `T32 ${w.label} MCP: one hunk, markers read`,
+        mcpFile.markersUnread === false && Array.isArray(mcpFile.hunks) && mcpFile.hunks.length === 1,
+        JSON.stringify(mcpFile)
+      );
+
+      // 7, 8, 9, 11 — every answer, against the exact branch bytes. The oracle
+      // is the COMMIT: `git show HEAD:a.txt` after the merge against
+      // `git show <branch>:a.txt`, which no line-ending normalisation can blur.
+      const answers = [
+        { what: 'explicit "ours"', choices: { 'a.txt': 'ours' }, from: 'main' },
+        { what: 'explicit "theirs"', choices: { 'a.txt': 'theirs' }, from: 'feature' },
+        { what: 'the per-hunk answer ["ours"]', choices: { 'a.txt': ['ours'] }, from: 'main' },
+        { what: 'the per-hunk answer ["theirs"]', choices: { 'a.txt': ['theirs'] }, from: 'feature' },
+        { what: 'an omitted choice', choices: {}, from: 'main' },
+      ];
+      for (const a of answers) {
+        const dir = await widthRepo(`${w.name}-${a.from}-${a.choices['a.txt'] ? String(a.choices['a.txt']) : 'default'}`, w.attrs, {
+          base: BASE,
+          ours: OURS,
+          theirs: THEIRS,
+        });
+        const at = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+        const want = await blob(dir, `${a.from}:a.txt`);
+        const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: a.choices, expect: at.at }));
+        check(`T32 ${w.label}: ${a.what} merges`, answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+        check(
+          `T32 ${w.label}:   committing ${a.from}'s bytes exactly`,
+          (await blob(dir, 'HEAD:a.txt')) === want,
+          JSON.stringify({ got: await blob(dir, 'HEAD:a.txt'), want })
+        );
+        check(
+          `T32 ${w.label}:   as a merge commit with two parents`,
+          (await sh(dir, 'rev-list', '--parents', '-n', '1', 'HEAD')).trim().split(/\s+/).length === 3
+        );
+        check(`T32 ${w.label}:   on the branch it started on`, (await sh(dir, 'rev-parse', '--abbrev-ref', 'HEAD')) === 'main');
+        const state = await repoState(dir);
+        check(`T32 ${w.label}:   leaving a clean repository`, state.status === '' && state.mergeHead === false, state.status);
+        check(
+          `T32 ${w.label}:   and not one marker on disk`,
+          !/[<>|]{3}|\n={3,}\n/.test(textOf(path.join(dir, 'a.txt')) || ''),
+          JSON.stringify(textOf(path.join(dir, 'a.txt')))
+        );
+      }
+
+      // 10, 15 — a malformed answer is refused with the repository untouched.
+      for (const bad of [
+        { what: 'a word that is not a side', choices: { 'a.txt': ['sideways'] }, reason: 'bad_pick' },
+        { what: 'more answers than hunks', choices: { 'a.txt': ['ours', 'theirs'] }, reason: 'wrong_length' },
+        { what: 'an empty list of answers', choices: { 'a.txt': [] }, reason: 'empty' },
+        { what: 'an explicit null', choices: { 'a.txt': null }, reason: 'null' },
+        { what: 'a path git never named', choices: { 'a.txt': 'ours', 'nope.txt': 'ours' }, reason: 'unknown_path' },
+      ]) {
+        const dir = await widthRepo(`${w.name}-bad-${bad.reason}`, w.attrs, { base: BASE, ours: OURS, theirs: THEIRS });
+        const at = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+        const before = await repoState(dir);
+        const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: bad.choices, expect: at.at }));
+        await refusedCleanly(`T32 ${w.label}: ${bad.what}`, answer.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === bad.reason)
+        );
+      }
+    }
+
+    // 6 — A CUSTOM WIDTH WITH SEVERAL HUNKS, ANSWERED ONE AT A TIME. The whole
+    // reason the parse exists is that a file can take its heading from one
+    // branch and its footer from the other, and a width the parse could not read
+    // took that away without saying so.
+    {
+      const dir = await widthRepo('w32-multi', '*.txt conflict-marker-size=32\n', {
+        base: 'top\nA-BASE\nmiddle\nB-BASE\nbottom\n',
+        ours: 'top\nA-OURS\nmiddle\nB-OURS\nbottom\n',
+        theirs: 'top\nA-THEIRS\nmiddle\nB-THEIRS\nbottom\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
+      check('T32 multi: two independent disagreements at width 32', hunks.length === 2, JSON.stringify(f.parts));
+      const answer = await caught(() =>
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours', 'theirs'] }, expect: clash.at })
+      );
+      check('T32 multi: half from each branch merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T32 multi:   with exactly the bytes that asks for',
+        (await blob(dir, 'HEAD:a.txt')) === 'top\nA-OURS\nmiddle\nB-THEIRS\nbottom\n',
+        JSON.stringify(await blob(dir, 'HEAD:a.txt'))
+      );
+    }
+
+    // 5 — THE ANCESTOR IS WHAT SAYS WHICH SIDE MOVED, and at a custom width it
+    // was being swallowed along with the incoming side. Only ONE branch changes
+    // this hunk, so a parse that read the ancestor answers 'theirs' and one that
+    // did not cannot tell.
+    {
+      const dir = await widthRepo('w32-diff3', '*.txt conflict-marker-size=32\n', {
+        base: 'head\nBASE\nSHARED\n',
+        ours: 'head\nBASE\nOURS-TAIL\n',
+        theirs: 'head\nTHEIRS\nSHARED\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
+      check('T32 diff3: the width-32 ancestor line was read', hunks.some((h) => h.changedBy !== 'both'), JSON.stringify(f.parts));
+    }
+
+    // 12 — A MODIFY/DELETE CLASH AT A CUSTOM WIDTH. There are no markers in this
+    // shape at all, so the existing no_such_side protection must be exactly as
+    // it was: a width fix that started refusing these would be a new false
+    // refusal, and one that started allowing them would undo T27.
+    {
+      const dir = await repo('w32-modifydelete');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'a repository with wide conflict markers');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'edited on the incoming branch\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'edited on feature');
+      await sh(dir, 'checkout', '-q', 'main');
+      await sh(dir, 'rm', '-q', 'a.txt');
+      await sh(dir, 'commit', '-qm', 'deleted on main');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T32 modify/delete: it conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 160));
+      const before = await repoState(dir);
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: {}, expect: clash.at }));
+      await refusedCleanly('T32 modify/delete: the default "ours"', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'no_such_side' && JSON.stringify(b.sides) === '["theirs"]')
+      );
+    }
+
+    // 13 — A BINARY CLASH AT A CUSTOM WIDTH. Git writes no markers into a binary
+    // file whatever the attribute says, so this file legitimately has no hunks
+    // and takes a whole-file word. It is here because the backstop above was
+    // broadened, and a backstop that started calling these unreadable would
+    // refuse every conflicting image in the project.
+    {
+      const dir = await repo('w32-binary');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.bin conflict-marker-size=32\n');
+      fs.writeFileSync(path.join(dir, 'x.bin'), Buffer.from([0, 1, 2, 3, 0, 255, 60, 60, 60]));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'a binary file');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'x.bin'), Buffer.from([0, 9, 9, 9, 0, 255]));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'x.bin'), Buffer.from([0, 5, 5, 5, 0, 254]));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'x.bin') || {};
+      check('T32 binary: no hunks, which is the truth about it', (f.parts || []).filter((p) => p.kind === 'clash').length === 0, JSON.stringify(f.parts).slice(0, 200));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'x.bin') || {};
+      check('T32 binary:   and it is NOT called unreadable', mcpFile.markersUnread === false, JSON.stringify(mcpFile));
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'x.bin': 'theirs' }, expect: clash.at }));
+      check('T32 binary: the whole-file answer still merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T32 binary:   with the incoming bytes exactly',
+        fs.readFileSync(path.join(dir, 'x.bin')).equals(Buffer.from([0, 9, 9, 9, 0, 255]))
+      );
+    }
+
+    // 14 — A FILE THAT LEGITIMATELY CONTAINS SOMETHING SHAPED LIKE A CONFLICT
+    // MARKER. A page explaining what a conflict looks like is ordinary, and
+    // MEASURED: git does NOT widen its own markers to avoid colliding with such
+    // text — at the default width it wrote a second `<<<<<<< HEAD` directly
+    // under the one already in the file.
+    //
+    // At the DEFAULT width the two are indistinguishable, to git as much as to
+    // this, and the behaviour is unchanged by anything here: the authored block
+    // is read as a disagreement like any other. That is recorded rather than
+    // asserted to be right.
+    //
+    // At a CUSTOM width they are distinguishable, and the answer is the one this
+    // whole change is built on: the authored seven-wide block is NOT read as a
+    // hunk — it is kept verbatim, no line of it lost — and because a marker is
+    // then sitting unread in text the parse called agreed, the path is REFUSED
+    // rather than answered. A safe refusal on a genuinely ambiguous file, with
+    // every byte of the file still there to finish by hand.
+    {
+      const DOC = 'When git cannot reconcile a file it writes:\n\n<<<<<<< HEAD\nyour version\n=======\ntheir version\n>>>>>>> other-branch\n\n';
+      const dir = await widthRepo('w7-authored-markers', null, {
+        base: `${DOC}status: BASE\n`,
+        ours: `${DOC}status: OURS\n`,
+        theirs: `${DOC}status: THEIRS\n`,
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
+      // Recorded, not endorsed: at the same width there is nothing to tell them
+      // apart with, and git has the same limitation.
+      check('T32 authored markers, default width: the authored block reads as a hunk too', hunks.length === 2, JSON.stringify(f.parts));
+
+      const wide = await widthRepo('w32-authored-markers', '*.txt conflict-marker-size=32\n', {
+        base: `${DOC}status: BASE\n`,
+        ours: `${DOC}status: OURS\n`,
+        theirs: `${DOC}status: THEIRS\n`,
+      });
+      const wideClash = await mergeBranch(git, { projectPath: wide, branch: 'feature' });
+      const wf = (wideClash.files || []).find((x) => x.path === 'a.txt') || {};
+      const wideHunks = (wf.parts || []).filter((p) => p.kind === 'clash');
+      check('T32 authored markers, width 32: the authored block is NOT one of git’s', wideHunks.length <= 1, JSON.stringify(wf.parts));
+      // NOT ONE LINE OF THE AUTHORED BLOCK IS LOST. The parse keeps what it did
+      // not read, verbatim, which is what makes the refusal below safe advice.
+      const agreed = (wf.parts || []).filter((p) => p.kind === 'same').map((p) => p.text).join('\n');
+      check(
+        'T32 authored markers, width 32:   and every line of it is still in the parse',
+        agreed.includes('<<<<<<< HEAD') && agreed.includes('=======') && agreed.includes('>>>>>>> other-branch'),
+        JSON.stringify(agreed).slice(0, 300)
+      );
+      const mcp = DOMAINS.git.merge.result(wideClash, { branch: 'feature' }, { root: wide, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 authored markers, width 32: the agent is told the markers went unread', mcpFile.markersUnread === true, JSON.stringify(mcpFile));
+      const before = await repoState(wide);
+      const answer = await caught(() => resolveMerge(git, { projectPath: wide, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: wideClash.at }));
+      await refusedCleanly('T32 authored markers, width 32: answering it at all', answer.value, wide, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
+    }
+
+    // AND THE WIDTH IS READ PER PATH, FROM GIT, NOT ONCE FOR THE MERGE. Two
+    // files in one conflict at two different widths — which is what a
+    // .gitattributes with two lines in it produces, and what no single global
+    // setting could serve. This is the check that goes red when the width stops
+    // being asked of git.
+    {
+      const dir = await repo('w-mixed');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n*.md conflict-marker-size=4\n');
+      fs.writeFileSync(path.join(dir, 'a.txt'), BASE);
+      fs.writeFileSync(path.join(dir, 'b.md'), BASE);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'two files, two widths');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS);
+      fs.writeFileSync(path.join(dir, 'b.md'), THEIRS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'a.txt'), OURS);
+      fs.writeFileSync(path.join(dir, 'b.md'), OURS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const byPath = Object.fromEntries((clash.files || []).map((f) => [f.path, f]));
+      check('T32 mixed: each file carries its own width', byPath['a.txt']?.markerSize === 32 && byPath['b.md']?.markerSize === 4, JSON.stringify(Object.entries(byPath).map(([p, f]) => [p, f.markerSize])));
+      check(
+        'T32 mixed: both are read as one disagreement each',
+        (byPath['a.txt']?.parts || []).filter((p) => p.kind === 'clash').length === 1 &&
+          (byPath['b.md']?.parts || []).filter((p) => p.kind === 'clash').length === 1,
+        JSON.stringify([byPath['a.txt']?.parts, byPath['b.md']?.parts])
+      );
+      const answer = await caught(() =>
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'], 'b.md': ['ours'] }, expect: clash.at })
+      );
+      check('T32 mixed: one from each branch merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T32 mixed:   with each file taking exactly the branch it was given',
+        (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')) &&
+          (await blob(dir, 'HEAD:b.md')) === (await blob(dir, 'main:b.md')),
+        JSON.stringify([await blob(dir, 'HEAD:a.txt'), await blob(dir, 'HEAD:b.md')])
+      );
+    }
+
+    // THE WIDTH THIS CANNOT GET RIGHT, AND WHAT IT COSTS.
+    //
+    // `.gitattributes` is itself mergeable, and when it conflicts the file that
+    // DECIDES the marker width is one of the files holding markers. MEASURED,
+    // real git: with the attribute at 32 on the ancestor, 40 on this branch and
+    // 12 on the incoming one, git wrote a.txt's markers FORTY wide — it merged
+    // under this branch's attributes — while `check-attr`, reading the now
+    // conflicted .gitattributes off disk afterwards, answers TWELVE. Stacki is
+    // handed the wrong width, and there is no fixing that from here: the two
+    // readings are both git's.
+    //
+    // What matters is what a wrong width costs. Parsed at twelve, the forty-wide
+    // markers match nothing, the file comes back with no hunks — and the opener
+    // is still sitting in the agreed text, where the backstop finds it. Every
+    // answer for that path is refused by name, HEAD does not move and not one
+    // byte changes. Wrong here is a refusal; it used to be a commit.
+    {
+      const dir = await repo('w-attrclash');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
+      fs.writeFileSync(path.join(dir, 'a.txt'), BASE);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=12\n');
+      fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=40\n');
+      fs.writeFileSync(path.join(dir, 'a.txt'), OURS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T32 attribute clash: both files conflict', (clash.files || []).length === 2, JSON.stringify((clash.files || []).map((f) => f.path)));
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 attribute clash: a.txt is reported unreadable, not as zero hunks', mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
+      for (const bad of [
+        { what: 'the omitted default', choices: { '.gitattributes': 'ours' } },
+        { what: 'an explicit "theirs"', choices: { 'a.txt': 'theirs', '.gitattributes': 'ours' } },
+        { what: 'a per-hunk answer', choices: { 'a.txt': ['theirs'], '.gitattributes': 'ours' } },
+      ]) {
+        const run = await repo(`w-attrclash-${bad.what.replace(/\W+/g, '-')}`);
+        cleanup.push(run);
+        fs.rmSync(run, { recursive: true, force: true });
+        fs.cpSync(dir, run, { recursive: true });
+        const clashAgain = await mergeBranch(git, { projectPath: run, branch: 'feature' });
+        const before = await repoState(run);
+        const answer = await caught(() => resolveMerge(git, { projectPath: run, branch: 'feature', choices: bad.choices, expect: clashAgain.at }));
+        await refusedCleanly(`T32 attribute clash: ${bad.what}`, answer.value, run, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict' && b.path === 'a.txt')
+        );
+      }
+    }
+  }
+
 }
 
 (async () => {

@@ -759,9 +759,171 @@ const conflicted = [
     renderResolved(unclosed) === 'a\n<<<<<<< HEAD\nO\n=======\nT\n',
     JSON.stringify(renderResolved(unclosed))
   );
-  // Not a marker: seven is the count git writes, and a longer run of the same
-  // character is somebody's own text.
-  check('a longer run of the same character is not a marker', unreadMarkers(parseConflict('a\n<<<<<<<<\nb\n')) === false);
+  // Not a marker: a run of angle brackets with nothing after it is a rule
+  // somebody drew, not an opener. (It is NOT "seven is the only count git
+  // writes", which is what this used to say and is false — see the width block
+  // below.) What makes a marker is the shape of the whole line: the run, and
+  // then a space, a tab, a carriage return or the end of the text.
+  check('a run of the same character with nothing after it is not a marker', unreadMarkers(parseConflict('a\n<<<<<<<<\nb\n')) === false);
+}
+
+// --- the width git wrote them at ---------------------------------------------
+//
+// SEVEN IS GIT'S DEFAULT, NOT ITS ONLY WIDTH. `conflict-marker-size=<n>` in
+// .gitattributes is documented and obeyed for any positive integer — MEASURED
+// against git 2.50.1, sizes 1 to 200 all come out at the width asked for, and 0,
+// a negative and a non-integer fall back to seven. test/git-branches.js T32
+// takes the whole matrix through real repositories, including what the two
+// failures below did to real commits; this is the parse itself, where both of
+// them lived.
+{
+  const wide = (n, ch) => ch.repeat(n);
+  const marked = (n) =>
+    ['head', `${wide(n, '<')} HEAD`, 'OURS', `${wide(n, '|')} 1234567`, 'BASE', wide(n, '='), 'THEIRS', `${wide(n, '>')} feature`, 'tail', ''].join('\n');
+
+  for (const n of [1, 2, 3, 6, 7, 9, 32, 60, 200]) {
+    const parts = parseConflict(marked(n), n);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check(`a ${n}-character marker is one disagreement`, clashes.length === 1, JSON.stringify(parts).slice(0, 300));
+    check(`  with both sides read at width ${n}`, clashes[0]?.ours === 'OURS' && clashes[0]?.theirs === 'THEIRS', JSON.stringify(clashes[0]));
+    // The ancestor line matched too, which is the only reason `changedBy` can
+    // be a three-way answer. Both sides moved off BASE here.
+    check(`  and the ancestor line at width ${n} with it`, clashes[0]?.changedBy === 'both', JSON.stringify(clashes[0]));
+    check(`  rebuilding takes the side asked for at width ${n}`, renderResolved(parts, ['theirs']) === 'head\nTHEIRS\ntail\n', JSON.stringify(renderResolved(parts, ['theirs'])));
+    check(`  and no marker survives into the parse at width ${n}`, unreadMarkers(parts, n) === false, JSON.stringify(parts).slice(0, 200));
+  }
+
+  // WIDER THAN THE WIDTH ASKED FOR — the failure that committed bytes neither
+  // branch wrote. `^<<<<<<<` matched the first seven of a thirty-two-character
+  // opener and read the rest as the label; the ancestor line and the closer did
+  // the same; and only `/^=======\s*$/` did not, so the separator and the whole
+  // incoming side fell into the ancestor and `theirs` came out EMPTY. Now the
+  // markers are matched at exactly the width given, so a marker of another width
+  // is not a marker — it is text this did not read, and it says so.
+  {
+    const parts = parseConflict(marked(32), 7);
+    check('a 32-wide marker read at 7 is not half-read into a false hunk', clashCount(parts) === 0, JSON.stringify(parts).slice(0, 300));
+    check('  it is reported as markers that went unread', unreadMarkers(parts, 7) === true);
+    check('  with every line of the file kept', renderResolved(parts) === marked(32), JSON.stringify(renderResolved(parts)));
+  }
+  // NARROWER — nothing matched at all, and the exactly-seven backstop could not
+  // see it either. Both halves of that are closed: the block is unread, and the
+  // shape of a whole block at any width below seven is recognised even when the
+  // width this was given is wrong.
+  {
+    const parts = parseConflict(marked(3), 7);
+    check('a 3-wide marker read at 7 is nought hunks', clashCount(parts) === 0, JSON.stringify(parts).slice(0, 300));
+    check('  and STILL reported as markers that went unread', unreadMarkers(parts, 7) === true);
+    check('  with every line of the file kept', renderResolved(parts) === marked(3), JSON.stringify(renderResolved(parts)));
+  }
+  // The same file read at its own width is an ordinary conflict again.
+  check('and at its own width it is an ordinary conflict', clashCount(parseConflict(marked(3), 3)) === 1);
+
+  // A width git would not have used falls back to seven, exactly as git does
+  // with an unset, zero, negative or non-integer attribute.
+  for (const bogus of [undefined, null, 0, -1, 2.5, '32', NaN]) {
+    check(`a marker size of ${JSON.stringify(bogus)} reads as git's default of seven`, clashCount(parseConflict(marked(7), bogus)) === 1, JSON.stringify(bogus));
+  }
+
+  // AND THE TEXT THAT MUST NOT BE MISTAKEN FOR ONE. The backstop looks for a
+  // whole block at the small widths rather than a bare opener, because a line
+  // beginning "< " is ordinary in diff output, in quoted mail and in
+  // documentation — refusing every conflicted file that holds one would be a
+  // false refusal invented rather than inherited.
+  const benign = [
+    ['diff output', 'Compare them:\n< the old line\n> the new line\ndone\n'],
+    ['a rule of equals signs', 'Title\n=====\nbody\n'],
+    ['a rule of angle brackets', 'a\n<<<<<<<<<<<<<<<<<<<<\nb\n'],
+    ['an HTML fragment', '<div>\n<span>x</span>\n</div>\n'],
+    ['a shell heredoc', 'cat <<EOF\nhello\nEOF\n'],
+  ];
+  for (const [what, text] of benign) {
+    check(`${what} is not read as a conflict`, clashCount(parseConflict(text)) === 0, JSON.stringify(parseConflict(text)).slice(0, 200));
+    check(`  nor called an unread marker`, unreadMarkers(parseConflict(text)) === false, JSON.stringify(text));
+    check(`  and rebuilds byte for byte`, renderResolved(parseConflict(text)) === text, JSON.stringify(renderResolved(parseConflict(text))));
+  }
+}
+
+// --- a marker is EXACTLY its width, not a prefix of a longer run -------------
+//
+// Matching `<{7}` without asking what comes next makes every marker a PREFIX
+// test: an eight-character run of the same character passes it, and so does a
+// thirty-two-character one. That is how a width-32 opener came to be read as a
+// width-7 marker with twenty-five more '<' in its label. The separator saves
+// most of those by refusing to match (nothing can eat the surplus '='), but not
+// all of them — a line of somebody's own text that starts with a run one longer
+// than the width in force can open, close, or split a block that was otherwise
+// read correctly, and the sides then belong to no branch.
+//
+// So each of the three markers that carry a label is checked against a run one
+// character too long sitting in ordinary text, with a real conflict beside it.
+{
+  const real = ['<<<<<<< HEAD', 'OURS', '=======', 'THEIRS', '>>>>>>> f'];
+
+  // An eight-character OPENER in the text before a real conflict. Read as a
+  // marker it swallows the real opener and the sides come back wrong; read as
+  // text it is left where it is, and says so.
+  {
+    const text = ['a', '<<<<<<<< not a marker', 'b', ...real, 'c', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long does not open a block', clashes.length === 1, JSON.stringify(parts));
+    check('  and the real conflict beside it is still read exactly', clashes[0]?.ours === 'OURS' && clashes[0]?.theirs === 'THEIRS', JSON.stringify(clashes[0]));
+    check('  with the over-long run reported as a marker that went unread', unreadMarkers(parts) === true, JSON.stringify(parts));
+  }
+
+  // An eight-character CLOSER inside the block. Read as a marker it ends the
+  // block early and `theirs` is never reached.
+  {
+    const text = ['a', '<<<<<<< HEAD', 'OURS', '>>>>>>>> quoted in the text', '=======', 'THEIRS', '>>>>>>> f', 'c', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long does not close a block', clashes.length === 1, JSON.stringify(parts));
+    check(
+      '  so both sides are the ones git wrote',
+      clashes[0]?.ours === 'OURS\n>>>>>>>> quoted in the text' && clashes[0]?.theirs === 'THEIRS',
+      JSON.stringify(clashes[0])
+    );
+  }
+
+  // An eight-character ANCESTOR line inside the block. Read as a marker every
+  // line after it stops being this branch's side and becomes the ancestor.
+  {
+    const text = ['a', '<<<<<<< HEAD', 'OURS', '|||||||| quoted in the text', 'MORE-OURS', '=======', 'THEIRS', '>>>>>>> f', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long is not the ancestor line', clashes.length === 1, JSON.stringify(parts));
+    check(
+      '  so this branch keeps both of its lines',
+      clashes[0]?.ours === 'OURS\n|||||||| quoted in the text\nMORE-OURS',
+      JSON.stringify(clashes[0])
+    );
+  }
+}
+
+// --- blocks this could not read, and the lines it used to lose ---------------
+{
+  // A BLOCK WITH NO SEPARATOR IS NOT A ONE-SIDED CONFLICT. Everything from the
+  // opener to the closer used to go into `ours` and the incoming side came out
+  // empty — a hunk claiming the other branch deleted those lines, which is a
+  // claim and not a gap. It is the same shape a wider-than-seven marker produced,
+  // and git writes a separator into every conflict it makes.
+  const noMiddle = 'a\n<<<<<<< HEAD\nO\nT\n>>>>>>> f\nb\n';
+  const parts = parseConflict(noMiddle);
+  check('a block with no separator is not read as a hunk', clashCount(parts) === 0, JSON.stringify(parts));
+  check('  it says its markers went unread', unreadMarkers(parts) === true);
+  check('  and every line of it is still there', renderResolved(parts) === noMiddle, JSON.stringify(renderResolved(parts)));
+
+  // A BLOCK THAT SPLITS INTO NO DISAGREEMENT WAS SILENTLY DELETED. The flush
+  // ran, the empty split contributed nothing, and the opener, separator and
+  // closer left the parse entirely — three lines gone out of the one function
+  // whose comment promises nothing is ever dropped. Git does not write a
+  // conflict whose sides are identical, so this is a block nobody read.
+  const emptyBlock = 'head\n<<<<<<< HEAD\n=======\n>>>>>>> x\ntail\n';
+  const emptyParts = parseConflict(emptyBlock);
+  check('a block with nothing on either side is not read as a hunk', clashCount(emptyParts) === 0, JSON.stringify(emptyParts));
+  check('  it says its markers went unread', unreadMarkers(emptyParts) === true);
+  check('  AND NOT ONE OF ITS LINES IS LOST', renderResolved(emptyParts) === emptyBlock, JSON.stringify(renderResolved(emptyParts)));
 }
 
 if (failures.length) {
