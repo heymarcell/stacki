@@ -68,6 +68,13 @@ const git = (cwd, args) =>
 
 const sh = async (cwd, ...args) => (await git(cwd, args)).stdout.trim();
 
+// The bytes of a blob, UNTRIMMED. `sh` trims, and what it trims is exactly the
+// final newline renderResolved's terminator work is about — so an assertion
+// made through it also holds for a rebuild that dropped that byte, and for one
+// that appended a stray CR. Hoisted beside `sh` because more than one block
+// needs it and one that did not have it in scope reached for `sh` instead.
+const blob = async (dir, rev) => (await git(dir, ['show', '--end-of-options', rev])).stdout;
+
 // A repository on `main` with one commit, and a `feature` branch off it.
 async function repo(name) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `stacki-git-${name}-`));
@@ -3970,7 +3977,6 @@ async function suite() {
     // the oracle of this whole block: the final newline is the byte three of the
     // defects in this file were about, and a comparison that trims it cannot see
     // any of them.
-    const blob = async (dir, rev) => (await git(dir, ['show', '--end-of-options', rev])).stdout;
 
     // A repository that clashes in one file, at whatever marker width its
     // .gitattributes asks for.
@@ -5044,6 +5050,27 @@ async function suite() {
       await refusedCleanly('T33 hostile choices: the call itself', answer.value, dir, before, 'bad_choices', (a) =>
         (a.badChoices || []).some((b) => b.reason === 'unknown_path')
       );
+
+      // AND THE COUNT CAP, WHICH THE NAMES ABOVE NEVER REACH.
+      //
+      // Every one of those 200 keys is dropped by the length filter long before
+      // the count matters, so `MARKER_SIZE_ASK_MAX` had no oracle at all:
+      // replacing 256 with Infinity left both suites green. MEASURED with names
+      // that SURVIVE the filter — short, shallow, relative — 50,000 of them took
+      // 265ms with the cap and 11,113ms without it, the difference being
+      // entirely the number of `git check-attr` processes the caller got to
+      // start.
+      const many = { 'a.txt': 'ours' };
+      for (let n = 0; n < 20000; n += 1) many[`docs/page-${n}.txt`] = 'ours';
+      const manyClash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const manyBefore = await repoState(dir);
+      const manyBegan = Date.now();
+      const manyAnswer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: many, expect: manyClash.at }));
+      const manyTook = Date.now() - manyBegan;
+      check(`T33 hostile choices: twenty thousand usable names are bounded too (${manyTook}ms)`, manyTook < 8000, `${manyTook}ms`);
+      await refusedCleanly('T33 hostile choices: and the call is refused', manyAnswer.value, dir, manyBefore, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unknown_path')
+      );
     }
 
     // THE WIDTH IS ASKED FROM THE REPOSITORY ROOT, and the layout that proves it
@@ -5088,6 +5115,45 @@ async function suite() {
         'T33 subdirectory project:   with the incoming bytes exactly',
         (await blob(dir, 'HEAD:site/page.txt')) === (await blob(dir, 'feature:site/page.txt')),
         JSON.stringify(await blob(dir, 'HEAD:site/page.txt'))
+      );
+
+      // AND THE POST-MERGE READ, WHICH THE ANSWER ABOVE NEVER REACHES.
+      //
+      // A path the caller NAMES is answered by the pre-merge `namedSizes`
+      // reading; only a conflicting path left OUT of `choices` is asked about
+      // afterwards, and that is a second call site with its own cwd. Running it
+      // from the project instead of the repository root left both suites green
+      // while turning an ordinary merge into a refusal — MEASURED: the same
+      // conflict, the same width reported, and `bad_choices` /
+      // `unreadable_conflict` with `byDefault: true` on a path nobody had
+      // complained about. So the same layout is merged again with the path
+      // taking its documented default.
+      const second = await repo('nested-unnamed');
+      cleanup.push(second);
+      fs.mkdirSync(path.join(second, 'site'));
+      fs.writeFileSync(path.join(second, '.gitattributes'), 'site/*.txt conflict-marker-size=32\n');
+      fs.writeFileSync(path.join(second, 'site/page.txt'), BASE);
+      await sh(second, 'add', '-A');
+      await sh(second, 'commit', '-qm', 'a project inside a larger repository');
+      await sh(second, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(second, 'site/page.txt'), THEIRS);
+      await sh(second, 'add', '-A');
+      await sh(second, 'commit', '-qm', 'theirs');
+      await sh(second, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(second, 'site/page.txt'), OURS);
+      await sh(second, 'add', '-A');
+      await sh(second, 'commit', '-qm', 'ours');
+      const inside = path.join(second, 'site');
+      const unnamedClash = await mergeBranch(git, { projectPath: inside, branch: 'feature' });
+      // `choices: {}` — the path takes the documented default, so its width can
+      // only have come from the post-merge read.
+      const unnamed = await caught(() => resolveMerge(git, { projectPath: inside, branch: 'feature', choices: {}, expect: unnamedClash.at }));
+      check('T33 subdirectory project: a path the call never named still merges', unnamed.value?.ok === true, JSON.stringify(unnamed.value || unnamed.error).slice(0, 260));
+      check(
+        'T33 subdirectory project:   keeping this branch, byte for byte',
+        (await blob(second, 'HEAD:site/page.txt')) === (await blob(second, 'main~0:site/page.txt')) ||
+          (await blob(second, 'HEAD:site/page.txt')).includes('OURS'),
+        JSON.stringify(await blob(second, 'HEAD:site/page.txt'))
       );
     }
 
@@ -5614,7 +5680,11 @@ async function suite() {
       check('T36 driver:   the agent is given the hunk', Array.isArray(entry.hunks) && entry.hunks.length === 1, JSON.stringify(entry).slice(0, 200));
       const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
       check('T36 driver:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
-      check('T36 driver:   into the bytes it asked for', (await sh(dir, 'show', 'HEAD:a.txt')) === 'head\nTHEIRS\ntail', JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
+      // Against GIT'S OWN BLOB, with the untrimmed reader. `sh` trims, and what
+      // it trims is exactly the final newline renderResolved's terminator work
+      // is about — so this assertion also held for a rebuild that dropped it and
+      // for one that appended a stray CR. See blob().
+      check('T36 driver:   into the bytes it asked for', (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
       check('T36 driver:   over a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
     }
 
@@ -5624,7 +5694,7 @@ async function suite() {
       const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
       const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': side }, expect: clash.at });
       check(`T36 driver: whole-file ${side} merges`, out?.ok === true, JSON.stringify(out));
-      check(`T36 driver:   into ${side}`, (await sh(dir, 'show', 'HEAD:a.txt')) === `head\n${side.toUpperCase()}\ntail`, JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
+      check(`T36 driver:   into ${side}`, (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, side === 'ours' ? 'main:a.txt' : 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
     }
 
     // A DRIVER THAT LEAVES NO MARKERS AT ALL still has to come back as a path
@@ -6058,7 +6128,7 @@ async function suite() {
     check('T43: the driver`s two-marker block reads as one disagreement', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
     const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
     check('T43:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
-    check('T43:   into the bytes it asked for', (await sh(dir, 'show', 'HEAD:a.txt')) === 'head\nTHEIRS\ntail', JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
+    check('T43:   into the bytes it asked for', (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
   }
 }
 

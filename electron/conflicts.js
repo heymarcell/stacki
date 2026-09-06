@@ -312,11 +312,20 @@ const DEFAULT_MARKER_SIZE = 7;
 // accepted as a number but produces a conflicted path with no markers written
 // into it at all". It does not: re-measured on git 2.50.1 (Apple Git-155),
 // `=2147483647` and `=1073741824` both kill git with SIGBUS trying to allocate
-// the marker, and it leaves NO conflict behind — no unmerged path, no
-// MERGE_HEAD, the file untouched. Stacki then answers the unnamed `failed` with
-// git's own words, which is a git crash reported as a git crash. Nothing here
-// prevents it and nothing here should pretend to: the bound is about the width
-// git REFUSES, not about the width that kills it.
+// the marker, and it leaves no conflict behind — no unmerged path, no
+// MERGE_HEAD, the file untouched.
+//
+// IT DOES LEAVE ONE THING, and this enumeration used to omit the only piece of
+// it a person has to clear: git dies holding `.git/index.lock`, so the NEXT git
+// command in that repository — Stacki's or the user's own — fails with
+// "Another git process seems to be running" until the lock is removed by hand.
+// And git's stderr is EMPTY on SIGBUS, so the `failed` Stacki answers with
+// carries the runner's message rather than anything git said; "with git's own
+// words" was wrong about this one case.
+//
+// Nothing here prevents the crash and nothing here should pretend to: the bound
+// is about the width git REFUSES, not about the width that kills it. Saying
+// what it leaves behind is the part that was missing.
 const MAX_MARKER_SIZE = 2147483647;
 
 /** Git's own reading of the attribute: a positive integer it can use, or seven. */
@@ -339,10 +348,23 @@ function markersFor(size) {
   const cached = markerCache.get(n);
   if (cached) return cached;
   if (markerCache.size >= MARKER_CACHE_MAX) markerCache.clear();
-  // EXACTLY n of the character and no more. Without the negative lookahead a
-  // width-7 pattern matches the first seven characters of a width-32 marker and
-  // reads the remaining twenty-five as a label — which is the shape that
-  // committed bytes neither branch wrote. See above.
+  // EXACTLY n OF THE CHARACTER AND NO MORE — and the SEPARATOR is what
+  // enforces that, not the lookahead.
+  //
+  // This comment used to credit the lookahead, and that was true while the
+  // label separator was optional (` ?(.*?)`): a width-7 pattern then matched
+  // the first seven characters of a width-32 marker and read the remaining
+  // twenty-five as a label, which is the shape that committed bytes neither
+  // branch wrote. Making the separator MANDATORY closed it more thoroughly —
+  // at position n a longer run holds another marker character, which is neither
+  // a space nor a tab, so the match fails before the lookahead is consulted.
+  // MEASURED over 7,344 lines: the two patterns, with and without it, disagree
+  // nowhere.
+  //
+  // It stays as belt and braces behind a separator rule that could be relaxed
+  // again, and it is written down here as belt and braces rather than as the
+  // mechanism, so a reader auditing the width rule is pointed at the thing that
+  // actually does the work. See above.
   const run = (ch) => {
     const one = ch === '|' ? '\\|' : ch;
     return `${one}{${n}}(?!${one})`;
