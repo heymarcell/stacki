@@ -5528,12 +5528,29 @@ async function suite() {
         () => new Promise((done, fail) => execFile('mkfifo', [at('pipe')], (err) => (err ? fail(err) : done(true))))
       );
       if (made.error === null) {
-        const answered = await Promise.race([
-          Promise.resolve().then(() => ({ read: conflictText(dir, 'pipe') })),
-          new Promise((done) => setTimeout(() => done({ read: 'BLOCKED FOREVER' }), 10000)),
-        ]);
-        check('T35 fifo: the reader returns rather than blocking on the open', answered.read !== 'BLOCKED FOREVER', JSON.stringify(answered));
-        check('T35 fifo:   with no text — a pipe is not a file with no rules in it', answered.read === null, JSON.stringify(answered));
+        // IN A CHILD PROCESS, BECAUSE A HANG HERE IS THE THING BEING MEASURED.
+        //
+        // `conflictText` is SYNCHRONOUS. Racing it against a timer in this
+        // process cannot work: if it blocks, it blocks the event loop, and the
+        // timer that was supposed to notice never runs. MEASURED — the first
+        // version of this check did exactly that, and dropping O_NONBLOCK
+        // wedged the whole mutation matrix for two hours instead of turning one
+        // assertion red. A child with a kill timeout makes the hang observable:
+        // a clean exit is the answer, a signal is the failure.
+        const readInAChild = () =>
+          new Promise((done) => {
+            const child = execFile(
+              process.execPath,
+              ['-e', 'const {conflictText}=require(process.argv[1]);process.stdout.write(JSON.stringify({read:conflictText(process.argv[2],"pipe")}))',
+                path.join(__dirname, '..', 'electron', 'gitBranches.js'), dir],
+              { timeout: 10000, killSignal: 'SIGKILL' },
+              (err, stdout) => done(err && (err.killed || err.signal) ? { blocked: true } : { blocked: false, out: String(stdout || '') })
+            );
+            child.on('error', () => done({ blocked: false, out: '' }));
+          });
+        const answered = await readInAChild();
+        check('T35 fifo: the reader returns rather than blocking on the open', answered.blocked === false, JSON.stringify(answered));
+        check('T35 fifo:   with no text — a pipe is not a file with no rules in it', answered.out === '{"read":null}', JSON.stringify(answered));
         fs.rmSync(at('pipe'), { force: true });
       }
 
@@ -5542,12 +5559,9 @@ async function suite() {
       check('T35 directory: reads as no text', conflictText(dir, 'adir') === null);
 
       // A DEVICE. Reading /dev/zero never returns; the gate answers before the
-      // read is attempted.
-      const dev = await Promise.race([
-        Promise.resolve().then(() => ({ read: conflictText('/dev', 'zero') })),
-        new Promise((done) => setTimeout(() => done({ read: 'BLOCKED FOREVER' }), 10000)),
-      ]);
-      check('T35 device: reads as no text, and returns', dev.read === null, JSON.stringify(dev));
+      // read is attempted. Called directly — if the gate were gone this would
+      // hang, and the suite's own watchdog is what would say so.
+      check('T35 device: reads as no text, and returns', conflictText('/dev', 'zero') === null);
 
       // A PATH THAT IS NOT THERE.
       check('T35 missing: reads as no text', conflictText(dir, 'nothing-here.txt') === null);
