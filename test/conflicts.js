@@ -967,6 +967,59 @@ const conflicted = [
   check('  AND NOT ONE OF ITS LINES IS LOST', renderResolved(emptyParts) === emptyBlock, JSON.stringify(renderResolved(emptyParts)));
 }
 
+// --- NOTHING IS EVER SILENTLY DROPPED, over rather more inputs than one ------
+//
+// That promise is in parseConflict's own comment and it was FALSE: a block
+// whose two sides split into no disagreement had its opener, separator and
+// closer deleted, three lines at a time, and the file came back shorter than it
+// went in. One example is checked above; this is the property.
+//
+// The claim: whenever the parse finds NO disagreement in a file, the file
+// rebuilds byte for byte. (Where it does find one, the markers are removed on
+// purpose, so there is nothing to compare against.) Anything the parse declines
+// to read has to survive it intact, because that text is what a person is being
+// sent back to the project to finish by hand.
+//
+// Deterministic: a fixed generator, a fixed seed, the same inputs on every
+// machine and every run. It is a fuzz in shape only.
+{
+  let seed = 20260906;
+  const next = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const MARKER_CHARS = ['<', '=', '|', '>'];
+  let broken = 0;
+  let tried = 0;
+  let firstBad = null;
+  for (let i = 0; i < 4000; i++) {
+    const lines = [];
+    const howMany = 1 + Math.floor(next() * 8);
+    for (let line = 0; line < howMany; line++) {
+      const roll = next();
+      if (roll < 0.45) {
+        // A run of a marker character, of any width, with or without a label
+        // and with or without the carriage return a CRLF file carries.
+        const ch = MARKER_CHARS[Math.floor(next() * MARKER_CHARS.length)];
+        lines.push(ch.repeat(1 + Math.floor(next() * 10)) + (next() < 0.5 ? ' label' : '') + (next() < 0.2 ? '\r' : ''));
+      } else if (roll < 0.6) lines.push('');
+      else lines.push(`text${line}${next() < 0.2 ? '\r' : ''}`);
+    }
+    const text = lines.join('\n') + (next() < 0.5 ? '\n' : '');
+    for (const width of [3, 7, 32]) {
+      const parts = parseConflict(text, width);
+      if (clashCount(parts) !== 0) continue;
+      tried++;
+      if (renderResolved(parts) !== text) {
+        broken++;
+        if (!firstBad) firstBad = `${JSON.stringify(text)} at width ${width} -> ${JSON.stringify(renderResolved(parts))}`;
+      }
+    }
+  }
+  check(
+    `a parse that finds no disagreement rebuilds the file byte for byte (${tried} generated inputs)`,
+    broken === 0 && tried > 1000,
+    firstBad || `only ${tried} inputs reached the check`
+  );
+}
+
 if (failures.length) {
   console.error(`conflicts: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
   process.exit(1);
