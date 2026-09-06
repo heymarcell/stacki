@@ -299,18 +299,37 @@ function whoChanged(ours, theirs, base) {
 // itself does with an unset or unusable attribute.
 const DEFAULT_MARKER_SIZE = 7;
 
-/** Git's own reading of the attribute: a positive integer, or seven. */
-const markerWidth = (size) => (Number.isInteger(size) && size > 0 ? size : DEFAULT_MARKER_SIZE);
+// The largest width git itself will take. MEASURED: `conflict-marker-size=5000`
+// and `=100000` are both honoured — git writes a marker that many characters
+// wide — and `=2147483647` is accepted as a number but produces a conflicted
+// path with no markers written into it at all. Above that, at 4294967296 and at
+// twenty digits, git says `warning: invalid marker-size '...', expecting an
+// integer` and uses SEVEN. `check-attr` reports the raw string either way, so
+// reading it without this bound would take a width git had just refused, match
+// nothing against the seven-character markers it really wrote, and refuse an
+// entirely ordinary merge.
+const MAX_MARKER_SIZE = 2147483647;
+
+/** Git's own reading of the attribute: a positive integer it can use, or seven. */
+const markerWidth = (size) =>
+  Number.isInteger(size) && size > 0 && size <= MAX_MARKER_SIZE ? size : DEFAULT_MARKER_SIZE;
 
 // Compiled once per width. A merge touches one width almost always, and
 // rebuilding four regexes per file for the sake of it is the kind of cost that
 // only ever shows up on the conflict with three hundred files in it.
+//
+// Bounded, because the widths come from a file in the repository being merged
+// and a .gitattributes can name a different one for every path in it. This is a
+// convenience, not a store: past the bound it starts again rather than growing
+// for as long as the app is open.
+const MARKER_CACHE_MAX = 64;
 const markerCache = new Map();
 
 function markersFor(size) {
   const n = markerWidth(size);
   const cached = markerCache.get(n);
   if (cached) return cached;
+  if (markerCache.size >= MARKER_CACHE_MAX) markerCache.clear();
   // EXACTLY n of the character and no more. Without the negative lookahead a
   // width-7 pattern matches the first seven characters of a width-32 marker and
   // reads the remaining twenty-five as a label — which is the shape that
@@ -797,5 +816,6 @@ module.exports = {
   mergeInline,
   unreadMarkers,
   DEFAULT_MARKER_SIZE,
+  MAX_MARKER_SIZE,
   markerWidth,
 };

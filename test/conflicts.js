@@ -13,7 +13,17 @@
 // cannot understand must keep all of its lines rather than losing the parts it
 // failed to parse.
 
-const { parseConflict, renderResolved, clashCount, conflictAtEnd, threeWay, mergeInline, unreadMarkers } = require('../electron/conflicts.js');
+const {
+  parseConflict,
+  renderResolved,
+  clashCount,
+  conflictAtEnd,
+  threeWay,
+  mergeInline,
+  unreadMarkers,
+  markerWidth,
+  MAX_MARKER_SIZE,
+} = require('../electron/conflicts.js');
 const { guardSuite } = require('./support/suiteGuard.js');
 
 // "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
@@ -820,9 +830,24 @@ const conflicted = [
   check('and at its own width it is an ordinary conflict', clashCount(parseConflict(marked(3), 3)) === 1);
 
   // A width git would not have used falls back to seven, exactly as git does
-  // with an unset, zero, negative or non-integer attribute.
-  for (const bogus of [undefined, null, 0, -1, 2.5, '32', NaN]) {
-    check(`a marker size of ${JSON.stringify(bogus)} reads as git's default of seven`, clashCount(parseConflict(marked(7), bogus)) === 1, JSON.stringify(bogus));
+  // with an unset, zero, negative or non-integer attribute — and, MEASURED, with
+  // one too big for it to parse: at 4294967296 and at twenty digits git says
+  // `warning: invalid marker-size ... expecting an integer` and writes SEVEN.
+  // check-attr reports the raw string either way, so a reading without that
+  // bound would build a pattern nothing can match and refuse an ordinary merge.
+  for (const bogus of [undefined, null, 0, -1, 2.5, '32', NaN, Infinity, MAX_MARKER_SIZE + 1, 4294967296, Number('9'.repeat(20))]) {
+    check(`a marker size of ${String(bogus)} reads as git's default of seven`, clashCount(parseConflict(marked(7), bogus)) === 1, String(bogus));
+  }
+  // The largest width git does accept is still a width, not a fallback.
+  check('and the largest width git takes is used as given', markerWidth(MAX_MARKER_SIZE) === MAX_MARKER_SIZE);
+
+  // A WIDTH BIG ENOUGH TO BE A LINE OF ITS OWN. Git honours five thousand and a
+  // hundred thousand — measured, it really writes markers that long — so the
+  // parse has to as well rather than treating "large" as "wrong".
+  {
+    const parts = parseConflict(marked(5000), 5000);
+    check('a five-thousand-character marker is one disagreement', clashCount(parts) === 1, JSON.stringify(parts).slice(0, 200));
+    check('  with both sides read', parts.find((p) => p.kind === 'clash')?.theirs === 'THEIRS');
   }
 
   // AND THE TEXT THAT MUST NOT BE MISTAKEN FOR ONE. The backstop looks for a

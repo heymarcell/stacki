@@ -8,6 +8,7 @@ const {
   conflictAtEnd,
   unreadMarkers,
   DEFAULT_MARKER_SIZE,
+  markerWidth,
 } = require('./conflicts');
 
 // Merging a branch and deleting one.
@@ -444,17 +445,19 @@ async function conflictMarkerSizes(git, root, files) {
     const fields = String((await git(root, ['check-attr', '-z', 'conflict-marker-size', '--', ...batch])).stdout || '').split('\0');
     for (let at = 0; at + 2 < fields.length; at += 3) {
       const value = fields[at + 2];
-      const width = /^[0-9]+$/.test(value) ? Number(value) : 0;
       // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
-      // NOT HAVING ASKED. Git's own reading is that only a positive integer
-      // means anything — "unspecified", zero, a negative and a non-integer all
-      // fall back to seven, with a warning for the last — so those are recorded
-      // AS seven rather than left out. Absence from this map means one thing
-      // only: git could not be asked about that path. resolveMerge tells the two
-      // apart to decide whether it still needs a second, later reading, and a
-      // path whose attribute is simply unset would otherwise get one — which is
-      // the reading that is wrong when the merge is what sets the attribute.
-      sizes.set(fields[at], Number.isInteger(width) && width > 0 ? width : DEFAULT_MARKER_SIZE);
+      // NOT HAVING ASKED. Git's own reading is that only a usable positive
+      // integer means anything — "unspecified", zero, a negative, a non-integer
+      // and a number too big for it to parse all fall back to seven, with a
+      // warning for the last two — so those are recorded AS seven rather than
+      // left out. `markerWidth` is that reading, in one place, and the bound is
+      // measured rather than assumed; see MAX_MARKER_SIZE. Absence from this map
+      // means one thing only: git could not be asked about that path.
+      // resolveMerge tells the two apart to decide whether it still needs a
+      // second, later reading, and a path whose attribute is simply unset would
+      // otherwise get one — which is the reading that is wrong when the merge is
+      // what sets the attribute.
+      sizes.set(fields[at], markerWidth(/^[0-9]+$/.test(value) ? Number(value) : 0));
     }
   };
   for (let from = 0; from < list.length; from += MARKER_SIZE_BATCH) {
