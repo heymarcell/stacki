@@ -1016,6 +1016,72 @@ const conflicted = [
   check('  and it answers correctly: no block, so no unread marker', answer === false);
 }
 
+// --- a marker carries its label, and a bare run is content -------------------
+{
+  // GIT ALWAYS WRITES THE SEPARATING SPACE. Measured across `merge` in all three
+  // conflict styles, on a detached HEAD, and `git merge-file --diff3` with no
+  // `-L` at all and with three EMPTY `-L` labels: the opener, the ancestor line
+  // and the closer always carry it — `<<<<<<< ` even when the label is the empty
+  // string — and only the SEPARATOR is bare.
+  //
+  // The parse used to take the space as optional while `unreadMarkers` took it
+  // as required, and the permissive half was the one that cost a commit: a page
+  // documenting conflict markers with UNLABELLED ones had its bare `<<<<<<<`
+  // read as structure, invisible to the backstop, and answering it committed a
+  // file equal to neither branch.
+  const doc = ['Conflict markers look like this:', '', '<<<<<<<', 'your side', '=======', 'their side', '>>>>>>>', '', 'tail', ''].join('\n');
+  check('a bare opener is content, not structure', clashCount(parseConflict(doc)) === 0, JSON.stringify(parseConflict(doc)));
+  check('  so nothing calls it an unread marker either', unreadMarkers(parseConflict(doc)) === false);
+  check('  and the page rebuilds byte for byte', renderResolved(parseConflict(doc)) === doc, JSON.stringify(renderResolved(parseConflict(doc))));
+
+  // AND THE ONE WHERE THE OPENER ALONE DECIDES IT. The block above is bare at
+  // both ends, so requiring the space at the CLOSER is enough to keep it out of
+  // the parse — which is not a check on the opener at all. This one is bare only
+  // where it begins, which is the shape a page mixing the two writes, and the
+  // opener is the only thing standing between it and being read as a conflict.
+  const halfBare = ['prose', '<<<<<<<', 'your side', '=======', 'their side', '>>>>>>> other-branch', 'tail', ''].join('\n');
+  check('a bare opener with a labelled closer is content too', clashCount(parseConflict(halfBare)) === 0, JSON.stringify(parseConflict(halfBare)));
+  check('  and that page rebuilds byte for byte as well', renderResolved(parseConflict(halfBare)) === halfBare, JSON.stringify(renderResolved(parseConflict(halfBare))));
+
+  // The mirror image: a bare closer inside a side used to end git's real block
+  // early and render the ANCESTOR section into the file.
+  const bareCloser = ['a', '<<<<<<< HEAD', 'OURS', '>>>>>>>', 'MORE', '||||||| 1234567', 'BASE', '=======', 'THEIRS', '>>>>>>> f', 'z', ''].join('\n');
+  const bareParts = parseConflict(bareCloser);
+  const bareClash = bareParts.find((part) => part.kind === 'clash');
+  check('a bare closer does not end a block', clashCount(bareParts) === 1, JSON.stringify(bareParts));
+  check('  so this branch keeps both of its lines and the ancestor stays out', bareClash?.ours === 'OURS\n>>>>>>>\nMORE' && bareClash?.theirs === 'THEIRS', JSON.stringify(bareClash));
+
+  // And git's own labelled markers are still markers, label or empty label.
+  check('a labelled marker is still a marker', clashCount(parseConflict(['a', '<<<<<<< HEAD', 'O', '||||||| b', 'B', '=======', 'T', '>>>>>>> f'].join('\n'))) === 1);
+  check(
+    '  including the empty label git merge-file writes',
+    clashCount(parseConflict(['a', '<<<<<<< ', 'O', '||||||| ', 'B', '=======', 'T', '>>>>>>> '].join('\n'))) === 1
+  );
+}
+
+// --- how wide an unconsumed marker has to be to mean anything ----------------
+{
+  // The OPENER is looked for at the width in force and at any width from seven
+  // up: a width this was not given leaves one behind, and an opener is what
+  // begins a block, so an unconsumed one is the evidence worth casting wide for.
+  const wideOpener = ['a', `${'<'.repeat(9)} HEAD`, 'b', ''].join('\n');
+  check('an unconsumed opener wider than the width in force is still a marker', unreadMarkers(parseConflict(wideOpener), 7) === true);
+
+  // The CLOSER is looked for only at the width in force. Casting it as wide was
+  // a false refusal with nothing to buy it: MEASURED, a README banner reading
+  // `>>>>>>>> WARNING <<<<<<<<`, in text both branches are identical on, refused
+  // an otherwise perfectly parsed merge outright.
+  const banner = ['>>>>>>>> WARNING <<<<<<<<', '', 'Do not edit.', '<<<<<<< HEAD', 'O', '||||||| 1234567', 'B', '=======', 'T', '>>>>>>> f', ''].join('\n');
+  const bannerParts = parseConflict(banner, 7, true);
+  check('a banner of eight closers does not refuse the file', unreadMarkers(bannerParts, 7) === false, JSON.stringify(bannerParts).slice(0, 240));
+  check('  and the conflict beside it is read exactly', clashCount(bannerParts) === 1 && bannerParts.find((x) => x.kind === 'clash')?.theirs === 'T', JSON.stringify(bannerParts));
+
+  // The shape that IS evidence: git's own closer, left in agreed text because a
+  // LABELLED closer in somebody's source ended the block early.
+  const early = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'BASE', '=======', 'THEIRS', '>>>>>>> quoted in the text', 'MORE', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('git’s own closer left behind is still found', unreadMarkers(parseConflict(early, 7, true), 7) === true, JSON.stringify(parseConflict(early, 7, true)).slice(0, 240));
+}
+
 // --- one of each marker, and not two -----------------------------------------
 {
   // A SECOND SEPARATOR, which an ordinary repository produces on its own: the

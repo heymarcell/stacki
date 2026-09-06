@@ -349,15 +349,34 @@ function markersFor(size) {
   };
   const built = {
     size: n,
-    // ` ?(.*?)\r?$`: git writes "<<<<<<< HEAD", and a bare marker with no label
-    // is tolerated the way it always was. `\r?` so a CRLF file's terminator is
-    // part of the marker rather than part of the label.
-    START: new RegExp(`^${run('<')} ?(.*?)\\r?$`),
+    // `[ \t](.*?)\r?$`: THE SPACE IS REQUIRED, AND THAT IS THE WHOLE OF THE RULE.
+    //
+    // These used to read ` ?(.*?)` — the space optional — on the reasoning that
+    // "a bare marker with no label is tolerated the way it always was". Meanwhile
+    // `unreadMarkers`, the backstop whose one job is to notice when this parse is
+    // wrong, took the opposite reading and ignored bare runs. Both halves of one
+    // file cannot be right, and the permissive half was the one that cost a
+    // commit: MEASURED, a page documenting conflict markers with UNLABELLED ones
+    // — which is how a great deal of documentation writes them — had its bare
+    // `<<<<<<<` read as structure, and the block it opened was invisible to the
+    // backstop, so answering committed a file equal to neither branch. The
+    // mirror image, a bare `>>>>>>>` in one side closing git's real block early,
+    // rendered the ANCESTOR section into the file.
+    //
+    // Git settles it. MEASURED across `merge` in all three conflict styles, on a
+    // detached HEAD, and `git merge-file --diff3` both with no `-L` at all and
+    // with three EMPTY `-L` labels: the opener, the ancestor line and the closer
+    // ALWAYS carry the separating space — `<<<<<<< ` even when the label is the
+    // empty string — and the SEPARATOR is always bare. So a bare run of angle
+    // brackets or pipes is content, and is kept as content, which is the reading
+    // the backstop already had.
+    START: new RegExp(`^${run('<')}[ \\t](.*?)\\r?$`),
     // `\s*` matches '\r' as well as trailing spaces, which is how the separator
-    // survived CRLF before any of this was deliberate.
+    // survived CRLF before any of this was deliberate. This one IS bare: that is
+    // what git writes.
     MIDDLE: new RegExp(`^${run('=')}\\s*$`),
-    BASE: new RegExp(`^${run('|')} ?(.*?)\\r?$`), // only present under diff3 conflict style
-    END: new RegExp(`^${run('>')} ?(.*?)\\r?$`),
+    BASE: new RegExp(`^${run('|')}[ \\t](.*?)\\r?$`), // only present under diff3 conflict style
+    END: new RegExp(`^${run('>')}[ \\t](.*?)\\r?$`),
   };
   markerCache.set(n, built);
   return built;
@@ -883,9 +902,11 @@ const unreadMarkers = (parts, markerSize) => {
     // is what tells a marker from a rule somebody drew across the page. That
     // distinction was already the shipped one and is kept: a line of twenty '<'
     // and nothing else is not a conflict marker at any width.
-    if (ch === '=' || ch === '|') {
-      if (!/^\s*$/.test(rest) && ch === '=') return null;
-      if (ch === '|' && rest !== '' && rest !== '\r' && !/^[ \t]/.test(rest)) return null;
+    // The same reading `markersFor` takes, which is git's: an opener, an ancestor
+    // line and a closer carry a separating space; the separator is bare. Those
+    // two readings used to disagree, and the disagreement was the defect.
+    if (ch === '=') {
+      if (!/^\s*$/.test(rest)) return null;
     } else if (!/^[ \t]/.test(rest)) return null;
     return { ch, width: run[0].length };
   };
@@ -915,7 +936,21 @@ const unreadMarkers = (parts, markerSize) => {
       // which is git's default and every deliberate `conflict-marker-size`
       // above it. A refusal here is one Stacki can be wrong about safely; the
       // alternative was measured committing bytes neither branch wrote.
-      if ((ch === '<' || ch === '>') && (width === n || width >= 7)) return true;
+      // THE OPENER IS LOOKED FOR AT ANY WIDTH FROM SEVEN UP; THE CLOSER ONLY AT
+      // THE WIDTH IN FORCE.
+      //
+      // A width this was not given leaves BOTH behind, and the opener arm is
+      // enough to find it — an opener is what begins a block, so an unconsumed
+      // one is the stronger evidence and the one worth casting wide for. Casting
+      // the closer that wide was a false refusal with nothing to buy it:
+      // MEASURED, a README whose banner reads `>>>>>>>> WARNING <<<<<<<<`, in
+      // text both branches are identical on, refused an otherwise perfectly
+      // parsed merge outright — the hunk beside it was exactly right. The closer
+      // is still checked at the width in force, which is the shape that matters:
+      // git's own closer, left in the agreed text because a labelled closer in
+      // somebody's source ended the block early.
+      if (ch === '<' && (width === n || width >= 7)) return true;
+      if (ch === '>' && width === n) return true;
       // AND THE ONE SHAPE THOSE TWO CANNOT SEE. Every way of being handed the
       // wrong width ends in a refusal except one: a real width BELOW seven,
       // read as seven, leaves `<<< HEAD` where neither check above can find it.
