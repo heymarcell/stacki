@@ -602,6 +602,34 @@ async function measureOriginFence() {
         [...found].sort().join(', ')
       );
     }
+
+    // AND A SWEEP OF THE SOURCE CANNOT SEE A CODE THE SOURCE DOES NOT MINT.
+    //
+    // The checks above are source ⊆ guide, with the count taken from that same
+    // scan — so a code that reaches a client from somewhere OTHER than the four
+    // files swept is invisible to them, and the closed-set claim stayed green
+    // over two of them. MEASURED against the shipping stack: an ordinary
+    // `.git/hooks/pre-commit` that exits non-zero, and `commit.gpgsign` with a
+    // signing key git cannot use, both make git.resolve_merge answer `failed`
+    // with git's own words; a mistyped call answers `bad_arguments` at the
+    // schema layer. Neither is minted in gitBranches.js, the mapper, mergeBinding
+    // or refs.parse, and neither was in the twelve.
+    //
+    // So the guide no longer claims a closed set: it says twelve OF ITS OWN and
+    // names the surface-wide ones beside them. This is the check on that half.
+    for (const [code, why] of [
+      ['failed', 'git itself refusing — a pre-commit hook, a signing key'],
+      ['bad_arguments', 'the schema layer, before anything dispatches'],
+      ['permission_denied', 'the permission matrix'],
+      ['no_project', 'no project open'],
+    ]) {
+      check(`the guide names ${code}, which is not merge-specific but reaches this call — ${why}`, merge.includes(code), merge.slice(0, 200));
+    }
+    check(
+      'and it says the twelve are its OWN rather than all a client can get',
+      /twelve refusals of its own/i.test(merge),
+      merge.slice(merge.indexOf('refusals') - 60, merge.indexOf('refusals') + 80)
+    );
   }
 
   if (failures.length) {

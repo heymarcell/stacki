@@ -21,6 +21,7 @@ const {
   threeWay,
   mergeInline,
   unreadMarkers,
+  sidesHoldMarkers,
   markerWidth,
   MAX_MARKER_SIZE,
   MARKER_CACHE_MAX,
@@ -1082,6 +1083,36 @@ const conflicted = [
   check('git’s own closer left behind is still found', unreadMarkers(parseConflict(early, 7, true), 7) === true, JSON.stringify(parseConflict(early, 7, true)).slice(0, 240));
 }
 
+// --- the question no rule about the SHAPE of the markup can answer ----------
+{
+  // Five rules now keep a line of somebody's source out of git's markup: exact
+  // width, one opener, one separator, at most one ancestor line before it, and
+  // — under diff3 — an ancestor line at all. Each closed the shape in front of
+  // it and the next review found another. The last was an authored example
+  // written in the DIFF3 spelling: opener, ancestor line, separator, closer, one
+  // of each, in order, at the width in force. It passes all five.
+  //
+  // What closes it is not the shape but the PROVENANCE, and git holds that: the
+  // markers git writes are in no blob. A marker line present in either side's
+  // committed version is not one git wrote — and a file holding one cannot have
+  // its own markers told from git's at all.
+  const withMarker = 'A conflict looks like this:\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nEnd\n';
+  const diff3Marker = 'A diff3 conflict:\n<<<<<<< HEAD\nours\n||||||| base\nancestor\n=======\ntheirs\n>>>>>>> feature\nEnd\n';
+  const ordinary = 'An ordinary page about nothing in particular.\nEnd\n';
+  check('a side holding a default-style marker is seen', sidesHoldMarkers(7, withMarker, ordinary) === true);
+  check('a side holding a diff3-style marker is seen too', sidesHoldMarkers(7, ordinary, diff3Marker) === true);
+  check('  which is the shape five structural rules cannot tell from git’s', clashCount(parseConflict(diff3Marker, 7, true)) === 1, JSON.stringify(parseConflict(diff3Marker, 7, true)));
+  check('two ordinary sides are not', sidesHoldMarkers(7, ordinary, ordinary) === false);
+  check('  nor is a missing side', sidesHoldMarkers(7, null, undefined) === false);
+  // The same width rule the backstop uses: the width in force, or seven and up.
+  check('a marker at the width in force is seen', sidesHoldMarkers(3, 'a\n<<< HEAD\nb\n') === true);
+  check('  and one at seven or more whatever the width', sidesHoldMarkers(3, `a\n${'<'.repeat(9)} HEAD\nb\n`) === true);
+  // And the shapes that are NOT markers stay content, so this does not refuse
+  // an ordinary file: a bare run, and a rule of angle brackets.
+  check('a bare run in a side is not a marker', sidesHoldMarkers(7, 'a\n<<<<<<<\nb\n') === false);
+  check('  nor is a rule of angle brackets', sidesHoldMarkers(7, `a\n${'<'.repeat(20)}\nb\n`) === false);
+}
+
 // --- one of each marker, and not two -----------------------------------------
 {
   // A SECOND SEPARATOR, which an ordinary repository produces on its own: the
@@ -1270,6 +1301,57 @@ const conflicted = [
     withClashes > 200,
     `${withClashes} inputs parsed to a disagreement`
   );
+}
+
+// TWO ANCESTOR LINES, WHICH THE COMMENT ENUMERATES AND NOTHING CHECKED.
+//
+// The refusal condition lists "a second opener, a second separator or a second
+// ancestor line inside it". Every other clause in it kills a suite when it is
+// deleted; `bases.length > 1` did not, because both product call sites pass
+// `fromDiff3 = true` and the later `bases.length !== 1` clause subsumes it for
+// them. The clause is what protects a caller that does NOT say the markup came
+// from a diff3 merge — the reading a `merge=<driver>` path now gets — so it is
+// pinned here rather than deleted, at the flag where it is the only rule that
+// applies. This is the mirror of `twoSeparators` above.
+{
+  const twoAncestors = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '||||||| 7654321', 'Y', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('a block with two ancestor lines is not read, at the forgiving flag', clashCount(parseConflict(twoAncestors, 7, false)) === 0, JSON.stringify(parseConflict(twoAncestors, 7, false)));
+  check('  and says so', unreadMarkers(parseConflict(twoAncestors, 7, false), 7) === true);
+  check('  and its bytes come back exactly', renderResolved(parseConflict(twoAncestors, 7, false), []) === twoAncestors);
+  // THE CONTROL: one ancestor line at the same flag IS read, so the assertion
+  // above is about the second one and not about the flag.
+  const oneAncestor = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('  while one ancestor line at that flag still reads', clashCount(parseConflict(oneAncestor, 7, false)) === 1, JSON.stringify(parseConflict(oneAncestor, 7, false)));
+}
+
+// THE TERMINATOR ARM WITH NO ORACLE: neither side put anything at the end.
+//
+// renderResolved reads the final newline off the side the last clash was
+// answered with. When that answer contributes no lines at all there is no
+// version's terminator to take, and the rebuilt text is returned as it stands.
+// That arm was executed ZERO times by either suite, and a mutation dropping one
+// byte from it stayed green — in the one function whose whole promise is that
+// no byte changes that was not asked for.
+{
+  const bothEmpty = 'head\n<<<<<<< HEAD\n||||||| 123\nA\n=======\n>>>>>>> f\n';
+  const parts = parseConflict(bothEmpty, 7, true);
+  check('a clash where both sides are empty is read', clashCount(parts) === 1, JSON.stringify(parts));
+  check('  and it does run to the end of the file', conflictAtEnd(parts) === true);
+  // The arm is only REACHED when `sides` is given, which is what the product
+  // passes — so it is asked for the way the product asks. Both sides end
+  // without a terminator here, which is the only way to tell the arm apart from
+  // the ordinary reading: 'ours' and 'theirs' take that missing terminator and
+  // 'both', contributing neither side, has none to take and keeps git's.
+  const bare = { ours: 'head', theirs: 'head' };
+  check("  answering it 'both' keeps the newline git wrote", renderResolved(parts, ['both'], bare) === 'head\n', JSON.stringify(renderResolved(parts, ['both'], bare)));
+  check("  answering it 'ours' takes ours' missing terminator", renderResolved(parts, ['ours'], bare) === 'head', JSON.stringify(renderResolved(parts, ['ours'], bare)));
+  check("  answering it 'theirs' takes theirs'", renderResolved(parts, ['theirs'], bare) === 'head', JSON.stringify(renderResolved(parts, ['theirs'], bare)));
+  // AND THE CONTROL: with a terminator on both sides every answer keeps it, so
+  // the three assertions above are about the arm and not about the fixture.
+  const ended = { ours: 'head\n', theirs: 'head\n' };
+  for (const pick of ['both', 'ours', 'theirs']) {
+    check(`  with terminators on both sides, '${pick}' keeps one`, renderResolved(parts, [pick], ended) === 'head\n', JSON.stringify(renderResolved(parts, [pick], ended)));
+  }
 }
 
 if (failures.length) {

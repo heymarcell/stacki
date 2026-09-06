@@ -1646,12 +1646,51 @@ const git = {
           // At the width git wrote them, which travels on the file beside the
           // parts: this surface has no repository to ask and seven is only git's
           // default, not the only width it writes. See conflictMarkerSizes.
-          const unread = parts ? unreadMarkers(parts, f?.markerSize) : false;
-          const clashes = parts && !unread ? parts.filter((part) => part && part.kind === 'clash') : null;
+          //
+          // AND WHETHER EITHER SIDE HOLDS A MARKER OF ITS OWN, which travels on
+          // the file for the same reason the width does: this surface has no
+          // repository to ask. See sidesHoldMarkers in conflicts.js — a
+          // conflict-marker line present in either side's COMMITTED version is
+          // not one git wrote, and a file holding one cannot have its own markers
+          // told from git's by any rule about their shape.
+          const unread = parts ? unreadMarkers(parts, f?.markerSize) || f?.sidesHoldMarkers === true : false;
+          // AND NOT FOR A FILE OUTSIDE THE OPEN PROJECT.
+          //
+          // A clash carries `ours` and `theirs` — the disputed regions of both
+          // branches' versions of the file — and this sent them for every
+          // conflicting path, containment or not. The note beside it says the
+          // opposite: that a file whose `sourcePath` is null "can still be
+          // answered in `choices`, but not read through this surface". MEASURED,
+          // a project at <repo>/site with the clash in <repo>/deploy.env:
+          // `source.read("../deploy.env")` answered `outside_project`, and the
+          // same file's `API_TOKEN=` lines came back in this envelope, both
+          // sides, from the same call.
+          //
+          // So the boundary the rest of this surface enforces is enforced here
+          // too, by the containment test computed just below. Nothing is lost:
+          // such a path still takes a whole-file "ours" or "theirs".
+          //
+          // EMPTY, not null. `null` is reserved above for "there is no text to
+          // split and no `choices` value answers this path", which is false
+          // here: a whole-file "ours" or "theirs" works for a file outside the
+          // project exactly as it does for a binary one. `[]` is already the
+          // shape that means "no hunks are offered; send a whole-file word".
+          const inProject = sourcePathOf(f?.path) !== null;
+          const clashes = parts && !unread ? (inProject ? parts.filter((part) => part && part.kind === 'clash') : []) : null;
           const encoded = JSON.stringify(clashes ?? null);
           const bytes = Buffer.byteLength(encoded, 'utf8');
-          const fits = bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES;
-          if (fits) spent += bytes;
+          // A NULL HUNK LIST IS NOT A HUNK LIST THAT DID NOT FIT.
+          //
+          // `fits` charged the four bytes of the string "null" against the
+          // envelope budget like any other entry, so once the budget was nearly
+          // spent a path with NO SIDES AT ALL — both branches renaming the same
+          // file leaves only stage 1 under that name — came back
+          // `hunksOmitted: true`, and the note's remedy for THAT shape ("read the
+          // file yourself and send a whole-file word") is refused for it and
+          // names a file that is not in the working tree to read. MEASURED with
+          // three padding files summing to 23,997 of the 24,000 bytes.
+          const fits = clashes === null || (bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES);
+          if (fits && clashes !== null) spent += bytes;
           return {
             path: f?.path ?? null,
             sourcePath: sourcePathOf(f?.path),
@@ -1707,7 +1746,9 @@ const git = {
             'there was no text to split, which is what a path with no version of its own looks like (both ' +
             'branches renaming the same file leaves only the version the merge started from under that name). ' +
             'No `choices` value answers that one either. A file with `hunks: []` is splittable text with no ' +
-            'disagreement in it, or a binary file, and takes a whole-file word. Mind the two path spaces: ' +
+            'disagreement in it, a binary file, or one outside the open project — the hunks of a file this ' +
+            'surface will not let you read are not sent either — and each of those takes a whole-file word. ' +
+            'Mind the two path spaces: ' +
             '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
             '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
             'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +

@@ -7,6 +7,7 @@ const {
   clashCount,
   conflictAtEnd,
   unreadMarkers,
+  sidesHoldMarkers,
   DEFAULT_MARKER_SIZE,
   markerWidth,
 } = require('./conflicts');
@@ -289,6 +290,83 @@ async function repoRoot(git, projectPath) {
 const unreadable = (why) => `\0stacki:unreadable:${why || 'unknown'}\0`;
 
 /**
+ * The bytes of a conflicted path opened WITHOUT following a symlink, or null.
+ *
+ * `fs.readFileSync` and `fs.writeFileSync` follow links. Git reports a
+ * conflicted symlink as an ordinary unmerged path, so an add/add on a link
+ * whose two branches point somewhere different was read THROUGH: the hunks
+ * reported for the link were the TARGET file's, and answering them wrote the
+ * rebuild into a file this merge never touched — outside the repository, if
+ * that is where the link pointed. MEASURED, on a link to docs/notes.md: that
+ * untouched documentation file went from nine lines to three, `git status`
+ * came back " M docs/notes.md" after a merge that reported ok, and HEAD:link
+ * was still the OURS target although "theirs" had been asked for — because
+ * `git add -- link` stages the link, so the answer given for the link itself
+ * was discarded. O_NOFOLLOW is the only fix here that is not a TOCTOU race:
+ * an lstat and then an open is two different files if the link is made in
+ * between.
+ */
+function openNoFollow(at, file, flags) {
+  // O_NONBLOCK in the same breath: opening a FIFO for reading BLOCKS until
+  // somebody opens the other end, and this is holding the editor's git path
+  // while it does. `mkfifo site.css` in a project is the measurement
+  // whitespaceRules.js records for its own reader; a conflicted path is no
+  // safer, because what is at that path when this runs is whatever is on disk,
+  // not what git put there. With the flag the open returns at once and the
+  // fstat in conflictText answers "not a regular file" — which is the answer a
+  // FIFO should get. It costs a regular file nothing.
+  return fs.openSync(path.join(at, file), flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+}
+
+/**
+ * The marked-up text of a conflicted path, or null if it has none that can be
+ * taken apart into hunks and put back together.
+ *
+ * Null is not a new answer: it is the one this code already gives for a binary
+ * file or a path one side deleted. No hunks are offered for it, and a per-hunk
+ * answer for it is refused by name (`not_splittable`) rather than applied. The
+ * whole-file answers still work, because those are `git checkout --ours` and
+ * git does its own reading.
+ *
+ * TWO THINGS HAVE TO BE TRUE and neither was being checked.
+ *
+ * IT MUST BE THE FILE, NOT A ROUTE TO ONE — see openNoFollow. A directory or a
+ * device that git named gets the same answer, for the same reason.
+ *
+ * ITS BYTES MUST SURVIVE THE ROUND TRIP. Git calls a file text when it finds
+ * no NUL in the first 8000 bytes, so a Latin-1 or Windows-1252 page conflicts
+ * and gets marked up like any other, and this code then read it with
+ * `'utf8'` — a decoder that answers U+FFFD for every byte it cannot decode and
+ * never says it did. The rebuild wrote those replacements back, on lines
+ * IDENTICAL IN BOTH BRANCHES and outside git's markers. MEASURED:
+ * `<p>caf\xE9</p>` came back `<p>caf\xEF\xBF\xBD</p>` in a two-parent merge
+ * commit reported `{ok: true, changed: true, resolved: 1}` over a clean
+ * `git status` — exactly the "bytes NEITHER BRANCH EVER WROTE" this file's
+ * other comments are written to stop. Encoding the string back and comparing
+ * is exact, costs one buffer, and needs no encoding guessed at.
+ */
+function conflictText(at, file) {
+  let fd = null;
+  try {
+    fd = openNoFollow(at, file, fs.constants.O_RDONLY);
+    if (!fs.fstatSync(fd).isFile()) return null;
+    const bytes = fs.readFileSync(fd);
+    const text = bytes.toString('utf8');
+    return Buffer.compare(Buffer.from(text, 'utf8'), bytes) === 0 ? text : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* the read already answered; a failed close cannot change it */
+      }
+    }
+  }
+}
+
+/**
  * WHAT THE CONFLICT ACTUALLY IS, measured rather than argued from.
  *
  * The two commit SHAs either side of a merge are an argument: git is
@@ -319,10 +397,28 @@ function conflictDigest(at, files) {
     let bytes = null;
     let why = null;
     try {
-      bytes = fs.readFileSync(path.join(at, file));
+      // NOT `fs.readFileSync`, which follows symlinks: a conflicted link used
+      // to be digested as the bytes of whatever it pointed at, so the same
+      // link over two different targets was one measurement and a link and its
+      // target were another. A link's own content is its target string, which
+      // is what readlink returns. See openNoFollow.
+      let fd = null;
+      try {
+        fd = openNoFollow(at, file, fs.constants.O_RDONLY);
+        bytes = fs.readFileSync(fd);
+      } finally {
+        if (fd !== null) fs.closeSync(fd);
+      }
     } catch (err) {
-      bytes = null;
       why = err?.code || err?.errno || 'unknown';
+      bytes = null;
+      if (why === 'ELOOP') {
+        try {
+          bytes = Buffer.concat([Buffer.from(unreadable('symlink'), 'utf8'), fs.readlinkSync(path.join(at, file), 'buffer')]);
+        } catch {
+          bytes = null;
+        }
+      }
     }
     hash.update(bytes === null ? Buffer.from(unreadable(why), 'utf8') : bytes);
     hash.update('\0');
@@ -442,22 +538,62 @@ const MARKER_SIZE_ASK_MAX = 256;
 // The longest a name worth asking git about can be: git's own path limit, so
 // nothing a repository can really contain is dropped.
 const MAX_PATH_CHARS = 4096;
-// And the longest one worth REPEATING back. A refusal names the key so the
+// And how DEEP. `check-attr` walks every directory level of a name looking for a
+// `.gitattributes`, so the cost of a name is its depth, not its length: MEASURED,
+// 256 names of two thousand levels each — every one of them inside the caps
+// above — took ELEVEN SECONDS before a single key had been checked against the
+// conflicting set, and every one was then refused as `unknown_path`. No real
+// project path is anywhere near this deep.
+const MAX_PATH_SEGMENTS = 64;
+// The longest a name is worth REPEATING back. A refusal names the key so the
 // caller can find its mistake, and five hundred characters is far past any path
-// in an Astro project while keeping the answer smaller than the question. A
-// longer one is shown clipped, with its real length, which is what was wrong
-// with it.
+// in an Astro project. A longer one is shown clipped, with its real length,
+// which is what was wrong with it.
 const MAX_SHOWN_PATH_CHARS = 512;
+// And how many of them. See the count below: the clip alone did not keep the
+// answer smaller than the question, because the refusal echoes each name twice,
+// repeats the `expected` list on every entry, and goes out twice.
+const MAX_UNKNOWN_PATHS_SHOWN = 20;
 
-async function conflictMarkerSizes(git, root, files) {
+async function mergeAttributes(git, root, files) {
   const sizes = new Map();
+  // The paths git did NOT merge itself. See the `merge` branch below.
+  const driven = new Set();
   const list = (files || []).filter((file) => typeof file === 'string' && file);
   const ask = async (batch) => {
     // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
     // "unspecified" where the attribute is not set.
-    const fields = String((await git(root, ['check-attr', '-z', 'conflict-marker-size', '--', ...batch])).stdout || '').split('\0');
+    // BOTH ATTRIBUTES IN ONE INVOCATION. check-attr takes a list of them and
+    // answers a row per path per attribute in the same "<path>\0<attr>\0<value>\0"
+    // shape, so asking for the second one costs no extra process — which
+    // matters, because this runs once per batch of sixty-four conflicting
+    // paths and a merge can conflict in hundreds.
+    const fields = String((await git(root, ['check-attr', '-z', 'conflict-marker-size', 'merge', '--', ...batch])).stdout || '').split('\0');
     for (let at = 0; at + 2 < fields.length; at += 3) {
       const value = fields[at + 2];
+      if (fields[at + 1] === 'merge') {
+        // WHOSE MARKERS THESE ARE.
+        //
+        // `merge=<driver>` hands the path to a program of the project's own,
+        // and what comes back is that program's markup, not git's — so the one
+        // thing the diff3 reading is entitled to assume, that every block git
+        // writes carries an ancestor line, is not true of it. MEASURED: with
+        // `a.txt merge=twomark` and a driver that writes the ordinary
+        // two-marker block, a merge Stacki ran with
+        // `-c merge.conflictStyle=diff3` left exactly that on disk, the
+        // ancestor-line rule refused to read it, and EVERY answer for that path
+        // came back `unreadable_conflict` — including the whole-file "ours"
+        // that never touches the markup. Pre-PR the same bytes read as one
+        // hunk. Git can be asked which paths those are, so it is asked, rather
+        // than the assumption being loosened for every path to cover them.
+        //
+        // The four values that are not a driver name are git's own words for
+        // "nothing was said" and for the two built-in settings; `union` and
+        // `binary` are drivers as much as a project's own script is, and
+        // neither writes diff3 markup.
+        if (value && !['unspecified', 'unset', 'set', 'text'].includes(value)) driven.add(fields[at]);
+        continue;
+      }
       // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
       // NOT HAVING ASKED. Git's own reading is that only a usable positive
       // integer means anything — "unspecified", zero, a negative, a non-integer
@@ -501,7 +637,14 @@ async function conflictMarkerSizes(git, root, files) {
       }
     }
   }
-  return sizes;
+  return { sizes, driven };
+}
+
+/**
+ * The conflict-marker widths alone, for callers that want no more than that.
+ */
+async function conflictMarkerSizes(git, root, files) {
+  return (await mergeAttributes(git, root, files)).sizes;
 }
 
 /**
@@ -528,7 +671,15 @@ async function conflictMarkerSizes(git, root, files) {
  * refusal, which is the same shape from either caller because it is the same
  * fact about the same tree.
  */
-function unwindGuard(git, { projectPath, at, into, branch }) {
+function unwindGuard(git, { projectPath, at, into, branch, ran }) {
+  // WHAT THE MERGE THIS UNWOUND WAS FOR, in the caller's own words. Both
+  // callers run a trial merge, but only one of them was given answers to check:
+  // `mergeBranch` runs one because that is the only way to find out what
+  // conflicts, and its refusal used to tell a user who had asked to merge a
+  // branch that "the merge Stacki ran to check those answers" was stuck —
+  // answers nobody had given. A refusal that describes an act the reader did
+  // not perform is one they cannot act on.
+  const forWhat = ran || 'to check those answers';
 /**
  * Put the trial merge back, AND SAY SO WHEN IT WOULD NOT GO BACK.
  *
@@ -690,13 +841,13 @@ const abort = async () => {
     files,
     message:
       mid !== null
-        ? `Nothing of "${branch}" was committed, but the merge Stacki ran to check those answers could not be ` +
+        ? `Nothing of "${branch}" was committed, but the merge Stacki ran ${forWhat} could not be ` +
           `unwound${said ? ` — git said: ${said}` : ''}, so the project is still in the middle of it` +
           `${files.length ? ` and ${files.length} ${one ? 'file holds' : 'files hold'} conflict markers: ${list}` : ''}. ` +
           'Nothing else here can be trusted until that is cleared: run `git merge --abort` in the project (or ' +
           'finish the merge there by hand), then ask Stacki again.'
-        : `Nothing of "${branch}" was committed and "${into}" did not move, but the merge Stacki ran to check ` +
-          `those answers did not come back out of the working tree${said ? ` — git said: ${said}` : ''}: ` +
+        : `Nothing of "${branch}" was committed and "${into}" did not move, but the merge Stacki ran ${forWhat} ` +
+          `did not come back out of the working tree${said ? ` — git said: ${said}` : ''}: ` +
           `${files.length} ${one ? 'file is' : 'files are'} not as ${one ? 'it was' : 'they were'} before it ` +
           `ran — ${list}. ${one ? 'It may hold' : 'They may hold'} conflict markers, or bytes neither branch ` +
           'wrote. There is no merge left in progress, so `git merge --abort` will not clear this: look at ' +
@@ -834,7 +985,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       `"${branch}" was at ${short(bound.incoming)} and is now at ${short(incomingNow)}`
     );
   }
-  const guard = unwindGuard(git, { projectPath, at, into, branch });
+  const guard = unwindGuard(git, { projectPath, at, into, branch, ran: 'to check those answers' });
   const abort = guard.abort;
   let blocked = null;
   let clean = false;
@@ -863,10 +1014,14 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // only the first `MARKER_SIZE_ASK_MAX` of them. Anything dropped here is
   // asked about again after the merge against git's own list, where the worst
   // case is the refusal this guard exists to produce — never a wrong parse.
-  const askable = Object.keys(choices || {}).filter(
-    (key) => key.length <= MAX_PATH_CHARS && !key.includes('\0') && !path.isAbsolute(key) && !key.split('/').includes('..')
-  );
-  const namedSizes = await conflictMarkerSizes(git, at, askable.slice(0, MARKER_SIZE_ASK_MAX));
+  const askable = Object.keys(choices || {}).filter((key) => {
+    if (key.length > MAX_PATH_CHARS || key.includes('\0') || path.isAbsolute(key)) return false;
+    const segments = key.split('/');
+    // Depth as well as length: a name's cost to `check-attr` is the number of
+    // directory levels it walks looking for a `.gitattributes`, not its size.
+    return segments.length <= MAX_PATH_SEGMENTS && !segments.includes('..');
+  });
+  const { sizes: namedSizes, driven: namedDriven } = await mergeAttributes(git, at, askable.slice(0, MARKER_SIZE_ASK_MAX));
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
@@ -1096,8 +1251,12 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const conflicted = new Set(left);
   // The widths, with the pre-merge reading preferred over the post-merge one
   // wherever there is one. See conflictMarkerSizes and `namedSizes` above.
-  const markerSizes = await conflictMarkerSizes(git, at, left.filter((file) => !namedSizes.has(file)));
+  const { sizes: markerSizes, driven } = await mergeAttributes(git, at, left.filter((file) => !namedSizes.has(file)));
   for (const [file, width] of namedSizes) markerSizes.set(file, width);
+  // The same pre-merge preference for `merge=<driver>`, and for the same
+  // reason: the attribute git resolved this merge against is the one in the
+  // tree BEFORE it, which is the tree the unwind restored. See mergeAttributes.
+  for (const file of namedDriven) driven.add(file);
   // Parsed once and kept. The apply loop below reads the same answer rather
   // than opening the file a second time — and, more to the point, rather than
   // deciding a length against one parse and applying it against another.
@@ -1108,7 +1267,13 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     try {
       // `true`: this markup came from a merge run with `merge.conflictStyle=diff3`
       // — see the trial merge above — so its ancestor line is not optional.
-      parts = parseConflict(fs.readFileSync(path.join(at, file), 'utf8'), markerSizes.get(file), true);
+      // conflictText, not a bare utf8 read: a symlink must not be followed and
+      // bytes that do not survive the round trip have no text to split.
+      const text = conflictText(at, file);
+      // `!driven.has(file)`: the ancestor-line rule holds for markup GIT wrote,
+      // and a `merge=<driver>` path's markup is the driver's. See
+      // mergeAttributes.
+      parts = text === null ? null : parseConflict(text, markerSizes.get(file), !driven.has(file));
     } catch {
       // Binary, or one side deleted it: there is no marked-up text to split,
       // so the only answer this file can take is a whole-file one.
@@ -1235,6 +1400,20 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     ...(has.length ? { deletedBy: given } : {}),
     ...extra,
   });
+  // WHETHER EITHER SIDE OF A FILE HOLDS A CONFLICT MARKER OF ITS OWN. Asked
+  // once per path and only for the paths this loop reaches. See
+  // sidesHoldMarkers: git's markers are in no blob, so a marker line that IS in
+  // one means the markers in the working-tree file cannot be told from git's —
+  // and five rules about the SHAPE of the markup could not close that, because
+  // the shape is identical.
+  const ownMarkersCache = new Map();
+  const ownMarkers = async (file) => {
+    if (ownMarkersCache.has(file)) return ownMarkersCache.get(file);
+    const [ourSide, theirSide] = await Promise.all([stage(git, projectPath, 2, file), stage(git, projectPath, 3, file)]);
+    const held = sidesHoldMarkers(markerSizes.get(file), ourSide, theirSide);
+    ownMarkersCache.set(file, held);
+    return held;
+  };
   const unusable = [];
   // A NAME GIT NEVER SAID. Named first, because it is the failure that used to
   // be completely invisible: the file the caller meant is still down there
@@ -1248,9 +1427,31 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // is named at the length that shows what was wrong with it.
   const shown = (key) =>
     key.length <= MAX_SHOWN_PATH_CHARS ? key : `${key.slice(0, MAX_SHOWN_PATH_CHARS)}… (${key.length} characters)`;
+  // AND COUNTED RATHER THAN ALL LISTED, because the clip alone did not make the
+  // answer smaller than the question — which is what its comment claimed.
+  // MEASURED: 400 keys of exactly 512 characters, a 209 KB request, came back as
+  // 2.9 MB on the wire. Three things multiplied: `shown` is echoed twice per
+  // entry, the twenty-path `expected` list was copied into EVERY entry, and the
+  // envelope goes out twice (structuredContent and an indented text block). So a
+  // handful of these names are shown — enough to see the mistake — the rest are
+  // counted, and `expected` is not repeated for a name that was never a path.
+  let unknownKeys = 0;
   for (const key of Object.keys(choices || {})) {
     if (conflicted.has(key)) continue;
+    unknownKeys += 1;
+    if (unknownKeys > MAX_UNKNOWN_PATHS_SHOWN) continue;
     unusable.push({ path: shown(key), given: shown(key), reason: 'unknown_path', expected: conflictedList });
+  }
+  if (unknownKeys > MAX_UNKNOWN_PATHS_SHOWN) {
+    unusable.push({
+      path: null,
+      given: `${unknownKeys} keys`,
+      reason: 'unknown_path',
+      // The count is the finding; listing four hundred of somebody's generated
+      // names is not.
+      expected: conflictedList,
+      andMore: unknownKeys - MAX_UNKNOWN_PATHS_SHOWN,
+    });
   }
   for (const file of left) {
     const choice = choices?.[file];
@@ -1277,7 +1478,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // by name, for every answer alike — the deliberate "theirs" as much as the
     // silent default, because the caller who typed it was answering the same
     // false description of the file.
-    if (unreadMarkers(partsOf(file), markerSizes.get(file))) {
+    if (unreadMarkers(partsOf(file), markerSizes.get(file)) || (await ownMarkers(file))) {
       unusable.push({
         path: file,
         given:
@@ -1419,9 +1620,13 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // anything about it at all. See noSide.
     const also =
       first.reason === 'unreadable_conflict'
-        ? ` "${first.path}" still holds conflict markers Stacki could not read, so it was described as having ` +
-          'no disagreements when git says it has some. Nothing that could be sent for it would be answering ' +
-          'the real file. Finish that one in the project by hand.'
+        ? ` The merge git ran marked "${first.path}" up in a form Stacki could not read, so it would have been ` +
+          'described as having no disagreements when git says it has some. Nothing that could be sent for it ' +
+          'would be answering the real file. That merge has been unwound, so the file on disk is the one this ' +
+          'started from and holds no markers now — finish that one in the project by hand (`git merge ' +
+          `"${branch}"` + ' there and edit it), or, if the file has a line of its own shaped like a conflict ' +
+          'marker, widen the markers for it so the two cannot be confused: `' + `${first.path} conflict-marker-size=32` +
+          '` in .gitattributes.'
         : first.reason === 'no_such_side'
         ? ` "${first.path}" exists on only one branch here — the other deleted it — so it takes ` +
           `${(first.sides || []).map((side) => `"${side}"`).join(' or ')} and nothing else, ` +
@@ -1485,7 +1690,17 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
               'be settled without guessing.'
           );
         }
-        fs.writeFileSync(path.join(at, file), renderResolved(parts, choice, sides));
+        // O_NOFOLLOW on the write too. partsOf already refused a path that was
+        // a link when it was read, but a link put there in between would be
+        // followed by a bare writeFileSync — the same escape, through a race
+        // instead of a commit. O_TRUNC because the rebuild may be shorter.
+        let fd = null;
+        try {
+          fd = openNoFollow(at, file, fs.constants.O_WRONLY | fs.constants.O_TRUNC);
+          fs.writeFileSync(fd, renderResolved(parts, choice, sides));
+        } finally {
+          if (fd !== null) fs.closeSync(fd);
+        }
       } else {
         // One answer for the whole file. Defaults to keeping what is on this
         // branch: a missing choice must never silently prefer the incoming
@@ -1544,7 +1759,7 @@ async function mergeBranch(git, { projectPath, branch }) {
   // WHAT THE TREE LOOKED LIKE BEFORE GIT TOUCHED IT, so the unwind below can be
   // measured rather than asserted. See unwindGuard: this refusal's own sentence
   // says the project is exactly as it was, and until this it never checked.
-  const guard = unwindGuard(git, { projectPath, at: root, into, branch });
+  const guard = unwindGuard(git, { projectPath, at: root, into, branch, ran: 'to find out what conflicts' });
   guard.setBefore(await guard.treeNow());
   try {
     // --no-edit: a merge commit here must not open an editor nobody is sitting
@@ -1586,14 +1801,10 @@ async function mergeBranch(git, { projectPath, branch }) {
         // width to read them at is a question for the tree as it was BEFORE
         // this merge, and that tree does not exist again until the unwind. See
         // conflictMarkerSizes.
-        let text = null;
-        try {
-          text = fs.readFileSync(path.join(root, file), 'utf8');
-        } catch {
-          // A binary file, or one side deleted it: there is no marked-up text
-          // to read, and the choice is the whole file or nothing.
-          text = null;
-        }
+        // A binary file, one side deleted it, a symlink, or bytes that are not
+        // valid UTF-8: there is no marked-up text to read, and the choice is
+        // the whole file or nothing. See conflictText.
+        const text = conflictText(root, file);
         clashes.push({
           path: file,
           ours: await stage(git, projectPath, 2, file),
@@ -1639,7 +1850,7 @@ async function mergeBranch(git, { projectPath, branch }) {
       // adds, changes or conflicts in `.gitattributes` is asked about the
       // version git actually read rather than the one it just produced. See
       // conflictMarkerSizes, which has both measurements.
-      const markerSizes = await conflictMarkerSizes(git, root, files);
+      const { sizes: markerSizes, driven } = await mergeAttributes(git, root, files);
       for (const clash of clashes) {
         // WHICH WIDTH `parts` WAS READ AT, carried with them. The MCP git domain
         // asks `unreadMarkers` about these same parts on the way out and cannot
@@ -1647,10 +1858,19 @@ async function mergeBranch(git, { projectPath, branch }) {
         // file would have been checked against seven there and reported
         // `markersUnread: false` however the parse had gone.
         clash.markerSize = markerSizes.get(clash.path) ?? DEFAULT_MARKER_SIZE;
+        // AND WHETHER EITHER SIDE HOLDS A MARKER OF ITS OWN, which is the one
+        // question no rule about the shape of the markup can answer. See
+        // sidesHoldMarkers: git's markers are in no blob, so a marker line that
+        // IS in a blob means this file's markers cannot be told from git's.
+        clash.sidesHoldMarkers = sidesHoldMarkers(clash.markerSize, clash.ours, clash.theirs);
         // `true` for the same reason resolveMerge passes it: this markup came
         // from a `merge.conflictStyle=diff3` merge, and git writes the ancestor
         // line into every block of one. See parseConflict.
-        clash.parts = clash.text === null ? null : parseConflict(clash.text, clash.markerSize, true);
+        // `!driven.has(...)`: true for the same reason resolveMerge passes it,
+        // and false for the same paths — markup a `merge=<driver>` wrote is not
+        // git's diff3 output and carries no ancestor line. See mergeAttributes.
+        clash.parts =
+          clash.text === null ? null : parseConflict(clash.text, clash.markerSize, !driven.has(clash.path));
         // The raw marked-up bytes were a working value, not something to put on
         // the wire: the panel reads `ours`/`theirs`, the MCP envelope reads
         // `parts`, and nothing wants a third copy of the file.
@@ -1846,6 +2066,7 @@ module.exports = {
   // Exported for test/git-branches.js, which pins the per-name retry: a name git
   // will not answer for must not cost the names beside it their width.
   conflictMarkerSizes,
+  mergeAttributes,
   mergeBranch,
   deleteBranch,
   switchBranch,

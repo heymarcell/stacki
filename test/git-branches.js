@@ -32,7 +32,7 @@ const { guardSuite } = require('./support/suiteGuard.js');
 // The one reading of a parsed conflict T31 needs: whether the clash runs to the
 // end of the file, which is the only place the final newline is not in the
 // marked-up text.
-const { conflictAtEnd } = require('../electron/conflicts.js');
+const { conflictAtEnd, clashCount, unreadMarkers } = require('../electron/conflicts.js');
 // The project-relative resolver the rest of the MCP surface puts every path
 // through. T22 checks the git domain's `sourcePath` against IT rather than by
 // joining strings here: a spelling this file agrees with but resolveInProject
@@ -262,6 +262,12 @@ function bytesOf(dir) {
       if (entry.name === '.git') continue;
       const at = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) walk(at);
+      // A SYMLINK IS ITS TARGET STRING, not the bytes at the end of it.
+      // `readFileSync` follows links, so a dangling link threw ENOENT and took
+      // the whole oracle with it, and a link whose target changed hashed the
+      // same as long as the file it pointed at had not. Both matter here: T35
+      // is about conflicted links.
+      else if (entry.isSymbolicLink()) out[at] = `link:${fs.readlinkSync(path.join(dir, at))}`;
       else out[at] = crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, at))).digest('hex');
     }
   };
@@ -359,6 +365,26 @@ async function twoClashRepo(name) {
 // the temp directory, while `npm test` chained on with && and reported the
 // whole run green with 355 assertions that had never executed.
 const cleanup = [];
+
+// Two branches that both edit the same file, so git must merge them and will
+// conflict. Declared here because blocks throughout the suite build fixtures
+// with it; it needs nothing but repo(), sh() and cleanup.
+const collide = async (name, { base, ours, theirs }) => {
+  const dir = await repo(name);
+  cleanup.push(dir);
+  fs.writeFileSync(path.join(dir, 'a.txt'), base);
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'base');
+  await sh(dir, 'checkout', '-qb', 'feature');
+  fs.writeFileSync(path.join(dir, 'a.txt'), theirs);
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'theirs');
+  await sh(dir, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(dir, 'a.txt'), ours);
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'ours');
+  return dir;
+};
 const removeFixtures = () => {
   for (const dir of cleanup) fs.rmSync(dir, { recursive: true, force: true });
 };
@@ -1344,6 +1370,13 @@ async function suite() {
     await sh(up, 'init', '-q', '-b', 'main', '.');
     await sh(up, 'config', 'user.email', 'test@example.com');
     await sh(up, 'config', 'user.name', 'Test');
+    // Signing off for the same reason repo() does it: a developer with
+    // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+    // cannot commit here at all. This used to be on ONE of the seven builders
+    // in this file while the comment above repo() said it was on every fixture:
+    // the suite died with an UNCAUGHT throw at the first of the other six,
+    // before a single assertion printed.
+    await sh(up, 'config', 'commit.gpgsign', 'false');
     fs.writeFileSync(path.join(up, 'a.txt'), 'base\n');
     await sh(up, 'add', '-A');
     await sh(up, 'commit', '-qm', 'first');
@@ -1358,6 +1391,13 @@ async function suite() {
       await sh(dir, 'clone', '-q', up, '.');
       await sh(dir, 'config', 'user.email', 'test@example.com');
       await sh(dir, 'config', 'user.name', 'Test');
+      // Signing off for the same reason repo() does it: a developer with
+      // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+      // cannot commit here at all. This used to be on ONE of the seven builders
+      // in this file while the comment above repo() said it was on every fixture:
+      // the suite died with an UNCAUGHT throw at the first of the other six,
+      // before a single assertion printed.
+      await sh(dir, 'config', 'commit.gpgsign', 'false');
       await sh(dir, 'reset', '-q', '--hard', 'HEAD~1');
       return dir;
     };
@@ -1634,6 +1674,13 @@ async function suite() {
       await sh(root, 'init', '-q', '-b', 'main', '.');
       await sh(root, 'config', 'user.email', 'test@example.com');
       await sh(root, 'config', 'user.name', 'Test');
+      // Signing off for the same reason repo() does it: a developer with
+      // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+      // cannot commit here at all. This used to be on ONE of the seven builders
+      // in this file while the comment above repo() said it was on every fixture:
+      // the suite died with an UNCAUGHT throw at the first of the other six,
+      // before a single assertion printed.
+      await sh(root, 'config', 'commit.gpgsign', 'false');
       fs.mkdirSync(path.join(root, 'site'));
       fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'base\n');
       await sh(root, 'add', '-A');
@@ -2445,6 +2492,13 @@ async function suite() {
       await sh(root, 'init', '-q', '-b', 'main', '.');
       await sh(root, 'config', 'user.email', 'test@example.com');
       await sh(root, 'config', 'user.name', 'Test');
+      // Signing off for the same reason repo() does it: a developer with
+      // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+      // cannot commit here at all. This used to be on ONE of the seven builders
+      // in this file while the comment above repo() said it was on every fixture:
+      // the suite died with an UNCAUGHT throw at the first of the other six,
+      // before a single assertion printed.
+      await sh(root, 'config', 'commit.gpgsign', 'false');
       fs.mkdirSync(path.join(root, 'site'));
       fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'base\n');
       await sh(root, 'add', '-A');
@@ -2502,6 +2556,13 @@ async function suite() {
     await sh(both, 'init', '-q', '-b', 'main', '.');
     await sh(both, 'config', 'user.email', 'test@example.com');
     await sh(both, 'config', 'user.name', 'Test');
+    // Signing off for the same reason repo() does it: a developer with
+    // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+    // cannot commit here at all. This used to be on ONE of the seven builders
+    // in this file while the comment above repo() said it was on every fixture:
+    // the suite died with an UNCAUGHT throw at the first of the other six,
+    // before a single assertion printed.
+    await sh(both, 'config', 'commit.gpgsign', 'false');
     fs.mkdirSync(path.join(both, 'site'));
     fs.writeFileSync(path.join(both, 'x.txt'), 'base root\n');
     fs.writeFileSync(path.join(both, 'site', 'x.txt'), 'base site\n');
@@ -2694,6 +2755,13 @@ async function suite() {
     await sh(root, 'init', '-q', '-b', 'main', '.');
     await sh(root, 'config', 'user.email', 'test@example.com');
     await sh(root, 'config', 'user.name', 'Test');
+    // Signing off for the same reason repo() does it: a developer with
+    // `commit.gpgsign = true` set globally, and no key that signs headlessly,
+    // cannot commit here at all. This used to be on ONE of the seven builders
+    // in this file while the comment above repo() said it was on every fixture:
+    // the suite died with an UNCAUGHT throw at the first of the other six,
+    // before a single assertion printed.
+    await sh(root, 'config', 'commit.gpgsign', 'false');
     fs.mkdirSync(path.join(root, 'site'));
     fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'base\n');
     fs.writeFileSync(path.join(root, 'README.md'), 'base\n');
@@ -4244,6 +4312,260 @@ async function suite() {
       );
     }
 
+    // A CONFLICT EXAMPLE WRITTEN IN THE DIFF3 SPELLING — THE SIXTH INSTANCE OF
+    // ONE CLASS, AND THE FIRST ANSWER TO THE CLASS ITSELF.
+    //
+    // Five rules now keep a line of somebody's source out of git's markup:
+    // exact width, one opener, one separator, at most one ancestor line before
+    // it, and — under diff3 — an ancestor line at all. Each closed the shape in
+    // front of it and the next review found another. This is the shape all five
+    // pass: an authored example written in the DIFF3 spelling, with an opener,
+    // an ancestor line, a separator and a closer, one of each, in order, at the
+    // width in force. MEASURED before this: two hunks where git wrote one,
+    // `markersUnread` false, and answering them committed a file equal to
+    // neither branch under `{ok: true, resolved: 1}`.
+    //
+    // No rule about the SHAPE of the markup can close that, because the shape is
+    // identical — git has the same problem, which is why conflict-marker-size
+    // exists. What closes it is the PROVENANCE: git's markers are in no blob.
+    // See sidesHoldMarkers.
+    for (const spelling of [
+      {
+        key: 'default',
+        what: 'an example written in the default spelling',
+        prose: ['A conflict looks like this:', '<<<<<<< HEAD', 'ours', '=======', 'theirs', '>>>>>>> feature', ''].join('\n'),
+      },
+      {
+        key: 'diff3',
+        what: 'an example written in the diff3 spelling',
+        prose: ['A diff3 conflict:', '<<<<<<< HEAD', 'ours', '||||||| base', 'ancestor', '=======', 'theirs', '>>>>>>> feature', ''].join('\n'),
+      },
+    ]) {
+      const dir = await collide(`authored-${spelling.key}`, {
+        base: `${spelling.prose}Intro\nBASE\nEnd\n`,
+        ours: `${spelling.prose}Intro\nOURS\nEnd\n`,
+        theirs: `${spelling.prose}Intro\nTHEIRS\nEnd\n`,
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const file = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check(`T33 ${spelling.what}: the agent is told the markers went unread`, file.markersUnread === true && file.hunks === null, JSON.stringify(file));
+      const before = await repoState(dir);
+      for (const answer of [{ 'a.txt': 'ours' }, { 'a.txt': 'theirs' }, { 'a.txt': ['ours'] }, { 'a.txt': ['ours', 'ours'] }, {}]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: answer, expect: clash.at }));
+        await refusedCleanly(`T33 ${spelling.what}: ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+        );
+      }
+    }
+
+    // AND THE CONTROL THIS MUST NOT COST. An ordinary page — no marker-shaped
+    // line in either version — merges exactly as before. The rule above is about
+    // files that contain a conflict marker, which is a vanishingly small set and
+    // the one nobody can answer correctly anyway.
+    {
+      const dir = await collide('no-marker-text', {
+        base: 'An ordinary page about nothing in particular.\nIntro\nBASE\nEnd\n',
+        ours: 'An ordinary page about nothing in particular.\nIntro\nOURS\nEnd\n',
+        theirs: 'An ordinary page about nothing in particular.\nIntro\nTHEIRS\nEnd\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const file = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T33 no marker text: one hunk, markers read', file.markersUnread === false && (file.hunks || []).length === 1, JSON.stringify(file));
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      check('T33 no marker text: it merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T33 no marker text:   with the incoming bytes exactly',
+        (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')),
+        JSON.stringify(await blob(dir, 'HEAD:a.txt'))
+      );
+    }
+
+    // A NULL HUNK LIST IS NOT A HUNK LIST THAT DID NOT FIT.
+    //
+    // The envelope gives three readings for a file with no hunk list, each with
+    // a different remedy, and `hunksOmitted` is the field that separates two of
+    // them. It was computed from a `fits` that charged the four bytes of the
+    // string "null" against the envelope budget like any other entry — so once
+    // the budget was nearly spent, a path with NO SIDES AT ALL came back
+    // `hunksOmitted: true`, and the note's remedy for THAT shape is "read the
+    // file yourself and send a whole-file word": refused for such a path, and
+    // naming a file that is not in the working tree to read.
+    //
+    // Asked of the mapper directly, because the budget boundary is what the case
+    // is about and a real repository cannot be built to sit four bytes from it
+    // without encoding the mapper's own arithmetic into the fixture.
+    {
+      const bulky = (n) => ({
+        path: `pad${n}.txt`,
+        markerSize: 7,
+        ours: 'x',
+        theirs: 'y',
+        parts: [{ kind: 'clash', ours: 'O'.repeat(4000), theirs: 'T'.repeat(4000), oursLines: 1, theirsLines: 1, changedBy: 'both' }],
+      });
+      const raw = {
+        ok: false,
+        conflicted: true,
+        from: 'main',
+        branch: 'feature',
+        root: '/nowhere',
+        at: { head: 'a', incoming: 'b', digest: 'c', into: 'main' },
+        // Enough to spend the envelope budget, then a path with no text to
+        // split at all — `parts: null`, which is what both branches renaming the
+        // same file leaves behind.
+        files: [bulky(0), bulky(1), bulky(2), { path: 'orig.txt', markerSize: 7, ours: null, theirs: null, parts: null }],
+      };
+      const mapped = DOMAINS.git.merge.result(raw, { branch: 'feature' }, { root: '/nowhere', mergeRef: () => 'REF' });
+      const noSides = (mapped?.files || []).find((f) => f.path === 'orig.txt') || {};
+      check('T33 budget: a path with no text to split says so, whatever the budget', noSides.hunks === null && noSides.hunksOmitted === false, JSON.stringify(noSides));
+      // The control: a real hunk list DOES get omitted when the budget is spent,
+      // so the rule above is "null is not an omission" rather than "nothing is".
+      const omitted = (mapped?.files || []).filter((f) => f.hunksOmitted === true);
+      check('T33 budget:   while a hunk list too large for it is still omitted', omitted.length >= 1, JSON.stringify((mapped?.files || []).map((f) => [f.path, f.hunksOmitted])));
+    }
+
+    // A CONFLICTING FILE OUTSIDE THE OPEN PROJECT IS NOT READ THROUGH THIS
+    // SURFACE — WHICH IS WHAT THE ENVELOPE'S OWN NOTE SAYS, AND DID NOT DO.
+    //
+    // A clash carries `ours` and `theirs`: the disputed regions of BOTH
+    // branches' versions of the file. The mapper sent them for every conflicting
+    // path, containment or not, while its note said "`sourcePath` is null for a
+    // conflicting file outside the project altogether — that one can still be
+    // answered in `choices`, but not read through this surface". MEASURED, a
+    // project at <repo>/site with the clash in <repo>/deploy.env:
+    // `source.read("../deploy.env")` answered `outside_project`, and the same
+    // file's `API_TOKEN=` lines came back in the merge envelope, both sides,
+    // from the same call.
+    {
+      const dir = await repo('outside-project');
+      cleanup.push(dir);
+      fs.mkdirSync(path.join(dir, 'site'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'deploy.env'), 'API_TOKEN=BASE\n');
+      fs.writeFileSync(path.join(dir, 'site/page.txt'), 'a page\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'a secret above the project');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'deploy.env'), 'API_TOKEN=sk-live-THEIRS\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'deploy.env'), 'API_TOKEN=sk-live-OURS\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const project = path.join(dir, 'site');
+      const clash = await mergeBranch(git, { projectPath: project, branch: 'feature' });
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: project, mergeRef: () => 'REF' });
+      const outside = (mcp?.files || []).find((x) => x.path === 'deploy.env') || {};
+      check('T33 outside the project: the file is reported, and named as outside', outside.sourcePath === null, JSON.stringify(outside));
+      check('T33 outside the project:   with no hunks — nothing of it is read here', Array.isArray(outside.hunks) && outside.hunks.length === 0, JSON.stringify(outside));
+      check('T33 outside the project:   and not for size or for doubt', outside.hunksOmitted === false && outside.markersUnread === false, JSON.stringify(outside));
+      // THE ASSERTION THAT MATTERS. Neither branch's version of that file is
+      // anywhere in what the agent is handed.
+      check(
+        'T33 outside the project: neither side’s bytes are in the envelope at all',
+        !JSON.stringify(mcp).includes('sk-live'),
+        JSON.stringify(mcp).slice(0, 300)
+      );
+      // And nothing is lost: the note's remedy for a file with no hunks works.
+      const answer = await caught(() => resolveMerge(git, { projectPath: project, branch: 'feature', choices: { 'deploy.env': 'theirs' }, expect: clash.at }));
+      check('T33 outside the project: a whole-file answer still finishes the merge', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T33 outside the project:   with the incoming bytes exactly',
+        (await blob(dir, 'HEAD:deploy.env')) === (await blob(dir, 'feature:deploy.env')),
+        JSON.stringify(await blob(dir, 'HEAD:deploy.env'))
+      );
+      // The control: a file INSIDE the project is still described in full, so
+      // the rule above is containment rather than "never send hunks".
+      const inside = (mcp?.files || []).find((x) => x.path === 'site/page.txt');
+      check('T33 outside the project control: the merge really was about a path above the project', !inside, JSON.stringify((mcp?.files || []).map((x) => x.path)));
+    }
+
+    // A REFUSAL MUST NOT BE LARGER THAN THE CALL THAT PROVOKED IT, AND THE CLIP
+    // ALONE DID NOT DO IT.
+    //
+    // MEASURED after the clip was added: 400 keys of exactly 512 characters — a
+    // 209 KB request — came back as 2.9 MB on the wire. Three things multiplied:
+    // the name is echoed TWICE per entry (`path` and `given`), the twenty-path
+    // `expected` list was copied into EVERY entry, and the envelope goes out
+    // twice (structuredContent and an indented text block). So the names are
+    // counted rather than all listed.
+    {
+      const dir = await repo('bounded-refusal');
+      cleanup.push(dir);
+      const names = Array.from(
+        { length: 20 },
+        (unused, n) => `src/pages/a-fairly-long-astro-path-that-people-really-do-write/section-${n}/index.astro`
+      );
+      for (const name of names) {
+        fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+        fs.writeFileSync(path.join(dir, name), BASE);
+      }
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'twenty pages');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      for (const name of names) fs.writeFileSync(path.join(dir, name), THEIRS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      for (const name of names) fs.writeFileSync(path.join(dir, name), OURS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      const choices = {};
+      for (const name of names) choices[name] = 'ours';
+      for (let n = 0; n < 400; n += 1) choices[`${'k'.repeat(508)}${String(n).padStart(4, '0')}`] = 'ours';
+      const askedBytes = Buffer.byteLength(JSON.stringify(choices));
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices, expect: clash.at }));
+      const answerBytes = Buffer.byteLength(JSON.stringify(answer.value ?? answer.error ?? null));
+      check(
+        `T33 bounded refusal: the answer is smaller than the question (${answerBytes} vs ${askedBytes} bytes)`,
+        answerBytes < askedBytes,
+        `${answerBytes} vs ${askedBytes}`
+      );
+      check(
+        'T33 bounded refusal:   with the unusable names counted rather than all listed',
+        (answer.value?.badChoices || []).length <= 25,
+        String((answer.value?.badChoices || []).length)
+      );
+      // The count is the finding, so it has to be there.
+      check(
+        'T33 bounded refusal:   and the count of the rest is on the answer',
+        (answer.value?.badChoices || []).some((bad) => Number.isInteger(bad.andMore) && bad.andMore > 300),
+        JSON.stringify((answer.value?.badChoices || []).map((bad) => bad.andMore))
+      );
+      await refusedCleanly('T33 bounded refusal: the call itself', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unknown_path')
+      );
+    }
+
+    // AND HOW DEEP A NAME IS, NOT ONLY HOW LONG. `check-attr` walks every
+    // directory level of a name looking for a `.gitattributes`, so the cost of a
+    // name is its depth. MEASURED after the length and count caps were added:
+    // 256 names of two thousand levels each — every one inside those caps — took
+    // ELEVEN SECONDS before a single key had been checked against the conflicting
+    // set, and every one was then refused as `unknown_path` anyway.
+    {
+      const dir = await widthRepo('deep-keys', null, { base: BASE, ours: OURS, theirs: THEIRS });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      // SHORT SEGMENTS, so the LENGTH cap does not catch these and the DEPTH cap
+      // is what has to. The first version of this fixture used `d0/d1/.../d1999`
+      // — around ten thousand characters — which MAX_PATH_CHARS excluded on its
+      // own, so the check passed with the depth filter deleted.
+      const deep = Array.from({ length: 1800 }, () => 'a').join('/');
+      const choices = { 'a.txt': 'ours' };
+      for (let n = 0; n < 256; n += 1) choices[`${deep}/f${n}.txt`] = 'ours';
+      const began = Date.now();
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices, expect: clash.at }));
+      const took = Date.now() - began;
+      check(`T33 deep keys: answered in ${took}ms rather than eleven seconds`, took < 5000, `${took}ms`);
+      await refusedCleanly('T33 deep keys: the call itself', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unknown_path')
+      );
+    }
+
     // AND THE WIDTH IS READ PER PATH, FROM GIT, NOT ONCE FOR THE MERGE. Two
     // files in one conflict at two different widths — which is what a
     // .gitattributes with two lines in it produces, and what no single global
@@ -4454,22 +4776,6 @@ async function suite() {
     // structure cannot be decided from the text, and it is now kept whole and
     // refused rather than guessed at. The remedy for a project that hits this is
     // the attribute — which is the thing the rest of T32 is about.
-    const collide = async (name, { base, ours, theirs }) => {
-      const dir = await repo(name);
-      cleanup.push(dir);
-      fs.writeFileSync(path.join(dir, 'a.txt'), base);
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'base');
-      await sh(dir, 'checkout', '-qb', 'feature');
-      fs.writeFileSync(path.join(dir, 'a.txt'), theirs);
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'theirs');
-      await sh(dir, 'checkout', '-q', 'main');
-      fs.writeFileSync(path.join(dir, 'a.txt'), ours);
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'ours');
-      return dir;
-    };
 
     const colliding = [
       {
@@ -4863,6 +5169,449 @@ async function suite() {
     await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
   }
 
+
+  // T34b — AND THE CLAIM ABOVE repo() IS CHECKED RATHER THAN ASSERTED.
+  //
+  // "A developer with `commit.gpgsign = true` set globally would have every
+  // fixture in this file fail at its first commit" was written above ONE of the
+  // seven builders in this file and true of only that one, because this PR grew
+  // the file from one builder to seven and the line was copied nowhere.
+  // MEASURED on such a machine: an UNCAUGHT `gpg failed to sign the data` at the
+  // first unfixed builder, zero assertions printed, non-zero exit — the exact
+  // situation the comment says was removed. A count is what keeps the claim and
+  // the file together as more builders are added.
+  {
+    const own = fs.readFileSync(__filename, 'utf8');
+    const identities = (own.match(/'config', 'user\.name'/g) || []).length;
+    const unsigned = (own.match(/'config', 'commit\.gpgsign', 'false'/g) || []).length;
+    check(
+      'T34b: every fixture builder in this file turns commit signing off',
+      identities > 0 && identities === unsigned,
+      `${identities} builders, ${unsigned} of them unsigned`
+    );
+  }
+
+  // T35 — A PATH GIT SAYS IS CONFLICTED IS NOT AUTOMATICALLY A UTF-8 FILE
+  // SITTING AT THAT PATH.
+  //
+  // Two premises held everywhere hunks are built and applied, and neither was
+  // ever checked. Both were MEASURED to commit bytes neither branch wrote.
+  //
+  //   1. THE BYTES ARE UTF-8. Git calls a file text when it finds no NUL in
+  //      the first 8000 bytes, so a Latin-1 page conflicts and is marked up
+  //      like any other. The read was `fs.readFileSync(..., 'utf8')`, whose
+  //      decoder answers U+FFFD for every byte it cannot decode and never
+  //      says so, and the rebuild wrote the replacements back — on lines
+  //      IDENTICAL IN BOTH BRANCHES, outside git's markers. MEASURED:
+  //      `<p>caf\xE9</p>` came back `<p>caf\xEF\xBF\xBD</p>` in a two-parent
+  //      merge commit, `{ok: true, changed: true, resolved: 1}`, clean status.
+  //
+  //   2. THE PATH IS THE FILE. `readFileSync`/`writeFileSync` follow symlinks,
+  //      and git reports a conflicted link as an ordinary unmerged path. An
+  //      add/add on a link was read THROUGH: the hunks offered for the link
+  //      were the TARGET's, and answering them rewrote a file the merge never
+  //      touched. MEASURED: an untouched docs/notes.md cut from nine lines to
+  //      three, " M docs/notes.md" after a merge that reported ok, and
+  //      HEAD:link still the OURS target although "theirs" was asked for —
+  //      `git add -- link` stages the link, so the answer was discarded.
+  //
+  // The answer is one helper, conflictText: O_NOFOLLOW, must be a regular
+  // file, and the decoded string must encode back to the same bytes. It
+  // answers null, which is what this code already answers for a binary file —
+  // no hunks, whole-file only, and a per-hunk answer refused `not_splittable`.
+  // The whole-file answers keep working because those are `git checkout
+  // --ours`, where git does its own reading.
+  {
+    const latin1 = async (name) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      const head = Buffer.from('<p>caf\xE9</p>\n', 'latin1');
+      const put = (tail) => fs.writeFileSync(path.join(dir, 'page.html'), Buffer.concat([head, Buffer.from(tail)]));
+      put('<h1>BASE</h1>\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      put('<h1>MAIN</h1>\n');
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      put('<h1>FEATURE</h1>\n');
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      return dir;
+    };
+    // The suite's own `git` stringifies stdout, which is exactly the decode
+    // this block exists to catch — so the oracle reads bytes for itself.
+    const raw = (dir, rev) =>
+      new Promise((done, fail) =>
+        execFile('git', ['show', '--end-of-options', rev], { cwd: dir, encoding: 'buffer', maxBuffer: 1 << 26 }, (err, stdout) =>
+          err ? fail(err) : done(Buffer.from(stdout))
+        )
+      );
+
+    // THE FILE IS STILL REPORTED — it is conflicted and the agent has to hear
+    // about it — but with no hunk list, exactly like a binary file.
+    {
+      const dir = await latin1('latin1-report');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'page.html');
+      check('T35 latin-1: the conflicting page is reported', !!file, JSON.stringify((clash.files || []).map((f) => f.path)));
+      check('T35 latin-1:   with no text to split', file?.text === null || file?.text === undefined, JSON.stringify(String(file?.text).slice(0, 60)));
+      check('T35 latin-1:   and no hunks', clashCount(file?.parts || []) === 0, String(clashCount(file?.parts || [])));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const entry = (mcp?.files || []).find((f) => f.path === 'page.html') || {};
+      check('T35 latin-1:   the agent is told hunks are null, not an empty list', entry.hunks === null, JSON.stringify(entry));
+      check('T35 latin-1:   and not that they were dropped for size', entry.hunksOmitted === false, JSON.stringify(entry));
+    }
+
+    // A PER-HUNK ANSWER IS REFUSED BY NAME, and the refusal costs nothing.
+    {
+      const dir = await latin1('latin1-per-hunk');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      for (const answer of [['ours'], ['theirs'], ['ours', 'theirs'], ['merged']]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'page.html': answer }, expect: clash.at }));
+        await refusedCleanly(`T35 latin-1: per-hunk ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.path === 'page.html' && b.reason === 'not_splittable')
+        );
+      }
+    }
+
+    // AND THE WHOLE-FILE ANSWER IS BYTE-EXACT, BOTH DIRECTIONS. This is the
+    // answer the refusal above sends the caller to, so it had better be right:
+    // the high byte survives, the merge has two parents, and nothing is left
+    // over. Answered against `git show`, not against a string this test built.
+    for (const [side, rev] of [['ours', 'main:page.html'], ['theirs', 'feature:page.html']]) {
+      const dir = await latin1(`latin1-${side}`);
+      const want = await raw(dir, rev);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'page.html': side }, expect: clash.at });
+      const got = await raw(dir, 'HEAD:page.html');
+      check(`T35 latin-1: whole-file ${side} merges`, out?.ok === true, JSON.stringify(out));
+      check(`T35 latin-1:   the committed bytes are ${side}, exactly`, Buffer.compare(want, got) === 0, `${want.toString('hex')} vs ${got.toString('hex')}`);
+      check(`T35 latin-1:   the 0xE9 survived`, got.includes(0xe9) && !got.includes(Buffer.from([0xef, 0xbf, 0xbd])), got.toString('hex'));
+      const parents = (await sh(dir, 'rev-list', '--parents', '-n', '1', 'HEAD')).split(' ').length - 1;
+      check(`T35 latin-1:   as a merge with two parents`, parents === 2, String(parents));
+      check(`T35 latin-1:   over a clean tree`, (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+    }
+
+    // THE CONTROL THIS MUST NOT COST — a UTF-8 file with multibyte characters
+    // in it round-trips, so it still splits and still merges per hunk. Without
+    // this, "refuse anything with a high byte" would pass everything above.
+    {
+      const dir = await repo('utf8-multibyte');
+      cleanup.push(dir);
+      const put = (tail) => fs.writeFileSync(path.join(dir, 'a.txt'), `café ☕\n${tail}\n`);
+      put('BASE');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      put('OURS');
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      put('THEIRS');
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const hunks = clashCount(clash.files[0]?.parts || []);
+      check('T35 control: a multibyte UTF-8 file still splits', hunks === 1, String(hunks));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': Array(hunks).fill('ours') }, expect: clash.at });
+      const got = await raw(dir, 'HEAD:a.txt');
+      check('T35 control:   and merges per hunk', out?.ok === true && out.resolved === 1, JSON.stringify(out));
+      check('T35 control:   with its bytes intact', got.equals(Buffer.from('café ☕\nOURS\n', 'utf8')), got.toString('hex'));
+    }
+
+    // A CONFLICTED SYMLINK. Two branches point the same link somewhere
+    // different, and the one this branch points at is a documentation file
+    // that shows what a conflict looks like — which is what made the read
+    // through it produce hunks rather than nothing.
+    const linked = async (name, { ours, theirs }) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      fs.mkdirSync(path.join(dir, 'docs'));
+      fs.writeFileSync(
+        path.join(dir, 'docs', 'notes.md'),
+        'A conflict looks like:\n<<<<<<< HEAD\nours line\n||||||| base\nbase line\n=======\ntheirs line\n>>>>>>> other\nend\n'
+      );
+      fs.writeFileSync(path.join(dir, 'seed.txt'), 'x\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.symlinkSync(ours, path.join(dir, 'link'));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.symlinkSync(theirs, path.join(dir, 'link'));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      return dir;
+    };
+    const NOTES = 'A conflict looks like:\n<<<<<<< HEAD\nours line\n||||||| base\nbase line\n=======\ntheirs line\n>>>>>>> other\nend\n';
+
+    {
+      const dir = await linked('symlink-report', { ours: 'docs/notes.md', theirs: 'elsewhere' });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'link');
+      check('T35 symlink: the conflicting link is reported', !!file, JSON.stringify((clash.files || []).map((f) => f.path)));
+      check('T35 symlink:   with no hunks of the file it points at', clashCount(file?.parts || []) === 0, String(clashCount(file?.parts || [])));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const entry = (mcp?.files || []).find((f) => f.path === 'link') || {};
+      check('T35 symlink:   the agent is told hunks are null', entry.hunks === null, JSON.stringify(entry));
+      const before = await repoState(dir);
+      for (const answer of [['ours'], ['theirs']]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { link: answer }, expect: clash.at }));
+        await refusedCleanly(`T35 symlink: per-hunk ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.path === 'link' && b.reason === 'not_splittable')
+        );
+        check('T35 symlink:   and the file it points at is untouched', fs.readFileSync(path.join(dir, 'docs', 'notes.md'), 'utf8') === NOTES);
+      }
+    }
+
+    // THE WHOLE-FILE ANSWER FOR A LINK IS HONOURED — this is the one that used
+    // to be silently discarded, answering "ours" to a caller who asked for
+    // "theirs" under ok: true.
+    for (const side of ['ours', 'theirs']) {
+      const dir = await linked(`symlink-${side}`, { ours: 'docs/notes.md', theirs: 'elsewhere' });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { link: side }, expect: clash.at });
+      const target = (await sh(dir, 'show', 'HEAD:link')).trim();
+      check(`T35 symlink: whole-file ${side} merges`, out?.ok === true, JSON.stringify(out));
+      check(`T35 symlink:   and the committed link is the one asked for`, target === (side === 'ours' ? 'docs/notes.md' : 'elsewhere'), target);
+      check(`T35 symlink:   the working tree agrees with the commit`, (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+      check(`T35 symlink:   and the documentation file is byte-for-byte what it was`, fs.readFileSync(path.join(dir, 'docs', 'notes.md'), 'utf8') === NOTES);
+    }
+
+    // A LINK OUT OF THE REPOSITORY ENTIRELY. Nothing may be written through it
+    // — this is the containment half, and the file it points at is one this
+    // repository has no business touching at all.
+    {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-outside-'));
+      cleanup.push(outside);
+      const away = path.join(outside, 'notes.md');
+      fs.writeFileSync(away, NOTES);
+      const dir = await linked('symlink-escape', { ours: away, theirs: 'elsewhere' });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'link');
+      check('T35 escape: a link out of the repository offers no hunks', clashCount(file?.parts || []) === 0, String(clashCount(file?.parts || [])));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { link: ['theirs'] }, expect: clash.at }));
+      await refusedCleanly('T35 escape: per-hunk through a link that leaves the repository', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'link' && b.reason === 'not_splittable')
+      );
+      check('T35 escape:   and the file outside is byte-for-byte what it was', fs.readFileSync(away, 'utf8') === NOTES);
+      const ok = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { link: 'theirs' }, expect: clash.at });
+      check('T35 escape:   the whole-file answer still merges', ok?.ok === true, JSON.stringify(ok));
+      check('T35 escape:   and STILL did not write outside', fs.readFileSync(away, 'utf8') === NOTES);
+    }
+
+    // A FIFO AT A CONFLICTED PATH. What is on disk when the resolve runs is
+    // whatever is on disk, not what git put there — and opening a FIFO for
+    // reading BLOCKS until somebody opens the other end. Without O_NONBLOCK
+    // this held the editor's git path forever; whitespaceRules.js records the
+    // same measurement for its own reader (`mkfifo site.css`).
+    {
+      const dir = await collide('fifo-path', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T35 fifo: the fixture conflicts to begin with', clashCount((clash.files || [])[0]?.parts || []) === 1);
+      // Replace the marked-up file with a FIFO between the merge and the
+      // answer, which is the only window in which this can happen.
+      const at = path.join(dir, 'a.txt');
+      fs.rmSync(at, { force: true });
+      const made = await caught(() => new Promise((done, fail) => execFile('mkfifo', [at], (err) => (err ? fail(err) : done(true)))));
+      if (made.error === null) {
+        const answered = await Promise.race([
+          caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at })),
+          new Promise((done) => setTimeout(() => done({ error: null, value: { code: 'BLOCKED FOREVER' } }), 15000)),
+        ]);
+        check('T35 fifo: the resolve answers rather than blocking on the open', answered.value?.code !== 'BLOCKED FOREVER', JSON.stringify(answered.value).slice(0, 200));
+        check('T35 fifo:   and refuses, because a FIFO has no text to split', answered.value?.ok === false, JSON.stringify(answered.value).slice(0, 200));
+      }
+      fs.rmSync(at, { force: true });
+      await sh(dir, 'merge', '--abort').catch(() => {});
+      await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+    }
+
+    // THE DIGEST MEASURED THE WRONG FILE TOO. conflictDigest read through the
+    // link, so the same link over two different targets was one measurement —
+    // and `stale_merge` is the check that is supposed to notice the tree moved
+    // under an answer.
+    {
+      const one = await linked('symlink-digest-a', { ours: 'docs/notes.md', theirs: 'elsewhere' });
+      const two = await linked('symlink-digest-b', { ours: 'docs/notes.md', theirs: 'somewhere-else' });
+      const a = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+      const b = await mergeBranch(git, { projectPath: two, branch: 'feature' });
+      check('T35 digest: two links with different incoming targets are two conflicts', a.at !== b.at, `${a.at} vs ${b.at}`);
+    }
+  }
+
+  // T36 — MARKUP A `merge=<driver>` PATH CAME BACK WITH IS THE DRIVER'S, NOT
+  // GIT'S, AND THE ANCESTOR-LINE RULE DOES NOT HOLD FOR IT.
+  //
+  // The diff3 reading is entitled to one thing: Stacki merges with
+  // `-c merge.conflictStyle=diff3` and git writes the ancestor line into every
+  // block IT writes. A `merge=<driver>` attribute hands the path to a program
+  // of the project's own, and what comes back is that program's markup —
+  // possibly the ordinary two-marker block, possibly no markers at all.
+  //
+  // MEASURED before this: with `a.txt merge=twomark` and a driver that writes
+  // the two-marker block, a merge Stacki ran with diff3 left exactly that on
+  // disk, the ancestor-line rule refused to read it, `unreadMarkers` fired, and
+  // EVERY answer for the path came back `unreadable_conflict` — including the
+  // whole-file "ours" that never touches the markup. Pre-PR the same bytes read
+  // as one hunk, so the PR made such a repository unmergeable through Stacki.
+  //
+  // Git can be asked which paths those are (`check-attr merge`), so it is
+  // asked — attribute truth, not a loosened rule for every path. See
+  // mergeAttributes.
+  {
+    const driven = async (name, driver) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      await sh(dir, 'config', 'merge.twomark.name', 'a driver of the project`s own');
+      await sh(dir, 'config', 'merge.twomark.driver', driver);
+      fs.writeFileSync(path.join(dir, '.gitattributes'), 'a.txt merge=twomark\n');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nBASE\ntail\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nOURS\ntail\n');
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'head\nTHEIRS\ntail\n');
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      return dir;
+    };
+    const TWO_MARKER = 'printf "head\\n<<<<<<< ours\\nOURS\\n=======\\nTHEIRS\\n>>>>>>> theirs\\ntail\\n" > %A; exit 1';
+
+    // THE PREMISE, MEASURED FIRST: git really does leave a two-marker block
+    // here, out of a merge run with diff3. Without this the assertions below
+    // could be passing over a fixture whose driver never ran.
+    {
+      const dir = await driven('driver-premise', TWO_MARKER);
+      await git(dir, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-ff', '--no-commit', 'feature']).catch(() => {});
+      const wrote = fs.readFileSync(path.join(dir, 'a.txt'), 'utf8');
+      check('T36 premise: the driver ran and wrote its own markup', wrote.includes('<<<<<<< ours') && !wrote.includes('|||||||'), JSON.stringify(wrote));
+      check('T36 premise:   and git says the path has a driver', (await sh(dir, 'check-attr', 'merge', '--', 'a.txt')) === 'a.txt: merge: twomark', await sh(dir, 'check-attr', 'merge', '--', 'a.txt'));
+      await sh(dir, 'merge', '--abort').catch(() => {});
+    }
+
+    {
+      const dir = await driven('driver-reads', TWO_MARKER);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T36 driver: the two-marker block reads as one disagreement', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
+      check('T36 driver:   and is not reported as unreadable', unreadMarkers(file.parts || [], file.markerSize) === false);
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const entry = (mcp?.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T36 driver:   the agent is given the hunk', Array.isArray(entry.hunks) && entry.hunks.length === 1, JSON.stringify(entry).slice(0, 200));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
+      check('T36 driver:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
+      check('T36 driver:   into the bytes it asked for', (await sh(dir, 'show', 'HEAD:a.txt')) === 'head\nTHEIRS\ntail', JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
+      check('T36 driver:   over a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+    }
+
+    // THE WHOLE-FILE ANSWER TOO, both directions.
+    for (const side of ['ours', 'theirs']) {
+      const dir = await driven(`driver-${side}`, TWO_MARKER);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': side }, expect: clash.at });
+      check(`T36 driver: whole-file ${side} merges`, out?.ok === true, JSON.stringify(out));
+      check(`T36 driver:   into ${side}`, (await sh(dir, 'show', 'HEAD:a.txt')) === `head\n${side.toUpperCase()}\ntail`, JSON.stringify(await sh(dir, 'show', 'HEAD:a.txt')));
+    }
+
+    // A DRIVER THAT LEAVES NO MARKERS AT ALL still has to come back as a path
+    // with no hunks rather than as a misread one — this is the `union` shape,
+    // and it is why the rule keys on the attribute rather than on the markup.
+    {
+      const dir = await driven('driver-silent', 'printf "head\\nBOTH\\ntail\\n" > %A; exit 1');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T36 driver: markup with no markers offers no hunks', clashCount(file.parts || []) === 0, String(clashCount(file.parts || [])));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at }));
+      await refusedCleanly('T36 driver: a per-hunk answer for it', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'wrong_length')
+      );
+      const ok = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
+      check('T36 driver:   and the whole-file answer merges', ok?.ok === true, JSON.stringify(ok));
+    }
+
+    // THE CONTROL THIS MUST NOT COST. The ancestor-line rule still holds for
+    // every path git DID merge: a two-marker block on a path with no driver is
+    // still not something git wrote under diff3, and is still refused. Without
+    // this, "always read the forgiving way" passes every assertion above.
+    {
+      const dir = await collide('no-driver-two-marker', {
+        base: 'A conflict looks like this:\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nIntro\nBASE\nEnd\n',
+        ours: 'A conflict looks like this:\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nIntro\nOURS\nEnd\n',
+        theirs: 'A conflict looks like this:\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nIntro\nTHEIRS\nEnd\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const entry = (mcp?.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T36 control: an authored block on a path with no driver is still unreadable', entry.markersUnread === true && entry.hunks === null, JSON.stringify(entry).slice(0, 200));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T36 control: and every answer for it is refused', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
+
+      // AND THE REFUSAL SAYS TRUE THINGS ABOUT THE TREE IT LEFT. It used to say
+      // the file "still holds conflict markers", composed AFTER the unwind — so
+      // an agent sent to look at the file found the pre-merge bytes and a clean
+      // `git status`, and could reasonably conclude the conflict was gone.
+      const said = String(out.value?.message || '');
+      check('T36 refusal: does not claim the file still holds markers', !/still holds conflict markers/.test(said), said.slice(0, 300));
+      check('T36 refusal:   says the merge was unwound', /unwound/.test(said), said.slice(0, 400));
+      check('T36 refusal:   and names the way out', /conflict-marker-size/.test(said), said.slice(0, 500));
+      check('T36 refusal:   which the tree agrees with', (await sh(dir, 'status', '--porcelain')) === '' && !/^<<<<<<< HEAD$/m.test(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8').split('\n').slice(6).join('\n')));
+    }
+  }
+
+  // T37 — A REFUSAL MUST NOT DESCRIBE AN ACT THE READER DID NOT PERFORM.
+  //
+  // `unwindGuard` is shared by both callers, and its stuck-merge sentence said
+  // "the merge Stacki ran to check those answers" for both. mergeBranch is
+  // given no answers at all — somebody asked to merge a branch — so a user who
+  // hit a stuck unwind there was told about answers nobody had given.
+  {
+    const dir = await collide('stuck-wording', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
+    let aborts = 0;
+    const abortRefusingGit = async (cwd, args) => {
+      if (args[0] === 'merge' && args[1] === '--abort') {
+        aborts += 1;
+        fs.rmSync(path.join(dir, '.git', 'MERGE_HEAD'), { force: true });
+      }
+      return git(cwd, args);
+    };
+    const stuck = await caught(() => mergeBranch(abortRefusingGit, { projectPath: dir, branch: 'feature' }));
+    check('T37: a merge whose unwind fails refuses rather than throwing', stuck.error === null, String(stuck.error));
+    check('T37:   and the unwind really was attempted', aborts === 1, String(aborts));
+    check('T37:   as merge_stuck', stuck.value?.code === 'merge_stuck', JSON.stringify(stuck.value).slice(0, 200));
+    const said = String(stuck.value?.message || '');
+    check('T37:   without mentioning answers nobody gave', !/those answers/.test(said), said.slice(0, 400));
+    check('T37:   saying what the merge was for', /to find out what conflicts/.test(said), said.slice(0, 400));
+    // The resolve side keeps its own wording, which IS about answers.
+    await sh(dir, 'merge', '--abort').catch(() => {});
+    await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    let more = 0;
+    const alsoRefusing = async (cwd, args) => {
+      if (args[0] === 'merge' && args[1] === '--abort') {
+        more += 1;
+        fs.rmSync(path.join(dir, '.git', 'MERGE_HEAD'), { force: true });
+      }
+      return git(cwd, args);
+    };
+    const answered = await caught(() =>
+      resolveMerge(alsoRefusing, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'sideways' }, expect: clash.at })
+    );
+    check('T37: the resolve side still says its merge was to check the answers', /to check those answers/.test(String(answered.value?.message || '')), String(answered.value?.message || '').slice(0, 300));
+    await sh(dir, 'merge', '--abort').catch(() => {});
+    await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+  }
 }
 
 (async () => {

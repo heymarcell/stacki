@@ -503,8 +503,14 @@ function parseConflict(text, markerSize, fromDiff3 = false) {
     // text, where `unreadMarkers` finds the opener still sitting in them and
     // every caller downstream refuses the path by name rather than answering
     // for it.
-    // AND UNDER diff3, THE ANCESTOR LINE IS NOT OPTIONAL — WHICH IS WHAT TELLS
-    // GIT'S BLOCK FROM ONE SOMEBODY TYPED.
+    // AND UNDER diff3, THE ANCESTOR LINE IS NOT OPTIONAL — WHICH TELLS GIT'S
+    // BLOCK FROM ONE SOMEBODY TYPED IN THE DEFAULT SPELLING, AND ONLY THAT ONE.
+    //
+    // This comment used to claim the ancestor line tells git's block from any
+    // block somebody typed. It does not, and the next review said so: an
+    // authored example written in the DIFF3 spelling has an ancestor line too,
+    // and passes every rule in this function. What answers that is not the shape
+    // of the markup at all — see sidesHoldMarkers, which asks git instead.
     //
     // Counting the markers inside a block cannot see a block that is WELL
     // FORMED and simply is not git's. MEASURED, real git, a page whose prose
@@ -968,6 +974,54 @@ const unreadMarkers = (parts, markerSize) => {
   return false;
 };
 
+/**
+ * Whether either SIDE of this conflict contains a conflict-marker line of its
+ * own — in which case none of the markers in the file can be told from git's.
+ *
+ * THE SIXTH INSTANCE OF ONE CLASS, AND THE FIRST ANSWER TO THE CLASS ITSELF.
+ *
+ * Five separate rules now keep a line of somebody's source from being read as
+ * part of git's markup: exact width, one opener, one separator, at most one
+ * ancestor line before it, and — under diff3 — an ancestor line at all. Each
+ * closed the shape in front of it and the next round found another. The last was
+ * an authored example written in the DIFF3 spelling: opener, ancestor line,
+ * separator, closer, one of each, in order, at the width in force. It passes
+ * every one of the five. MEASURED, real git: two hunks reported where git wrote
+ * one, `markersUnread` false, and answering them committed a file equal to
+ * neither branch under `{ok: true, resolved: 1}`.
+ *
+ * No rule about the SHAPE of the text can close that, because the shape is
+ * identical — git has the same problem, which is why `conflict-marker-size`
+ * exists. What closes it is a fact about the text's PROVENANCE, and git holds
+ * it: THE MARKERS GIT WRITES ARE IN NO BLOB. They are the merge machinery's
+ * invention, added on the way to the working tree. So a marker line that is
+ * present in either side's committed version is not a marker git wrote — and a
+ * file holding one cannot have its own markers told apart from git's at all.
+ *
+ * The stages are already read for every conflicting path. This asks them.
+ *
+ * A safe refusal, and a narrow one: it costs a merge only for a file that both
+ * conflicts AND contains a conflict-marker line, which is the file nobody can
+ * answer correctly anyway. Everything else — the overwhelming ordinary case —
+ * is untouched, because an ordinary source file has no such line in it.
+ */
+const sidesHoldMarkers = (markerSize, ...sides) => {
+  const n = markerWidth(markerSize);
+  for (const side of sides) {
+    if (typeof side !== 'string' || !side) continue;
+    // The same reading `unreadMarkers` takes of an opener: the run at the width
+    // in force or at seven-or-more, and then the separating space git always
+    // writes. The closer is not asked for — an opener is what begins a block,
+    // and a file with one has already answered the question.
+    for (const line of side.split('\n')) {
+      const run = /^(<+)[ \t]/.exec(line);
+      if (!run) continue;
+      if (run[1].length === n || run[1].length >= 7) return true;
+    }
+  }
+  return false;
+};
+
 module.exports = {
   parseConflict,
   renderResolved,
@@ -977,6 +1031,7 @@ module.exports = {
   lineDiff,
   mergeInline,
   unreadMarkers,
+  sidesHoldMarkers,
   DEFAULT_MARKER_SIZE,
   MAX_MARKER_SIZE,
   MARKER_CACHE_MAX,

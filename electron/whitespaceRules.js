@@ -119,9 +119,29 @@ const MAX_MS = 2000;
 const MAX_FILES = 2000;
 const MAX_READ_MS = 2000;
 
+// A FILE THAT IS ITSELF A STYLESHEET, in every spelling Astro takes.
+//
+// This was `.css` alone, and the four preprocessor extensions Astro supports
+// natively were skipped — silently, which is the part that mattered: a skip is
+// not a failure, so `failed` stayed false, no ANY sentinel was added, and a
+// project whose only rule lived in `site.scss` answered with the EMPTY SET.
+// Empty is not "I could not tell"; it is the positive statement "nothing in
+// this project preserves whitespace", and it is the one answer that deletes
+// bytes the page shows. MEASURED: the same `.preserved { white-space: pre }`
+// rule and the same move, `site.css` -> "alpha\n      beta" preserved,
+// `site.scss` -> "alpha\n    beta", two rendered spaces gone under ok: true.
+//
+// postcss reads scss/less/pcss well enough to find the declarations; the
+// indented syntaxes (.sass, .styl) it will not parse at all, and that is
+// already handled — tokensInCss answers [ANY] for a text it cannot parse, so
+// those projects get the refusing answer instead of the empty one. Reading
+// them is what makes both outcomes possible; skipping them made only the wrong
+// one possible.
+const STYLESHEET = /\.(css|pcss|postcss|scss|sass|less|styl|stylus)$/i;
+
 // Every file whose text could hold a rule. Stylesheets, and the `<style>`
 // blocks of pages, layouts and components.
-const SOURCE_FILE = /\.(css|astro|svelte|vue|html)$/i;
+const SOURCE_FILE = /\.(css|pcss|postcss|scss|sass|less|styl|stylus|astro|svelte|vue|html)$/i;
 
 // THE THREE VALUES THAT RENDER DIFFERENTLY AFTER A REINDENT, AND THE THREE THAT
 // DO NOT. Measured in a real Blink window: with `pre`, `pre-wrap` and
@@ -324,7 +344,7 @@ function styleBlocksIn(text) {
 /**
  * The only parts of one file this scan actually looks at.
  *
- * A `.css` file IS the stylesheet; anything else contributes its `<style>`
+ * A stylesheet file IS the stylesheet; anything else contributes its `<style>`
  * blocks and nothing more. Said once, because the cache stamp below and the
  * reducer below that have to agree about it: while the stamp asked for the
  * `<style>` blocks of every file, a `.css` path handed in as `knownText` was
@@ -333,7 +353,7 @@ function styleBlocksIn(text) {
  * served the first answer for ever.
  */
 function readableTexts(abs, text) {
-  return /\.css$/i.test(abs) ? [text] : styleBlocksIn(text);
+  return STYLESHEET.test(abs) ? [text] : styleBlocksIn(text);
 }
 
 // A path that is not there is a fact about the project; anything else is a part
@@ -578,10 +598,27 @@ function knownMap(options) {
  * cannot be scanned at all.
  *
  * Never throws and never returns null: a caller that gets a set has an answer
- * it can act on, and the answer to "something went wrong" is the one that
- * refuses reindentation rather than the one that permits it.
+ * it can act on, and the answer to A SCAN THAT WENT WRONG — a directory it
+ * could not read, a stylesheet too big to parse, a file it does not know how to
+ * parse — is the one that refuses reindentation rather than the one that
+ * permits it.
+ *
+ * "No project to scan" is NOT one of those and is answered the other way, on
+ * purpose: see the first line of the function. A review read this paragraph as
+ * covering that case too, which it used to.
  */
 function preservingTokens(projectPath, options = {}) {
+  // NO PROJECT IS NOT A FAILED SCAN, AND THE TWO GET OPPOSITE ANSWERS.
+  //
+  // Everything below that cannot be read contributes ANY, which REFUSES
+  // reindentation. This line does the opposite deliberately: a caller with no
+  // project to scan has no project whose rules could be broken, and answering
+  // ANY here would switch the guard off for every such caller rather than
+  // narrowing anything. test/source-fidelity-matrix.js asserts it by name.
+  //
+  // A review read the docstring above as promising ANY here too, which is what
+  // that paragraph used to say; the paragraph is what was too broad, and it now
+  // says which "went wrong" it means.
   if (!projectPath || typeof projectPath !== 'string') return new Set();
   const known = knownMap(options);
   let scan;
