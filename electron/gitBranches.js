@@ -398,39 +398,85 @@ async function stage(git, projectPath, n, file) {
  * cwd, and `left` is spelled from the root. `-z` so the names come back
  * verbatim and match the ones asked about, byte for byte, whatever is in them.
  *
+ * AND IT IS ASKED IN THE STATE GIT MERGED UNDER, WHICH IS NOT THE STATE THE
+ * MERGE PRODUCES.
+ *
+ * `.gitattributes` is an ordinary tracked file, so a merge can ADD it, change it
+ * or conflict in it — and the file that decides the marker width is then one of
+ * the files the merge is rewriting. Git resolves attributes against the working
+ * tree as it stood BEFORE it wrote anything, so asking afterwards can answer
+ * about a file git never consulted. MEASURED, twice, both ways round:
+ *
+ *   The incoming branch ADDS `*.txt conflict-marker-size=32` and a.txt clashes.
+ *   Git wrote a.txt's markers SEVEN wide — it merged before that attribute
+ *   existed here — while check-attr, run while the merge was still in progress
+ *   and reading the .gitattributes git had just written, answered 32. An
+ *   ordinary merge of an ordinary branch, refused as unreadable.
+ *
+ *   `.gitattributes` itself conflicts, 32 on the ancestor, 40 on this branch and
+ *   12 on the incoming one. Git wrote a.txt's markers FORTY wide; check-attr
+ *   afterwards, reading the now marked-up .gitattributes off disk, answered 12.
+ *
+ * In both, the pre-merge working tree gives the width git used — seven and forty
+ * — so that is when this is asked. `mergeBranch` asks after its unwind, which
+ * restores exactly that state (`merge --abort` keeps uncommitted changes it did
+ * not touch, so a .gitattributes edited and not committed is still the one git
+ * read); `resolveMerge` asks before its trial merge, for the paths the caller
+ * named, and only falls back to a post-merge reading for a path it was not told
+ * about.
+ *
  * A path this cannot answer for is simply absent from the map, and every reader
  * falls back to git's own default of seven. That is deliberate: a repository
  * that will not answer a `check-attr` still has to be able to merge, and being
- * given the wrong width is not silent — it leaves the real markers unread in
- * the agreed text, where `unreadMarkers` finds them and the path is refused by
- * name. Wrong here costs a refusal, never a commit.
+ * given the wrong width is not silent — a marker of any other width matches
+ * nothing at the width in force, so it stays in the agreed text where
+ * `unreadMarkers` finds it and the path is refused by name. Wrong here costs a
+ * refusal, never a commit.
  */
 const MARKER_SIZE_BATCH = 64;
 
 async function conflictMarkerSizes(git, root, files) {
   const sizes = new Map();
   const list = (files || []).filter((file) => typeof file === 'string' && file);
+  const ask = async (batch) => {
+    // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
+    // "unspecified" where the attribute is not set.
+    const fields = String((await git(root, ['check-attr', '-z', 'conflict-marker-size', '--', ...batch])).stdout || '').split('\0');
+    for (let at = 0; at + 2 < fields.length; at += 3) {
+      const value = fields[at + 2];
+      const width = /^[0-9]+$/.test(value) ? Number(value) : 0;
+      // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
+      // NOT HAVING ASKED. Git's own reading is that only a positive integer
+      // means anything — "unspecified", zero, a negative and a non-integer all
+      // fall back to seven, with a warning for the last — so those are recorded
+      // AS seven rather than left out. Absence from this map means one thing
+      // only: git could not be asked about that path. resolveMerge tells the two
+      // apart to decide whether it still needs a second, later reading, and a
+      // path whose attribute is simply unset would otherwise get one — which is
+      // the reading that is wrong when the merge is what sets the attribute.
+      sizes.set(fields[at], Number.isInteger(width) && width > 0 ? width : DEFAULT_MARKER_SIZE);
+    }
+  };
   for (let from = 0; from < list.length; from += MARKER_SIZE_BATCH) {
     // Batched because a merge can conflict in hundreds of paths and a command
     // line has a length. Nothing here depends on the batches agreeing.
     const batch = list.slice(from, from + MARKER_SIZE_BATCH);
-    let out = '';
     try {
-      out = (await git(root, ['check-attr', '-z', 'conflict-marker-size', '--', ...batch])).stdout;
+      await ask(batch);
     } catch {
-      continue; // this batch keeps git's default; see above
-    }
-    // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
-    // "unspecified" where the attribute is not set.
-    const fields = String(out || '').split('\0');
-    for (let at = 0; at + 2 < fields.length; at += 3) {
-      const value = fields[at + 2];
-      // Git's own reading: only a positive integer means anything. It warns and
-      // falls back to seven for everything else, and so does this by leaving
-      // the path out of the map.
-      if (!/^[0-9]+$/.test(value)) continue;
-      const width = Number(value);
-      if (Number.isInteger(width) && width > 0) sizes.set(fields[at], width);
+      // ONE UNUSABLE NAME MUST NOT COST THE OTHERS THEIR ANSWER. check-attr dies
+      // on the whole invocation for a path outside the repository — MEASURED:
+      // `check-attr ... -- a.txt ../outside` exits 128 having printed a.txt's
+      // row, so a caller that put one bad name in `choices` would silently take
+      // the default width for every real conflict in the same batch. Asked one
+      // at a time, the bad name costs only itself.
+      for (const one of batch) {
+        try {
+          await ask([one]);
+        } catch {
+          /* this path keeps git's default; see above */
+        }
+      }
     }
   }
   return sizes;
@@ -735,6 +781,14 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // the instant before git touched it, and taken on every path that runs a
   // trial merge rather than only on the ones that expect to unwind.
   treeBefore = await treeNow();
+  // HOW WIDE GIT WRITES THE MARKERS FOR THE PATHS THIS CALL IS ABOUT, asked
+  // BEFORE the trial merge — because a merge that rewrites `.gitattributes`
+  // rewrites the answer, and the answer that matters is the one git itself
+  // reads, which is this one. Only the paths the caller named can be asked for
+  // here; anything else git turns out to have conflicted is asked about
+  // afterwards, below, where the worst case is the refusal this whole guard
+  // exists to produce. See conflictMarkerSizes.
+  const namedSizes = await conflictMarkerSizes(git, at, Object.keys(choices || {}));
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
@@ -962,11 +1016,10 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const WHOLE_FILE = new Set(['ours', 'theirs']);
   const PER_HUNK = new Set(['ours', 'theirs', 'both', 'merged']);
   const conflicted = new Set(left);
-  // HOW WIDE GIT WROTE THE MARKERS, per path, before anything reads one. The
-  // trial merge above is the one whose output these answers are applied to, so
-  // this is asked after it and about the same working tree. See
-  // conflictMarkerSizes.
-  const markerSizes = await conflictMarkerSizes(git, at, left);
+  // The widths, with the pre-merge reading preferred over the post-merge one
+  // wherever there is one. See conflictMarkerSizes and `namedSizes` above.
+  const markerSizes = await conflictMarkerSizes(git, at, left.filter((file) => !namedSizes.has(file)));
+  for (const [file, width] of namedSizes) markerSizes.set(file, width);
   // Parsed once and kept. The apply loop below reads the same answer rather
   // than opening the file a second time — and, more to the point, rather than
   // deciding a length against one parse and applying it against another.
@@ -1429,9 +1482,6 @@ async function mergeBranch(git, { projectPath, branch }) {
       // sending someone to a terminal, which for most of the people this
       // editor is for is the same as refusing.
       const clashes = [];
-      // The widths git used, asked while the merge is still in progress and so
-      // about the attributes it actually merged under. See conflictMarkerSizes.
-      const markerSizes = await conflictMarkerSizes(git, root, files);
       for (const file of files) {
         // The file as git left it, both versions in it and marked. Parsing
         // that rather than diffing the two sides here means the three-way
@@ -1439,25 +1489,23 @@ async function mergeBranch(git, { projectPath, branch }) {
         // and each disagreement comes back separately, so a page whose heading
         // should come from one branch and whose footer should come from the
         // other can say so.
-        let parts = null;
+        // The marked-up bytes, kept and parsed below rather than here: the
+        // width to read them at is a question for the tree as it was BEFORE
+        // this merge, and that tree does not exist again until the unwind. See
+        // conflictMarkerSizes.
+        let text = null;
         try {
-          parts = parseConflict(fs.readFileSync(path.join(root, file), 'utf8'), markerSizes.get(file));
+          text = fs.readFileSync(path.join(root, file), 'utf8');
         } catch {
           // A binary file, or one side deleted it: there is no marked-up text
           // to read, and the choice is the whole file or nothing.
-          parts = null;
+          text = null;
         }
         clashes.push({
           path: file,
           ours: await stage(git, projectPath, 2, file),
           theirs: await stage(git, projectPath, 3, file),
-          parts,
-          // WHICH WIDTH `parts` WAS READ AT, carried with them. The MCP git
-          // domain asks `unreadMarkers` about these same parts on the way out
-          // and cannot re-derive the width — it has no repository to ask — so a
-          // custom-width file would have been checked against seven there and
-          // reported `markersUnread: false` however the parse had gone.
-          markerSize: markerSizes.get(file) ?? DEFAULT_MARKER_SIZE,
+          text,
         });
       }
       // WHICH CONFLICT THIS IS. Computed here, while the marked-up files are
@@ -1484,6 +1532,27 @@ async function mergeBranch(git, { projectPath, branch }) {
         await git(projectPath, ['merge', '--abort']);
       } catch {
         /* already unwound */
+      }
+      // AND ONLY NOW, HOW WIDE GIT WROTE THOSE MARKERS.
+      //
+      // The unwind put the working tree back exactly as it was before the merge,
+      // which is the state git resolved attributes against — so a merge that
+      // adds, changes or conflicts in `.gitattributes` is asked about the
+      // version git actually read rather than the one it just produced. See
+      // conflictMarkerSizes, which has both measurements.
+      const markerSizes = await conflictMarkerSizes(git, root, files);
+      for (const clash of clashes) {
+        // WHICH WIDTH `parts` WAS READ AT, carried with them. The MCP git domain
+        // asks `unreadMarkers` about these same parts on the way out and cannot
+        // re-derive the width — it has no repository to ask — so a custom-width
+        // file would have been checked against seven there and reported
+        // `markersUnread: false` however the parse had gone.
+        clash.markerSize = markerSizes.get(clash.path) ?? DEFAULT_MARKER_SIZE;
+        clash.parts = clash.text === null ? null : parseConflict(clash.text, clash.markerSize);
+        // The raw marked-up bytes were a working value, not something to put on
+        // the wire: the panel reads `ours`/`theirs`, the MCP envelope reads
+        // `parts`, and nothing wants a third copy of the file.
+        delete clash.text;
       }
       // WHICH PATH SPACE THOSE `path`s ARE IN, said rather than left to be
       // worked out. Every `path` above is repo-root-relative, and the project

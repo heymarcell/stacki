@@ -901,6 +901,22 @@ const conflicted = [
   }
 }
 
+// --- the width matters to the BACKSTOP too, not only to the parse ------------
+//
+// Two of the three things `unreadMarkers` looks for need no width: a run of
+// seven or more, and a complete block at any of the widths below seven. The
+// third does, and it is the shape neither of the others can see — a marker
+// narrower than seven that is NOT part of a complete block, which is what a
+// person's own text or a half-edited file leaves behind in a repository that
+// sets a small conflict-marker-size. Asked at the wrong width it is invisible.
+{
+  const text = ['head', '<<< HEAD', 'OURS', '||| 1234567', 'BASE', '===', 'THEIRS', '>>> feature', 'tail', '<<< see the docs', 'end', ''].join('\n');
+  const parts = parseConflict(text, 3);
+  check('the real 3-wide conflict is still read', clashCount(parts) === 1, JSON.stringify(parts));
+  check('  and the lone 3-wide opener after it is reported unread', unreadMarkers(parts, 3) === true, JSON.stringify(parts));
+  check('  which asking at git’s default width cannot see', unreadMarkers(parts) === false);
+}
+
 // --- blocks this could not read, and the lines it used to lose ---------------
 {
   // A BLOCK WITH NO SEPARATOR IS NOT A ONE-SIDED CONFLICT. Everything from the

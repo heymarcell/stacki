@@ -4163,6 +4163,34 @@ async function suite() {
       );
     }
 
+    // AND THE WIDTH TRAVELS WITH THE PARTS, because the surface that describes
+    // them to an agent has no repository to ask. A file at a SMALL width with a
+    // lone opener of that width left in it — somebody's own text, or a
+    // half-edited file — is unread, and a check made at git's default width
+    // cannot see a three-character marker at all. That is the one shape neither
+    // of the width-agnostic arms of the backstop covers, so it is the one that
+    // proves `markerSize` has to reach the MCP domain.
+    {
+      const DOCS = '<<< see the docs\n';
+      const dir = await widthRepo('w3-lone-opener', '*.txt conflict-marker-size=3\n', {
+        base: `head\nBASE\ntail\n${DOCS}`,
+        ours: `head\nOURS\ntail\n${DOCS}`,
+        theirs: `head\nTHEIRS\ntail\n${DOCS}`,
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 lone small opener: the real conflict is still read', (f.parts || []).filter((p) => p.kind === 'clash').length === 1, JSON.stringify(f.parts));
+      check('T32 lone small opener:   at width 3', f.markerSize === 3, String(f.markerSize));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 lone small opener: the agent is told the markers went unread', mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
+      const before = await repoState(dir);
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      await refusedCleanly('T32 lone small opener: answering it', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
+    }
+
     // AND THE WIDTH IS READ PER PATH, FROM GIT, NOT ONCE FOR THE MERGE. Two
     // files in one conflict at two different widths — which is what a
     // .gitattributes with two lines in it produces, and what no single global
@@ -4207,64 +4235,132 @@ async function suite() {
       );
     }
 
-    // THE WIDTH THIS CANNOT GET RIGHT, AND WHAT IT COSTS.
+    // THE MERGE ITSELF CAN CHANGE THE ATTRIBUTE THAT DECIDES THE WIDTH, AND THE
+    // ANSWER GIT USED IS THE PRE-MERGE ONE.
     //
-    // `.gitattributes` is itself mergeable, and when it conflicts the file that
-    // DECIDES the marker width is one of the files holding markers. MEASURED,
-    // real git: with the attribute at 32 on the ancestor, 40 on this branch and
-    // 12 on the incoming one, git wrote a.txt's markers FORTY wide — it merged
-    // under this branch's attributes — while `check-attr`, reading the now
-    // conflicted .gitattributes off disk afterwards, answers TWELVE. Stacki is
-    // handed the wrong width, and there is no fixing that from here: the two
-    // readings are both git's.
-    //
-    // What matters is what a wrong width costs. Parsed at twelve, the forty-wide
-    // markers match nothing, the file comes back with no hunks — and the opener
-    // is still sitting in the agreed text, where the backstop finds it. Every
-    // answer for that path is refused by name, HEAD does not move and not one
-    // byte changes. Wrong here is a refusal; it used to be a commit.
+    // `.gitattributes` is an ordinary tracked file. Asking `check-attr` while
+    // the merge is in progress reads the version the merge has just written,
+    // which is not the version git resolved attributes against — and the first
+    // draft of this change did exactly that. MEASURED, an ordinary branch: the
+    // incoming side ADDS `*.txt conflict-marker-size=32`, a.txt clashes, git
+    // writes a.txt's markers SEVEN wide because that attribute did not exist
+    // when it merged, and check-attr answered 32. The file was then read at 32,
+    // found nothing, and a merge that had always worked was refused as
+    // unreadable. So the widths are read after the unwind, in the tree git
+    // actually merged under.
     {
-      const dir = await repo('w-attrclash');
+      const dir = await repo('w-attr-added');
       cleanup.push(dir);
-      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
       fs.writeFileSync(path.join(dir, 'a.txt'), BASE);
       await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'commit', '-qm', 'no attributes at all yet');
       await sh(dir, 'checkout', '-qb', 'feature');
-      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=12\n');
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
       fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS);
       await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'commit', '-qm', 'the incoming branch adds the attribute');
       await sh(dir, 'checkout', '-q', 'main');
-      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=40\n');
       fs.writeFileSync(path.join(dir, 'a.txt'), OURS);
       await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'ours');
+      await sh(dir, 'commit', '-qm', 'this branch');
+      // What git really did, before anything reads it: seven, because the
+      // attribute the incoming branch adds was not in force when it merged.
+      const wrote = await widthGitWrote(dir, 'a.txt');
+      check('T32 attribute added: git wrote seven-wide markers', wrote.opener === 7 && wrote.middle === 7, JSON.stringify(wrote));
       const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
-      check('T32 attribute clash: both files conflict', (clash.files || []).length === 2, JSON.stringify((clash.files || []).map((f) => f.path)));
       const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
-      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      check('T32 attribute added: read at the width git used, not the one it wrote', f.markerSize === 7, String(f.markerSize));
+      check('T32 attribute added:   so it is one disagreement, not a refusal', (f.parts || []).filter((p) => p.kind === 'clash').length === 1, JSON.stringify(f.parts));
+      const answer = await caught(() =>
+        // Only a.txt: git reconciles the added .gitattributes by itself, so it
+        // is not a path this merge reported and naming it would be refused as
+        // unknown_path — correctly.
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at })
+      );
+      check('T32 attribute added: and the ordinary merge still merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T32 attribute added:   with the incoming bytes exactly',
+        (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')),
+        JSON.stringify(await blob(dir, 'HEAD:a.txt'))
+      );
+    }
+
+    // THE SAME QUESTION WITH `.gitattributes` ITSELF IN THE CONFLICT, which is
+    // the hardest version of it: the file that decides the width is one of the
+    // files holding markers. MEASURED: 32 on the ancestor, 40 on this branch, 12
+    // on the incoming one. Git wrote a.txt's markers FORTY wide — it merged
+    // under this branch's attributes — while check-attr, reading the now
+    // marked-up .gitattributes off disk afterwards, answers TWELVE. Read before
+    // the merge, or after the unwind, the answer is forty and the conflict is an
+    // ordinary one.
+    //
+    // AND THE ONE PATH WHERE THIS STILL CANNOT KNOW. resolveMerge re-runs the
+    // merge, so it can only ask about the paths the caller NAMED before running
+    // it; a conflicting path left out of `choices` is asked about afterwards,
+    // when the answer may be the merge's own. That is deliberate and it is why
+    // the backstop exists: the width is then wrong, the markers match nothing,
+    // and the path is refused by name with nothing written. Both halves are
+    // checked here.
+    {
+      const build = async (name) => {
+        const dir = await repo(name);
+        cleanup.push(dir);
+        fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
+        fs.writeFileSync(path.join(dir, 'a.txt'), BASE);
+        await sh(dir, 'add', '-A');
+        await sh(dir, 'commit', '-qm', 'base');
+        await sh(dir, 'checkout', '-qb', 'feature');
+        fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=12\n');
+        fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS);
+        await sh(dir, 'add', '-A');
+        await sh(dir, 'commit', '-qm', 'theirs');
+        await sh(dir, 'checkout', '-q', 'main');
+        fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=40\n');
+        fs.writeFileSync(path.join(dir, 'a.txt'), OURS);
+        await sh(dir, 'add', '-A');
+        await sh(dir, 'commit', '-qm', 'ours');
+        return dir;
+      };
+
+      const read = await build('w-attrclash-read');
+      const wrote = await widthGitWrote(read, 'a.txt');
+      check('T32 attribute clash: git wrote this branch’s width of forty', wrote.opener === 40 && wrote.middle === 40, JSON.stringify(wrote));
+      const clash = await mergeBranch(git, { projectPath: read, branch: 'feature' });
+      check('T32 attribute clash: both files conflict', (clash.files || []).length === 2, JSON.stringify((clash.files || []).map((x) => x.path)));
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T32 attribute clash: a.txt is read at forty, not at the twelve the merge wrote', f.markerSize === 40, String(f.markerSize));
+      check('T32 attribute clash:   so it is one disagreement', (f.parts || []).filter((p) => p.kind === 'clash').length === 1, JSON.stringify(f.parts));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: read, mergeRef: () => 'REF' });
       const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
-      check('T32 attribute clash: a.txt is reported unreadable, not as zero hunks', mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
-      for (const bad of [
-        { what: 'the omitted default', choices: { '.gitattributes': 'ours' } },
-        { what: 'an explicit "theirs"', choices: { 'a.txt': 'theirs', '.gitattributes': 'ours' } },
-        { what: 'a per-hunk answer', choices: { 'a.txt': ['theirs'], '.gitattributes': 'ours' } },
-      ]) {
-        const run = await repo(`w-attrclash-${bad.what.replace(/\W+/g, '-')}`);
-        cleanup.push(run);
-        fs.rmSync(run, { recursive: true, force: true });
-        fs.cpSync(dir, run, { recursive: true });
-        const clashAgain = await mergeBranch(git, { projectPath: run, branch: 'feature' });
-        const before = await repoState(run);
-        const answer = await caught(() => resolveMerge(git, { projectPath: run, branch: 'feature', choices: bad.choices, expect: clashAgain.at }));
-        await refusedCleanly(`T32 attribute clash: ${bad.what}`, answer.value, run, before, 'bad_choices', (a) =>
-          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict' && b.path === 'a.txt')
-        );
-      }
+      check('T32 attribute clash MCP: markers read', mcpFile.markersUnread === false && (mcpFile.hunks || []).length === 1, JSON.stringify(mcpFile));
+
+      // NAMED — the width is read before the trial merge and the answer applies.
+      const named = await build('w-attrclash-named');
+      const namedClash = await mergeBranch(git, { projectPath: named, branch: 'feature' });
+      const namedAnswer = await caught(() =>
+        resolveMerge(git, { projectPath: named, branch: 'feature', choices: { 'a.txt': ['theirs'], '.gitattributes': 'ours' }, expect: namedClash.at })
+      );
+      check('T32 attribute clash: the answer that names the path merges', namedAnswer.value?.ok === true, JSON.stringify(namedAnswer.value || namedAnswer.error));
+      check(
+        'T32 attribute clash:   with the incoming bytes exactly',
+        (await blob(named, 'HEAD:a.txt')) === (await blob(named, 'feature:a.txt')),
+        JSON.stringify(await blob(named, 'HEAD:a.txt'))
+      );
+
+      // NOT NAMED — the width can only be read afterwards, and afterwards it is
+      // the merge's own. The markers then match nothing, and the documented
+      // default of "ours" is refused rather than committed. Nothing is written.
+      const unnamed = await build('w-attrclash-unnamed');
+      const unnamedClash = await mergeBranch(git, { projectPath: unnamed, branch: 'feature' });
+      const before = await repoState(unnamed);
+      const unnamedAnswer = await caught(() =>
+        resolveMerge(git, { projectPath: unnamed, branch: 'feature', choices: { '.gitattributes': 'ours' }, expect: unnamedClash.at })
+      );
+      await refusedCleanly('T32 attribute clash: the default, for a path the call never named', unnamedAnswer.value, unnamed, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict' && b.path === 'a.txt')
+      );
     }
   }
-
 }
 
 (async () => {
