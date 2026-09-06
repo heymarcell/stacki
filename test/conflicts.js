@@ -942,6 +942,78 @@ const conflicted = [
   check('  which asking at git’s default width cannot see', unreadMarkers(parts) === false);
 }
 
+// --- a real conflict is NEVER described as nothing to decide -----------------
+//
+// THE PROPERTY, not another example of it. Everything about the width exists to
+// stop one thing: a path git says is unmerged coming back with no hunks and no
+// complaint, because that is what makes the whole-file default reachable against
+// a description that is false. The examples above are the shapes that were
+// measured doing it; this asks the question over the space they came out of.
+//
+// Every real marker width crossed with every side that can be empty (git writes
+// a one-sided block whenever one branch deleted what the other changed), read at
+// every width Stacki might be handed. For each: if the parse finds no
+// disagreement, `unreadMarkers` must say so.
+{
+  const block = (width, oursEmpty, theirsEmpty, base) => {
+    const line = (ch, label) => ch.repeat(width) + (label ? ` ${label}` : '');
+    const out = ['head', line('<', 'HEAD')];
+    if (!oursEmpty) out.push('OURS');
+    if (base) out.push(line('|', '1234567'), 'BASE');
+    out.push(line('=', ''));
+    if (!theirsEmpty) out.push('THEIRS');
+    out.push(line('>', 'feature'), 'tail', '');
+    return out.join('\n');
+  };
+  let silent = 0;
+  let seen = 0;
+  let example = null;
+  for (const real of [1, 2, 3, 4, 5, 6, 7, 8, 12, 32]) {
+    for (const [oursEmpty, theirsEmpty] of [[false, false], [true, false], [false, true], [true, true]]) {
+      for (const base of [true, false]) {
+        const text = block(real, oursEmpty, theirsEmpty, base);
+        for (const read of [1, 3, 5, 7, 9, 32]) {
+          seen++;
+          const parts = parseConflict(text, read);
+          if (clashCount(parts) === 0 && !unreadMarkers(parts, read)) {
+            silent++;
+            if (!example) example = `real ${real}, read ${read}, oursEmpty ${oursEmpty}, theirsEmpty ${theirsEmpty}, diff3 ${base}`;
+          }
+        }
+      }
+    }
+  }
+  check(
+    `no width and no shape describes a real conflict as nothing to decide (${seen} combinations)`,
+    silent === 0 && seen > 400,
+    example || `${seen} combinations`
+  );
+}
+
+// --- the backstop's cost is the input's LENGTH, not its shape ----------------
+//
+// The first version of the small-width scan was six regexes of the form
+// `<{w}(?!<)[ \t][\s\S]*?\n={w}(?!=)[ \t\r]*\n[\s\S]*?\n>{w}(?!>)[ \t]`, run over
+// the agreed text of every conflicting file. Two unanchored lazy spans in one
+// pattern backtrack catastrophically, and the text they run over comes out of
+// the repository being merged — content somebody else chose. MEASURED on the
+// input below, ~700 KB of opener- and separator-shaped lines with no closer: the
+// line walk answers in 7ms and that pattern had not returned after FIVE MINUTES,
+// with the main process holding the whole time.
+//
+// A generous ceiling, because a shared machine is slow in ways that are nobody's
+// bug — the point is three orders of magnitude, not a stopwatch.
+{
+  const lines = [];
+  for (let i = 0; i < 20000; i++) lines.push('<<<<< a', '=====', `ordinary line ${i}`);
+  const parts = [{ kind: 'same', text: lines.join('\n') }];
+  const started = Date.now();
+  const answer = unreadMarkers(parts, 7);
+  const took = Date.now() - started;
+  check('an adversarial agreed text does not stall the backstop', took < 2000, `${took}ms over ${Buffer.byteLength(parts[0].text)} bytes`);
+  check('  and it answers correctly: no block, so no unread marker', answer === false);
+}
+
 // --- blocks this could not read, and the lines it used to lose ---------------
 {
   // A BLOCK WITH NO SEPARATOR IS NOT A ONE-SIDED CONFLICT. Everything from the

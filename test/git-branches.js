@@ -3949,7 +3949,10 @@ async function suite() {
 
       // 7, 8, 9, 11 — every answer, against the exact branch bytes. The oracle
       // is the COMMIT: `git show HEAD:a.txt` after the merge against
-      // `git show <branch>:a.txt`, which no line-ending normalisation can blur.
+      // `git show <branch>:a.txt`, both read without `sh`'s trim so a final
+      // newline is part of the comparison. On the CRLF rows that comparison is
+      // blob against blob and therefore blind to line endings by construction —
+      // those rows ask the working tree as well, below.
       const answers = [
         { what: 'explicit "ours"', choices: { 'a.txt': 'ours' }, from: 'main' },
         { what: 'explicit "theirs"', choices: { 'a.txt': 'theirs' }, from: 'feature' },
@@ -3984,6 +3987,31 @@ async function suite() {
           !/[<>|]{3}|\n={3,}\n/.test(textOf(path.join(dir, 'a.txt')) || ''),
           JSON.stringify(textOf(path.join(dir, 'a.txt')))
         );
+        // AND THE BYTES ON DISK, WHICH THE BLOB ORACLE CANNOT SEE ON THESE ROWS.
+        //
+        // The comparison above is blob against blob, and a blob under
+        // `text eol=crlf` is stored with LF whichever side it came from — so on
+        // the two CRLF rows it is precisely line-ending normalisation that makes
+        // the two sides comparable, and precisely line-ending damage that it
+        // cannot show. Three of the defects this file exists for were one byte
+        // of line ending. So the working tree is asked as well, where the
+        // terminator is the file's own: every line ends CRLF, none ends on a
+        // lone LF, and the whole file is the committed blob with its terminators
+        // put back — which is what `text eol=crlf` promises and what a rebuild
+        // that dropped or invented one would fail.
+        if (w.crlf) {
+          const onDisk = textOf(path.join(dir, 'a.txt'));
+          check(
+            `T32 ${w.label}:   and the working tree holds that side with CRLF, byte for byte`,
+            onDisk === want.replace(/\n/g, '\r\n'),
+            JSON.stringify({ onDisk, want })
+          );
+          check(
+            `T32 ${w.label}:   with no lone newline left anywhere in it`,
+            typeof onDisk === 'string' && !/[^\r]\n/.test(onDisk) && !/^\n/.test(onDisk),
+            JSON.stringify(onDisk)
+          );
+        }
       }
 
       // 10, 15 — a malformed answer is refused with the repository untouched.
@@ -4360,7 +4388,252 @@ async function suite() {
         (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict' && b.path === 'a.txt')
       );
     }
+
+    // T33 — A LINE OF SOURCE THAT LOOKS LIKE PART OF A MARKER, INSIDE THE BLOCK
+    // GIT WROTE.
+    //
+    // Git does NOT widen its own markers to avoid colliding with the file's
+    // text — MEASURED: at the default width it wrote a second `<<<<<<< HEAD`
+    // directly under one already in the file — which is exactly why
+    // `conflict-marker-size` exists and why this branch now supports it. Until
+    // this, the parse walked a block with two booleans ("seen the separator
+    // yet", "seen the ancestor line yet") and took the FIRST line matching
+    // either as git's. A file whose own text contains such a line was then not
+    // parsed worse; it was parsed WRONG, and it committed.
+    //
+    // Three shapes, all measured against real git, all `{ok: true}` before:
+    //
+    //   A bare `=======` line inside the region. Both branches adding a section
+    //   whose text contains one gave the block `<<< / Title / ======= / OURS /
+    //   ||| / ======= / Other / ======= / THEIRS / >>>`; the first separator was
+    //   taken as git's, so the hunk read `ours: "Title"` and
+    //   `theirs: "OURS\nOther\nTHEIRS"` — this branch's own OURS line attributed
+    //   to the incoming side, with `markersUnread: false` on the envelope — and
+    //   `['theirs']` committed "top\nOURS\nOther\nTHEIRS\nbottom\n", equal to
+    //   NEITHER branch.
+    //
+    //   A `||||||| note` line inside this branch's side. Everything after it
+    //   became the ancestor, so the hunk lost a line of ours: answering `ours`
+    //   would have written a file this branch never had.
+    //
+    //   A `>>>>>>> quoted in the text` line inside the incoming side. It closed
+    //   the block early, the two sides happened to read correctly, and git's
+    //   REAL closer fell into the agreed text — `['theirs']` committed
+    //   "top\nTHEIRS\nMORE\n>>>>>>> feature\nbottom\n": a conflict marker
+    //   written into the source, ok: true, HEAD moved. `unreadMarkers` could not
+    //   see it, because it looked only for openers and the opener had been
+    //   consumed.
+    //
+    // Git writes one shape: opener, optional ancestor line, separator, closer,
+    // all at one width and in that order. Anything else is a block whose
+    // structure cannot be decided from the text, and it is now kept whole and
+    // refused rather than guessed at. The remedy for a project that hits this is
+    // the attribute — which is the thing the rest of T32 is about.
+    const collide = async (name, { base, ours, theirs }) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, 'a.txt'), base);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), theirs);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'a.txt'), ours);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      return dir;
+    };
+
+    const colliding = [
+      {
+        key: 'separator',
+        what: 'a bare seven-equals line inside the region',
+        base: 'top\nbottom\n',
+        ours: 'top\nTitle\n=======\nOURS\nbottom\n',
+        theirs: 'top\nOther\n=======\nTHEIRS\nbottom\n',
+        // The line git's own markup must contain for the fixture to be the one
+        // this is about.
+        inMarkup: (text) => (text.match(/(?:^|\n)=======(?:\n|$)/g) || []).length > 1,
+      },
+      {
+        key: 'ancestor',
+        what: 'a seven-pipe line inside this branch’s side',
+        base: 'top\nbottom\n',
+        ours: 'top\nX\n||||||| note\nOURS\nbottom\n',
+        theirs: 'top\nY\nTHEIRS\nbottom\n',
+        inMarkup: (text) => (text.match(/(?:^|\n)\|{7} /g) || []).length > 1,
+      },
+      {
+        key: 'closer',
+        what: 'a seven-angle closer line inside the incoming side',
+        base: 'top\nBASE\nbottom\n',
+        ours: 'top\nOURS\nbottom\n',
+        theirs: 'top\nTHEIRS\n>>>>>>> quoted in the text\nMORE\nbottom\n',
+        inMarkup: (text) => (text.match(/(?:^|\n)>{7} /g) || []).length > 1,
+      },
+    ];
+
+    for (const c of colliding) {
+      // THE FIXTURE IS THE ONE THIS IS ABOUT — git really did put that line
+      // inside its own block. Asked of git, not assumed.
+      const probe = await collide(`collide-${c.key}-probe`, c);
+      const markup = await widthGitWrote(probe, 'a.txt');
+      void markup;
+      await sh(probe, '-c', 'merge.conflictStyle=diff3', 'merge', '--no-commit', '--no-ff', '--no-edit', '--', 'feature').catch(() => {});
+      const wrote = textOf(path.join(probe, 'a.txt')) || '';
+      await sh(probe, 'merge', '--abort').catch(() => {});
+      check(`T33 ${c.what}: git's own markup really contains it twice`, c.inMarkup(wrote), JSON.stringify(wrote));
+
+      const dir = await collide(`collide-${c.key}`, c);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      const mcpFile = (mcp?.files || []).find((x) => x.path === 'a.txt') || {};
+      check(`T33 ${c.what}: the agent is told the markers went unread`, mcpFile.markersUnread === true && mcpFile.hunks === null, JSON.stringify(mcpFile));
+      check(`T33 ${c.what}:   and not one line of the file is lost from the parse`, (f.parts || []).map((p) => p.text).join('\n').includes('bottom'), JSON.stringify(f.parts));
+      const before = await repoState(dir);
+      for (const answer of [{ 'a.txt': 'ours' }, { 'a.txt': 'theirs' }, { 'a.txt': ['theirs'] }, {}]) {
+        const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: answer, expect: clash.at }));
+        await refusedCleanly(`T33 ${c.what}: ${JSON.stringify(answer)}`, out.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+        );
+      }
+    }
+
+    // AND THE CONTROL THIS MUST NOT BREAK. The same character, in the AGREED
+    // text between two blocks, is ordinary content — git put it outside its
+    // markers and there is nothing ambiguous about it. Refusing here would be a
+    // false refusal invented rather than inherited, and it is the shape a
+    // Markdown file with a setext underline in it actually has.
+    {
+      const dir = await collide('collide-control', {
+        base: 'top\nA\n=======\nB\nbottom\n',
+        ours: 'top\nA1\n=======\nB1\nbottom\n',
+        theirs: 'top\nA2\n=======\nB2\nbottom\nEXTRA\n',
+      });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      const hunks = (f.parts || []).filter((p) => p.kind === 'clash');
+      check('T33 control: a separator-shaped line in the AGREED text is content', hunks.length === 2, JSON.stringify(f.parts));
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      check('T33 control:   and the markers are read', ((mcp?.files || [])[0] || {}).markersUnread === false, JSON.stringify((mcp?.files || [])[0]));
+      const answer = await caught(() =>
+        resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs', 'theirs'] }, expect: clash.at })
+      );
+      check('T33 control: it merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T33 control:   with the incoming bytes exactly, that line included',
+        (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')),
+        JSON.stringify(await blob(dir, 'HEAD:a.txt'))
+      );
+    }
+
+    // THE WIDTH IS ASKED FROM THE REPOSITORY ROOT, and the layout that proves it
+    // is the one repoRoot exists for. `check-attr` spells and scopes its paths
+    // from the cwd; git's conflicting paths are spelled from the repository
+    // root. Asked from a project inside a larger repository, "site/a.txt" means
+    // <root>/site/site/a.txt — a path that does not exist, answered
+    // "unspecified", and the whole width feature quietly switches off for the
+    // one layout it was hardest to get right in.
+    {
+      const dir = await repo('w32-subdir');
+      cleanup.push(dir);
+      fs.mkdirSync(path.join(dir, 'site'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.gitattributes'), '*.txt conflict-marker-size=32\n');
+      fs.writeFileSync(path.join(dir, 'site/page.txt'), BASE);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'a project inside a larger repository');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(dir, 'site/page.txt'), THEIRS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(dir, 'site/page.txt'), OURS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const project = path.join(dir, 'site');
+      const clash = await mergeBranch(git, { projectPath: project, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'site/page.txt') || {};
+      check('T33 subdirectory project: the width is found for a repo-root-spelled path', f.markerSize === 32, JSON.stringify({ path: f.path, markerSize: f.markerSize }));
+      check('T33 subdirectory project:   so the conflict is one disagreement', (f.parts || []).filter((p) => p.kind === 'clash').length === 1, JSON.stringify(f.parts));
+      const answer = await caught(() =>
+        resolveMerge(git, { projectPath: project, branch: 'feature', choices: { 'site/page.txt': ['theirs'] }, expect: clash.at })
+      );
+      check('T33 subdirectory project: it merges', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T33 subdirectory project:   with the incoming bytes exactly',
+        (await blob(dir, 'HEAD:site/page.txt')) === (await blob(dir, 'feature:site/page.txt')),
+        JSON.stringify(await blob(dir, 'HEAD:site/page.txt'))
+      );
+    }
+
+    // GIT'S READING OF THE ATTRIBUTE, NOT A STRICTER ONE. MEASURED:
+    // `conflict-marker-size=+5` makes git write FIVE-character markers with no
+    // warning at all — it parses the value with the C integer reader, which
+    // takes a sign — while `5x`, `0x10` and `1e3` are refused with a warning and
+    // fall back to seven. A digits-only test was both stricter than git and
+    // wrong in the one direction that costs a merge.
+    {
+      const dir = await widthRepo('w-plus-five', '*.txt conflict-marker-size=+5\n', { base: BASE, ours: OURS, theirs: THEIRS });
+      const wrote = await widthGitWrote(dir, 'a.txt');
+      check('T33 "+5": git writes five-wide markers for it', wrote.opener === 5 && wrote.middle === 5, JSON.stringify(wrote));
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const f = (clash.files || []).find((x) => x.path === 'a.txt') || {};
+      check('T33 "+5": Stacki reads it as five too', f.markerSize === 5, String(f.markerSize));
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      check('T33 "+5": so the merge goes through', answer.value?.ok === true, JSON.stringify(answer.value || answer.error));
+      check(
+        'T33 "+5":   with the incoming bytes exactly',
+        (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')),
+        JSON.stringify(await blob(dir, 'HEAD:a.txt'))
+      );
+    }
+
+    // A CONFLICTING PATH THE MCP SURFACE CANNOT NAME MUST NOT TAKE THE SILENT
+    // DEFAULT.
+    //
+    // `choices` is `z.record(z.string(), z.unknown())`, and MEASURED with zod
+    // 4.4.3: parsing `{"__proto__":"theirs","a.txt":"ours"}` returns an object
+    // with ONLY `a.txt` on it — the record is rebuilt by assignment, and
+    // assigning `__proto__` sets a prototype instead of making a property. So an
+    // agent that answers a file named `__proto__` is answering into a hole.
+    //
+    // The documented default for a file left out is "keeps this branch's
+    // version", and applying it here would be a false success: the caller did
+    // say something and it did not arrive. It is refused instead — today by
+    // `choices?.['__proto__']` reading back `Object.prototype` and failing the
+    // shape check, which is accidental safety and exactly why it is pinned. A
+    // change to `Object.hasOwn` anywhere in that validator would turn this into
+    // the silent default, and this check is what would say so.
+    {
+      const dir = await repo('proto-path');
+      cleanup.push(dir);
+      for (const name of ['__proto__', 'a.txt']) fs.writeFileSync(path.join(dir, name), BASE);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'checkout', '-qb', 'feature');
+      for (const name of ['__proto__', 'a.txt']) fs.writeFileSync(path.join(dir, name), THEIRS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      for (const name of ['__proto__', 'a.txt']) fs.writeFileSync(path.join(dir, name), OURS);
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T33 __proto__: git reports it as one of the conflicting paths', (clash.files || []).some((f) => f.path === '__proto__'), JSON.stringify((clash.files || []).map((f) => f.path)));
+      const before = await repoState(dir);
+      // Exactly the object a client's `{"__proto__":"theirs","a.txt":"theirs"}`
+      // becomes after the schema has parsed it.
+      const survived = { 'a.txt': 'theirs' };
+      const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: survived, expect: clash.at }));
+      await refusedCleanly('T33 __proto__: the answer that could not carry it', answer.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === '__proto__')
+      );
+    }
   }
+
 }
 
 (async () => {

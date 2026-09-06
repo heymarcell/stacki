@@ -457,7 +457,13 @@ async function conflictMarkerSizes(git, root, files) {
       // second, later reading, and a path whose attribute is simply unset would
       // otherwise get one — which is the reading that is wrong when the merge is
       // what sets the attribute.
-      sizes.set(fields[at], markerWidth(/^[0-9]+$/.test(value) ? Number(value) : 0));
+      // `[+-]?` because git parses this with the C integer reader, which takes a
+      // sign. MEASURED: `conflict-marker-size=+5` makes git write FIVE-character
+      // markers with no warning at all, while `5x`, `0x10` and `1e3` are refused
+      // with one and fall back to seven — so digits-only was both too strict and
+      // exactly wrong for the one form git accepts silently. `-5` parses and is
+      // then not a usable width, which `markerWidth` is what decides.
+      sizes.set(fields[at], markerWidth(/^[+-]?[0-9]+$/.test(value) ? Number(value) : 0));
     }
   };
   for (let from = 0; from < list.length; from += MARKER_SIZE_BATCH) {

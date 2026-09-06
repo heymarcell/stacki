@@ -512,6 +512,86 @@ async function measureOriginFence() {
     }
   }
 
+  // ── The merge refusals the guide claims to enumerate ────────────────────────
+  //
+  // A CLOSED SET IS A CLAIM, AND THIS ONE WAS WRONG BY FOUR.
+  //
+  // The guide's merge section says "N refusals" and then lists them. It said
+  // FIVE, and `git.resolve_merge` can answer with nine: the two the ref layer
+  // mints before the handler is reached (`bad_ref`, `wrong_target`) and two the
+  // handler itself mints and nothing rewrites (`working_tree_blocked`,
+  // `bad_branch_name`). An agent reading that list and finding a code outside it
+  // has no way to tell a refusal it should act on from a bug, which is the exact
+  // defect this branch fixed elsewhere in itself for three audit codes.
+  //
+  // So the list is DISCOVERED from the shipping source rather than kept in step
+  // by hand: the handler's own returns, the helpers it returns through, and the
+  // domain mapper's refusals before it. Not a grep of the guide against a hand
+  // list — a grep of the guide against the code.
+  {
+    const branches = readRepo('electron/gitBranches.js');
+    const domains = readRepo('electron/mcp/agent/domains.js');
+    const agentIndex = readRepo('electron/mcp/agent/index.js');
+    const between = (text, from, to) => {
+      const a = text.indexOf(from);
+      const b = a === -1 ? -1 : text.indexOf(to, a + from.length);
+      return a === -1 || b === -1 ? '' : text.slice(a, b);
+    };
+    const codesIn = (text) => new Set([...text.matchAll(/(?:code:\s*|problem\(\s*|no\(\s*)'([a-z][a-z0-9_]*)'/g)].map((m) => m[1]));
+
+    // The handler, from its own declaration to the next one.
+    const handler = between(branches, 'async function resolveMerge(', 'async function mergeBranch(');
+    check('the resolve_merge handler was found to read', handler.length > 2000, String(handler.length));
+    const found = codesIn(handler);
+    // The helpers it returns THROUGH, which carry codes of their own.
+    for (const [call, where, from, to] of [
+      ['badBranchName(', branches, 'const badBranchName =', '\nasync function isDirty'],
+      ['stale(', branches, 'const stale =', '\nasync function resolveMerge'],
+    ]) {
+      if (handler.includes(call)) for (const code of codesIn(between(where, from, to))) found.add(code);
+    }
+    // And the two the mapper answers before the handler is ever called.
+    for (const code of codesIn(between(domains, '  resolve_merge: {', '\n  },\n'))) found.add(code);
+    // `mergeBinding` is where a missing or unreadable ref is turned away.
+    for (const code of codesIn(between(agentIndex, 'function mergeBinding(', '\n  }\n'))) found.add(code);
+    // A ref that will not read at all answers from readRef, which every guarded
+    // operation shares; the merge one reaches it through mergeBinding.
+    found.add('bad_ref');
+
+    // A POSITIVE CONTROL ON THE SWEEP ITSELF, so a scanner that stopped matching
+    // cannot turn the completeness check below into a tautology over nothing.
+    for (const [code, why] of [
+      ['bad_choices', 'a code: property in the handler'],
+      ['merge_stuck', 'the handler, whose refusals no mapper rewrites'],
+      ['stale_merge', 'the stale() helper the handler returns through'],
+      ['wrong_target', 'a problem() call in the domain mapper'],
+      ['guard_required', 'mergeBinding, before the handler runs'],
+      ['working_tree_blocked', 'the handler, on a re-merge git will not start'],
+      ['bad_branch_name', 'the badBranchName() helper'],
+    ]) {
+      check(`the merge-refusal sweep found ${code} — ${why}`, found.has(code), [...found].sort().join(', '));
+    }
+
+    const model = TOPICS['operating-model'].body;
+    const merge = model.slice(model.indexOf('## A merge conflict'), model.indexOf('## Semantic first'));
+    check('the guide still has a merge section to check', merge.length > 500, String(merge.length));
+    const missing = [...found].filter((code) => !merge.includes(code)).sort();
+    check('the guide names every refusal git.resolve_merge can answer with', missing.length === 0, `missing: ${missing.join(', ')}`);
+    // AND THE NUMBER IT STATES IS THE NUMBER IT LISTS. Saying "five" over a list
+    // of five that is missing four is two failures, and only one of them is
+    // caught by the check above.
+    const WORDS = { One: 1, Two: 2, Three: 3, Four: 4, Five: 5, Six: 6, Seven: 7, Eight: 8, Nine: 9, Ten: 10, Eleven: 11, Twelve: 12 };
+    const said = merge.match(/\b([A-Z][a-z]+) refusals\b/);
+    check('the guide states how many merge refusals there are', !!said && WORDS[said[1]] !== undefined, said ? said[1] : merge.slice(0, 120));
+    if (said && WORDS[said[1]] !== undefined) {
+      check(
+        `the guide says ${said[1]} and the source has ${found.size}`,
+        WORDS[said[1]] === found.size,
+        [...found].sort().join(', ')
+      );
+    }
+  }
+
   if (failures.length) {
     console.error(`\ncontract-wording: ${failures.length} failed, ${checked - failures.length} passed\n`);
     console.error(failures.join('\n') + '\n');

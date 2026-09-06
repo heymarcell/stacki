@@ -1683,7 +1683,10 @@ const git = {
             'themselves — the merge was unwound, so they hold the pre-merge bytes. A file whose ' +
             '`markersUnread` is true is one git reports as conflicting whose markers could not be read: it has ' +
             'no hunk list to answer and git.resolve_merge refuses every answer for it, so that one has to be ' +
-            'finished in the project by hand. Mind the two path spaces: ' +
+            'finished in the project by hand. A file whose `hunksOmitted` is true is a different thing and takes ' +
+            'a different answer: its hunks were read but were too large to carry here, so `hunks` is null for ' +
+            'size rather than for doubt. Read that file yourself and send a whole-file "ours" or "theirs" for ' +
+            'it, or reconcile it in the project. Mind the two path spaces: ' +
             '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
             '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
             'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +

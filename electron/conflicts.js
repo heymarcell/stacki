@@ -390,57 +390,80 @@ function parseConflict(text, markerSize) {
       i++;
       continue;
     }
-    // A marker that never closes is a file somebody edited by hand and left
-    // broken. Treating the rest as ordinary text keeps every line, which
-    // matters more here than being clever: nothing is silently dropped.
-    const ours = [];
-    const theirs = [];
-    const base = [];
-    let sawMiddle = false;
-    let sawBase = false;
+    // WHERE THE STRUCTURE IS, COUNTED RATHER THAN LATCHED.
+    //
+    // This used to walk the block with two booleans — "have I seen a separator
+    // yet", "have I seen the ancestor line yet" — and put every other line in
+    // whichever bucket those two named. A separator is `=======` and an ancestor
+    // line is `|||||||`, and A LINE OF SOURCE CAN BE EITHER OF THOSE. Git does
+    // not widen its own markers to avoid the collision (MEASURED: at the default
+    // width it wrote a second `<<<<<<< HEAD` directly under one already in the
+    // file), which is exactly why `conflict-marker-size` exists.
+    //
+    // What the latch did with such a line was not a worse parse, it was a wrong
+    // one, and it committed. MEASURED, real git, both branches adding a section
+    // whose text contains a bare `=======` line: git's block was
+    // `<<< / Title / ======= / OURS / ||| / ======= / Other / ======= / THEIRS /
+    // >>>`, the FIRST of those three separators was taken as git's, and the file
+    // came back as one hunk with `ours: "Title"` and
+    // `theirs: "OURS\nOther\nTHEIRS"` — this branch's own OURS line attributed
+    // to the incoming side. `markersUnread` was false, the panel and the agent
+    // were both shown that, and `['theirs']` wrote
+    // `"top\nOURS\nOther\nTHEIRS\nbottom\n"` — equal to NEITHER branch —
+    // staged it and committed a two-parent merge as `ok: true`. The same latch
+    // on the ancestor line lost a line the other way round.
+    //
+    // So the structure is located by counting, and a block git wrote has exactly
+    // one separator and at most one ancestor line, the ancestor line first.
+    // Anything else is a block whose shape cannot be decided from the text, and
+    // guessing at it is the failure above. Those are kept verbatim instead — see
+    // the refusal below — which costs a merge that has to be finished by hand
+    // and is what `conflict-marker-size` is for.
     let closed = false;
     let j = i + 1;
+    const middles = [];
+    const bases = [];
     for (; j < lines.length; j++) {
       const line = lines[j];
       if (END.test(line)) {
         closed = true;
         break;
       }
-      if (MIDDLE.test(line)) {
-        sawMiddle = true;
-        continue;
-      }
+      if (MIDDLE.test(line)) middles.push(j);
       // Under diff3 the common ancestor sits between the two sides. It is not
       // a third choice — it is what both started FROM — but it is what says
       // which side actually changed, so it is kept and never offered.
-      if (BASE.test(line)) {
-        sawBase = true;
-        continue;
-      }
-      (sawMiddle ? theirs : sawBase ? base : ours).push(line);
+      else if (BASE.test(line)) bases.push(j);
     }
     // A BLOCK THIS DID NOT FULLY READ IS KEPT WHOLE, NEVER HALF-READ.
     //
-    // `closed` was the only test here, and a block missing its SEPARATOR still
-    // passed it: everything from the opener to the closer went into `ours` (or,
-    // under diff3, into the ancestor once the ancestor line had been seen) and
-    // the incoming side came out empty — a hunk saying "the other branch
-    // deleted this", which is a claim, not a gap. That is exactly the shape a
+    // `closed` was once the only test here, and a block missing its SEPARATOR
+    // still passed it: everything from the opener to the closer went into `ours`
+    // and the incoming side came out empty — a hunk saying "the other branch
+    // deleted this", which is a claim, not a gap. That is the shape a
     // wider-than-seven marker produced before the width became a parameter, and
-    // it committed bytes neither branch wrote. See the marker note above.
+    // it committed bytes neither branch wrote.
     //
-    // Git writes all four markers or none: an opener, an optional ancestor line
-    // under diff3, a separator and a closer, every one of them at the same
-    // width. A block missing any of the three that are never optional is
-    // therefore not a block git wrote at this width, and the honest answer is
-    // that it was not read — so its lines stay verbatim in the agreed text,
-    // where `unreadMarkers` finds the opener still sitting in them and every
-    // caller downstream refuses the path by name rather than answering for it.
-    if (!closed || !sawMiddle) {
+    // Git writes one shape and only one: an opener, an optional ancestor line
+    // under diff3, a separator, a closer, every one of them at the same width
+    // and in that order. A block that is not that shape — unclosed, without a
+    // separator, with more than one of either, or with the ancestor line after
+    // the separator — is not a block git wrote at this width, and the honest
+    // answer is that it was not read. Its lines stay verbatim in the agreed
+    // text, where `unreadMarkers` finds the opener still sitting in them and
+    // every caller downstream refuses the path by name rather than answering
+    // for it.
+    if (!closed || middles.length !== 1 || bases.length > 1 || (bases.length === 1 && bases[0] > middles[0])) {
       same.push(lines[i]);
       i++;
       continue;
     }
+    const middleAt = middles[0];
+    const baseAt = bases.length ? bases[0] : -1;
+    const sawBase = baseAt !== -1;
+    const ours = lines.slice(i + 1, sawBase ? baseAt : middleAt);
+    const base = sawBase ? lines.slice(baseAt + 1, middleAt) : [];
+    const theirs = lines.slice(middleAt + 1, j);
     // One of git's conflicts is often several decisions wearing one coat.
     // Comparing the two sides line by line separates them, so the lines they
     // agree on stop being part of the choice and each run they disagree on
@@ -771,37 +794,74 @@ function renderResolved(parts, picks = [], sides = null) {
  */
 const unreadMarkers = (parts, markerSize) => {
   const n = markerWidth(markerSize);
-  // `<{n}(?!<)` for the width git actually used, `<{7,}` for the default and
-  // every wider one. When n is seven or more the first alternative is already
-  // covered by the second; when it is smaller — sizes 1 to 6 are all legal —
-  // it is the only one of the two that can see the marker at all.
-  const opener = new RegExp(`(?:^|\\n)(?:<{${n}}(?!<)|<{7,})(?=[ \\t\\r]|$)`);
-  const texts = (parts || []).filter((part) => part && part.kind === 'same').map((part) => part.text || '');
-  if (texts.some((text) => opener.test(text))) return true;
-  // AND THE ONE MIS-READING THE OPENER ALONE CANNOT CATCH.
+  // WALKED LINE BY LINE, NOT MATCHED WITH A REGEX OVER THE WHOLE TEXT.
   //
-  // Every way of being handed the wrong width ends in a refusal except one. Too
-  // small a width leaves the real, wider opener unread and the `<{7,}` arm
-  // finds it; too large a width leaves a seven-wide opener unread and the same
-  // arm finds that. But a real width BELOW seven, read as seven, leaves `<<<
-  // HEAD` sitting in agreed text that neither arm can see — and that is the
-  // shape that was measured committing this branch's version over the incoming
-  // one under `{ok: true, resolved: 1}`.
-  //
-  // Guessing at short openers on their own is not the answer: a line beginning
-  // `< ` is ordinary in diff output, in quoted mail and in documentation, and
-  // refusing every conflicted file that contains one would be a false refusal
-  // invented rather than inherited. What is NOT ordinary is a whole block —
-  // opener, separator and closer, all the same width, in that order, with the
-  // separator alone on its line. Git writes exactly that and little else does.
-  //
-  // Only widths one to six are looked for here. Seven and above are already
-  // answered by the opener arm above, which is both cheaper and stricter.
-  for (let width = 1; width < 7; width++) {
-    const block = new RegExp(
-      `(?:^|\\n)<{${width}}(?!<)[ \\t][\\s\\S]*?\\n={${width}}(?!=)[ \\t\\r]*\\n[\\s\\S]*?\\n>{${width}}(?!>)[ \\t]`
-    );
-    if (texts.some((text) => block.test(text))) return true;
+  // The first version of the small-width scan below was six regexes of the form
+  // `<{w}[ \t][\s\S]*?\n={w}[ \t\r]*\n[\s\S]*?\n>{w}[ \t]`, run over the agreed
+  // text of every conflicting file. Two unanchored lazy spans in one pattern
+  // backtrack quadratically at best, and the text they run over is a file out of
+  // the repository being merged — which is to say, content somebody else chose.
+  // A merge is not a place to hand the main process a pattern whose cost is
+  // decided by the input. Walking the lines is linear and says the same thing.
+  const markerOf = (line) => {
+    const run = /^([<=|>])\1*/.exec(line);
+    if (!run) return null;
+    const ch = run[1];
+    const rest = line.slice(run[0].length);
+    // WHAT MAKES A MARKER LINE, AND IT IS NOT THE RUN ALONE.
+    //
+    // Git writes an opener and a closer with a LABEL after them — the branch,
+    // HEAD, a filename — never bare; and it writes the separator bare. So an
+    // opener or closer needs the space that separates it from its label, which
+    // is what tells a marker from a rule somebody drew across the page. That
+    // distinction was already the shipped one and is kept: a line of twenty '<'
+    // and nothing else is not a conflict marker at any width.
+    if (ch === '=' || ch === '|') {
+      if (!/^\s*$/.test(rest) && ch === '=') return null;
+      if (ch === '|' && rest !== '' && rest !== '\r' && !/^[ \t]/.test(rest)) return null;
+    } else if (!/^[ \t]/.test(rest)) return null;
+    return { ch, width: run[0].length };
+  };
+  for (const part of parts || []) {
+    if (!part || part.kind !== 'same') continue;
+    // Per width, the last structural marker seen: an opener arms it, a
+    // separator advances it, and a closer completes a block. Six counters and
+    // one pass, whatever the text is.
+    const stage = new Map();
+    for (const line of String(part.text || '').split('\n')) {
+      const marker = markerOf(line);
+      if (!marker) continue;
+      const { ch, width } = marker;
+      // THE OPENER, AND THE CLOSER TOO — a block has both, and the one this
+      // used to look for is not always the one left behind.
+      //
+      // Only the opener was looked for, on the reasoning that a block always
+      // starts with one. It does — but the parse does not always LOSE the
+      // opener. MEASURED, real git: a line reading `>>>>>>> quoted in the text`
+      // inside the incoming side ended the block early, so the parse read the
+      // two sides correctly, put git's REAL closer into the agreed text, and
+      // `['theirs']` committed `"top\nTHEIRS\nMORE\n>>>>>>> feature\nbottom\n"`
+      // — a conflict marker written into the source, ok: true, HEAD moved. The
+      // opener was consumed; the closer was the evidence.
+      //
+      // Both are checked at the width git says it used and at seven or more,
+      // which is git's default and every deliberate `conflict-marker-size`
+      // above it. A refusal here is one Stacki can be wrong about safely; the
+      // alternative was measured committing bytes neither branch wrote.
+      if ((ch === '<' || ch === '>') && (width === n || width >= 7)) return true;
+      // AND THE ONE SHAPE THOSE TWO CANNOT SEE. Every way of being handed the
+      // wrong width ends in a refusal except one: a real width BELOW seven,
+      // read as seven, leaves `<<< HEAD` where neither check above can find it.
+      // Guessing at short openers alone is not the answer — a line beginning
+      // `< ` is ordinary in diff output, in quoted mail and in documentation —
+      // so what is looked for is a whole BLOCK at one of those widths: opener,
+      // separator, closer, in that order. Git writes exactly that and little
+      // else does.
+      if (width >= 7) continue;
+      if (ch === '<') stage.set(width, 'opened');
+      else if (ch === '=' && stage.get(width) === 'opened') stage.set(width, 'split');
+      else if (ch === '>' && stage.get(width) === 'split') return true;
+    }
   }
   return false;
 };
