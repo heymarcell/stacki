@@ -385,6 +385,31 @@ const collide = async (name, { base, ours, theirs }) => {
   await sh(dir, 'commit', '-qm', 'ours');
   return dir;
 };
+
+// A conflicted SYMLINK: two branches point the same link somewhere different.
+// Hoisted beside collide() because more than one block builds one.
+const linked = async (name, { ours, theirs }) => {
+  const dir = await repo(name);
+  cleanup.push(dir);
+  fs.mkdirSync(path.join(dir, 'docs'));
+  fs.writeFileSync(
+    path.join(dir, 'docs', 'notes.md'),
+    'A conflict looks like:\n<<<<<<< HEAD\nours line\n||||||| base\nbase line\n=======\ntheirs line\n>>>>>>> other\nend\n'
+  );
+  fs.writeFileSync(path.join(dir, 'seed.txt'), 'x\n');
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'base');
+  await sh(dir, 'branch', 'feature');
+  fs.symlinkSync(ours, path.join(dir, 'link'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'ours');
+  await sh(dir, 'checkout', '-q', 'feature');
+  fs.symlinkSync(theirs, path.join(dir, 'link'));
+  await sh(dir, 'add', '-A');
+  await sh(dir, 'commit', '-qm', 'theirs');
+  await sh(dir, 'checkout', '-q', 'main');
+  return dir;
+};
 const removeFixtures = () => {
   for (const dir of cleanup) fs.rmSync(dir, { recursive: true, force: true });
 };
@@ -5259,7 +5284,9 @@ async function suite() {
       check('T35 latin-1:   and no hunks', clashCount(file?.parts || []) === 0, String(clashCount(file?.parts || [])));
       const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
       const entry = (mcp?.files || []).find((f) => f.path === 'page.html') || {};
-      check('T35 latin-1:   the agent is told hunks are null, not an empty list', entry.hunks === null, JSON.stringify(entry));
+      // `[]`, not null: no hunks are offered, but both sides exist and a
+      // whole-file word answers it. See T38, which is about that distinction.
+      check('T35 latin-1:   the agent is told no hunks are offered', Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry));
       check('T35 latin-1:   and not that they were dropped for size', entry.hunksOmitted === false, JSON.stringify(entry));
     }
 
@@ -5324,28 +5351,6 @@ async function suite() {
     // different, and the one this branch points at is a documentation file
     // that shows what a conflict looks like — which is what made the read
     // through it produce hunks rather than nothing.
-    const linked = async (name, { ours, theirs }) => {
-      const dir = await repo(name);
-      cleanup.push(dir);
-      fs.mkdirSync(path.join(dir, 'docs'));
-      fs.writeFileSync(
-        path.join(dir, 'docs', 'notes.md'),
-        'A conflict looks like:\n<<<<<<< HEAD\nours line\n||||||| base\nbase line\n=======\ntheirs line\n>>>>>>> other\nend\n'
-      );
-      fs.writeFileSync(path.join(dir, 'seed.txt'), 'x\n');
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'base');
-      await sh(dir, 'branch', 'feature');
-      fs.symlinkSync(ours, path.join(dir, 'link'));
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'ours');
-      await sh(dir, 'checkout', '-q', 'feature');
-      fs.symlinkSync(theirs, path.join(dir, 'link'));
-      await sh(dir, 'add', '-A');
-      await sh(dir, 'commit', '-qm', 'theirs');
-      await sh(dir, 'checkout', '-q', 'main');
-      return dir;
-    };
     const NOTES = 'A conflict looks like:\n<<<<<<< HEAD\nours line\n||||||| base\nbase line\n=======\ntheirs line\n>>>>>>> other\nend\n';
 
     {
@@ -5356,7 +5361,7 @@ async function suite() {
       check('T35 symlink:   with no hunks of the file it points at', clashCount(file?.parts || []) === 0, String(clashCount(file?.parts || [])));
       const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
       const entry = (mcp?.files || []).find((f) => f.path === 'link') || {};
-      check('T35 symlink:   the agent is told hunks are null', entry.hunks === null, JSON.stringify(entry));
+      check('T35 symlink:   the agent is told no hunks are offered', Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry));
       const before = await repoState(dir);
       for (const answer of [['ours'], ['theirs']]) {
         const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { link: answer }, expect: clash.at }));
@@ -5611,6 +5616,196 @@ async function suite() {
     check('T37: the resolve side still says its merge was to check the answers', /to check those answers/.test(String(answered.value?.message || '')), String(answered.value?.message || '').slice(0, 300));
     await sh(dir, 'merge', '--abort').catch(() => {});
     await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+  }
+
+  // T38 — "NOTHING TO SPLIT" IS NOT "NOTHING ANSWERS IT", AND THE ENVELOPE HAS
+  // TO TELL THE CLIENT WHICH.
+  //
+  // `hunks: null` with both flags false is this envelope's word for the ONE
+  // path no `choices` value can answer: both branches renamed the same file, so
+  // git kept only the version the merge started from and there is no "ours" and
+  // no "theirs" to name. Every other unsplittable path HAS both sides and takes
+  // a whole-file word — which is what `[]` means.
+  //
+  // A binary file, a page whose bytes are not UTF-8 and a symlink used to READ
+  // as text and split into no disagreement, so they arrived as `[]` by
+  // accident. Once conflictText refused to decode them they became
+  // `parts === null` and fell into the rename/rename shape, whose note says "No
+  // `choices` value answers that one either". MEASURED: an agent that obeyed it
+  // omitted a conflicting PNG, the documented default committed OURS for it
+  // inside a two-parent merge reported `{ok: true, resolved: 1}`, and `feature`
+  // was recorded as merged — so safe-delete stopped protecting the branch whose
+  // image had just been discarded. "theirs" for the same file works and is
+  // byte-exact; the client was told not to send it.
+  {
+    const raw = (dir, rev) =>
+      new Promise((done, fail) =>
+        execFile('git', ['show', '--end-of-options', rev], { cwd: dir, encoding: 'buffer', maxBuffer: 1 << 26 }, (err, stdout) =>
+          err ? fail(err) : done(Buffer.from(stdout))
+        )
+      );
+    // NUL so git calls it binary, and 0x89/0xFF so the bytes are not UTF-8.
+    const png = (b) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]), Buffer.alloc(40, b), Buffer.from([0xff, 0xfe])]);
+    const envelopeFor = async (dir) => {
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
+      return { clash, files: mcp?.files || [] };
+    };
+
+    // A BINARY FILE: offered no hunks, but answerable, and byte-exact both ways.
+    for (const [side, want] of [['ours', 2], ['theirs', 3]]) {
+      const dir = await repo(`binary-${side}`);
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, 'logo.png'), png(1));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.writeFileSync(path.join(dir, 'logo.png'), png(2));
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'logo.png'), png(3));
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      const { clash, files } = await envelopeFor(dir);
+      const entry = files.find((f) => f.path === 'logo.png') || {};
+      check(`T38 binary: hunks is [] — no hunks offered, but an answer exists`, Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry));
+      check('T38 binary:   not null, which would mean nothing answers it', entry.hunks !== null, JSON.stringify(entry));
+      check('T38 binary:   and neither flag is set', entry.hunksOmitted === false && entry.markersUnread === false, JSON.stringify(entry));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'logo.png': side }, expect: clash.at });
+      check(`T38 binary: the whole-file "${side}" merges`, out?.ok === true && out.resolved === 1, JSON.stringify(out));
+      const got = await raw(dir, 'HEAD:logo.png');
+      check(`T38 binary:   into ${side}, byte for byte`, got.equals(png(want)), `${got.length} bytes, ${got.subarray(0, 4).toString('hex')}`);
+      check('T38 binary:   over a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+    }
+
+    // A NON-UTF-8 PAGE and A SYMLINK: the same shape, for the same reason.
+    {
+      const latin = await repo('latin1-envelope');
+      cleanup.push(latin);
+      const head = Buffer.from('<p>caf\xE9</p>\n', 'latin1');
+      const put = (tail) => fs.writeFileSync(path.join(latin, 'page.html'), Buffer.concat([head, Buffer.from(tail)]));
+      put('BASE\n');
+      await sh(latin, 'add', '-A');
+      await sh(latin, 'commit', '-qm', 'base');
+      await sh(latin, 'branch', 'feature');
+      put('OURS\n');
+      await sh(latin, 'commit', '-qam', 'ours');
+      await sh(latin, 'checkout', '-q', 'feature');
+      put('THEIRS\n');
+      await sh(latin, 'commit', '-qam', 'theirs');
+      await sh(latin, 'checkout', '-q', 'main');
+      const { files } = await envelopeFor(latin);
+      const entry = files.find((f) => f.path === 'page.html') || {};
+      check('T38 latin-1: hunks is [] and an answer exists', Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry));
+
+      const link = await linked('symlink-envelope', { ours: 'docs/notes.md', theirs: 'elsewhere' });
+      const both = await envelopeFor(link);
+      const linkEntry = (both.files || []).find((f) => f.path === 'link') || {};
+      check('T38 symlink: hunks is [] and an answer exists', Array.isArray(linkEntry.hunks) && linkEntry.hunks.length === 0, JSON.stringify(linkEntry));
+    }
+
+    // THE TWO SHAPES THAT MUST STAY NULL. Without these, "answer everything
+    // with []" passes every assertion above.
+    {
+      // Both branches renamed it: no side to name, and resolveMerge says so.
+      const dir = await repo('rename-rename-envelope');
+      cleanup.push(dir);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      await sh(dir, 'mv', 'a.txt', 'one.txt');
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      await sh(dir, 'mv', 'a.txt', 'two.txt');
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      const { clash, files } = await envelopeFor(dir);
+      const entry = files.find((f) => f.path === 'a.txt') || {};
+      check('T38 rename/rename: hunks stays null — nothing answers it', entry.hunks === null, JSON.stringify(entry));
+      check('T38 rename/rename:   with neither flag set', entry.hunksOmitted === false && entry.markersUnread === false, JSON.stringify(entry));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T38 rename/rename: and a whole-file word for it', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'no_sides')
+      );
+    }
+    {
+      // Markers that could not be read: BOTH sides exist, so the `hasSide` test
+      // would make this `[]` — and resolveMerge refuses every answer for it,
+      // including the whole-file word. It has to stay null.
+      const dir = await collide('unread-envelope', {
+        base: 'A conflict:\n<<<<<<< HEAD\no\n||||||| b\na\n=======\nt\n>>>>>>> f\nIntro\nBASE\nEnd\n',
+        ours: 'A conflict:\n<<<<<<< HEAD\no\n||||||| b\na\n=======\nt\n>>>>>>> f\nIntro\nOURS\nEnd\n',
+        theirs: 'A conflict:\n<<<<<<< HEAD\no\n||||||| b\na\n=======\nt\n>>>>>>> f\nIntro\nTHEIRS\nEnd\n',
+      });
+      const { clash, files } = await envelopeFor(dir);
+      const entry = files.find((f) => f.path === 'a.txt') || {};
+      check('T38 unread: hunks stays null although both sides exist', entry.hunks === null, JSON.stringify(entry));
+      check('T38 unread:   and says why', entry.markersUnread === true, JSON.stringify(entry));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T38 unread: and the whole-file word it would have invited', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.reason === 'unreadable_conflict')
+      );
+    }
+  }
+
+  // T39 — A REFUSAL MUST NOT BE BIGGER THAN THE REQUEST, ON EVERY BRANCH THAT
+  // ECHOES THE CALLER'S OWN STRING.
+  //
+  // `shown()` was applied inside the unknown-key loop alone, while `bad_value`
+  // and `bad_pick` put the caller's raw string into `given` — and the mapper
+  // interpolates the same string into `message`. `choices` is
+  // `z.record(z.string(), z.unknown())` with no bound on a value, so the wrong
+  // shape this refusal names by name — "the reconciled file text sent as a
+  // choice" — was the one that came back biggest. MEASURED: a 2 MB value made an
+  // 8 MB answer, echoed twice per envelope and sent twice on the wire.
+  {
+    const dir = await collide('refusal-size', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
+    const huge = 'x'.repeat(200000);
+    for (const [what, choice] of [
+      ['a whole-file word', huge],
+      ['one pick in a list', [huge]],
+    ]) {
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const asked = Buffer.byteLength(JSON.stringify({ choices: { 'a.txt': choice } }), 'utf8');
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': choice }, expect: clash.at });
+      const answered = Buffer.byteLength(JSON.stringify(out), 'utf8');
+      check(`T39 ${what}: is refused`, out?.ok === false && out.code === 'bad_choices', JSON.stringify(out).slice(0, 200));
+      check(`T39 ${what}:   and the answer is smaller than the question`, answered < asked, `${asked} B asked, ${answered} B answered`);
+      // Not merely smaller — bounded, so a bigger question does not buy a
+      // bigger answer.
+      check(`T39 ${what}:   by a bound, not by a ratio`, answered < 8000, `${answered} B`);
+      // AND IT STILL SAYS WHICH VALUE WAS WRONG: a clip that showed nothing
+      // would pass both checks above and help nobody.
+      const said = JSON.stringify(out.badChoices || []);
+      check(`T39 ${what}:   while still showing what was sent`, said.includes('xxxxx') && /characters/.test(said), said.slice(0, 200));
+    }
+  }
+
+  // T40 — THE GUIDE DOES NOT DESCRIBE A REFUSAL THAT CANNOT ARRIVE, OR
+  // DESCRIBE ONE WRONGLY.
+  //
+  // `bad_branch_name` was documented as "that branch is gone, or is not a name
+  // git takes". A branch that is gone answers `stale_merge`, MEASURED — and an
+  // MCP client cannot provoke the code at all, because resolve_merge takes the
+  // branch out of the signed mergeRef and git.merge checked it before minting
+  // one. It is still live for the panel, which passes a branch of its own.
+  {
+    const dir = await collide('guide-truth', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    await sh(dir, 'branch', '-D', 'feature');
+    const gone = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at }));
+    check('T40: a branch that is GONE answers stale_merge, not bad_branch_name', gone.value?.code === 'stale_merge', JSON.stringify(gone.value).slice(0, 200));
+    const model = require('../electron/mcp/guide.js').TOPICS['operating-model'].body;
+    const merge = model.slice(model.indexOf('## A merge conflict'), model.indexOf('## Semantic first'));
+    check('T40: and the guide no longer says otherwise', !/bad_branch_name\s+that branch is gone/.test(merge), merge.slice(merge.indexOf('bad_branch_name'), merge.indexOf('bad_branch_name') + 160));
+    check('T40:   saying instead that it cannot be provoked', /cannot provoke/.test(merge), 'not said');
+    check('T40:   and pointing at stale_merge for a branch that is gone', /GONE is stale_merge/.test(merge), 'not said');
+    // The code is still reachable from the caller that supplies its own branch.
+    const bad = await caught(() => resolveMerge(git, { projectPath: dir, branch: '--strategy=ours', choices: {}, expect: clash.at }));
+    check('T40:   while the code itself is still live for the panel', bad.value?.code === 'bad_branch_name', JSON.stringify(bad.value).slice(0, 160));
   }
 }
 

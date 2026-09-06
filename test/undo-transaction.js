@@ -1555,6 +1555,85 @@ const UNCOALESCED = 900;
         short({ ok: edited?.ok, holdsTheEdit: now.includes('SECOND OF THE PAIR') })
       );
 
+      // ── 9e. THE SAME PAIR, WITH A REF ────────────────────────────────────
+      //
+      // 9d edits THROUGH THE SELECTION, on the stated reasoning that "a ref
+      // carries the revision it was minted at and is refused as stale after
+      // the undo has moved it, which is a different (and correct) refusal".
+      // That reasoning holds when the two calls are made one after the other.
+      // It does NOT hold when they are issued CONCURRENTLY, which is how an MCP
+      // host issues parallel tool calls and how every `target.*` write an agent
+      // makes is shaped: the ref's revision is compared in commands.js, BEFORE
+      // `commit` joins the queue, so between the comparison and the write the
+      // undo runs to completion and nothing refuses anything.
+      //
+      // MEASURED, 5 runs in 5, both of 9d's closing assertions failing: the
+      // undo answered `{ok: true, undone: true}`, the edit answered
+      // `{ok: true}`, and the file held NEITHER change — word for word the
+      // sentence 9d's header says was fixed.
+      //
+      // The check is made again inside `commitNow`, where the write is, so a
+      // document that moved while the edit waited its turn refuses instead of
+      // overwriting. See commitNow.
+      {
+        const fresh = await run('target', 'read', { ref: refFor(ON_INDEX) });
+        check('9e: the node reads back for a fresh ref', fresh.ok === true, short(fresh));
+        const first = await run('target', 'set_text', { ref: fresh.ref, text: 'FIRST OF THE REF PAIR' });
+        check('9e: the edit that will be undone lands', first.ok === true, short(first));
+        await H.settle(UNCOALESCED);
+        check('9e:   and is on disk', app.read('src/pages/index.astro').includes('FIRST OF THE REF PAIR'), short(app.read('src/pages/index.astro').slice(0, 140)));
+        const second = await run('target', 'read', { ref: refFor(ON_INDEX) });
+        check('9e:   and a ref minted after it reads back', second.ok === true, short(second));
+
+        // Issued together, the way a host issues parallel tool calls. No held
+        // door: the point is the window between the ref's check and the write,
+        // which is open on its own.
+        const [undoAnswer, editAnswer] = await Promise.all([
+          run('project', 'undo'),
+          run('target', 'set_text', { ref: second.ref, text: 'SECOND OF THE REF PAIR' }),
+        ]);
+        await H.settle(UNCOALESCED);
+        const disk = app.read('src/pages/index.astro');
+        const holdsFirst = disk.includes('FIRST OF THE REF PAIR');
+        const holdsSecond = disk.includes('SECOND OF THE REF PAIR');
+        // WHICHEVER ORDER THEY RAN IN, THE FILE IS ONE OF THE TWO STATES THAT
+        // WERE ASKED FOR — never a third, and never a mixture. Both orderings
+        // are legitimate: undo-then-edit leaves SECOND, edit-then-undo takes
+        // the edit straight back and leaves FIRST.
+        check(
+          '9e: the file holds one of the two states asked for, not a third',
+          holdsFirst !== holdsSecond,
+          short({ holdsFirst, holdsSecond, disk: disk.slice(0, 160) })
+        );
+        // AND THE EDIT EITHER LANDED OR SAID WHY NOT, by name, so the caller
+        // knows to read again rather than believing bytes are there.
+        check(
+          '9e:   an edit that lost the race is refused as stale, not silently',
+          editAnswer?.ok === true || editAnswer?.code === 'stale_target',
+          short({ ok: editAnswer?.ok, code: editAnswer?.code, message: String(editAnswer?.message || '').slice(0, 160) })
+        );
+        // AND THE UNDO'S OWN ENVELOPE DOES NOT CONTRADICT ITSELF.
+        //
+        // `undone` is computed as "the past stack got shorter", which is true
+        // whatever the bytes did — and the envelope carries the two digests
+        // that say what the bytes DID do. MEASURED at 10b8b33, both from one
+        // Promise.all: `undone: true` beside
+        // `contentDigest === beforeDigest` — the API observing that the watched
+        // file had not moved — while the edit it raced answered `ok: true` and
+        // its bytes were never written. Two calls, two claims of success, one
+        // file that did not move at all.
+        //
+        // An undo that moved nothing and an edit that claims to have landed
+        // cannot both be true of the same file.
+        const restored = (undoAnswer?.restored?.files || [])[0] || null;
+        const movedNothing = !!restored && restored.contentDigest === restored.beforeDigest;
+        check(
+          '9e: an undo that moved no bytes does not sit beside an edit that claims it landed',
+          !(movedNothing && undoAnswer?.undone === true && editAnswer?.ok === true),
+          short({ undone: undoAnswer?.undone, movedNothing, editOk: editAnswer?.ok, restored })
+        );
+      }
+
       // Back to the fixture's own words, so section 10 starts from a page
       // nobody has left half-edited.
       const back = await run('target', 'read', { ref: refFor(ON_INDEX) });

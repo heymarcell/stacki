@@ -325,7 +325,15 @@ export function createAgentCommands(getApp) {
       const dry = applyOperations(model, operations, { insertables: a.insertables() });
       if (!dry.ok) return { ...dry, ok: false, document: doc };
 
-      const applied = await a.commit(operations, { label: args.label || 'agent edit' });
+      // The expectation travels WITH the write, so it is checked again once the
+      // write holds its turn. The checks above are not in the same queue as
+      // `commit`, and an undo running between them rewrites the whole document:
+      // measured, an undo and a ref-carrying set_text in one Promise.all both
+      // answered ok over a file that held neither change. See commitNow.
+      const applied = await a.commit(operations, {
+        label: args.label || 'agent edit',
+        expect: { revision: args.expectedRevision ?? null, digest: args.expectedDigest ?? null },
+      });
       if (!applied.ok) return { ...applied, document: doc };
       // What the document was before this edit, whether or not the caller
       // claimed to know. An agent that did not pass expectedRevision still

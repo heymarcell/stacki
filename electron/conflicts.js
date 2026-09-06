@@ -735,8 +735,14 @@ function renderResolved(parts, picks = [], sides = null) {
   // empty one, which removes exactly one separator with it. `both` is asked the
   // same way and keeps its newline between two sides that BOTH have lines.
   const chunks = [];
+  // The last CLASH that put anything into the file; null while nothing has.
+  let endedOn = null;
   for (const part of parts || []) {
     if (part.kind === 'same') {
+      // NOT reset here. A conflict block whose two versions end the same way
+      // splits into a clash and the agreed run after it, and `conflictAtEnd`
+      // calls that shape a conflict at the end — so the terminator behind that
+      // agreed run is still the chosen side's. See conflictAtEnd.
       chunks.push(part.text);
       continue;
     }
@@ -769,6 +775,11 @@ function renderResolved(parts, picks = [], sides = null) {
       lines = sideLines(part, 'ours');
     }
     if (lines === 0) continue;
+    // WHICH CLASH THE FILE ACTUALLY ENDS ON, recorded as it is written rather
+    // than assumed to be the last one. A clash whose chosen side has no lines
+    // contributes nothing, so the file ends on whatever came before it — see
+    // the terminator block below, which used to ask the last clash regardless.
+    endedOn = { part, pick };
     chunks.push(piece);
   }
   const text = chunks.join('\n');
@@ -788,9 +799,29 @@ function renderResolved(parts, picks = [], sides = null) {
   // So the side is the one the rendered text actually ENDS on. 'merged' is
   // asked the same way, by suffix, because a combined version ends on whichever
   // side contributed its last run and there is no word that says which.
+  // THE CLASH THE FILE ENDS ON, not the last one in the list.
+  //
+  // These were `parts.filter(clash).at(-1)` and `picks.at(-1)`, which is the
+  // same thing only while the last clash contributed lines. When its chosen
+  // side has ZERO — the ordinary shape of one branch deleting a trailing line —
+  // the file does not end on that clash at all, and its terminator was still
+  // read off that side's blob and stripped. MEASURED, ours "a\nX" and theirs
+  // "a\nY\n\n" over two hunks: `["theirs","ours"]` committed "a\nY", leaving
+  // "Y" unterminated although the "Y" came from theirs and theirs terminates
+  // it; `["theirs","theirs"]` committed "a\nY\n\n". Two answers differing by
+  // one blank line produced files differing by two bytes.
+  //
+  // WHEN NO CLASH CONTRIBUTED ANYTHING AT ALL, the rendered file is the agreed
+  // text alone — which is the whole of the version being taken, terminator and
+  // all. So the last answer still names the version to read it off, which is
+  // the reading this had before and the one `atEnd` in test/conflicts.js pins:
+  // ours "a", theirs "a\nC\n", answered `['ours']`, is "a" and must not gain a
+  // newline. That case and the one above are told apart by whether any clash
+  // put a line in, not by which clash is last.
   const list = parts || [];
-  const last = list.filter((part) => part.kind === 'clash')[clashCount(parts) - 1] || null;
-  const pick = picks[clashCount(parts) - 1];
+  const clashes = list.filter((part) => part.kind === 'clash');
+  const last = endedOn ? endedOn.part : clashes[clashes.length - 1] || null;
+  const pick = endedOn ? endedOn.pick : picks[clashes.length - 1];
   // The last line is sometimes neither side's — it is BOTH sides'. A conflict
   // block whose two versions end the same way splits into a clash and the
   // agreed run after it (see `conflictAtEnd`), so the file can end on text that
@@ -800,6 +831,24 @@ function renderResolved(parts, picks = [], sides = null) {
   // fall through to the same readings as everywhere else, which is where they
   // belong — with no line of its own at the end of the file, neither word
   // claims anything this could be more precise about.
+  // AND 'ours'/'theirs' ARE ASKED THE SAME QUESTION, because a word does not
+  // make a side the one the file ends on.
+  //
+  // This read the side straight off the pick, and `both` was corrected to ask
+  // by line count while these two were left. When the LAST clash's chosen side
+  // has ZERO lines — the ordinary shape of one branch deleting a trailing line
+  // — the rendered file does not end on that clash at all, and its terminator
+  // was still taken off that side's whole blob and stripped. MEASURED, ours
+  // "a\nX" and theirs "a\nY\n\n" over two hunks: `["theirs","ours"]`
+  // committed "a\nY" — "Y" left with no terminator, although the "Y" came from
+  // theirs and theirs terminates it. `["theirs","theirs"]` committed
+  // "a\nY\n\n". The two answers differ by one blank line; the files differed
+  // by two bytes.
+  //
+  // A clash whose chosen side contributed nothing falls through to null, which
+  // is already the reading for "neither side put anything at the end": git's
+  // own terminator is then the only one there is, and the rendered text keeps
+  // it.
   let endsOn = 'ours';
   if (pick === 'theirs') endsOn = 'theirs';
   // Asked by line count, the same question the `both` render above asks, so
@@ -836,7 +885,32 @@ function renderResolved(parts, picks = [], sides = null) {
   // immediately before the invented newline belongs to the line ending unless
   // that side's own last line really ends in one. Both readings are evidence
   // rather than convention — the rendered bytes and the blob git is holding.
-  const crlf = text.endsWith('\r\n') && !source.endsWith('\r');
+  return trimTerminator(text, source);
+}
+
+/**
+ * `text` with the terminator git invented taken off, one line ending's worth.
+ *
+ * Shared by both readings above so they cannot drift apart: the one that names
+ * a side, and the one where the file ends on agreed text and BOTH sides say
+ * there is no terminator.
+ *
+ * HOW MUCH TO TAKE IS ASKED OF THE SIDES, NOT GUESSED FROM THE TEXT. This used
+ * to slice exactly one character. In a CRLF file that removes the '\n' of a
+ * '\r\n' pair and leaves the '\r' behind — a byte NEITHER BRANCH WROTE, on the
+ * last line of the file, invisible in every editor that draws it. MEASURED with
+ * real git and `*.txt text eol=crlf`, ours "head\r\nOURS\r\n" and theirs
+ * "head\r\nTHEIRS" with no terminator: `['theirs']` rendered
+ * "head\r\nTHEIRS\r" where git's own checkout of that side is
+ * "head\r\nTHEIRS". Written, staged and committed as `{ok: true, resolved: 1}`.
+ *
+ * The chosen version has no terminator — that is what got us here — so a '\r'
+ * immediately before the invented newline belongs to the line ending unless a
+ * side's own last line really ends in one.
+ */
+function trimTerminator(text, ...sources) {
+  const own = sources.some((source) => typeof source === 'string' && source.endsWith('\r'));
+  const crlf = text.endsWith('\r\n') && !own;
   return text.slice(0, crlf ? -2 : -1);
 }
 

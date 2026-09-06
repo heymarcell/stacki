@@ -87,9 +87,9 @@ with any this surface gives anywhere: bad_arguments, permission_denied,
 no_project, and \`failed\` carrying git's words when git refuses (a pre-commit
 hook, a signing key it cannot use).
 
-Six are about the handle and all six mean the same thing to do — run git.merge
-and pass back the \`mergeRef\` it hands you, unchanged: guard_required (none sent,
-or recording no conflict), bad_ref (not one Stacki issued, or altered),
+Six are about the handle and mean one thing: run git.merge and pass back the
+\`mergeRef\` it hands you, unchanged. guard_required (it records no conflict; a ref
+you never sent is bad_arguments), bad_ref (not one Stacki issued, or altered),
 stale_ref (expired), wrong_project, wrong_kind (not a merge ref), wrong_target
 (a different merge from the one \`branch\` names).
 
@@ -97,24 +97,25 @@ The other five are about the merge:
 
   stale_merge      a commit landed on either branch, or git reconciles them
                    differently now; both SHAs are named. Run git.merge again and
-                   answer THAT, never re-send old answers
+                   answer THAT — never re-send old answers
   bad_choices      a key that is not a conflicting path, a list not as long as
                    that file's hunks, "merged" where the hunk offered none. The
-                   message says which and why
+                   message says which, and why
   merge_blocked    git would not start the re-merge, usually another process
-                   holding the repository. gitSaid has git's words; send it again
+                   holding the repository. gitSaid has git's words; retry
   working_tree_blocked   it must write a file with uncommitted changes in it.
-                   Commit, park or discard them and send the call again
-  bad_branch_name  that branch is gone, or is not a name git takes
+                   Commit, park or discard them, then send it again
+  bad_branch_name  not a name git takes. You cannot provoke it: the branch comes
+                   from the ref, checked when it was minted. A branch that is
+                   GONE is stale_merge
 
-The twelfth has NOT left the project as it was, and it is the only refusal here
-that says so:
+The twelfth has NOT left the project as it was, and says so:
 
   merge_stuck      the re-merge ran and the unwind did not take. Nothing was
                    committed and the branch did not move, but \`files\` names what
                    differs, from the REPOSITORY root. \`mergeInProgress\`: true,
-                   \`git merge --abort\`; false, nothing to abort and it takes
-                   \`git checkout HEAD -- <path>\`. Do not retry; ask.
+                   \`git merge --abort\`; false, \`git checkout HEAD -- <path>\`.
+                   Do not retry. Ask.
 
 ## Semantic first, source as the fallback
 

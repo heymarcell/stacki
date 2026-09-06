@@ -1278,24 +1278,56 @@ function createAgentApi({
     const moved = before ? watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel)) : [];
     const files = [...new Set([...claimed, ...moved])];
     if (!files.length) return answer;
-    return {
-      ...answer,
-      restored: {
-        ...answer.restored,
-        files: files.map((file) => {
-          const text = readFile(file);
-          const had = before && before.has(file) ? before.get(file) : undefined;
-          return {
-            file,
-            contentDigest: text === null ? null : digestOf(text),
-            // Only for the files this actually held a before-image of. A
-            // claimed file outside the watched set has no honest answer here,
-            // and `null` already means "there were no bytes".
-            ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
-          };
-        }),
-      },
+    const evidence = {
+      ...answer.restored,
+      files: files.map((file) => {
+        const text = readFile(file);
+        const had = before && before.has(file) ? before.get(file) : undefined;
+        return {
+          file,
+          contentDigest: text === null ? null : digestOf(text),
+          // Only for the files this actually held a before-image of. A
+          // claimed file outside the watched set has no honest answer here,
+          // and `null` already means "there were no bytes".
+          ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
+        };
+      }),
     };
+    // AND `undone`/`redone` ARE HELD TO THAT EVIDENCE.
+    //
+    // The flag is computed in the renderer from the ENTRY — the renderer
+    // returns null when there was nothing for this call to take off the stack,
+    // which is a real improvement on reading the stack depth across a queue.
+    // It still says nothing about bytes, and the field's stated contract is
+    // that `undone: true` means the bytes are on disk.
+    //
+    // MEASURED at 10b8b33, `project.undo` and a ref-carrying `target.set_text`
+    // in one `Promise.all`, 5 runs in 5: the entry came off the stack, so
+    // `undone: true`, while every watched file's `contentDigest` equalled its
+    // `beforeDigest` — this function's own observation that NOTHING MOVED —
+    // and the edit racing it answered `ok: true` over bytes that were never
+    // written. Two claims of success over a file that did not change at all.
+    //
+    // Where this watched the before-image and every file it watched is
+    // unchanged, the restore moved nothing, and the flag says so. A no-op undo
+    // reported as no-op is at worst a pedantic false negative on a flag; the
+    // alternative is a false success on the one field an agent uses to decide
+    // whether to read the file again.
+    const knew = evidence.files.filter((f) => f.beforeDigest !== undefined);
+    const movedNothing = knew.length > 0 && knew.every((f) => f.contentDigest === f.beforeDigest);
+    const flag = answer.undone !== undefined ? 'undone' : answer.redone !== undefined ? 'redone' : null;
+    if (movedNothing && flag && answer[flag] === true) {
+      return {
+        ...answer,
+        [flag]: false,
+        restored: evidence,
+        note:
+          'That change came off the history stack, but no file this watched moved — so there are no restored bytes ' +
+          'to read. Something else wrote the document while this was in flight. Read the file again before ' +
+          'deciding what to do next.',
+      };
+    }
+    return { ...answer, restored: evidence };
   }
 
   /**

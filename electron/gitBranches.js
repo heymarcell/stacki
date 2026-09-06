@@ -1425,8 +1425,22 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // keys came back as a 40 MB refusal, sent twice by the envelope, so ~80 MB
   // reached the client from one schema-legal call. A name too long to be a path
   // is named at the length that shows what was wrong with it.
+  //
+  // AND IT IS THE VALUES TOO, NOT JUST THE KEYS. This was applied inside the
+  // unknown-key loop alone, while `bad_value`, `bad_pick` and `bad_shape` put
+  // the caller's raw string into `given` — and the mapper interpolates that same
+  // string into `message`. `choices` is `z.record(z.string(), z.unknown())` with
+  // no bound on a value, so the one wrong shape this refusal exists to catch by
+  // name — "the reconciled file text sent as a choice" — is the one that comes
+  // back biggest. MEASURED: a 2 MB value made an 8 MB answer (echoed twice per
+  // envelope, and the envelope goes out twice), from a request the 32 MB body
+  // cap would have let reach 32 MB.
   const shown = (key) =>
-    key.length <= MAX_SHOWN_PATH_CHARS ? key : `${key.slice(0, MAX_SHOWN_PATH_CHARS)}… (${key.length} characters)`;
+    typeof key !== 'string'
+      ? key
+      : key.length <= MAX_SHOWN_PATH_CHARS
+        ? key
+        : `${key.slice(0, MAX_SHOWN_PATH_CHARS)}… (${key.length} characters)`;
   // AND COUNTED RATHER THAN ALL LISTED, because the clip alone did not make the
   // answer smaller than the question — which is what its comment claimed.
   // MEASURED: 400 keys of exactly 512 characters, a 209 KB request, came back as
@@ -1528,7 +1542,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     }
     if (typeof choice === 'string') {
       if (!WHOLE_FILE.has(choice)) {
-        unusable.push({ path: file, given: choice, reason: 'bad_value', expected: [...WHOLE_FILE] });
+        unusable.push({ path: file, given: shown(choice), reason: 'bad_value', expected: [...WHOLE_FILE] });
         continue;
       }
       // A SIDE THAT IS IN THE VOCABULARY IS NOT ALWAYS A SIDE THIS FILE HAS.
@@ -1563,7 +1577,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       }
       const bad = choice.find((pick) => !PER_HUNK.has(pick));
       if (bad !== undefined) {
-        unusable.push({ path: file, given: typeof bad === 'string' ? bad : typeof bad, reason: 'bad_pick', expected: [...PER_HUNK] });
+        unusable.push({ path: file, given: typeof bad === 'string' ? shown(bad) : typeof bad, reason: 'bad_pick', expected: [...PER_HUNK] });
         continue;
       }
       const parts = partsOf(file);

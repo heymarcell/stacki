@@ -131,13 +131,18 @@ const MAX_READ_MS = 2000;
 // rule and the same move, `site.css` -> "alpha\n      beta" preserved,
 // `site.scss` -> "alpha\n    beta", two rendered spaces gone under ok: true.
 //
-// postcss reads scss/less/pcss well enough to find the declarations; the
-// indented syntaxes (.sass, .styl) it will not parse at all, and that is
-// already handled — tokensInCss answers [ANY] for a text it cannot parse, so
-// those projects get the refusing answer instead of the empty one. Reading
-// them is what makes both outcomes possible; skipping them made only the wrong
-// one possible.
+// postcss reads scss/less/pcss well enough to find the declarations. The
+// indented syntaxes are not CSS at all and are not parsed: see INDENTED_SYNTAX
+// and the reducer, where they answer "I could not read this" outright rather
+// than being handed to a parser that sometimes accepts them and finds nothing.
+// Reading all of these is what makes the refusing answer possible; skipping
+// them made only the wrong one possible.
 const STYLESHEET = /\.(css|pcss|postcss|scss|sass|less|styl|stylus)$/i;
+
+// The ones written without braces or semicolons. postcss has no parser for
+// these, so whatever it makes of one is an accident — see the reducer, which
+// answers ANY for them rather than asking.
+const INDENTED_SYNTAX = /\.(sass|styl|stylus)$/i;
 
 // Every file whose text could hold a rule. Stylesheets, and the `<style>`
 // blocks of pages, layouts and components.
@@ -243,7 +248,28 @@ function declarationPreserves(decl) {
   const value = String(decl.value || '')
     .replace(/!\s*important\s*$/i, '')
     .trim();
-  if (/var\s*\(/i.test(value)) return true;
+  // A VALUE THIS CANNOT EVALUATE IS "COULD BE", NOT "IS NOT".
+  //
+  // The docstring above has always said so; only `var(` implemented it. Every
+  // other unreadable spelling — a Sass `$ws`, a Less `@ws`, `map-get($m, ws)`,
+  // `if($c, pre, normal)`, `env(--ws)`, a `#{...}` interpolation — fell through
+  // to the value table, failed it, and contributed NOTHING. Nothing is not
+  // doubt: it is the positive answer "no rule here preserves this element's
+  // whitespace", and it is the one that deletes bytes the page shows.
+  //
+  // This mattered little while the scan read `.css` alone, because those
+  // spellings only occur in the preprocessor files it skipped. Widening
+  // STYLESHEET to read them turned a file that was NOT SEEN into a file that is
+  // read and answered WRONGLY. MEASURED, the same move over the same markup:
+  // `white-space: pre` in site.scss held `alpha\n      beta`; `$ws: pre;
+  // white-space: $ws` in the same file gave `alpha\n    beta` — two rendered
+  // spaces gone under ok: true.
+  //
+  // So the question is asked the other way round: a value that is not one of
+  // the words this understands, and is not plainly a word at all, is unreadable
+  // and therefore preserving. Over-answering here only ever refuses a reindent.
+  const READABLE_WORD = /^[a-z-]+$/i;
+  if (!READABLE_WORD.test(value)) return true;
   return prop === 'white-space' ? PRESERVING_VALUE.test(value) : PRESERVING_COLLAPSE_VALUE.test(value);
 }
 
@@ -667,6 +693,30 @@ function preservingTokens(projectPath, options = {}) {
         tokens.add(ANY);
         continue;
       }
+    }
+    // AN INDENTED-SYNTAX FILE IS UNREADABLE BY CONSTRUCTION, WHETHER OR NOT
+    // POSTCSS THROWS.
+    //
+    // `.sass` and `.styl` are not CSS: the braces and semicolons postcss parses
+    // by are absent. Most such files make it throw, and tokensInCss answers
+    // [ANY] for a text it cannot parse — which is what the comment above
+    // STYLESHEET originally claimed made reading them safe. That claim was
+    // FALSE for an ordinary shape: a file whose first statement is an at-rule
+    // with no `;` — `@use 'sass:math'`, the modern Dart Sass module spelling, or
+    // a file of `@mixin`s — parses cleanly, because the at-rule swallows the
+    // rest of the file as its parameters. No rule is found, nothing throws, and
+    // the file contributes the EMPTY set. MEASURED: a project whose only rule
+    // was `.preserved / white-space: pre` under a `@use` header answered `[]`
+    // and the same move deleted two rendered spaces under ok: true.
+    //
+    // Depending on the parser to fail is depending on an accident. These
+    // extensions answer "I could not read this" outright, which is the answer
+    // the widening was for: before it they were not read at all, and not being
+    // read is what produced the empty set. It is blunt — one `.styl` file makes
+    // the whole project refuse a reindent — and blunt in the safe direction.
+    if (INDENTED_SYNTAX.test(abs)) {
+      tokens.add(ANY);
+      continue;
     }
     for (const one of readableTexts(abs, text)) {
       for (const token of tokensInCss(one)) tokens.add(token);

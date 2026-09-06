@@ -5586,8 +5586,44 @@ export default function App() {
      * the two doors an agent has into the open document, `commit` and
      * `writeOpenSource`, alongside the two that take it back.
      */
-    commit: async (operations, { label } = {}) => oneAtATime(() => agentAppRef.current.commitNow(operations, { label })),
-    commitNow: async (operations, { label } = {}) => {
+    commit: async (operations, { label, expect } = {}) =>
+      oneAtATime(() => agentAppRef.current.commitNow(operations, { label, expect })),
+    commitNow: async (operations, { label, expect } = {}) => {
+      // THE EXPECTATION IS CHECKED AGAIN HERE, INSIDE THE TURN.
+      //
+      // commands.js checks it before calling this, which is where a caller's
+      // `stale_target` comes from — and that check is not in the queue this
+      // call joins, so between the two an undo can run to completion. MEASURED,
+      // `project.undo` and a ref-carrying `target.set_text` in one
+      // `Promise.all`, 5 runs in 5: the ref's revision still matched when it
+      // was read, so nothing refused it; the undo then rewrote the whole
+      // document; and both calls answered ok while the file held NEITHER
+      // change. That is the exact sentence the note above says was fixed, and
+      // it was fixed only for the selection form, which carries no expectation
+      // and therefore had nothing to check outside the queue.
+      //
+      // A check that decides whether a write is safe has to be made where the
+      // write is made. Re-asking costs one comparison and closes the window
+      // completely, whatever else is queued.
+      if (expect && (expect.revision != null || expect.digest != null)) {
+        // Through the bundle, not through captured state: the whole point is
+        // that this runs after an await, in whatever the app is now.
+        const app = agentAppRef.current;
+        const file = app.openFile();
+        const revision = app.revision();
+        const digest = app.digest();
+        const moved =
+          (expect.revision != null && expect.revision !== revision) || (expect.digest != null && expect.digest !== digest);
+        if (moved) {
+          return {
+            ok: false,
+            code: 'stale_target',
+            message:
+              `${file} changed while this edit was waiting its turn behind another write` +
+              `${expect.revision != null ? ` (revision ${expect.revision} → ${revision})` : ''}. Nothing was changed.`,
+          };
+        }
+      }
       // Resolved BEFORE the mutation, because the mutation cannot await: this
       // is the one place a component an agent places can be given the import
       // it needs, and an insert that cannot have one is refused here rather

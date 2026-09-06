@@ -1637,11 +1637,13 @@ const git = {
           //                   that name). resolve_merge answers `no_sides` for
           //                   it, and no `choices` value can help.
           //
-          // A BINARY file is NOT one of these: it reads as text, splits into no
-          // disagreement, and comes back with `hunks: []` and both flags false —
-          // which this comment used to cite as the precedent for `hunks: null`,
-          // wrongly. It takes a whole-file word like any other unsplittable
-          // file.
+          // A BINARY file is NOT one of these. It used to READ as text and split
+          // into no disagreement, which is how it arrived as `hunks: []`; since
+          // conflictText refuses to decode bytes that are not UTF-8 it has no
+          // parts at all, and the `hasSide` test below is what keeps it in the
+          // `[]` shape it belongs in. Either way it takes a whole-file word like
+          // any other unsplittable file — this comment once cited it as the
+          // precedent for `hunks: null`, wrongly.
           const parts = Array.isArray(f?.parts) ? f.parts : null;
           // At the width git wrote them, which travels on the file beside the
           // parts: this surface has no repository to ask and seven is only git's
@@ -1676,7 +1678,48 @@ const git = {
           // project exactly as it does for a binary one. `[]` is already the
           // shape that means "no hunks are offered; send a whole-file word".
           const inProject = sourcePathOf(f?.path) !== null;
-          const clashes = parts && !unread ? (inProject ? parts.filter((part) => part && part.kind === 'clash') : []) : null;
+          // AND "NOTHING TO SPLIT" IS NOT "NOTHING ANSWERS IT".
+          //
+          // `null` is this envelope's word for the ONE path no `choices` value
+          // can answer: both branches renamed the same file, so git kept only
+          // the version the merge started from and there is no "ours" and no
+          // "theirs" to name. Every other unsplittable path — a binary file, a
+          // page whose bytes are not UTF-8, a symlink, a path outside the
+          // project — HAS both sides and takes a whole-file word, which is what
+          // `[]` means here.
+          //
+          // Those three used to read as text and split into no disagreement, so
+          // they arrived as `[]` by accident. Once conflictText started refusing
+          // to decode them they became `parts === null` and collapsed into the
+          // rename/rename shape, and the note's only sentence about that shape
+          // says "No `choices` value answers that one either". MEASURED: an
+          // agent that obeyed it omitted a conflicting PNG, the documented
+          // default committed OURS for it inside a two-parent merge reported
+          // `{ok: true, resolved: 1}`, and `feature` was thereafter recorded as
+          // merged — so safe-delete stopped protecting the branch whose image
+          // had just been discarded. Sending "theirs" for the same file works
+          // perfectly and is byte-exact; the client was told not to.
+          //
+          // The index is what tells the two apart, and it was already read:
+          // stage 2 and stage 3 are on the clash. Neither present is the
+          // unanswerable path; either present is a whole-file answer.
+          //
+          // `markersUnread` keeps `null` and is checked FIRST: that path has
+          // both sides and would pass the test below, but resolveMerge refuses
+          // every answer for it by name — the whole-file word included, because
+          // the caller who typed it was answering a description of the file
+          // that was not true. Telling a client to send one would be an
+          // instruction that is refused.
+          const hasSide = f?.ours != null || f?.theirs != null;
+          const clashes = unread
+            ? null
+            : parts
+              ? inProject
+                ? parts.filter((part) => part && part.kind === 'clash')
+                : []
+              : hasSide
+                ? []
+                : null;
           const encoded = JSON.stringify(clashes ?? null);
           const bytes = Buffer.byteLength(encoded, 'utf8');
           // A NULL HUNK LIST IS NOT A HUNK LIST THAT DID NOT FIT.
@@ -1745,8 +1788,9 @@ const git = {
             'it, or reconcile it in the project. `hunks: null` with BOTH of those false is a third thing again: ' +
             'there was no text to split, which is what a path with no version of its own looks like (both ' +
             'branches renaming the same file leaves only the version the merge started from under that name). ' +
-            'No `choices` value answers that one either. A file with `hunks: []` is splittable text with no ' +
-            'disagreement in it, a binary file, or one outside the open project — the hunks of a file this ' +
+            'No `choices` value answers that one either. A file with `hunks: []` is one with both versions but ' +
+            'no hunk list to offer: splittable text with no disagreement in it, a binary file, a page whose ' +
+            'bytes are not UTF-8, a symlink, or one outside the open project — the hunks of a file this ' +
             'surface will not let you read are not sent either — and each of those takes a whole-file word. ' +
             'Mind the two path spaces: ' +
             '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +

@@ -484,13 +484,22 @@ indentation between its children treated as content and therefore left out.
 that is in the project as text. It therefore does not see a rule that arrives
 from outside it — a stylesheet fetched from a URL or served out of
 `node_modules` — one injected at runtime by script, or a class name that only
-exists after a build step and is not written in the markup. It reads `.css`
-only, so a rule written in `.scss`, `.sass`, `.less` or `.styl` is not seen. It
-does not run a build: a custom utility declared in a JavaScript config rather
+exists after a build step and is not written in the markup. It reads `.css`, `.pcss`,
+`.postcss`, `.scss` and `.less`, and the `<style>` blocks of pages, layouts and
+components. The indented syntaxes — `.sass`, `.styl`, `.stylus` — are not CSS
+and are not parsed at all: a project containing one resolves to "could match
+anything", so no reindent of rendered whitespace happens anywhere in it. That is
+blunt, and blunt in the safe direction; the alternative measured worse, because
+postcss accepts some `.sass` files (one whose first statement is `@use
+'sass:math'`, say) without finding any rule in them, which would read as the
+positive "nothing here preserves whitespace". It does not run a build: a custom utility declared in a JavaScript config rather
 than in CSS is invisible, so `@apply my-utility` reads as preserving nothing —
 whereas an `@utility` or `@mixin` block in the project's CSS that declares
 `white-space` does resolve to "could match anything", because which elements end
-up with it is not answerable from the text. It also cannot resolve a `class`
+up with it is not answerable from the text. A value it cannot evaluate statically — `var(--ws)`, a Sass
+`$ws`, a Less `@ws`, `map-get(...)`, an interpolation — is read as preserving
+rather than as absent, so such a rule refuses a reindent instead of permitting
+one. It also cannot resolve a `class`
 whose value is an expression rather than a literal, and it never consults the
 live preview: doing so would make the bytes written to disk depend on whether a
 window is open and which route it shows, and could not answer about a
