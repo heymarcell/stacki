@@ -64,22 +64,40 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
 // A DISPOSABLE COPY, ALWAYS. The forensic dogfood project is evidence; a replay
 // that edited it would destroy the thing the replay is about.
 
+/**
+ * A disposable copy of a real project, with the replay's own fixtures over it.
+ *
+ * THE COPY IS NOT OPTIONAL. The dogfood's project is evidence; a replay that
+ * edited it would destroy the thing it is about. And it has to be a copy of a
+ * REAL one rather than a fresh directory, because the packaged app refuses to
+ * open a project with no dependencies installed — which is correct of it, and
+ * means the fixture has to arrive with `node_modules`.
+ *
+ * The overlay is what makes the scenarios repeatable: the pages, the stylesheet
+ * and the asset below are shaped like the exact things that broke, so the
+ * replay asks the same questions whatever the borrowed project happens to
+ * contain.
+ */
 function disposableCopy(from) {
   const to = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-replay-project-'));
   fs.cpSync(from, to, { recursive: true, dereference: false });
   fs.rmSync(path.join(to, '.git'), { recursive: true, force: true });
+  fs.rmSync(path.join(to, '.stacki'), { recursive: true, force: true });
+  fs.rmSync(path.join(to, '.astro'), { recursive: true, force: true });
   return to;
 }
 
-/** A project of this script's own, shaped like the things the dogfood broke. */
-function buildProject() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-replay-project-'));
+/** The replay's own pages, written over whatever the copy had. */
+function overlayFixtures(root) {
   const w = (rel, text) => {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
     fs.writeFileSync(path.join(root, rel), text, 'utf8');
   };
-  w('package.json', JSON.stringify({ name: 'replay', type: 'module', dependencies: { astro: '^5.0.0' } }, null, 2));
-  w('astro.config.mjs', "import { defineConfig } from 'astro/config';\nexport default defineConfig({});\n");
+  // Anything else under src/pages would be a page the scenarios have to account
+  // for; the replay owns this project's routes.
+  for (const entry of fs.readdirSync(path.join(root, 'src', 'pages'), { withFileTypes: true })) {
+    fs.rmSync(path.join(root, 'src', 'pages', entry.name), { recursive: true, force: true });
+  }
   // TABS and a joined emoji, exactly as the dogfood's own page had them.
   w(
     'src/pages/index.astro',
@@ -140,7 +158,6 @@ body {
 `
   );
   w('public/images/hero.png', 'PNG-BYTES');
-  w('src/content.config.ts', "import { defineCollection, z } from 'astro:content';\nexport const collections = {};\n");
   return root;
 }
 
@@ -169,8 +186,16 @@ body {
     process.exit(1);
   }
 
-  const project = arg('project') ? disposableCopy(arg('project')) : buildProject();
-  say(`project (a disposable copy): ${project}`);
+  // The dogfood's own project by default — a COPY of it, with the replay's
+  // fixtures written over the top.
+  const source = arg('project', '/Users/heymarcell/DEV/stacki-live-dogfood');
+  if (!fs.existsSync(path.join(source, 'node_modules', 'astro'))) {
+    console.error(`dogfood-replay: ${source} has no installed astro. Pass --project=<a project with node_modules>.`);
+    process.exit(2);
+  }
+  say(`copying ${source} …`);
+  const project = overlayFixtures(disposableCopy(source));
+  say(`project (a disposable copy, fixtures overlaid): ${project}`);
   say(`window: ${visible ? 'VISIBLE — this will take the screen' : 'hidden'}`);
   say();
 
