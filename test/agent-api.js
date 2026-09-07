@@ -348,7 +348,7 @@ const OTHER = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agen
 
   // EVERY OPERATION'S RISK, WRITTEN DOWN HERE.
   //
-  // The permission matrix drives all 111 operations at all four levels and
+  // The permission matrix drives all 112 operations at all four levels and
   // checks each answer against the policy — but it asks the REGISTRY what an
   // operation needs, and the gate reads that same field. So it proves the gate
   // is consistent with the registry, never that the registry is right:
@@ -368,7 +368,7 @@ const PINNED_RISK = {
   read: [
     'target.read', 'target.select', 'target.enter', 'target.exit', 'style.read',
     'style.list_sources', 'style.read_source', 'style.variables', 'source.read',
-    'source.read_symbol', 'source.resolve_path', 'page.list', 'page.read',
+    'source.read_symbol', 'source.resolve_path', 'page.list', 'page.read', 'page.open',
     'page.component_usage', 'page.dynamic_paths', 'page.injected_routes', 'page.import_path',
     'page.rebase_import', 'content.cms_list', 'content.cms_read', 'content.cms_usage',
     'content.cms_meta', 'content.config', 'content.collections', 'content.entries',

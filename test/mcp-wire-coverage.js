@@ -190,9 +190,25 @@ async function watchdogsWork() {
     fired instanceof CaseTimeout && fired.message.includes(label) && hangs.state.fired === true,
     fired ? `it threw ${fired?.name}: ${fired?.message}` : `nothing was thrown after ${elapsed}ms — the bound did not fire at all`
   );
+  // WHAT THIS IS ASKING, and why it is not `elapsed >= bound` exactly.
+  //
+  // The property is that the bound is what ended the step — promptly, rather
+  // than the promise being waited out — so the failures it must catch are a
+  // kill that fires IMMEDIATELY (a constant reject, which would make every
+  // bound meaningless) and one that fires far too late or never.
+  //
+  // A `setTimeout(150)` is allowed to fire a whisker early: Node clamps against
+  // a coarser clock than `Date.now()` reads, and under load this run measured
+  // 149ms for a 150ms bound and failed the whole chain on it. That is a false
+  // RED about the timer's resolution, not about the watchdog, and a suite that
+  // fails for reasons it is not testing teaches people to rerun it.
+  //
+  // So: at least most of the bound, and nowhere near waiting it out. A constant
+  // reject measures ~0ms and still fails.
+  const SLACK_MS = 2;
   check(
     'and it ends it at its bound rather than waiting it out',
-    elapsed >= bound && elapsed < bound * 20,
+    elapsed >= bound - SLACK_MS && elapsed < bound * 20,
     `bound ${bound}ms · ended after ${elapsed}ms`
   );
 

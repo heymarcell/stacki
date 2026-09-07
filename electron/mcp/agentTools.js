@@ -715,6 +715,15 @@ const PageInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }),
   z.object({ action: z.literal('read'), path: RelPath }),
   z.object({
+    action: z.literal('open'),
+    route: z
+      .string()
+      .max(300)
+      .optional()
+      .describe('The route to show, as page.list reports it — "/", "/about", "/blog/first". A full URL is accepted too.'),
+    path: PagePath.optional().describe('Or the page by path, as page.create and page.list answer with.'),
+  }),
+  z.object({
     action: z.literal('create'),
     // A NAME, NOT A PATH, and the only argument in this domain that is not one.
     // It says so, because the difference is exactly what a caller gets wrong.

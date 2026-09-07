@@ -36,7 +36,7 @@ only the first while sounding like the second.
 | Negotiated legacy version asserted | — | — | **BEST EFFORT** | no test asserts the version returned |
 | Server instructions reach the model | ✅ quoted back verbatim | n/a | **TESTED** | a session asked to quote them, with no tool calls, returned all of them. Now 1,826 bytes against a measured host cap of 2,048 characters; `test/host-limits.js` fails if anything crosses it |
 | `tools/list` | ✅ 11/11 | ✅ | **TESTED** | 165,135 bytes (17,783 gzipped) — HTTP bytes, not model context; see "What the catalogue actually costs" below |
-| `tools/call` | ✅ 83 calls | ✅ | **TESTED** | all 14 tools registered; `test/mcp-wire-coverage.js` covers all <!--count:total-->111<!--/--> operations |
+| `tools/call` | ✅ 83 calls | ✅ | **TESTED** | all 14 tools registered; `test/mcp-wire-coverage.js` covers all <!--count:total-->112<!--/--> operations |
 | Arguments that belong to another action are refused | — | ✅ | **TESTED** | every branch is closed (`additionalProperties: false`); a foreign key is `bad_arguments` and nothing is dispatched. `test/schema-dispatch-contract.js` |
 | Structured output validated against the delivered schema | — | ✅ | **TESTED** | `test/mcp-modern.js` |
 | `resources/list` | ✅ 11/11 | ✅ | **TESTED** | 2,233 bytes each time |

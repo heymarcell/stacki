@@ -72,6 +72,7 @@ says so.
 | --- | --- | --- | --- | --- | --- |
 | `list` | Inspect | main | — | electron/main.js project:scan | Pages, components and layouts in the project. |
 | `read` | Inspect | main | — | electron/astroParser.js parsePage | A page or component's model, imports and structure. |
+| `open` | Inspect | renderer | — | src/App.jsx selectPage — the same call the page switcher makes | Put a page on the canvas, so get_context and capture are about it — what the page switcher does. |
 | `create` | Edit project | main | — | electron/main.js page:create | Create a page, optionally wrapped in a layout. |
 | `delete` | Full control | main | — | electron/main.js page:delete | Delete a page file. |
 | `move` | Edit project | main | — | electron/main.js page:move | Move or rename a page, rewriting its imports. |
@@ -197,7 +198,7 @@ says so.
 
 ## Totals
 
-- 8 domains, 111 operations.
-- 48 readable in Inspect, 46 more in Edit project, 17 more in Full control.
+- 8 domains, 112 operations.
+- 49 readable in Inspect, 46 more in Edit project, 17 more in Full control.
 - 32 land on Stacki's own undo stack.
 - 57 capabilities deliberately kept out.

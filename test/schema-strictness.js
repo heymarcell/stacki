@@ -431,7 +431,11 @@ const declaredDefaults = (json) => {
     // these numbers is what the sweep below is measured against; a change to
     // any of them is somebody adding or removing a shape on the public input
     // surface, and it should have to be written down.
-    check('the input surface has 158 closed object positions', byKind('closed').length === 158, String(byKind('closed').length));
+    //
+    // 158 -> 159 when the page domain gained `open`: one more branch on the
+    // `page` union, and a branch is a closed object position. Written down,
+    // which is the point of the number.
+    check('the input surface has 159 closed object positions', byKind('closed').length === 159, String(byKind('closed').length));
     check('  9 record positions, where the caller chooses the keys', byKind('record').length === 9, String(byKind('record').length));
     check('  6 shapeless values, where the caller chooses everything', byKind('any').length === 6, String(byKind('any').length));
     check('  and no object with a shape and no fence', byKind('openObject').length === 0, byKind('openObject').map((l) => l.label).join(', '));
@@ -604,7 +608,10 @@ const declaredDefaults = (json) => {
     );
     check(
       '  and every one of them either named the key or is a registered exception',
-      named === 151 && unnameable === 7,
+      // 151 -> 152 with `page.open`: one more closed branch, and its unknown
+      // key is nameable like every other branch's. The seven that cannot name
+      // one are unchanged and are listed below with the reason each is open.
+      named === 152 && unnameable === 7,
       `${named} named the key, ${unnameable} could not: ${byKind('closed').filter(cannotName).map((l) => l.label).join(', ')}`
     );
 
@@ -1096,7 +1103,15 @@ const declaredDefaults = (json) => {
     // a schema it has already closed, so the array keeps its own identity and
     // there is one fewer rebuilt node. Nothing a client is shown changed:
     // measured, the fourteen published documents are byte-identical either way.
-    check('the rebuild replaced 196 nodes on the published surface, and each remembers its original', pairs.length === 196, `${pairs.length} rebuilt nodes`);
+    //
+    // It went back to 197 when the page domain gained `open` — one more branch
+    // in the `page` union, and a branch is a rebuilt node. The three totals
+    // below moved with it, by the two bounded strings that branch declares
+    // (`route` and `path`, counted once for the branch and once again inside
+    // the rebuilt union above it): 1,101 -> 1,107 and 1,086 -> 1,092. The
+    // numbers are here so that a bound going MISSING is loud; a bound arriving
+    // on purpose is supposed to be argued for in this comment.
+    check('the rebuild replaced 197 nodes on the published surface, and each remembers its original', pairs.length === 197, `${pairs.length} rebuilt nodes`);
     check(
       '  including the eight domain unions themselves',
       ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((n) => pairs.some((p) => p.at === n)),
@@ -1215,8 +1230,8 @@ const declaredDefaults = (json) => {
     // supposed to be argued for in this comment.
     check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
     check(
-      '  and compared real constraints: 1,101 bound keywords across the rebuilt nodes',
-      bounds === 1101,
+      '  and compared real constraints: 1,107 bound keywords across the rebuilt nodes',
+      bounds === 1107,
       `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
     );
 
@@ -1246,7 +1261,7 @@ const declaredDefaults = (json) => {
       for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
     }
     check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
-    check('  and the tally walked something: 1,086 checks across the rebuilt nodes', checksSeen === 1086, `${checksSeen} checks`);
+    check('  and the tally walked something: 1,092 checks across the rebuilt nodes', checksSeen === 1092, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────

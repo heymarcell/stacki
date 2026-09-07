@@ -123,6 +123,10 @@ const OPERATIONS = {
   page: {
     list: { risk: 'read', via: 'main', channel: 'project:scan', summary: 'Pages, components and layouts in the project.', reuses: 'electron/main.js project:scan' },
     read: { risk: 'read', via: 'main', channel: 'page:read', summary: "A page or component's model, imports and structure.", reuses: 'electron/astroParser.js parsePage' },
+    // `read` for the same reason `target.select` is: it changes what is on
+    // SCREEN and nothing on disk. No file moves, no dev server starts, and
+    // navigating back is free.
+    open: { risk: 'read', via: 'renderer', summary: 'Put a page on the canvas, so get_context and capture are about it — what the page switcher does.', reuses: 'src/App.jsx selectPage — the same call the page switcher makes' },
     create: { risk: 'write', via: 'main', channel: 'page:create', summary: 'Create a page, optionally wrapped in a layout.', reuses: 'electron/main.js page:create' },
     delete: { risk: 'high', via: 'main', channel: 'page:delete', summary: 'Delete a page file.', reuses: 'electron/main.js page:delete' },
     move: { risk: 'write', via: 'main', channel: 'page:move', summary: 'Move or rename a page, rewriting its imports.', reuses: 'electron/main.js page:move' },

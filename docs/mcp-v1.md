@@ -83,8 +83,8 @@ already have.
 | --- | --- | --- |
 | Server instructions | 1,826 bytes, capped by `test/host-limits.js` against a host limit of 2,048 characters | every connection |
 | Tools | **14** | `tools/list` is **165,135 bytes** (17,783 gzipped) |
-| Agent operations | **<!--count:total-->111<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->110<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
-| Permission answers | **<!--count:permAnswers-->444<!--/-->** (<!--count:total-->111<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
+| Agent operations | **<!--count:total-->112<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->111<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
+| Permission answers | **<!--count:permAnswers-->448<!--/-->** (<!--count:total-->112<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
 | Resources | **7** — `stacki://guide/{operating-model,editing,review,audit,astro}`, `stacki://project/profile` and `stacki://build` | a read costs only when asked |
 | Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,135 bytes |
 
@@ -124,7 +124,7 @@ bytes and is serialised once per domain tool — **41,589 bytes, 30% of the whol
 catalogue, all identical**. There is no mechanism in the protocol for tools to
 share a schema: each tool's `outputSchema` is a standalone document, so `$ref`
 cannot cross between them. The only ways to remove that cost are to collapse the
-domain tools into fewer tools, which would change the <!--count:total-->111<!--/-->/14 contract, or to
+domain tools into fewer tools, which would change the <!--count:total-->112<!--/-->/14 contract, or to
 declare less than the tools actually return, which would break the strict clients
 this server exists to be correct for. **v1 states the cost rather than hiding
 it.**
@@ -265,10 +265,10 @@ see the same thing.
 
 | | |
 | --- | --- |
-| **Visual only** — the default, on every project, always | see the selection, photograph it, read and reply to comments. **<!--count:visualOps-->0<!--/--> of <!--count:total-->111<!--/--> operations.** |
-| **Inspect project** | also read the project: source, content, assets, git history, the project profile, and `audit`. <!--count:inspectOps-->48<!--/--> operations. |
-| **Edit project** | also change things, on the undo stack. <!--count:editOps-->94<!--/--> operations. |
-| **Full control** | also deletes, dependency installs and git. <!--count:fullOps-->111<!--/--> operations, and it lasts the session only. |
+| **Visual only** — the default, on every project, always | see the selection, photograph it, read and reply to comments. **<!--count:visualOps-->0<!--/--> of <!--count:total-->112<!--/--> operations.** |
+| **Inspect project** | also read the project: source, content, assets, git history, the project profile, and `audit`. <!--count:inspectOps-->49<!--/--> operations. |
+| **Edit project** | also change things, on the undo stack. <!--count:editOps-->95<!--/--> operations. |
+| **Full control** | also deletes, dependency installs and git. <!--count:fullOps-->112<!--/--> operations, and it lasts the session only. |
 
 Granted **per project**. Opening another project starts at Visual only again.
 Nothing an agent can send changes the level; it is a decision a person makes in
@@ -393,7 +393,7 @@ Summary of what v1 claims:
 | --- | --- |
 | Connection preamble | ~146 KB, once per session |
 | `get_context` | small; 75 essential computed properties by default |
-| `get_capabilities()` with no topic | ~13-14 KB (<!--count:total-->111<!--/--> action rows) |
+| `get_capabilities()` with no topic | ~13-14 KB (<!--count:total-->112<!--/--> action rows) |
 | `stacki://project/profile` | 3 KB on a small project; capped at a budget, and it says when it trimmed |
 | `audit`, default | 3 viewports × one real page load each, plus axe |
 
@@ -435,7 +435,7 @@ core protocol — not the Tasks extension.
 v1 is a promise about behaviour, not a freeze.
 
 **Stable — a change here is a breaking change:** the protocol revisions served,
-the transport gates, the 14 tools and their names, the <!--count:total-->111<!--/--> operations and their
+the transport gates, the 14 tools and their names, the <!--count:total-->112<!--/--> operations and their
 names, the four permission levels and the default, the four finding kinds and
 what each claims, refusal codes, ref opacity and staleness semantics, the trust
 boundary, and the refusal to produce a score.

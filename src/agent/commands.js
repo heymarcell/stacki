@@ -604,6 +604,35 @@ export function createAgentCommands(getApp) {
     const a = app();
     if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
 
+    // PUT A ROUTE ON THE CANVAS.
+    //
+    // THE LOOP THAT DID NOT CLOSE. An agent could create a page, list it, read
+    // it and edit it — and could not look at it. Of the operations this API
+    // had, only `project.probe` and the `audit` tool took a route at all, and
+    // both fetch a URL from a dev server without moving what the person is
+    // looking at. So "make the page and show me" needed a human in the middle.
+    //
+    // THROUGH `selectPage`, WHICH IS THE MENU ITEM — not a second idea of
+    // navigation. The edit stack is left, the file is opened, the panels
+    // follow, and the context an agent reads next is the context a person would
+    // see. Nothing on disk moves and no dev server is started, which is why the
+    // registry files it as `read`: `target.select` is the same shape and the
+    // same risk.
+    if (action === 'open') {
+      const moved = await a.openPage({ route: args.route ?? null, path: args.path ?? null });
+      if (!moved.ok) return moved;
+      // AND THE CONTEXT AFTER THE MOVE, so the next call does not have to ask.
+      // A navigation whose answer describes where you were is a navigation you
+      // have to follow with a read.
+      return {
+        ok: true,
+        moved: true,
+        injected: moved.injected === true,
+        page: moved.page,
+        document: documentOf(a),
+      };
+    }
+
     if (action === 'component_create') {
       const anchor = args.anchor || null;
       if (!anchor) return fail('bad_ref', 'component_create needs a ref to the node to turn into a component.');

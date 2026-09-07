@@ -326,6 +326,29 @@ async function writeAllOrNone(entries, { read, write, remove }) {
   }
 }
 
+/**
+ * The page a route names, or null.
+ *
+ * ONE MATCHER, TWO DOORS. The URL bar has always done this; `page.open` does
+ * exactly the same thing for an agent, and two spellings of "which page is this
+ * route" is how the URL bar and the agent come to disagree about a project.
+ *
+ * Accepts a full URL or a bare path, drops a query and a fragment, and compares
+ * with the trailing slash normalised — except for "/" itself, which IS its
+ * trailing slash.
+ */
+function pageForRoute(pages, typed) {
+  const raw = String(typed || '').trim();
+  if (!raw) return null;
+  let route = raw;
+  const asUrl = raw.match(/^https?:\/\/[^/]+(\/.*)?$/i);
+  if (asUrl) route = asUrl[1] || '/';
+  if (!route.startsWith('/')) route = `/${route}`;
+  route = route.replace(/\?.*$|#.*$/, '');
+  const norm = (r) => (r !== '/' ? r.replace(/\/$/, '') : r);
+  return (pages || []).find((p) => norm(p.route) === norm(route)) || null;
+}
+
 export default function App() {
   const [project, setProject] = useState(null); // {path, name}
   const [scan, setScan] = useState({ pages: [], layouts: [], components: [] });
@@ -857,19 +880,12 @@ export default function App() {
       setUrlDraft(null);
       const raw = String(typed || '').trim();
       if (!raw) return;
-      // Accept a full URL or a bare path.
-      let route = raw;
-      const m = raw.match(/^https?:\/\/[^/]+(\/.*)?$/i);
-      if (m) route = m[1] || '/';
-      if (!route.startsWith('/')) route = '/' + route;
-      route = route.replace(/\?.*$|#.*$/, '');
-      const norm = (r) => (r !== '/' ? r.replace(/\/$/, '') : r);
-      const page = (scan.pages || []).find((p) => norm(p.route) === norm(route));
+      const page = pageForRoute(scan.pages, raw);
       if (page) {
         selectPage(page);
         return;
       }
-      showToast(`No page matches ${route}`, 'error');
+      showToast(`No page matches ${raw}`, 'error');
     },
     [scan.pages, showToast, selectPage]
   );
@@ -5380,6 +5396,59 @@ export default function App() {
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
+
+    /**
+     * Put a route on the canvas, the way the page switcher does.
+     *
+     * THE LOOP THAT DID NOT CLOSE. An agent could create a page, list it, read
+     * it and edit it — and could not look at it. Of the 111 operations, only
+     * `project.probe` and the `audit` tool took a route at all, and both fetch
+     * a URL from a dev server without moving what the person is looking at. So
+     * "make the page and show me" needed a human in the middle.
+     *
+     * THROUGH `selectPage`, WHICH IS THE MENU ITEM. Not a second idea of
+     * navigation: the same call the switcher makes, so the edit stack is left,
+     * the file is opened, the panels follow, and the context an agent reads
+     * next is the context a person would see. An injected route — one whose
+     * source lives in a dependency — goes through `selectRoute`, which is what
+     * the app itself does for those.
+     *
+     * NOTHING ON DISK MOVES and no dev server is started. It changes what is on
+     * screen, which is why the registry files it as `read`: `target.select` is
+     * the same shape and the same risk.
+     */
+    openPage: async ({ route = null, path: byPath = null } = {}) => {
+      const pages = scan.pages || [];
+      const page = byPath ? pages.find((p) => relOf(p.path) === byPath) : pageForRoute(pages, route);
+      if (page) {
+        await selectPage(page);
+        await new Promise((done) => setTimeout(done, 120));
+        return { ok: true, moved: true, page: { file: relOf(page.path), route: page.route, name: page.name } };
+      }
+      // A route the project serves but has no file for.
+      if (route) {
+        const injected = (injectedRoutes || []).find((e) => pageForRoute([{ route: e.route, path: null }], route));
+        if (injected) {
+          await selectRoute(injected);
+          await new Promise((done) => setTimeout(done, 120));
+          return { ok: true, moved: true, injected: true, page: { file: null, route: injected.route, from: injected.from } };
+        }
+      }
+      // THE ROUTES GO IN A FIELD, NOT IN THE SENTENCE. The envelope is scrubbed
+      // for anything that looks like an absolute filesystem path before it
+      // leaves, and a route looks exactly like one: a list of them in the
+      // message came back as "It has: a path outside this project, /, a path
+      // outside this project". Data stays data.
+      return {
+        ok: false,
+        code: 'no_such_route',
+        message: byPath
+          ? 'That is not a page in this project. `routes` lists the ones there are.'
+          : 'No page in this project serves that route. `routes` lists the ones there are.',
+        asked: byPath || route || null,
+        routes: pages.map((p) => p.route).slice(0, 40),
+      };
+    },
     /**
      * Put a write the main process carried out on the undo stack.
      *

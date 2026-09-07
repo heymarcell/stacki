@@ -854,6 +854,35 @@ fullScenario({ domain: 'page', action: 'list', run: async ({ call }) => {
   ] };
 } });
 
+// THE LOOP THAT DID NOT CLOSE. An agent could create a page, list it, read it
+// and edit it — and could not look at it. This drives the navigation and then
+// asks `get_context` where the canvas is, because an answer that says it moved
+// is a claim and the snapshot is the evidence.
+fullScenario({ domain: 'page', action: 'open', run: async ({ call, tool }) => {
+  // `get_context` is the evidence, not the answer: an envelope that says it
+  // moved is a claim, and the snapshot the app publishes is what happened.
+  const ctx = async () => {
+    const res = await tool('get_context', {});
+    try {
+      return res?.structuredContent ?? JSON.parse(res?.content?.find((c) => c.type === 'text')?.text || '{}');
+    } catch {
+      return {};
+    }
+  };
+  const before = await ctx();
+  const { envelope } = await call('page', 'open', { route: '/about' });
+  const after = await ctx();
+  return { envelope, checks: [
+    ['it says it moved', envelope?.moved === true],
+    ['and names the page it moved to', envelope?.page?.route === '/about'],
+    ['with the file behind it', String(envelope?.page?.file || '').endsWith('src/pages/about.astro')],
+    ['the canvas was somewhere else before', before?.page?.route !== '/about'],
+    ['and get_context now says that route', after?.page?.route === '/about'],
+    ['and names the same file', String(after?.page?.file || '').endsWith('src/pages/about.astro')],
+    ['and the answer carries the document it landed on', String(envelope?.document?.file || '').endsWith('src/pages/about.astro')],
+  ] };
+} });
+
 fullScenario({ domain: 'page', action: 'read', run: async ({ call }) => {
   const { envelope } = await call('page', 'read', { path: 'src/pages/index.astro' });
   return { envelope, checks: [
