@@ -1149,6 +1149,42 @@ export default function App() {
     h.lastPush = now;
   }, []);
 
+  /**
+   * Where the history was, so a write that turns out to have changed nothing
+   * can put it back.
+   *
+   * WHY A NO-OP MUST NOT LEAVE A STEP. `pushHistory` runs BEFORE the operations
+   * do — it has to, because what it records is the state before them — so it
+   * cannot know whether anything will move. For a person that is harmless: the
+   * gestures that reach it always change something. An agent's `target.set_text`
+   * to the value a node already has, `set_prop` to the value it already has, or
+   * `add_class` for a class already present all reach it too, and all three
+   * wrote nothing and left an entry behind.
+   *
+   * The entry is not the whole damage. `pushHistory` also empties `future` and
+   * bumps `redoEpoch`, so a no-op DESTROYS THE REDO STACK: undo, then a no-op,
+   * and the redo the person was about to press is gone. And the next ⌘Z spends
+   * itself restoring a document to what it already is, so the change they meant
+   * to undo takes two presses and the second one is a surprise.
+   *
+   * Both halves are restored, because putting `past` back and leaving `future`
+   * emptied still eats the redo.
+   */
+  const markHistory = useCallback(() => {
+    const h = historyRef.current;
+    return { past: h.past.length, future: h.future.slice(), redoEpoch: h.redoEpoch, lastKey: h.lastKey, lastPush: h.lastPush };
+  }, []);
+
+  const restoreHistory = useCallback((mark) => {
+    if (!mark) return;
+    const h = historyRef.current;
+    h.past.length = Math.min(h.past.length, mark.past);
+    h.future = mark.future;
+    h.redoEpoch = mark.redoEpoch;
+    h.lastKey = mark.lastKey;
+    h.lastPush = mark.lastPush;
+  }, []);
+
   // Records an already-performed change from outside the page model. `undo`
   // and `redo` are async and do the work themselves (rewrite the file, restore
   // the entry, rename back). Consecutive commands sharing a coalesceKey inside
@@ -5629,6 +5665,23 @@ export default function App() {
       // it needs, and an insert that cannot have one is refused here rather
       // than written half-done.
       const importPaths = await importPathsForInserts(operations);
+      // Taken before the mutation, because `mutateModel` is what pushes the
+      // history entry and it pushes it before knowing whether anything moved.
+      const historyMark = markHistory();
+      // THE MODEL DIGEST, NOT `snapshotOf().source`. That field is deliberately
+      // null while the page is dirty — it holds the last SAVED bytes — so
+      // comparing it would skip the check for exactly the case that matters,
+      // which is a second write arriving before the first has been saved.
+      // `digestOfModel` is the same function the document digest and every
+      // ref's observation are built from, and since it stopped hashing the
+      // parse counter's node ids it answers about the document rather than
+      // about the parse.
+      const documentDigest = () => {
+        const st = pageStateRef.current.pageState;
+        if (!st) return null;
+        return digestOfModel(st.editable ? st.model : st.source);
+      };
+      const wasDigest = documentDigest();
       let outcome = null;
       mutateModel((m) => {
         const run = applyOperations(m, operations, { insertables, importPaths });
@@ -5650,6 +5703,16 @@ export default function App() {
       }
       if (outcome.selectId) setSelectedId(outcome.selectId);
       await flushSave();
+      // AND THEN THE BYTES DECIDE. `applyOperations` answering ok means it ran,
+      // not that it changed anything — `set_text` to the value already there is
+      // a perfectly successful operation over an unchanged document. The same
+      // evidence the answer's `changedFiles` is built from, asked here so the
+      // undo stack is built from it too.
+      const nowDigest = documentDigest();
+      if (wasDigest !== null && nowDigest !== null && wasDigest === nowDigest) {
+        restoreHistory(historyMark);
+        return { ok: true, selectedId: outcome.selectId || null, label: label || null, noop: true };
+      }
       return { ok: true, selectedId: outcome.selectId || null, label: label || null };
     },
   };

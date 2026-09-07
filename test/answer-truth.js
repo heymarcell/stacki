@@ -207,6 +207,61 @@ const short = (x, n = 260) => JSON.stringify(x ?? null).slice(0, n);
     }
   }
 
+  // ── a write that moved nothing leaves nothing behind ──────────────────────
+  //
+  // `pushHistory` runs BEFORE the operations do — it has to, because what it
+  // records is the state before them — so it cannot know whether anything will
+  // move. For a person that is harmless: the gestures that reach it always
+  // change something. An agent's `set_prop` to the value already there reaches
+  // it too, and left a step behind.
+  //
+  // The step is not the whole damage. `pushHistory` also empties `future` and
+  // bumps `redoEpoch`, so a no-op DESTROYS THE REDO STACK — and the next ⌘Z
+  // spends itself restoring a document to what it already is, so the change the
+  // person meant to undo takes two presses and the second one is a surprise.
+
+  {
+    const root = H.makeProject();
+    const app = await H.start(root, { agentMode: 'full' });
+    const run = (d, a, args = {}) => app.api.run(d, a, args);
+    const ref = async () => (await run('target', 'read')).target.ref;
+    await H.settle(600);
+    try {
+      const bytes = () => app.read('src/pages/index.astro');
+      const clean = bytes();
+
+      const real = await run('target', 'set_prop', { ref: await ref(), name: 'data-x', value: '1' });
+      check('the first write lands', real.ok === true, short(real));
+      await H.settle(200);
+      const afterReal = bytes();
+      check('  and is on disk', afterReal.includes('data-x="1"'), afterReal.slice(0, 140));
+
+      const again = await run('target', 'set_prop', { ref: await ref(), name: 'data-x', value: '1' });
+      check('the same write again succeeds', again.ok === true, short(again));
+      await H.settle(200);
+      check('  and moves no bytes', bytes() === afterReal, 'the second write changed the file');
+      check('  and reports no changed file', (again.changedFiles || []).length === 0, short(again.changedFiles));
+
+      // THE ASSERTION THE DEFECT WAS. One real change, so ONE undo.
+      const first = await run('project', 'undo');
+      await H.settle(250);
+      check('one undo takes the document back', first.undone === true, short(first));
+      check('  all the way back, to the bytes it started with', bytes() === clean, 'the undo restored a no-op instead');
+      const second = await run('project', 'undo');
+      await H.settle(250);
+      check('and there is nothing more of ours to undo', second.undone === false, short(second));
+
+      // AND THE REDO THE PERSON WAS ABOUT TO PRESS IS STILL THERE.
+      const redo = await run('project', 'redo');
+      await H.settle(250);
+      check('the redo still works', redo.redone === true, short(redo));
+      check('  and puts the real edit back', bytes().includes('data-x="1"'), bytes().slice(0, 140));
+    } finally {
+      app.stop();
+      H.removeProject(root);
+    }
+  }
+
   if (failures.length) {
     console.error(`\nanswer-truth: ${failures.length} failed, ${checked - failures.length} passed\n`);
     console.error(failures.join('\n') + '\n');
