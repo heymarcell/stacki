@@ -622,6 +622,29 @@ function createAgentApi({
 
   // --- evidence --------------------------------------------------------------
 
+  /**
+   * ONE SPELLING PER FILE.
+   *
+   * `readFile` below resolves whatever it is handed, so `src/pages/index.astro`
+   * and `./src/pages/index.astro` read the same bytes — which means both
+   * qualify as "moved", and `changedFiles` reported ONE write to ONE file as
+   * two entries with identical digests and an identical patch. A live dogfood
+   * saw it; the spelling it saw was an absolute path, and that entry point has
+   * since been closed at the ref boundary, but the ASSEMBLY was never made
+   * spelling-safe and the same defect came back through `touchedBy`, which
+   * returns the caller's own bytes.
+   *
+   * Canonicalising rather than only deduplicating, because a single answer
+   * carrying `./src/styles/site.css` is still wrong: what a client is told a
+   * file is called has to be what every other answer calls it.
+   */
+  const canonRel = (rel) => {
+    const ctx = context();
+    if (!ctx.root || !rel) return null;
+    const at = relativeTo(ctx.root, path.resolve(ctx.root, rel));
+    return at || null;
+  };
+
   const readFile = (rel) => {
     const ctx = context();
     if (!ctx.root || !rel) return null;
@@ -698,7 +721,9 @@ function createAgentApi({
   const filesOf = (anchor, extra = []) => {
     const keys = anchor?.keys || [];
     const fromKeys = keys.map((k) => (typeof k === 'string' && k.includes('#') ? k.slice(0, k.indexOf('#')) : null));
-    return [...new Set([...fromKeys, anchor?.page?.file || null, ...extra].filter(Boolean))];
+    // Through `canonRel` BEFORE the Set, so two spellings of one file collapse
+    // to one member rather than surviving as two.
+    return [...new Set([...fromKeys, anchor?.page?.file || null, ...extra].map(canonRel).filter(Boolean))];
   };
 
   // --- target ----------------------------------------------------------------
@@ -1376,8 +1401,13 @@ function createAgentApi({
     //   command puts back, and it is deliberately not the same list: a
     //   stylesheet edit that changed no open document still wants an undo, and
     //   reloading the editor for it would be pointless churn.
-    const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
-    const named = [...new Set((await touchedBy(domain, action, args, ctx)).filter(Boolean))];
+    // EVERY ONE OF THESE THREE IS CANONICALISED FIRST. `editing` was already
+    // relative; `named` is whatever `touchedBy` returns, and for two of its
+    // branches that is the caller's own argument, unresolved. Deduplicating
+    // afterwards compares strings, and `'src/x.astro'` and `'./src/x.astro'`
+    // are two strings for one file.
+    const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].map(canonRel).filter(Boolean))];
+    const named = [...new Set((await touchedBy(domain, action, args, ctx)).map(canonRel).filter(Boolean))];
     const watching = [...new Set([...editing, ...named])];
     const before = snapshot(watching);
     // Normalised the moment it arrives, so the three returns below spread a
