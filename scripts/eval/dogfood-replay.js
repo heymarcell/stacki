@@ -202,7 +202,12 @@ body {
   let app = null;
   const started = Date.now();
   try {
-    app = await startPackagedApp({ access: 'full', project, app: appPath, visible, contained: false });
+    // `edit`, NOT `full`. `full` is destructive and remote, and
+    // electron/mcp/agent/access.js makes it session-only on purpose — it cannot
+    // be written into settings, so asking for it here gets the DEFAULT, which is
+    // `visual`, and every write in this file comes back `permission_denied`.
+    // The first dry run did exactly that. Nothing below needs `high`.
+    app = await startPackagedApp({ access: 'edit', project, app: appPath, visible, contained: false });
   } catch (err) {
     console.error(`dogfood-replay: the app did not start — ${err.message}`);
     fs.rmSync(project, { recursive: true, force: true });
@@ -278,6 +283,11 @@ body {
     // ── B — refs around repeated siblings ──────────────────────────────────
     say('\nDOGFOOD B — three near-identical cards, and a stale handle');
     {
+      // FROM A KNOWN PAGE. A read with no ref describes the SELECTION, and the
+      // selection after scenario A's undo is not something this scenario should
+      // be guessing about.
+      await call('page', 'open', { route: '/' });
+      await sleep(600);
       const page = await call('target', 'read');
       const cards = (page.target?.children || []).filter((c) => c.tag === 'Card');
       check('the page has three cards', cards.length === 3, short((page.target?.children || []).map((c) => c.tag)));
@@ -352,7 +362,15 @@ body {
       const card = (page.target?.children || []).find((c) => c.tag === 'Card');
       const instance = await call('style', 'read', { ref: card.ref });
       check('a component instance says what it is', instance.about?.kindOfThing === 'component_instance', short(instance.about));
-      check('  rather than answering as an unstyled element', (instance.problems || []).length > 0, short(instance.problems));
+      // EITHER ANSWER IS RIGHT, AND THE EMPTY SUCCESS IS NEITHER. With a canvas
+      // running, `resolveTarget` finds the box the instance renders and the read
+      // is about a real element — the better answer, and the one this build
+      // gives here. Without one it must SAY it did not resolve. What the dogfood
+      // got was the third thing: no box, no explanation, and a rule list
+      // indistinguishable from an element with no CSS.
+      const resolved = instance.about?.unresolvedInstance === false && !!instance.element?.tag;
+      const explained = instance.about?.unresolvedInstance === true && (instance.problems || []).length > 0;
+      check('  and either resolves the rendered box or says it could not', resolved || explained, `${short(instance.about)} element=${short(instance.element)} problems=${short(instance.problems)}`);
     }
 
     // ── E — CSS sections ───────────────────────────────────────────────────
@@ -440,7 +458,11 @@ body {
       const renamed = await call('page', 'folder_rename', { from: 'src/pages/guides', to: 'src/pages/handbook' });
       check('folder_rename takes both ends in that space', renamed.ok === true, short(renamed));
       check('  and the folder moved', exists('src/pages/handbook') && !exists('src/pages/guides'));
-      await call('page', 'folder_delete', { dir: 'src/pages/handbook' });
+      // `folder_delete` is `high` and this session is `edit`, so it is refused —
+      // which is the permission gate doing its job, not a scenario failure. The
+      // folder goes with the disposable project.
+      const denied = await call('page', 'folder_delete', { dir: 'src/pages/handbook' });
+      check('and a high-risk delete is refused at this access level', denied.ok === false && denied.code === 'permission_denied', short(denied));
     }
 
     // ── I — assets ─────────────────────────────────────────────────────────
@@ -494,9 +516,15 @@ body {
     // ── M — the ordinary loop still works ──────────────────────────────────
     say('\nDOGFOOD M — one ordinary edit, undone, redone');
     {
+      await call('page', 'open', { route: '/' });
+      await sleep(600);
       const before = read('src/pages/index.astro');
       const page = await call('target', 'read');
       const p = (page.target?.children || []).find((c) => c.tag === 'p');
+      if (!p) {
+        check('the page has a paragraph to edit', false, short((page.target?.children || []).map((c) => c.tag)));
+        throw new Error('scenario M cannot start');
+      }
       const edited = await call('target', 'set_text', { ref: p.ref, text: 'Edited by the replay.' });
       check('an ordinary edit lands', edited.ok === true, short(edited));
       await sleep(400);
@@ -516,7 +544,8 @@ body {
       check('  and the edit is back', read('src/pages/index.astro').includes('Edited by the replay.'));
 
       // A NO-OP LEAVES NO STEP.
-      const again = await call('target', 'set_text', { ref: (await call('target', 'read')).target?.children?.find((c) => c.tag === 'p')?.ref, text: 'Edited by the replay.' });
+      const fresh = (await call('target', 'read')).target?.children?.find((c) => c.tag === 'p')?.ref;
+      const again = await call('target', 'set_text', { ref: fresh, text: 'Edited by the replay.' });
       await sleep(400);
       check('writing the same text again succeeds', again.ok === true, short(again));
       check('  and reports no changed file', (again.changedFiles || []).length === 0, short(again.changedFiles));
