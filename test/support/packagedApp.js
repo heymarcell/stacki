@@ -114,6 +114,8 @@ async function startPackagedApp({
   project: given = null,
   // Which bundle to launch. See `binaryOf`.
   app = APP,
+  // Whether a person is meant to watch this one. See `appVars` below.
+  visible = false,
   // WHETHER THIS APP IS PART OF A TRIAL, and must therefore be unable to reach
   // GitHub.
   //
@@ -179,8 +181,14 @@ async function startPackagedApp({
   // future STACKI_* name that happens to look credential-shaped is exempt from
   // the shape strip for the right reason instead of by luck.
   const appVars = {
-    STACKI_NO_DIALOGS: '1',
-    STACKI_HIDDEN_WINDOW: '1',
+    // HIDDEN BY DEFAULT, AND THAT IS THE RIGHT DEFAULT. Every packaged suite
+    // wants a window that captures identically and never takes the screen; a
+    // run that steals focus several times a minute is a run nobody leaves
+    // going. `visible: true` is for the one thing that has to be watched by a
+    // person — the dogfood replay, where the point is that somebody sees the
+    // site not go blank.
+    STACKI_NO_DIALOGS: visible ? '0' : '1',
+    STACKI_HIDDEN_WINDOW: visible ? '0' : '1',
     STACKI_MCP_PORT: String(port),
     STACKI_AUTOMATION_PROJECT: project,
     STACKI_AUTOMATION_MARKER: marker,
