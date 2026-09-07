@@ -629,14 +629,51 @@ async function mergeAttributes(git, root, files) {
   //   union         both sides concatenated. MEASURED: it does not conflict at
   //                 all — the merge exits 0 with no unmerged stages — so it
   //                 never reaches the conflict surfaces below.
-  //   anything else a driver name, and a program only if it is `defined`.
+  //   anything else a driver name, resolved by `classify` below.
+  //
+  // AND A BUILT-IN'S NAME IS NOT RESERVED, WHICH IS WHERE THIS WAS WRONG.
+  //
+  // The first version of this asked "is the name one of git's three" BEFORE it
+  // asked "is a program configured under it", so `a.txt merge=binary` with a
+  // `merge.binary.driver` in config was called built-in. Git does the opposite.
+  // `find_ll_merge_driver` in merge-ll.c handles the three special ATTRIBUTE
+  // STATES first and then, for any name it has to resolve, searches the
+  // USER-DEFINED drivers before the built-in table — so a project may override
+  // `text`, `binary` or `union` by name, and git will run the program.
+  //
+  // MEASURED, git 2.50.1, all fifteen rows, with a driver that reverses the
+  // sides: `merge=binary` + `merge.binary.driver` ran the PROGRAM, and so did
+  // `merge=union`, `merge=text`, and each of those named through
+  // `merge.default`. Under the old reading all six were classified built-in,
+  // their reversed block was read as git's grammar, and a per-hunk answer of
+  // "theirs" committed this branch's own bytes with `{ok: true}`.
+  //
+  // The order below is that function's, branch for branch.
   const BUILT_IN = new Set(['text', 'binary', 'union']);
-  const effective = (value) => {
-    // Only a path with no attribute of its own falls to `merge.default`.
-    if (value === 'unspecified') return byDefault || 'text';
-    if (value === 'set') return 'text';
-    if (value === 'unset') return 'binary';
-    return value;
+  const classify = (value) => {
+    // ATTR_TRUE — bare `merge`. The built-in text driver directly; a configured
+    // `merge.text.driver` does NOT override it. MEASURED.
+    if (value === 'set') return { kind: 'text', name: null };
+    // ATTR_FALSE — bare `-merge`. Built-in binary directly, likewise unoverridable.
+    if (value === 'unset') return { kind: 'binary', name: null };
+    let name;
+    if (value === 'unspecified') {
+      // ATTR_UNSET with no `merge.default` is the built-in text driver directly,
+      // and a `merge.text.driver` does not reach it either. MEASURED.
+      if (!byDefault) return { kind: 'text', name: null };
+      name = byDefault;
+    } else {
+      name = value;
+    }
+    // A NAME IS RESOLVED AGAINST THE USER'S DRIVERS FIRST.
+    if (defined.has(name)) return { kind: 'custom', name };
+    // Then git's own table.
+    if (BUILT_IN.has(name)) return { kind: name, name: null };
+    // And a name that is neither falls back to the three-way merge. MEASURED:
+    // `merge=nosuch` and `merge.default=nosuch` both leave git's own diff3
+    // markup on disk, so treating the bare string as a driver would refuse an
+    // ordinary merge.
+    return { kind: 'text', name: null };
   };
   const list = (files || []).filter((file) => typeof file === 'string' && file);
   const ask = async (batch) => {
@@ -699,13 +736,13 @@ async function mergeAttributes(git, root, files) {
         // rule does not hold. `custom` is the subset whose markup is a
         // program's. See BUILT_IN, effective and defined above for how each
         // attribute word resolves.
-        const name = effective(value);
-        const builtIn = BUILT_IN.has(name);
-        // A name with no program behind it is git's text driver, so it is
-        // neither driven nor opaque. See `defined`.
-        const genuine = !builtIn && defined.has(name);
-        if (genuine || (builtIn && name !== 'text')) driven.add(fields[at]);
-        if (genuine) custom.set(fields[at], name);
+        const { kind, name } = classify(value);
+        // `driven` is every path git did NOT merge with its built-in TEXT
+        // driver — the set for which the ancestor-line rule does not hold.
+        if (kind !== 'text') driven.add(fields[at]);
+        // `custom` is the subset a program produced, and is what makes the path
+        // opaque. The name is the one git resolved, which is the one to show.
+        if (kind === 'custom') custom.set(fields[at], name);
         continue;
       }
       // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
@@ -1627,7 +1664,26 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // by name, for every answer alike — the deliberate "theirs" as much as the
     // silent default, because the caller who typed it was answering the same
     // false description of the file.
-    const own = await ownMarkers(file);
+    // AND NOT FOR A PATH WHOSE MARKUP IS NEVER READ.
+    //
+    // This gate exists because a marker-shaped line in a blob makes the file's
+    // OWN markers indistinguishable from git's — which matters only where the
+    // markup is being parsed into hunks. A genuine custom driver's output is
+    // not parsed at all, so there is nothing to confuse: the path offers no
+    // hunks either way, and the whole-file words are answered from index stages
+    // 2 and 3 without reading a byte of the working-tree text.
+    //
+    // MEASURED: a README whose two sides both legitimately contain
+    // `<<<<<<< HEAD` as prose, merged by a driver — `sidesHoldMarkers` was true,
+    // and `unreadable_conflict` refused the whole-file "ours" and "theirs" as
+    // well as the per-hunk array, leaving a project whose source documents
+    // conflict markers unable to finish a driver-merged conflict through Stacki
+    // at all. The per-hunk refusal is still right, and is still made below by
+    // `not_splittable`; the whole-file veto was not.
+    //
+    // The protection is unchanged for every path git marked up itself, which is
+    // what it was written for.
+    const own = custom.has(file) ? { own: false, sides: [] } : await ownMarkers(file);
     if (own.own || unreadMarkers(partsOf(file), markerSizes.get(file), ...own.sides)) {
       unusable.push({
         path: file,

@@ -6470,6 +6470,168 @@ async function suite() {
       );
     }
   }
+
+  // T45 — A BUILT-IN'S NAME IS NOT RESERVED, AND GIT LOOKS AT THE USER'S
+  // DRIVERS FIRST.
+  //
+  // T44 asks whether a driver's output is read. This asks the question before
+  // it: WHICH paths a driver merged. The first version of that classification
+  // tested `BUILT_IN.has(name)` before `defined.has(name)`, so a project with
+  //
+  //     a.txt merge=binary
+  //     [merge "binary"] driver = ...
+  //
+  // was called built-in and its program's output was read as git's grammar.
+  //
+  // Git does the opposite. `find_ll_merge_driver` (merge-ll.c) handles the three
+  // special ATTRIBUTE STATES first — bare `merge`, bare `-merge`, and
+  // unspecified-with-no-default all go straight to a built-in and cannot be
+  // overridden — and then, for any name it must resolve, searches the
+  // USER-DEFINED drivers BEFORE the built-in table, falling back to the
+  // three-way merge for a name that is in neither.
+  //
+  // Every row below was measured against git 2.50.1 with a driver that reverses
+  // the sides, and the six that a program really merged all committed this
+  // branch's own bytes for an answer of "theirs" under the old reading.
+  {
+    const REV = '#!/bin/sh\nkeep=$(cat "$2")\n{ echo "<<<<<<< custom"; cat "$3"; echo "======="; printf "%s\\n" "$keep"; echo ">>>>>>> custom"; } > "$2"\nexit 1\n';
+    // The sharpest shape: a driver that also writes an ancestor line, so its
+    // output satisfies even the strict diff3 reading a built-in text path gets.
+    const REV3 = '#!/bin/sh\nkeep=$(cat "$2")\n{ echo "<<<<<<< custom"; cat "$3"; echo "||||||| base"; cat "$1"; echo "======="; printf "%s\\n" "$keep"; echo ">>>>>>> custom"; } > "$2"\nexit 1\n';
+    const SILENT = '#!/bin/sh\nprintf "the driver could not merge this\\n" > "$2"\nexit 1\n';
+    const T45_OURS = 'MAIN-ONLY-BYTES\n';
+    const T45_THEIRS = 'FEATURE-ONLY-BYTES\n';
+
+    const make = async (name, { attr = null, drivers = [], byDefault = null, script = REV, ours = T45_OURS, theirs = T45_THEIRS } = {}) => {
+      const dir = await repo(`t45-${name}`);
+      cleanup.push(dir);
+      const drv = path.join(dir, '.git', 'd.sh');
+      fs.writeFileSync(drv, script, { mode: 0o755 });
+      fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+      if (attr) fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), attr);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'BASE\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), ours);
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), theirs);
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      for (const n of drivers) await sh(dir, 'config', `merge.${n}.driver`, `${drv} %O %A %B`);
+      if (byDefault) await sh(dir, 'config', 'merge.default', byDefault);
+      return dir;
+    };
+
+    // A ROW GIT MERGED ITSELF. `hunks` is what the built-in leaves behind: one
+    // disagreement for the text driver, none for binary (it writes no markup).
+    const builtInRow = async (label, key, opts, hunks) => {
+      const dir = await make(key, opts);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check(`T45 ${label}: is not called a custom driver`, file.customDriver === undefined, JSON.stringify(file.customDriver));
+      check(`T45 ${label}:   and offers ${hunks} hunk(s)`, clashCount(file.parts || []) === hunks, String(clashCount(file.parts || [])));
+    };
+
+    // A ROW A PROGRAM MERGED. Opaque, refused per hunk, exact by whole file.
+    const opaqueRow = async (label, key, opts, name) => {
+      {
+        const dir = await make(`${key}-a`, opts);
+        const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+        const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+        check(`T45 ${label}: no hunks are read out of it`, file.parts === null, JSON.stringify(file.parts));
+        check(`T45 ${label}:   and it names the driver git ran`, file.customDriver === name, JSON.stringify(file.customDriver));
+        const entry = ((DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' }) || {}).files || [])[0] || {};
+        check(`T45 ${label}:   the agent sees an empty hunk list`, Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry).slice(0, 200));
+        check(`T45 ${label}:   with markersUnread and hunksOmitted false`, entry.markersUnread === false && entry.hunksOmitted === false, JSON.stringify(entry).slice(0, 200));
+        const before = await repoState(dir);
+        const per = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+        await refusedCleanly(`T45 ${label}: a per-hunk answer`, per.value, dir, before, 'bad_choices', (a) =>
+          (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable' && b.customDriver === name)
+        );
+      }
+      // THE BYTE ORACLE. Under the old reading this is where "theirs" landed
+      // main's bytes, because the driver put the incoming side first.
+      for (const [side, want] of [
+        ['ours', opts.ours || T45_OURS],
+        ['theirs', opts.theirs || T45_THEIRS],
+      ]) {
+        const one = await make(`${key}-${side}`, opts);
+        const clash = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+        const done = await resolveMerge(git, { projectPath: one, branch: 'feature', choices: { 'a.txt': side }, expect: clash.at });
+        check(`T45 ${label}: whole-file ${side} merges`, done?.ok === true, JSON.stringify(done));
+        check(`T45 ${label}:   into the index's exact ${side} blob`, (await blob(one, 'HEAD:a.txt')) === want, JSON.stringify(await blob(one, 'HEAD:a.txt')));
+        check(`T45 ${label}:   as a two-parent merge commit`, (await sh(one, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(one, 'log', '-1', '--format=%P'));
+        check(`T45 ${label}:   over a clean tree`, (await sh(one, 'status', '--porcelain')) === '', await sh(one, 'status', '--porcelain'));
+        check(`T45 ${label}:   with none of the driver's markup committed`, !(await blob(one, 'HEAD:a.txt')).includes('<<<<<<< custom'), JSON.stringify(await blob(one, 'HEAD:a.txt')));
+      }
+    };
+
+    // --- the three special states, which no configured driver may override ---
+    await builtInRow('01 bare `merge` over merge.text.driver', '01', { attr: 'a.txt merge\n', drivers: ['text'] }, 1);
+    await builtInRow('02 bare `-merge` over merge.binary.driver', '02', { attr: 'a.txt -merge\n', drivers: ['binary'] }, 0);
+    await builtInRow('03 unspecified with no default over merge.text.driver', '03', { drivers: ['text'] }, 1);
+    // --- an explicit name: user-defined first, then the built-in table -------
+    await builtInRow('04 merge=text with no driver', '04', { attr: 'a.txt merge=text\n' }, 1);
+    await opaqueRow('05 merge=text OVERRIDDEN by merge.text.driver', '05', { attr: 'a.txt merge=text\n', drivers: ['text'] }, 'text');
+    await opaqueRow('05b the same driver writing a diff3-shaped block', '05b', { attr: 'a.txt merge=text\n', drivers: ['text'], script: REV3 }, 'text');
+    await builtInRow('06 merge=binary with no driver', '06', { attr: 'a.txt merge=binary\n' }, 0);
+    await opaqueRow('07 merge=binary OVERRIDDEN by merge.binary.driver', '07', { attr: 'a.txt merge=binary\n', drivers: ['binary'] }, 'binary');
+    await opaqueRow('09 merge=union OVERRIDDEN by merge.union.driver', '09', { attr: 'a.txt merge=union\n', drivers: ['union'] }, 'union');
+    // 08: union with nothing configured does not conflict at all, so it never
+    // reaches any of the surfaces above. Asserted rather than assumed.
+    {
+      const dir = await make('08', { attr: 'a.txt merge=union\n' });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      check('T45 08 merge=union with no driver: merges without conflicting', clash?.ok === true, JSON.stringify(clash).slice(0, 160));
+    }
+    // --- merge.default resolves by the very same rule ------------------------
+    await builtInRow('10 merge.default=text with no driver', '10', { byDefault: 'text' }, 1);
+    await opaqueRow('11 merge.default=text OVERRIDDEN', '11', { byDefault: 'text', drivers: ['text'] }, 'text');
+    await opaqueRow('12 merge.default=binary OVERRIDDEN', '12', { byDefault: 'binary', drivers: ['binary'] }, 'binary');
+    await opaqueRow('13 merge.default=union OVERRIDDEN', '13', { byDefault: 'union', drivers: ['union'] }, 'union');
+    // --- a name in neither table is the three-way merge ----------------------
+    await builtInRow('14 merge=nosuch with no driver', '14', { attr: 'a.txt merge=nosuch\n' }, 1);
+    await builtInRow('15 merge.default=nosuch with no driver', '15', { byDefault: 'nosuch' }, 1);
+
+    // --- MARKER PROVENANCE MUST NOT VETO AN OPAQUE PATH ---------------------
+    //
+    // The provenance gate is about markup Stacki PARSES: a marker-shaped line in
+    // a blob makes the file's own markers indistinguishable from git's. A custom
+    // driver's output is not parsed, so there is nothing to confuse — and the
+    // whole-file words are answered from index stages 2 and 3 without reading a
+    // byte of it.
+    //
+    // MEASURED before the fix: a README whose two sides both hold
+    // `<<<<<<< HEAD` as prose, merged by a driver — `sidesHoldMarkers` was true
+    // and `unreadable_conflict` refused the whole-file "ours" and "theirs" as
+    // well as the array, so the conflict could not be finished through Stacki at
+    // all.
+    const AUTHORED_OURS = 'docs\n<<<<<<< HEAD\nprose on main\n=======\nMAIN-ONLY-BYTES\n';
+    const AUTHORED_THEIRS = 'docs\n<<<<<<< HEAD\nprose on feature\n=======\nFEATURE-ONLY-BYTES\n';
+    await opaqueRow('16 authored markers on a driver-merged path', '16', {
+      attr: 'a.txt merge=mydrv\n',
+      drivers: ['mydrv'],
+      script: SILENT,
+      ours: AUTHORED_OURS,
+      theirs: AUTHORED_THEIRS,
+    }, 'mydrv');
+
+    // AND THE CONTROL THAT BYPASS MUST NOT COST. The same authored markers on a
+    // path GIT merged are still refused for every answer, which is what the
+    // provenance rule was written for. Without this, "never check provenance"
+    // passes everything above.
+    {
+      const dir = await make('17', { ours: AUTHORED_OURS, theirs: AUTHORED_THEIRS });
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T45 17 control: authored markers with NO driver', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'unreadable_conflict')
+      );
+    }
+  }
 }
 
 (async () => {
