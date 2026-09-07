@@ -12,7 +12,7 @@
 //   outside the open project, on `write` risk, two calls from a listing.
 //
 //   AND THE SAME FENCE IN THE PAGE DOMAIN, which is where the third hole was.
-//   `page.move`'s `to` and the folder actions' `dir` are spelled relative to
+//   `page.move`'s `to` and the folder actions' `dir` were spelled relative to
 //   src/pages, so they never reached the resolver at all and were fenced
 //   lexically instead — and a symlink under src/pages walked straight through
 //   that: a page moved OUT of the project on `edit`, a directory created
@@ -301,19 +301,34 @@ Nothing declares a shape for this.
 
     // ── THE PAGE DOMAIN'S VERSION OF THE SAME ESCAPE ─────────────────────────
     //
-    // `page.move`'s `to` and the folder actions' `dir`/`from`/`to` are spelled
-    // relative to src/pages rather than to the project, and that is why they
-    // were the only path arguments in this surface that never reached rel().
-    // What fenced them instead was the handler's own path.resolve +
-    // startsWith — a check on the SPELLING, and a symlink under src/pages is
-    // spelled like everything else in there. Measured on this branch before the
-    // fix, in one run: page.move took a page OUT of the project on `edit`,
-    // folder_create made a directory outside it, folder_delete ran
-    // fs.rmSync(recursive, force) on one at `full`, all three `{ok:true}` —
-    // while asset.write_text and source.write refused the identical route.
+    // What fenced these before they reached rel() was the handler's own
+    // path.resolve + startsWith — a check on the SPELLING, and a symlink under
+    // src/pages is spelled like everything else in there. Measured on this
+    // branch before the fix, in one run: page.move took a page OUT of the
+    // project on `edit`, folder_create made a directory outside it,
+    // folder_delete ran fs.rmSync(recursive, force) on one at `full`, all three
+    // `{ok:true}` — while asset.write_text and source.write refused the
+    // identical route.
+    //
+    // THE SPELLINGS BELOW ARE PROJECT-RELATIVE, which is the whole page domain's
+    // one coordinate system now (see test/page-paths.js). The escape is the
+    // same escape: `src/pages/out` is a symlink to a directory outside the
+    // project, so `src/pages/out/newdir` is spelled entirely inside src/pages
+    // and lands outside it — which is exactly what a spelling check cannot see
+    // and what the realpath step in `resolveInProject` is for.
+    //
+    // TWO CONTAINMENT CODES, AND WHICH ONE YOU GET. A path that leaves by its
+    // own spelling (`../../../ESCAPED.astro`) never reaches the filesystem: the
+    // resolver refuses it as `bad_path` before resolving anything. One that
+    // leaves through a link is inside src/pages as written, so it is resolved,
+    // and the realpath fence answers `outside_project`. Both are refusals and
+    // both are checked; what is asserted below is that it is one of them and
+    // that the canary did not move.
     //
     // So the canary is read back after EVERY attempt. A refusal code is a claim
     // about what happened; the bytes are what happened.
+    const contained = (envelope) =>
+      envelope?.ok === false && (envelope.code === 'outside_project' || envelope.code === 'bad_path');
     {
       const pagesOut = path.join(outside, 'reached-through-src-pages');
       fs.mkdirSync(path.join(pagesOut, 'keep'), { recursive: true });
@@ -349,18 +364,18 @@ Nothing declares a shape for this.
       };
 
       {
-        const said = await rig.call('page', 'move', { from: 'src/pages/escape-probe.astro', to: 'out/MOVED.astro' });
-        check('page.move refuses a destination that leads out through a symlink', said.envelope?.code === 'outside_project', short(said.envelope));
+        const said = await rig.call('page', 'move', { from: 'src/pages/escape-probe.astro', to: 'src/pages/out/MOVED.astro' });
+        check('page.move refuses a destination that leads out through a symlink', contained(said.envelope), short(said.envelope));
         intact('page.move');
       }
       {
-        const said = await rig.call('page', 'folder_create', { dir: 'out/newdir' });
-        check('page.folder_create refuses one', said.envelope?.code === 'outside_project', short(said.envelope));
+        const said = await rig.call('page', 'folder_create', { dir: 'src/pages/out/newdir' });
+        check('page.folder_create refuses one', contained(said.envelope), short(said.envelope));
         intact('page.folder_create');
       }
       {
-        const said = await rig.call('page', 'folder_rename', { from: 'out/keep', to: 'out/renamed' });
-        check('page.folder_rename refuses one', said.envelope?.code === 'outside_project', short(said.envelope));
+        const said = await rig.call('page', 'folder_rename', { from: 'src/pages/out/keep', to: 'src/pages/out/renamed' });
+        check('page.folder_rename refuses one', contained(said.envelope), short(said.envelope));
         intact('page.folder_rename');
       }
       {
@@ -368,16 +383,16 @@ Nothing declares a shape for this.
         // actually run it — a permission_denied here would prove nothing about
         // containment.
         rig.harness.setMode('full');
-        const said = await rig.call('page', 'folder_delete', { dir: 'out/keep' });
+        const said = await rig.call('page', 'folder_delete', { dir: 'src/pages/out/keep' });
         rig.harness.setMode('edit');
-        check('page.folder_delete refuses one at the mode that would run it', said.envelope?.code === 'outside_project', short(said.envelope));
+        check('page.folder_delete refuses one at the mode that would run it', contained(said.envelope), short(said.envelope));
         check('  and the directory outside the project is still there', fs.existsSync(path.join(pagesOut, 'keep')), 'a recursive delete ran outside the project');
         intact('page.folder_delete');
       }
       // And the shape that never needed a link: a climb.
       {
         const said = await rig.call('page', 'move', { from: 'src/pages/escape-probe.astro', to: '../../../ESCAPED.astro' });
-        check('page.move refuses a destination that climbs out', said.envelope?.code === 'outside_project', short(said.envelope));
+        check('page.move refuses a destination that climbs out', contained(said.envelope), short(said.envelope));
         intact('a climbing page.move');
       }
 
@@ -406,17 +421,17 @@ Nothing declares a shape for this.
       // four operations, in-project, have to still do their work. A fence that
       // refuses everything passes every assertion above.
       {
-        const moved = await rig.call('page', 'move', { from: 'src/pages/escape-probe.astro', to: 'nested/probe.astro' });
+        const moved = await rig.call('page', 'move', { from: 'src/pages/escape-probe.astro', to: 'src/pages/nested/probe.astro' });
         check('page.move still moves a page inside the project', moved.envelope?.ok === true, short(moved.envelope));
         check('  and the file is really there', rig.harness.exists('src/pages/nested/probe.astro'), 'the move did not land');
-        const made = await rig.call('page', 'folder_create', { dir: 'nested/deeper' });
+        const made = await rig.call('page', 'folder_create', { dir: 'src/pages/nested/deeper' });
         check('page.folder_create still makes one', made.envelope?.ok === true, short(made.envelope));
         check('  on disk', fs.existsSync(path.join(rig.root, 'src/pages/nested/deeper')), 'the folder was not created');
-        const renamed = await rig.call('page', 'folder_rename', { from: 'nested/deeper', to: 'nested/deepest' });
+        const renamed = await rig.call('page', 'folder_rename', { from: 'src/pages/nested/deeper', to: 'src/pages/nested/deepest' });
         check('page.folder_rename still renames one', renamed.envelope?.ok === true, short(renamed.envelope));
         check('  on disk', fs.existsSync(path.join(rig.root, 'src/pages/nested/deepest')), 'the folder was not renamed');
         rig.harness.setMode('full');
-        const gone = await rig.call('page', 'folder_delete', { dir: 'nested/deepest' });
+        const gone = await rig.call('page', 'folder_delete', { dir: 'src/pages/nested/deepest' });
         rig.harness.setMode('edit');
         check('page.folder_delete still deletes one', gone.envelope?.ok === true, short(gone.envelope));
         check('  and it is gone', !fs.existsSync(path.join(rig.root, 'src/pages/nested/deepest')), 'the folder is still there');

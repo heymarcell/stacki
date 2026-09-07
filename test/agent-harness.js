@@ -214,6 +214,39 @@ function loadMain() {
   const Module = require('module');
   const handlers = new Map();
   const sent = [];
+  // WHERE MAIN'S OWN ANNOUNCEMENTS GO.
+  //
+  // `send()` in electron/main.js is main talking to the renderer — how the app
+  // says "the project's files moved", "the CMS changed", "the stylesheet
+  // changed". Until now this harness had no window, so `send()` saw
+  // `mainWindow === null` and did nothing, and every one of those announcements
+  // was invisible here.
+  //
+  // That is not a neutral gap: it is exactly the shape of the defect a live
+  // dogfood found. An agent created a page, the file was on disk, `page.list`
+  // saw it, and the page switcher the person was looking at did not — because
+  // the announcement that makes the renderer rescan was never delivered. A
+  // harness that drops every main→renderer event cannot fail that test, and
+  // did not.
+  //
+  // So the window is a real object with the four things `createWindow` and
+  // `send` use, and everything it is asked to send is both recorded and handed
+  // to whoever subscribed through the bridge.
+  const mainEvents = [];
+  const listeners = new Map();
+  let readyResolve = null;
+  const deliver = (channel, payload) => {
+    mainEvents.push({ channel, payload });
+    for (const cb of listeners.get(channel) || []) {
+      try {
+        cb(payload);
+      } catch (err) {
+        // A listener that throws is the app's problem to report, not a reason
+        // for the next listener not to hear about the change.
+        console.error(`[harness] ${channel} listener threw:`, err);
+      }
+    }
+  };
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-agent-userdata-'));
   // Taken back when this process ends. One per run is easy to overlook and adds
   // up to gigabytes across a working day — there were three hundred and
@@ -230,20 +263,58 @@ function loadMain() {
     app: {
       getPath: () => userData,
       getVersion: () => '0.0.0-test',
-      // Never resolves: the app's own startup must not run here.
-      whenReady: () => new Promise(() => {}),
+      // STILL NEVER RESOLVES BY ITSELF. The app's own startup — the menu, the
+      // auto-updater, the MCP endpoint, the terminal handlers — must not run in
+      // a unit fixture, and twenty suites depend on it not running.
+      //
+      // `bootWindow()` below resolves it deliberately, for the one thing in
+      // that block this harness does need: `createWindow`, which is what gives
+      // `send()` a window to talk through. Nothing else in the block is reached,
+      // because the harness resolves the promise and then does not await the
+      // continuation — it takes the window and stops.
+      whenReady: () => new Promise((resolve) => {
+        readyResolve = resolve;
+      }),
       on() {},
       setName() {},
       setAboutPanelOptions() {},
       requestSingleInstanceLock: () => true,
+      // Reached by the auto-update logger, which runs in the whenReady block
+      // `bootWindow` resolves. It refuses to do anything in a development build
+      // and only wants to know whether it may talk to the window yet.
+      isReady: () => true,
       isPackaged: false,
+      setLoginItemSettings() {},
+      getLoginItemSettings: () => ({ openAtLogin: false }),
+      getName: () => 'Stacki',
+      getAppPath: () => path.join(__dirname, '..'),
       dock: { setIcon() {} },
       quit() {},
     },
     BrowserWindow: class {
+      constructor() {
+        this.webContents = {
+          send: (channel, payload) => deliver(channel, payload),
+          setWindowOpenHandler() {},
+          on() {},
+          session: { setPermissionRequestHandler() {} },
+        };
+      }
       static getAllWindows() {
         return [];
       }
+      loadURL() {}
+      loadFile() {}
+      on() {}
+      isDestroyed() {
+        return false;
+      }
+      isMinimized() {
+        return false;
+      }
+      restore() {}
+      show() {}
+      focus() {}
     },
     screen: {
       getPrimaryDisplay: () => ({ workAreaSize: { width: 1440, height: 900 } }),
@@ -295,7 +366,7 @@ function loadMain() {
     if (!fn) throw new Error(`no handler for ${channel}`);
     return fn(null, payload);
   };
-  mainLoaded = { handlers, callMain, userData, sent };
+  mainLoaded = { handlers, callMain, userData, sent, mainEvents, listeners, deliver, boot: () => readyResolve?.() };
   return mainLoaded;
 }
 
@@ -380,8 +451,20 @@ const settle = (ms = 60) => new Promise((done) => setTimeout(done, ms));
 // caller may not be asking: a suite about what `project.probe` is ALLOWED to
 // reach needs a project origin it controls, not a project origin that works.
 // Anything that actually renders still needs `realDevServer`.
-async function start(root, { agentMode = 'full', realDevServer = false, devUrl = null } = {}) {
-  const { handlers, callMain } = loadMain();
+async function start(root, { agentMode = 'full', realDevServer = false, devUrl = null, deliverMainEvents = false } = {}) {
+  const { handlers, callMain, mainEvents, listeners, boot } = loadMain();
+  // OFF BY DEFAULT, because it changes what the app is told and every existing
+  // suite was written against a fixture that is told nothing. On, main gets a
+  // window and its announcements reach the App the way they do in the shipped
+  // process — which is the only way a test can watch the two views of a project
+  // converge, or fail to.
+  if (deliverMainEvents) {
+    // The MCP endpoint is started from the same whenReady block. It is a real
+    // HTTP listener and no part of what this is for.
+    process.env.STACKI_MCP = 'off';
+    boot();
+    await new Promise((done) => setTimeout(done, 0));
+  }
   const dom = makeDom();
 
   // Everything the app publishes about itself, kept so the API can read it the
@@ -472,7 +555,21 @@ async function start(root, { agentMode = 'full', realDevServer = false, devUrl =
       get(target, prop) {
         if (prop in target) return target[prop];
         if (typeof prop !== 'string') return undefined;
-        if (prop.startsWith('on')) return () => () => {};
+        // A SUBSCRIPTION THAT REMEMBERS. `on*` used to answer with a black hole
+        // — a function returning an unsubscribe that had nothing to undo — so
+        // every main→renderer announcement died here even when main made one.
+        // Now the callback is filed under the channel the preload uses for it,
+        // and `deliver()` in loadMain hands events to whoever asked.
+        if (prop.startsWith('on')) {
+          const channel = EVENT_CHANNEL_OF[prop];
+          if (!channel) return () => () => {};
+          return (cb) => {
+            const list = listeners.get(channel) || [];
+            list.push(cb);
+            listeners.set(channel, list);
+            return () => listeners.set(channel, (listeners.get(channel) || []).filter((f) => f !== cb));
+          };
+        }
         // Everything else is one of main's own handlers, under the name the
         // preload gives it.
         const channel = CHANNEL_OF[prop];
@@ -563,6 +660,15 @@ async function start(root, { agentMode = 'full', realDevServer = false, devUrl =
       mode = next;
     },
     settle,
+    // Everything main has announced to the renderer since this fixture started,
+    // in order. A test that wants to know whether main SAID something reads
+    // this; one that wants to know whether the App ACTED on it reads the App.
+    mainEvents: () => mainEvents.slice(),
+    // The rendered app. There is no browser painting it, so nothing here has a
+    // size or a colour — but the ELEMENTS are the app's own, rendered by React
+    // from the app's own state, which is what makes "the page switcher lists
+    // three pages" a question about the product rather than about a variable.
+    document: () => dom.window.document,
     read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'),
     write: (rel, text) => {
       // Makes the directories on the way. A fixture that can only write beside
@@ -594,4 +700,25 @@ const CHANNEL_OF = (() => {
   return out;
 })();
 
-module.exports = { makeProject, removeProject, start, loadMain, settle, FIXTURE, CHANNEL_OF };
+// Which IPC channel each `on*` subscription listens on, read out of the preload
+// for the same reason CHANNEL_OF is: a hand-written table here would be a second
+// place to keep the names, and the first thing that goes stale is the copy.
+//
+// The shape it matches is the preload's own:
+//
+//     onFsChanged: (cb) => {
+//       const listener = (_e, payload) => cb(payload);
+//       ipcRenderer.on('fs:changed', listener);
+//
+// so the name and the channel come from the same declaration.
+const EVENT_CHANNEL_OF = (() => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+  const body = source.slice(source.indexOf('contextBridge.exposeInMainWorld'));
+  const out = {};
+  for (const m of body.matchAll(/^\s{2}(on[A-Z][\w$]*):\s*\(cb\)\s*=>\s*\{[\s\S]{0,400}?ipcRenderer\.on\('([^']+)'/gm)) {
+    out[m[1]] = m[2];
+  }
+  return out;
+})();
+
+module.exports = { makeProject, removeProject, start, loadMain, settle, FIXTURE, CHANNEL_OF, EVENT_CHANNEL_OF };

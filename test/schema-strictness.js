@@ -1202,10 +1202,21 @@ const declaredDefaults = (json) => {
     // went one whole extra count of the union's own thirty. Nothing was
     // dropped from the surface — the published documents are byte-identical —
     // and every one of those keywords is still counted, once, under the union.
+    //
+    // They ROSE from 1,091 and 1,076 when the page domain got one path space.
+    // Five arguments that were a bare `z.string().max(300)` — `page.move`'s
+    // `to` and the four folder paths — became `PagePath`, which is `.min(1)`
+    // as well, because an empty page path is not a page path and the resolver
+    // has always refused one; and two that were `RelPath` (`.min(1).max(1024)`,
+    // a path anywhere in the project) became the same `PagePath`, which is the
+    // narrower and truer bound. Net five more bounded keywords, counted twice
+    // each. The number moving is the mechanism working: it is here so that a
+    // bound cannot go missing quietly, and a bound that CHANGES on purpose is
+    // supposed to be argued for in this comment.
     check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
     check(
-      '  and compared real constraints: 1,091 bound keywords across the rebuilt nodes',
-      bounds === 1091,
+      '  and compared real constraints: 1,101 bound keywords across the rebuilt nodes',
+      bounds === 1101,
       `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
     );
 
@@ -1235,7 +1246,7 @@ const declaredDefaults = (json) => {
       for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
     }
     check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
-    check('  and the tally walked something: 1,076 checks across the rebuilt nodes', checksSeen === 1076, `${checksSeen} checks`);
+    check('  and the tally walked something: 1,086 checks across the rebuilt nodes', checksSeen === 1086, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────

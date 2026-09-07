@@ -695,15 +695,44 @@ const SourceInput = closed(z.discriminatedUnion('action', [
 
 // --- page --------------------------------------------------------------------
 
+// ONE PATH SPACE, SAID ONCE.
+//
+// Every path in this domain is project-relative and under src/pages — the same
+// spelling every other domain uses and the same spelling these actions RETURN.
+// It used to be two: `page.move`'s `from` was project-relative and its `to` was
+// relative to src/pages, and the folder actions prefixed `src/pages/` onto
+// whatever they were handed, so passing back a path this API had just returned
+// produced `src/pages/src/pages/blog`. Three of them did not even fail at it.
+//
+// The rule is in one constant so that the schema a client reads, the refusal it
+// gets when it is wrong, and the resolver that enforces it cannot drift apart.
+// See `pagesRel` in electron/mcp/agent/domains.js for the other two.
+const PAGE_PATH_RULE = 'Project-relative and under src/pages/ — for example src/pages/blog or src/pages/blog/first.astro.';
+
+const PagePath = z.string().min(1).max(300).describe(PAGE_PATH_RULE);
+
 const PageInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }),
   z.object({ action: z.literal('read'), path: RelPath }),
-  z.object({ action: z.literal('create'), name: z.string().max(300), layout: z.string().max(120).optional() }),
-  z.object({ action: z.literal('delete'), path: RelPath }),
-  z.object({ action: z.literal('move'), from: RelPath, to: z.string().max(300).describe('The new path, relative to src/pages.') }),
-  z.object({ action: z.literal('folder_create'), dir: z.string().max(300) }),
-  z.object({ action: z.literal('folder_rename'), from: z.string().max(300), to: z.string().max(300) }),
-  z.object({ action: z.literal('folder_delete'), dir: z.string().max(300) }),
+  z.object({
+    action: z.literal('create'),
+    // A NAME, NOT A PATH, and the only argument in this domain that is not one.
+    // It says so, because the difference is exactly what a caller gets wrong.
+    name: z
+      .string()
+      .max(300)
+      .describe(
+        'The page\'s name, WITHOUT src/pages and without an extension — "contact", or "docs/intro" for one in a ' +
+          'folder. This is the one argument here that is a name rather than a path; the answer comes back as a ' +
+          'project-relative path (src/pages/contact.astro), which is what every other action in this domain takes.'
+      ),
+    layout: z.string().max(120).optional(),
+  }),
+  z.object({ action: z.literal('delete'), path: PagePath }),
+  z.object({ action: z.literal('move'), from: PagePath, to: PagePath.describe(`Where it should end up. ${PAGE_PATH_RULE}`) }),
+  z.object({ action: z.literal('folder_create'), dir: PagePath }),
+  z.object({ action: z.literal('folder_rename'), from: PagePath, to: PagePath.describe(`The folder's new path. ${PAGE_PATH_RULE}`) }),
+  z.object({ action: z.literal('folder_delete'), dir: PagePath }),
   z.object({
     action: z.literal('component_create'),
     name: z.string().max(120).describe('The component name — a word starting with a capital letter.'),

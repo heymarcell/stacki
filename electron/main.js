@@ -2321,6 +2321,65 @@ function markSelfWrite(p) {
   notePageMayHaveChanged();
 }
 
+// What counts as a page file, in the one place the watcher and the mutations
+// below both read it from.
+const PAGE_FILE = /\.(astro|md|mdx|html)$/i;
+
+/**
+ * THE ONE PLACE A CHANGE TO WHICH PAGES EXIST IS ANNOUNCED.
+ *
+ * WHY THIS EXISTS. Two doors create, move and delete pages. The Pages panel
+ * calls these handlers over IPC and then rescans the project itself, so its
+ * list is fresh. The Agent API calls THE SAME handlers and does not — it has no
+ * renderer state of its own to refresh. So a page an agent created was on disk,
+ * was in `project:scan`, was in `page.list`, and was NOT in the page switcher
+ * the person was looking at until they closed and reopened the project. A live
+ * dogfood found it on `page.create` and it was true of every page and folder
+ * mutation.
+ *
+ * THE WATCHER CANNOT COVER IT, and that is deliberate rather than an oversight.
+ * `markSelfWrite` makes the app's own writes invisible to the watcher on
+ * purpose — otherwise every save would race its own event — which means the one
+ * signal that makes the renderer rescan is suppressed for exactly the writes
+ * that need it. The same reasoning already appears twice in this file for
+ * content writes ("our writes are invisible to the watcher, so say so
+ * directly"). This is that, said once, for the page surface, instead of six
+ * times or not at all.
+ *
+ * IT SENDS THE CHANNEL THE WATCHER SENDS. `fs:changed` is what App.jsx's
+ * listener rescans on, and it also decides whether the OPEN page was affected
+ * by looking for its path in `files` — so a folder rename lists the pages that
+ * moved rather than the folder, and an open page inside it is reloaded or
+ * closed exactly as it would be if somebody had moved that folder in Finder.
+ * One code path, one behaviour, whichever door the change came through.
+ */
+function notePagesChanged(files) {
+  const list = (Array.isArray(files) ? files : [files]).filter(Boolean).map((f) => path.resolve(f));
+  if (!list.length) return;
+  send('fs:changed', { files: list });
+}
+
+/** Every page file under `dir`, absolute. For folder operations. */
+function pageFilesUnder(dir) {
+  const out = [];
+  const walk = (at, depth) => {
+    if (depth > 24) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(at, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(at, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (PAGE_FILE.test(entry.name)) out.push(full);
+    }
+  };
+  walk(dir, 0);
+  return out;
+}
+
 handle('watch:start', async (_e, projectPath) => {
   openProjectRoot = path.resolve(projectPath); // scopes the asset protocol
   if (watcher) {
@@ -2379,7 +2438,7 @@ handle('watch:start', async (_e, projectPath) => {
       cssTimer = setTimeout(() => send('css:changed', {}), 200);
       return;
     }
-    if (!/\.(astro|md|mdx|html)$/i.test(name)) return;
+    if (!PAGE_FILE.test(name)) return;
     const full = path.join(srcDir, name);
     // Ignore events caused by the app's own recent writes.
     const wrote = selfWrites.get(path.resolve(full));
@@ -3500,12 +3559,14 @@ handle('page:create', async (_e, { projectPath, name, layout }) => {
   }
   markSelfWrite(pagePath);
   fs.writeFileSync(pagePath, serializePage(model), 'utf8');
+  notePagesChanged([pagePath]);
   return { pagePath };
 });
 
 handle('page:delete', async (_e, pagePath) => {
   markSelfWrite(pagePath);
   fs.rmSync(pagePath);
+  notePagesChanged([pagePath]);
   return { ok: true };
 });
 
@@ -3539,6 +3600,10 @@ handle('page:move', async (_e, { projectPath, from, to }) => {
   markSelfWrite(dest);
   fs.writeFileSync(dest, source, 'utf8');
   fs.rmSync(from);
+  // BOTH ENDS. The renderer decides whether the OPEN page was affected by
+  // looking for its path in this list, and for a move that is the path it had
+  // before as much as the one it has now.
+  notePagesChanged([from, dest]);
   return { newPath: dest };
 });
 
@@ -3589,7 +3654,12 @@ function realpathOfNearest(abs) {
 }
 
 handle('pagefolder:create', async (_e, { projectPath, dir }) => {
-  fs.mkdirSync(resolvePagesDir(projectPath, dir), { recursive: true });
+  const full = resolvePagesDir(projectPath, dir);
+  fs.mkdirSync(full, { recursive: true });
+  // A new folder holds no pages, so there is no page path to name — but the
+  // folder itself is part of the structure the switcher draws, and a rescan is
+  // what puts it there.
+  notePagesChanged([full]);
   return { ok: true };
 });
 
@@ -3597,7 +3667,11 @@ handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   const a = resolvePagesDir(projectPath, from);
   const b = resolvePagesDir(projectPath, to);
   if (fs.existsSync(b)) throw refuse('exists', 'A folder with that name already exists.');
+  // Listed BEFORE the rename, because afterwards those paths do not exist to be
+  // walked — and the page that was open is at one of them.
+  const moved = pageFilesUnder(a);
   fs.renameSync(a, b);
+  notePagesChanged([...moved, ...moved.map((f) => path.join(b, path.relative(a, f)))]);
   return { ok: true };
 });
 
@@ -3605,7 +3679,9 @@ handle('pagefolder:delete', async (_e, { projectPath, dir }) => {
   const full = resolvePagesDir(projectPath, dir);
   const pagesDir = path.join(projectPath, 'src', 'pages');
   if (full === pagesDir) throw new Error('Invalid folder.');
+  const gone = pageFilesUnder(full);
   fs.rmSync(full, { recursive: true, force: true });
+  notePagesChanged(gone.length ? gone : [full]);
   return { ok: true };
 });
 

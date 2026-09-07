@@ -74,28 +74,114 @@ function rel(ctx, value, what = 'path') {
   return found;
 }
 
+/** Where pages live, as this API spells it. */
+const PAGES_DIR = 'src/pages';
+
 /**
- * A path the page handlers spell relative to src/pages, resolved like any other.
+ * A page or page-folder path: PROJECT-RELATIVE, like every other path here.
  *
- * `page.move`'s `to` and the folder actions' `dir`/`from`/`to` are relative to
- * the pages directory rather than to the project, and that is why they were the
- * only path arguments in this surface that never reached rel(). What fenced
- * them instead was the handler's own `path.resolve` + `startsWith`, which is a
- * check on the SPELLING — and a symlink under src/pages is spelled like
- * everything else in there. Measured: `to: 'out/MOVED.astro'` through such a
+ * ONE COORDINATE SYSTEM, AND WHY THERE USED TO BE TWO. This function is the
+ * result of a live dogfood finding `page.folder_rename` reporting
+ *
+ *     src/pages/src/pages/blog is not in this project.
+ *
+ * for a perfectly ordinary project-relative argument. The old version prefixed
+ * `src/pages/` onto whatever it was handed, unconditionally — so a caller who
+ * had read the OUTPUT of `page.create` (`src/pages/contact.astro`, project
+ * relative, like every other path this API returns) and passed that spelling
+ * back got a phantom directory. Three of the folder actions did not even fail:
+ * `folder_create({dir: 'src/pages/news'})` answered ok and made
+ * `src/pages/src/pages/news`.
+ *
+ * Worse than either was `page.move`, which took `from` through `rel` — project
+ * relative — and `to` through the prefixing one. One operation, two coordinate
+ * systems, and nothing said so.
+ *
+ * So there is one space and it is the one the rest of the surface already uses
+ * and already returns: project-relative POSIX, under `src/pages`. A value that
+ * is not under `src/pages` is REFUSED, and the refusal says what to pass —
+ * because the alternative, guessing that a bare `blog` meant `src/pages/blog`,
+ * is how there came to be two spellings in the first place. Guessing is what
+ * this function exists to stop doing.
+ *
+ * THE FENCE IS STILL `rel`'s. `resolveInProject` resolves symlinks, which the
+ * handlers' own `path.resolve` + `startsWith` cannot: that compares SPELLINGS,
+ * and a symlink under src/pages is spelled like everything else in there.
+ * Measured before it went through here: `to: 'out/MOVED.astro'` through such a
  * link moved a page OUT of the project on `edit`, `dir: 'out/newdir'` created a
  * directory outside it, and `folder_delete` ran fs.rmSync(recursive, force) on
  * one, while asset.write_text and source.write refused the identical route with
- * outside_project in the same run.
- *
- * So they go through the same resolver as the rest, realpath step included, and
- * the handler is handed the absolute path it would have computed itself — its
- * own fence still holds, this one is simply the half that survives a link.
+ * outside_project in the same run. The handler's own fence still holds; this is
+ * the half that survives a link.
  */
 function pagesRel(ctx, value, what = 'page folder') {
-  const raw = String(value ?? '').trim().replace(/^\/+/, '');
-  if (!raw) return { error: { ok: false, code: 'bad_path', message: `A ${what} inside src/pages is required, relative to it.` } };
-  return rel(ctx, `src/pages/${raw}`, what);
+  // Separators first, so a Windows-shaped argument is judged by where it points
+  // rather than by how it is punctuated.
+  const raw = String(value ?? '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '');
+  if (!raw) {
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message: `A ${what} is required, project-relative and under ${PAGES_DIR}/ — for example ${PAGES_DIR}/blog.`,
+      },
+    };
+  }
+  // Under src/pages, spelled from the project root. `src/pages` itself is the
+  // root of the page tree and is a legitimate thing to name; anything else is
+  // somewhere this action does not reach.
+  const withinPages = raw === PAGES_DIR || raw.startsWith(`${PAGES_DIR}/`);
+  if (!withinPages) {
+    const rule = `page and folder paths are project-relative and live under ${PAGES_DIR}/`;
+    // AND ONLY OFFER A SPELLING THAT IS ONE. The most likely mistake by a long
+    // way is the OLD spelling — a path relative to src/pages — and naming what
+    // that value would be as a project path is the whole difference between a
+    // refusal somebody can act on and one they have to decode. But it is only
+    // sensible advice for a value that IS a plain relative path: prefixing
+    // `src/pages/` onto `../escape` or `/etc/passwd` produces a suggestion that
+    // is either a traversal or a fiction, and telling somebody to pass one of
+    // those is worse than telling them nothing.
+    const absolute = raw.startsWith('/') || /^[A-Za-z]:\//.test(raw);
+    const traverses = raw.split('/').includes('..');
+    const elsewhereInProject = raw.startsWith('src/');
+    let advice;
+    if (absolute || traverses) advice = `Give a path inside the project, such as ${PAGES_DIR}/blog.`;
+    else if (elsewhereInProject) advice = `${raw} is somewhere else in the project; only ${PAGES_DIR}/ holds pages.`;
+    else advice = `Pass ${PAGES_DIR}/${raw}.`;
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message: `${raw} is not a ${what}: ${rule}. ${advice} Nothing was changed.`,
+      },
+    };
+  }
+  const found = rel(ctx, raw, what);
+  if (found.error) return found;
+  // AND WHERE IT ACTUALLY LANDS, not only how it is spelled.
+  //
+  // `src/pages/../../escape` begins with `src/pages/` and resolves to `escape`
+  // at the project root — inside the project, so `rel` is right to allow it,
+  // and nowhere near a page. Without this the handler caught it, which meant
+  // the same mistake came back as `outside_project` / "Invalid folder." from
+  // one action and as `bad_path` with a sentence from another. One resolver
+  // owns the question, so there is one answer to it.
+  const landed = found.rel;
+  if (landed !== PAGES_DIR && !landed.startsWith(`${PAGES_DIR}/`)) {
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message:
+          `${raw} is not a ${what}: it resolves to ${landed}, which is outside ${PAGES_DIR}/. ` +
+          `Give a path inside the project, such as ${PAGES_DIR}/blog. Nothing was changed.`,
+      },
+    };
+  }
+  return found;
 }
 
 const clip = (text, max) => {
@@ -509,16 +595,19 @@ const page = {
     args: (input, ctx) => {
       const at = rel(ctx, input.path, 'page path');
       if (at.error) return at;
-      if (!/^src\/pages\//.test(at.rel)) return problem('bad_request', 'Only a file under src/pages is a page.');
       return at.abs;
     },
     result: (_raw, input) => ({ deleted: input.path }),
   },
 
+  // BOTH ENDS IN THE SAME SPACE. `from` went through `rel` and `to` through the
+  // prefixing resolver, so one operation took two coordinate systems and said
+  // so nowhere. Both are project-relative now, and both are checked to be under
+  // src/pages by the one function that knows what that means.
   move: {
     channel: 'page:move',
     args: (input, ctx) => {
-      const from = rel(ctx, input.from, 'page path');
+      const from = pagesRel(ctx, input.from, 'page path');
       if (from.error) return from;
       const to = pagesRel(ctx, input.to, 'page path');
       if (to.error) return to;
@@ -527,12 +616,16 @@ const page = {
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.newPath || '') }),
   },
 
+  // Each folder action answers with the path it acted on, in the space it was
+  // given — so a caller can hand the answer straight back to the next call,
+  // which is the thing that used to double it.
   folder_create: {
     channel: 'pagefolder:create',
     args: (input, ctx) => {
       const dir = pagesRel(ctx, input.dir);
       return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
     },
+    result: (_raw, input, ctx) => ({ path: pagesRel(ctx, input.dir).rel ?? null }),
   },
   folder_rename: {
     channel: 'pagefolder:rename',
@@ -543,6 +636,7 @@ const page = {
       if (to.error) return to;
       return { projectPath: ctx.root, from: from.abs, to: to.abs };
     },
+    result: (_raw, input, ctx) => ({ from: pagesRel(ctx, input.from).rel ?? null, path: pagesRel(ctx, input.to).rel ?? null }),
   },
   folder_delete: {
     channel: 'pagefolder:delete',
@@ -550,6 +644,7 @@ const page = {
       const dir = pagesRel(ctx, input.dir);
       return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
     },
+    result: (_raw, input, ctx) => ({ deleted: pagesRel(ctx, input.dir).rel ?? null }),
   },
 
 

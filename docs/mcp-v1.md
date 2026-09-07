@@ -85,7 +85,7 @@ already have.
 | Tools | **14** | `tools/list` is **165,135 bytes** (17,783 gzipped) |
 | Agent operations | **<!--count:total-->111<!--/-->** across <!--count:domains-->8<!--/--> domains — <!--count:full-->110<!--/--> reachable, <!--count:boundary-->1<!--/--> BOUNDARY (`git.publish`) | in the tool schemas above |
 | Permission answers | **<!--count:permAnswers-->444<!--/-->** (<!--count:total-->111<!--/--> operations × <!--count:modes-->4<!--/--> levels) | — |
-| Resources | **6** — `stacki://guide/{operating-model,editing,review,audit,astro}` and `stacki://project/profile` | `resources/list` is 2,233 bytes; a read costs only when asked |
+| Resources | **7** — `stacki://guide/{operating-model,editing,review,audit,astro}`, `stacki://project/profile` and `stacki://build` | a read costs only when asked |
 | Prompts | **3** — change the UI, work the review, audit and fix | `prompts/list` is 1,135 bytes |
 
 ### The connection preamble, measured on a real host
@@ -100,6 +100,12 @@ across eleven sessions:
 | `resources/list` | 2,233 |
 | `prompts/list` | 1,135 |
 | **total, before the model has seen the task** | **170,691** |
+
+**These are the bytes of a six-resource build.** `stacki://build` was added
+after that recording and adds roughly 460 bytes to `resources/list`, which is a
+fifth of a percent of the preamble; the number above is left as it was measured
+rather than being adjusted by arithmetic nobody ran a proxy for. The next
+recording replaces the table.
 
 Those are HTTP bytes, and HTTP bytes are not model context. Claude Code has MCP
 tool search on by default: it is handed the catalogue and gives the model tool

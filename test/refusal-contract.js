@@ -677,7 +677,17 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
 
     // PATHS AND CONTENT
     await provoke('an absolute path', 'outside_project', 'source', 'read', { path: '/etc/hosts' });
-    await provoke('a page folder with no name', 'bad_path', 'page', 'folder_create', { dir: '' });
+    // NOT the empty string any more, which is now refused a step earlier and
+    // more strictly: `PagePath` carries `.min(1)`, so a client validating
+    // against the published schema never sends it and the runtime answers
+    // `bad_arguments` — refused by the protocol rather than by a sentence,
+    // which is the better refusal and the wrong one to grade `bad_path` with.
+    //
+    // What produces `bad_path` is the mistake that is actually made: a path in
+    // the OLD spelling, relative to src/pages instead of to the project. That
+    // is the shape a live dogfood hit, and the refusal for it names the path to
+    // pass instead. See test/page-paths.js for the whole matrix.
+    await provoke('a page folder in the old, src/pages-relative spelling', 'bad_path', 'page', 'folder_create', { dir: 'news' });
     await provoke('a page that is not there', 'no_file', 'page', 'read', { path: 'src/pages/nope.astro' });
     await provoke('a file Stacki has no tree for', 'unrepresentable', 'page', 'read', { path: 'package.json' });
     await provoke('an import that resolves to nothing', 'not_found', 'source', 'resolve_path', {
