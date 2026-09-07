@@ -145,6 +145,36 @@ function makeRepo(files) {
   check('and when', record.builtAt === '2026-01-02T03:04:05.000Z', JSON.stringify(record));
   check('and it is on disk as JSON', JSON.parse(fs.readFileSync(file, 'utf8')).gitHead === repo.head());
 
+  // ONE STAMP PER BUILD, WHICH IS WHAT A UNIVERSAL BUILD REQUIRES.
+  //
+  // electron-builder packs x64 and arm64 separately and reconciles the two trees
+  // into one bundle, running `beforePack` once per architecture in the same
+  // process. Stamping twice wrote two files that agreed about everything except
+  // `builtAt`, and the reconcile refused them outright:
+  //
+  //   ⨯ Can't reconcile two non-macho files electron/build-info.json
+  //
+  // A whole package build failed on it, which is exactly the class of thing this
+  // suite is for.
+  {
+    stamper._resetStamp();
+    const two = tmp('twopass');
+    const twoFile = path.join(two, 'bi.json');
+    const first = stamper.stamp({ root: repo.dir, file: twoFile, now: new Date('2026-01-01T00:00:00.000Z') });
+    const firstBytes = fs.readFileSync(twoFile, 'utf8');
+    const second = stamper.stamp({ root: repo.dir, file: twoFile, now: new Date('2026-06-06T06:06:06.000Z') });
+    const secondBytes = fs.readFileSync(twoFile, 'utf8');
+    check('a second pass in the same build writes identical bytes', firstBytes === secondBytes, `${firstBytes}\n    vs\n    ${secondBytes}`);
+    check('  and the same instant', first.builtAt === second.builtAt, `${first.builtAt} vs ${second.builtAt}`);
+    check('  and the file is still there afterwards', fs.existsSync(twoFile));
+    // A different build, later, is a different stamp — the reuse is scoped to
+    // one invocation, not to whatever is lying on disk.
+    stamper._resetStamp();
+    const later = stamper.stamp({ root: repo.dir, file: twoFile, now: new Date('2026-06-06T06:06:06.000Z') });
+    check('a later build stamps afresh', later.builtAt !== first.builtAt, `${later.builtAt} vs ${first.builtAt}`);
+    stamper._resetStamp();
+  }
+
   // It does not refuse. Recording the truth about a work-in-progress build is
   // the point; the gate that refuses is provenance.compare().
   fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'changed\n');

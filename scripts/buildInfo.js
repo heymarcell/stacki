@@ -27,6 +27,22 @@ const { gitIdentity } = require('../electron/buildInfo');
 const REPO_ROOT = path.join(__dirname, '..');
 const STAMP_FILE = path.join(REPO_ROOT, 'electron', 'build-info.json');
 
+// ONE STAMP PER BUILD, NOT ONE PER ARCHITECTURE.
+//
+// A universal macOS build packs x64 and arm64 separately and then reconciles the
+// two trees into one bundle, and electron-builder runs `beforePack` once per
+// architecture — in the same process. Stamping twice wrote two files that agreed
+// about everything except `builtAt`, and the reconcile refused them:
+//
+//   ⨯ Can't reconcile two non-macho files electron/build-info.json
+//
+// So the identity is computed once and reused for the rest of the invocation.
+// It is keyed on the commit and tree, so a build of a DIFFERENT tree in the same
+// process still stamps afresh, and the reuse is scoped to the process rather
+// than to the file on disk — "when this was built" stays the truth about this
+// build rather than about whenever the file happened to be written.
+let stampedThisProcess = null;
+
 /**
  * Write electron/build-info.json for the tree at `root`.
  *
@@ -42,6 +58,17 @@ function stamp({ root = REPO_ROOT, file = STAMP_FILE, now = new Date() } = {}) {
   }
 
   const identity = gitIdentity(root);
+  if (
+    stampedThisProcess &&
+    stampedThisProcess.file === file &&
+    stampedThisProcess.record.gitHead === (identity ? identity.gitHead : null) &&
+    stampedThisProcess.record.gitTree === (identity ? identity.gitTree : null)
+  ) {
+    // Written again anyway, in case something removed it between passes — the
+    // BYTES are what has to be identical, not the number of writes.
+    fs.writeFileSync(file, `${JSON.stringify(stampedThisProcess.record, null, 2)}\n`, 'utf8');
+    return stampedThisProcess.record;
+  }
   const record = {
     packageVersion: version,
     gitHead: identity ? identity.gitHead : null,
@@ -55,7 +82,13 @@ function stamp({ root = REPO_ROOT, file = STAMP_FILE, now = new Date() } = {}) {
   };
 
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  stampedThisProcess = { file, record };
   return record;
+}
+
+/** For a test: forget that this process has stamped anything. */
+function _resetStamp() {
+  stampedThisProcess = null;
 }
 
 /** electron-builder's beforePack signature. */
@@ -67,6 +100,7 @@ exports.default = async function beforePack() {
 };
 
 exports.stamp = stamp;
+exports._resetStamp = _resetStamp;
 exports.STAMP_FILE = STAMP_FILE;
 
 // `node scripts/buildInfo.js` stamps by hand, which is what a build that is not
