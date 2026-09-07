@@ -48,6 +48,23 @@
 // by the gate and a malformed one by the argument check — so the sweep proves
 // the shape of both answers without executing a single operation against the
 // fixture.
+//
+// AND THEN A SECOND WIRE RUNS AT `full`, because the first one cannot grade a
+// success and had been read as though it could. Every answer the `visual` sweep
+// validates is a REFUSAL — twelve of them, all `permission_denied` or
+// `bad_arguments` — and a refusal carries none of the fields a mutation
+// answers with. `changedFiles`, `notes`, `through`, `documentBefore` and
+// `revisionAfter` are declared in the Envelope and were reached by nothing:
+// no SUCCESS from any mutating operation in this repository was ever held
+// against the schema its tool publishes. The defect class that leaves open is
+// named in test/audit-schema-conformance.js — "a field DECLARED as an array
+// and emitted as a number" — and it has shipped, in `git`: a whole-tree
+// restore answered a COUNT on `changedFiles`, the SDK refused the call for
+// failing its own output schema, and the agent was told a destructive
+// operation had failed WHILE THE WORKING TREE HAD IN FACT BEEN RESTORED. So
+// the second wire runs one mutation per mutating tool at a level where it
+// really runs, proves on disk that it really ran, and validates the success
+// envelope with the same validator.
 
 const { DOMAINS, actionsOf, find } = require('../electron/mcp/agent/registry.js');
 const { NORMALIZE } = require('../electron/mcp/agent/index.js');
@@ -75,6 +92,22 @@ const check = (what, condition, detail) => {
 };
 const short = (v, n = 300) => JSON.stringify(v ?? null).slice(0, n);
 const same = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+
+/**
+ * EVERY KEY THE `visual` WIRE EVER PUT ON AN ENVELOPE.
+ *
+ * Filled by the two sweeps below — the 111-operation one and the per-tool
+ * grading one — and read by the mutation sweep at the bottom, which asserts
+ * that the fields it grades are fields NONE of those refusals reached. That is
+ * the whole of finding 63 stated as something falsifiable: without it, "every
+ * tool answers within its own declared output schema" reads like coverage of
+ * the surface and is coverage of the refusal branch.
+ */
+const refusalKeys = new Set();
+/** Record what an answer carried, so the claim above is measured and not asserted. */
+const noteKeys = (into, value) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) for (const k of Object.keys(value)) into.add(k);
+};
 
 const OPERATIONS = [];
 for (const domain of DOMAINS) for (const action of actionsOf(domain)) OPERATIONS.push({ domain, action, op: find(domain, action) });
@@ -323,6 +356,7 @@ function productToolNames() {
         } catch {
           /* a raw host sentence is not JSON, which is the complaint */
         }
+        noteKeys(refusalKeys, res?.structuredContent);
         check(`${domain}.${action} answers with structured content`, !!res?.structuredContent, short(res?.content?.[0]?.text));
         check(`  ${domain}.${action}: the text block is the same payload`, !!parsed && parsed.ok === false, short(res?.content?.[0]?.text));
         check(`  ${domain}.${action}: with a code a client can branch on`, typeof parsed?.code === 'string' && parsed.code.length > 0, short(parsed?.code));
@@ -344,6 +378,7 @@ function productToolNames() {
       } catch {
         /* see above */
       }
+      noteKeys(refusalKeys, res?.structuredContent);
       check(`${domain}.${action} with a bad ${spoil.name} is a Stacki refusal`, !!res?.structuredContent && parsed?.ok === false, short(res?.content?.[0]?.text));
       check(`  ${domain}.${action}: as bad_arguments`, parsed?.code === 'bad_arguments', short(parsed?.code));
       check(`  ${domain}.${action}: naming the operation`, parsed?.operation === `${domain}.${action}`, short(parsed?.operation));
@@ -486,6 +521,11 @@ function productToolNames() {
         const res = await rig.client.callTool({ name: tool.name, arguments: action ? { action } : {} });
         const verdict = await verdictOf(tool.outputSchema, res?.structuredContent);
         graded += 1;
+        // WHAT WAS ACTUALLY GRADED, recorded rather than described. Every one
+        // of these is a refusal — this wire is at `visual` — and the mutation
+        // sweep at the bottom of the file holds its own successes against this
+        // set to show which declared fields nothing here can reach.
+        noteKeys(refusalKeys, res?.structuredContent);
         check(`${tool.name} answers within its own declared output schema`, verdict.valid === true, `${verdict.errorMessage || ''}\n    ${short(res?.structuredContent)}`);
       }
       check(
@@ -605,6 +645,293 @@ function productToolNames() {
     problems.push(...(said?.problems || []));
   }
 
+  // ── WHAT A MUTATION ANSWERS, AGAINST WHAT ITS TOOL DECLARED ────────────────
+  //
+  // THE HALF THE SWEEP ABOVE CANNOT SEE.
+  //
+  // "every tool the wire can grade was graded" is true and it is twelve
+  // refusals. `visual` is the level that allows nothing, so every answer that
+  // loop validates is `permission_denied` or `bad_arguments` — and a refusal
+  // carries `ok`, `code`, `message`, `operation`, `issues` and very little
+  // else. The Envelope declares a great deal more than that, and all of it
+  // belongs to the answers a mutation gives: `changedFiles`, an ARRAY of
+  // `{file, beforeDigest, afterDigest, patch:{hunks:[{at,text}], linesAdded,
+  // linesRemoved}}`; `notes`, an array of strings; `through`, an enum of
+  // exactly `editor|disk`; `documentBefore`/`document`; `revisionBefore`/
+  // `revisionAfter`, integers. None of it was ever validated against anything,
+  // on any wire, in any suite: the four successes in test/agent-api.js are
+  // read-only, and this file's grading loop is at `visual`.
+  //
+  // WHICH IS THE EXACT SHAPE OF A DEFECT THAT HAS SHIPPED. `git.restore_project`
+  // answers a COUNT of restored files — naming every file of a whole-tree
+  // restore is the one thing this API promises not to send — and it landed on
+  // `changedFiles`, which the schema declares as an array. The SDK validates
+  // structured output, so it refused the whole call: `isError: true`, no
+  // structuredContent, no envelope, and an agent told that a destructive
+  // operation had failed WHILE THE WORKING TREE HAD ALREADY BEEN RESTORED. The
+  // guard for it is `ownChangedFiles` in electron/mcp/agent/index.js, and
+  // measured here on 2026-09-07 by removing it: every check in this file still
+  // passed, 1041 of 1041, exit 0, while `git.restore_project` over a real
+  // client answered nothing at all.
+  //
+  // So this wire runs at `full`, which allows everything, and every mutating
+  // tool answers a real success against the real fixture. Each one is asserted
+  // three ways: it SUCCEEDED (`ok:true`, and the client was handed a result
+  // rather than an isError), it really HAPPENED (read off disk, or back off the
+  // wire — a success that changed nothing would validate perfectly), and the
+  // envelope it answered with VALIDATES against the schema its tool publishes.
+  {
+    // A SECOND RIG, STARTED AFTER THE FIRST HAS STOPPED, never beside it.
+    // test/agent-harness.js puts its jsdom on the process globals, and two
+    // live harnesses would steer one another's documents — the same reason
+    // mcpWireRig captures `global.window` at construction time.
+    const mutating = await startWireRig({ era: 'modern', agentMode: 'full' });
+    const validator = new AjvJsonSchemaValidator();
+    const gradeAgainst = (schema, payload) =>
+      payload === undefined || payload === null
+        ? { valid: false, errorMessage: 'no structuredContent' }
+        : validator.getValidator(schema)(payload);
+
+    try {
+      const listedFull = await mutating.client.listTools();
+      const fullTools = new Map(listedFull.tools.map((t) => [t.name, t]));
+
+      // THE MUTATING SURFACE, FROM THE REGISTRY — never a list typed here.
+      //
+      // This is the completeness gate the header of the section is about. A
+      // ninth domain, or a mutating action added to a domain that had none,
+      // enters this set the day it lands in registry.js; if the table below
+      // has nothing for it, the two checks at the bottom fail. A sweep whose
+      // denominator is its own numerator measures nothing, which is how the
+      // grading loop above came to be read as covering the surface.
+      const MUTATING_TOOLS = DOMAINS.filter((d) => actionsOf(d).some((a) => find(d, a).risk !== 'read'));
+      check('every domain in the registry has a mutating operation', MUTATING_TOOLS.length === DOMAINS.length, `${MUTATING_TOOLS.length} of ${DOMAINS.length}: ${MUTATING_TOOLS.join(', ')}`);
+
+      const H = mutating.harness;
+      const INDEX = 'src/pages/index.astro';
+      const SHEET = 'src/styles/site.css';
+      const SITE = 'src/data/site.json';
+      const ROBOTS = 'User-agent: *\nDisallow: /wire-graded\n';
+      const TEXT = 'Wire-graded text';
+      const CLASS = 'wire-graded';
+      const HEADER = '// wire-graded\n';
+      const flatten = (node, out = []) => {
+        if (!node) return out;
+        out.push(node);
+        for (const child of node.children || []) flatten(child, out);
+        return out;
+      };
+      // A ref for a tag, read fresh EVERY time. A ref carries the revision the
+      // read saw and every mutation below bumps it, so a ref held across one
+      // is refused as `stale_target` — which is the surface working correctly
+      // and would leave this sweep grading refusals again, one level down.
+      const refFor = async (tag, within = null) => {
+        const { envelope } = await mutating.call('target', 'read', within ? { ref: within } : {});
+        const hit = flatten(envelope?.target).find((n) => String(n.tag || '').toLowerCase() === tag);
+        return hit?.ref || null;
+      };
+      const json = (rel) => {
+        try {
+          return JSON.parse(H.read(rel));
+        } catch {
+          return null;
+        }
+      };
+
+      // Carried between steps: the commit `git.restore_project` restores to.
+      const state = {};
+
+      // ONE MUTATION PER MUTATING TOOL, in an order that leaves each one able
+      // to run. They share a fixture on purpose — a rig apiece would be eight
+      // fixtures for eight envelopes — so the order is owned: the two target
+      // writes before the undo that takes one back, the git repository seeded
+      // after everything else is on disk so the commit has something to hold.
+      const MUTATIONS = [
+        {
+          domain: 'target',
+          action: 'set_text',
+          args: async () => ({ ref: await refFor('p', await refFor('footer')), text: TEXT }),
+          evidence: 'the page on disk says it',
+          landed: () => H.read(INDEX).includes(`<p>${TEXT}</p>`) && !H.read(INDEX).includes('Made carefully.'),
+        },
+        {
+          domain: 'target',
+          action: 'add_class',
+          args: async () => ({ ref: await refFor('div'), className: CLASS }),
+          evidence: 'the class is on that div and the one it already had is still there',
+          landed: () => /<div class="pricing-grid wire-graded">/.test(H.read(INDEX)),
+        },
+        {
+          domain: 'style',
+          action: 'set_property',
+          args: async () => ({ ref: await refFor('div'), selector: '.pricing-grid', source: `file:${SHEET}`, property: 'outline', value: '3px solid red' }),
+          evidence: 'the declaration is in the stylesheet',
+          landed: () => /outline:\s*3px solid red;/.test(H.read(SHEET)),
+        },
+        {
+          domain: 'source',
+          action: 'write',
+          args: async () => {
+            const read = await mutating.call('source', 'read', { path: 'src/lib/format.js' });
+            state.source = `${HEADER}${String(read.envelope?.text || '')}`;
+            return { path: 'src/lib/format.js', text: state.source, expectedDigest: read.envelope?.digest };
+          },
+          evidence: 'the file is the bytes that were sent',
+          landed: () => H.read('src/lib/format.js') === state.source,
+        },
+        {
+          domain: 'page',
+          action: 'create',
+          args: async () => ({ name: CLASS, layout: 'Base' }),
+          evidence: 'the page exists and is inside the layout it asked for',
+          landed: () => H.exists(`src/pages/${CLASS}.astro`) && /<Base[\s/>]/.test(H.read(`src/pages/${CLASS}.astro`)),
+        },
+        {
+          domain: 'content',
+          action: 'cms_write',
+          args: async () => {
+            const read = await mutating.call('content', 'cms_read', { path: SITE });
+            return { path: SITE, data: { ...(read.envelope?.data || {}), wireGraded: true }, ref: read.envelope?.ref };
+          },
+          evidence: 'the entry on disk carries the new field and still carries the old ones',
+          landed: () => json(SITE)?.wireGraded === true && typeof json(SITE)?.tagline === 'string',
+        },
+        {
+          domain: 'asset',
+          action: 'write_text',
+          args: async () => {
+            const read = await mutating.call('asset', 'read_text', { path: 'public/robots.txt' });
+            return { path: 'public/robots.txt', text: ROBOTS, ref: read.envelope?.ref };
+          },
+          evidence: 'the file is exactly the text that was sent',
+          landed: () => H.read('public/robots.txt') === ROBOTS,
+        },
+        {
+          domain: 'project',
+          action: 'undo',
+          args: async () => ({}),
+          // cms_write is the last UNDOABLE step above — the asset write answers
+          // `undoable:false` and says why — so this is one step off the top of
+          // Stacki's own stack, and the field it added is the thing that goes.
+          evidence: 'the last undoable edit came back off, and the ones under it did not',
+          landed: () => json(SITE)?.wireGraded === undefined && typeof json(SITE)?.tagline === 'string' && H.read(INDEX).includes(TEXT),
+        },
+        {
+          domain: 'git',
+          action: 'init',
+          args: async () => ({}),
+          evidence: 'the project is a repository now',
+          landed: () => H.exists('.git'),
+        },
+        {
+          domain: 'git',
+          action: 'commit',
+          args: async () => ({ message: 'The fixture, as the mutation sweep left it' }),
+          evidence: 'git.info reports that commit as HEAD and nothing outstanding',
+          landed: async (env) => {
+            state.head = env?.head || null;
+            const { envelope: info } = await mutating.call('git', 'info', {});
+            return !!state.head && info?.head === state.head && info?.dirty === false;
+          },
+        },
+        {
+          // THE OPERATION THE WHOLE SECTION IS HERE FOR. This is the one that
+          // answers a count where the schema declares an array, and it is the
+          // only mutating operation on the surface that does.
+          domain: 'git',
+          action: 'restore_project',
+          args: async () => {
+            const read = await mutating.call('asset', 'read_text', { path: 'public/robots.txt' });
+            await mutating.call('asset', 'write_text', { path: 'public/robots.txt', text: 'dirtied after the commit\n', ref: read.envelope?.ref });
+            if (H.read('public/robots.txt') === ROBOTS) throw new Error('the tree was not dirtied, so a restore would restore nothing');
+            return { ref: state.head };
+          },
+          evidence: 'the file that was dirtied after the commit is the committed one again',
+          landed: () => H.read('public/robots.txt') === ROBOTS,
+        },
+      ];
+
+      const succeeded = new Set();
+      const successKeys = new Set();
+      for (const step of MUTATIONS) {
+        const { domain, action } = step;
+        const op = `${domain}.${action}`;
+        // Not a read wearing a mutation's name. The registry decides.
+        check(`${op} is an operation the registry calls a mutation`, find(domain, action)?.risk !== 'read', short(find(domain, action)?.risk));
+        const tool = fullTools.get(domain);
+        if (!check(`${op}: the ${domain} tool declares an output schema on this wire`, !!tool?.outputSchema, domain)) continue;
+
+        const { envelope, raw } = await mutating.call(domain, action, await step.args());
+        check(`${op} SUCCEEDS at full, so there is a success to grade`, envelope?.ok === true, short(envelope));
+        check(`  ${op}: and the client is handed a result rather than an isError`, raw?.isError !== true, short({ isError: raw?.isError, text: raw?.content?.[0]?.text }));
+        const verdict = gradeAgainst(tool.outputSchema, envelope);
+        check(`  ${op}: and that SUCCESS validates against the schema ${domain} publishes`, verdict.valid === true, `${verdict.errorMessage || ''}\n    ${short(envelope)}`);
+        // A SUCCESS THAT CHANGED NOTHING VALIDATES PERFECTLY. Without this the
+        // sweep could be satisfied by a surface that answered `{ok:true}` to
+        // everything, which is the failure mode a schema check cannot see.
+        let landed = false;
+        try {
+          landed = await step.landed(envelope);
+        } catch (err) {
+          landed = false;
+          check(`  ${op}: reading the world back threw`, false, String(err?.message || err));
+        }
+        check(`  ${op}: and it really happened — ${step.evidence}`, landed === true, '');
+        if (envelope?.ok === true && verdict.valid === true && landed === true) {
+          succeeded.add(domain);
+          noteKeys(successKeys, envelope);
+        }
+      }
+
+      // ── THE COMPLETENESS GATE, EXTENDED ──────────────────────────────────
+      //
+      // The one above says every tool the `visual` wire can grade was graded.
+      // This says the same thing about the half that wire cannot reach, and it
+      // counts a tool as covered only when a call to it SUCCEEDED, VALIDATED
+      // and LANDED — so a mutation that quietly starts refusing (a fixture
+      // change, a stale ref, a level that stops allowing it) drops its tool out
+      // of the set and fails here, rather than reducing the coverage in silence
+      // the way `graded` used to when a rig stopped publishing a tool.
+      check(
+        'every mutating tool is named in the mutation table',
+        same(MUTATING_TOOLS, [...new Set(MUTATIONS.map((m) => m.domain))]),
+        `registry: ${MUTATING_TOOLS.join(', ')}\n    table:    ${[...new Set(MUTATIONS.map((m) => m.domain))].join(', ')}`
+      );
+      check(
+        'and every one of them answered a graded, landed SUCCESS',
+        same(MUTATING_TOOLS, [...succeeded]),
+        `registry: ${MUTATING_TOOLS.join(', ')}\n    graded:   ${[...succeeded].sort().join(', ') || '(nothing)'}`
+      );
+
+      // ── AND IT GRADED SOMETHING THE REFUSAL SWEEP CANNOT REACH ───────────
+      //
+      // The argument for this whole section, measured rather than asserted.
+      // `refusalKeys` is every key that appeared on ANY envelope the `visual`
+      // wire produced — the well-formed call and the spoiled one for all 111
+      // operations, and the twelve the grading loop validated. Nothing was
+      // sampled: the set is filled where each answer arrives, so it cannot fall
+      // behind a sweep that grows. These five fields are declared in
+      // the Envelope, are carried only by answers to work that actually ran,
+      // and are exactly where a wrong KIND hides — `changedFiles` is the array
+      // `git` shipped as a number, `through` is a two-value enum, and
+      // `revisionAfter` is an integer.
+      const MUTATION_ONLY = ['changedFiles', 'notes', 'through', 'documentBefore', 'revisionAfter'];
+      check(
+        'no refusal on the visual wire ever carried the fields a mutation answers with',
+        MUTATION_ONLY.every((f) => !refusalKeys.has(f)),
+        `refusals carried: ${[...refusalKeys].sort().join(', ')}`
+      );
+      check(
+        'and every one of them was on an envelope this sweep graded',
+        MUTATION_ONLY.every((f) => successKeys.has(f)),
+        `graded successes carried: ${[...successKeys].sort().join(', ')}\n    missing: ${MUTATION_ONLY.filter((f) => !successKeys.has(f)).join(', ') || '(none)'}`
+      );
+    } finally {
+      const said = await mutating.stop();
+      problems.push(...(said?.problems || []));
+    }
+  }
+
   // Cleanup failure is test failure.
   check('the rig left nothing behind', problems.length === 0, problems.join('; '));
 
@@ -613,7 +940,7 @@ function productToolNames() {
     console.error(`schema-dispatch-contract: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
-  console.log(`schema-dispatch-contract: ${checked} passed  [${OPERATIONS.length} operations: schema, registry, dispatch and the shape of every refusal]`);
+  console.log(`schema-dispatch-contract: ${checked} passed  [${OPERATIONS.length} operations: schema, registry, dispatch, the shape of every refusal, and one graded success per mutating tool]`);
 })().catch((err) => {
   suiteDone();
   // WHAT HAD ALREADY FAILED, BEFORE WHATEVER THREW.

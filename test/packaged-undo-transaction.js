@@ -37,6 +37,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { startPackagedApp, available, APP } = require('./support/packagedApp.js');
+const { skipSuite } = require('./support/suiteGuard.js');
 
 const failures = [];
 let checked = 0;
@@ -90,7 +91,10 @@ import Hero from '../components/Hero.astro';
 
 (async () => {
   if (!available()) {
-    console.log(`packaged-undo-transaction: skipped  [no ${APP} — run npm run dist:mac:unsigned]`);
+    // DECLARED, not silent — see test/support/suiteGuard.js. Same line and
+    // same exit 0 on a laptop; a failure under STACKI_NO_SKIPS, which the job
+    // that builds the bundle sets.
+    skipSuite('packaged-undo-transaction', `no ${APP} — run npm run dist:mac:unsigned`);
     return;
   }
 

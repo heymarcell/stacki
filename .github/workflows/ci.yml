@@ -112,7 +112,7 @@ jobs:
       # there, which is exactly the kind of thing CI is for.
       - run: npm run build
 
-      # The whole chain: 180 `npm run` entries, covering 182 files. The three
+      # The whole chain: 182 `npm run` entries, covering 184 files. The three
       # named above print a skip line and say why; everything else runs.
       #
       # THOSE TWO NUMBERS ARE CHECKED, because they had already drifted. This
@@ -220,6 +220,30 @@ jobs:
       # cache is cold the fixture installs it and the suites still run, because
       # STACKI_CANVAS_OFFLINE is deliberately NOT set on this job.
       STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
+      # A SKIP IN THIS JOB IS A FALSE GREEN, SO IT IS AN ERROR HERE.
+      #
+      # Seven suites below need the bundle, and each one used to answer a
+      # missing bundle with `console.log('… skipped'); return` — exit 0, having
+      # asserted nothing. On a laptop that is correct: nobody should need a
+      # ten-minute build to run `npm test`.
+      #
+      # In THIS job it is a lie. The "build the unsigned app" step above
+      # produces the bundle, so if a suite here cannot find it, the build
+      # silently did not make what the suite needs — and the job goes green
+      # having verified nothing about the packaged app. That is the whole point
+      # of the job.
+      #
+      # Each of those escapes now goes through skipSuite() in
+      # test/support/suiteGuard.js, which reads this variable: unset, it prints
+      # the same skip line and exits as before; set, it prints FAILED naming the
+      # suite and makes the exit code non-zero.
+      #
+      # NOT SET ON THE OTHER TWO JOBS. "core suite (macos)" and "secure protocol
+      # + cloudflare (linux)" run suites whose skip is measured and legitimate
+      # on those machines — the three STACKI_HOSTED_RUNNER ones above among
+      # them. Forbidding a skip is only honest where the resource is guaranteed
+      # to exist, and this job is the only one that builds it.
+      STACKI_NO_SKIPS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -267,6 +291,13 @@ jobs:
       - name: a stacki:// link through Launch Services
         env:
           STACKI_HOSTED_RUNNER: '1'
+          # THE ONE DELIBERATE SKIP IN THIS JOB, so the job-level
+          # STACKI_NO_SKIPS is turned off for this step alone. The skip above is
+          # measured — Launch Services routing, not a missing bundle — and the
+          # suite runs for real on a Mac in `npm run test:secureacceptance`.
+          # skipSuite() treats '0' as "not forbidden", so this reads as an
+          # exemption rather than as an unset variable.
+          STACKI_NO_SKIPS: '0'
         run: npm run test:packageddeeplink
 
       # Every Secure Share state, asserted before capture, at five window

@@ -26,6 +26,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { startPackagedApp, available, APP } = require('./support/packagedApp.js');
+const { skipSuite } = require('./support/suiteGuard.js');
 const { auditFixture, MUST_NOT_FIRE_ON_CLEAN } = require('./support/auditFixture.js');
 const { TOPIC_NAMES, uriFor } = require('../electron/mcp/guide.js');
 const { PROFILE_URI, PROMPTS } = require('../electron/mcp/intelligence.js');
@@ -52,7 +53,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
   if (!available()) {
-    console.log(`packaged-audit: skipped  [no ${APP} — run npm run dist:mac:unsigned]`);
+    // DECLARED, not silent — see test/support/suiteGuard.js. Same line and
+    // same exit 0 on a laptop; a failure under STACKI_NO_SKIPS, which the job
+    // that builds the bundle sets.
+    skipSuite('packaged-audit', `no ${APP} — run npm run dist:mac:unsigned`);
     return;
   }
 

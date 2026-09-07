@@ -28,6 +28,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const { spawn, execFileSync } = require('child_process');
+const { skipSuite } = require('./support/suiteGuard.js');
 
 const failures = [];
 let checked = 0;
@@ -129,9 +130,11 @@ async function runFor(copy, seconds, port) {
 (async () => {
   const appPath = process.argv[2] || DEFAULT_APP;
   if (!fs.existsSync(appPath)) {
-    console.log(`update-feed-acceptance: skipped — no packaged app at ${appPath}`);
-    console.log('  build one with: npm run dist:mac:unsigned');
-    process.exit(0);
+    // DECLARED, not silent — see test/support/suiteGuard.js. `return` rather
+    // than process.exit(0), because an explicit 0 would overwrite the non-zero
+    // exit code skipSuite sets when the caller has forbidden a skip.
+    skipSuite('update-feed-acceptance', `no packaged app at ${appPath} — build one with npm run dist:mac:unsigned`);
+    return;
   }
 
   const feed = countingFeed();

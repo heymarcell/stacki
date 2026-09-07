@@ -555,6 +555,69 @@ const MAX_SHOWN_PATH_CHARS = 512;
 // repeats the `expected` list on every entry, and goes out twice.
 const MAX_UNKNOWN_PATHS_SHOWN = 20;
 
+/**
+ * THE EXACT NAME GIT WILL LOOK UP, WITH NOTHING NORMALISED OUT OF IT.
+ *
+ * A merge-driver name is DATA. It is the subsection git searches for under
+ * `[merge "<name>"]`, and git compares it byte for byte — so the name is
+ * whatever is configured, not a tidied version of it. This read used to be
+ * `String(stdout || '').trim() || null`, which is three separate
+ * normalisations, and each one loses a distinction git makes:
+ *
+ *   key absent            -> null            no default driver
+ *   merge.default=""      -> ""              a driver named by the empty string
+ *   merge.default=" text "-> " text "        a driver named with the spaces
+ *   merge.default="text"  -> "text"          a driver named text
+ *
+ * MEASURED, git 2.50.1, with a driver that writes a sentinel and reverses the
+ * sides, all four rows run end to end:
+ *
+ *   `merge.default=""` with `[merge ""] driver` -> THE PROGRAM RAN. `|| null`
+ *   read that as "no key", so the path was classified built-in text, the
+ *   driver's reversed block was parsed as git's grammar, and a per-hunk answer
+ *   of "theirs" committed THIS branch's bytes with `{ok: true}`.
+ *
+ *   `merge.default=" text "` with `[merge " text "] driver` -> THE PROGRAM RAN.
+ *   `.trim()` turned the name into `text`, which is in the built-in table and
+ *   is NOT the key the inventory holds, so the same misread followed.
+ *
+ *   And the error runs the other way too: `merge.default=" text "` with
+ *   `[merge "text"]` (no spaces) does NOT run the program — git finds no
+ *   subsection — while the trimmed name matched the inventory and would have
+ *   called an ordinary git merge opaque.
+ *
+ * So the value is read with `-z`, whose terminator is the one byte a config
+ * value may never contain, and returned verbatim. No trim, no empty-to-absent
+ * collapse, no case folding, no Unicode normalisation.
+ *
+ * DUPLICATES ARE GIT'S RULE, NOT THIS FUNCTION'S. `--get` answers with the LAST
+ * value when a key is set more than once, and MEASURED that is the one the
+ * merge actually uses: two `merge.default` lines, a driver under the second
+ * name only, and the driver ran. `--get` is therefore exactly right here and
+ * `--get-all` would not be.
+ *
+ * Callers must ask `byDefault === null` for "no default". Truthiness cannot
+ * tell the absent key from the empty name, and those are the two rows above
+ * that differ by whether a program runs.
+ */
+async function defaultDriverName(git, root) {
+  let out;
+  try {
+    out = String((await git(root, ['config', '-z', '--get', 'merge.default'])).stdout ?? '');
+  } catch {
+    // Unset is exit 1, which is an answer: no key, so no default driver.
+    return null;
+  }
+  // `-z --get` writes "<value>\0". A config value cannot hold a NUL, so the
+  // FIRST one is the protocol terminator and everything before it is the value.
+  const end = out.indexOf('\0');
+  // No terminator is not an empty name. A runner that answers non-zero exits
+  // with empty stdout instead of throwing lands here, and reading that as `""`
+  // would invent a configured empty driver where there is no key at all.
+  if (end === -1) return null;
+  return out.slice(0, end);
+}
+
 async function mergeAttributes(git, root, files) {
   const sizes = new Map();
   // The paths git did NOT merge itself. See the `merge` branch below.
@@ -576,13 +639,7 @@ async function mergeAttributes(git, root, files) {
   //
   // Asked once for the whole call, not per path: it is a repository-wide
   // setting and this already runs a process per batch of sixty-four.
-  let byDefault = null;
-  try {
-    byDefault = String((await git(root, ['config', '--get', 'merge.default'])).stdout || '').trim() || null;
-  } catch {
-    // Unset is exit 1, which is an answer: no default driver.
-    byDefault = null;
-  }
+  const byDefault = await defaultDriverName(git, root);
   // AND WHICH OF THOSE NAMES IS A DRIVER THAT EXISTS.
   //
   // `merge=<name>` does not mean a program ran. A name with no
@@ -660,7 +717,13 @@ async function mergeAttributes(git, root, files) {
     if (value === 'unspecified') {
       // ATTR_UNSET with no `merge.default` is the built-in text driver directly,
       // and a `merge.text.driver` does not reach it either. MEASURED.
-      if (!byDefault) return { kind: 'text', name: null };
+      //
+      // `=== null` and not truthiness: `merge.default=""` is a KEY THAT IS SET,
+      // naming the driver under `[merge ""]`, and MEASURED that program runs.
+      // `!byDefault` sent that row here — to the built-in text reading — and a
+      // custom driver's output was then parsed as git's own grammar. See
+      // defaultDriverName.
+      if (byDefault === null) return { kind: 'text', name: null };
       name = byDefault;
     } else {
       name = value;
@@ -1145,6 +1208,51 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   // the instant before git touched it, and taken on every path that runs a
   // trial merge rather than only on the ones that expect to unwind.
   guard.setBefore(await guard.treeNow());
+  // A MERGE ALREADY IN PROGRESS IS SOMEBODY ELSE'S HERE TOO, AND THIS ROUTE HAD
+  // NO CHECK AT ALL.
+  //
+  // `mergeBranch` refuses a foreign merge before it tries anything — see the
+  // `merge_blocked` above its own trial merge, and T42. This function did not,
+  // and it is the route that ABORTS: git refuses to begin a second merge while
+  // MERGE_HEAD exists, so the trial merge below throws "You have not concluded
+  // your merge", `left` is the USER'S OWN unmerged entries rather than an empty
+  // list, the digest of those entries cannot match the binding — the caller is
+  // holding a digest of a conflict Stacki produced, not of a half-finished hand
+  // resolution — and the digest arm runs `await abort()` INTO A MERGE STACKI
+  // NEVER STARTED.
+  //
+  // MEASURED, real git, no stubs: the user's own `git merge --no-ff
+  // --no-commit`, a.txt hand-edited on disk to "HAND-RESOLVED BY THE USER" and
+  // not yet staged, then an ordinary resolve carrying the binding from an
+  // earlier git.merge. a.txt came back "MAIN", `.git/MERGE_HEAD` was gone, and
+  // the answer was `merge_stuck` — "the merge Stacki ran to check those answers
+  // did not come back out of the working tree" — about a merge that never ran,
+  // over a hand resolution that no longer existed. `git merge --abort` had
+  // SUCCEEDED, which is why there was nothing left to quote.
+  //
+  // Asked BEFORE the trial merge, which is exactly what tells Stacki's own
+  // merge apart from a stranger's: nothing of this call has run yet, so a merge
+  // in progress at this instant is not one this call started. Everything below
+  // keeps unwinding as it did — `abort` still fires for the merge THIS function
+  // opens, because by the time it does this check has already passed.
+  //
+  // `midMerge` answers the unmerged paths, `[]` for a MERGE_HEAD with none, and
+  // null for a repository that would not answer — so the question is "is it not
+  // null", not "is it truthy": an empty array is a merge in progress.
+  if ((await guard.midMerge()) !== null) {
+    return {
+      ok: false,
+      code: 'merge_blocked',
+      from: into,
+      branch,
+      gitSaid: null,
+      message:
+        `"${into}" is already in the middle of a merge that Stacki did not start, so those answers were not ` +
+        'applied. Nothing was merged and nothing was written. Finish that one in the project first — ' +
+        '`git merge --continue` when it is resolved, or `git merge --abort` to drop it — then run git.merge on ' +
+        `"${branch}" again and answer the conflict it reports.`,
+    };
+  }
   // HOW WIDE GIT WRITES THE MARKERS FOR THE PATHS THIS CALL IS ABOUT, asked
   // BEFORE the trial merge — because a merge that rewrites `.gitattributes`
   // rewrites the answer, and the answer that matters is the one git itself

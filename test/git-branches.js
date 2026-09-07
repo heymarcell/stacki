@@ -1891,6 +1891,17 @@ async function suite() {
     // BEGINS with a space came back without it — a name no file has, arrived at
     // with no quoting involved at all.
     const SPACED = ' draft.astro';
+    // AND THE OTHER END OF THE SAME NAME, because `.trim()` ate BOTH and only
+    // one of them was ever asked about. Everything in this block passed with a
+    // right-side-only trim in place: `' draft.astro'` keeps its leading space
+    // under `.trimEnd()` and every assertion here went green while
+    // `'draft2.astro '` — a name real git stores and prints verbatim, MEASURED
+    // with `ls-files -z` and `diff --name-only -z` on this machine — was
+    // silently turned into `'draft2.astro'`, a file that does not exist. That
+    // is the same three consequences the block above documents: the digest
+    // hashes the UNREADABLE sentinel, the sides come back null, and a resolve
+    // naming the real path is refused as `unknown_path`.
+    const TRAILING = 'draft2.astro ';
     // The same clash over both files, with `body` the thing the two branches
     // disagree about. Two of these differing only in that is what says the
     // binding measured the files rather than its own failure to open them.
@@ -1898,15 +1909,15 @@ async function suite() {
       const at = await repo(name);
       cleanup.push(at);
       fs.mkdirSync(path.join(at, 'src', 'pages'), { recursive: true });
-      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), 'base\n');
+      for (const file of [PAGE, SPACED, TRAILING]) fs.writeFileSync(path.join(at, file), 'base\n');
       await sh(at, 'add', '-A');
       await sh(at, 'commit', '-qm', 'both pages');
       await sh(at, 'checkout', '-qb', 'feature');
-      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), `from feature, ${body}\n`);
+      for (const file of [PAGE, SPACED, TRAILING]) fs.writeFileSync(path.join(at, file), `from feature, ${body}\n`);
       await sh(at, 'add', '-A');
       await sh(at, 'commit', '-qm', 'feature pages');
       await sh(at, 'checkout', '-q', 'main');
-      for (const file of [PAGE, SPACED]) fs.writeFileSync(path.join(at, file), 'from main\n');
+      for (const file of [PAGE, SPACED, TRAILING]) fs.writeFileSync(path.join(at, file), 'from main\n');
       await sh(at, 'add', '-A');
       await sh(at, 'commit', '-qm', 'main pages');
       return at;
@@ -1918,6 +1929,27 @@ async function suite() {
     check('T15d: the accented path comes back as the name the file has', listed.includes(PAGE), JSON.stringify(listed));
     check('T15d: and not C-quoted', !listed.some((one) => one.includes('\\')), JSON.stringify(listed));
     check('T15d: a path that begins with a space keeps it', listed.includes(SPACED), JSON.stringify(listed));
+    // AND ONE THAT ENDS WITH ONE, which is the half a `.trimEnd()` would still
+    // eat. Asserted against the exact key rather than with a `startsWith`,
+    // because `'draft2.astro'` — the trimmed spelling — is a plausible-looking
+    // string that is the name of nothing in this repository.
+    check('T15d: a path that ends with a space keeps it', listed.includes(TRAILING), JSON.stringify(listed));
+    // THE PREMISE, so that assertion is about Stacki and not about the
+    // filesystem: git itself stores and prints this name verbatim.
+    check(
+      'T15d: premise — git spells that name back with the space still on it',
+      (await git(dir, ['ls-files', '-z'])).stdout.split('\0').includes(TRAILING),
+      JSON.stringify((await git(dir, ['ls-files', '-z'])).stdout.split('\0').filter(Boolean))
+    );
+    // AND ITS SIDES WERE READ. `git show :2:` and `:3:` are run on that same
+    // name, so a trimmed one answers null from both — the same "measurement of
+    // nothing wearing the shape of a measurement" the quoted name produced.
+    const trailing = (clash.files || []).find((f) => f.path === TRAILING);
+    check(
+      'T15d:   with both of its sides read',
+      trailing?.ours === 'from main\n' && trailing?.theirs === 'from feature, one\n',
+      JSON.stringify({ ours: trailing?.ours, theirs: trailing?.theirs })
+    );
     const only = (clash.files || []).find((f) => f.path === PAGE);
     // The two sides are read by `git show :2:` and `:3:` on that same name, so
     // a quoted one came back null from both and left nothing to decide.
@@ -1937,10 +1969,15 @@ async function suite() {
       !!clash.at?.digest && clash.at.digest !== clash2.at?.digest,
       JSON.stringify({ one: clash.at?.digest, two: clash2.at?.digest })
     );
-    const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: 'theirs', [SPACED]: 'theirs' }, expect: clash.at });
+    const answer = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { [PAGE]: 'theirs', [SPACED]: 'theirs', [TRAILING]: 'theirs' }, expect: clash.at });
     check('T15d: a resolve naming those paths goes through', answer?.ok === true, JSON.stringify(answer).slice(0, 400));
     check('T15d: and the incoming bytes are what is on disk', fs.readFileSync(path.join(dir, PAGE), 'utf8') === 'from feature, one\n', fs.readFileSync(path.join(dir, PAGE), 'utf8'));
     check('T15d: for the space-led path too', fs.readFileSync(path.join(dir, SPACED), 'utf8') === 'from feature, one\n', fs.readFileSync(path.join(dir, SPACED), 'utf8'));
+    // AND THE SPACE-TRAILED ONE, ANSWERED BY THAT EXACT KEY. A `choices` key
+    // the validator cannot match is refused as `unknown_path` and the whole
+    // call fails, so `answer.ok` above already carries this — but the bytes are
+    // what says the answer landed on the file rather than beside it.
+    check('T15d: and for the space-trailed path', textOf(path.join(dir, TRAILING)) === 'from feature, one\n', JSON.stringify(textOf(path.join(dir, TRAILING))));
     check('T15d: as a two-parent merge commit', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 2);
   }
 
@@ -6070,9 +6107,20 @@ async function suite() {
   //
   // `bad_branch_name` was documented as "that branch is gone, or is not a name
   // git takes". A branch that is gone answers `stale_merge`, MEASURED — and an
-  // MCP client cannot provoke the code at all, because resolve_merge takes the
-  // branch out of the signed mergeRef and git.merge checked it before minting
-  // one. It is still live for the panel, which passes a branch of its own.
+  // MCP client cannot provoke the code THROUGH `resolve_merge`, because that
+  // operation takes the branch out of the signed mergeRef and `git.merge`
+  // checked it before minting one. It is still live for the panel, which passes
+  // a branch of its own.
+  //
+  // SCOPED TO `resolve_merge`, AND THAT SCOPE IS THE WHOLE OF THE CLAIM. This
+  // said "an MCP client cannot provoke the code at all", which is false of the
+  // surface: test/refusal-contract.js provokes `bad_branch_name` over a real
+  // MCP client with `git.checkout {branch: '-x'}` — a name git would have read
+  // as an option — driven through the official client to the real handler. The
+  // shipped guide sentence was always correctly scoped (it sits inside the
+  // `git.resolve_merge` refusal list); only this comment overreached, and a
+  // comment that overclaims is how a true sentence gets deleted later for
+  // being "already covered".
   {
     const dir = await collide('guide-truth', { base: 'head\nBASE\ntail\n', ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail\n' });
     const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
@@ -6202,6 +6250,89 @@ async function suite() {
     check('T42 control: an ordinary conflict is still reported', clash?.conflicted === true, JSON.stringify(clash).slice(0, 120));
     const ok = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
     check('T42 control:   and still merges', ok?.ok === true, JSON.stringify(ok));
+  }
+
+  // T42b — AND THE ROUTE THAT ACTUALLY ABORTS HAD NO SUCH CHECK.
+  //
+  // T42 above closes `mergeBranch`. `resolveMerge` is the other caller of the
+  // same unwind and the more dangerous one, because every refusal below its
+  // trial merge is allowed to run `git merge --abort` — and until this it never
+  // asked whose merge it would be aborting.
+  //
+  // THE TRACE, MEASURED before the guard existed, real git and no stubs, with
+  // the user's hand resolution written to disk and NOT yet staged (which is what
+  // half-finished looks like most of the time):
+  //
+  //   the trial merge throws "You have not concluded your merge"
+  //   `left` = the USER'S unmerged entries — non-empty, so the empty-list
+  //           refusal that names `merge_blocked` is never reached
+  //   `digestNow` hashes those entries, i.e. the hand-resolved bytes, which
+  //           cannot equal a binding taken from a conflict Stacki produced
+  //   -> `await abort()` runs `git merge --abort`, IT SUCCEEDS, and the user's
+  //      merge is over
+  //
+  // The answer was `merge_stuck`: "the merge Stacki ran to check those answers
+  // did not come back out of the working tree" — a merge that never ran — with
+  // a.txt back at "MAIN", `.git/MERGE_HEAD` gone, and `gitSaid: null` because
+  // the abort had worked. T42's oracle, applied here: the hand-resolved BYTES
+  // and the MERGE_HEAD are what this is about, not the code.
+  {
+    const dir = await collide('someone-elses-merge-resolve', { base: 'head\nBASE\ntail\n', ours: 'head\nMAIN\ntail\n', theirs: 'head\nFEATURE\ntail\n' });
+    // A REAL BINDING, from a real merge Stacki ran and unwound. Nothing about
+    // this call is malformed: it is the ordinary second half of a conflict the
+    // agent was legitimately shown, arriving while the user has since started
+    // something of their own in the project.
+    const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T42b: the binding comes from a real conflict', !!clash?.at?.digest, JSON.stringify(clash?.at));
+    const HAND = 'head\nHAND-RESOLVED BY THE USER\ntail\n';
+    for (const staged of [false, true]) {
+      const how = staged ? 'staged' : 'unstaged';
+      await git(dir, ['merge', '--no-ff', '--no-commit', 'feature']).catch(() => {});
+      fs.writeFileSync(path.join(dir, 'a.txt'), HAND);
+      // UNSTAGED is the arm that reached the abort: with the resolution staged
+      // there are no unmerged entries left, so the empty-list arm answered
+      // first. Both are run because both are what a person's tree looks like
+      // partway through, and a guard that only covers one of them covers the
+      // safe one.
+      if (staged) await sh(dir, 'add', 'a.txt');
+      check(`T42b (${how}): the fixture really is mid-merge`, fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')));
+      check(
+        `T42b (${how}):   with the user's own entries in the index`,
+        staged ? (await sh(dir, 'diff', '--name-only', '--diff-filter=U')) === '' : (await sh(dir, 'diff', '--name-only', '--diff-filter=U')) === 'a.txt',
+        await sh(dir, 'diff', '--name-only', '--diff-filter=U')
+      );
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      check(`T42b (${how}): it refuses rather than throwing`, out.error === null, String(out.error));
+      check(`T42b (${how}):   as merge_blocked`, out.value?.code === 'merge_blocked', JSON.stringify(out.value).slice(0, 240));
+      check(`T42b (${how}):   saying whose merge it is`, /did not start/.test(String(out.value?.message || '')), String(out.value?.message || '').slice(0, 260));
+      check(
+        `T42b (${how}):   and naming both ways out of it`,
+        /--continue/.test(String(out.value?.message || '')) && /--abort/.test(String(out.value?.message || '')),
+        String(out.value?.message || '').slice(0, 260)
+      );
+      // THE BYTES, WHICH IS THE WHOLE POINT. T42's oracle exactly.
+      check(`T42b (${how}): the hand resolution is untouched`, textOf(path.join(dir, 'a.txt')) === HAND, JSON.stringify(textOf(path.join(dir, 'a.txt'))));
+      check(`T42b (${how}):   and the merge is still in progress`, fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD')));
+      await sh(dir, 'merge', '--abort').catch(() => {});
+      await sh(dir, 'reset', '--hard', '-q', 'HEAD').catch(() => {});
+    }
+    // AND THE CONTROL THIS MUST NOT COST, IN BOTH DIRECTIONS. A guard that
+    // refused before every trial merge would be a worse defect than the one it
+    // closes, and a guard that stopped Stacki unwinding its OWN merge would
+    // leave conflict markers in files this editor parses as markup.
+    const again = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+    check('T42b control: an ordinary conflict is still reported', again?.conflicted === true, JSON.stringify(again).slice(0, 120));
+    const before = await repoState(dir);
+    const bad = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'whichever' }, expect: again.at }));
+    // `refusedCleanly` asserts MERGE_HEAD is gone and the tree is clean, which
+    // is the unwind of Stacki's OWN trial merge — the thing the guard above
+    // must not have reached.
+    await refusedCleanly('T42b control: a word outside the vocabulary', bad.value, dir, before, 'bad_choices', (a) =>
+      (a.badChoices || []).some((b) => b.path === 'a.txt')
+    );
+    const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: again.at });
+    check('T42b control:   and a good answer still merges', done?.ok === true, JSON.stringify(done).slice(0, 200));
+    check('T42b control:   over a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
   }
 
   // T43 — A MERGE DRIVER NAMED IN CONFIG IS A MERGE DRIVER.
@@ -6520,7 +6651,12 @@ async function suite() {
       await sh(dir, 'commit', '-qam', 'theirs');
       await sh(dir, 'checkout', '-q', 'main');
       for (const n of drivers) await sh(dir, 'config', `merge.${n}.driver`, `${drv} %O %A %B`);
-      if (byDefault) await sh(dir, 'config', 'merge.default', byDefault);
+      // NOT `if (byDefault)`. The empty string is a NAME git resolves — it is
+      // the subsection `[merge ""]` — so a truthiness test configured nothing
+      // for the one row that distinguishes an unset key from a configured empty
+      // name, and the row silently tested the other thing. See T46, which walks
+      // that whole matrix against git itself.
+      if (byDefault !== null && byDefault !== undefined) await sh(dir, 'config', 'merge.default', byDefault);
       return dir;
     };
 
@@ -6631,6 +6767,381 @@ async function suite() {
         (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'unreadable_conflict')
       );
     }
+  }
+
+  // T46 — THE MERGE-DRIVER CLASSIFICATION MATRIX, WITH GIT AS THE ORACLE.
+  //
+  // T45 asserts what this code SAYS about a configuration. This asserts that
+  // what it says is TRUE — and the only witness to that is git. Every row below
+  // runs a real merge with a real driver program first, reads out of the
+  // resulting worktree whether that program ACTUALLY RAN and under WHICH NAME,
+  // unwinds, and only then asks Stacki. The two answers must agree, in both
+  // directions: a row where git ran a program and Stacki calls it built-in
+  // fails, and so does a row where git ran nothing and Stacki names a driver.
+  //
+  // A test that only pinned Stacki's answers to literals would go on passing
+  // through exactly the bug this block was written for. That bug read
+  //
+  //     String(stdout || '').trim() || null
+  //
+  // for `merge.default`, which is three normalisations in one expression, and
+  // each of them turns a name git resolves into a different name — or into no
+  // name at all. MEASURED against git 2.50.1, every one of these runs the
+  // program end to end:
+  //
+  //     merge.default=""       with [merge ""]        -> THE PROGRAM RAN
+  //     merge.default=" text " with [merge " text "]  -> THE PROGRAM RAN
+  //     merge.default="text"   with [merge "text"]    -> THE PROGRAM RAN
+  //
+  // while the error also runs the other way:
+  //
+  //     merge.default=" text " with [merge "text"]    -> NO PROGRAM. git looks
+  //     for the subsection named with the spaces, does not find it, and writes
+  //     its own markup — which the trimmed reading would have called opaque,
+  //     refusing an ordinary conflict nobody could then finish in the app.
+  //
+  // The driver used here ECHOES ITS OWN NAME and writes THE SIDES REVERSED, so
+  // a row that is misclassified does not merely report the wrong thing: asking
+  // for "theirs" lands this branch's bytes in a commit. That is the damage
+  // being measured, and it is measured against the index's own stages rather
+  // than against literals written here.
+  {
+    const T46_MARK = 'T46-DRIVER-RAN';
+    // `%O %A %B` is git's substitution; the FOURTH argument is a literal — the
+    // exact subsection name this driver was registered under. So the line the
+    // program writes says WHICH driver git chose, not merely that one ran, and
+    // `customDriver` can be checked byte for byte against git's own choice.
+    const T46_DRIVER =
+      '#!/bin/sh\n' +
+      'keep=$(cat "$2")\n' +
+      `{ printf "%s:%s\\n" "${T46_MARK}" "$4"; echo "<<<<<<< custom"; cat "$3"; echo "======="; printf "%s\\n" "$keep"; echo ">>>>>>> custom"; } > "$2"\n` +
+      'exit 1\n';
+    // THE INCOMING SIDE GOES FIRST, above `=======`, and this branch's below.
+    // A reader that mistakes this for git's grammar hands back the opposite of
+    // what it was asked for, silently, with ok:true. See T44.
+    const T46_RAN = new RegExp(`^${T46_MARK}:(.*)$`, 'm');
+    const T46_OURS = 'MAIN-ONLY-BYTES\n';
+    const T46_THEIRS = 'FEATURE-ONLY-BYTES\n';
+
+    // The name the driver echoed, or null when no program ran at all. `(.*)$`
+    // under /m stops at the newline and keeps every other byte, so a name that
+    // is empty, that is a single space, or that ends in one comes back exactly
+    // as git passed it.
+    const ranAs = (text) => {
+      const found = T46_RAN.exec(text || '');
+      return found ? found[1] : null;
+    };
+
+    let t46seq = 0;
+    /**
+     * A repository whose a.txt clashes, with drivers and defaults as given.
+     *
+     * `drivers` and `defaults` are ARRAYS of exact names, and every name is
+     * used verbatim — no `if (name)` anywhere. The T45 helper had
+     * `if (byDefault) await sh(...)`, which silently configured NOTHING for the
+     * empty name, so a row meaning "merge.default is set to the empty string"
+     * tested "merge.default is unset" instead — the two rows that differ by
+     * whether a program runs, collapsed into one. `defaults` is a list so a key
+     * can be set TWICE, which git answers with the last value.
+     */
+    const t46repo = async ({ attr = null, drivers = [], defaults = [] } = {}) => {
+      const dir = await repo(`t46-${String(++t46seq).padStart(3, '0')}`);
+      cleanup.push(dir);
+      const drv = path.join(dir, '.git', 'd.sh');
+      fs.writeFileSync(drv, T46_DRIVER, { mode: 0o755 });
+      fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
+      if (attr !== null) fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), attr);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'BASE\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), T46_OURS);
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), T46_THEIRS);
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      // Single-quoted, because a name may hold spaces and git hands the driver
+      // line to a shell. None of the names here contains a quote.
+      for (const name of drivers) await sh(dir, 'config', `merge.${name}.driver`, `'${drv}' %O %A %B '${name}'`);
+      // `--add`, so two lines of the same key are two lines and not one.
+      for (const value of defaults) await sh(dir, 'config', '--add', 'merge.default', value);
+      return dir;
+    };
+
+    /**
+     * THE ORACLE. A real merge, read, and unwound.
+     *
+     * `--no-commit` so a merge that does NOT conflict can be undone too —
+     * without it, `merge=union` with no driver commits and the repository is
+     * spent before Stacki has been asked anything. `merge --abort` puts both
+     * cases back, and that is asserted rather than assumed: an oracle that left
+     * the tree changed would make every measurement after it meaningless.
+     *
+     * The stages are read HERE, while the merge is still in progress, because
+     * that is the only moment they exist — and they are what a whole-file
+     * answer must reproduce byte for byte.
+     */
+    const askGit = async (dir) => {
+      const before = await repoState(dir);
+      const ran = await caught(() => sh(dir, 'merge', '--no-ff', '--no-commit', '--no-edit', 'feature'));
+      const worktree = textOf(path.join(dir, 'a.txt'));
+      const conflicted = (await sh(dir, 'ls-files', '-u')) !== '';
+      const stage2 = conflicted ? (await caught(() => blob(dir, ':2:a.txt'))).value : null;
+      const stage3 = conflicted ? (await caught(() => blob(dir, ':3:a.txt'))).value : null;
+      if (fs.existsSync(path.join(dir, '.git', 'MERGE_HEAD'))) await sh(dir, 'merge', '--abort');
+      const after = await repoState(dir);
+      return {
+        // Whether git ran a program of the project's own, and which.
+        driver: ranAs(worktree),
+        conflicted,
+        // Whether git's own markup is there — which is how many disagreements
+        // a readable path should offer. Derived from the merge, not assumed:
+        // the built-in text driver writes one block and the built-in binary
+        // driver writes none.
+        markers: /^<{7}/m.test(worktree || ''),
+        worktree,
+        stage2,
+        stage3,
+        failed: ran.error !== null,
+        restored:
+          after.head === before.head &&
+          after.status === before.status &&
+          after.mergeHead === false &&
+          Object.keys({ ...before.bytes, ...after.bytes }).every((f) => before.bytes[f] === after.bytes[f]),
+      };
+    };
+
+    // A row whose oracle says NO PROGRAM RAN. Stacki must name no driver and
+    // must hand back hunks, as many as git's own markup holds.
+    const readableRow = async (label, dir, oracle) => {
+      check(`T46 ${label}: git ran no program of the project's own`, oracle.driver === null, JSON.stringify({ driver: oracle.driver, worktree: oracle.worktree }));
+      check(`T46 ${label}:   and left a conflict to answer`, oracle.conflicted === true, JSON.stringify(oracle.worktree));
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check(`T46 ${label}:   so Stacki names no custom driver either`, file.customDriver === undefined, JSON.stringify(file.customDriver));
+      check(`T46 ${label}:   and the markup is read, not withheld`, Array.isArray(file.parts), JSON.stringify(file.parts));
+      check(
+        `T46 ${label}:   offering the ${oracle.markers ? 1 : 0} disagreement(s) git's own markup holds`,
+        clashCount(file.parts || []) === (oracle.markers ? 1 : 0),
+        `${clashCount(file.parts || [])} for ${JSON.stringify(oracle.worktree)}`
+      );
+    };
+
+    // A row whose oracle says A PROGRAM RAN, and under exactly which name.
+    // Everything an opaque path owes a caller is asserted here, and the two
+    // whole-file answers are checked against the index's OWN stages.
+    const opaqueRow = async (label, opts, dir, oracle) => {
+      check(`T46 ${label}: git really executed the driver program`, oracle.driver !== null, JSON.stringify(oracle.worktree));
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check(`T46 ${label}:   Stacki names the driver git chose, byte for byte`, file.customDriver === oracle.driver, JSON.stringify({ stacki: file.customDriver, git: oracle.driver }));
+      check(`T46 ${label}:   and reads no hunks out of its output`, file.parts === null, JSON.stringify(file.parts));
+      const entry = ((DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' }) || {}).files || [])[0] || {};
+      check(`T46 ${label}:   the agent sees an empty hunk list`, Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry).slice(0, 200));
+      check(`T46 ${label}:   with markersUnread and hunksOmitted false`, entry.markersUnread === false && entry.hunksOmitted === false, JSON.stringify(entry).slice(0, 200));
+      const before = await repoState(dir);
+      const per = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      await refusedCleanly(`T46 ${label}: a per-hunk answer`, per.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable' && b.customDriver === oracle.driver)
+      );
+      // THE BYTE ORACLE. A fresh repository per side, because resolving commits.
+      for (const side of ['ours', 'theirs']) {
+        const one = await t46repo(opts);
+        const seen = await askGit(one);
+        check(`T46 ${label}: ${side}: git ran the same driver here`, seen.driver === oracle.driver, JSON.stringify({ here: seen.driver, there: oracle.driver }));
+        const want = side === 'ours' ? seen.stage2 : seen.stage3;
+        const other = side === 'ours' ? seen.stage3 : seen.stage2;
+        // Without this the comparison below is vacuous: two identical stages
+        // would let a resolve that always answers with stage 2 pass as "theirs".
+        check(`T46 ${label}: ${side}: the two index stages differ`, typeof want === 'string' && typeof other === 'string' && want !== other, JSON.stringify({ want, other }));
+        const clash2 = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+        const done = await resolveMerge(git, { projectPath: one, branch: 'feature', choices: { 'a.txt': side }, expect: clash2.at });
+        const got = await blob(one, 'HEAD:a.txt');
+        check(`T46 ${label}: whole-file ${side} merges`, done?.ok === true, JSON.stringify(done));
+        check(`T46 ${label}:   into the exact bytes of index stage ${side === 'ours' ? 2 : 3}`, got === want, JSON.stringify({ got, want }));
+        check(`T46 ${label}:   and NOT the other side's bytes`, got !== other, JSON.stringify({ got, other }));
+        check(`T46 ${label}:   as a two-parent merge commit`, (await sh(one, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(one, 'log', '-1', '--format=%P'));
+        check(`T46 ${label}:   over a clean tree`, (await sh(one, 'status', '--porcelain')) === '', await sh(one, 'status', '--porcelain'));
+        check(
+          `T46 ${label}:   with none of the driver's markup committed`,
+          !got.includes(T46_MARK) && !got.includes('<<<<<<< custom') && !got.includes('>>>>>>> custom'),
+          JSON.stringify(got)
+        );
+      }
+    };
+
+    /**
+     * ONE ROW, ROUTED BY THE ORACLE — and pinned to what was measured by hand.
+     *
+     * `recorded` is the name measured against git 2.50.1 when this was written,
+     * `null` for "no program". It is asserted against what git does NOW, so a
+     * change in git's own behaviour fails here loudly instead of quietly
+     * redefining what the row is testing. Which battery runs is then decided by
+     * the LIVE measurement, not by the record.
+     */
+    const row = async (label, opts, recorded) => {
+      const dir = await t46repo(opts);
+      const oracle = await askGit(dir);
+      check(`T46 ${label}: the oracle merge was unwound`, oracle.restored === true, JSON.stringify(oracle).slice(0, 300));
+      check(
+        `T46 ${label}: git's answer is still ${recorded === null ? 'no program' : `the program named ${JSON.stringify(recorded)}`}`,
+        oracle.driver === recorded,
+        JSON.stringify({ measured: oracle.driver, recorded, worktree: oracle.worktree })
+      );
+      // WHICH BATTERY RUNS IS THE LIVE MEASUREMENT'S CALL, not the record's. A
+      // row that disagreed with the record above still gets tested against what
+      // git actually did, so the failure names one thing and not two.
+      if (oracle.driver === null) await readableRow(label, dir, oracle);
+      else await opaqueRow(label, opts, dir, oracle);
+    };
+
+    // --- THE THREE SPECIAL ATTRIBUTE STATES ---------------------------------
+    //
+    // `find_ll_merge_driver` (merge-ll.c) answers these BEFORE it looks at any
+    // name, so no configured driver can reach them. Each row has the driver a
+    // careless reading would have run sitting right there in config.
+    await row('S1 bare `merge` with merge.text.driver configured', { attr: 'a.txt merge\n', drivers: ['text'] }, null);
+    await row('S2 bare `-merge` with merge.binary.driver configured', { attr: 'a.txt -merge\n', drivers: ['binary'] }, null);
+    await row('S3 no attribute, no merge.default, merge.text.driver configured', { drivers: ['text'] }, null);
+
+    // --- WHAT AN ATTRIBUTE CAN ACTUALLY SAY ---------------------------------
+    //
+    // An attribute value ends at whitespace, so a name with a space in it
+    // cannot be written as `merge=<name>` at all. That is not a reason to drop
+    // those names — it is a row of its own, MEASURED rather than assumed, and
+    // the value git reads INSTEAD is what the merge then resolves.
+    //
+    // MEASURED, git 2.50.1, `.git/info/attributes`:
+    //   `a.txt merge= text `  -> check-attr says ""       (` text ` is gone; the
+    //                            word `text` is parsed as a SECOND attribute)
+    //   `a.txt merge=driver ` -> check-attr says "driver" (trailing space eaten)
+    //   `a.txt merge= driver` -> check-attr says ""
+    //   `a.txt merge=`        -> check-attr says ""       — the EMPTY NAME IS
+    //                            representable, and `[merge ""]` answers it.
+    const T46_NAMES = [
+      // [name, what `merge=<name>` is read back as — the name itself where the
+      //  attribute can carry it]
+      ['text', 'text'],
+      ['binary', 'binary'],
+      ['union', 'union'],
+      ['mydrv', 'mydrv'],
+      ['my.driver', 'my.driver'],
+      ['', ''],
+      [' text ', ''],
+      ['driver ', 'driver'],
+      [' driver', ''],
+      ['A', 'A'],
+      ['ümlaut', 'ümlaut'],
+      ['a-b_c', 'a-b_c'],
+    ];
+    // Measured once, in one repository, and the matrix below is driven by what
+    // was measured rather than by the table.
+    const attrReads = new Map();
+    {
+      const dir = await t46repo({});
+      for (const [name, expected] of T46_NAMES) {
+        fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), `a.txt merge=${name}\n`);
+        const fields = String((await git(dir, ['check-attr', '-z', 'merge', '--', 'a.txt'])).stdout || '').split('\0');
+        attrReads.set(name, fields[2]);
+        check(
+          `T46 attr ${JSON.stringify(name)}: \`merge=${name}\` is read back as ${JSON.stringify(expected)}`,
+          fields[2] === expected,
+          JSON.stringify(fields[2])
+        );
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    // --- EVERY NAME, BOTH CHANNELS, WITH THE DRIVER AND WITHOUT -------------
+    for (const [name] of T46_NAMES) {
+      const shown = JSON.stringify(name);
+      const carried = attrReads.get(name) === name;
+      const instead = attrReads.get(name);
+
+      // (a) `merge=<name>` WITH merge.<name>.driver.
+      if (carried) {
+        await row(`A ${shown} merge=${shown} with its driver`, { attr: `a.txt merge=${name}\n`, drivers: [name] }, name);
+      } else {
+        // UNREPRESENTABLE VIA ATTRIBUTE, and this is what that costs: the
+        // driver IS configured under the exact name, git reads a DIFFERENT name
+        // out of the attribute, finds no subsection for it, and merges the file
+        // itself. Stacki must call it readable — a classification keyed off the
+        // name as WRITTEN rather than as READ would call it opaque and refuse a
+        // conflict that anybody can answer.
+        await row(
+          `A ${shown} merge=${shown} is read as ${JSON.stringify(instead)}, so its driver is unreachable`,
+          { attr: `a.txt merge=${name}\n`, drivers: [name] },
+          null
+        );
+      }
+
+      // (b) `merge=<name>` WITHOUT any driver. A name is not a driver.
+      if (attrReads.get(name) === 'union') {
+        // The built-in union driver does not conflict at all, so it never
+        // reaches any conflict surface. Asserted rather than skipped.
+        const dir = await t46repo({ attr: `a.txt merge=${name}\n` });
+        const oracle = await askGit(dir);
+        check(`T46 B ${shown} merge=${shown} with no driver: git merges it without conflicting`, oracle.conflicted === false, JSON.stringify(oracle.worktree));
+        check(`T46 B ${shown}:   and ran no program`, oracle.driver === null, JSON.stringify(oracle.driver));
+        const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+        check(`T46 B ${shown}:   and Stacki reports it merged`, clash?.ok === true, JSON.stringify(clash).slice(0, 200));
+      } else {
+        await row(`B ${shown} merge=${shown} with no driver`, { attr: `a.txt merge=${name}\n` }, null);
+      }
+
+      // (c) `merge.default=<name>` WITH merge.<name>.driver. The channel the
+      // `.trim() || null` read broke, and the only channel that can carry a
+      // name with a space in it.
+      await row(`C ${shown} merge.default=${shown} with its driver`, { drivers: [name], defaults: [name] }, name);
+
+      // (d) `merge.default=<name>` WITHOUT any driver.
+      if (name === 'union') {
+        const dir = await t46repo({ defaults: [name] });
+        const oracle = await askGit(dir);
+        check(`T46 D ${shown} merge.default=${shown} with no driver: git merges it without conflicting`, oracle.conflicted === false, JSON.stringify(oracle.worktree));
+        check(`T46 D ${shown}:   and ran no program`, oracle.driver === null, JSON.stringify(oracle.driver));
+        const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+        check(`T46 D ${shown}:   and Stacki reports it merged`, clash?.ok === true, JSON.stringify(clash).slice(0, 200));
+      } else {
+        await row(`D ${shown} merge.default=${shown} with no driver`, { defaults: [name] }, null);
+      }
+    }
+
+    // --- THE ERROR RUNNING THE OTHER WAY ------------------------------------
+    //
+    // Every row above with a space in its name pairs the name with its own
+    // driver. These pair it with the name a NORMALISATION would have produced,
+    // which is the shape that makes a trimmed read call an ordinary merge
+    // opaque — and an opaque path offers no hunks, so a conflict nobody could
+    // finish through the app.
+    await row('E1 merge.default=" text " with a driver under "text"', { drivers: ['text'], defaults: [' text '] }, null);
+    await row('E2 merge.default=" driver" with a driver under "driver"', { drivers: ['driver'], defaults: [' driver'] }, null);
+    await row('E3 merge.default="driver " with a driver under "driver"', { drivers: ['driver'], defaults: ['driver '] }, null);
+    // And the same asymmetry proved from the attribute side: the value git
+    // really read is the one that resolves, so a driver under THAT name runs.
+    // This is the positive control for the three unrepresentable rows above —
+    // without it, "the attribute mangles the name" would be a claim about
+    // check-attr rather than about the merge.
+    await row('E4 `merge= text ` with a driver under the EMPTY name', { attr: 'a.txt merge= text \n', drivers: [''] }, '');
+    await row('E5 `merge=driver ` with a driver under "driver"', { attr: 'a.txt merge=driver \n', drivers: ['driver'] }, 'driver');
+
+    // --- A KEY SET TWICE ----------------------------------------------------
+    //
+    // `--get` answers with the LAST value, and MEASURED that is the value the
+    // merge itself uses: with the driver defined only under the second name the
+    // program ran, and defined only under the first it did not. So `--get` is
+    // the right question here and `--get-all` would not be.
+    {
+      const dir = await t46repo({ defaults: ['alpha', 'beta'], drivers: ['beta'] });
+      const got = String((await git(dir, ['config', '-z', '--get', 'merge.default'])).stdout || '');
+      const all = String((await git(dir, ['config', '-z', '--get-all', 'merge.default'])).stdout || '');
+      check('T46 F: two merge.default lines are both in config', all === 'alpha\0beta\0', JSON.stringify(all));
+      check('T46 F:   and --get answers with the LAST of them', got === 'beta\0', JSON.stringify(got));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    await row('F1 two merge.default lines, driver under the SECOND', { defaults: ['alpha', 'beta'], drivers: ['beta'] }, 'beta');
+    await row('F2 two merge.default lines, driver under the FIRST only', { defaults: ['alpha', 'beta'], drivers: ['alpha'] }, null);
   }
 }
 

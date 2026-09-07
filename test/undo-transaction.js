@@ -625,6 +625,108 @@ const UNCOALESCED = 900;
       check('  and the stack moved exactly one step', same(retried.history, { past: 2, future: 0 }), short(retried.history));
     }
 
+    // ── 4b. AND IT IS THE TOP OF `future`, NOT THE ONE UNDERNEATH IT ─────────
+    //
+    // Section 4 above mirrors section 3 in everything except the assertion
+    // section 3 exists for. At its retry `future` is ONE deep, so "the retry
+    // targets the same command" and "the retry targets the only command" are
+    // the same sentence, and the check that reads the restored file names
+    // could not have failed for a redo that took the wrong entry: there was no
+    // other entry for it to take. Section 3 has the discriminator — two
+    // entries on `past`, and the write beneath the failed one asserted NOT to
+    // be the one that came back — and this is the missing half of it.
+    //
+    // MEASURED, with the one-line off-by-one that IS this defect: in
+    // `redoStep`, `h.future[h.future.length - 1]` read as
+    // `h.future[Math.max(0, h.future.length - 2)]` — the same entry whenever
+    // `future` is one deep, the one UNDERNEATH whenever it is two. The whole
+    // of section 4 passed on it, unchanged, including "and it is the same
+    // command".
+    //
+    // So: two entries on `future`, put there by two undos, with the blocked
+    // one on top. They touch different files — `public/keep-renamed.svg` for
+    // the asset rename on top, `src/data/other.json` for the content write
+    // beneath it — so WHICH entry the retry replayed is a question the bytes
+    // on disk answer, and the two answers cannot be mistaken for each other.
+    {
+      // THE ENTRY THAT WILL SIT UNDERNEATH. It goes on `past` last, so it
+      // comes off first, so it lands on `future` first — which is the bottom.
+      const otherBefore = app.read('src/data/other.json');
+      const readOther = await run('content', 'cms_read', { path: 'src/data/other.json' });
+      const wroteOther = await run('content', 'cms_write', {
+        path: 'src/data/other.json',
+        data: { note: 'THE ENTRY UNDERNEATH THE BLOCKED REDO' },
+        ref: readOther.ref,
+      });
+      check('4b: a content write on a second file lands', wroteOther.ok === true, short(wroteOther));
+      const otherAfter = app.read('src/data/other.json');
+      check('4b:   and is in the file', otherAfter !== otherBefore && /UNDERNEATH THE BLOCKED REDO/.test(otherAfter), otherAfter.slice(0, 120));
+
+      const undoneWrite = await run('project', 'undo');
+      await H.settle(150);
+      check('4b: the content write is undone', undoneWrite.ok === true && undoneWrite.undone === true, short(undoneWrite));
+      check('4b:   and its file is back, byte for byte', app.read('src/data/other.json') === otherBefore, short(app.read('src/data/other.json')));
+
+      const undoneRename = await run('project', 'undo');
+      await H.settle(150);
+      check('4b: and the asset rename beneath it is undone too', undoneRename.ok === true && undoneRename.undone === true, short(undoneRename));
+      check('4b:   the file is back under its own name, byte for byte', at('public/keep.svg') === ASSET && at('public/keep-renamed.svg') === null, short({ keep: at('public/keep.svg'), renamed: at('public/keep-renamed.svg') }));
+      const before = undoneRename.history;
+      check('4b:   SO THE REDO STACK IS TWO DEEP, with the rename on top', same(before, { past: 1, future: 2 }), short(before));
+
+      // THE OBSTRUCTION, at the name the entry on TOP has to rename onto. It
+      // obstructs that entry and no other: the content write underneath goes
+      // nowhere near this file, so a redo that refuses is a redo that reached
+      // for the top of the stack.
+      app.write('public/keep-renamed.svg', COLLIDER);
+      const failed = await run('project', 'redo');
+      wire.push(failed);
+      check('4b: the blocked redo is refused', failed.ok === false, short(failed));
+      check('4b:   with the documented code', failed.code === 'redo_failed', short({ code: failed.code }));
+      check('4b:   and says it did not redo anything', failed.redone === false, short({ redone: failed.redone }));
+      check('4b:   AND THE STACK HAS NOT MOVED', same(failed.history, before), short({ before, after: failed.history }));
+      check('4b:   the obstruction is untouched', at('public/keep-renamed.svg') === COLLIDER, short(at('public/keep-renamed.svg')));
+      check('4b:   and the entry UNDERNEATH it did not run in its place', app.read('src/data/other.json') === otherBefore, short(app.read('src/data/other.json')));
+
+      // THE RETRY, WITH SOMETHING UNDER IT — the sentence section 4 cannot
+      // say. Not "a command was replayed" but "the one on TOP was, and the one
+      // beneath it is still where the undo left it".
+      fs.rmSync(path.join(root, 'public/keep-renamed.svg'));
+      const retried = await run('project', 'redo');
+      await H.settle(150);
+      check('4b: with the obstruction gone the same redo goes through', retried.ok === true && retried.redone === true, short(retried));
+      const names = filesOf(retried);
+      check(
+        '4b:   and it is the ASSET RENAME ON TOP that was replayed, not the write beneath it',
+        names.includes('public/keep-renamed.svg') && !names.includes('src/data/other.json'),
+        short(names)
+      );
+      check('4b:   the file is renamed again, byte for byte', at('public/keep-renamed.svg') === ASSET && at('public/keep.svg') === null, short({ renamed: at('public/keep-renamed.svg'), keep: at('public/keep.svg') }));
+      // THE BYTES THAT MAKE THE LINE ABOVE AN ASSERTION RATHER THAN A LABEL. A
+      // redo that took the entry underneath would have rewritten this file and
+      // answered `ok: true, redone: true` with the asset still sitting where
+      // the undo left it.
+      check('4b:   AND THE CONTENT WRITE UNDERNEATH IS STILL UNDONE, byte for byte', app.read('src/data/other.json') === otherBefore, short(app.read('src/data/other.json')));
+      check('4b:   with the stack moved exactly one step', same(retried.history, { past: 2, future: 1 }), short(retried.history));
+
+      // POSITIVE CONTROL. The entry underneath is still on `future` and still
+      // reachable: a redo that had simply refused to go past the top entry
+      // would pass every check above.
+      const under = await run('project', 'redo');
+      await H.settle(150);
+      check('4b: the entry underneath is still there to be redone', under.ok === true && under.redone === true, short(under));
+      check('4b:   and it is the content write this time', filesOf(under).includes('src/data/other.json'), short(filesOf(under)));
+      check('4b:   whose bytes are back', app.read('src/data/other.json') === otherAfter, short(app.read('src/data/other.json')));
+      check('4b:   with the redo stack empty', same(under.history, { past: 3, future: 0 }), short(under.history));
+
+      // Back to what section 4 left behind, so the sections below start from
+      // the stack and the bytes they always did.
+      const put = await run('project', 'undo');
+      await H.settle(150);
+      check('4b: the extra command is taken back off', put.ok === true && app.read('src/data/other.json') === otherBefore, short(app.read('src/data/other.json')));
+      check('4b:   leaving the rename and the site.json write on the stack', same(put.history, { past: 2, future: 1 }), short(put.history));
+    }
+
     // ── 5. NO PARTIAL FILE STATE ─────────────────────────────────────────────
     //
     // One rename across two stylesheets, undone with one of them read-only.

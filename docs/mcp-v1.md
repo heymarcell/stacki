@@ -504,3 +504,38 @@ whose value is an expression rather than a literal, and it never consults the
 live preview: doing so would make the bytes written to disk depend on whether a
 window is open and which route it shows, and could not answer about a
 destination that does not exist until after the write.
+
+### Git: what is not read, and what is not repaired
+
+**A custom merge driver's output is opaque, deliberately.** A path merged by a
+program of the project's own — `merge=<name>` in `.gitattributes`, or any path
+at all when `merge.default` names a driver — is handed the three versions and
+writes whatever it likes into the result. Nothing in git's contract makes it
+emit conflict markers, and nothing makes the text above `=======` this branch
+and the text below it the incoming one; that ordering belongs to the built-in
+text driver, not to conflict markup. So Stacki reads no hunk sides out of such a
+path and offers none: `hunks` comes back empty, the envelope names the driver in
+`customDriver`, and a per-hunk array for that path is refused as
+`not_splittable`. The whole-file words are still exact, because "ours" and
+"theirs" are answered from git's index — stages 2 and 3 — without reading a byte
+of the driver's text. Marker-provenance checking does not run on such a path
+either, for the same reason: nothing is being parsed, so there is nothing for an
+authored marker-shaped line to be confused with. Every path git marked up itself
+is unaffected.
+
+**A driver's NAME is data, and is matched byte for byte.** `merge.default` is
+read with `git config -z --get` and used exactly as configured: a key that is
+absent, a key set to the empty string, and a key set to `" text "` with the
+spaces are three different things, and git resolves each to a different
+subsection. Stacki does not trim, case-fold, Unicode-normalise, or collapse an
+empty value to "unset", because git does none of those and the answer must be
+the one git will act on.
+
+**A git configuration that breaks stock git is not something Stacki repairs.**
+Where a user's configuration would change the meaning of an answer, Stacki pins
+it for its own invocation and says so — `diff.relative` is pinned to `false` for
+the single call that would otherwise be misread — but it takes no view on the
+user's configuration otherwise and does not correct it. A repository whose
+configuration makes git itself fail is reported as the failure it is; making it
+work again is the user's to do, not Stacki's, and a product that silently
+rewrote a person's git config to get a cleaner answer would be a worse one.

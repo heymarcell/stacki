@@ -1918,8 +1918,8 @@ const git = {
       // declares it — every path in this answer is git's own spelling, relative
       // to the REPOSITORY root, and an agent that re-spells them the way
       // source.read wants is the mistake that declaration exists to stop.
+      const scrub = (text) => (typeof text === 'string' && text ? withoutHostPaths(text, ctx?.root) : text ?? null);
       if (raw?.ok === false && (raw.code === 'merge_stuck' || raw.code === 'merge_blocked')) {
-        const scrub = (text) => (typeof text === 'string' && text ? withoutHostPaths(text, ctx?.root) : text ?? null);
         return {
           ...raw,
           branch: raw.branch ?? input.branch ?? null,
@@ -1928,6 +1928,44 @@ const git = {
           ...(raw.code === 'merge_stuck'
             ? { files: take(raw.files, MAX_LIST), pathsRelativeTo: 'repository-root' }
             : {}),
+        };
+      }
+      // AND THE THIRD GIT FAILURE, WHICH FELL THROUGH FOR THE SAME REASON THE
+      // OTHER TWO DID.
+      //
+      // `working_tree_blocked` is minted in gitBranches.js when git will not
+      // START the re-merge because a file it has to write holds uncommitted
+      // work. The branch above names two codes and this was not one of them, so
+      // it reached a client through `runMain`'s spread exactly as the handler
+      // wrote it — while the SAME refusal from git.merge, one mapper up, is
+      // shaped. One code, two shapes, decided by which call produced it.
+      //
+      // `files` is what makes that matter. It is not a list Stacki composed: it
+      // is git's own stderr, split on newlines and filtered — every line that
+      // is not one of the prose lines this file knows to drop. So it is
+      // UNBOUNDED, and it is text that started life outside this surface, which
+      // is the exact class the scrubber exists for.
+      //
+      // MEASURED, git 2.50.1, 500 files changed on the incoming branch and left
+      // uncommitted here: git listed all five hundred under "Your local changes
+      // to the following files would be overwritten by merge:", and the
+      // envelope carried 500 entries — a hundred over the cap this surface
+      // declares and every other list on it obeys. (Git truncates its own
+      // message near four kilobytes, so the last entry can also be HALF A PATH:
+      // one more reason not to hand the list on as though Stacki had built it.)
+      //
+      // Cut to MAX_LIST and put through the same scrub as the sentences, and
+      // the path space declared for the same reason `merge_stuck` declares it:
+      // these are git's spelling, from the repository root, and an agent that
+      // re-spells them the way source.read wants is the mistake that field
+      // stops.
+      if (raw?.ok === false && raw.code === 'working_tree_blocked') {
+        return {
+          ...raw,
+          branch: raw.branch ?? input.branch ?? null,
+          message: scrub(raw.message),
+          files: take(raw.files, MAX_LIST).map((one) => (typeof one === 'string' ? withoutHostPaths(one, ctx?.root) : one)),
+          pathsRelativeTo: 'repository-root',
         };
       }
       if (raw?.ok === false && Array.isArray(raw.badChoices)) {

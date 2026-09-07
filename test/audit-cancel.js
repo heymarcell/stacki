@@ -596,6 +596,103 @@ const engineWith = (log, opts = {}) =>
     check('  and the queued refusal added no clears of its own', log.session.storage === 3, short(log.session));
   }
 
+  // ---- AND THE SLOT THE ABANDONED QUEUED RUN WAS STANDING IN ---------------
+  //
+  // THE CASE ABOVE STOPS ONE RUN TOO EARLY. It proves the caller is answered at
+  // the abort rather than at the end of the run in front, and then it ends: the
+  // block finishes with `await first` and nobody ever asks this engine for
+  // another audit. So the one thing a queued refusal is FOR -- the slot, and the
+  // audit that gets to have it -- was never read by any assertion in this file.
+  //
+  // WHY NO OTHER CASE COVERS IT. The slot is a promise chain, and an abandoned
+  // run is a LINK in it: `queue = mine.catch(...)` is assigned at
+  // electron/mcp/audit/index.js:817, before the abort racer below it exists, so
+  // every audit behind an abandoned one waits on `mine` -- the very promise
+  // whose caller has already been sent away. The two other cancel-then-audit
+  // cases in this file are cancels that happened INSIDE `runExclusive`, where
+  // the slot is released by the ordinary settling of `mine` and the link is
+  // never the abandoned one; and their follow-up run is refused at the door with
+  // `session_not_isolated`, so it stops before it asks for the slot at all. If
+  // the queued path left its link unsettled, or settled it by doing the work
+  // anyway, no check in this process would move.
+  //
+  // TWO PROPERTIES, and the case is arranged so one run reads both.
+  //
+  // NOT OCCUPIED: an ordinary audit queued BEHIND the abandoned one must still
+  // wait for the run in front -- cancellation buys the wasted work back, not a
+  // second audit on the shared partition -- and must then be measured normally,
+  // window opened and `ok: true`, rather than waiting on a link nobody will ever
+  // settle.
+  //
+  // NOT DOUBLE-SETTLED: the abandoned link must answer its turn without doing
+  // the run. Its caller already has an answer; if `mine` went on to call
+  // `runExclusive` when the queue reached it, the engine would open a window and
+  // wipe the shared partition for a request it has already told the caller was
+  // cancelled -- work charged to the audit behind it, in an answer nobody can
+  // read. That second run can only hide AFTER the chain has drained, which is
+  // where the counts below are taken: the case above reads its window and clear
+  // counts on the turn `first` resolves, and the abandoned link's callback has
+  // not run yet at that moment, so those checks cannot see it.
+  {
+    const log = newLog();
+    const front = gate('load');
+    const engine = engineWith(log, { gateFor: (phase, nth) => (phase === 'load' && nth === 1 ? front : null) });
+    const ac = new AbortController();
+    // The racer arms exactly one abort listener for a run that is still waiting.
+    // Read while it is armed as well as after, so the count below is known to be
+    // a reading that moves rather than the constant zero an `AbortSignal` gives
+    // to anything that asks it the wrong way -- the mistake this file made once
+    // already, at the listener block near the end.
+    const armed = () => getEventListeners(ac.signal, 'abort').length;
+
+    const first = engine.run({ route: '/', viewports: ONE, rules: [] });
+    const abandoned = engine.run({ route: '/other', viewports: ONE, rules: [] }, { signal: ac.signal });
+    check('the run in front of the abandoned one is holding the queue open', await until(() => log.blockedOn.includes('load')), short(log));
+    check('  and the queued run is armed to answer at the abort', armed() === 1, `${armed()} abort listeners while it waits`);
+    ac.abort();
+    const b = await answeredCancel('an audit abandoned while it was queued', abandoned);
+    check('the audit abandoned while queued is refused', b?.ok === false && b.code === 'cancelled', short(b));
+
+    // BEHIND the abandoned one, not after it: this run is chained onto the very
+    // promise whose caller has just walked away, which is the link under test.
+    let behindAnswered = false;
+    const behind = engine.run({ route: '/third', viewports: ONE, rules: [] }).then((v) => {
+      behindAnswered = true;
+      return v;
+    });
+    // Serialisation is not what cancellation buys. A slot that opened the moment
+    // the queued caller left would put this run on the partition alongside the
+    // one in front, which is the thing the queue exists to prevent.
+    await until(() => behindAnswered, 200);
+    check('  and the audit behind it does NOT jump the run in front', behindAnswered === false, 'it answered while the run in front was still holding its load');
+
+    front.release();
+    const a = await first;
+    check('the audit in front of both still finishes', a?.ok === true, short(a));
+    const releasedAt = Date.now();
+    const third = await boundDeadline('the audit queued behind an abandoned one', behind, 20000);
+    const tookAfterFront = Date.now() - releasedAt;
+    // THE HEADLINE. A link left occupied by the racer does not fail this slowly
+    // or loudly by itself -- it never answers, and this deadline is what turns
+    // that into a red line rather than a hang.
+    check('the audit queued behind an abandoned one gets the slot at all', third.answered === true, short(third.value));
+    check('  and is measured normally rather than refused', third.value?.ok === true, short(third.value));
+    check('  and really did open its own window to do it', log.opened === 2, short(log));
+    check('  and claims isolation, having had the partition to itself', third.value?.engine?.sessionIsolated === true, short(third.value?.engine));
+    check('  and took the slot as soon as the run in front freed it, rather than waiting on anything of the abandoned run', tookAfterFront < ANSWER_BY_MS, `${tookAfterFront}ms after the run in front finished`);
+
+    // AND THE ABANDONED LINK DID NOTHING ON ITS TURN. Read here, after the whole
+    // chain has drained through it, which is the only place a second run could
+    // be hiding: two windows for the two runs that had callers, and six clears
+    // for the two runs that happened -- three each, before the run, before the
+    // viewport, and on the way out.
+    check('the abandoned link never became a run of its own', log.opened === 2 && log.destroyed === 2, short(log));
+    check('  and added no clears to the shared partition after its caller had gone', log.session.storage === 6, short(log.session));
+    check('  and left no abort listener armed to answer it a second time', armed() === 0, `${armed()} abort listeners after the chain drained`);
+    check('  and leaves none live', liveWindowCount() === 0, String(liveWindowCount()));
+    cleanedUp('the audit queued behind an abandoned one', log);
+  }
+
   // ---- ABORTED DURING THE LOAD ---------------------------------------------
   //
   // THE CASE THE OLD FAKE COULD NOT POSE. The load never finishes, the way

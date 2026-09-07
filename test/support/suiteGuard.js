@@ -92,4 +92,58 @@ function guardSuite(name, deadlineMs = 600000) {
   };
 }
 
-module.exports = { portTaken, freePort, guardSuite };
+/**
+ * A SKIP THAT SAYS SO, because "exited 0 having asserted nothing" is the other
+ * way a suite reports success without having run.
+ *
+ * MEASURED, in this worktree, on 2026-09-07:
+ *
+ *     node test/packaged-lifecycle.js          → EXIT=0, "17 passed"
+ *     (same file, with the one path its `available()` probes made absent)
+ *                                              → EXIT=0, "packaged-lifecycle: skipped"
+ *
+ * and three suites that ARE in the npm test chain do the same thing off an
+ * environment variable rather than a missing file:
+ *
+ *     STACKI_HOSTED_RUNNER=1 node test/hover-cost.js         → EXIT=0, 0 checks
+ *     STACKI_HOSTED_RUNNER=1 node test/popover-dropdown.js   → EXIT=0, 0 checks
+ *     STACKI_HOSTED_RUNNER=1 node test/shared-acceptance.js  → EXIT=0, 0 checks
+ *
+ * Zero is what the chain reads, and zero is what a suite that ran everything
+ * reports too. So on a machine — or in a container, or on a runner with one
+ * variable set differently — where the resource is missing, the entry is not a
+ * weaker test. It is not a test.
+ *
+ * The skip itself is legitimate: nobody wants `npm test` to be impossible
+ * without a signed bundle. What is not legitimate is that the skip is
+ * UNDECLARED — the caller cannot ask for a run in which skipping is an error,
+ * so no run anywhere can prove the skipped path still works.
+ *
+ * This makes the skip a declaration:
+ *
+ *     STACKI_NO_SKIPS unset  → prints the skip line, exits as the suite would
+ *     STACKI_NO_SKIPS set    → prints FAILED and makes the exit code non-zero
+ *
+ * so a release run sets it and a laptop does not.
+ *
+ * `done` is the guard's own `done()` and passing it matters: `guardSuite` turns
+ * "returned without finishing" into a failure, which a bare skip escape looks
+ * exactly like. A DECLARED skip is a legitimate ending, and this is how it says
+ * so; an undeclared one keeps failing, which is the point.
+ *
+ * @returns {boolean} whether the skip was allowed. False means this run had
+ *   already been told not to accept one, and the exit code is now non-zero.
+ */
+function skipSuite(name, reason, done) {
+  if (typeof done === 'function') done();
+  const forbidding = process.env.STACKI_NO_SKIPS;
+  if (forbidding && forbidding !== '0') {
+    console.error(`\n${name}: FAILED — skipped (${reason}), and STACKI_NO_SKIPS forbids a suite that asserts nothing.`);
+    process.exitCode = 1;
+    return false;
+  }
+  console.log(`${name}: skipped  [${reason}]`);
+  return true;
+}
+
+module.exports = { portTaken, freePort, guardSuite, skipSuite };

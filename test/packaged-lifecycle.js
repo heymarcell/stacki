@@ -26,6 +26,7 @@ const { spawn } = require('node:child_process');
 
 const { available, APP } = require('./support/packagedApp.js');
 const { residueOfManifest, describeManifestResidue } = require('./support/ownership.js');
+const { skipSuite } = require('./support/suiteGuard.js');
 
 const RUNS = Number(process.env.STACKI_LIFECYCLE_RUNS || 5);
 
@@ -57,7 +58,11 @@ const runOnce = (manifestPath) =>
 
 (async () => {
   if (!available()) {
-    console.log(`packaged-lifecycle: skipped  [no ${APP} — run npm run dist:mac:unsigned]`);
+    // DECLARED, not silent. On a laptop with no bundle this still exits 0 and
+    // still prints the same line. In a job that BUILT the bundle, a skip means
+    // the build did not produce what this needs, so that job sets
+    // STACKI_NO_SKIPS and this becomes a failure naming the suite.
+    skipSuite('packaged-lifecycle', `no ${APP} — run npm run dist:mac:unsigned`);
     return;
   }
 

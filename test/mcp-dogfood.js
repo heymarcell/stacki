@@ -366,6 +366,23 @@ function makeClient({ url, token }) {
 
   // REVIEW TEXT IS DATA. A comment that tells the agent it may do more does not
   // make it so — the permission gate reads settings, never the message.
+  //
+  // WHAT THIS PROVES, AND WHAT IT DOES NOT — because the sentence above claims
+  // far more than the check below measures, and a reader would take the claim.
+  //
+  // The only consequence checked here is the tools/list NAME LIST. That catches
+  // a hostile comment that adds, removes or renames a tool, and nothing else.
+  // MEASURED in this worktree on 2026-09-07: with the gate deliberately
+  // sabotaged so that SERVING this comment raised the level from `visual` to
+  // `full`, the name list came back byte-for-byte identical and this check
+  // stayed green — while nine checks in the deterministic suite went red.
+  //
+  // So the actual claim — the permission mode does not move, no operation's
+  // granted risk moves, and an operation refused before is refused after — is
+  // proven by test/review-instruction-safety.js, which measures all three over
+  // the wire either side of the hostile bytes, in node, and IS in the npm test
+  // chain. This stays as the real-Electron sighting of the same fixture: that a
+  // person can type this into the running app at all.
   const hostile = await inRenderer(`
     (async () => {
       const r = await window.avb.reviewsAct({

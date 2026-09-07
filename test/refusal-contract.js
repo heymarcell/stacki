@@ -871,6 +871,102 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
       check('  and the repository is not left mid-merge', gitQuiet(root, 'ls-files', '-u') === '' && !fs.existsSync(path.join(root, '.git/MERGE_HEAD')), gitQuiet(root, 'status', '--porcelain'));
     }
 
+    // AND THE MERGE GIT WOULD NOT START FOR THE ORDINARY REASON: SOMETHING IS
+    // OPEN AND UNSAVED.
+    //
+    // `working_tree_blocked` is reached on this wire from `git.checkout` and was
+    // never reached from `git.resolve_merge` — which is how it came to be the
+    // one refusal on that route the mapper does not shape. That branch names
+    // `merge_stuck` and `merge_blocked`; this code is not in it, so the
+    // handler's answer went out through `runMain`'s spread exactly as
+    // gitBranches.js wrote it — and `files` there is not a list Stacki
+    // composed. It is GIT'S OWN STDERR for "Your local changes to the following
+    // files would be overwritten by merge:", split on newlines with the prose
+    // lines dropped, and nothing bounded it or put it through the scrub every
+    // other sentence on this surface goes through.
+    //
+    // SO THE FIXTURE IS BIGGER THAN THE CAP, on the wire, because a probe with
+    // one file in the way cannot tell a capped list from a short one. Five
+    // hundred files the incoming branch changed and this branch has open:
+    // MEASURED with git 2.50.1, git lists all five hundred, and before the
+    // mapper learned this code all five hundred arrived at the client.
+    //
+    // Short names on purpose: git truncates its own message near four
+    // kilobytes — measured, 900 files under `w/f<n>` came back as 510 lines
+    // with the last one cut in half — so the fixture is built to fit inside
+    // that budget and the premise below asserts that it did.
+    {
+      const dir = path.join(root, 'w');
+      const OPEN = MAX_LIST + 100;
+      const clashAt = path.join(dir, 'c.txt');
+      const openAt = (i) => path.join(dir, String(i));
+      const writeAll = (side) => {
+        for (let i = 0; i < OPEN; i += 1) fs.writeFileSync(openAt(i), `${side}\n`);
+      };
+      fs.mkdirSync(dir, { recursive: true });
+      writeAll('base');
+      fs.writeFileSync(clashAt, 'base\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'a clash and five hundred files for the unsaved-work probe');
+      git(root, 'checkout', '-q', '-b', 'unsaved-other');
+      fs.writeFileSync(clashAt, 'theirs\n');
+      // CHANGED ON THE INCOMING BRANCH ONLY, so the re-merge must write every
+      // one of them and git stops on the uncommitted versions below. `c.txt` is
+      // what mints the handle; these are what block the call the handle is for.
+      writeAll('theirs');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'their answer, and five hundred files only they touched');
+      git(root, 'checkout', '-q', 'main');
+      fs.writeFileSync(clashAt, 'ours\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'our answer');
+      const { envelope: clash } = await rig.call('git', 'merge', { branch: 'unsaved-other' });
+      check('the unsaved-work probe starts from a real conflict', clash?.code === 'merge_conflict', short(clash, 160));
+      check('  in the one file both branches touched', (clash?.files || []).length === 1 && clash.files[0]?.path === 'w/c.txt', short((clash?.files || []).map((f) => f.path), 160));
+      await provoke('finishing a merge that would overwrite unsaved work', 'working_tree_blocked', 'git', 'resolve_merge', {
+        mergeRef: clash?.mergeRef,
+        branch: 'unsaved-other',
+        choices: { 'w/c.txt': 'ours' },
+      }, {
+        setup: () => writeAll('open in the editor and never committed'),
+      });
+      const unsaved = observed[observed.length - 1]?.envelope;
+      // THE FILES THAT ARE IN THE WAY, which are the only thing that gets a
+      // person unstuck: the refusal is about paths the agent never named.
+      check('  and it names the files that are in the way', (unsaved?.files || []).includes('w/0'), short(unsaved?.files, 200));
+      // THE PREMISE THE CAP ASSERTION RESTS ON: git really did name more of
+      // them than the surface is allowed to carry. Asked of git rather than of
+      // the envelope, which is the thing under test.
+      const wouldOverwrite = gitQuiet(root, 'diff', '--name-only', 'main', 'unsaved-other') || '';
+      check('  and the tree really has more open files than the cap', wouldOverwrite.split('\n').filter(Boolean).length > MAX_LIST, String(wouldOverwrite.split('\n').filter(Boolean).length));
+      // AND THE PROMISES THE MAPPER WAS SKIPPING. The sweep below holds every
+      // envelope to these; they are said here by name because this is the route
+      // where the shaping was absent rather than merely untested.
+      check(`  and what leaves is cut to the ${MAX_LIST} the surface caps at`, unsaved?.files?.length === MAX_LIST, short({ files: unsaved?.files?.length }));
+      check('  and it names no place on this machine', hostPathsIn(unsaved, root).length === 0, hostPathsIn(unsaved, root).join('; '));
+      // WHICH PATH SPACE THOSE ARE SPELLED IN. `merge_stuck` on this same route
+      // declares it and this did not, so an agent handing one of these to
+      // source.read was reading a different file or none.
+      check('  and says which path space they are in', unsaved?.pathsRelativeTo === 'repository-root', short(unsaved?.pathsRelativeTo));
+      check('  and says what to do about it', /commit|park|discard/i.test(String(unsaved?.message || '')), short(unsaved?.message, 240));
+      // AND THE SAME REFUSAL ONE CALL EARLIER IN THE STORY. `git.merge`'s
+      // mapper does cap this list, and nothing asserted that it did — so the
+      // cap and the sentence there were both free.
+      await provoke('a merge that would overwrite unsaved work', 'working_tree_blocked', 'git', 'merge', { branch: 'unsaved-other' });
+      const blockedMerge = observed[observed.length - 1]?.envelope;
+      check(`  the merge route caps its list at ${MAX_LIST} too`, blockedMerge?.files?.length === MAX_LIST, short({ files: blockedMerge?.files?.length }));
+      check('  names the files in the way', (blockedMerge?.files || []).includes('w/0'), short(blockedMerge?.files, 160));
+      check('  and says what to do, and that nothing happened', /commit|park|discard/i.test(String(blockedMerge?.message || '')) && /nothing was changed/i.test(String(blockedMerge?.message || '')), short(blockedMerge?.message, 240));
+      // PUT BACK, AND TAKEN AWAY. The unsaved work is discarded and the five
+      // hundred files are removed from `main` again: every snapshot after this
+      // one would otherwise walk them, and the fixture is meant to be a small
+      // Astro project rather than this probe's leftovers.
+      git(root, 'checkout', '-q', '--', '.');
+      fs.rmSync(dir, { recursive: true, force: true });
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'the unsaved-work probe is over');
+    }
+
     // THE PREVIEW
     await provoke('probing a project nothing is serving', 'no_preview', 'project', 'probe', {});
 
@@ -1349,6 +1445,111 @@ const UNREACHABLE = new Map(); // code -> the proof that nothing can produce it
           check('  merge_stuck: and the tree really is still mid-merge', gitQuiet(stuckRoot, 'ls-files', '-u') !== '', short(gitQuiet(stuckRoot, 'status', '--porcelain'), 120));
         } finally {
           fs.rmSync(stuckRoot, { recursive: true, force: true });
+        }
+      }
+
+      // AND THE CAP ON THE OTHER LIST GIT WRITES: THE FILES IN THE WAY.
+      //
+      // `working_tree_blocked` is reached on the wire twice above — from
+      // git.checkout and from git.resolve_merge — and both of those are about
+      // ONE file, so neither of them can say whether the cap bites. This does,
+      // for both git routes that mint the code, and it is measured on each side
+      // of the mapper: what the handler hands over, and what leaves.
+      //
+      // The list is not one Stacki composed. `gitBranches.js` takes git's own
+      // stderr for "Your local changes to the following files would be
+      // overwritten by merge:", splits it on newlines and drops the prose
+      // lines it recognises; everything else is a `files` entry. Nothing in the
+      // handler bounds it, and MEASURED with git 2.50.1 and five hundred files
+      // the incoming branch changed, git listed all five hundred — a hundred
+      // over the cap this surface declares and every other list on it obeys.
+      //
+      // Its own repository, off the fixture, for the same reason as the block
+      // above: the disk oracle bracketing every wire refusal must not be asked
+      // about a tree this deliberately dirties five hundred files in.
+      {
+        const gitAsync = (cwd, args) =>
+          new Promise((settle, fail) => {
+            execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+              if (err) {
+                err.stdout = stdout;
+                err.stderr = stderr;
+                fail(err);
+                return;
+              }
+              settle({ stdout, stderr });
+            });
+          });
+        const dirtyRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'refusal-merge-dirty-')));
+        try {
+          // SHORT NAMES ON PURPOSE. Git truncates its own message near four
+          // kilobytes — measured, 900 files under `w/f<n>` came back as 510
+          // lines with the last one cut in half — so the fixture is built to
+          // fit the whole list inside that budget, and the premise below
+          // asserts it did rather than assuming it.
+          const OVER_CAP = MAX_LIST + 100;
+          fs.mkdirSync(path.join(dirtyRoot, 'w'));
+          const writeAll = (side) => {
+            for (let i = 0; i < OVER_CAP; i += 1) fs.writeFileSync(path.join(dirtyRoot, 'w', String(i)), `${side}\n`);
+          };
+          git(dirtyRoot, 'init', '-q', '-b', 'main');
+          git(dirtyRoot, 'config', 'user.email', 'refusal@example.com');
+          git(dirtyRoot, 'config', 'user.name', 'Refusal Contract');
+          git(dirtyRoot, 'config', 'commit.gpgsign', 'false');
+          writeAll('base');
+          fs.writeFileSync(path.join(dirtyRoot, 'c.txt'), 'base\n');
+          git(dirtyRoot, 'add', '-A');
+          git(dirtyRoot, 'commit', '-q', '-m', 'base');
+          git(dirtyRoot, 'checkout', '-q', '-b', 'other');
+          // Changed on the incoming branch ONLY, so the merge must write every
+          // one of them; `c.txt` is the single genuine clash that mints the
+          // binding a resolve needs.
+          writeAll('theirs');
+          fs.writeFileSync(path.join(dirtyRoot, 'c.txt'), 'theirs\n');
+          git(dirtyRoot, 'add', '-A');
+          git(dirtyRoot, 'commit', '-q', '-m', 'their answer');
+          git(dirtyRoot, 'checkout', '-q', 'main');
+          fs.writeFileSync(path.join(dirtyRoot, 'c.txt'), 'ours\n');
+          git(dirtyRoot, 'add', '-A');
+          git(dirtyRoot, 'commit', '-q', '-m', 'our answer');
+          const clash = await mergeBranch(gitAsync, { projectPath: dirtyRoot, branch: 'other' });
+          check('the unsaved-work cap fixture conflicts, so there is a binding to resolve against', clash?.conflicted === true, short({ ok: clash?.ok, conflicted: clash?.conflicted }, 160));
+          // AND NOW THE WORK NOBODY SAVED, in every file the merge has to
+          // write.
+          writeAll('open in the editor and not committed');
+
+          const rawResolve = await resolveMerge(gitAsync, {
+            projectPath: dirtyRoot,
+            branch: 'other',
+            choices: { 'c.txt': 'ours' },
+            expect: clash?.at,
+          });
+          check('resolve_merge refuses it as working_tree_blocked', rawResolve?.code === 'working_tree_blocked' && rawResolve?.dirty === true, short(rawResolve, 200));
+          check('  and the handler hands back more paths than MAX_LIST', Array.isArray(rawResolve?.files) && rawResolve.files.length > MAX_LIST, String(rawResolve?.files?.length));
+          const shapedResolve = await DOMAINS_MODULE.DOMAINS.git.resolve_merge.result(rawResolve, { branch: 'other' }, { root: dirtyRoot });
+          check('  and the mapper cut that list to the cap the surface declares', shapedResolve?.files?.length === MAX_LIST, String(shapedResolve?.files?.length));
+          check('  keeping the code and the sentence', shapedResolve?.code === 'working_tree_blocked' && /commit|park|discard/i.test(String(shapedResolve?.message || '')), short(shapedResolve?.message, 240));
+          check('  declaring which path space those are spelled in', shapedResolve?.pathsRelativeTo === 'repository-root', short(shapedResolve?.pathsRelativeTo));
+          check('  and naming no place on THIS machine', hostPathsIn(shapedResolve, dirtyRoot).length === 0, hostPathsIn(shapedResolve, dirtyRoot).join('; '));
+
+          // AND THE SAME CODE FROM THE OTHER ROUTE. `git.merge`'s mapper does
+          // cap this list — and nothing asserted that it did, so the cap and
+          // the sentence were both free. Same fixture, same uncommitted work,
+          // one call earlier in the story.
+          const rawMerge = await mergeBranch(gitAsync, { projectPath: dirtyRoot, branch: 'other' });
+          check('git.merge refuses the same tree', rawMerge?.ok === false && rawMerge?.dirty === true, short(rawMerge, 200));
+          check('  and its handler hands back more paths than MAX_LIST too', Array.isArray(rawMerge?.files) && rawMerge.files.length > MAX_LIST, String(rawMerge?.files?.length));
+          const shapedMerge = await DOMAINS_MODULE.DOMAINS.git.merge.result(rawMerge, { branch: 'other' }, { root: dirtyRoot });
+          check('  which the merge mapper cuts to the cap as well', shapedMerge?.files?.length === MAX_LIST, String(shapedMerge?.files?.length));
+          check('  under the code a client can branch on', shapedMerge?.code === 'working_tree_blocked', short(shapedMerge?.code));
+          check('  with the sentence that says what to do', /commit|park|discard/i.test(String(shapedMerge?.message || '')) && /nothing was changed/i.test(String(shapedMerge?.message || '')), short(shapedMerge?.message, 240));
+          check('  and naming no place on THIS machine either', hostPathsIn(shapedMerge, dirtyRoot).length === 0, hostPathsIn(shapedMerge, dirtyRoot).join('; '));
+          // THE PREMISE BOTH HALVES REST ON: git really did list them all, and
+          // neither call moved the repository or left a merge open.
+          check('  git listed the whole set rather than truncating its own message', rawMerge.files.every((one) => typeof one === 'string' && /^w\/\d+$/.test(one)), short(rawMerge.files.slice(-3), 120));
+          check('  and nothing was merged by either call', gitQuiet(dirtyRoot, 'ls-files', '-u') === '' && !fs.existsSync(path.join(dirtyRoot, '.git/MERGE_HEAD')), short(gitQuiet(dirtyRoot, 'status', '--porcelain'), 120));
+        } finally {
+          fs.rmSync(dirtyRoot, { recursive: true, force: true });
         }
       }
 

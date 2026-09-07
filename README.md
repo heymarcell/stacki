@@ -19,9 +19,12 @@ MIT licensed — fork it, build on it, ship your own version.
   to that element — at the breakpoint you left it at, and on the copy of it you were looking at — and your coding
   agent can read them, go and look at each one, do the work, and close the loop. See [Comments](#comments).
 - **Let an AI see and change what's selected (MCP)** — Stacki runs a small [MCP](https://modelcontextprotocol.io)
-  server, so Claude Code, Cursor or any MCP client can ask what you have selected on the canvas, where it is
+  server, so an MCP client can ask what you have selected on the canvas, where it is
   in source, what it actually looks like — and, if you allow it, change that exact thing through Stacki, on
-  the undo stack you can press ⌘Z on. See [Connecting an AI agent](#connecting-an-ai-agent-mcp).
+  the undo stack you can press ⌘Z on. Claude Code is the host Stacki is actually driven against;
+  configuration is shipped for others, and
+  [`docs/mcp-compatibility.md`](docs/mcp-compatibility.md) says which have been
+  driven and which have only been assumed. See [Connecting an AI agent](#connecting-an-ai-agent-mcp).
 - **Code fallback** — pages with markup too complex for the visual model open in a code editor instead, still with live preview.
 - **New project** — "New Project…" scaffolds a minimal Astro starter (layout + 5 components + home page) and runs `npm install` for you.
 
@@ -622,7 +625,10 @@ below does not have:
 ```
 
 **Cursor** — `~/.cursor/mcp.json` for every project, or `.cursor/mcp.json` for
-one. Cursor's interpolation is spelled `${env:VAR}`:
+one. Cursor's interpolation is spelled `${env:VAR}`. This configuration is
+shipped, not qualified: Cursor is a GUI launcher with no documented
+ephemeral-config CLI, so nothing here has been driven against it. See
+[`docs/mcp-compatibility.md`](docs/mcp-compatibility.md):
 
 ```json
 {
