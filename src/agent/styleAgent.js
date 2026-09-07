@@ -1456,7 +1456,54 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
     );
   }
 
+  // ── AN ANSWER ABOUT A COMPONENT INSTANCE IS NOT AN ANSWER ABOUT AN ELEMENT ──
+  //
+  // `<Hero />` is not a box. It is a reference to a file, and what it renders is
+  // decided in that file — possibly a Fragment, possibly a `<slot/>`, possibly
+  // conditionally. So nothing on the page has this node's tag or classes, and a
+  // read over the AUTHORED cascade finds no rule that matches it.
+  //
+  // That came back as `ok: true, matchedRuleCount: 0, rules: [], element.tag:
+  // null, computed: null, problems: []` — byte-for-byte the answer for an
+  // element that genuinely has no CSS. In the same project, at the same moment,
+  // entering the component and reading its root `<section class="hero">`
+  // returned `.hero` with all three of its declarations. A live dogfood filed
+  // the empty one, correctly: an agent reading it would conclude the element is
+  // unstyled and go and write CSS that already exists.
+  //
+  // DECIDED BY WHAT THE NODE IS, NOT BY WHETHER THE LIST CAME BACK EMPTY. A
+  // real element with no CSS must keep answering "no CSS"; a flag that fired on
+  // an empty list would take that answer away from it. So the question asked is
+  // "is this a component instance whose rendered identity we did not obtain" —
+  // and with a canvas running, `resolveTarget` DOES obtain one, and this says
+  // nothing.
+  // `rootSnapshot` EXISTS for an instance even when nothing resolved it — it is
+  // the snapshot the matcher was given, and for an unresolved instance it is one
+  // with no tag. So the signal is the rendered TAG, which is the thing that is
+  // present exactly when a real box was found.
+  const isInstance = node?.kind === 'component';
+  const unrendered = isInstance && !rootSnapshot?.tag;
+  if (unrendered) {
+    problems.push(
+      `<${node.name || 'Component'} /> is a component instance, not an element: what it renders is decided inside ` +
+        `${node.name || 'the component'}'s own file, so no rule in this page's CSS matches the instance itself. ` +
+        'This is NOT an element with no styles. To read the styles of what it renders, use target.enter to open the ' +
+        'component and read the element inside it; with the preview running, a read of the instance resolves to the ' +
+        'rendered box instead.'
+    );
+  }
+
   return {
+    // WHAT THIS ANSWER IS ABOUT, as data rather than as a sentence. A client
+    // that branches on `rules.length` needs to be able to tell the two zeroes
+    // apart without parsing prose.
+    about: {
+      kindOfThing: isInstance ? 'component_instance' : 'element',
+      componentName: isInstance ? node.name || null : null,
+      // False when the answer describes a real box; true when it describes a
+      // reference to a file and the box was never found.
+      unresolvedInstance: unrendered,
+    },
     element: {
       tag: rootSnapshot?.tag || null,
       id: rootSnapshot?.id || null,

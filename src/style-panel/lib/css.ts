@@ -8,7 +8,7 @@
 
 import postcss, { type Root, type Rule, type AtRule, type ChildNode, type Declaration } from 'postcss'
 import type { ParsedDeclaration, ParsedRule, StyleRegion } from './types'
-import { parseSelectorList } from './selectors'
+import { parseSelectorList, type ScopedStyleStrategy } from './selectors'
 import { selectorKey } from './resolved'
 
 // A direct child rule of `container` whose selector is the SAME target as `selector`
@@ -119,6 +119,14 @@ type WalkContext = {
   idSeed: string
   /** Shared running counter assigning cascade document order across embeds. */
   order: { n: number }
+  /**
+   * Whether Astro scopes this source — which changes the SPECIFICITY of every
+   * selector in it, because Astro scopes by rewriting each compound rather than
+   * by wrapping the block. Undefined means unscoped, which is every stylesheet
+   * and every `<style is:global>`. See `parseSelectorList` in ./selectors.
+   */
+  scoped?: boolean
+  strategy?: ScopedStyleStrategy
 }
 
 /** Split a selector list on top-level commas (ignoring commas inside `()`/`[]`). */
@@ -685,7 +693,7 @@ function buildRule(
     nestedDisplay,
     queryDisplay,
     atContext,
-    selectors: parseSelectorList(selectorText),
+    selectors: parseSelectorList(selectorText, ctx.scoped ? { scoped: true, strategy: ctx.strategy ?? 'attribute' } : undefined),
     declarations,
   }
 }
