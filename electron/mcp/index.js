@@ -25,6 +25,7 @@ const { createAudit } = require('./audit');
 const { createStackiMcpServer, DEFAULT_PORT } = require('./server');
 const { createAgentApi } = require('./agent');
 const agentRefs = require('./agent/refs');
+const { buildIdentity } = require('../buildInfo');
 const { anchorFrom } = require('../review/anchor');
 const reviews = require('../review');
 
@@ -134,7 +135,10 @@ function projectChanged() {
 
 /** What the settings/status surface shows. Includes the token, which the app's own window may display. */
 function status() {
-  return { ...state, token: state.running ? running?.token || null : null };
+  // `build` rides along so the panel a person opens to connect an agent can
+  // also tell them which Stacki that agent will be talking to. Same object
+  // get_context and stacki://build carry; one source, three surfaces.
+  return { ...state, token: state.running ? running?.token || null : null, build: buildIdentity() };
 }
 
 function resolvePort(settings) {

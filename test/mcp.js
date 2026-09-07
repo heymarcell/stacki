@@ -55,6 +55,7 @@ const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validat
 
 const schemaValidator = new AjvJsonSchemaValidator();
 const { ContextOutput, CaptureOutput, INSTRUCTIONS } = require('../electron/mcp/tools.js');
+const { buildIdentity } = require('../electron/buildInfo.js');
 const {
   ACTIONS: REVIEW_ACTIONS,
   requirementProblem,
@@ -377,9 +378,17 @@ const fakeTrail = (keys) =>
 // ── The output schemas ──────────────────────────────────────────────────────
 
 {
+  // WHAT THE TOOL ANSWERS, not what the store holds. The store's snapshot is
+  // the page half of the answer; `build` is attached by the get_context handler
+  // in electron/mcp/tools.js, because a guarantee that depends on which
+  // implementation of getContext was wired in is not a guarantee. So the
+  // schema is exercised against the two halves put together, the way a client
+  // receives them.
+  const answer = (snapshot) => ({ ...snapshot, build: buildIdentity() });
+
   const store = createContextStore({ resolveTrail: fakeTrail });
   store.publish(payload());
-  const snap = store.read();
+  const snap = answer(store.read());
   const parsed = ContextOutput.safeParse(snap);
   check('a ready snapshot matches the declared output schema', parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues?.slice(0, 3)));
 
@@ -387,15 +396,15 @@ const fakeTrail = (keys) =>
   snap.selection.computedStyles = { display: 'flex', 'scroll-snap-stop': 'normal' };
   check('a snapshot with styles still matches', ContextOutput.safeParse(snap).success);
 
-  const empty = createContextStore({ resolveTrail: fakeTrail }).read();
+  const empty = answer(createContextStore({ resolveTrail: fakeTrail }).read());
   check('an empty snapshot matches the same schema', ContextOutput.safeParse(empty).success, JSON.stringify(ContextOutput.safeParse(empty).error?.issues?.slice(0, 3)));
 
   for (const status of ['no_project', 'no_page', 'no_selection', 'preview_not_ready']) {
-    const s = createContextStore({ resolveTrail: fakeTrail }).read();
+    const s = answer(createContextStore({ resolveTrail: fakeTrail }).read());
     s.selection.status = status;
     check(`the schema accepts the ${status} status`, ContextOutput.safeParse(s).success);
   }
-  const bogus = createContextStore({ resolveTrail: fakeTrail }).read();
+  const bogus = answer(createContextStore({ resolveTrail: fakeTrail }).read());
   bogus.selection.status = 'exploded';
   check('the schema rejects a status nobody defined', !ContextOutput.safeParse(bogus).success);
 

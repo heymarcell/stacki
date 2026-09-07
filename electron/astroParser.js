@@ -721,13 +721,34 @@ function parseTemplate(str, base = null) {
       if (nodes.length) gaps.push(nodes.length);
     }
     if (text.trim()) {
-      // `source` when the collapsed value isn't the whole truth: a slice that
-      // spans lines (the serializer hands those lines back if nothing has
-      // edited the node since), and one written with entities in it — `&copy;`
-      // and `©` are the same character to a reader and not to a diff, and the
-      // file's own spelling is the file's to keep.
-      const node = { id: makeId(), kind: 'text', value: textValue(text) };
-      if (text.includes('\n') || /&[#a-zA-Z]/.test(text)) node.source = text;
+      // `source` WHEN THE VALUE ALONE WOULD NOT WRITE THESE BYTES BACK — asked
+      // by measurement rather than by a list of the cases somebody thought of.
+      //
+      // `textOut` hands the original slice back for a node nothing has edited,
+      // and `encodeText(value)` for one that has been. So the question of
+      // whether the original is worth keeping has exactly one right answer:
+      // does `encodeText(value)` already produce it? If it does, the value is
+      // the whole truth and a copy of the bytes is dead weight; if it does not,
+      // the bytes are the only place that truth lives.
+      //
+      // The two cases the old condition listed both satisfy that test — a slice
+      // spanning lines is collapsed by `textValue`, and `&copy;` decodes to `©`
+      // which writes back as itself — so nothing that was kept stops being
+      // kept. WHAT IT ADDS is every case nobody enumerated, and there was at
+      // least one: `🧑‍🚀` is one line with no entity in it, so it got no
+      // `source`, and an unrelated structural edit that reprinted its parent
+      // wrote it back through `encodeText` as `🧑&#8205;🚀`. A live dogfood
+      // caught exactly that, in a heading nobody had asked to change. The
+      // encoder no longer spells joiners out (electron/htmlText.js), and this
+      // is the half that means the question cannot come back for some other
+      // character: a condition that asks the encoder cannot fall behind it.
+      //
+      // COSTS NOTHING FOR ORDINARY TEXT. `encodeText` is the identity on plain
+      // single-line prose, which is nearly every text node in a project, and
+      // those still carry no `source` — the same memory profile as before.
+      const value = textValue(text);
+      const node = { id: makeId(), kind: 'text', value };
+      if (encodeText(value) !== text) node.source = text;
       emit(at(node, pos, textEnd));
     }
     if (next === -1) break;
@@ -923,8 +944,28 @@ function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// THE WHITESPACE A BROWSER ACTUALLY COLLAPSES, which is not what `\s` means.
+//
+// `\s` includes U+00A0 and the fixed-width spaces, and a browser collapses
+// none of them — that is the entire reason somebody types a no-break space. So
+// squeezing a run of `\s` turned a literal `ten\u00a0kilos` in a file into
+// `ten kilos` on the next reserialize of a node nobody had edited, silently
+// undoing the one thing the character was there to do.
+//
+// `textValue`'s comment has always said this about the ENTITY spelling — it
+// decodes after collapsing precisely so `&#160;` survives — but a file that
+// writes the character itself went through the collapse first and lost it.
+// Same defect as the joiner in `🧑‍🚀`: a character rewritten in a node nobody
+// asked to change.
+//
+// This is the HTML white space set: tab, line feed, form feed, carriage return
+// and the plain space. Nothing else.
+const HTML_SPACE = /[\t\n\f\r ]+/g;
+const HTML_SPACE_EDGE = /^[\t\n\f\r ]/;
+const HTML_SPACE_EDGE_END = /[\t\n\f\r ]$/;
+
 function collapseWhitespace(text) {
-  return text.replace(/\s+/g, ' ').trim();
+  return text.replace(HTML_SPACE, ' ').replace(HTML_SPACE_EDGE, '').replace(HTML_SPACE_EDGE_END, '');
 }
 
 // The words, with every run of whitespace inside them squeezed to one space,
@@ -934,7 +975,7 @@ function collapseWhitespace(text) {
 // spelling is kept: entities are still entities here.
 function collapseText(raw) {
   return (
-    (/^\s/.test(raw) ? ' ' : '') + collapseWhitespace(raw) + (/\s$/.test(raw) ? ' ' : '')
+    (HTML_SPACE_EDGE.test(raw) ? ' ' : '') + collapseWhitespace(raw) + (HTML_SPACE_EDGE_END.test(raw) ? ' ' : '')
   );
 }
 

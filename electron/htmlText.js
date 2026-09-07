@@ -55,20 +55,44 @@ function decodeEntities(text) {
   });
 }
 
+// The invisible characters that get written as entities, and the rule that
+// decides which those are: A CHARACTER IS SPELLED OUT WHEN LEAVING IT LITERAL
+// WOULD MAKE THE FILE LIE TO WHOEVER OPENS IT.
+//
+// A no-break space looks exactly like a space and is not one — the file lies,
+// so `&#160;` is the honest spelling. The same is true of the en, em and thin
+// spaces, and of the soft hyphen, which looks like nothing at all and is a
+// hyphenation instruction.
+//
+// U+200D ZERO WIDTH JOINER and U+200C ZERO WIDTH NON-JOINER ARE NOT LIKE THAT,
+// and this list used to have them in it. A joiner is not a character standing
+// beside its neighbours; it is what makes its neighbours ONE character. The
+// file says `🧑‍🚀` and the page shows one astronaut; write the joiner as
+// `&#8205;` and the file says three things where the page shows one. THAT is
+// the lie. A live dogfood watched `🧑‍🚀` in an untouched heading become
+// `🧑&#8205;🚀` and filed it as a defect, correctly. The same applies to every
+// other joined sequence: family emoji, flags, skin-tone modifiers, Indic
+// conjuncts, and the ZWNJ that keeps Persian and Hindi words from ligating.
+const SPELLED_OUT = /[\u00a0\u2002\u2003\u2009\u00ad]/g;
+
 /**
  * Characters as text in a file: the three that would otherwise be read as
- * markup, and the spaces that are invisible in a source file. Everything else
- * goes in as itself — `©` is a character the file can hold, and spelling it
- * `&copy;` in a file that says `©` everywhere else would be the editor imposing
- * its own habits.
+ * markup, and the invisible characters a reader could not otherwise see.
+ * Everything else goes in as itself — `©` is a character the file can hold, and
+ * spelling it `&copy;` in a file that says `©` everywhere else would be the
+ * editor imposing its own habits.
+ *
+ * ONLY REACHED FOR TEXT THAT WAS ACTUALLY EDITED. An untouched node is written
+ * back from the bytes it was read from — see `textOut` in electron/astroParser.js
+ * and the `source` it reads, which is now kept for exactly the nodes this
+ * function would not reproduce.
  */
 function encodeText(text) {
   return String(text ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/ /g, '&#160;')
-    .replace(/[   ‌‍­]/g, (c) => `&#${c.codePointAt(0)};`);
+    .replace(SPELLED_OUT, (c) => `&#${c.codePointAt(0)};`);
 }
 
-module.exports = { decodeEntities, encodeText };
+module.exports = { decodeEntities, encodeText, SPELLED_OUT };

@@ -71,6 +71,7 @@ const { NORMALIZE } = require('../electron/mcp/agent/index.js');
 const { DOMAINS: DISPATCH } = require('../electron/mcp/agent/domains.js');
 const { answer } = require('../electron/mcp/agentTools.js');
 const { createContextStore } = require('../electron/mcp/contextStore.js');
+const { buildIdentity } = require('../electron/buildInfo.js');
 const { createCapture } = require('../electron/mcp/capture.js');
 const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 const { startWireRig } = require('./support/mcpWireRig.js');
@@ -536,14 +537,20 @@ function productToolNames() {
 
       // get_context, off the wire: the shipping store, fed the App's own
       // published payload, against the schema get_context publishes.
+      //
+      // `build` is the other half of that answer and it is attached by the tool
+      // handler rather than by the store (electron/mcp/tools.js), so a caller
+      // grading the store's output alone is grading a fragment. Put together
+      // the way a client receives them.
       {
         const schema = tools.get('get_context')?.outputSchema;
+        const answer = (snapshot) => ({ ...snapshot, build: buildIdentity() });
         const store = createContextStore({ resolveTrail: (keys) => rig.harness.resolveTrail(keys) });
-        const cold = await verdictOf(schema, store.read());
+        const cold = await verdictOf(schema, answer(store.read()));
         check('the cold-start snapshot validates against the schema get_context publishes', cold.valid === true, cold.errorMessage || '');
         store.publish(rig.harness.payload());
-        const live = await verdictOf(schema, store.read());
-        check('  and so does the snapshot minted from the App’s real payload', live.valid === true, `${live.errorMessage || ''}\n    ${short(store.read())}`);
+        const live = await verdictOf(schema, answer(store.read()));
+        check('  and so does the snapshot minted from the App’s real payload', live.valid === true, `${live.errorMessage || ''}\n    ${short(answer(store.read()))}`);
         // AND IT IS THE APP'S PAYLOAD, not the cold start passing under its
         // name: a store nobody published to knows no project and no page, so a
         // validator that only ever sees `{root: null}` has proved nothing.

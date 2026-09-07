@@ -38,8 +38,10 @@ const z = require('zod');
 
 const { TOPICS, TOPIC_NAMES, uriFor } = require('./guide');
 const { buildProfile, MAX_PROFILE_BYTES } = require('./projectProfile');
+const { buildIdentity } = require('../buildInfo');
 
 const PROFILE_URI = 'stacki://project/profile';
+const BUILD_URI = 'stacki://build';
 
 // A GUIDE IS THE SAME BYTES ON EVERY MACHINE RUNNING THIS BUILD.
 //
@@ -162,6 +164,37 @@ function registerResources(server, { api = null } = {}) {
       return textContents(uri.href, body, 'application/json');
     }
   );
+
+  // WHICH BUILD IS ANSWERING, as a resource a client can read without spending
+  // a tool call or a permission.
+  //
+  // `get_context` carries the same object, and that is the road most agents
+  // will take. This exists for the road they take FIRST: a host that lists
+  // resources on connect can pin the session to a build before it has asked
+  // Stacki anything at all, and a person reading a transcript can see it
+  // without hunting for the first tool result.
+  //
+  // NOT `public`, despite being byte-identical on every machine running this
+  // build. The guides are public because they are a frozen table compiled into
+  // the app and hold nothing about anybody; this one is about the ARTEFACT, and
+  // a dev build's answer includes whether the developer's tree was dirty. That
+  // is not somebody else's business to hold in a shared cache. `{0, private}`
+  // is inherited from the operation-level default in electron/mcp/server.js.
+  server.registerResource(
+    'build-identity',
+    BUILD_URI,
+    {
+      title: 'Which Stacki this is',
+      description:
+        'The identity of the running build: package version, the commit and tree it was made from, whether ' +
+        'that tree was dirty, and whether this is a packaged or a development build. A version number alone ' +
+        'does not identify a build — every build between two releases carries the same one. Quote this in any ' +
+        'report about what Stacki did. Needs no permission.',
+      mimeType: 'application/json',
+      annotations: { audience: ['assistant'] },
+    },
+    async (uri) => textContents(uri.href, JSON.stringify(buildIdentity(), null, 1), 'application/json')
+  );
 }
 
 // The prompts. Three, because there are three genuinely different shapes of
@@ -268,4 +301,4 @@ function registerPrompts(server) {
   }
 }
 
-module.exports = { registerResources, registerPrompts, PROFILE_URI, PROMPTS, GUIDE_CACHE_HINT };
+module.exports = { registerResources, registerPrompts, PROFILE_URI, BUILD_URI, PROMPTS, GUIDE_CACHE_HINT };

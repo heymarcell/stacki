@@ -26,6 +26,8 @@
 
 const z = require('zod');
 
+const { buildIdentity } = require('../buildInfo');
+
 const { registerReviewTools } = require('./reviewTools');
 const { registerResources, registerPrompts } = require('./intelligence');
 const { registerAuditTool } = require('./auditTool');
@@ -133,9 +135,27 @@ const Selection = z.object({
   computedStyles: z.record(z.string(), z.string()).nullable().optional(),
 });
 
+// WHICH BUILD ANSWERED. Declared on the output schema rather than tucked into a
+// diagnostic, because the whole point is that a report about Stacki's behaviour
+// can name the bytes that behaved. `gitHead` is 40 hex or null; `dirty` is
+// three-valued because "nobody could establish it" is not the same claim as
+// "it was clean". See electron/buildInfo.js.
+const BuildIdentity = z.object({
+  packageVersion: nullableString.describe('The version in package.json. NOT sufficient to identify a build.'),
+  gitHead: nullableString.describe('The commit this build was made from, 40 hex, or null when unknown.'),
+  gitTree: nullableString.describe('That commit\'s tree.'),
+  dirty: z
+    .boolean()
+    .nullable()
+    .describe('Whether the tree had uncommitted changes when this was built. null means it could not be established.'),
+  buildKind: z.enum(['packaged', 'dev', 'unknown']),
+  builtAt: nullableString.describe('ISO-8601, packaged builds only.'),
+});
+
 const ContextOutput = z.object({
   revision: z.number().int(),
   timestamp: z.number().int(),
+  build: BuildIdentity,
   project: z.object({ root: nullableString }),
   page: z.object({ route: nullableString, file: nullableString }),
   view: View,
@@ -203,9 +223,21 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
     },
     async ({ styleDetail }) => {
       const snapshot = await getContext({ styleDetail: styleDetail || 'essential' });
+      // WHICH STACKI ANSWERED, attached HERE rather than by the app's
+      // implementation of getContext.
+      //
+      // The field is on the declared output schema, so a strict client
+      // validates every result against it; putting it on the snapshot the app
+      // happens to build would make the guarantee depend on which
+      // implementation was wired in, and the whole point of this field is that
+      // it is always there. A dogfood report that begins "Stacki 0.1.23"
+      // identifies nothing — every build between two releases says that, and
+      // the build that produced sixteen defect reports turned out to be
+      // ninety-three commits behind the one it was qualifying.
+      const answer = { ...snapshot, build: buildIdentity() };
       return {
-        content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }],
-        structuredContent: snapshot,
+        content: [{ type: 'text', text: JSON.stringify(answer, null, 2) }],
+        structuredContent: answer,
       };
     }
   );
@@ -290,4 +322,4 @@ function registerTools(server, { getContext, capture, getComments, comment, api 
   registerPrompts(server);
 }
 
-module.exports = { registerTools, INSTRUCTIONS, READ_ONLY, ContextOutput, CaptureOutput, MAX_PADDING };
+module.exports = { registerTools, INSTRUCTIONS, READ_ONLY, ContextOutput, BuildIdentity, CaptureOutput, MAX_PADDING };
