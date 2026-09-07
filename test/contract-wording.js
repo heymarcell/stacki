@@ -632,7 +632,51 @@ async function measureOriginFence() {
     );
   }
 
-  if (failures.length) {
+  // ── THE MOST POLYMORPHIC ARGUMENT IN THE SURFACE ─────────────────────────────
+//
+// `target.edit` takes `operations`, an array whose items are a discriminated
+// union of thirteen. The flattened top-level block published for it read, in
+// full, "Used by: edit." — because `items` is a `oneOf` rather than a single
+// object, so `fieldsOf` answered null and the description fell back to the list
+// of actions that use it.
+//
+// Which is the exact failure `summarised()` exists to prevent, one level down:
+// a client that renders `properties` was told a batch edit takes an array and
+// nothing else, and had to discover thirteen shapes one refusal at a time. The
+// branches were always published underneath and remain the contract; this is
+// about what a client that cannot read them is shown.
+{
+  const { TargetInput, StyleInput } = require('../electron/mcp/agentTools.js');
+  const z = require('zod');
+  const json = z.toJSONSchema(TargetInput, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' });
+  const branches = json.oneOf || json.anyOf || [];
+  const editBranch = branches.find((b) => (b?.properties?.action?.const ?? b?.properties?.action?.enum?.[0]) === 'edit');
+  check('target.edit publishes its operations array', !!editBranch?.properties?.operations, JSON.stringify(Object.keys(editBranch?.properties || {})));
+  const variants = editBranch?.properties?.operations?.items?.oneOf || [];
+  check('  whose items are a union of many shapes', variants.length >= 10, `${variants.length} variants`);
+
+  // What a client that reads only `properties` is shown — the same call
+  // `advertised()` makes, over the same conversion.
+  const { summarised } = require('../electron/mcp/agentTools.js');
+  const summariseFor = (schema) => summarised(z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' }));
+  const summary = summariseFor(TargetInput);
+  const opsDesc = String(summary?.properties?.operations?.description || '');
+  check('and the flattened block describes the operations, not only who uses it', /one of /.test(opsDesc), opsDesc.slice(0, 200));
+  for (const type of ['set_text', 'set_prop', 'insert_before', 'append_child', 'remove', 'duplicate', 'move', 'set_tag']) {
+    check(`  and names the ${type} shape`, opsDesc.includes(type), opsDesc.slice(0, 300));
+  }
+  check('  and marks a required field as required', /set_prop\{name, value/.test(opsDesc), opsDesc.slice(0, 300));
+  check('  and an optional one with a question mark', /valueType\?/.test(opsDesc), opsDesc.slice(0, 300));
+
+  // The object-shaped ones did not regress.
+  const styleSummary = summariseFor(StyleInput);
+  const editDesc = String(styleSummary?.properties?.edit?.description || '');
+  check('style.edit still names each action shape', /set_section_title: \{file, start, end, title, expect\}/.test(editDesc), editDesc.slice(0, 260));
+  const declDesc = String(styleSummary?.properties?.declarations?.description || '');
+  check('and an array of one object shape still reads as one', /\[\{property, value, important\?\}\]/.test(declDesc), declDesc.slice(0, 200));
+}
+
+if (failures.length) {
     console.error(`\ncontract-wording: ${failures.length} failed, ${checked - failures.length} passed\n`);
     console.error(failures.join('\n') + '\n');
     process.exit(1);

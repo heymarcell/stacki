@@ -1112,9 +1112,47 @@ function registerAgentTools(server, { api }) {
 /** `{a, b, c?}` — the fields of one object argument, required ones first-class. */
 function fieldsOf(spec) {
   if (!spec || typeof spec !== 'object') return null;
-  if (spec.type === 'array' && spec.items?.type === 'object') {
-    const inner = fieldsOf(spec.items);
-    return inner ? `[${inner}]` : '[{…}]';
+  if (spec.type === 'array') {
+    // AN ARRAY OF ALTERNATIVES IS THE MOST POLYMORPHIC SHAPE IN THIS SURFACE,
+    // AND IT WAS THE ONE DESCRIBED AS NOTHING.
+    //
+    // `target.edit` takes `operations`, an array whose items are a discriminated
+    // union of eight — set_text, set_prop, remove_prop, insert_before,
+    // insert_after, append_child, remove, duplicate, move, set_tag — and the
+    // flattened block published for it read, in full: "Used by: edit." Because
+    // `items` is a `oneOf` rather than a single object, this function answered
+    // null and the description fell back to the caller's list of actions.
+    //
+    // Which is the exact failure `summarised` exists to prevent, one level
+    // down: a client that renders `properties` was told a batch edit takes an
+    // array and nothing else, and had to discover the eight shapes one refusal
+    // at a time. The branches were always published underneath and remain the
+    // contract; this makes the summary say what they say.
+    const items = spec.items;
+    const variants = Array.isArray(items?.oneOf) ? items.oneOf : Array.isArray(items?.anyOf) ? items.anyOf : null;
+    if (variants && variants.length) {
+      const shapes = variants
+        .map((variant) => {
+          // The discriminant, when there is one — `{type: 'set_text', …}` reads
+          // as `set_text{…}` rather than as one anonymous shape among eight.
+          const props = variant?.properties || {};
+          const tag =
+            props.type?.const ?? props.type?.enum?.[0] ?? props.action?.const ?? props.action?.enum?.[0] ?? null;
+          const required = new Set(variant?.required || []);
+          const names = Object.keys(props)
+            .filter((name) => name !== 'type' && name !== 'action')
+            .map((name) => (required.has(name) ? name : `${name}?`));
+          const body = names.length ? `{${names.join(', ')}}` : '{}';
+          return tag ? `${tag}${body}` : body;
+        })
+        .filter(Boolean);
+      return shapes.length ? `[one of ${shapes.join(' | ')}]` : '[{…}]';
+    }
+    if (items?.type === 'object') {
+      const inner = fieldsOf(items);
+      return inner ? `[${inner}]` : '[{…}]';
+    }
+    return null;
   }
   if (spec.type !== 'object' || !spec.properties) return null;
   const required = new Set(spec.required || []);
@@ -1837,4 +1875,9 @@ module.exports = {
   DESTRUCTIVE,
   REMOTE,
   TOOL_NAMES: ['get_capabilities', ...DOMAINS],
+  // Exported so a test can grade what a client that renders `properties` is
+  // actually shown — which is the thing `summarised` exists to fix, and the
+  // thing that had regressed for an array of alternatives.
+  summarised,
+  fieldsOf,
 };
