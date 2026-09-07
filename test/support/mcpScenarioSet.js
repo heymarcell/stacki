@@ -861,14 +861,10 @@ fullScenario({ domain: 'page', action: 'list', run: async ({ call }) => {
 fullScenario({ domain: 'page', action: 'open', run: async ({ call, tool }) => {
   // `get_context` is the evidence, not the answer: an envelope that says it
   // moved is a claim, and the snapshot the app publishes is what happened.
-  const ctx = async () => {
-    const res = await tool('get_context', {});
-    try {
-      return res?.structuredContent ?? JSON.parse(res?.content?.find((c) => c.type === 'text')?.text || '{}');
-    } catch {
-      return {};
-    }
-  };
+  // `tool()` answers `{envelope, raw}` — the envelope is what the client
+  // validated against get_context's declared output schema, so reading it is
+  // also an assertion that the snapshot still matches what is published.
+  const ctx = async () => (await tool('get_context', {})).envelope || {};
   const before = await ctx();
   const { envelope } = await call('page', 'open', { route: '/about' });
   const after = await ctx();

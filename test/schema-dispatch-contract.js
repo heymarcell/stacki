@@ -119,7 +119,7 @@ for (const domain of DOMAINS) for (const action of actionsOf(domain)) OPERATIONS
 // coverage doc, the 444 permission answers, get_capabilities. A change to it is
 // a decision, and this is where the decision has to be made deliberately.
 check('the surface is eight domains', DOMAINS.length === 8, DOMAINS.join(', '));
-check('and exactly 111 operations', OPERATIONS.length === 111, String(OPERATIONS.length));
+check('and exactly 112 operations', OPERATIONS.length === 112, String(OPERATIONS.length));
 
 // ── the one function every answer in this surface goes through ───────────────
 //
