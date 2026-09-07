@@ -97,6 +97,7 @@ const { listEntries, planEntryWrite, countEntries, coveredPaths } = require('./c
 const { planRename, applyRename } = require('./contentRefs');
 const { resolveInProject } = require('./mcp/agent/paths');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
+const assetRefs = require('./assetRefs');
 const { probeUrl } = require('./devProbe')
 const { trustedPreviewUrl } = require('./projectOrigin.js');
 const { selectionTrail, formatTrail } = require('./selectionTrail');
@@ -2697,10 +2698,56 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
     throw refuse('bad_path', 'Cannot move a folder into itself.');
   }
   const dest = uniqueDest(toDir, path.basename(from));
+
+  // WHAT POINTS AT IT, BEFORE IT MOVES.
+  //
+  // A live dogfood moved public/images/hero.png and the page's
+  // `<img src="/images/hero.png">` and the stylesheet's `url(...)` stayed where
+  // they were — `{ok: true}`, no warning, a site broken in two places by an
+  // operation that reported success. The cross-root case above has always
+  // refused for exactly this reason; a move WITHIN a root breaks references
+  // just as thoroughly and was not checked at all.
+  //
+  // Planned before the file moves, so a reference this cannot rewrite is a
+  // refusal rather than a half-done move.
+  const movePlan = fs.statSync(from).isDirectory()
+    ? null
+    : assetRefs.plan(projectPath, toPosix(path.relative(projectPath, from)), toPosix(path.relative(projectPath, dest)));
+  if (movePlan?.dynamic?.length) {
+    throw refuse(
+      'unsupported',
+      `${movePlan.dynamic.length} reference${movePlan.dynamic.length === 1 ? '' : 's'} to this asset ` +
+        `${movePlan.dynamic.length === 1 ? 'is' : 'are'} built at runtime rather than written out — ` +
+        `${movePlan.dynamic.map((d) => `${d.file}:${d.line}`).slice(0, 5).join(', ')} — so moving the file would ` +
+        'break them and nothing here can rewrite them. Nothing was moved. Move it by hand, or change those ' +
+        'references to name the file directly first.'
+    );
+  }
+  if (movePlan?.truncated) {
+    throw refuse(
+      'unsupported',
+      'This project has more files than Stacki will scan for references to an asset, so it cannot establish that ' +
+        'moving this one is safe. Nothing was moved.'
+    );
+  }
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.mkdirSync(toDir, { recursive: true });
   fs.renameSync(from, dest);
+  // AND THE POINTERS GO WITH IT. All or nothing: `apply` puts back every file
+  // it had already written if one of them fails, because a project with three
+  // of five references rewritten is broken in a new way nobody asked for.
+  const moveRewrite = movePlan ? assetRefs.apply(movePlan, markSelfWrite) : { ok: true, rewritten: [] };
+  if (!moveRewrite.ok) {
+    // The references could not be updated, so the file goes back where it was
+    // and the caller is told nothing happened rather than being handed a broken
+    // site with an `ok`.
+    markSelfWrite(dest);
+    markSelfWrite(from);
+    fs.renameSync(dest, from);
+    throw refuse('write_failed', `The asset's references could not be updated (${moveRewrite.error}), so nothing was moved.`);
+  }
+  if (moveRewrite.rewritten.length) send('fs:changed', { files: moveRewrite.rewritten.map((r) => path.join(projectPath, r)) });
   send('assets:changed', {});
   // WHERE THE FILE ACTUALLY WENT. `uniqueDest` renames around a collision, so
   // the landing path is not `toDirRel/basename(fromRel)` and only this line
@@ -2716,16 +2763,43 @@ handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   const from = assetAbs(projectPath, rel);
   const dest = path.join(path.dirname(from), clean);
   const landed = () => toPosix(path.relative(projectPath, dest));
-  if (dest === from) return { ok: true, rel: landed() };
+  if (dest === from) return { ok: true, rel: landed(), rewroteReferences: [] };
   if (fs.existsSync(dest)) throw refuse('exists', 'Something with that name already exists.');
+  // Same reasoning as the move above: a rename changes the address, and an
+  // address nothing follows any more is a broken page.
+  const renamePlan = fs.statSync(from).isDirectory() ? null : assetRefs.plan(projectPath, toPosix(rel), landed());
+  if (renamePlan?.dynamic?.length) {
+    throw refuse(
+      'unsupported',
+      `${renamePlan.dynamic.length} reference${renamePlan.dynamic.length === 1 ? '' : 's'} to this asset ` +
+        `${renamePlan.dynamic.length === 1 ? 'is' : 'are'} built at runtime rather than written out — ` +
+        `${renamePlan.dynamic.map((d) => `${d.file}:${d.line}`).slice(0, 5).join(', ')} — so renaming the file ` +
+        'would break them and nothing here can rewrite them. Nothing was renamed.'
+    );
+  }
+  if (renamePlan?.truncated) {
+    throw refuse(
+      'unsupported',
+      'This project has more files than Stacki will scan for references to an asset, so it cannot establish that ' +
+        'renaming this one is safe. Nothing was renamed.'
+    );
+  }
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
+  const renameRewrite = renamePlan ? assetRefs.apply(renamePlan, markSelfWrite) : { ok: true, rewritten: [] };
+  if (!renameRewrite.ok) {
+    markSelfWrite(dest);
+    markSelfWrite(from);
+    fs.renameSync(dest, from);
+    throw refuse('write_failed', `The asset's references could not be updated (${renameRewrite.error}), so nothing was renamed.`);
+  }
+  if (renameRewrite.rewritten.length) send('fs:changed', { files: renameRewrite.rewritten.map((r) => path.join(projectPath, r)) });
   send('assets:changed', {});
   // The name the file is under, which is not the name that was asked for: `/`
   // and `\\` are stripped above, so 'sub/KEEP.svg' lands as 'subKEEP.svg'. The
   // caller that undoes this has to name the file that exists.
-  return { ok: true, rel: landed() };
+  return { ok: true, rel: landed(), rewroteReferences: renameRewrite.rewritten };
 });
 
 // To the system's bin, not to nothing. An asset is somebody's photograph as
