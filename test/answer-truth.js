@@ -153,6 +153,22 @@ const short = (x, n = 260) => JSON.stringify(x ?? null).slice(0, n);
     check('and so does adding a node', digestOfModel(a) !== digestOfModel(extra));
     check('raw source still digests as itself', typeof digestOfModel('some source') === 'string');
     check('and null is null', digestOfModel(null) === null);
+
+    // AND `id` IS NOT ONLY THE NODE'S. An element's `id` ATTRIBUTE lives at
+    // `props.id`, and the first version of this dropped every key with that
+    // name at every depth — so `set_prop {name: 'id'}` changed the file and did
+    // not change the digest, and the no-op rollback threw away the undo entry
+    // for an edit that had happened. test/source-fidelity-matrix.js failed 130
+    // cases on it. A replacer is called with the containing object as `this`,
+    // and a node carries `kind` where a props map does not.
+    const el = (nodeId, props) => ({ nodes: [{ id: nodeId, kind: 'element', name: 'div', props, children: [] }] });
+    check('renumbering the parse is still invisible', digestOfModel(el('n1', {})) === digestOfModel(el('n99', {})));
+    check('but an id ATTRIBUTE is visible', digestOfModel(el('n1', {})) !== digestOfModel(el('n1', { id: { type: 'string', value: 'top' } })));
+    check('  and so is its value', digestOfModel(el('n1', { id: { type: 'string', value: 'top' } })) !== digestOfModel(el('n1', { id: { type: 'string', value: 'bottom' } })));
+    // The same for anything else that happens to be called `id` and is not a
+    // node — a content entry's field, say.
+    const entry = (v) => ({ nodes: [], data: { id: v, title: 'x' } });
+    check('and a data field called id is visible too', digestOfModel(entry('a')) !== digestOfModel(entry('b')));
   }
 
   // ── one physical file, one entry, spelled one way ─────────────────────────

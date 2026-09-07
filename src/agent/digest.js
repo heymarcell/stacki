@@ -47,7 +47,23 @@ function fnv1a(text) {
  * The digest's job is to answer "is this the same document", and it now answers
  * that question instead of "is this the same parse".
  */
-const withoutNodeIds = (key, value) => (key === 'id' ? undefined : value);
+// ONLY THE NODE'S OWN `id`, WHICH IS NOT THE ONLY THING CALLED THAT.
+//
+// The first version of this dropped every key named `id` at every depth — and
+// an element's `id` ATTRIBUTE lives at `props.id`. So `set_prop {name: 'id'}`
+// changed the file and did not change the digest, and the no-op rollback in
+// src/App.jsx then threw the undo entry away for an edit that had happened.
+// test/source-fidelity-matrix.js caught it: 130 cases, all downstream of
+// `[tabs] set_prop on a component`, whose undo answered `undone: false` over a
+// file that had visibly moved.
+//
+// A JSON.stringify replacer is called with the containing object as `this`, so
+// the question "is this the node's identity or somebody's attribute" has an
+// exact answer: a node carries `kind`, a props map does not.
+function withoutNodeIds(key, value) {
+  if (key !== 'id') return value;
+  return typeof this?.kind === 'string' ? undefined : value;
+}
 
 /**
  * The digest of a model (or of raw source, for a file Stacki cannot model).
