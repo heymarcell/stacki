@@ -42,39 +42,80 @@ same object at once:
 
 An edit through Stacki moves all three: it goes through the same editor a click
 does, so it appears on the canvas, lands on the undo stack the person can press
-Cmd-Z on, and saves through the normal writer.
+Cmd-Z on, and saves through the usual writer.
 
 ## Refs
 
 A ref is a handle to one modelled object. get_context and get_comments hand you
-one; target, style, content, page and asset act on one. A ref is worth more than
-a file path because it names the object rather than a place in a file: it
-survives the lines around it moving.
+one; target, style, content, page and asset act on one. It is worth more than a
+file path because it names the object rather than a place in a file: it survives
+the lines around it moving.
 
 A ref also carries the revision your read saw. A write through a stale ref is
-REFUSED rather than silently overwriting a change somebody made in between. That
-refusal is not an error to route around — it is the system telling you the world
-moved. Do not guess at what changed, and do not retry the same ref.
+REFUSED rather than silently overwriting a change somebody made in between: the
+system telling you the world moved, not an error to route around.
 
 ## Recovering from stale_target, cheaply
 
-A ref is scoped to ONE version of ONE document, deliberately. That is what makes
-"nothing was overwritten" true, and it is not going to be relaxed: a ref that
-still wrote after the file moved would be a ref that cannot promise anything.
-
-Recovering from it costs one call, not a re-discovery:
+A ref is scoped to ONE version of ONE document, deliberately: one that still
+wrote after the file moved could promise nothing. Do not guess at what changed
+and do not retry the same ref. Recovering costs one call:
 
   target.read { ref }   A stale ref is still a good READ handle. Reads are not
-                        observation-guarded, so this re-resolves the ref by the
-                        marks it recorded and answers with the object as it is
-                        NOW, plus a fresh ref you can write through.
+                        observation-guarded, so this re-resolves it by the marks
+                        it recorded and answers with the object as it is NOW,
+                        plus a fresh ref to write with.
 
-And usually you need even that only once. EVERY write answers with a fresh
-\`ref\`, the \`document\` it left behind and its revision, so a chain of edits on one
-node just keeps using the ref the last answer gave you. What does cost a read
-each is a chain across SIBLINGS: editing one bumps the document, so the refs you
-read for the others are stale. N siblings is N reads. That is the price of never
-writing over somebody's change.
+And usually only once. EVERY write answers with a fresh \`ref\`, the \`document\` it
+left behind and its revision, so a chain of edits on one node keeps using the
+last answer's ref. A chain across SIBLINGS costs a read each: editing one bumps
+the document. N siblings is N reads — the price of never overwriting a change.
+
+## A merge conflict is a moment, and its ref says which one
+
+git.merge that clashes answers \`merge_conflict\` with a \`mergeRef\` beside the
+hunks. Applying answers RE-RUNS the merge, so they answer only the conflict you
+were shown, and the ref proves it is still that one: both tips and a digest of
+what git wrote.
+
+  git.resolve_merge { mergeRef, choices }   the branch comes out of the ref, so
+                                            one merge's answers cannot be
+                                            paired with another's branch.
+
+Twelve refusals OF ITS OWN, eleven of them merging nothing. It can also answer
+with any this surface gives anywhere: bad_arguments, permission_denied,
+no_project, and \`failed\` carrying git's words when git refuses (a pre-commit
+hook, a signing key it cannot use).
+
+Six are about the handle and mean one thing: run git.merge and pass back the
+\`mergeRef\` it hands you, unchanged. guard_required (it records no conflict; a ref
+you never sent is bad_arguments), bad_ref (not one Stacki issued, or altered),
+stale_ref (expired), wrong_project, wrong_kind (not a merge ref), wrong_target
+(a different merge from the one \`branch\` names).
+
+The other five are about the merge:
+
+  stale_merge      a commit landed on either branch, or git reconciles them
+                   differently now; both SHAs are named. Run git.merge again and
+                   answer THAT — never re-send old answers
+  bad_choices      a key that is not a conflicting path, a list not as long as
+                   that file's hunks, "merged" where the hunk offered none. The
+                   message says which, and why
+  merge_blocked    git would not start the re-merge, usually another process
+                   holding the repository. gitSaid has git's words; retry
+  working_tree_blocked   it must write a file with uncommitted changes in it.
+                   Commit, park or discard them, then send it again
+  bad_branch_name  not a name git takes. You cannot provoke it: the branch comes
+                   from the ref, checked when it was minted. A branch that is
+                   GONE is stale_merge
+
+The twelfth has NOT left the project as it was, and says so:
+
+  merge_stuck      the re-merge ran and the unwind did not take. Nothing was
+                   committed and the branch did not move, but \`files\` names what
+                   differs, from the REPOSITORY root. \`mergeInProgress\`: true,
+                   \`git merge --abort\`; false, \`git checkout HEAD -- <path>\`.
+                   Do not retry. Ask.
 
 ## Semantic first, source as the fallback
 
@@ -87,13 +128,13 @@ Prefer the operation that names what you mean:
   a design token              style.set_variable
   structure                   target.insert_before / append_child / move / remove
 
-Reach for source.read and source.write when the thing you need to change is not
-in Stacki's model — a script, a config, a utility module, arbitrary frontmatter
-logic. Replacing a file by path needs the ref you read it with, or its
-expectedDigest, for the same reason a ref does.
+Reach for source.read and source.write when the thing to change is not in
+Stacki's model — a script, a config, a utility module, frontmatter logic.
+Replacing a file by path needs the ref you read it with, or its expectedDigest,
+for the same reason a ref does.
 
-The model is a fast path, not a fence. Nothing stops you using your own file
-tools; you will just be re-deriving things Stacki has already parsed.
+The model is a fast path, not a fence. Your own file tools still work; you will
+just re-derive what Stacki has parsed.
 
 ## Things that are true and surprise people
 
@@ -104,7 +145,7 @@ tools; you will just be re-deriving things Stacki has already parsed.
 - occurrence / occurrenceCount tell you which copy you are looking at.
 - Permission starts at visual-only and is granted per project. get_capabilities
   says what this level may do, so a refusal means asking the person rather than
-  looking for another route.`,
+  looking for another way in.`,
   },
 
   editing: {

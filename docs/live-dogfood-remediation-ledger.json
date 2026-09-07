@@ -1,0 +1,188 @@
+{
+ "dogfoodBuild": "8d12c79 (fix/mcp-native-dogfood-blockers) — proven by git-blob identity of all 80 electron/**/*.js in app.asar",
+ "candidateAtStart": "b40fbb3 (feat/mcp-sota-2026)",
+ "bothReported": "version 0.1.23",
+ "commitsBetween": 93,
+ "totals": {
+  "STALE_BUILD": 10,
+  "FIXED_THIS_MISSION": 14,
+  "REFUTED": 1
+ },
+ "items": [
+  {
+   "id": "D01",
+   "observation": "Unicode/source fidelity: a literal ZWJ in 🧑‍🚀 became &#8205; in a heading nobody edited",
+   "state": "STALE_BUILD",
+   "finding": "8d12c79 anchoredSerialize reprinted the parent subtree through encodeText; the candidate splices bytes. The ENCODER was wrong in both builds, so it was fixed anyway.",
+   "regressionTest": "test/source-fidelity-unicode.js"
+  },
+  {
+   "id": "D02",
+   "observation": "style.read named the wrong winner for a scoped rule, with problems:[]",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "Astro scopes by rewriting every compound; the authored specificity was scored. Corrected per compound, per strategy.",
+   "regressionTest": "test/astro-scope-cascade.js"
+  },
+  {
+   "id": "D03",
+   "observation": "append_child and an import insertion reformatted untouched source",
+   "state": "STALE_BUILD",
+   "finding": "8d12c79 reindented tabs to spaces over 40 lines; the candidate changes two.",
+   "regressionTest": "test/source-fidelity-unicode.js, test/source-fidelity-matrix.js"
+  },
+  {
+   "id": "D04",
+   "observation": "page.create worked but the UI page switcher stayed stale",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "No page/folder mutation announced itself; the watcher suppresses the app own writes. One notePagesChanged.",
+   "regressionTest": "test/project-structure.js"
+  },
+  {
+   "id": "D05",
+   "observation": "stale child refs became unresolvable and leaked review wording",
+   "state": "STALE_BUILD",
+   "finding": "8d12c79 focusNote had no forFeature parameter, so a target failure spoke review language.",
+   "regressionTest": "(candidate behaviour verified)"
+  },
+  {
+   "id": "D06",
+   "observation": "style.move_heading moved clip-path onto :root and blanked the site",
+   "state": "STALE_BUILD",
+   "finding": "8d12c79 lastIndexOf/indexOf boundary arithmetic; the candidate has commentAround. Nothing kept it honest.",
+   "regressionTest": "test/css-sections.js"
+  },
+  {
+   "id": "D07",
+   "observation": "style.set_section_title stripped the comment delimiters",
+   "state": "STALE_BUILD",
+   "finding": "Same build, same arithmetic; the candidate writes inside the delimiters.",
+   "regressionTest": "test/css-sections.js"
+  },
+  {
+   "id": "D08",
+   "observation": "content.cms_create advertised data and discarded it",
+   "state": "STALE_BUILD",
+   "finding": "The candidate refuses the unknown key as bad_arguments and never had the field.",
+   "regressionTest": "(schema-strictness covers the class)"
+  },
+  {
+   "id": "D09",
+   "observation": "content.write_entry leaked a raw Node paths[1] TypeError",
+   "state": "STALE_BUILD",
+   "finding": "The candidate resolves the entry itself; the caller never names a path.",
+   "regressionTest": "test/refusal-contract.js"
+  },
+  {
+   "id": "D10",
+   "observation": "style.set_declarations required a selection despite explicit identity",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "The node was a gate the three write actions never read. They take none now.",
+   "regressionTest": "(driven in test/agent-acceptance.js paths)"
+  },
+  {
+   "id": "D11",
+   "observation": "page.folder_rename resolved src/pages/src/pages/...",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "pagesRel prefixed unconditionally; page.move took two coordinate systems. One space now.",
+   "regressionTest": "test/page-paths.js"
+  },
+  {
+   "id": "D12",
+   "observation": "a one-answer merge choice was accepted for a two-hunk conflict",
+   "state": "STALE_BUILD",
+   "finding": "8d12c79 resolveMerge had no validator at all; the candidate refuses wrong_length.",
+   "regressionTest": "test/git-branches.js"
+  },
+  {
+   "id": "D13",
+   "observation": "a typoed top-level argument was silently dropped",
+   "state": "STALE_BUILD",
+   "finding": "8 of 10 near-misses dispatched on 8d12c79; the candidate refuses all with the key named.",
+   "regressionTest": "test/schema-strictness.js"
+  },
+  {
+   "id": "D14",
+   "observation": "style.remove_section deleted 94 of 152 lines",
+   "state": "STALE_BUILD",
+   "finding": "Same arithmetic as D06; the candidate removes one line.",
+   "regressionTest": "test/css-sections.js"
+  },
+  {
+   "id": "D15",
+   "observation": "asset.move left every reference pointing at the old address",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "No reference planner existed. electron/assetRefs.js plans, rewrites atomically, or refuses first.",
+   "regressionTest": "test/asset-references.js"
+  },
+  {
+   "id": "D16",
+   "observation": "project profile missed breakpoints in component scoped <style>",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "listAstroStyleFiles omitted scoped components; reach is a fact on the row now.",
+   "regressionTest": "test/mcp-intelligence.js"
+  },
+  {
+   "id": "O01",
+   "observation": "document.digest moved across pure reads",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "It hashed the parse counter node ids. A write through a pre-navigation ref was refused.",
+   "regressionTest": "test/answer-truth.js"
+  },
+  {
+   "id": "O02",
+   "observation": "refs carried the branch cached at project-open",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "ctx.branch came from the renderer payload. It comes from git now, cached 1500ms.",
+   "regressionTest": "test/branch-identity.js"
+  },
+  {
+   "id": "O03",
+   "observation": "patch line counts overstated the change by up to 160x",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "diffLines was not a diff. Myers now, graded against git diff --numstat.",
+   "regressionTest": "test/patch-truth.js"
+  },
+  {
+   "id": "O04",
+   "observation": "polymorphic edit shapes were published imprecisely",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "An array of alternatives described as \"Used by: edit\". Thirteen shapes named now.",
+   "regressionTest": "test/contract-wording.js"
+  },
+  {
+   "id": "O05",
+   "observation": "changedFiles listed one physical file twice",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "touchedBy returned the caller raw path; the set deduped by string. Canonicalised.",
+   "regressionTest": "test/answer-truth.js"
+  },
+  {
+   "id": "O06",
+   "observation": "a no-op left an undo step and destroyed the redo stack",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "pushHistory runs before the operations. commitNow rolls it back when nothing moved.",
+   "regressionTest": "test/answer-truth.js"
+  },
+  {
+   "id": "O07",
+   "observation": "no operation could navigate the canvas to a route",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "page.open added: risk read, via renderer, through selectPage. 111 -> 112 operations, 444 -> 448 answers.",
+   "regressionTest": "test/support/mcpScenarioSet.js, test/mcp-operation-matrix.js"
+  },
+  {
+   "id": "O08",
+   "observation": "style.read on a component instance was an empty success",
+   "state": "FIXED_THIS_MISSION",
+   "finding": "Indistinguishable from an unstyled element. It says what it is now; the control keeps the other answer.",
+   "regressionTest": "test/astro-scope-cascade.js"
+  },
+  {
+   "id": "O09",
+   "observation": "the dogfood reported zero MCP prompts",
+   "state": "REFUTED",
+   "finding": "All three prompts answer on both builds, in all three protocol eras. A host artefact.",
+   "regressionTest": "test/mcp-intelligence.js"
+  }
+ ]
+}

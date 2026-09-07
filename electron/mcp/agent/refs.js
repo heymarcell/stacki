@@ -65,6 +65,12 @@ const KINDS = [
   'content', // a CMS file or a content-collection entry
   'field', // one field inside a content object
   'asset', // a file under public/ or src/
+  // ONE CONFLICTED MERGE, and the only kind here that does not name a thing in
+  // the project. A merge conflict is a MOMENT — two commits and what git made
+  // of them — and answers to it are only answers to that moment. Handing them
+  // back without one is how a hunk's answer landed on a different hunk once a
+  // commit arrived on either branch, with `ok: true` over the top of it.
+  'merge',
 ];
 
 // The signing key, made once per run and never rotated: it is what makes a

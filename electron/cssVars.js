@@ -1210,16 +1210,64 @@ function renameVariables(projectPath, { renames, markWrite }) {
     });
     if (!hits) continue;
     occurrences += hits;
-    writes.push([abs, next]);
+    // The bytes it went in with travel with it. Cheap here — the file has just
+    // been read — and the only thing that can put it back further down.
+    writes.push([abs, next, text]);
   }
 
   // Written only once every file has been read and rewritten in memory: a
   // half-applied rename is worse than a refused one. Each file is announced as
   // the app's own write just before it happens, so the watcher does not read it
   // back as somebody editing the project from outside.
-  for (const [abs, next] of writes) {
-    markWrite?.(abs);
-    fs.writeFileSync(abs, next, 'utf8');
+  //
+  // AND THAT SENTENCE APPLIES TO THE COMMIT LOOP TOO, WHICH IT DID NOT.
+  //
+  // Checking everything first only rules out the failures this function can see
+  // coming. The loop below can still stop halfway on an I/O error — a file made
+  // read-only, a volume that has gone away — and leave the project in exactly
+  // the state the comment above calls worse than a refused one: one stylesheet
+  // declaring `--gap-large`, another still referencing `--gap`, and nothing
+  // anywhere declaring what it references. So each file that was written is put
+  // back before the original error — the one that says WHY the rename could not
+  // happen — is re-thrown.
+  //
+  // AND THE FILE THE WRITE ACTUALLY BROKE IS ONE OF THEM, WHICH IT WAS NOT.
+  //
+  // `written.push(abs)` ran AFTER `writeFileSync` returned, so the single file
+  // whose own write threw was the single file the rollback never touched — and
+  // `writeFileSync` opens with `w`, which TRUNCATES before it writes. A failure
+  // past that point (out of space, an I/O error, a volume pulled) therefore
+  // left that stylesheet empty or half written while every stylesheet around it
+  // was put back: the worst state of the three, and the one the paragraph above
+  // exists to rule out. The bytes it went in with are already in `writes`; only
+  // this ordering kept them from being used. Recorded BEFORE the call instead,
+  // so a file the write never opened is simply written back the bytes it still
+  // holds, which costs a write and settles the case that matters.
+  //
+  // Every entry in `writes` was read off the disk a few lines up, so each one
+  // has its prior text and there is no "this file did not exist" case to answer
+  // here — the renderer's twins carry that branch because their restores can
+  // name a file the person has since deleted.
+  const written = [];
+  try {
+    for (const [abs, next] of writes) {
+      written.push(abs);
+      markWrite?.(abs);
+      fs.writeFileSync(abs, next, 'utf8');
+    }
+  } catch (err) {
+    const priorOf = new Map(writes.map(([abs, , text]) => [abs, text]));
+    for (const abs of written.reverse()) {
+      const was = priorOf.get(abs);
+      if (typeof was !== 'string') continue;
+      try {
+        markWrite?.(abs);
+        fs.writeFileSync(abs, was, 'utf8');
+      } catch {
+        /* the disk is already refusing writes; there is nothing further to try */
+      }
+    }
+    throw err;
   }
   return { ok: true, files: writes.length, occurrences };
 }

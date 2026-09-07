@@ -176,25 +176,59 @@ async function buildProfile(run) {
   // the same cap the source list is, so a project with fifty stylesheets does not
   // turn one resource read into fifty file reads.
   const sourceList = capped(styleSources?.sources || [], CAPS.styleSources);
-  const cssTexts = [];
+
+  // THE PROJECT'S STYLESHEETS, NOT THE OPEN PAGE'S.
+  //
+  // "What breakpoints does this project have" is a question about the project,
+  // and it was being answered from `sources` — which is the list of style
+  // sources that reach whatever page happens to be on screen. A component that
+  // the open page does not use was therefore never read, and neither was a
+  // component whose `<style>` is ordinary: `listAstroStyleFiles` omitted those
+  // entirely, because the panel that first asked for it wanted somewhere to
+  // write GLOBAL css and a scoped block is not that.
+  //
+  // So a `@media (max-width: 1024px)` authored in a component's own scoped
+  // `<style>` was in no list this function could see, and the note below said
+  // the project had no such breakpoint — a claim, about something nobody had
+  // looked at. `projectSources` is the inventory, with reach as a fact on each
+  // row rather than as the reason a row exists.
+  const inventory = Array.isArray(styleSources?.projectSources) ? styleSources.projectSources : [];
+  const wanted = [];
+  const seen = new Set();
+  for (const s of inventory) {
+    const at = s?.path;
+    if (!at || seen.has(at)) continue;
+    seen.add(at);
+    wanted.push(at);
+  }
+  // The open page's own sources too, for anything the inventory cannot name —
+  // a `<style>` block in the open file has no path of its own and is only ever
+  // reachable this way.
   for (const s of sourceList.items) {
-    // A `<style>` block of the open file has no path to read back; a component
-    // file has one, and its page-wide block can hold the only media query in a
-    // project. Skipping every source that was not a plain `file` lost those.
     if (s.kind !== 'file' && s.kind !== 'astro') continue;
-    // The label of a component source is a bare filename ("Nav.astro"), which
-    // read_source cannot resolve. `path` is the project-relative one.
-    const path = s.path || (s.kind === 'file' ? s.label : null);
-    if (!path) continue;
-    const got = await ask('style', 'read_source', { path });
-    if (got?.ok === false) continue;
+    const at = s.path || (s.kind === 'file' ? s.label : null);
+    if (!at || seen.has(at)) continue;
+    seen.add(at);
+    wanted.push(at);
+  }
+
+  const offered = capped(wanted, CAPS.styleSources);
+  const cssTexts = [];
+  const unread = [];
+  for (const at of offered.items) {
+    const got = await ask('style', 'read_source', { path: at });
+    if (got?.ok === false) {
+      unread.push(at);
+      continue;
+    }
     // style.read_source answers under `css`. Reading `got.text` — the shape
     // source.read uses — meant cssTexts was empty in every project there has
     // ever been, and the note below then stated as a fact that the project had
     // no breakpoints. Both spellings are accepted so a rename cannot silently
     // do it again, and `stylesheetsRead` below makes an empty list checkable.
     const text = typeof got?.css === 'string' ? got.css : typeof got?.text === 'string' ? got.text : null;
-    if (text !== null) cssTexts.push({ path, text });
+    if (text !== null) cssTexts.push({ path: at, text });
+    else unread.push(at);
   }
 
   const pkg = pkgRead?.ok === false ? { readable: false } : packageFacts(pkgRead?.text ?? '');
@@ -272,16 +306,27 @@ async function buildProfile(run) {
         // "no breakpoints" and "nothing was read" are the same answer — and for
         // a long time it WAS the same answer, given confidently.
         stylesheetsRead: cssTexts.length,
-        stylesheetsOffered: sourceList.total,
+        stylesheetsOffered: offered.total,
+        // WHICH OF THE OFFERED SOURCES WERE NOT READ, by name. A count that
+        // does not match `stylesheetsRead` says something was skipped; this
+        // says what, so a "no breakpoints" answer can be checked rather than
+        // believed. Empty is the ordinary case and the one worth being able to
+        // see.
+        stylesheetsUnread: unread.slice(0, 12),
         // Said explicitly, because "no breakpoints" and "we did not look" are
-        // very different facts and an agent should not have to guess which it got.
+        // very different facts and an agent should not have to guess which it
+        // got — and there is a third: "some of it was looked at". A project
+        // where one source could not be read has not been shown to have no
+        // breakpoints, and the sentence no longer says it has.
         note:
           bps.total > 0
-            ? 'Read from @media width queries in the project’s own stylesheets.'
-            : cssTexts.length > 0
-              ? `No width media queries in the ${cssTexts.length} stylesheet${cssTexts.length === 1 ? '' : 's'} read. This project has no authored breakpoints.`
-              : 'No stylesheet could be read, so no breakpoint was looked for. This says nothing about whether the project has any.',
-        source: 'style.read_source over style.list_sources',
+            ? `Read from @media width queries in ${cssTexts.length} of this project’s own style sources — every stylesheet and every component <style>, scoped or not.`
+            : cssTexts.length === 0
+              ? 'No style source could be read, so no breakpoint was looked for. This says nothing about whether the project has any.'
+              : unread.length > 0
+                ? `No width media queries in the ${cssTexts.length} style source${cssTexts.length === 1 ? '' : 's'} read, but ${unread.length} could not be read. This project has no breakpoints in what was read; the rest is unknown.`
+                : `No width media queries in the ${cssTexts.length} style source${cssTexts.length === 1 ? '' : 's'} read, which is every one this project has. It has no authored breakpoints.`,
+        source: 'style.read_source over style.list_sources projectSources',
       },
       // WHAT GENERATES CSS THIS PROJECT DOES NOT AUTHOR.
       //

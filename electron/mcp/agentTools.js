@@ -92,7 +92,15 @@ const DocumentState = z
 
 const Envelope = z.looseObject({
   ok: z.boolean().describe('Whether the operation happened. False is a status with a code, never a crash.'),
-  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, bound_value, not_editable, no_project, bad_request, …'),
+  // THE THREE THAT REACHED A CLIENT WITHOUT BEING NAMED HERE. `merge_blocked`,
+  // `merge_stuck` and `bad_branch_name` are minted in electron/gitBranches.js
+  // and pass through the git mappers untouched — the resolve mapper only
+  // rewrites a refusal carrying `badChoices` — so they were arriving on the
+  // wire under a `code` this description told nobody about. They are named here
+  // because this line is the shortest thing a client ever reads about refusals
+  // and the only one that travels with the schema, whichever layer of the
+  // process actually mints the code.
+  code: z.string().nullable().optional().describe('Why not. permission_denied, guard_required, stale_target, stale_merge, bad_choices, merge_blocked, merge_stuck, bad_branch_name, bound_value, not_editable, no_project, bad_request, command_failed, …'),
   message: z.string().nullable().optional(),
 
   // --- what a mutation answers with ---------------------------------------
@@ -170,9 +178,228 @@ const MoveTarget = z
   })
   .describe('Where the node should end up.');
 
+/**
+ * EVERY REBUILT SCHEMA, BESIDE THE ONE IT WAS REBUILT FROM.
+ *
+ * A rebuild can only be trusted if what came out can be compared with what went
+ * in, and once `closed()` has run the open tree is unreachable from anywhere —
+ * which is how twelve advertised bounds were deleted with a suite of 1,565
+ * assertions watching. Every node `carried()` produces remembers its original
+ * here.
+ *
+ * A WeakMap, keyed by the REBUILT node, for two reasons. It must not keep a
+ * schema alive: `publishChecked` closes a tool's schema on every registration,
+ * and a server that registers per request would otherwise accumulate a row per
+ * request forever. And keying by the rebuilt node is what lets a reader walk a
+ * closed tree asking each node what it used to be, rather than needing a handle
+ * on an open tree nobody exports.
+ *
+ * The original in every row is a schema this file never rebuilt, and that is a
+ * property `closeField` has to maintain rather than one that comes for free:
+ * see the note there on closing a closed schema twice, which for a while left
+ * thirty rows pointing at a rebuild instead of at an open tree.
+ *
+ * Read by test/schema-strictness.js, which converts both halves of every pair
+ * to JSON Schema and requires every keyword to be identical bar the fence. That
+ * grades the MECHANISM rather than the six fields this defect happened to hurt,
+ * so a wrapper added tomorrow whose checks are not carried fails the day it is
+ * written.
+ */
+const OPEN_SOURCE = new WeakMap();
+
+/** What `schema` was before this file closed it, if it did. */
+const openSourceOf = (schema) => (schema && typeof schema === 'object' ? OPEN_SOURCE.get(schema) : undefined);
+
 // One operation inside a batch. The same vocabulary as the single-operation
 // actions, so learning one teaches the other.
-const Operation = z.discriminatedUnion('type', [
+/**
+ * The same union, with every branch closed.
+ *
+ * `z.object()` STRIPS a key it does not know, and a stripped key is an argument
+ * the caller wrote and nobody ran. On a surface where most arguments are
+ * optional and several operations have a server-side fallback for the one you
+ * left out, that is not a tidy-up: it is a silent retarget. Measured at the
+ * baseline commit, every one of these was accepted with `ok: true` and did
+ * something other than what was asked:
+ *
+ *   git   {action:'restore_file', path, rev:'abc'}   -> `rev` dropped; restored from HEAD
+ *   git   {action:'push', branchName:'feature-x'}    -> dropped; pushed the CURRENT branch
+ *   target{action:'remove', target:'<a ref>'}        -> dropped; removed the person's SELECTION
+ *   project{action:'probe', route:'/pricing'}        -> dropped; probed the preview root
+ *
+ * Two of those are `high` risk and one is destructive. The mistyped name is the
+ * likeliest agent error of all — the top-level `properties` block that
+ * `summarised()` publishes lists every branch's argument names side by side,
+ * with nothing structural to say which action each belongs to — so the surface
+ * has to answer it rather than absorb it.
+ *
+ * Closing the branch turns all four into `bad_arguments`, naming the key. It
+ * also makes the ADVERTISED schema say so: `z.toJSONSchema` emits
+ * `additionalProperties: false` per branch, so a validating client refuses the
+ * call before it is sent, and this file's header stops being aspirational.
+ *
+ * Rebuilt rather than declared branch by branch, so a branch added tomorrow is
+ * closed without its author having to remember to close it.
+ */
+function closed(union) {
+  const key = union.def?.discriminator || 'action';
+  const rebuilt = z.discriminatedUnion(
+    key,
+    union.options.map((branch) => {
+      // A BRANCH CAN CARRY A DESCRIPTION, AND REBUILDING IT DROPPED ONE.
+      //
+      // `z.strictObject(shape)` keeps every FIELD's `.describe()` and none of
+      // the object's own, so two operations lost the sentence published beside
+      // them in `tools/list` — retrieval metadata deleted by a change that was
+      // about validation. `carried()` puts the sentence back, and the branch's
+      // own checks with it.
+      return carried(closeShape(branch.shape), branch);
+    })
+  );
+  // The union's own checks and description, which the rebuild above does not
+  // reach: `z.discriminatedUnion` was handed the branches, not the wrapper.
+  return carried(rebuilt, union);
+}
+
+/**
+ * Close an object shape, and everything object-shaped inside it.
+ *
+ * Closing only the top level left the same silent strip one level down: the
+ * arguments that are themselves objects — a node spec, a move target, a
+ * declaration identity — went on dropping keys nobody typed correctly. A
+ * mistyped field inside `node` is exactly as invisible as a mistyped field
+ * beside it, and rather more likely, because those are the shapes an agent has
+ * to construct rather than copy.
+ *
+ * Wrappers are unwrapped and put back: `.optional()`, `.nullable()`,
+ * `.default()` and arrays all hold an inner type that may itself be an object.
+ * Anything this does not recognise is returned untouched — a rebuilt schema
+ * that dropped a refinement would be worse than an open one.
+ */
+function closeShape(shape) {
+  const out = {};
+  for (const [name, field] of Object.entries(shape)) out[name] = closeField(field);
+  return z.strictObject(out);
+}
+
+function closeField(field) {
+  const def = field?.def;
+  if (!def) return field;
+  // CLOSING A CLOSED SCHEMA A SECOND TIME BLINDED THE CHECK THAT GRADES THE
+  // REBUILD.
+  //
+  // `Operation` is closed at declaration and then embedded in `target.edit`, so
+  // walking into `operations` found a discriminated union and rebuilt it again.
+  // The second generation was identical in what it accepts — but its
+  // OPEN_SOURCE entry pointed at the FIRST generation, which is itself a
+  // rebuild, and the genuinely open union was then reachable from neither half
+  // of any pair. Measured: 30 of the 197 pairs test/schema-strictness.js grades
+  // — the `Operation` union, its thirteen branches, the node specs, their
+  // props record and the move target — compared one rebuild against another, so
+  // a keyword lost by the FIRST close was invisible to the one assertion whose
+  // whole purpose is to notice a keyword going missing that nobody predicted.
+  //
+  // A node this file has already rebuilt is already closed, all the way down,
+  // so handing it straight back is both correct and one generation cheaper. The
+  // wrapper around it then sees `closedInner === inner` and keeps its own
+  // identity too, which is why the array of operations stops being rebuilt at
+  // all: there is nothing left in it to close.
+  if (OPEN_SOURCE.has(field)) return field;
+  if (def.type === 'object') return carried(closeShape(field.shape), field);
+  // A UNION OF SHAPES IS STILL SHAPES. `audit`'s `viewports` takes either a
+  // named string or a `{width, height}` object, and the object half was the
+  // last place on the surface still dropping a key silently.
+  if (def.type === 'union' && Array.isArray(def.options)) {
+    const rebuilt = def.options.map(closeField);
+    if (rebuilt.every((o, i) => o === def.options[i])) return field;
+    // A DISCRIMINATED UNION REBUILT AS A PLAIN ONE STOPS NAMING THE KEY.
+    //
+    // A discriminated union in zod 4 IS a union with `discriminator` on its
+    // def, so `Operation` -- the batch's own union on `type` -- matched this
+    // branch, every option was rebuilt, and what went back was a plain
+    // `z.union` with the discriminator dropped on the way past. The cost is
+    // not validation, which still refuses: it is the ANSWER. A plain union
+    // fails as `invalid_union` with "Invalid input" and buries the thirteen
+    // real sub-errors in `errors[]`, which `issuesOf()` does not read -- so a
+    // mistyped key inside an edit batch came back as `operations.0: Invalid
+    // input`, the one shape on this surface an agent cannot act on,
+    // reintroduced one level down by the fix for the level above.
+    return carried(
+      def.discriminator ? z.discriminatedUnion(def.discriminator, rebuilt) : z.union(rebuilt),
+      field
+    );
+  }
+  // A RECORD'S VALUES ARE STILL SHAPES, and the wrapper walk below could not
+  // see them: a record holds its inner type under `valueType`, not `innerType`
+  // or `element`, so it was returned untouched and every object inside it
+  // stayed open. `props` on a node spec is the one that mattered -- its KEYS
+  // are attribute names the author chooses and are rightly open, but its VALUE
+  // is a declared `{type, value}` shape an agent has to construct, and a
+  // mistyped key in it was dropped and the insert ran.
+  if (def.type === 'record' && def.valueType) {
+    const closedValue = closeField(def.valueType);
+    if (closedValue === def.valueType) return field;
+    return carried(z.record(def.keyType, closedValue), field);
+  }
+  // One inner type, held under a name that differs by wrapper.
+  const innerKey = def.type === 'array' ? 'element' : 'innerType';
+  const inner = def[innerKey];
+  if (!inner || typeof inner !== 'object' || !inner.def) return field;
+  const closedInner = closeField(inner);
+  if (closedInner === inner) return field;
+  if (def.type === 'array') return carried(z.array(closedInner), field);
+  if (def.type === 'optional') return carried(closedInner.optional(), field);
+  if (def.type === 'nullable') return carried(closedInner.nullable(), field);
+  if (def.type === 'default') return carried(closedInner.default(def.defaultValue), field);
+  return field;
+}
+
+/**
+ * THE REBUILD WIDENED WHAT THE SURFACE ACCEPTS.
+ *
+ * Every branch above hands back a NEW schema built from the old one's inner
+ * types, and everything hanging off the OLD wrapper that was not explicitly
+ * copied across went with it. Only the description was copied. In zod 4 a
+ * wrapper's bounds live in `def.checks` — `.min()`, `.max()`, `.int()`,
+ * `.regex()` are all checks rather than part of the type — so
+ * `z.array(closedInner)` is the same array with its bounds deleted.
+ *
+ * That is the one failure this mechanism must not have. Closing an object only
+ * ever REFUSES more; losing a check ACCEPTS more, silently, and the advertised
+ * JSON Schema stops naming the bound at the same moment, so a validating client
+ * stops catching it either. Because `Operation` is a discriminated union,
+ * `closeField(element) !== element` always held, so the array rebuild always
+ * fired: twelve published keywords went missing at once, across seven fields —
+ * `target.edit.operations` (1..30), `style.set_declarations` (1..40),
+ * `style.add_variables` / `rename_variables` / `move_variables` (1..100 each),
+ * `content.write_entry.edits` (..500) and `audit.viewports` (..6). Six of the
+ * seven have no downstream guard, so one call could put five thousand variable
+ * renames inside a single undo transaction, and `MAX_BODY_BYTES` in server.js
+ * lost the largest schema-legal write it is sized against.
+ *
+ * Nothing else was lost, and that is a measurement rather than a hope: a string
+ * `.max()`, a `.regex()`, a number's `.int()` all sit on a primitive, and
+ * `closeField` returns a primitive untouched, so those checks were never in the
+ * rebuild's path. The invariance check in test/schema-strictness.js is what
+ * says so for every position rather than for the ones anybody thought of.
+ *
+ * So the checks are carried across with the description, on EVERY rebuilt
+ * wrapper rather than on arrays alone — a refinement on an object, a bound on
+ * a record, a check on an optional, all of them. `.check()` re-attaches the
+ * check objects themselves, so the runtime rule and the emitted `minItems` /
+ * `maxItems` come back together. test/schema-strictness.js asserts that the
+ * closed tree's JSON Schema keywords are IDENTICAL to the open tree's, which is
+ * what makes this a class closed rather than an instance fixed.
+ */
+const carried = (rebuilt, original) => {
+  const checks = original?.def?.checks;
+  const withChecks = checks && checks.length ? rebuilt.check(...checks) : rebuilt;
+  const kept = original.description ? withChecks.describe(original.description) : withChecks;
+  OPEN_SOURCE.set(kept, original);
+  return kept;
+};
+
+const Operation = closed(z.discriminatedUnion('type', [
   // `value` is this form's name and stays the declared one; `text` is accepted
   // because the single-action form calls it that. See the note on
   // `action: "set_text"` below.
@@ -194,7 +421,7 @@ const Operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('duplicate') }),
   z.object({ type: z.literal('move'), to: MoveTarget }),
   z.object({ type: z.literal('set_tag'), tag: z.string().max(64) }),
-]);
+]));
 
 // --- target ------------------------------------------------------------------
 
@@ -208,7 +435,7 @@ const guard = {
   expectedDigest: z.string().max(64).optional().describe('The document digest your read reported.'),
 };
 
-const TargetInput = z.discriminatedUnion('action', [
+const TargetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ...withTarget({
@@ -290,7 +517,7 @@ const TargetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('duplicate'), ...withTarget(guard) }),
   z.object({ action: z.literal('move'), ...withTarget({ ...guard, to: MoveTarget }) }),
   z.object({ action: z.literal('set_tag'), ...withTarget({ ...guard, tag: z.string().max(64) }) }),
-]);
+]));
 
 // --- style -------------------------------------------------------------------
 
@@ -308,7 +535,7 @@ const DeclarationIdentity = z
   })
   .describe('A declaration, named the way style.read reported it. Pass the whole object back unchanged.');
 
-const StyleInput = z.discriminatedUnion('action', [
+const StyleInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     ref: Ref.optional(),
@@ -413,11 +640,11 @@ const StyleInput = z.discriminatedUnion('action', [
     action: z.literal('move_heading'),
     edit: z.object({ file: RelPath, selector: z.string().max(300), start: z.number().int().min(0), end: z.number().int().min(0), before: z.string().max(200).optional(), expect: z.string().max(20000).describe('The text between those offsets now, as `variables` reported it.') }),
   }),
-]);
+]));
 
 // --- source ------------------------------------------------------------------
 
-const SourceInput = z.discriminatedUnion('action', [
+const SourceInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('read'),
     path: RelPath,
@@ -464,19 +691,57 @@ const SourceInput = z.discriminatedUnion('action', [
         'declarationLine into source.read’s startLine and endLine.'
     ),
   z.object({ action: z.literal('resolve_path'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- page --------------------------------------------------------------------
 
-const PageInput = z.discriminatedUnion('action', [
+// ONE PATH SPACE, SAID ONCE.
+//
+// Every path in this domain is project-relative and under src/pages — the same
+// spelling every other domain uses and the same spelling these actions RETURN.
+// It used to be two: `page.move`'s `from` was project-relative and its `to` was
+// relative to src/pages, and the folder actions prefixed `src/pages/` onto
+// whatever they were handed, so passing back a path this API had just returned
+// produced `src/pages/src/pages/blog`. Three of them did not even fail at it.
+//
+// The rule is in one constant so that the schema a client reads, the refusal it
+// gets when it is wrong, and the resolver that enforces it cannot drift apart.
+// See `pagesRel` in electron/mcp/agent/domains.js for the other two.
+const PAGE_PATH_RULE = 'Project-relative and under src/pages/ — for example src/pages/blog or src/pages/blog/first.astro.';
+
+const PagePath = z.string().min(1).max(300).describe(PAGE_PATH_RULE);
+
+const PageInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }),
   z.object({ action: z.literal('read'), path: RelPath }),
-  z.object({ action: z.literal('create'), name: z.string().max(300), layout: z.string().max(120).optional() }),
-  z.object({ action: z.literal('delete'), path: RelPath }),
-  z.object({ action: z.literal('move'), from: RelPath, to: z.string().max(300).describe('The new path, relative to src/pages.') }),
-  z.object({ action: z.literal('folder_create'), dir: z.string().max(300) }),
-  z.object({ action: z.literal('folder_rename'), from: z.string().max(300), to: z.string().max(300) }),
-  z.object({ action: z.literal('folder_delete'), dir: z.string().max(300) }),
+  z.object({
+    action: z.literal('open'),
+    route: z
+      .string()
+      .max(300)
+      .optional()
+      .describe('The route to show, as page.list reports it — "/", "/about", "/blog/first". A full URL is accepted too.'),
+    path: PagePath.optional().describe('Or the page by path, as page.create and page.list answer with.'),
+  }),
+  z.object({
+    action: z.literal('create'),
+    // A NAME, NOT A PATH, and the only argument in this domain that is not one.
+    // It says so, because the difference is exactly what a caller gets wrong.
+    name: z
+      .string()
+      .max(300)
+      .describe(
+        'The page\'s name, WITHOUT src/pages and without an extension — "contact", or "docs/intro" for one in a ' +
+          'folder. This is the one argument here that is a name rather than a path; the answer comes back as a ' +
+          'project-relative path (src/pages/contact.astro), which is what every other action in this domain takes.'
+      ),
+    layout: z.string().max(120).optional(),
+  }),
+  z.object({ action: z.literal('delete'), path: PagePath }),
+  z.object({ action: z.literal('move'), from: PagePath, to: PagePath.describe(`Where it should end up. ${PAGE_PATH_RULE}`) }),
+  z.object({ action: z.literal('folder_create'), dir: PagePath }),
+  z.object({ action: z.literal('folder_rename'), from: PagePath, to: PagePath.describe(`The folder's new path. ${PAGE_PATH_RULE}`) }),
+  z.object({ action: z.literal('folder_delete'), dir: PagePath }),
   z.object({
     action: z.literal('component_create'),
     name: z.string().max(120).describe('The component name — a word starting with a capital letter.'),
@@ -498,11 +763,11 @@ const PageInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('injected_routes') }),
   z.object({ action: z.literal('import_path'), fromFile: RelPath, targetFile: RelPath }),
   z.object({ action: z.literal('rebase_import'), fromPage: RelPath, toPage: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- content -----------------------------------------------------------------
 
-const ContentInput = z.discriminatedUnion('action', [
+const ContentInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('cms_list') }),
   z.object({ action: z.literal('cms_read'), path: RelPath }),
   z.object({ action: z.literal('cms_write'), path: RelPath, data: z.unknown(), ref: FileRef.optional(), expectedDigest: Digest.optional() }),
@@ -569,11 +834,11 @@ const ContentInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('rename'), collection: z.string().max(200), from: z.string().max(300), to: z.string().max(300) }),
   z.object({ action: z.literal('sample_entry'), collection: z.string().max(200), id: z.string().max(300).optional() }),
   z.object({ action: z.literal('resolve_import'), fromFile: RelPath, spec: z.string().max(1024) }),
-]);
+]));
 
 // --- asset -------------------------------------------------------------------
 
-const AssetInput = z.discriminatedUnion('action', [
+const AssetInput = closed(z.discriminatedUnion('action', [
   z.object({
     action: z.literal('list'),
     under: z.string().max(1024).optional().describe('Only what is inside this folder, e.g. "public/images".'),
@@ -586,11 +851,11 @@ const AssetInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('move'), path: RelPath, toFolder: z.string().max(1024) }),
   z.object({ action: z.literal('rename'), path: RelPath, name: z.string().max(200) }),
   z.object({ action: z.literal('delete'), path: RelPath }),
-]);
+]));
 
 // --- project -----------------------------------------------------------------
 
-const ProjectInput = z.discriminatedUnion('action', [
+const ProjectInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('scan') }),
   z.object({ action: z.literal('classes'), limit: z.number().int().min(1).max(2000).optional() }),
@@ -612,11 +877,11 @@ const ProjectInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('dev_stop') }),
   z.object({ action: z.literal('undo') }),
   z.object({ action: z.literal('redo') }),
-]);
+]));
 
 // --- git ---------------------------------------------------------------------
 
-const GitInput = z.discriminatedUnion('action', [
+const GitInput = closed(z.discriminatedUnion('action', [
   z.object({ action: z.literal('info') }),
   z.object({ action: z.literal('gh_status') }),
   z.object({ action: z.literal('status'), limit: z.number().int().min(1).max(400).optional() }),
@@ -629,7 +894,36 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('commit'), message: z.string().min(1).max(4000), paths: z.array(z.string().max(1024)).max(500).optional() }),
   z.object({ action: z.literal('checkout'), branch: z.string().max(300), create: z.boolean().optional(), parkFirst: z.boolean().optional() }),
   z.object({ action: z.literal('merge'), branch: z.string().max(300) }),
-  z.object({ action: z.literal('resolve_merge'), branch: z.string().max(300), choices: z.record(z.string(), z.unknown()) }),
+  z.object({
+    action: z.literal('resolve_merge'),
+    mergeRef: Ref.describe(
+      'The `mergeRef` git.merge handed back with the conflict, unchanged. It says WHICH conflict these answers ' +
+        'are about \u2014 the two commits and what git made of them \u2014 and the branch is taken from IT rather ' +
+        'than from `branch`. Required: applying the answers re-runs the merge, so a resolve that cannot say which ' +
+        'conflict it is settling is refused with guard_required, and one whose conflict has moved since is refused ' +
+        'with stale_merge. Nothing is merged either way \u2014 run git.merge again and answer what it reports now.'
+    ),
+    branch: z
+      .string()
+      .max(300)
+      .optional()
+      .describe('The branch being merged in. Cross-checked against the mergeRef rather than used, so naming a different one is refused.'),
+    choices: z
+      .record(z.string(), z.unknown())
+      .describe(
+        'How to settle each conflicting file, keyed by the `path` git.merge reported for it, spelled exactly as ' +
+          'it reported it. THOSE PATHS ARE RELATIVE TO THE REPOSITORY ROOT and not to the open project, so they ' +
+          'are not the paths source.read and the rest of this surface take \u2014 the two differ whenever the project ' +
+          'sits inside a larger repository, and every conflicting file git.merge reports carries both: `path` to ' +
+          'send back here, `sourcePath` to read the file with. A value is either "ours" or ' +
+          '"theirs" for the whole file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per ' +
+          'conflicting hunk, in the order git reports them, which is the order git.merge listed them in, and ' +
+          'exactly as many entries as that file has hunks. Every key must be a path git.merge reported, and ' +
+          '"merged" is only an answer where that hunk offered one. A file you leave out keeps this branch\'s ' +
+          'version. Anything else \u2014 a misspelt path, a short or long list, an empty one, an explicit null \u2014 ' +
+          'is refused with bad_choices and nothing changed.'
+      ),
+  }),
   z.object({ action: z.literal('delete_branch'), branch: z.string().max(300), force: z.boolean().optional() }),
   z.object({ action: z.literal('restore_file'), ref: z.string().max(200).optional().describe('The revision to come back to. Defaults to HEAD — the last commit.'), path: RelPath }),
   z.object({ action: z.literal('restore_project'), ref: z.string().max(200) }),
@@ -637,7 +931,7 @@ const GitInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('unpark') }),
   z.object({ action: z.literal('push'), branch: z.string().max(300).optional().describe('The branch to push. Defaults to the branch the project is on.') }),
   z.object({ action: z.literal('publish'), repoName: z.string().max(200), private: z.boolean().optional() }),
-]);
+]));
 
 // --- descriptions ------------------------------------------------------------
 //
@@ -645,13 +939,20 @@ const GitInput = z.discriminatedUnion('action', [
 // — the schema already says the fields, and a description that repeats them is
 // paid for in every client's context on every call.
 
+// The eight domain schemas by name, so a refusal can say what the action it
+// named actually accepts without a second table to go stale.
+const DOMAIN_SCHEMAS = {};
+
 const DESCRIPTIONS = {
   target:
     'Inspect and edit the source-backed element behind what is on screen. read returns everything Stacki knows ' +
     'about it — file and lines, the component chain, props, classes, children, where its words come from and how ' +
     'many copies of it the page is rendering — so you do not have to search the repository for any of that. ' +
-    'The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo stack, and ' +
-    'save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
+    'It EDITS as well as reads, and the structural verbs are here rather than in source: set_text, set_prop, ' +
+    'set_classes, add_class, set_tag, insert_before, insert_after, append_child, duplicate, move and remove — so ' +
+    '"put this inside that", "delete this" and "add a card here" are one call on the object Stacki already ' +
+    'identified. The edits go through Stacki’s own editor: they appear on the canvas at once, land on the undo ' +
+    'stack, and save through the normal writer. Give the ref from get_context, comment(focus) or an earlier read; omit it ' +
     'to act on what the user has selected right now. A ref carries the document as your read found it, so an ' +
     'edit through one is refused if anybody changed that document meanwhile — you do not have to ask for that. ' +
     'Text that comes from a {binding} is NOT replaced with a literal: the answer says where the real value lives.',
@@ -665,15 +966,60 @@ const DESCRIPTIONS = {
     'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
     'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
   source:
-    'Project files as text. The fallback for code Stacki cannot model as a tree — a framework component, a ' +
-    'config, plain JS — and the honest route when target reports a file unrepresentable. Prefer target for ' +
-    '.astro markup: it keeps undo, the preview and the editor in step. Paths are project-relative. Replacing a ' +
+    'Project files as text, and the LAST resort rather than the first. It is the fallback for code Stacki cannot ' +
+    'model as a tree — a .ts or .js module, a config, a framework component — and the honest route when target ' +
+    'reports a file unrepresentable. It is NOT the way to answer a question about the project: use project or ' +
+    'page for structure, target for .astro markup, style for CSS and content for collection entries. Those keep ' +
+    'undo, the preview and the editor in step, and they answer from what Stacki has already parsed; reading the ' +
+    'files to work the same thing out costs more calls and can be wrong. Paths are project-relative. Replacing a ' +
     'file that already exists needs the ref your read gave you (or its digest); creating one does not.',
-  page: 'Pages, page folders and components as project objects: list, read, create, move, delete, and where a component is used.',
-  content: 'The CMS data files and the content collections: list, read, write, create, delete, validate, rename, and the entries themselves.',
-  asset: 'Files already inside the project, under public/ and src/: list, measure, read and write text ones, make folders, move, rename, delete.',
-  project: 'The open project itself: what is in it, which classes it uses, whether the preview is up, why it is not — and Stacki’s own undo and redo.',
-  git: 'The repository, through Stacki’s own git operations. Reading is always available; committing, switching, restoring, merging and pushing need full control.',
+  // THESE FIVE WERE ONE-LINE CATALOGUE LABELS, AND A CATALOGUE LABEL IS NOT
+  // RETRIEVAL METADATA.
+  //
+  // With tool search on — the default on the host this is measured against — a
+  // description is what a tool is FOUND by, and these listed their verbs
+  // without ever saying which question they answer. Measured over sixteen
+  // held-out sessions: `source` took 30 of 80 calls, and not one of them was on
+  // the single file in the fixture that `source`'s own description names as the
+  // case it exists for. Asked "which component renders the header?", the model
+  // read four files by hand rather than call `page.component_usage`, which is
+  // the operation for exactly that.
+  //
+  // So each now leads with the question a person actually types, in their
+  // words rather than the API's. They are still far shorter than `capture` and
+  // `get_comments`, and `test/host-limits.js` holds the ceiling.
+  page:
+    'Pages, folders and components as project objects, and the fast answer to "which component renders this?", ' +
+    '"what routes does this project have?" and "where is this component used?". list gives every route with its ' +
+    'file; component_usage names every page an component appears on; dynamic_paths asks the running dev server ' +
+    'what a [slug] route really stands for. Reach for this BEFORE reading files: it answers structure questions ' +
+    'from what Stacki has already parsed, and reading the pages by hand to work the same thing out is the long ' +
+    'way round. Also create, move, rename and delete.',
+  content:
+    'Content collections and CMS data — the answer to "rename that blog post", "what collections does this ' +
+    'project have?" and "change the title of this entry". Reads the real Astro content config, so it knows each ' +
+    'collection\u2019s schema and validates an entry against it before writing. Entries are objects with fields, ' +
+    'not files to be text-edited: editing frontmatter through source instead loses the schema check and the ' +
+    'references between entries. Also create, delete, rename and validate.',
+  asset:
+    'Images, fonts, downloads and data files already in the project, under public/ and src/ — the answer to ' +
+    '"what images does this use?", "how big is that?" and "move this into a folder". list and measure without ' +
+    'reading the bytes; read and write the text ones; make folders, move, rename, delete. Renaming or moving ' +
+    'updates what refers to it. This is for files that exist; it does not download or generate anything.',
+  project:
+    'The open project as a whole, and the first thing to ask when you do not know what you are looking at: ' +
+    'info and scan give the routes, components, layouts and stylesheets in one call; classes gives every class ' +
+    'name in use. Also whether the preview is running, why it is not, and how to start it — and Stacki\u2019s own ' +
+    'undo and redo, which is what "undo that" means here, not git. probe fetches a page from the project\u2019s own ' +
+    'dev server and nothing else. If a resource-capable client is available, stacki://project/profile is the ' +
+    'same picture in one read.',
+  git:
+    'The repository, through Stacki\u2019s own git operations — "commit what we changed", "what has changed?", ' +
+    '"put that file back", "make a branch". status and info and history and diffs are readable at any level; ' +
+    'committing, switching, restoring, merging and pushing need full control. A refusal names its cause — a ' +
+    'merge conflict, uncommitted work in the way, a branch that is not there — rather than saying it failed. ' +
+    'publish creates a repository on GitHub under the person\u2019s own account, which is the one thing here that ' +
+    'reaches outside this machine.',
 };
 
 // --- registration ------------------------------------------------------------
@@ -726,8 +1072,11 @@ function registerAgentTools(server, { api }) {
     }
   );
 
-  const domain = (name, inputSchema, annotations) =>
-    server.registerTool(
+  const domain = (name, inputSchema, annotations) => {
+    // Kept by name so a refusal can say what the action it named accepts,
+    // without a second table that would go stale.
+    DOMAIN_SCHEMAS[name] = inputSchema;
+    return server.registerTool(
       name,
       {
         title: `Stacki ${name}`,
@@ -748,18 +1097,16 @@ function registerAgentTools(server, { api }) {
         // Declaring `text` optional is what lets `value` be accepted; the cost
         // is that a call with NEITHER now reaches here instead of being refused
         // by the schema. Refused with a sentence that names both, which is what
-        // the Zod error should have said in the first place.
-        if (name === 'target' && action === 'set_text' && typeof shaped.text !== 'string') {
-          return answer({
-            ok: false,
-            code: 'bad_arguments',
-            operation: 'target.set_text',
-            message: 'set_text needs the new text. Send it as `text` — `value` is accepted too, because that is what the same operation is called inside `edit`.',
-          });
+        // the Zod error should have said in the first place — in BOTH forms of
+        // the operation. See `textlessSetText`.
+        if (name === 'target') {
+          const textless = textlessSetText(action, shaped);
+          if (textless) return answer(textless);
         }
         return answer(await api.run(name, action, shaped));
       }
     );
+  };
 
   domain('target', TargetInput, annotationsFor('target'));
   domain('style', StyleInput, annotationsFor('style'));
@@ -774,9 +1121,47 @@ function registerAgentTools(server, { api }) {
 /** `{a, b, c?}` — the fields of one object argument, required ones first-class. */
 function fieldsOf(spec) {
   if (!spec || typeof spec !== 'object') return null;
-  if (spec.type === 'array' && spec.items?.type === 'object') {
-    const inner = fieldsOf(spec.items);
-    return inner ? `[${inner}]` : '[{…}]';
+  if (spec.type === 'array') {
+    // AN ARRAY OF ALTERNATIVES IS THE MOST POLYMORPHIC SHAPE IN THIS SURFACE,
+    // AND IT WAS THE ONE DESCRIBED AS NOTHING.
+    //
+    // `target.edit` takes `operations`, an array whose items are a discriminated
+    // union of eight — set_text, set_prop, remove_prop, insert_before,
+    // insert_after, append_child, remove, duplicate, move, set_tag — and the
+    // flattened block published for it read, in full: "Used by: edit." Because
+    // `items` is a `oneOf` rather than a single object, this function answered
+    // null and the description fell back to the caller's list of actions.
+    //
+    // Which is the exact failure `summarised` exists to prevent, one level
+    // down: a client that renders `properties` was told a batch edit takes an
+    // array and nothing else, and had to discover the eight shapes one refusal
+    // at a time. The branches were always published underneath and remain the
+    // contract; this makes the summary say what they say.
+    const items = spec.items;
+    const variants = Array.isArray(items?.oneOf) ? items.oneOf : Array.isArray(items?.anyOf) ? items.anyOf : null;
+    if (variants && variants.length) {
+      const shapes = variants
+        .map((variant) => {
+          // The discriminant, when there is one — `{type: 'set_text', …}` reads
+          // as `set_text{…}` rather than as one anonymous shape among eight.
+          const props = variant?.properties || {};
+          const tag =
+            props.type?.const ?? props.type?.enum?.[0] ?? props.action?.const ?? props.action?.enum?.[0] ?? null;
+          const required = new Set(variant?.required || []);
+          const names = Object.keys(props)
+            .filter((name) => name !== 'type' && name !== 'action')
+            .map((name) => (required.has(name) ? name : `${name}?`));
+          const body = names.length ? `{${names.join(', ')}}` : '{}';
+          return tag ? `${tag}${body}` : body;
+        })
+        .filter(Boolean);
+      return shapes.length ? `[one of ${shapes.join(' | ')}]` : '[{…}]';
+    }
+    if (items?.type === 'object') {
+      const inner = fieldsOf(items);
+      return inner ? `[${inner}]` : '[{…}]';
+    }
+    return null;
   }
   if (spec.type !== 'object' || !spec.properties) return null;
   const required = new Set(spec.required || []);
@@ -901,6 +1286,15 @@ function advertised(schema) {
     // suite green by making its question meaningless.
     safeParse: (value) => schema.safeParse(value),
     parse: (value) => schema.parse(value),
+    // AND THE TREE ITSELF, for the one reader that needs the schema rather than
+    // an answer from it. test/schema-strictness.js walks the CLOSED tree asking
+    // each node, through `openSourceOf`, what it was before the rebuild, and
+    // requires the two to publish the same keywords — the check that would have
+    // caught twelve bounds being deleted. There is no way to do that through a
+    // `safeParse`, and the schema a tool is registered with is otherwise
+    // reachable only for the eight domains that export theirs. Not read by the
+    // SDK, which looks at `~standard` and nothing else.
+    schema,
   };
 }
 
@@ -923,6 +1317,51 @@ function issuesOf(error) {
 }
 
 /**
+ * The same object, with unknown keys refused rather than dropped.
+ *
+ * Only touches a plain object schema. Anything that is not object-shaped — a
+ * union, something with a refinement wrapped round it — is handed back
+ * untouched, because rebuilding one from `.shape` would lose whatever the
+ * wrapper was there to add.
+ *
+ * AN ALREADY-STRICT ROOT IS NOT A CLOSED SCHEMA, AND USED TO BE TREATED AS ONE.
+ *
+ * There was a second early return here: a schema whose own catchall is `never`
+ * was handed straight back. That reads as an optimisation and is a hole, because
+ * strictness at the top says nothing whatever about the objects underneath —
+ * which is the entire argument for `closeShape` over `z.strictObject` two
+ * functions up: "a mistyped field inside `node` is exactly as invisible as a
+ * mistyped field beside it, and rather more likely". Measured through
+ * `publishChecked` with `z.strictObject({ node: z.object({ a }) })`: the call
+ * `{node:{a:'x', stackiUnknownKey:1}}` was accepted, the key deleted, and the
+ * handler RAN with arguments nobody wrote. None of the six non-domain tools
+ * declares a strict root today, so nothing on the shipping surface was open —
+ * the defect was that the guard sat one `z.strictObject` away from silently
+ * reopening everything beneath it, on the day somebody closed a root by hand
+ * believing that made it safer.
+ *
+ * Rebuilding an already-strict object costs nothing it can lose: `closeShape`
+ * produces a strict object either way, and `carried()` puts the original's own
+ * checks and description back.
+ */
+function closedObject(schema) {
+  const shape = schema && typeof schema === 'object' ? schema.shape : null;
+  if (!shape || typeof shape !== 'object') return schema;
+  // `closeShape`, not `z.strictObject`, so a nested argument is closed here for
+  // the same reason it is inside a domain branch: `audit`'s `viewports` takes
+  // objects, and a key added beside `width` and `height` was dropped without a
+  // word. What stays open is what should — a record's VALUES, where arbitrary
+  // keys are the point.
+  //
+  // Through `carried()`, so the top-level object of a non-domain tool keeps its
+  // own checks and description too. Nothing on the surface hangs a check on a
+  // tool's outermost object today; the five tools that come through here are
+  // rebuilt by the same rule as everything below them so that the day one does,
+  // it is not deleted on the way to being published.
+  return carried(closeShape(shape), schema);
+}
+
+/**
  * The same refusal for a tool that is not a domain.
  *
  * The fix below was applied to the eight domain tools and stopped there, so
@@ -935,6 +1374,199 @@ function issuesOf(error) {
  * They have no `action` to be wrong about, so there is no bad_action half; the
  * envelope is otherwise the domain one, down to the `issues` vocabulary.
  */
+/**
+ * THE SHAPE OF A REFUSAL, DECLARED RATHER THAN RELIED UPON.
+ *
+ * The five non-domain tools publish the PAYLOAD they answer with when they
+ * work, and `badToolArguments` below answers something else entirely: no
+ * `revision`, no `timestamp`, and two fields those payloads never declare. That
+ * shipped only because both the SDK server and the official client skip output
+ * validation when `isError` is set -- so the declared contract was false, and
+ * the day either stops skipping, an argument mistake on those tools answers
+ * with nothing at all rather than with something wrong.
+ *
+ * Publishing `z.union([Payload, ToolRefusal])` makes the declaration true
+ * without loosening the success half: a payload still has to be exactly a
+ * payload. It is the move `audit` already made by declaring the four fields
+ * its gate refusal carries.
+ *
+ * AND IT IS STRICT, ON A SURFACE WHOSE WHOLE SCHEMA MECHANISM EXISTS TO STOP AN
+ * OBJECT ACCEPTING KEYS IT DOES NOT DECLARE.
+ *
+ * This was `z.object`, which STRIPS. Because `orRefusal(X)` is
+ * `z.union([X, ToolRefusal])`, that made the refusal branch a hole straight
+ * through the declared output schema of the four tools that use it --
+ * get_context, capture, get_comments and comment: ANY value carrying
+ * `{ok:false, code, message}` validated against it no matter what else it held.
+ * Measured: a value carrying nothing but `ok`, a code, a message and a fourth
+ * key called `smuggled` parsed clean, with `smuggled` silently deleted from the
+ * parse result. The two things a
+ * refusal on this surface must never carry are an undeclared field and a host
+ * absolute path, and a contract check that validates a refusal against the
+ * schema its tool publishes was being answered yes either way.
+ *
+ * The advertised document does not change: zod already emits
+ * `additionalProperties: false` for a stripping object under `io: 'output'`,
+ * which is the direction the SDK converts an output schema in. What closes here
+ * is the gap between what that document says and what the schema accepts.
+ */
+const ToolRefusal = z.strictObject({
+  ok: z.literal(false),
+  code: z.string(),
+  message: z.string(),
+  operation: z.string().optional(),
+  issues: z
+    .array(
+      z.strictObject({ path: z.array(z.union([z.string(), z.number()])), message: z.string(), code: z.string().optional() })
+    )
+    .optional(),
+});
+
+/** Two JSON Schema fragments, compared as documents rather than as objects. */
+const sameFragment = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** A fragment's alternatives: the members of a bare `anyOf`, or the thing itself. */
+const alternativesOf = (spec) =>
+  spec && typeof spec === 'object' && Array.isArray(spec.anyOf) && Object.keys(spec).length === 1 ? spec.anyOf : [spec];
+
+/**
+ * THE UNION DELETED THE PUBLISHED SHAPE OF THE TOOLS IT WAS APPLIED TO.
+ *
+ * `z.union([Payload, ToolRefusal])` emits `{anyOf:[{…},{…}]}` and NOTHING at the
+ * top level — no `properties`, no `required`. Measured on all four tools that
+ * declare one: `get_context`, `capture`, `get_comments` and `comment` each went
+ * from publishing a named, typed field list to publishing two nested branches
+ * and a root with `$schema` and `anyOf` in it. A host that reads
+ * `outputSchema.properties` to render or to type a result — the same client
+ * class `summarised()` a few hundred lines up exists to serve — got nothing at
+ * all. Declaring the refusal made the declaration TRUER and the document LESS
+ * USEFUL, which is not a trade this surface has to make.
+ *
+ * So the branches are kept exactly as they are, and the fields they declare are
+ * ALSO published at the top level, where a client that has never heard of
+ * `anyOf` will look. Both readings stay true at once:
+ *
+ *   - a hoisted property is asserted against every answer, so it may only be
+ *     hoisted in a form BOTH branches satisfy. A name that appears once is
+ *     copied; a name both branches declare identically is copied once; a name
+ *     they declare DIFFERENTLY (`ok` is `boolean` in a payload and `const
+ *     false` in a refusal) is published as the alternatives side by side, which
+ *     is the only shape that accepts both. Nothing is narrowed and nothing that
+ *     used to validate stops validating.
+ *
+ *   - `required` CANNOT carry the payload's list, and this is the one place the
+ *     two readings genuinely cannot both hold. A top-level `required` is
+ *     asserted against every answer too, so publishing the payload's required
+ *     fields there would refuse every refusal — reinstating exactly the false
+ *     declaration `orRefusal` was written to end. What is published instead is
+ *     the INTERSECTION: the fields every possible answer really does carry.
+ *     For `get_comments` and `comment` that is `ok`, which is the useful half
+ *     anyway ("every answer says whether it worked"); for `get_context` and
+ *     `capture` the payload and the refusal share no field at all, so the
+ *     honest answer is that nothing is guaranteed, and `required` is omitted
+ *     rather than asserted falsely. The per-branch `required` lists are still
+ *     there, in the branches, for a client that reads them.
+ *
+ * The alternative — collapsing the two branches into one object with everything
+ * optional — would publish `properties` and `required` at the root and stop
+ * saying which COMBINATIONS are legal, so `{}` would validate against a tool
+ * that can never answer with it. That trades a true document for a readable
+ * one; this trades nothing.
+ */
+function hoistUnionProperties(doc) {
+  const branches = Array.isArray(doc?.anyOf) ? doc.anyOf : null;
+  const shaped = branches && branches.length > 1 && branches.every((b) => b && typeof b === 'object' && b.properties && typeof b.properties === 'object');
+  // Not a union of objects: hand back exactly what was converted. A shape this
+  // does not understand must not be half-rewritten.
+  if (!shaped) return doc;
+  const properties = {};
+  for (const branch of branches) {
+    for (const [name, spec] of Object.entries(branch.properties)) {
+      if (!(name in properties)) {
+        properties[name] = spec;
+        continue;
+      }
+      if (sameFragment(properties[name], spec)) continue;
+      const merged = [];
+      for (const alt of [...alternativesOf(properties[name]), ...alternativesOf(spec)]) {
+        if (!merged.some((m) => sameFragment(m, alt))) merged.push(alt);
+      }
+      properties[name] = { anyOf: merged };
+    }
+  }
+  const required = branches.reduce((kept, branch) => kept.filter((name) => (branch.required || []).includes(name)), [...(branches[0].required || [])]);
+  return { ...doc, type: 'object', properties, ...(required.length ? { required } : {}) };
+}
+
+/**
+ * A schema that VALIDATES as itself and PUBLISHES with its fields hoisted.
+ *
+ * Same shape as `advertised()` and for a related reason: the SDK reads
+ * `~standard` and nothing else, so the document a client is served can be
+ * improved without touching what the server actually checks an answer against.
+ * `validate` is delegated to the real schema rather than reimplemented, so a
+ * payload with a wrong-typed field is refused exactly as it was — that
+ * assertion exists in test/schema-strictness.js and it is still the same zod
+ * answering it.
+ */
+function publishedAs(schema, shapeDocument) {
+  const std = schema['~standard'];
+  const convert = std.jsonSchema || {
+    input: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'input', unrepresentable: 'any' }),
+    output: (o) => z.toJSONSchema(schema, { target: o?.target || 'draft-2020-12', io: 'output', unrepresentable: 'any' }),
+  };
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'stacki',
+      jsonSchema: {
+        input: (o) => shapeDocument(convert.input(o)),
+        output: (o) => shapeDocument(convert.output(o)),
+      },
+      validate: (value) => schema['~standard'].validate(value),
+    },
+    safeParse: (value) => schema.safeParse(value),
+    parse: (value) => schema.parse(value),
+    // The union itself, for the readers that need the schema rather than an
+    // answer from it — the refusal-branch derivation in
+    // test/schema-strictness.js finds the four tools by looking for
+    // `ToolRefusal` among a published union's options.
+    schema,
+  };
+}
+
+/** What a tool publishes when its answer is either a payload or a refusal. */
+const orRefusal = (payload) => publishedAs(z.union([payload, ToolRefusal]), hoistUnionProperties);
+
+/**
+ * A CLAUSE, NOT A SENTENCE — THE FULL STOP THE ISSUE HAD ALREADY WRITTEN.
+ *
+ * `issuesOf` ends its own sentence ("name is required.") and both composers
+ * below dropped that straight into a longer one and then punctuated again. A
+ * real agent received this from the packaged app, during the native dogfood:
+ *
+ *   asset.rename could not run — name: name is required.. asset.rename takes: path, name.
+ *
+ * Two full stops, because two layers each believed they were the last one. The
+ * same seam puts a stop in front of a semicolon as soon as there are two issues
+ * — "path: path is required.; name: name is required." — which is the identical
+ * mistake wearing different punctuation.
+ *
+ * So a clause is a clause here: whatever sentence-ending punctuation the issue
+ * brought with it is trimmed, and the composer — the only thing that knows
+ * whether a clause is followed by a semicolon, by another sentence, or by the
+ * end — puts one back exactly once. Nothing about WHICH issue is reported
+ * changes. This is only the surface talking to an agent in a sentence it has to
+ * parse, which is the thing the surface is for.
+ */
+const asClause = (issue) => `${(issue?.path || []).join('.') || 'arguments'}: ${String(issue?.message ?? '').replace(/[.\s]+$/, '')}`;
+
+/** Those clauses as one sentence, ended once. */
+const clausesOf = (issues) => `${issues.map(asClause).join('; ')}.`;
+
+/** Whatever zod called the failure at one top-level field, if it named one. */
+const zodCodeAt = (error, field) => (error?.issues || []).find((i) => (i?.path || [])[0] === field)?.code || null;
+
 function badToolArguments(tool, error) {
   const issues = issuesOf(error);
   return {
@@ -942,7 +1574,7 @@ function badToolArguments(tool, error) {
     code: 'bad_arguments',
     operation: tool,
     issues,
-    message: `${tool} could not run — ${issues.map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`).join('; ')}`,
+    message: `${tool} could not run — ${clausesOf(issues)}`,
   };
 }
 
@@ -962,7 +1594,22 @@ function badToolArguments(tool, error) {
  * back as an output-validation crash instead of an answer.
  */
 function publishChecked(server, name, config, handler) {
-  const schema = config.inputSchema;
+  // CLOSED HERE TOO, AND FOR THE SAME REASON.
+  //
+  // `closed()` was applied to the eight domain unions and stopped there, which
+  // left the six tools that are not domains — get_context, capture,
+  // get_comments, comment, get_capabilities and audit — still stripping a key
+  // they did not recognise. That is the same silent retarget, on tools where it
+  // is just as consequential: `audit({ rout: '/pricing' })` dropped the typo
+  // and audited the site root instead, reporting findings about a page nobody
+  // asked about; `get_comments({ scop: 'selection' })` widened a read of one
+  // element's reviews to the whole project.
+  //
+  // Applied at the composition point rather than at six registration sites, so
+  // a tool added beside them tomorrow is closed without its author knowing to
+  // ask — which is the same argument the `checked` facade in tools.js already
+  // makes for the refusal shape.
+  const schema = closedObject(config.inputSchema);
   return server.registerTool(name, { ...config, inputSchema: advertised(schema) }, async (args, extra) => {
     const parsed = schema.safeParse(args || {});
     if (!parsed.success) return answer(badToolArguments(name, parsed.error));
@@ -979,28 +1626,86 @@ function publishChecked(server, name, config, handler) {
  */
 function badArguments(domain, action, error) {
   const known = actionsOf(domain);
+  // NO ACTION AT ALL IS A MISSING ARGUMENT, NOT AN UNKNOWN ACTION.
+  //
+  // These were one branch, and a call with no `action` came back as this,
+  // reproduced against the packaged app during the native dogfood:
+  //
+  //   {"ok":false,"code":"bad_action","operation":"project.",
+  //    "message":"Stacki has no project.(no action). Call get_capabilities for
+  //               what it does have."}
+  //
+  // `operation` is "project." with a dangling dot — a value a client reads as
+  // an operation name, and there is no operation called "project." — and
+  // "Stacki has no project.(no action)" is not a sentence. Underneath the
+  // wording it was also the wrong classification: nothing unknown was named,
+  // a REQUIRED ARGUMENT was left out, and `bad_arguments` is the code this
+  // surface uses for that everywhere else. An agent branching on `bad_action`
+  // goes looking for a name it got wrong; there is no name to look at.
+  //
+  // What was right about the old answer is kept whole: it listed every action
+  // the tool has, which is the one thing that gets the caller unstuck, so
+  // `actions` and the sentence both still carry the list.
+  if (typeof action !== 'string') {
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      // The tool, not "project." — a domain with no action is named by the
+      // domain, which is the only true thing there is to say about it.
+      operation: domain,
+      // Stacki's own sentence for a value that is simply not there, in the
+      // shape `issuesOf` gives every other absent argument — and carrying
+      // ZOD'S OWN issue code for the discriminator rather than a hand-picked
+      // one. Two reasons, and the second is the load-bearing one: whatever zod
+      // called it is the truthful label for what failed, and a refusal-code
+      // literal written here would be swept up by the enumeration discovery in
+      // test/refusal-contract.js, which reads `code:` properties out of this
+      // file and cannot tell a zod issue code from a refusal code.
+      issues: [{ path: ['action'], message: 'action is required.', ...(zodCodeAt(error, 'action') ? { code: zodCodeAt(error, 'action') } : {}) }],
+      actions: known,
+      message: `${domain} needs an action and this call named none. ${domain} takes: ${known.join(', ')}.`,
+    };
+  }
   // An action the tool does not have is a bad ACTION, not a bad argument — the
   // same envelope the dispatcher produces, rather than zod's "Invalid
   // discriminator value" followed by the list in prose.
-  if (typeof action !== 'string' || !known.includes(action)) {
+  if (!known.includes(action)) {
     return {
       ok: false,
       code: 'bad_action',
-      operation: `${domain}.${typeof action === 'string' ? action : ''}`,
-      message: `Stacki has no ${domain}.${typeof action === 'string' ? action : '(no action)'}. Call get_capabilities for what it does have.`,
+      operation: `${domain}.${action}`,
+      message: `Stacki has no ${domain}.${action}. Call get_capabilities for what it does have.`,
       actions: known,
     };
   }
   const issues = issuesOf(error);
+  // AND WHAT IT WOULD HAVE TAKEN.
+  //
+  // Naming the key the caller got wrong is half an answer: "Unrecognized key:
+  // \"rout\"" tells an agent to stop guessing but not what to guess next, and
+  // the top-level `properties` block the schema publishes lists every branch's
+  // arguments side by side, which is what invited the mistake. The accepted
+  // set is right here in the schema, so it travels with the refusal — as a
+  // field a client can read, and in the sentence for one that only shows text.
+  const accepts = acceptedBy(domain, action);
   return {
     ok: false,
     code: 'bad_arguments',
     operation: `${domain}.${action}`,
     issues,
-    message: `${domain}.${action} could not run — ${issues
-      .map((i) => `${i.path.join('.') || 'arguments'}: ${i.message}`)
-      .join('; ')}`,
+    accepts,
+    message:
+      `${domain}.${action} could not run — ${clausesOf(issues)}` +
+      (accepts.length ? ` ${domain}.${action} takes: ${accepts.join(', ')}.` : ''),
   };
+}
+
+/** The argument names one action actually declares, read from its own branch. */
+function acceptedBy(domain, action) {
+  const schema = DOMAIN_SCHEMAS[domain];
+  const branch = schema?.options?.find((o) => o.shape?.action?.def?.values?.[0] === action || o.shape?.action?.def?.value === action);
+  if (!branch?.shape) return [];
+  return Object.keys(branch.shape).filter((k) => k !== 'action');
 }
 
 /**
@@ -1011,25 +1716,108 @@ function badArguments(domain, action, error) {
  * property of the wire, where an agent chooses argument names from two schemas
  * that disagreed, and it stops there. `text` wins when both are sent, because
  * `text` is what the action's own schema names first.
+ *
+ * AND IT HAS TO WIN IN BOTH FORMS, WHICH IS THE WHOLE POINT OF AN ALIAS.
+ *
+ * The batch branch used to copy `text` across only when `value` was NOT a
+ * string, so a call sending both got `text` from the single form and `value`
+ * from the batch — two precedences for one pair of names, on the one operation
+ * this alias exists because agents already confuse. An agent that filled both
+ * in (a client that maps a field twice, a retry that adds the other spelling
+ * to a call that was refused) wrote different words in the same element
+ * depending on which shape it happened to reach for, and both answered ok.
+ *
+ * So both branches read the same way: `text` if it is a string, `value`
+ * otherwise, and the name the layer underneath uses is the one that goes out —
+ * `text` for the action, `value` for the operation. The other spelling is
+ * removed rather than left riding along, so nothing downstream can pick the
+ * loser back up.
  */
+const preferredText = (args) => (typeof args.text === 'string' ? args.text : args.value);
+
 function normalise(domain, action, args) {
   if (domain !== 'target') return args;
   if (action === 'set_text') {
-    const text = typeof args.text === 'string' ? args.text : args.value;
+    const text = preferredText(args);
     const { value, ...rest } = args;
     return { ...rest, ...(typeof text === 'string' ? { text } : {}) };
   }
   if (action === 'edit' && Array.isArray(args.operations)) {
     return {
       ...args,
-      operations: args.operations.map((op) =>
-        op && op.type === 'set_text' && typeof op.value !== 'string' && typeof op.text === 'string'
-          ? { ...op, value: op.text }
-          : op
-      ),
+      operations: args.operations.map((op) => {
+        if (!op || op.type !== 'set_text') return op;
+        const value = preferredText(op);
+        const { text, ...rest } = op;
+        return { ...rest, ...(typeof value === 'string' ? { value } : {}) };
+      }),
     };
   }
   return args;
+}
+
+/**
+ * THE ONE OPERATION THAT CAN ARRIVE WITH NO ARGUMENT AT ALL — IN EITHER FORM.
+ *
+ * `set_text` declares BOTH its spellings optional, which is the price of
+ * accepting `value` as an alias for `text`: see the note beside
+ * `action: "set_text"` in `TargetInput`. So a call carrying NEITHER is
+ * schema-legal in both shapes, and the check that closes that hole has to cover
+ * both — which it did not.
+ *
+ * Measured on the shipping surface, one ref, two calls:
+ *
+ *   target({action:"set_text", ref})                      → bad_arguments
+ *   target({action:"edit", ref, operations:[{type:"set_text"}]}) → {"ok":true}
+ *
+ * The second reached electron/mcp/agent/index.js, where `NORMALIZE.set_text` is
+ * `String(o.value ?? '')` — so the batch form ACCEPTED an operation with no
+ * text in it and replaced the element's words with the empty string. One
+ * surface, two answers, and the one that answered yes silently deleted what was
+ * there. An agent that has been refused the action form and reaches for the
+ * batch shape instead — which is exactly what the alias note records a real
+ * Claude Code doing — got a wipe and an `ok`.
+ *
+ * So both forms are refused HERE, by one function, in one shape: the same
+ * `bad_arguments` code, the same `target.<action>` operation naming, an issue
+ * pointing at the argument that is missing, and a sentence that names both
+ * spellings. A batch is refused whole, before `api.run`, so nothing in it is
+ * applied — a partly-applied batch would be a worse answer than either.
+ *
+ * An EMPTY STRING is not missing. `{text:""}` and `{value:""}` are a deliberate
+ * "make this element say nothing", and both forms have always taken them.
+ *
+ * @returns {object|null} the refusal, or null when there is nothing to refuse.
+ */
+function textlessSetText(action, shaped) {
+  if (action === 'set_text') {
+    if (typeof shaped.text === 'string') return null;
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      operation: 'target.set_text',
+      issues: [{ path: ['text'], message: 'set_text needs the new text' }],
+      message:
+        'set_text needs the new text. Send it as `text` — `value` is accepted too, because that is what the same operation is called inside `edit`.',
+    };
+  }
+  if (action === 'edit' && Array.isArray(shaped.operations)) {
+    // `normalise` has already run, so the surviving spelling on an operation is
+    // `value` whichever name the caller used. A set_text with neither is the
+    // one this finds.
+    const at = shaped.operations.findIndex((op) => op && op.type === 'set_text' && typeof op.value !== 'string');
+    if (at < 0) return null;
+    return {
+      ok: false,
+      code: 'bad_arguments',
+      operation: 'target.edit',
+      issues: [{ path: ['operations', at, 'value'], message: 'set_text needs the new text' }],
+      message:
+        `operations.${at} is a set_text with no text in it. Send it as \`value\` — \`text\` is accepted too, because ` +
+        'that is what the same operation is called as an action. Nothing in this batch was applied.',
+    };
+  }
+  return null;
 }
 
 /**
@@ -1067,6 +1855,8 @@ function answer(result, { spaces = 2, images = [] } = {}) {
 
 module.exports = {
   registerAgentTools,
+  ToolRefusal,
+  orRefusal,
   // Exported so the two tools that live outside this file can refuse in exactly
   // the same shape rather than in one that resembles it. See auditTool.js.
   answer,
@@ -1077,6 +1867,9 @@ module.exports = {
   badToolArguments,
   DESCRIPTIONS,
   Envelope,
+  // What a closed schema was before it was closed, for the invariance check in
+  // test/schema-strictness.js. See OPEN_SOURCE.
+  openSourceOf,
   TargetInput,
   StyleInput,
   SourceInput,
@@ -1091,4 +1884,9 @@ module.exports = {
   DESTRUCTIVE,
   REMOTE,
   TOOL_NAMES: ['get_capabilities', ...DOMAINS],
+  // Exported so a test can grade what a client that renders `properties` is
+  // actually shown — which is the thing `summarised` exists to fix, and the
+  // thing that had regressed for an array of alternatives.
+  summarised,
+  fieldsOf,
 };

@@ -36,6 +36,13 @@ export type SelectorInfo = {
   pseudoElement: string | null
   /** True when matching had to guess (e.g. sibling combinator we can't verify). */
   approximate: boolean
+  /**
+   * How many of this selector's compounds Astro's scoping would mark, and
+   * therefore how much of `specificity` is the scope marker rather than what
+   * the author typed. Zero for every unscoped rule, and for a scoped one under
+   * `scopedStyleStrategy: 'where'`, where the marker costs nothing.
+   */
+  scopeMarkers?: number
 }
 
 /** A parsed CSS rule, tied back to its live postcss node for editing. */

@@ -45,13 +45,17 @@ const check = (what, condition, detail) => {
 const APP = path.join(__dirname, '..', 'release', 'mac-universal', 'Stacki.app');
 const { connectMcp, MODERN_VERSION } = require('./support/mcpWire.js');
 const H = require('./agent-harness.js');
+const { skipSuite } = require('./support/suiteGuard.js');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PORT = 43970 + Math.floor(Math.random() * 20);
 
 (async () => {
   if (!fs.existsSync(APP)) {
-    console.log('packaged-mcp: skipped  [no release/mac-universal/Stacki.app — run npm run dist:mac:unsigned]');
+    // DECLARED, not silent — see test/support/suiteGuard.js. Same line and
+    // same exit 0 on a laptop; a failure under STACKI_NO_SKIPS, which the job
+    // that builds the bundle sets.
+    skipSuite('packaged-mcp', 'no release/mac-universal/Stacki.app — run npm run dist:mac:unsigned');
     return;
   }
 

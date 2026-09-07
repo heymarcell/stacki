@@ -10,6 +10,12 @@
 //
 // The project is never written to: its src/ tree is copied to a temporary
 // directory first, and the copy is what gets edited.
+//
+// The project itself is built by test/support/contentFixture.js — nine file
+// formats, each holding something a re-serializer would destroy. It used to
+// default to a personal folder under ~/Downloads, so on every machine but one,
+// and on every CI runner, this printed "skipped" and asserted nothing. A path
+// given as argv[2] or STACKI_CONTENT_FIXTURE still wins.
 
 const fs = require('fs');
 const path = require('path');
@@ -25,8 +31,7 @@ const formats = {
   frontmatter: require('../electron/formats/frontmatter.js'),
 };
 
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const source = path.resolve(process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -58,10 +63,19 @@ function changedLines(a, b) {
 const read = (root, rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 
 (async () => {
-  if (!fs.existsSync(path.join(source, 'src', 'content.config.ts'))) {
-    console.log(`content-entries: skipped (no project at ${source})`);
+  let fixture;
+  try {
+    fixture = contentFixture('content-entries', { log: (m) => console.log(`content-entries: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const source = fixture.source;
+
   const config = await readContentConfig(source, { force: true });
   if (config.error) {
     console.error(`content-entries: could not read the config — ${config.error}`);

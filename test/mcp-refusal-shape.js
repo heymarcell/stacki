@@ -112,7 +112,7 @@ const TOKEN = 'refusal-shape-token-aaaaaaaaaaaaaaaa';
 
   const { client, close } = await connectMcp({ url: server.url, token: TOKEN, era: 'modern', name: 'refusal-shape' });
 
-  const call = async (name, args = {}) => client.callTool({ name, arguments: args }, undefined, { timeout: 30000 });
+  const call = async (name, args = {}) => client.callTool({ name, arguments: args }, { timeout: 30000 });
 
   try {
     // --- EVERY TOOL THAT CAN REFUSE, AND WHAT ARRIVES.
@@ -177,10 +177,10 @@ const TOKEN = 'refusal-shape-token-aaaaaaaaaaaaaaaa';
       });
       await open.start();
       const second = await connectMcp({ url: open.url, token: TOKEN, era: 'modern', name: 'refusal-shape-2' });
-      const res = await second.client.callTool({ name: 'audit', arguments: { viewports: ['phone'] } }, undefined, { timeout: 30000 });
+      const res = await second.client.callTool({ name: 'audit', arguments: { viewports: ['phone'] } }, { timeout: 30000 });
       check('an audit that cannot run is an error too, not only a refused one', res.isError === true, short({ isError: res.isError, sc: res.structuredContent }));
       check('  and it says why', res.structuredContent?.code === 'no_preview', short(res.structuredContent));
-      const good = await second.client.callTool({ name: 'get_comments', arguments: {} }, undefined, { timeout: 30000 });
+      const good = await second.client.callTool({ name: 'get_comments', arguments: {} }, { timeout: 30000 });
       check('  while a review read that works is not an error', good.isError !== true, short({ isError: good.isError }));
       await second.close();
       await open.stop();

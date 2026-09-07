@@ -33,8 +33,8 @@ Phase A is closed and independently reviewed. These are facts to preserve, not w
 to redo:
 
 - MCP protocol 2026-07-28, proven with the official modern client
-- 111 Agent operations across 8 domains: 110 FULL + 1 BOUNDARY (`git.publish`)
-- 444/444 permission subjects covered
+- 112 Agent operations across 8 domains: 111 FULL + 1 BOUNDARY (`git.publish`)
+- 448/448 permission subjects covered
 - 13 top-level MCP tools
 - Real Astro content fixture; real dev lifecycle; correct component-extraction transaction
 - Target mutation: MCP -> source -> model -> Astro -> pixels -> undo

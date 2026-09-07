@@ -32,6 +32,7 @@ const H = require('../agent-harness.js');
 const { EXTRA, writeBinary } = require('./mcpWireFixture.js');
 const { ensureAstro, astroCached, CACHE } = require('../agent-canvas-fixture.js');
 const { createStackiMcpServer } = require('../../electron/mcp/server.js');
+const { createContextStore } = require('../../electron/mcp/contextStore.js');
 const { connectMcp } = require('./mcpWire.js');
 const net = require('node:net');
 
@@ -245,6 +246,10 @@ async function startWireRig({
   let token = `wire-rig-token-${port}-aaaaaaaaaaaa`;
   let url = `http://127.0.0.1:${port}/mcp`;
 
+  // The same normaliser the app uses, fed by the same trail resolver, so the
+  // snapshot this rig serves is the shape the schema declares.
+  const contextStore = createContextStore({ resolveTrail: (keys) => harness.resolveTrail(keys) });
+
   const buildServer = (port, token) => createStackiMcpServer({
     port,
     token,
@@ -253,7 +258,26 @@ async function startWireRig({
     // The four core tools still have to exist for the endpoint to build. The
     // context one is answered from the App's own published payload, so
     // get_context over the wire is the App's real snapshot.
-    getContext: async () => harness.payload(),
+    //
+    // THROUGH THE STORE, THE WAY THE SHIPPED SERVER DOES IT.
+    //
+    // This handed back `harness.payload()` — the RAW renderer payload — while
+    // electron/mcp/index.js feeds that through `createContextStore` and answers
+    // `store.read()`. The raw payload has no `revision`, no `timestamp`, no
+    // `selection.status`, no `selection.source` and no `selection.sourceTrail`,
+    // so every `get_context` over this rig failed its own declared output
+    // schema and came back a refusal — while the comment above claimed it was
+    // the App's real snapshot.
+    //
+    // It was invisible because nothing in the coverage set reads context over
+    // the wire and then uses it. A held-out evaluation did, and paid for it:
+    // the same ten prompts took 59 calls against 46, and 2.04M model tokens
+    // against 1.48M, because the agent kept re-deriving what a working
+    // get_context would have told it once.
+    getContext: async () => {
+      contextStore.publish(harness.payload());
+      return contextStore.read();
+    },
     capture: async (args) => ({
       image: null,
       mimeType: null,
@@ -326,17 +350,65 @@ async function startWireRig({
   // and it is slower still the first time a fixture runs one. The client's
   // default deadline is shorter than that, so a working lifecycle came back as
   // "Request timed out" — a wire timeout dressed up as an operation failure.
+  //
+  // AND IT WAS NOT ACTUALLY BEING ASKED FOR. Both calls below passed the v1
+  // THREE-argument form, `callTool(params, resultSchema, options)`, with
+  // `undefined` in the middle. @modelcontextprotocol/client 2.0.0 declares
+  // `callTool(params, options?)` — two arguments, and the runtime reads the
+  // second one as the options — so the third was dropped on the floor and every
+  // wire call in this repository ran on the SDK's own 60s default while this
+  // constant said 180,000 and the comment above explained why it had to.
+  // Measured on the same call: the three-argument form answered
+  // `Request timed out` at 61,013ms; the two-argument form honoured its budget
+  // and ran to a real answer. A deadline that is not the deadline is worse than
+  // none, because the number written here is the one a reader trusts.
   const CALL_TIMEOUT_MS = 180000;
 
   const call = async (domain, action, args = {}) => {
-    const res = await client.callTool({ name: domain, arguments: { action, ...args } }, undefined, { timeout: CALL_TIMEOUT_MS });
+    const res = await client.callTool({ name: domain, arguments: { action, ...args } }, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
   };
 
   /** get_capabilities, get_context and the rest of the non-domain surface. */
   const tool = async (name, args = {}) => {
-    const res = await client.callTool({ name, arguments: args }, undefined, { timeout: CALL_TIMEOUT_MS });
+    const res = await client.callTool({ name, arguments: args }, { timeout: CALL_TIMEOUT_MS });
     return { envelope: res.structuredContent, raw: res };
+  };
+
+  // THE OTHER HAND ON THE DOCUMENT: the person at the keyboard.
+  //
+  // Every `call()` above is an AGENT, and the four agent doors into the open
+  // document — commit, writeOpenSource, undo/redo and extractComponent — are on
+  // the renderer's serialising queue, so one agent call can no longer land
+  // inside another. That is the point of the queue, and it means an agent call
+  // is no longer able to play the part of a concurrent change arriving DURING
+  // an operation.
+  //
+  // A person still is. ⌘⌫ on the canvas is a `keydown` on the document, handled
+  // by the App's own shortcut effect, which calls `removeNode` -> `mutateModel`
+  // and takes no queue at all — the same unqueued path the menu's "make a
+  // component" uses. So a scenario that needs a real edit to land mid-operation
+  // presses the key, exactly as the user would.
+  //
+  // The window is captured HERE rather than read off `global` at press time:
+  // `H.start` puts its jsdom on the globals, and a later rig would otherwise
+  // steer this one's keystrokes into someone else's document.
+  const win = global.window;
+  const doc = global.document;
+  /** One keystroke, on the document, where the App's shortcut effect listens. */
+  const press = (key, init = {}) => {
+    doc.dispatchEvent(new win.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init }));
+  };
+  /**
+   * Delete whatever is selected in Stacki, the way a person does.
+   *
+   * Then wait: `removeNode` schedules the save rather than awaiting one, so
+   * without a turn of the loop the removal is in the model and not yet on disk,
+   * and a scenario reading the file would be told the person had done nothing.
+   */
+  const deleteSelection = async (ms = 120) => {
+    press('Backspace');
+    await H.settle(ms);
   };
 
   let stopped = false;
@@ -398,7 +470,7 @@ async function startWireRig({
     return { problems: stopProblems };
   };
 
-  return { root, harness, client, call, tool, stop, url, token, port, withDeps, realDevServer };
+  return { root, harness, client, call, tool, press, deleteSelection, stop, url, token, port, withDeps, realDevServer };
 }
 
 module.exports = { startWireRig, astroCached };

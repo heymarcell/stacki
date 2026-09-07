@@ -27,10 +27,59 @@ const path = require('node:path');
 const registry = require('./registry');
 const permissions = require('./permissions');
 const refs = require('./refs');
-const { runMain, resolveContentEntry } = require('./domains');
+const { runMain, resolveContentEntry, withoutHostPaths } = require('./domains');
 const { patchBetween } = require('./patch');
 const { relativeTo } = require('./paths');
 const { digestOf } = require('./digest');
+
+/**
+ * Every string in a refusal, said the way `withoutHostPaths` says one.
+ *
+ * THE HOLE WAS THAT IT WAS APPLIED TO ONE FIELD. A renderer refusal is an
+ * object, and `message` is only the sentence a person reads; the machinery
+ * beside it carries text too. `project.undo` answers a failed inverse with
+ * `restored.failed`, built in the renderer from `cleanError`, which knows about
+ * ANSI and about Electron's IPC prefix and nothing at all about paths —
+ * measured side by side in one envelope, `message` said "open
+ * 'src/styles/site.css'" and `restored.failed` said "open
+ * '/var/folders/vq/…/src/styles/site.css'". Naming the second field would have
+ * left the third one to find later, so the walk is over the whole answer.
+ *
+ * AND A SECOND REFERENCE TO THE SAME OBJECT IS SCRUBBED TOO.
+ *
+ * The visited set answered `return value` — THE ORIGINAL, UNSCRUBBED OBJECT —
+ * the second time a reference was reached, and it was a set of everything ever
+ * visited rather than of what is on the path being walked, so it fired for an
+ * ordinary graph and not only for a cycle. One error object carried under two
+ * fields of a refusal is that graph, and Electron's IPC uses structured clone,
+ * which PRESERVES shared references: the first field went out project-relative
+ * and the second went out with the host path intact — the exact defect this
+ * function was written to close. Measured on `{restored: e, cause: e}`:
+ * `restored.failed` said "open 'src/styles/one.css'" and `cause.failed` said
+ * "open '/var/folders/…/src/styles/one.css'".
+ *
+ * So the SCRUBBED copy is memoised and handed back on a second visit. A cycle
+ * still terminates — the copy goes into the map before its own fields are
+ * walked, so the reference that closes the loop finds it there — and the loop
+ * now closes onto the scrubbed object rather than reopening the unscrubbed one.
+ */
+function scrubHostPaths(value, root, seen = new WeakMap()) {
+  if (typeof value === 'string') return withoutHostPaths(value, root);
+  if (!value || typeof value !== 'object') return value;
+  // A refusal is plain data, but it is data this process did not build, so a
+  // cycle in it must not be a stack overflow on the way to the wire.
+  if (seen.has(value)) return seen.get(value);
+  if (Array.isArray(value)) {
+    const list = [];
+    seen.set(value, list);
+    for (const item of value) list.push(scrubHostPaths(item, root, seen));
+    return list;
+  }
+  const out = {};
+  seen.set(value, out);
+  for (const [key, item] of Object.entries(value)) out[key] = scrubHostPaths(item, root, seen);
+  return out;
+}
 
 // What the editor's operations actually take.
 //
@@ -106,6 +155,22 @@ function createAgentApi({
   // preview. Main owns the process and knows the moment it binds, so it is
   // asked first and the payload is the fallback.
   getDevUrl = () => null,
+  // WHICH BRANCH IS CHECKED OUT, NOW.
+  //
+  // The same reasoning as `getDevUrl` above, for the same reason and with worse
+  // consequences. The payload is published from a React effect and carries the
+  // branch as of the last render — and App.jsx reads git once, when the project
+  // opens, so "as of the last render" is in practice "as of project open".
+  // Measured: a checkout through the Agent API's OWN git surface, then a ref
+  // minted 2.2 seconds later, still carrying the branch from before the switch;
+  // `git.info` answering `beta` and `project.info` answering `alpha` in
+  // consecutive calls; and a write through that ref succeeding, because the
+  // branch a ref records is part of what makes it stale and this one recorded
+  // the wrong branch.
+  //
+  // Main owns the checkout and knows the moment it moves, so it is asked first
+  // and the payload is the fallback.
+  getBranch = () => null,
   version = '0.0.0',
 } = {}) {
   const gate = permissions.createGate(getAgentMode);
@@ -119,12 +184,20 @@ function createAgentApi({
         return callMain(channel, args);
       },
       devUrl: getDevUrl() || payload?.preview?.url || null,
-      branch: payload?.project?.branch || null,
+      // `??`, not `||`: main answering `null` means "detached, or not a
+      // repository", which is an ANSWER, and falling through to a stale
+      // payload value there would be the whole defect wearing a different hat.
+      branch: getBranch() ?? payload?.project?.branch ?? null,
       payload,
       // The two things the domains need from the ref system: a ref to hand back
       // with a read, and the observation to check a write against.
       sourceRef: (rel) => sourceRef(rel),
       refObservation: (ref, expectedPath) => refObservation(ref, expectedPath),
+      // And the same pair for a conflicted merge, which is a moment rather
+      // than a file. Minted only here, on the MCP side of the boundary: the
+      // panel gets the plain observation over IPC and never sees a ref.
+      mergeRef: (data, observed) => mergeRef(data, observed),
+      mergeBinding: (ref) => mergeBinding(ref),
       // And how text reaches a file, which is not always the same door.
       writeText: (rel, text) => writeProjectText(rel, text),
     };
@@ -304,6 +377,63 @@ function createAgentApi({
   }
 
   /**
+   * A ref for the conflict a merge just reported.
+   *
+   * `at` is what the merge measured before it unwound: the two commits it was
+   * between, and a digest of the bytes git wrote for the clash. It goes in the
+   * OBSERVATION, which is exactly what an observation is for — and the branch
+   * goes in the DATA, so resolving takes the branch out of the ref rather than
+   * out of the call. An agent holding two conflicts cannot then answer one of
+   * them into the other by pairing the wrong pair of arguments.
+   *
+   * Minted with no observation, this would be a ref that proves nothing and
+   * refuses nothing — the same hole a writable node ref with no document
+   * behind it was. So it is not minted at all rather than minted hollow.
+   */
+  function mergeRef(data, observed) {
+    const ctx = context();
+    if (!ctx.root || !data?.branch) return null;
+    if (!observed || typeof observed !== 'object' || !observed.head || !observed.incoming || !observed.digest) return null;
+    return refs.mint(
+      'merge',
+      { branch: data.branch, into: data.into ?? null },
+      { projectRoot: ctx.root, observed: { head: observed.head, incoming: observed.incoming, digest: observed.digest } }
+    );
+  }
+
+  /**
+   * What a merge ref binds a resolve to, or the refusal that says why not.
+   *
+   * Absent is `guard_required` rather than `bad_ref`: "you did not say which
+   * conflict" and "that is not a ref" send an agent to two different places,
+   * and only one of them is where the answer is.
+   */
+  function mergeBinding(ref) {
+    if (ref === undefined || ref === null || ref === '') {
+      return {
+        error: no(
+          'guard_required',
+          'Finishing a merge has to say which conflict the choices answer. Run git.merge, and pass the `mergeRef` ' +
+            'its conflict handed you back here, unchanged. Nothing was merged.'
+        ),
+      };
+    }
+    const parsed = readRef(ref, 'merge');
+    if (!parsed.ok) return { error: parsed };
+    const seen = parsed.observed;
+    if (!seen || !seen.head || !seen.incoming || !seen.digest) {
+      return {
+        error: no(
+          'guard_required',
+          'That mergeRef carries no record of the conflict it was made for, so there is nothing to check these ' +
+            'choices against. Run git.merge again and use the ref it hands back. Nothing was merged.'
+        ),
+      };
+    }
+    return { branch: parsed.data?.branch || null, into: parsed.data?.into ?? null, observed: seen };
+  }
+
+  /**
    * The digest of a project file right now, or nothing when there is no file.
    *
    * A CMS path can name an export inside a page — `src/pages/index.astro#plans`
@@ -470,10 +600,50 @@ function createAgentApi({
         'The Stacki window did not answer in time. It may be starting a preview or opening a page — try again.'
       );
     }
+    // NOBODY'S HOME DIRECTORY, WHICHEVER SIDE THE SENTENCE WAS WRITTEN ON.
+    //
+    // `thrownFailure` strips absolute paths out of anything that THREW in the
+    // main process, and every refusal built there goes through it. A message
+    // composed in the RENDERER does not: it is returned, not thrown, so it
+    // arrived here exactly as written. `project.undo`'s new `undo_failed`
+    // interpolates a renderer `cleanError`, which strips ANSI and Electron's
+    // IPC prefix and knows nothing about paths — so a failing inverse could
+    // put this machine's directory layout on the wire.
+    //
+    // Applied to the whole class rather than to that one message, because the
+    // next renderer-built refusal would have the same hole and no reason to
+    // remember it — and to the whole ANSWER rather than to `message`, for the
+    // same reason one field down. See `scrubHostPaths`.
+    if (answer && typeof answer === 'object' && answer.ok === false) {
+      return scrubHostPaths(answer, context().root);
+    }
     return answer;
   }
 
   // --- evidence --------------------------------------------------------------
+
+  /**
+   * ONE SPELLING PER FILE.
+   *
+   * `readFile` below resolves whatever it is handed, so `src/pages/index.astro`
+   * and `./src/pages/index.astro` read the same bytes — which means both
+   * qualify as "moved", and `changedFiles` reported ONE write to ONE file as
+   * two entries with identical digests and an identical patch. A live dogfood
+   * saw it; the spelling it saw was an absolute path, and that entry point has
+   * since been closed at the ref boundary, but the ASSEMBLY was never made
+   * spelling-safe and the same defect came back through `touchedBy`, which
+   * returns the caller's own bytes.
+   *
+   * Canonicalising rather than only deduplicating, because a single answer
+   * carrying `./src/styles/site.css` is still wrong: what a client is told a
+   * file is called has to be what every other answer calls it.
+   */
+  const canonRel = (rel) => {
+    const ctx = context();
+    if (!ctx.root || !rel) return null;
+    const at = relativeTo(ctx.root, path.resolve(ctx.root, rel));
+    return at || null;
+  };
 
   const readFile = (rel) => {
     const ctx = context();
@@ -551,7 +721,9 @@ function createAgentApi({
   const filesOf = (anchor, extra = []) => {
     const keys = anchor?.keys || [];
     const fromKeys = keys.map((k) => (typeof k === 'string' && k.includes('#') ? k.slice(0, k.indexOf('#')) : null));
-    return [...new Set([...fromKeys, anchor?.page?.file || null, ...extra].filter(Boolean))];
+    // Through `canonRel` BEFORE the Set, so two spellings of one file collapse
+    // to one member rather than surviving as two.
+    return [...new Set([...fromKeys, anchor?.page?.file || null, ...extra].map(canonRel).filter(Boolean))];
   };
 
   // --- target ----------------------------------------------------------------
@@ -1150,24 +1322,56 @@ function createAgentApi({
     const moved = before ? watching.filter((rel) => (before.get(rel) ?? null) !== readFile(rel)) : [];
     const files = [...new Set([...claimed, ...moved])];
     if (!files.length) return answer;
-    return {
-      ...answer,
-      restored: {
-        ...answer.restored,
-        files: files.map((file) => {
-          const text = readFile(file);
-          const had = before && before.has(file) ? before.get(file) : undefined;
-          return {
-            file,
-            contentDigest: text === null ? null : digestOf(text),
-            // Only for the files this actually held a before-image of. A
-            // claimed file outside the watched set has no honest answer here,
-            // and `null` already means "there were no bytes".
-            ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
-          };
-        }),
-      },
+    const evidence = {
+      ...answer.restored,
+      files: files.map((file) => {
+        const text = readFile(file);
+        const had = before && before.has(file) ? before.get(file) : undefined;
+        return {
+          file,
+          contentDigest: text === null ? null : digestOf(text),
+          // Only for the files this actually held a before-image of. A
+          // claimed file outside the watched set has no honest answer here,
+          // and `null` already means "there were no bytes".
+          ...(had === undefined ? {} : { beforeDigest: had === null ? null : digestOf(had) }),
+        };
+      }),
     };
+    // AND `undone`/`redone` ARE HELD TO THAT EVIDENCE.
+    //
+    // The flag is computed in the renderer from the ENTRY — the renderer
+    // returns null when there was nothing for this call to take off the stack,
+    // which is a real improvement on reading the stack depth across a queue.
+    // It still says nothing about bytes, and the field's stated contract is
+    // that `undone: true` means the bytes are on disk.
+    //
+    // MEASURED at 10b8b33, `project.undo` and a ref-carrying `target.set_text`
+    // in one `Promise.all`, 5 runs in 5: the entry came off the stack, so
+    // `undone: true`, while every watched file's `contentDigest` equalled its
+    // `beforeDigest` — this function's own observation that NOTHING MOVED —
+    // and the edit racing it answered `ok: true` over bytes that were never
+    // written. Two claims of success over a file that did not change at all.
+    //
+    // Where this watched the before-image and every file it watched is
+    // unchanged, the restore moved nothing, and the flag says so. A no-op undo
+    // reported as no-op is at worst a pedantic false negative on a flag; the
+    // alternative is a false success on the one field an agent uses to decide
+    // whether to read the file again.
+    const knew = evidence.files.filter((f) => f.beforeDigest !== undefined);
+    const movedNothing = knew.length > 0 && knew.every((f) => f.contentDigest === f.beforeDigest);
+    const flag = answer.undone !== undefined ? 'undone' : answer.redone !== undefined ? 'redone' : null;
+    if (movedNothing && flag && answer[flag] === true) {
+      return {
+        ...answer,
+        [flag]: false,
+        restored: evidence,
+        note:
+          'That change came off the history stack, but no file this watched moved — so there are no restored bytes ' +
+          'to read. Something else wrote the document while this was in flight. Read the file again before ' +
+          'deciding what to do next.',
+      };
+    }
+    return { ...answer, restored: evidence };
   }
 
   /**
@@ -1197,8 +1401,13 @@ function createAgentApi({
     //   command puts back, and it is deliberately not the same list: a
     //   stylesheet edit that changed no open document still wants an undo, and
     //   reloading the editor for it would be pointless churn.
-    const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].filter(Boolean))];
-    const named = [...new Set((await touchedBy(domain, action, args, ctx)).filter(Boolean))];
+    // EVERY ONE OF THESE THREE IS CANONICALISED FIRST. `editing` was already
+    // relative; `named` is whatever `touchedBy` returns, and for two of its
+    // branches that is the caller's own argument, unresolved. Deduplicating
+    // afterwards compares strings, and `'src/x.astro'` and `'./src/x.astro'`
+    // are two strings for one file.
+    const editing = [...new Set([openFile, ...filesOf(currentAnchor(ctx))].map(canonRel).filter(Boolean))];
+    const named = [...new Set((await touchedBy(domain, action, args, ctx)).map(canonRel).filter(Boolean))];
     const watching = [...new Set([...editing, ...named])];
     const before = snapshot(watching);
     // Normalised the moment it arrives, so the three returns below spread a
@@ -1594,4 +1803,9 @@ function createAgentApi({
 // batch `Operation` union or the registry — implemented, dispatched, and
 // reachable by no client. Nothing checked that the three agreed, so the
 // discrepancy was invisible; test/schema-dispatch-contract.js now does.
-module.exports = { createAgentApi, NORMALIZE, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };
+// AND `scrubHostPaths` IS EXPORTED SO ITS EDGES CAN BE ASKED ABOUT DIRECTLY.
+// A shared reference and a cycle are shapes an end-to-end refusal cannot be
+// made to have on demand — the renderer builds the object — so the only honest
+// test of either is one that hands this function the shape itself.
+// test/undo-transaction.js does, beside the wire assertions it belongs with.
+module.exports = { createAgentApi, scrubHostPaths, NORMALIZE, COMMAND_TIMEOUT_MS, NAVIGATING_TIMEOUT_MS, DEV_START_TIMEOUT_MS, DEV_STOP_TIMEOUT_MS };

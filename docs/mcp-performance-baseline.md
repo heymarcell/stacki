@@ -128,24 +128,54 @@ is asked for:
 | `style.list_sources` (loads sources, no cascade) | **0.2–0.5** |
 
 Sub-1 ms variance across every dimension is a fixed setup cost, not computation that scales with the
-work. `readCascade` re-runs `scanPage()`, `loadEmbedDocs()` and `rebuildRules()` on every call — all
-document-scoped, all redone per node.
+work.
 
-### Why it was left alone
+### What that fixed cost actually is — the earlier answer here was wrong
 
-1. **It is not an MCP cost.** The transport contributes 5.7 ms. Optimizing the MCP layer to chase
-   this would be optimizing the wrong thing.
+This section used to attribute the 124 ms to `readCascade` re-running `scanPage()`,
+`loadEmbedDocs()` and `rebuildRules()` per call. **That is not where the time goes**, and the
+correction matters because it points at the opposite conclusion.
 
-2. **This rig has no canvas**, and the cascade path is exactly where that matters. The number is
-   real in this environment; whether it reproduces in the packaged app with a live canvas is
-   **unmeasured**. Acting on it would mean tuning against an artifact.
+A CPU profile of the whole run (`node --cpu-prof`) attributes **4,833 ms to `(idle)`** and nothing
+of consequence to any cascade function. The process is not computing during those 124 ms — it is
+waiting. The wait is one line:
 
-3. **A cache here needs proven invalidation** — selection, source edit, style edit, viewport, preview
-   reload, page change, project change. A stale answer about CSS is worse than 124 ms, and an
-   invalidation proof is not something to rush.
+    // src/App.jsx — the agent bridge
+    settle: () => new Promise((done) => setTimeout(done, 120)),
 
-Measuring the real cost needs the packaged app with a project open, which is currently blocked: a
-packaged Stacki has no non-interactive way to open one (see `test/packaged-mcp.js`).
+`style.read` locates the node, selects it, and awaits `settle()` before reading, because styles are
+read against the live page and the element has to BE the selected one. Falsified rather than
+argued: with that timeout set to 0, `style.read` measures **7.6 ms p50 instead of 132**, and returns
+a **byte-identical** 6,037-byte answer.
+
+| `settle` | `style.read` p50 | bytes |
+| --- | --- | --- |
+| 120 ms (shipped) | 132.2 ms | 6,037 |
+| 0 ms (experiment, reverted) | 7.6 ms | 6,037 |
+
+So the honest description is: `style.read` does about 7 ms of work and then a fixed 120 ms wait.
+
+### Why nothing was optimized
+
+1. **A cache would have been the wrong fix.** It would have saved the ~7 ms of real work and none of
+   the 120 ms — while taking on the invalidation burden (selection, source edit, style edit,
+   viewport, preview reload, page change, project change) and the risk of a stale CSS winner. The
+   old attribution would have sent the next person to build exactly that.
+
+2. **The wait is doing a real job in the real app, and none at all here.** This rig has no canvas, so
+   there is nothing for the settle to wait for and the 120 ms is pure measurement artifact. In the
+   packaged app with a live canvas it is the thing that stops a style read answering about the
+   element that WAS selected. Removing it to win a benchmark this rig produces would be tuning
+   against an artifact, in the direction of a silent wrong answer.
+
+3. **The one safe narrowing is not proven.** Skipping the settle when the selection did not actually
+   move looks right and is not obviously safe: a read immediately after a write to the same element
+   would then race the canvas. That needs a proof, not a guess, and 120 ms does not buy the risk.
+
+4. **It is not an MCP cost.** The transport contributes 5.7 ms.
+
+The packaged number is measured separately by `npm run bench:packagedmcp`, which is the environment
+where the wait is load-bearing.
 
 ## Conclusion
 

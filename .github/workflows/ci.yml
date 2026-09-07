@@ -51,8 +51,16 @@ jobs:
       STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
       # THREE SUITES ARE A LOCAL GATE, AND THEY SAY SO.
       #
-      # Which three was measured rather than guessed: a survey job ran all 131
-      # independently on this runner and reported the ones it could not host.
+      # Which three was measured rather than guessed: a survey job ran each
+      # suite in the chain independently on this runner and reported the ones it
+      # could not host.
+      #
+      # THE SURVEY WAS OF 131 FILES AND THE CHAIN IS NOW 178 ENTRIES. This list
+      # is a record of what that survey found, not a claim about everything that
+      # runs here: it predates every suite added since, and nothing added since
+      # has been surveyed on a hosted runner. A suite that turns out to need
+      # this variable joins the list by being measured here, the way these three
+      # were, rather than by being guessed at.
       #
       #   popover-dropdown   measures a box against the size of the screen the
       #                      window is on, and a runner's screen is not a desk's
@@ -104,8 +112,34 @@ jobs:
       # there, which is exactly the kind of thing CI is for.
       - run: npm run build
 
-      # All 131 files. The three named above print a skip line and say why;
-      # everything else runs.
+      # The whole chain: 192 `npm run` entries, covering 194 files. The three
+      # named above print a skip line and say why; everything else runs.
+      #
+      # THOSE TWO NUMBERS ARE CHECKED, because they had already drifted. This
+      # said 131 once and then 178, and 178 was wrong on the commit that wrote
+      # it — the chain was 180 entries by then. A comment nobody can be wrong
+      # about out loud is a comment that goes quietly stale, so test/packaging.js
+      # counts the chain in package.json and reads these numbers back out of
+      # this file. Change the chain and that suite says so.
+      #
+      # AND ONE SUITE THIS BRANCH ADDED THAT IS DELIBERATELY NOT AMONG THEM.
+      #
+      # test/audit-cancel-inflight.js is new to `npm test`, and it has the shape
+      # of a suite that flakes on a shared machine: real Electron, an offscreen
+      # window, the official MCP client over a real socket, and assertions with
+      # 2000ms in them. It is not in the skip list because that list is measured,
+      # and the measurement says it does not belong there. On a developer's Mac
+      # the whole suite takes 61 seconds, and its two-second budgets are met by
+      # 3ms and 8ms (letting go after the signal), 5ms and 86ms (the offscreen
+      # window gone), and 0ms (the queued run answering) — two to three orders
+      # of magnitude of headroom, on assertions whose work is destroying a
+      # window rather than rendering a page. Its slow control, /hang-load at
+      # 40s, is two fixed 20-second budgets and does not move with the machine.
+      #
+      # It has NOT been run on a hosted runner, so that is a judgement from
+      # margins rather than a survey. If it does flake here it belongs in the
+      # list above — measured, like the other three, rather than pre-emptively
+      # skipped, because skipping a suite that works is its own kind of lie.
       #
       # WHY MACOS. It was on ubuntu first and got within one suite of the end,
       # which was useful — but Stacki ships to macOS and Windows, so the suite
@@ -186,6 +220,30 @@ jobs:
       # cache is cold the fixture installs it and the suites still run, because
       # STACKI_CANVAS_OFFLINE is deliberately NOT set on this job.
       STACKI_CANVAS_CACHE: ${{ github.workspace }}/.astro-cache
+      # A SKIP IN THIS JOB IS A FALSE GREEN, SO IT IS AN ERROR HERE.
+      #
+      # Seven suites below need the bundle, and each one used to answer a
+      # missing bundle with `console.log('… skipped'); return` — exit 0, having
+      # asserted nothing. On a laptop that is correct: nobody should need a
+      # ten-minute build to run `npm test`.
+      #
+      # In THIS job it is a lie. The "build the unsigned app" step above
+      # produces the bundle, so if a suite here cannot find it, the build
+      # silently did not make what the suite needs — and the job goes green
+      # having verified nothing about the packaged app. That is the whole point
+      # of the job.
+      #
+      # Each of those escapes now goes through skipSuite() in
+      # test/support/suiteGuard.js, which reads this variable: unset, it prints
+      # the same skip line and exits as before; set, it prints FAILED naming the
+      # suite and makes the exit code non-zero.
+      #
+      # NOT SET ON THE OTHER TWO JOBS. "core suite (macos)" and "secure protocol
+      # + cloudflare (linux)" run suites whose skip is measured and legitimate
+      # on those machines — the three STACKI_HOSTED_RUNNER ones above among
+      # them. Forbidding a skip is only honest where the resource is guaranteed
+      # to exist, and this job is the only one that builds it.
+      STACKI_NO_SKIPS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -233,6 +291,13 @@ jobs:
       - name: a stacki:// link through Launch Services
         env:
           STACKI_HOSTED_RUNNER: '1'
+          # THE ONE DELIBERATE SKIP IN THIS JOB, so the job-level
+          # STACKI_NO_SKIPS is turned off for this step alone. The skip above is
+          # measured — Launch Services routing, not a missing bundle — and the
+          # suite runs for real on a Mac in `npm run test:secureacceptance`.
+          # skipSuite() treats '0' as "not forbidden", so this reads as an
+          # exemption rather than as an unset variable.
+          STACKI_NO_SKIPS: '0'
         run: npm run test:packageddeeplink
 
       # Every Secure Share state, asserted before capture, at five window
@@ -261,6 +326,24 @@ jobs:
 
       - name: a real project, changed and undone in the packaged app
         run: npm run test:packagedacceptance
+
+      # A SUITE THAT EXISTED AND RAN NOWHERE. `test:packagedundo` was in
+      # package.json and in neither `npm test` nor any job here, so the one
+      # proof that a completed `project.undo` has its restore ON DISK in the
+      # SHIPPED bundle — the thing test/undo-bytes.js can only show against a
+      # harness whose timing flatters it — was never executed by anything. It
+      # belongs in this job rather than in `npm test` because it needs the
+      # bundle the build step above produces.
+      - name: an undo is not done until its restore is on disk, in the bundle
+        run: npm run test:packagedundo
+
+      # The same class as the suite above: it needs a packaged app, so it could
+      # never be in `npm test`, and it was in no CI job either. It guards a build
+      # quietly reaching the official update feed — which succeeds, and only fails
+      # later when Squirrel refuses to stage what it downloaded. It counts
+      # requests rather than watching for an error dialog.
+      - name: an unsigned build asks nobody for an update
+        run: npm run test:updatefeed
 
       # Phase B and Phase C, from the bundle rather than from source. This is
       # the only job that can catch axe-core not being packaged: the engine is

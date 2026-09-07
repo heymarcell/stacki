@@ -202,6 +202,29 @@ const divRef = async (rig) => {
   // then the target is removed through an honest Stacki edit, and the outer
   // extraction resumes to find nothing to replace. Nothing is faked — the
   // operation still travels the whole MCP → Agent → renderer path.
+  //
+  // WHO REMOVES IT, AND WHY IT CANNOT BE ANOTHER AGENT CALL.
+  //
+  // This used to issue `target.remove` from inside the interceptor. That is a
+  // second AGENT call, and `extractComponent` has since joined the renderer's
+  // serialising queue alongside commit, writeOpenSource, undo and redo — the
+  // fix for a measured silent data loss (see 9f in test/undo-transaction.js).
+  // So the removal waited for a queue the extraction above it was still
+  // holding, and the whole scenario timed out into `not_ready`. The mechanism
+  // it was using is exactly the one the queue exists to make impossible: a
+  // genuinely concurrent agent call now WAITS its turn instead of landing
+  // inside an operation, and a re-entrant one is not something an agent can
+  // make happen at all.
+  //
+  // The scenario itself is untouched, because a node going away mid-extraction
+  // is not an agent-only event. The person at the canvas does it: ⌘⌫ is a
+  // keydown the App's own shortcut effect turns into `removeNode` ->
+  // `mutateModel`, unqueued, which is the same door the "make a component" menu
+  // item goes through. So the div is SELECTED before the extraction and the key
+  // is pressed while the extraction is between writing the component file and
+  // rewriting the page. Still a real edit through the shipping renderer path,
+  // still not React internals — and now through a path that can really be
+  // concurrent with a queued operation, which is what the scenario claims.
 
   const intercept = (rig, channel, wrap) => {
     const handlers = rig.harness.handlers;
@@ -211,12 +234,27 @@ const divRef = async (rig) => {
     return () => handlers.set(channel, original);
   };
 
+  /**
+   * The div's ref, with Stacki's live selection on the same node.
+   *
+   * Two things at once, on purpose: the ref is what the agent extracts through,
+   * and the selection is what Delete acts on. A select that did not take would
+   * make the keypress a no-op and quietly turn every scenario below into a
+   * successful extraction, so it is checked here rather than diagnosed later.
+   */
+  const selectedDivRef = async (rig) => {
+    const ref = await divRef(rig);
+    const chose = await rig.call('target', 'select', { ref });
+    if (chose.envelope?.ok !== true) throw new Error(`the div could not be selected: ${brief(chose.envelope)}`);
+    return ref;
+  };
+
   // A. the target vanishes, and the rollback works
   {
     const rig = await startWireRig();
     let restore = null;
     try {
-      const target = await divRef(rig);
+      const target = await selectedDivRef(rig);
       const deleteCalls = [];
 
       // Watch what the rollback actually hands the delete handler. If somebody
@@ -231,8 +269,9 @@ const divRef = async (rig) => {
         const made = await original(event, payload);
         fileExistedBeforeRollback = rig.harness.exists('src/components/WireCard.astro');
         // The node goes away through a real edit, the way a concurrent change
-        // would take it — not by poking at React internals.
-        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        // would take it — the person pressing Delete on the canvas, not by
+        // poking at React internals.
+        await rig.deleteSelection();
         return made;
       });
       restore = () => {
@@ -275,7 +314,7 @@ const divRef = async (rig) => {
     const rig = await startWireRig();
     let restore = null;
     try {
-      const target = await divRef(rig);
+      const target = await selectedDivRef(rig);
       const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
         if (typeof payload === 'string' && payload.endsWith('OrphanCard.astro')) {
           throw new Error('test-owned failure: this deletion is not allowed');
@@ -284,7 +323,7 @@ const divRef = async (rig) => {
       });
       const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
         const made = await original(event, payload);
-        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        await rig.deleteSelection();
         return made;
       });
       restore = () => {
@@ -328,7 +367,7 @@ const divRef = async (rig) => {
     const rig = await startWireRig();
     let restore = null;
     try {
-      const target = await divRef(rig);
+      const target = await selectedDivRef(rig);
       const restoreDelete = intercept(rig, 'page:delete', (original, event, payload) => {
         if (typeof payload === 'string' && payload.endsWith('RefusedCard.astro')) {
           return { ok: false, message: 'test-owned refusal: nothing was removed' };
@@ -337,7 +376,7 @@ const divRef = async (rig) => {
       });
       const restoreCreate = intercept(rig, 'component:create', async (original, event, payload) => {
         const made = await original(event, payload);
-        await rig.call('target', 'remove', { ref: await divRef(rig) });
+        await rig.deleteSelection();
         return made;
       });
       restore = () => {

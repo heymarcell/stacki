@@ -21,3 +21,9 @@ release/
 /relay.db
 /relay.db-wal
 /relay.db-shm
+
+# Stamped by scripts/buildInfo.js at package time, read by electron/buildInfo.js
+# at runtime. Generated, never committed — and ignored rather than merely
+# untracked, so that stamping a build cannot make the tree it was built from
+# report itself dirty.
+/electron/build-info.json

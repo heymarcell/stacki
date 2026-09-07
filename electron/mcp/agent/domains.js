@@ -24,6 +24,10 @@ const fs = require('node:fs');
 const { resolveInProject, relativeTo, toPosix } = require('./paths');
 const { digestOf, digestOfFile, checkDigest } = require('./digest');
 const { originOf, projectOriginTest } = require('../../projectOrigin.js');
+// Only for `unreadMarkers`: whether a conflicted file's markers were actually
+// read. See the git.merge conflict envelope, which used to describe a file git
+// reported as conflicting as having zero conflicting hunks.
+const { unreadMarkers } = require('../../conflicts.js');
 
 const problem = (code, message, extra = {}) => ({ error: { ok: false, code, message, ...extra } });
 
@@ -70,28 +74,114 @@ function rel(ctx, value, what = 'path') {
   return found;
 }
 
+/** Where pages live, as this API spells it. */
+const PAGES_DIR = 'src/pages';
+
 /**
- * A path the page handlers spell relative to src/pages, resolved like any other.
+ * A page or page-folder path: PROJECT-RELATIVE, like every other path here.
  *
- * `page.move`'s `to` and the folder actions' `dir`/`from`/`to` are relative to
- * the pages directory rather than to the project, and that is why they were the
- * only path arguments in this surface that never reached rel(). What fenced
- * them instead was the handler's own `path.resolve` + `startsWith`, which is a
- * check on the SPELLING — and a symlink under src/pages is spelled like
- * everything else in there. Measured: `to: 'out/MOVED.astro'` through such a
+ * ONE COORDINATE SYSTEM, AND WHY THERE USED TO BE TWO. This function is the
+ * result of a live dogfood finding `page.folder_rename` reporting
+ *
+ *     src/pages/src/pages/blog is not in this project.
+ *
+ * for a perfectly ordinary project-relative argument. The old version prefixed
+ * `src/pages/` onto whatever it was handed, unconditionally — so a caller who
+ * had read the OUTPUT of `page.create` (`src/pages/contact.astro`, project
+ * relative, like every other path this API returns) and passed that spelling
+ * back got a phantom directory. Three of the folder actions did not even fail:
+ * `folder_create({dir: 'src/pages/news'})` answered ok and made
+ * `src/pages/src/pages/news`.
+ *
+ * Worse than either was `page.move`, which took `from` through `rel` — project
+ * relative — and `to` through the prefixing one. One operation, two coordinate
+ * systems, and nothing said so.
+ *
+ * So there is one space and it is the one the rest of the surface already uses
+ * and already returns: project-relative POSIX, under `src/pages`. A value that
+ * is not under `src/pages` is REFUSED, and the refusal says what to pass —
+ * because the alternative, guessing that a bare `blog` meant `src/pages/blog`,
+ * is how there came to be two spellings in the first place. Guessing is what
+ * this function exists to stop doing.
+ *
+ * THE FENCE IS STILL `rel`'s. `resolveInProject` resolves symlinks, which the
+ * handlers' own `path.resolve` + `startsWith` cannot: that compares SPELLINGS,
+ * and a symlink under src/pages is spelled like everything else in there.
+ * Measured before it went through here: `to: 'out/MOVED.astro'` through such a
  * link moved a page OUT of the project on `edit`, `dir: 'out/newdir'` created a
  * directory outside it, and `folder_delete` ran fs.rmSync(recursive, force) on
  * one, while asset.write_text and source.write refused the identical route with
- * outside_project in the same run.
- *
- * So they go through the same resolver as the rest, realpath step included, and
- * the handler is handed the absolute path it would have computed itself — its
- * own fence still holds, this one is simply the half that survives a link.
+ * outside_project in the same run. The handler's own fence still holds; this is
+ * the half that survives a link.
  */
 function pagesRel(ctx, value, what = 'page folder') {
-  const raw = String(value ?? '').trim().replace(/^\/+/, '');
-  if (!raw) return { error: { ok: false, code: 'bad_path', message: `A ${what} inside src/pages is required, relative to it.` } };
-  return rel(ctx, `src/pages/${raw}`, what);
+  // Separators first, so a Windows-shaped argument is judged by where it points
+  // rather than by how it is punctuated.
+  const raw = String(value ?? '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '');
+  if (!raw) {
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message: `A ${what} is required, project-relative and under ${PAGES_DIR}/ — for example ${PAGES_DIR}/blog.`,
+      },
+    };
+  }
+  // Under src/pages, spelled from the project root. `src/pages` itself is the
+  // root of the page tree and is a legitimate thing to name; anything else is
+  // somewhere this action does not reach.
+  const withinPages = raw === PAGES_DIR || raw.startsWith(`${PAGES_DIR}/`);
+  if (!withinPages) {
+    const rule = `page and folder paths are project-relative and live under ${PAGES_DIR}/`;
+    // AND ONLY OFFER A SPELLING THAT IS ONE. The most likely mistake by a long
+    // way is the OLD spelling — a path relative to src/pages — and naming what
+    // that value would be as a project path is the whole difference between a
+    // refusal somebody can act on and one they have to decode. But it is only
+    // sensible advice for a value that IS a plain relative path: prefixing
+    // `src/pages/` onto `../escape` or `/etc/passwd` produces a suggestion that
+    // is either a traversal or a fiction, and telling somebody to pass one of
+    // those is worse than telling them nothing.
+    const absolute = raw.startsWith('/') || /^[A-Za-z]:\//.test(raw);
+    const traverses = raw.split('/').includes('..');
+    const elsewhereInProject = raw.startsWith('src/');
+    let advice;
+    if (absolute || traverses) advice = `Give a path inside the project, such as ${PAGES_DIR}/blog.`;
+    else if (elsewhereInProject) advice = `${raw} is somewhere else in the project; only ${PAGES_DIR}/ holds pages.`;
+    else advice = `Pass ${PAGES_DIR}/${raw}.`;
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message: `${raw} is not a ${what}: ${rule}. ${advice} Nothing was changed.`,
+      },
+    };
+  }
+  const found = rel(ctx, raw, what);
+  if (found.error) return found;
+  // AND WHERE IT ACTUALLY LANDS, not only how it is spelled.
+  //
+  // `src/pages/../../escape` begins with `src/pages/` and resolves to `escape`
+  // at the project root — inside the project, so `rel` is right to allow it,
+  // and nowhere near a page. Without this the handler caught it, which meant
+  // the same mistake came back as `outside_project` / "Invalid folder." from
+  // one action and as `bad_path` with a sentence from another. One resolver
+  // owns the question, so there is one answer to it.
+  const landed = found.rel;
+  if (landed !== PAGES_DIR && !landed.startsWith(`${PAGES_DIR}/`)) {
+    return {
+      error: {
+        ok: false,
+        code: 'bad_path',
+        message:
+          `${raw} is not a ${what}: it resolves to ${landed}, which is outside ${PAGES_DIR}/. ` +
+          `Give a path inside the project, such as ${PAGES_DIR}/blog. Nothing was changed.`,
+      },
+    };
+  }
+  return found;
 }
 
 const clip = (text, max) => {
@@ -124,6 +214,23 @@ function lineStarts(text) {
 /** Lines `from`..`to` inclusive, terminators included, as they sit in the file. */
 const sliceLines = (text, starts, from, to) => text.slice(starts[from - 1], to < starts.length ? starts[to] : text.length);
 
+/**
+ * A file's text, or null when there is no file.
+ *
+ * `digestOfFile` reads and hashes in one step, which is right where the digest
+ * is all anyone wants. It is wrong where the SAME read has to answer a second
+ * question — how big is it — because two reads of one file are two answers, and
+ * a write racing between them reports a digest and a size belonging to
+ * different versions. So the read is separated from what is computed off it.
+ */
+function readTextOrNull(abs) {
+  try {
+    return fs.readFileSync(abs, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 // The two things the API layer supplies, with the behaviour to fall back on
 // when it has not — so `runMain` stays a function of its context and can be
 // driven straight in a test.
@@ -139,6 +246,13 @@ const putText = (ctx, rel, text) =>
 // small enough that no single call can fill a context window.
 const MAX_LIST = 400;
 const MAX_TEXT_BYTES = 120_000;
+// Per conflicting file, for the hunks that describe it. Well under MAX_TEXT_BYTES
+// because a merge answers about MANY files at once and the budget is the whole
+// envelope, not one entry in it.
+const MAX_CONFLICT_BYTES = 8_000;
+// And across all of them. See the merge mapper: a cap that only ever asks
+// "is this ONE file small enough" is not a cap on the answer.
+const MAX_CONFLICT_ENVELOPE_BYTES = 24_000;
 const MAX_SNIPPET_LINES = 400;
 
 // --- source ------------------------------------------------------------------
@@ -223,12 +337,32 @@ const source = {
     }
     const wrote = await putText(ctx, at.rel, input.text);
     if (wrote.error) return wrote;
+    // WHAT IS ON DISK, not what the caller asked for -- the same rule
+    // asset.write_text already carries a comment about, and BOTH numbers in
+    // this envelope obey it now.
+    //
+    // It matters most here, because these bytes genuinely can differ: a write
+    // to the OPEN document is routed through the renderer (agent/index.js
+    // `write_open_source`), which parses the text into a model and lets the
+    // normal save write the SERIALIZER's bytes. Hashing the input meant a
+    // client storing `afterDigest` for optimistic concurrency held a digest no
+    // file had, and its next guarded write was refused as `stale_target`
+    // against a file nobody had touched.
+    //
+    // `bytes` was still measured from the request after that was fixed, so in
+    // exactly the case the paragraph above names one envelope reported the
+    // digest of the file on disk beside the size of a file that was never
+    // written. Read ONCE and both derived from the same string, because two
+    // reads of one file are two answers waiting for the day they disagree --
+    // and byte-counted the way source.read counts `wholeFileBytes`, so the two
+    // numbers a client compares were arrived at the same way.
+    const landed = readTextOrNull(at.abs);
     return {
       value: {
         path: at.rel,
         beforeDigest: before,
-        afterDigest: digestOf(input.text),
-        bytes: Buffer.byteLength(input.text, 'utf8'),
+        afterDigest: landed === null ? null : digestOf(landed),
+        bytes: landed === null ? null : Buffer.byteLength(landed, 'utf8'),
         ...wrote.through,
       },
     };
@@ -456,21 +590,30 @@ const page = {
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.pagePath || raw?.path || '') }),
   },
 
+  // THROUGH `pagesRel`, WHICH IS WHERE "ONLY A FILE UNDER src/pages IS A PAGE"
+  // NOW LIVES. This used to be `rel` plus a hand-written check of the same
+  // thing one line below it, and moving the check into the resolver without
+  // moving the CALL would have turned `page.delete` into "delete any file in
+  // the project" — test/agent-acceptance.js caught exactly that, on a
+  // component, before this line was written the second time.
   delete: {
     channel: 'page:delete',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'page path');
+      const at = pagesRel(ctx, input.path, 'page path');
       if (at.error) return at;
-      if (!/^src\/pages\//.test(at.rel)) return problem('bad_request', 'Only a file under src/pages is a page.');
       return at.abs;
     },
     result: (_raw, input) => ({ deleted: input.path }),
   },
 
+  // BOTH ENDS IN THE SAME SPACE. `from` went through `rel` and `to` through the
+  // prefixing resolver, so one operation took two coordinate systems and said
+  // so nowhere. Both are project-relative now, and both are checked to be under
+  // src/pages by the one function that knows what that means.
   move: {
     channel: 'page:move',
     args: (input, ctx) => {
-      const from = rel(ctx, input.from, 'page path');
+      const from = pagesRel(ctx, input.from, 'page path');
       if (from.error) return from;
       const to = pagesRel(ctx, input.to, 'page path');
       if (to.error) return to;
@@ -479,12 +622,16 @@ const page = {
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.newPath || '') }),
   },
 
+  // Each folder action answers with the path it acted on, in the space it was
+  // given — so a caller can hand the answer straight back to the next call,
+  // which is the thing that used to double it.
   folder_create: {
     channel: 'pagefolder:create',
     args: (input, ctx) => {
       const dir = pagesRel(ctx, input.dir);
       return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
     },
+    result: (_raw, input, ctx) => ({ path: pagesRel(ctx, input.dir).rel ?? null }),
   },
   folder_rename: {
     channel: 'pagefolder:rename',
@@ -495,6 +642,7 @@ const page = {
       if (to.error) return to;
       return { projectPath: ctx.root, from: from.abs, to: to.abs };
     },
+    result: (_raw, input, ctx) => ({ from: pagesRel(ctx, input.from).rel ?? null, path: pagesRel(ctx, input.to).rel ?? null }),
   },
   folder_delete: {
     channel: 'pagefolder:delete',
@@ -502,6 +650,7 @@ const page = {
       const dir = pagesRel(ctx, input.dir);
       return dir.error ? dir : { projectPath: ctx.root, dir: dir.abs };
     },
+    result: (_raw, input, ctx) => ({ deleted: pagesRel(ctx, input.dir).rel ?? null }),
   },
 
 
@@ -533,7 +682,17 @@ const page = {
     // `{ paths: [], problem: null }` — indistinguishable from a page with no
     // dynamic routes, and from a dev server that had answered 500. The scenario
     // accepted "no paths, or a problem", which this satisfied both ways.
-    result: (raw) => ({ paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null }),
+    result: (raw) => {
+      // "I could not ask" is a refusal, not an empty list. See the handler.
+      if (raw && raw.asked === false) {
+        return problem(
+          'no_preview',
+          'Stacki is not serving this project, so the routes this page stands for cannot be enumerated — ' +
+            'only the dev server can run its getStaticPaths. Start the preview with project.dev_start and ask again.'
+        ).error;
+      }
+      return { paths: take(raw?.entries || [], MAX_LIST), problem: raw?.error || null };
+    },
   },
 
   injected_routes: {
@@ -1174,7 +1333,13 @@ const style = {
       if (typeof input.css !== 'string') return problem('bad_request', 'css is required.');
       return { filePath: at.abs, css: input.css };
     },
-    result: (_raw, input) => ({ path: input.path, afterDigest: digestOf(input.css) }),
+    // Read back rather than re-hashed: see source.write above for why the
+    // caller's own text is the wrong thing to hash.
+    result: (_raw, input, ctx) => {
+      const at = rel(ctx, input.path, 'stylesheet path');
+      if (at.error) return at;
+      return { path: at.rel, afterDigest: digestOfFile(at.abs) };
+    },
   },
   variables: {
     channel: 'css:variables',
@@ -1424,9 +1589,591 @@ const git = {
   checkout: {
     channel: 'git:checkout',
     args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, create: !!input.create, parkFirst: input.parkFirst !== false }),
+    // `{ ok:false, blocked:true }` is the shape runMain spreads into an envelope,
+    // so this arrived as `code: 'failed'` — the code that means nobody knows —
+    // for the commonest refusal a branch switch has. It is not a failure at all:
+    // git moved nothing, the work is still there, and the caller has to commit,
+    // park or discard it. That is an answer, and it needs a name to be one.
+    result: (raw, input) => {
+      if (raw?.ok === false && raw.blocked) {
+        return {
+          ...problem(
+            'working_tree_blocked',
+            `Switching to "${input.branch}" would overwrite work that has not been committed. ` +
+              'Commit it, park it, or discard it first — nothing was changed.'
+          ).error,
+          branch: input.branch,
+          from: raw.from ?? null,
+          files: take(raw.files, MAX_LIST),
+        };
+      }
+      return raw;
+    },
   },
-  merge: { channel: 'git:merge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }) },
-  resolve_merge: { channel: 'git:resolveMerge', args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, choices: input.choices || {} }) },
+  merge: {
+    channel: 'git:merge',
+    args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch }),
+    // TWO NAMED CAUSES, AND A PAYLOAD THAT FITS.
+    //
+    // `conflicted` and `dirty` both reached the wire as `failed`, and the
+    // conflicted one arrived with no message at all — the handler writes none,
+    // so the envelope fell through to its own "That operation was refused."
+    // An agent cannot tell "your branches disagree, go and reconcile them" from
+    // "git broke" without reading English, and will retry the thing that cannot
+    // work.
+    //
+    // AND THE SIZE. The handler hands back, per conflicting file, BOTH COMPLETE
+    // VERSIONS of it (`ours` and `theirs`, each a whole `git show :N:file`) for
+    // the conflict UI in the app, which needs them. Nothing bounded that on the
+    // way out here: this was the one list in the surface with no cap, and the
+    // largest thing the git domain can say. Two conflicting thousand-line pages
+    // is a payload no host will deliver — so the agent was told `failed`, at
+    // length, and could not find out why.
+    //
+    // What travels instead is what an agent acts on: which files clash, and the
+    // conflicting HUNKS (`parts`) rather than the files they came from, both
+    // bounded and both saying so when they bite. The whole versions stay
+    // available to the panel over IPC, which is where they were needed.
+    result: (raw, input, ctx) => {
+      if (raw?.ok === false && raw.conflicted) {
+        const all = Array.isArray(raw.files) ? raw.files : [];
+        // A PER-FILE CAP IS NOT A BUDGET. Twenty conflicting files each just
+        // under the per-file limit is twenty times the limit, and this refusal
+        // is one envelope. So the per-file clip stays and a running total sits
+        // over it: once the budget is spent, later files keep their path and
+        // lose their hunks, and say so. `Buffer.byteLength`, not `.length` —
+        // the clip below measures characters, and a conflict in a CJK or
+        // emoji-carrying file is up to four bytes for each of them.
+        let spent = 0;
+        // THE GIT DOMAIN SPEAKS A DIFFERENT PATH SPACE FROM THE REST OF THE
+        // SURFACE, AND NOTHING SAID SO.
+        //
+        // Every other path an agent handles here — source.read, source.write,
+        // asset and page paths — is PROJECT-relative and is resolved by
+        // resolveInProject, which refuses anything outside the project. Git's
+        // are relative to the REPOSITORY ROOT, and the project does not have to
+        // be the repository: with the repo at <root> and the project at
+        // <root>/site, this refusal named "site/a.txt", `choices` had to be
+        // keyed "site/a.txt", and `badChoices[].expected` listed "site/a.txt" —
+        // while source.read("site/a.txt") looks for <root>/site/site/a.txt.
+        // Undocumented, an agent reading a conflicted path and handing it
+        // straight to source.read got a refusal, or — where a repository has
+        // <root>/x and <root>/site/x — the WRONG FILE, silently.
+        //
+        // Translating everything to project-relative was the tempting fix and
+        // it is not safe: a conflict can land anywhere in the repository, and a
+        // file above the project has no project-relative spelling that any
+        // other tool in this surface would accept ("../README.md" is refused as
+        // outside_project, correctly). Pretending otherwise would move the lie
+        // rather than remove it.
+        //
+        // So the two spaces are both named, per file, and the envelope says
+        // which is which. `path` is git's, and it is the ONE that goes back in
+        // `choices` — unchanged, or the resolve is refused as unknown_path.
+        // `sourcePath` is the same file spelled the way the rest of the surface
+        // spells it, and it is null exactly when the file lies outside the open
+        // project, which is the case no translation can serve.
+        //
+        // BOTH ROOTS THROUGH realpath, OR THE COMPARISON IS A COIN TOSS. Git
+        // answers `rev-parse --show-toplevel` with a resolved path and Stacki's
+        // project path is whatever opened the project, so on any machine where
+        // one leg of the path is a symlink — /tmp -> /private/tmp on macOS, a
+        // home directory on a mounted volume, a repository reached through a
+        // link — the two spellings of the same directory do not share a prefix.
+        // The containment test would then answer "outside the project" for
+        // every file and `sourcePath` would be null for all of them: not a
+        // wrong path, but the useful half of this silently switched off.
+        const realOf = (p) => {
+          try {
+            return fs.realpathSync(p);
+          } catch {
+            return path.resolve(p);
+          }
+        };
+        const repoRoot = typeof raw.root === 'string' && raw.root ? realOf(raw.root) : null;
+        const projectRoot = ctx?.root ? realOf(ctx.root) : null;
+        const sourcePathOf = (p) => {
+          if (!repoRoot || !projectRoot || typeof p !== 'string' || !p) return null;
+          const abs = path.resolve(repoRoot, p);
+          if (abs !== projectRoot && !abs.startsWith(projectRoot + path.sep)) return null;
+          return toPosix(path.relative(projectRoot, abs)) || null;
+        };
+        const files = take(all, MAX_LIST).map((f) => {
+          // ONLY THE REGIONS THAT ACTUALLY CLASH.
+          //
+          // `parts` is the whole file cut into runs, and the runs both sides
+          // AGREE on are almost all of it — which is the bulk this refusal must
+          // not carry twice. A conflict in one line of a three-hundred-line page
+          // is one clash and three hundred lines of settled text; the settled
+          // text is already on disk, unchanged, because the merge was unwound.
+          //
+          // AND AN EMPTY LIST OF HUNKS IS A CLAIM, NOT AN ABSENCE OF ONE.
+          //
+          // `parts` is a forgiving parse: anything it cannot read as a conflict
+          // block it keeps verbatim as agreed text, so a file whose markers it
+          // could not read comes back with NO clashes in it — and this then
+          // sent `{hunks: [], hunksOmitted: false}` for a file git had just
+          // reported as conflicting, under an instruction telling the agent to
+          // send "exactly as many entries as the hunks listed here". Zero, for
+          // a file that has some. MEASURED with `*.txt text eol=crlf`, whose
+          // markers carry the file's '\r' and defeated the marker regexes
+          // outright; those are fixed, and this is the shape rather than the
+          // cause, because no list of parser fixes can promise the shape will
+          // not recur.
+          //
+          // So such a file says so, with `hunks: null` and a field that says
+          // WHY it is null, because the three shapes that produce it have three
+          // different remedies:
+          //
+          //   markersUnread   git says the path conflicts and the markers could
+          //                   not be read. No answer is accepted; finish it in
+          //                   the project.
+          //   hunksOmitted    the hunks were read and were too large to carry.
+          //                   A whole-file "ours" or "theirs" is accepted.
+          //   neither         there was no marked-up text to split at all —
+          //                   `parts` is null because the file could not be read
+          //                   as text from the working tree, which is the shape
+          //                   a path with no version of its own has (both
+          //                   branches renaming it leaves stage 1 alone under
+          //                   that name). resolve_merge answers `no_sides` for
+          //                   it, and no `choices` value can help.
+          //
+          // A BINARY file is NOT one of these. It used to READ as text and split
+          // into no disagreement, which is how it arrived as `hunks: []`; since
+          // conflictText refuses to decode bytes that are not UTF-8 it has no
+          // parts at all, and the `hasSide` test below is what keeps it in the
+          // `[]` shape it belongs in. Either way it takes a whole-file word like
+          // any other unsplittable file — this comment once cited it as the
+          // precedent for `hunks: null`, wrongly.
+          const parts = Array.isArray(f?.parts) ? f.parts : null;
+          // At the width git wrote them, which travels on the file beside the
+          // parts: this surface has no repository to ask and seven is only git's
+          // default, not the only width it writes. See conflictMarkerSizes.
+          //
+          // AND WHETHER EITHER SIDE HOLDS A MARKER OF ITS OWN, which travels on
+          // the file for the same reason the width does: this surface has no
+          // repository to ask. See sidesHoldMarkers in conflicts.js — a
+          // conflict-marker line present in either side's COMMITTED version is
+          // not one git wrote, and a file holding one cannot have its own markers
+          // told from git's by any rule about their shape.
+          // `f.ours`/`f.theirs` are the two sides the merge carried out with it,
+          // and unreadMarkers needs them for the same reason resolveMerge passes
+          // them: a marker-shaped line the AUTHOR wrote is not evidence that
+          // this read the width wrongly, and one git wrote is. See its opener
+          // arm.
+          const unread = parts
+            ? unreadMarkers(parts, f?.markerSize, f?.ours, f?.theirs) || f?.sidesHoldMarkers === true
+            : false;
+          // AND NOT FOR A FILE OUTSIDE THE OPEN PROJECT.
+          //
+          // A clash carries `ours` and `theirs` — the disputed regions of both
+          // branches' versions of the file — and this sent them for every
+          // conflicting path, containment or not. The note beside it says the
+          // opposite: that a file whose `sourcePath` is null "can still be
+          // answered in `choices`, but not read through this surface". MEASURED,
+          // a project at <repo>/site with the clash in <repo>/deploy.env:
+          // `source.read("../deploy.env")` answered `outside_project`, and the
+          // same file's `API_TOKEN=` lines came back in this envelope, both
+          // sides, from the same call.
+          //
+          // So the boundary the rest of this surface enforces is enforced here
+          // too, by the containment test computed just below. Nothing is lost:
+          // such a path still takes a whole-file "ours" or "theirs".
+          //
+          // EMPTY, not null. `null` is reserved above for "there is no text to
+          // split and no `choices` value answers this path", which is false
+          // here: a whole-file "ours" or "theirs" works for a file outside the
+          // project exactly as it does for a binary one. `[]` is already the
+          // shape that means "no hunks are offered; send a whole-file word".
+          const inProject = sourcePathOf(f?.path) !== null;
+          // AND "NOTHING TO SPLIT" IS NOT "NOTHING ANSWERS IT".
+          //
+          // `null` is this envelope's word for the ONE path no `choices` value
+          // can answer: both branches renamed the same file, so git kept only
+          // the version the merge started from and there is no "ours" and no
+          // "theirs" to name. Every other unsplittable path — a binary file, a
+          // page whose bytes are not UTF-8, a symlink, a path outside the
+          // project — HAS both sides and takes a whole-file word, which is what
+          // `[]` means here.
+          //
+          // Those three used to read as text and split into no disagreement, so
+          // they arrived as `[]` by accident. Once conflictText started refusing
+          // to decode them they became `parts === null` and collapsed into the
+          // rename/rename shape, and the note's only sentence about that shape
+          // says "No `choices` value answers that one either". MEASURED: an
+          // agent that obeyed it omitted a conflicting PNG, the documented
+          // default committed OURS for it inside a two-parent merge reported
+          // `{ok: true, resolved: 1}`, and `feature` was thereafter recorded as
+          // merged — so safe-delete stopped protecting the branch whose image
+          // had just been discarded. Sending "theirs" for the same file works
+          // perfectly and is byte-exact; the client was told not to.
+          //
+          // The index is what tells the two apart, and it was already read:
+          // stage 2 and stage 3 are on the clash. Neither present is the
+          // unanswerable path; either present is a whole-file answer.
+          //
+          // `markersUnread` keeps `null` and is checked FIRST: that path has
+          // both sides and would pass the test below, but resolveMerge refuses
+          // every answer for it by name — the whole-file word included, because
+          // the caller who typed it was answering a description of the file
+          // that was not true. Telling a client to send one would be an
+          // instruction that is refused.
+          const hasSide = f?.ours != null || f?.theirs != null;
+          const clashes = unread
+            ? null
+            : parts
+              ? inProject
+                ? parts.filter((part) => part && part.kind === 'clash')
+                : []
+              : hasSide
+                ? []
+                : null;
+          const encoded = JSON.stringify(clashes ?? null);
+          const bytes = Buffer.byteLength(encoded, 'utf8');
+          // A NULL HUNK LIST IS NOT A HUNK LIST THAT DID NOT FIT.
+          //
+          // `fits` charged the four bytes of the string "null" against the
+          // envelope budget like any other entry, so once the budget was nearly
+          // spent a path with NO SIDES AT ALL — both branches renaming the same
+          // file leaves only stage 1 under that name — came back
+          // `hunksOmitted: true`, and the note's remedy for THAT shape ("read the
+          // file yourself and send a whole-file word") is refused for it and
+          // names a file that is not in the working tree to read. MEASURED with
+          // three padding files summing to 23,997 of the 24,000 bytes.
+          const fits = clashes === null || (bytes <= MAX_CONFLICT_BYTES && spent + bytes <= MAX_CONFLICT_ENVELOPE_BYTES);
+          if (fits && clashes !== null) spent += bytes;
+          return {
+            path: f?.path ?? null,
+            sourcePath: sourcePathOf(f?.path),
+            hunks: fits ? clashes : null,
+            hunksOmitted: !fits,
+            markersUnread: unread,
+            // WHY THIS ONE HAS NO HUNKS, WHEN THE REASON IS A PROGRAM.
+            //
+            // A path a custom merge driver merged comes through with `hunks: []`
+            // like any other unsplittable file, and without this a client is left
+            // to guess why a plainly textual file offers nothing to answer one
+            // hunk at a time. Present only where it applies, so no other file's
+            // shape changes. See mergeAttributes in gitBranches.js.
+            ...(f?.customDriver ? { customDriver: f.customDriver } : {}),
+          };
+        });
+        // THE HANDLE THAT SAYS WHICH CONFLICT THIS IS.
+        //
+        // The merge is re-run when the answers are applied, so answers given
+        // against this conflict must not be applied to a later one \u2014 measured
+        // to the point of committing the wrong half of a file, `ok: true`, when
+        // a commit arrived on either branch in between. The ref carries the two
+        // commits and a digest of what git actually wrote, and it carries the
+        // BRANCH, so resolve_merge takes the branch out of the ref rather than
+        // out of the call. Signed here and nowhere else: the panel is handed
+        // the same three facts unsigned over IPC, because the panel is Stacki.
+        const mergeRef = typeof ctx?.mergeRef === 'function' ? ctx.mergeRef({ branch: input.branch, into: raw.from ?? null }, raw.at) : null;
+        return {
+          ...problem(
+            'merge_conflict',
+            `Merging "${input.branch}" stopped on ${all.length} conflicting ${all.length === 1 ? 'file' : 'files'}. ` +
+              'The merge was unwound, so the project is exactly as it was. Reconcile the files named here and ' +
+              'apply the result with git.resolve_merge, passing the `mergeRef` below back unchanged \u2014 it says which ' +
+              'conflict your answers are about, and a resolve without it is refused. `choices` takes "ours" or ' +
+              '"theirs" per file, or an array of "ours" | "theirs" | "both" | "merged" \u2014 one entry per hunk, ' +
+              'exactly as many as the hunks listed here, in this order, keyed by `path` exactly as given below.'
+          ).error,
+          branch: input.branch,
+          into: raw.from ?? null,
+          mergeRef,
+          conflictCount: all.length,
+          files,
+          filesOmitted: Math.max(0, all.length - files.length),
+          // THE ONE FIELD THAT SAYS WHICH OF THE TWO PATH SPACES `path` IS IN.
+          // See sourcePathOf above: git spells its paths from the repository
+          // root and everything else in this surface spells them from the
+          // project, and those are the same string only when the project IS the
+          // repository.
+          pathsRelativeTo: 'repository-root',
+          // Said out loud rather than left to be discovered: the panel gets the
+          // whole of both sides, and this does not.
+          note:
+            'Each side\'s complete file is not included here. Read the conflicting hunks above, or the files ' +
+            'themselves — the merge was unwound, so they hold the pre-merge bytes. A file whose ' +
+            '`markersUnread` is true is one git reports as conflicting whose markers could not be read: it has ' +
+            'no hunk list to answer and git.resolve_merge refuses every answer for it, so that one has to be ' +
+            'finished in the project by hand. A file whose `hunksOmitted` is true is a different thing and takes ' +
+            'a different answer: its hunks were read but were too large to carry here, so `hunks` is null for ' +
+            'size rather than for doubt. Read that file yourself and send a whole-file "ours" or "theirs" for ' +
+            'it, or reconcile it in the project. `hunks: null` with BOTH of those false is a third thing again: ' +
+            'there was no text to split, which is what a path with no version of its own looks like (both ' +
+            'branches renaming the same file leaves only the version the merge started from under that name). ' +
+            'No `choices` value answers that one either. A file with `hunks: []` is one with both versions but ' +
+            'no hunk list to offer: splittable text with no disagreement in it, a binary file, a page whose ' +
+            'bytes are not UTF-8, a symlink, or one outside the open project — the hunks of a file this ' +
+            'surface will not let you read are not sent either — and each of those takes a whole-file word. ' +
+            'Mind the two path spaces: ' +
+            '`path` is relative to the REPOSITORY root and is the only spelling git.resolve_merge accepts as a ' +
+            '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
+            'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +
+            'and `sourcePath` is null for a conflicting file outside the project altogether — that one can still ' +
+            'be answered in `choices`, but not read through this surface. ' +
+            'A file carrying `customDriver` is a fourth case: a merge driver of the project\'s own produced ' +
+            'that conflict, and what it wrote is that program\'s output rather than git\'s conflict markup. ' +
+            'A custom driver is handed the three versions and writes its result; nothing requires it to emit ' +
+            'markers, or to put this branch before the incoming one if it does. So Stacki does not read hunk ' +
+            'sides out of it and offers none — a per-hunk array for that path is refused. Its whole-file ' +
+            '"ours" and "theirs" are still exact, because those are answered from git\'s index rather than ' +
+            'from the driver\'s text.',
+        };
+      }
+      if (raw?.ok === false && raw.dirty) {
+        return {
+          ...problem(
+            'working_tree_blocked',
+            `Merging "${input.branch}" needs to write files that have uncommitted changes. ` +
+              'Commit them, park them, or discard them first — nothing was changed.'
+          ).error,
+          branch: input.branch,
+          // `from`, matching checkout's. Both refusals mean "the work in your
+          // tree is in the way"; naming the branch you are on two different
+          // things across two operations of one domain is a distinction a
+          // caller has to learn for nothing.
+          from: raw.from ?? null,
+          files: take(raw.files, MAX_LIST),
+        };
+      }
+      return raw;
+    },
+  },
+  resolve_merge: {
+    channel: 'git:resolveMerge',
+    // THE BRANCH COMES OUT OF THE REF, NOT OUT OF THE CALL.
+    //
+    // An agent that has run two merges holds two sets of answers and two branch
+    // names, and pairing them wrongly is one transposed argument away. Taking
+    // the branch from the signed handle makes that pairing impossible rather
+    // than unlikely. `branch` stays in the schema because it reads as the
+    // obvious argument and leaving it out would be a trap of its own \u2014 but it
+    // is cross-checked, never used.
+    args: (input, ctx) => {
+      if (typeof ctx.mergeBinding !== 'function') {
+        return problem('bad_ref', 'Stacki cannot read refs right now, so a merge cannot be finished safely.');
+      }
+      const bound = ctx.mergeBinding(input.mergeRef);
+      if (bound.error) return bound;
+      if (input.branch != null && input.branch !== bound.branch) {
+        return problem(
+          'wrong_target',
+          `That mergeRef is for the conflict from merging "${bound.branch}", and this call names "${input.branch}". ` +
+            'Those are two different merges and the answers to one are not answers to the other. Nothing was merged.'
+        );
+      }
+      // AND THE BRANCH IT WAS BEING MERGED INTO, which this dropped.
+      //
+      // The ref has always carried it — mergeRef is minted with `{branch, into}`
+      // — and every fact that reached the handler came out of `observed`, which
+      // holds the two commits and the digest and nothing about the branch. So
+      // the handler compared `tipOf('HEAD')` and called that enough, and a
+      // checkout to a sibling branch at the same commit passed: the answers an
+      // agent gave about merging into `main` were committed onto the other
+      // branch, `{ok: true, into: "release"}`. The binding names it, so it goes
+      // through; gitBranches.js refuses the mismatch. See the guard there.
+      return {
+        projectPath: ctx.root,
+        branch: bound.branch,
+        choices: input.choices || {},
+        expect: { ...bound.observed, into: bound.into },
+      };
+    },
+    // A CHOICE THAT WAS NOT UNDERSTOOD IS NOT A RESOLUTION.
+    //
+    // The handler used to treat anything that was not the string 'theirs' as
+    // "keep ours" and then commit it, so a wrong shape discarded the other
+    // branch's work and answered `ok: true, changed: true` with
+    // `undoable: false`. It now refuses; this gives that refusal a code and
+    // states the vocabulary an agent should have been told in the first place.
+    result: (raw, input, ctx) => {
+      // THE TWO GIT FAILURES THIS MAPPER USED TO WALK PAST.
+      //
+      // `merge_blocked` and `merge_stuck` are minted in gitBranches.js and are
+      // the only two refusals here that are about GIT rather than about the
+      // answers: the re-merge would not start, or it started and would not
+      // unwind. The branch below only recognises a refusal by `badChoices`, so
+      // both of these fell through to `runMain`'s spread and reached a client
+      // exactly as the handler wrote them — which is two things this surface
+      // does not allow anywhere else.
+      //
+      // `files` is `git ls-files -u`, one entry per path still holding conflict
+      // markers, and NOTHING CAPPED IT. A tree in the middle of a large merge
+      // has as many as the merge touched, and an unbounded list is the promise
+      // this API breaks least willingly. It is cut to MAX_LIST like every other
+      // list that leaves here.
+      //
+      // And `gitSaid` is git's own stderr, verbatim by design — which is right,
+      // and is also the one field in this refusal whose text Stacki did not
+      // write. Git names a path from time to time (`unable to create
+      // '<...>/.git/index.lock'` is the cause the handler's own comment was
+      // measured against), so it goes through the same scrub as every other
+      // sentence that started life outside this surface.
+      //
+      // The sentences themselves are the handler's and stay whole: they name
+      // the branch, quote git, and say what clears it. What is added here is
+      // the path space, for the same reason the `bad_choices` refusal below
+      // declares it — every path in this answer is git's own spelling, relative
+      // to the REPOSITORY root, and an agent that re-spells them the way
+      // source.read wants is the mistake that declaration exists to stop.
+      const scrub = (text) => (typeof text === 'string' && text ? withoutHostPaths(text, ctx?.root) : text ?? null);
+      if (raw?.ok === false && (raw.code === 'merge_stuck' || raw.code === 'merge_blocked')) {
+        return {
+          ...raw,
+          branch: raw.branch ?? input.branch ?? null,
+          gitSaid: scrub(raw.gitSaid),
+          message: scrub(raw.message),
+          ...(raw.code === 'merge_stuck'
+            ? { files: take(raw.files, MAX_LIST), pathsRelativeTo: 'repository-root' }
+            : {}),
+        };
+      }
+      // AND THE THIRD GIT FAILURE, WHICH FELL THROUGH FOR THE SAME REASON THE
+      // OTHER TWO DID.
+      //
+      // `working_tree_blocked` is minted in gitBranches.js when git will not
+      // START the re-merge because a file it has to write holds uncommitted
+      // work. The branch above names two codes and this was not one of them, so
+      // it reached a client through `runMain`'s spread exactly as the handler
+      // wrote it — while the SAME refusal from git.merge, one mapper up, is
+      // shaped. One code, two shapes, decided by which call produced it.
+      //
+      // `files` is what makes that matter. It is not a list Stacki composed: it
+      // is git's own stderr, split on newlines and filtered — every line that
+      // is not one of the prose lines this file knows to drop. So it is
+      // UNBOUNDED, and it is text that started life outside this surface, which
+      // is the exact class the scrubber exists for.
+      //
+      // MEASURED, git 2.50.1, 500 files changed on the incoming branch and left
+      // uncommitted here: git listed all five hundred under "Your local changes
+      // to the following files would be overwritten by merge:", and the
+      // envelope carried 500 entries — a hundred over the cap this surface
+      // declares and every other list on it obeys. (Git truncates its own
+      // message near four kilobytes, so the last entry can also be HALF A PATH:
+      // one more reason not to hand the list on as though Stacki had built it.)
+      //
+      // Cut to MAX_LIST and put through the same scrub as the sentences, and
+      // the path space declared for the same reason `merge_stuck` declares it:
+      // these are git's spelling, from the repository root, and an agent that
+      // re-spells them the way source.read wants is the mistake that field
+      // stops.
+      if (raw?.ok === false && raw.code === 'working_tree_blocked') {
+        return {
+          ...raw,
+          branch: raw.branch ?? input.branch ?? null,
+          message: scrub(raw.message),
+          files: take(raw.files, MAX_LIST).map((one) => (typeof one === 'string' ? withoutHostPaths(one, ctx?.root) : one)),
+          pathsRelativeTo: 'repository-root',
+        };
+      }
+      if (raw?.ok === false && Array.isArray(raw.badChoices)) {
+        const first = raw.badChoices[0] || {};
+        // WHAT IS WRONG WITH THE FIRST ONE, in the sentence rather than only in
+        // the list. The refusal used to say "could not be understood, starting
+        // with <path>", which was true while the only failure was a word
+        // outside the vocabulary on a path git had reported. It now also
+        // catches a path git never reported at all \u2014 a typo, a file git merged
+        // by itself, one left over from an earlier merge \u2014 and an array of the
+        // wrong length, where the offending thing is a COUNT. "The choice for
+        // src/pages/abot.astro could not be understood" sends an agent looking
+        // at the value; the file is spelled wrong.
+        const why = {
+          // AND THE COMMONEST WAY TO SPELL ONE WRONG IS NOT A TYPO. git.merge
+          // reports repo-root-relative paths and everything else in this surface
+          // is project-relative, so an agent that re-spelled a conflicted path
+          // the way source.read wants it lands here. The refusal names the space
+          // rather than leaving the agent to re-check the letters.
+          unknown_path:
+            `"${first.path}" is not one of the files this merge could not reconcile, so nothing would have answered ` +
+            'for it — note that a `choices` key is the `path` git.merge reported, which is relative to the ' +
+            'REPOSITORY root and not to the project, and `expected` below lists them exactly as they must be sent',
+          wrong_length: `"${first.path}" has ${first.hunks} conflicting ${first.hunks === 1 ? 'hunk' : 'hunks'} and ${first.given} ${first.given === 1 ? 'answer' : 'answers'} were given for it`,
+          no_merged: `"${first.path}" hunk ${first.hunk} has no combined version, so "merged" is not one of its answers`,
+          empty: `"${first.path}" was given an empty list of answers, which answers none of its hunks`,
+          null: `"${first.path}" was given null, which is neither an answer nor leaving the file out`,
+          not_splittable: first.customDriver
+            ? `"${first.path}" was merged by the custom merge driver "${first.customDriver}", so what is in the ` +
+              'working tree is that program\'s output and not git\'s conflict markup. A custom driver is not ' +
+              'required to write markers at all, nor to put this branch\'s side first if it does, so Stacki ' +
+              'will not read hunk sides out of it and offers none to answer. Send "ours" or "theirs" for the ' +
+              'whole file \u2014 those are taken from git\'s index and are exact \u2014 or reconcile the file in the ' +
+              'project by hand.'
+            : `"${first.path}" has no hunks to answer one at a time \u2014 it takes "ours" or "theirs" for the whole file`,
+          // THE ONE REFUSAL THAT HAS NO ANSWER TO SUGGEST. The file still holds
+          // conflict markers this could not read, so the hunk list it was
+          // described with was empty for a file git says is conflicted — and
+          // every word in the vocabulary would be answering that false
+          // description, the deliberate "theirs" as much as the whole-file
+          // default the panel used to fabricate. `markersUnread` on the
+          // git.merge envelope names the same files in advance.
+          unreadable_conflict:
+            `"${first.path}" still holds conflict markers Stacki could not read, so it was listed with no hunks ` +
+            'while git reports it as conflicting \u2014 nothing that can be sent for that path would be answering the ' +
+            'real file, and this merge has to be finished in the project by hand',
+          bad_pick: `"${first.given}" is not one of the answers a hunk of "${first.path}" can take`,
+          bad_value: `"${first.given}" is not one of the answers "${first.path}" can take`,
+          bad_shape: `the choice for "${first.path}" is a ${first.given}, which is neither a word nor a list of them`,
+          // A WORD IN THE VOCABULARY THAT THIS FILE HAS NO VERSION FOR.
+          //
+          // One branch edited the file and the other deleted it, so the side
+          // asked for does not exist. This used to pass validation as
+          // vocabulary and then die inside `git checkout --theirs` with
+          // `error: path 'a.txt' does not have their version`, which reached
+          // the agent as an unnamed `failed`. The sentence also has to say the
+          // thing the vocabulary cannot: "ours" and "theirs" both name a
+          // version to KEEP, so accepting the other branch's deletion is not
+          // expressible as a choice at all.
+          //
+          // The other side is always there on this reason — a path with NEITHER
+          // is `no_sides` below, which is a different thing to say — so this
+          // sentence no longer carries a branch for a list it cannot be given.
+          no_such_side:
+            `"${first.path}" was deleted on the ${first.deletedBy === 'theirs' ? 'incoming' : 'current'} branch, so it has ` +
+            `no "${first.given}" version to take — "${(first.sides || []).join('" or "')}" is the only answer it can take, ` +
+            'and accepting the deletion is not something a choice can say: keep the file here and delete it in a commit of its own',
+          // AND A CONFLICT THE VOCABULARY CANNOT EXPRESS AT ALL.
+          //
+          // Both branches renamed the same file, so git's conflict includes the
+          // ORIGINAL name carrying the base and nothing else — no "ours" and no
+          // "theirs" under that name. MEASURED with git 2.50.1: it was refused
+          // as `no_such_side`, and this sentence told the agent the path "was
+          // deleted on the current branch", which is not what happened and
+          // sends it to try the other word. There is no other word. Both name a
+          // version to keep and this path has neither, so the honest answer is
+          // that `choices` cannot describe this merge — not that the wrong side
+          // was picked.
+          no_sides:
+            `"${first.path}" has no "ours" and no "theirs" — git kept only the version this merge started from ` +
+            'under that name, which is what both branches renaming or moving the same file leaves behind. Both ' +
+            'words name a version to keep and there is neither, so no choice can answer for that path and this ' +
+            'merge cannot be finished through resolve_merge: it has to be done in the project by hand',
+        }[first.reason] || `the choice for "${first.path}" could not be understood`;
+        return {
+          ...problem(
+            'bad_choices',
+            `Nothing was merged: ${raw.badChoices.length} of the choices could not be used, starting with the ` +
+              `first \u2014 ${why}. A choice is either "ours" or "theirs" for the whole file, or an array of ` +
+              '"ours" | "theirs" | "both" | "merged" \u2014 one entry per conflicting hunk and exactly as many ' +
+              'entries as that file has hunks, in the order git.merge listed them. Every key must be a `path` ' +
+              'git.merge reported, spelled exactly as it reported it — those are relative to the REPOSITORY ' +
+              'root, not to the project, and are not the paths source.read takes. A file you leave out entirely ' +
+              "keeps this branch's version."
+          ).error,
+          branch: input.branch,
+          into: raw.from ?? null,
+          badChoices: take(raw.badChoices, MAX_LIST),
+          // The same declaration git.merge's conflict carries, on the refusal
+          // that is most often ABOUT the path space. `badChoices[].expected`
+          // holds git's own spellings.
+          pathsRelativeTo: 'repository-root',
+        };
+      }
+      return raw;
+    },
+  },
   delete_branch: {
     channel: 'git:deleteBranch',
     args: (input, ctx) => ({ projectPath: ctx.root, branch: input.branch, force: !!input.force }),
@@ -1650,6 +2397,24 @@ const GIT_CAUSES = [
     () => 'There is nothing to commit — no file in the project has changed since the last commit.',
   ],
   [/pathspec .* did not match/i, 'no_file', null],
+  // THE TWO COMMONEST GIT REFUSALS OF ALL, WHICH ARRIVED AS `failed`.
+  //
+  // The in-band shapes are named by the `merge` and `checkout` result mappers
+  // above; these catch the same two causes when git's text reaches here as a
+  // throw instead — a caller that reaches `git:merge` by another route, an
+  // operation that shells out and lets the error rise, or a git that words the
+  // refusal in a way the handler's own test above did not match. The codes are
+  // deliberately the same in both routes: one cause, one name, however it
+  // travelled.
+  //
+  // Both sentences are git's own, because git names the branch and the files it
+  // is talking about better than a rewrite here could.
+  [/CONFLICT \(|Automatic merge failed|fix conflicts and then commit/i, 'merge_conflict', null],
+  [
+    /would be overwritten by (checkout|merge)|Your local changes to the following files would be overwritten|Please commit your changes or stash them/i,
+    'working_tree_blocked',
+    null,
+  ],
   // BEFORE the ref rule, and deliberately: `fatal: invalid reference: x` is
   // what `git switch x` says, and the argument the caller got wrong there is a
   // branch. An operation that takes a `branch` answering `no_ref` while its
@@ -1735,6 +2500,10 @@ function refusal(raw) {
 
 module.exports = {
   runMain,
+  // Exported so the renderer's own answers get the same treatment. A message
+  // built in the renderer never passed through `thrownFailure`, so an absolute
+  // path in one reached the wire intact.
+  withoutHostPaths,
   // Exported for test/git-envelopes.js, which calls it with the error shapes
   // that reach it — including the ones no fixture can provoke end to end, like
   // a package manager's stderr with somebody's home directory in it.

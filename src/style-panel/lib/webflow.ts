@@ -636,6 +636,11 @@ export function rebuildRules(docs: EmbedDoc[]): ParsedRule[] {
           regionIndex,
           idSeed: doc.source.key,
           order,
+          // THE ONE PLACE THE SCOPING FACT WAS BEING DROPPED. `styleSources()`
+          // records it above; nothing carried it this far, so every selector
+          // was scored as the author typed it and a scoped rule lost a cascade
+          // it wins in the browser.
+          scoped: doc.source.scope === 'scoped',
         }),
       )
     })
@@ -652,6 +657,11 @@ export function rebuildRules(docs: EmbedDoc[]): ParsedRule[] {
         regionIndex: doc.regions.length + index,
         idSeed: doc.source.key,
         order,
+        // NOT scoped, even though they were written inside a scoped block:
+        // these are the `:global(...)` rules, and Astro unwraps those and
+        // serves them with no marker at all. Marking them would make Stacki
+        // wrong about the one kind of rule in a scoped block that is not.
+        scoped: false,
       })
       for (const rule of collected) readOnlyRules.add(rule)
       rules.push(...collected)

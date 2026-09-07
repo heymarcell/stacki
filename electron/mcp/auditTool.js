@@ -422,7 +422,16 @@ function registerAuditTool(server, { audit, api }) {
     // with this same schema, so a mistyped argument is refused as
     // `bad_arguments` before the gate is asked and the engine never sees a
     // shape it did not declare.
-    async (args = {}) => {
+    // `ctx` IS THE SECOND ARGUMENT THE SDK HAS ALWAYS PASSED, AND THIS HANDLER
+    // USED TO DROP IT.
+    //
+    // `ctx.mcpReq.signal` is a live AbortSignal: the SDK aborts it when the
+    // caller's HTTP request goes away — a host tool-timeout, a disconnect, a
+    // person pressing escape. The audit is the one operation in this surface
+    // long enough for that to happen mid-flight, and until now nothing observed
+    // it: the run kept loading pages and opening windows for a caller that had
+    // gone, and every audit queued behind it waited for work nobody would read.
+    async (args = {}, ctx = undefined) => {
       // THE SAME DOOR. See the note at the top of this file.
       const denied = api.checkAccess(AUDIT_OPERATION, AUDIT_RISK);
       // Compact, exactly as this tool has always answered: the text block is a
@@ -435,7 +444,7 @@ function registerAuditTool(server, { audit, api }) {
       // captured audit undeliverable. `answer` puts the blocks first, exactly as
       // electron/mcp/tools.js orders the capture tool's, so a host that shows
       // only the first block shows the picture.
-      const { images = [], ...body } = await audit(args);
+      const { images = [], ...body } = await audit(args, { signal: ctx?.mcpReq?.signal ?? null });
       return answer(body, { spaces: 0, images });
     }
   );

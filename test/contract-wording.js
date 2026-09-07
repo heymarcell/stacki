@@ -512,7 +512,171 @@ async function measureOriginFence() {
     }
   }
 
-  if (failures.length) {
+  // ── The merge refusals the guide claims to enumerate ────────────────────────
+  //
+  // A CLOSED SET IS A CLAIM, AND THIS ONE WAS WRONG BY FOUR.
+  //
+  // The guide's merge section says "N refusals" and then lists them. It said
+  // FIVE, and `git.resolve_merge` can answer with nine: the two the ref layer
+  // mints before the handler is reached (`bad_ref`, `wrong_target`) and two the
+  // handler itself mints and nothing rewrites (`working_tree_blocked`,
+  // `bad_branch_name`). An agent reading that list and finding a code outside it
+  // has no way to tell a refusal it should act on from a bug, which is the exact
+  // defect this branch fixed elsewhere in itself for three audit codes.
+  //
+  // So the list is DISCOVERED from the shipping source rather than kept in step
+  // by hand: the handler's own returns, the helpers it returns through, and the
+  // domain mapper's refusals before it. Not a grep of the guide against a hand
+  // list — a grep of the guide against the code.
+  {
+    const branches = readRepo('electron/gitBranches.js');
+    const domains = readRepo('electron/mcp/agent/domains.js');
+    const agentIndex = readRepo('electron/mcp/agent/index.js');
+    const between = (text, from, to) => {
+      const a = text.indexOf(from);
+      const b = a === -1 ? -1 : text.indexOf(to, a + from.length);
+      return a === -1 || b === -1 ? '' : text.slice(a, b);
+    };
+    const codesIn = (text) => new Set([...text.matchAll(/(?:code:\s*|problem\(\s*|no\(\s*)'([a-z][a-z0-9_]*)'/g)].map((m) => m[1]));
+
+    // The handler, from its own declaration to the next one.
+    const handler = between(branches, 'async function resolveMerge(', 'async function mergeBranch(');
+    check('the resolve_merge handler was found to read', handler.length > 2000, String(handler.length));
+    const found = codesIn(handler);
+    // The helpers it returns THROUGH, which carry codes of their own. The list
+    // is a list because a helper that moves takes its codes out of the sweep
+    // with it — which is exactly what happened to `merge_stuck` when `abort`
+    // was lifted out of resolveMerge into unwindGuard, and what the positive
+    // control below is for.
+    for (const [call, where, from, to] of [
+      ['badBranchName(', branches, 'const badBranchName =', '\nasync function isDirty'],
+      ['stale(', branches, 'const stale =', '\nasync function resolveMerge'],
+      ['guard.abort', branches, 'function unwindGuard(', '\n/**\n * Finish a merge'],
+      ['abort()', branches, 'function unwindGuard(', '\n/**\n * Finish a merge'],
+    ]) {
+      if (handler.includes(call)) for (const code of codesIn(between(where, from, to))) found.add(code);
+    }
+    // And the two the mapper answers before the handler is ever called.
+    for (const code of codesIn(between(domains, '  resolve_merge: {', '\n  },\n'))) found.add(code);
+    // `mergeBinding` is where a missing or unreadable ref is turned away — and
+    // it turns away through `readRef`, which is `refs.parse`, which has FOUR
+    // codes of its own. Hardcoding `bad_ref` for that layer, as this used to,
+    // made the completeness check below a tautology over an incomplete set:
+    // `stale_ref`, `wrong_project` and `wrong_kind` are all reachable from a
+    // resolve_merge call and none of them was in it.
+    for (const code of codesIn(between(agentIndex, 'function mergeBinding(', '\n  }\n'))) found.add(code);
+    for (const code of codesIn(between(readRepo('electron/mcp/agent/refs.js'), 'function parse(', '\nmodule.exports'))) found.add(code);
+
+    // A POSITIVE CONTROL ON THE SWEEP ITSELF, so a scanner that stopped matching
+    // cannot turn the completeness check below into a tautology over nothing.
+    for (const [code, why] of [
+      ['bad_choices', 'a code: property in the handler'],
+      ['merge_stuck', 'the handler, whose refusals no mapper rewrites'],
+      ['stale_merge', 'the stale() helper the handler returns through'],
+      ['wrong_target', 'a problem() call in the domain mapper'],
+      ['guard_required', 'mergeBinding, before the handler runs'],
+      ['working_tree_blocked', 'the handler, on a re-merge git will not start'],
+      ['bad_branch_name', 'the badBranchName() helper'],
+      ['stale_ref', 'refs.parse, which mergeBinding reaches through readRef'],
+      ['wrong_kind', 'refs.parse — and it is in no document but this one'],
+      ['wrong_project', 'refs.parse'],
+    ]) {
+      check(`the merge-refusal sweep found ${code} — ${why}`, found.has(code), [...found].sort().join(', '));
+    }
+
+    const model = TOPICS['operating-model'].body;
+    const merge = model.slice(model.indexOf('## A merge conflict'), model.indexOf('## Semantic first'));
+    check('the guide still has a merge section to check', merge.length > 500, String(merge.length));
+    const missing = [...found].filter((code) => !merge.includes(code)).sort();
+    check('the guide names every refusal git.resolve_merge can answer with', missing.length === 0, `missing: ${missing.join(', ')}`);
+    // AND THE NUMBER IT STATES IS THE NUMBER IT LISTS. Saying "five" over a list
+    // of five that is missing four is two failures, and only one of them is
+    // caught by the check above.
+    const WORDS = { One: 1, Two: 2, Three: 3, Four: 4, Five: 5, Six: 6, Seven: 7, Eight: 8, Nine: 9, Ten: 10, Eleven: 11, Twelve: 12 };
+    const said = merge.match(/\b([A-Z][a-z]+) refusals\b/);
+    check('the guide states how many merge refusals there are', !!said && WORDS[said[1]] !== undefined, said ? said[1] : merge.slice(0, 120));
+    if (said && WORDS[said[1]] !== undefined) {
+      check(
+        `the guide says ${said[1]} and the source has ${found.size}`,
+        WORDS[said[1]] === found.size,
+        [...found].sort().join(', ')
+      );
+    }
+
+    // AND A SWEEP OF THE SOURCE CANNOT SEE A CODE THE SOURCE DOES NOT MINT.
+    //
+    // The checks above are source ⊆ guide, with the count taken from that same
+    // scan — so a code that reaches a client from somewhere OTHER than the four
+    // files swept is invisible to them, and the closed-set claim stayed green
+    // over two of them. MEASURED against the shipping stack: an ordinary
+    // `.git/hooks/pre-commit` that exits non-zero, and `commit.gpgsign` with a
+    // signing key git cannot use, both make git.resolve_merge answer `failed`
+    // with git's own words; a mistyped call answers `bad_arguments` at the
+    // schema layer. Neither is minted in gitBranches.js, the mapper, mergeBinding
+    // or refs.parse, and neither was in the twelve.
+    //
+    // So the guide no longer claims a closed set: it says twelve OF ITS OWN and
+    // names the surface-wide ones beside them. This is the check on that half.
+    for (const [code, why] of [
+      ['failed', 'git itself refusing — a pre-commit hook, a signing key'],
+      ['bad_arguments', 'the schema layer, before anything dispatches'],
+      ['permission_denied', 'the permission matrix'],
+      ['no_project', 'no project open'],
+    ]) {
+      check(`the guide names ${code}, which is not merge-specific but reaches this call — ${why}`, merge.includes(code), merge.slice(0, 200));
+    }
+    check(
+      'and it says the twelve are its OWN rather than all a client can get',
+      /twelve refusals of its own/i.test(merge),
+      merge.slice(merge.indexOf('refusals') - 60, merge.indexOf('refusals') + 80)
+    );
+  }
+
+  // ── THE MOST POLYMORPHIC ARGUMENT IN THE SURFACE ─────────────────────────────
+//
+// `target.edit` takes `operations`, an array whose items are a discriminated
+// union of thirteen. The flattened top-level block published for it read, in
+// full, "Used by: edit." — because `items` is a `oneOf` rather than a single
+// object, so `fieldsOf` answered null and the description fell back to the list
+// of actions that use it.
+//
+// Which is the exact failure `summarised()` exists to prevent, one level down:
+// a client that renders `properties` was told a batch edit takes an array and
+// nothing else, and had to discover thirteen shapes one refusal at a time. The
+// branches were always published underneath and remain the contract; this is
+// about what a client that cannot read them is shown.
+{
+  const { TargetInput, StyleInput } = require('../electron/mcp/agentTools.js');
+  const z = require('zod');
+  const json = z.toJSONSchema(TargetInput, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' });
+  const branches = json.oneOf || json.anyOf || [];
+  const editBranch = branches.find((b) => (b?.properties?.action?.const ?? b?.properties?.action?.enum?.[0]) === 'edit');
+  check('target.edit publishes its operations array', !!editBranch?.properties?.operations, JSON.stringify(Object.keys(editBranch?.properties || {})));
+  const variants = editBranch?.properties?.operations?.items?.oneOf || [];
+  check('  whose items are a union of many shapes', variants.length >= 10, `${variants.length} variants`);
+
+  // What a client that reads only `properties` is shown — the same call
+  // `advertised()` makes, over the same conversion.
+  const { summarised } = require('../electron/mcp/agentTools.js');
+  const summariseFor = (schema) => summarised(z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' }));
+  const summary = summariseFor(TargetInput);
+  const opsDesc = String(summary?.properties?.operations?.description || '');
+  check('and the flattened block describes the operations, not only who uses it', /one of /.test(opsDesc), opsDesc.slice(0, 200));
+  for (const type of ['set_text', 'set_prop', 'insert_before', 'append_child', 'remove', 'duplicate', 'move', 'set_tag']) {
+    check(`  and names the ${type} shape`, opsDesc.includes(type), opsDesc.slice(0, 300));
+  }
+  check('  and marks a required field as required', /set_prop\{name, value/.test(opsDesc), opsDesc.slice(0, 300));
+  check('  and an optional one with a question mark', /valueType\?/.test(opsDesc), opsDesc.slice(0, 300));
+
+  // The object-shaped ones did not regress.
+  const styleSummary = summariseFor(StyleInput);
+  const editDesc = String(styleSummary?.properties?.edit?.description || '');
+  check('style.edit still names each action shape', /set_section_title: \{file, start, end, title, expect\}/.test(editDesc), editDesc.slice(0, 260));
+  const declDesc = String(styleSummary?.properties?.declarations?.description || '');
+  check('and an array of one object shape still reads as one', /\[\{property, value, important\?\}\]/.test(declDesc), declDesc.slice(0, 200));
+}
+
+if (failures.length) {
     console.error(`\ncontract-wording: ${failures.length} failed, ${checked - failures.length} passed\n`);
     console.error(failures.join('\n') + '\n');
     process.exit(1);

@@ -861,12 +861,21 @@ const anchorOf = (over) => {
 
     // Pruning.
     const gone = msgs()[1].id;
+    // THE CLAIM BELOW USED TO BE `check(..., true)`.
+    //
+    // It named a real and non-obvious property — an agent's reply may be taken
+    // out of a thread even though it may not be reworded — and then asserted a
+    // literal. Both halves are observable, so both are observed: this message
+    // really is the agent's, and rewording it really is refused.
+    check('the message about to be pruned is the agent\u2019s reply', msgs()[1].authorType === 'agent', String(msgs()[1].authorType));
+    const reword = store.editMessage(t.id, gone, 'a different sentence entirely');
+    check('  and an agent\u2019s reply cannot be reworded', reword.ok !== true, JSON.stringify(reword));
     const pruned = store.removeMessage(t.id, gone);
     check('a message can be taken out of a thread', pruned.ok === true, JSON.stringify(pruned));
     check('and it really is gone', !msgs().some((m) => m.id === gone));
     check('on disk too, before the call answers', !onDisk().some((m) => m.id === gone));
     check('the rest of the thread is intact', msgs().length === 2 && msgs()[1].body === 'still looks off on a phone');
-    check('an agent\u2019s reply CAN be removed even though it cannot be reworded', true);
+    check('  but it CAN be removed', pruned.ok === true && !msgs().some((m) => m.id === gone), JSON.stringify(pruned));
     check('an unknown message is refused', store.removeMessage(t.id, 'rm_nope').code === 'no_message_id');
 
     // The last one is the review.

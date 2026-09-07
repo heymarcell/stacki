@@ -854,6 +854,31 @@ fullScenario({ domain: 'page', action: 'list', run: async ({ call }) => {
   ] };
 } });
 
+// THE LOOP THAT DID NOT CLOSE. An agent could create a page, list it, read it
+// and edit it — and could not look at it. This drives the navigation and then
+// asks `get_context` where the canvas is, because an answer that says it moved
+// is a claim and the snapshot is the evidence.
+fullScenario({ domain: 'page', action: 'open', run: async ({ call, tool }) => {
+  // `get_context` is the evidence, not the answer: an envelope that says it
+  // moved is a claim, and the snapshot the app publishes is what happened.
+  // `tool()` answers `{envelope, raw}` — the envelope is what the client
+  // validated against get_context's declared output schema, so reading it is
+  // also an assertion that the snapshot still matches what is published.
+  const ctx = async () => (await tool('get_context', {})).envelope || {};
+  const before = await ctx();
+  const { envelope } = await call('page', 'open', { route: '/about' });
+  const after = await ctx();
+  return { envelope, checks: [
+    ['it says it moved', envelope?.moved === true],
+    ['and names the page it moved to', envelope?.page?.route === '/about'],
+    ['with the file behind it', String(envelope?.page?.file || '').endsWith('src/pages/about.astro')],
+    ['the canvas was somewhere else before', before?.page?.route !== '/about'],
+    ['and get_context now says that route', after?.page?.route === '/about'],
+    ['and names the same file', String(after?.page?.file || '').endsWith('src/pages/about.astro')],
+    ['and the answer carries the document it landed on', String(envelope?.document?.file || '').endsWith('src/pages/about.astro')],
+  ] };
+} });
+
 fullScenario({ domain: 'page', action: 'read', run: async ({ call }) => {
   const { envelope } = await call('page', 'read', { path: 'src/pages/index.astro' });
   return { envelope, checks: [
@@ -887,7 +912,7 @@ fullScenario({ domain: 'page', action: 'create', run: async ({ call, fixture }) 
 fullScenario({ domain: 'page', action: 'move', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-made', layout: 'Base' });
   const before = fixture.read('src/pages/wire-made.astro');
-  const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'moved/index.astro' });
+  const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'src/pages/moved/index.astro' });
   const after = fixture.exists('src/pages/moved/index.astro') ? fixture.read('src/pages/moved/index.astro') : '';
   const spec = (after.match(/import\s+Base\s+from\s+'([^']+)'/) || [])[1] || '';
   return { envelope, checks: [
@@ -914,7 +939,7 @@ fullScenario({ domain: 'page', action: 'delete', run: async ({ call, fixture }) 
 } });
 
 fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixture }) => {
-  const { envelope } = await call('page', 'folder_create', { dir: 'wire-docs' });
+  const { envelope } = await call('page', 'folder_create', { dir: 'src/pages/wire-docs' });
   return { envelope, checks: [['the folder exists under pages', fixture.exists('src/pages/wire-docs')]] };
 } });
 
@@ -925,7 +950,7 @@ fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixt
 fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-docs/inner', layout: 'Base' });
   const before = fixture.read('src/pages/wire-docs/inner.astro');
-  const { envelope } = await call('page', 'folder_rename', { from: 'wire-docs', to: 'wire-guide' });
+  const { envelope } = await call('page', 'folder_rename', { from: 'src/pages/wire-docs', to: 'src/pages/wire-guide' });
   const after = fixture.exists('src/pages/wire-guide/inner.astro') ? fixture.read('src/pages/wire-guide/inner.astro') : '';
   const spec = (after.match(/import\s+Base\s+from\s+'([^']+)'/) || [])[1] || '';
   return { envelope, checks: [
@@ -945,7 +970,7 @@ fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixt
 fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-guide/doomed', layout: 'Base' });
   const before = fixture.exists('src/pages/wire-guide/doomed.astro');
-  const { envelope } = await call('page', 'folder_delete', { dir: 'wire-guide' });
+  const { envelope } = await call('page', 'folder_delete', { dir: 'src/pages/wire-guide' });
   return { envelope, checks: [
     ['the folder and the page in it were there first', before],
     ['the folder is gone', !fixture.exists('src/pages/wire-guide')],
@@ -1955,11 +1980,19 @@ fullScenario({ domain: 'git', action: 'resolve_merge', run: async ({ call, fixtu
   const attempt = await call('git', 'merge', { branch: 'wire-conflict' });
   const clashed = JSON.stringify(attempt.envelope?.conflicts || attempt.envelope || {});
 
-  const { envelope } = await call('git', 'resolve_merge', { branch: 'wire-conflict', choices: { [FILE]: 'theirs' } });
+  // WHICH CONFLICT THESE ANSWERS ARE ABOUT. Applying them re-runs the merge, so
+  // a resolve that cannot name the conflict it is settling is refused — the
+  // handle the conflict envelope hands back is what names it, and the branch
+  // comes out of the handle rather than out of this call.
+  const { envelope } = await call('git', 'resolve_merge', {
+    mergeRef: attempt.envelope?.mergeRef,
+    choices: { [FILE]: 'theirs' },
+  });
   const after = fixture.read(FILE);
   const status = git(fixture, ['status', '--porcelain']);
   return { envelope, checks: [
     ['the two branches really disagree about that file', clashed.includes('conflict-canary')],
+    ['and the conflict handed back a handle to settle it with', typeof attempt.envelope?.mergeRef === 'string'],
     ['and the merge was the one thing that could not go through cleanly', attempt.envelope?.ok !== true || clashed.includes('conflict-canary')],
     ['resolving takes the side that was asked for', after.trim() === 'the incoming side'],
     ['leaving no conflict markers behind', !/^<{7}|^={7}|^>{7}/m.test(after)],

@@ -3320,6 +3320,9 @@ body > .embed-editor_provenance {
 .mcp-status { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 12.5px; }
 .mcp-status code { user-select: text; color: var(--text); font-size: 12px; }
 .mcp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); flex-shrink: 0; }
+/* The build's short SHA, pushed to the end of the row and dimmed: it is there
+   to be quoted in a bug report, not to be read on every glance. */
+.mcp-status .mcp-build { margin-left: auto; color: var(--text-faint); font-size: 11px; }
 .mcp-status.on .mcp-dot { background: var(--green); }
 .mcp-status.off .mcp-dot { background: var(--red); }
 .mcp-error { color: var(--red); margin: 10px 0 0; user-select: text; }

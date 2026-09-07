@@ -48,13 +48,14 @@ const { createContextStore, normalize } = require('../electron/mcp/contextStore.
 const { propertiesFor, pickEssential, allStyles, ESSENTIAL } = require('../electron/mcp/essentialStyles.js');
 const { captureRect, fitWidth } = require('../electron/mcp/captureRect.js');
 const { createCapture } = require('../electron/mcp/capture.js');
-const { createStackiMcpServer, tokenMatches, bearerOf, DEFAULT_PORT, ENDPOINT_PATH } = require('../electron/mcp/server.js');
+const { createStackiMcpServer, MAX_BODY_BYTES, tokenMatches, bearerOf, DEFAULT_PORT, ENDPOINT_PATH } = require('../electron/mcp/server.js');
 // The validator the SDK hands a client, used here on the server's own answers:
 // a schema is only a contract if something checks the payload against it.
 const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/server/validators/ajv');
 
 const schemaValidator = new AjvJsonSchemaValidator();
 const { ContextOutput, CaptureOutput, INSTRUCTIONS } = require('../electron/mcp/tools.js');
+const { buildIdentity } = require('../electron/buildInfo.js');
 const {
   ACTIONS: REVIEW_ACTIONS,
   requirementProblem,
@@ -377,9 +378,17 @@ const fakeTrail = (keys) =>
 // ── The output schemas ──────────────────────────────────────────────────────
 
 {
+  // WHAT THE TOOL ANSWERS, not what the store holds. The store's snapshot is
+  // the page half of the answer; `build` is attached by the get_context handler
+  // in electron/mcp/tools.js, because a guarantee that depends on which
+  // implementation of getContext was wired in is not a guarantee. So the
+  // schema is exercised against the two halves put together, the way a client
+  // receives them.
+  const answer = (snapshot) => ({ ...snapshot, build: buildIdentity() });
+
   const store = createContextStore({ resolveTrail: fakeTrail });
   store.publish(payload());
-  const snap = store.read();
+  const snap = answer(store.read());
   const parsed = ContextOutput.safeParse(snap);
   check('a ready snapshot matches the declared output schema', parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues?.slice(0, 3)));
 
@@ -387,15 +396,15 @@ const fakeTrail = (keys) =>
   snap.selection.computedStyles = { display: 'flex', 'scroll-snap-stop': 'normal' };
   check('a snapshot with styles still matches', ContextOutput.safeParse(snap).success);
 
-  const empty = createContextStore({ resolveTrail: fakeTrail }).read();
+  const empty = answer(createContextStore({ resolveTrail: fakeTrail }).read());
   check('an empty snapshot matches the same schema', ContextOutput.safeParse(empty).success, JSON.stringify(ContextOutput.safeParse(empty).error?.issues?.slice(0, 3)));
 
   for (const status of ['no_project', 'no_page', 'no_selection', 'preview_not_ready']) {
-    const s = createContextStore({ resolveTrail: fakeTrail }).read();
+    const s = answer(createContextStore({ resolveTrail: fakeTrail }).read());
     s.selection.status = status;
     check(`the schema accepts the ${status} status`, ContextOutput.safeParse(s).success);
   }
-  const bogus = createContextStore({ resolveTrail: fakeTrail }).read();
+  const bogus = answer(createContextStore({ resolveTrail: fakeTrail }).read());
   bogus.selection.status = 'exploded';
   check('the schema rejects a status nobody defined', !ContextOutput.safeParse(bogus).success);
 
@@ -429,11 +438,31 @@ const fakeTrail = (keys) =>
 // starts to, this file stops being able to test what it claims to.
 
 {
+  // RECURSIVELY, which it was not. `readdirSync` returns one level and the
+  // `.js` filter then dropped `agent/` and `audit/` silently -- so the two
+  // subtrees holding most of the surface were never read, and a
+  // `require('electron')` added under either passed this guard while breaking
+  // the property it names. The review tree's sibling checks below already walk;
+  // this now walks the same way.
   const dir = path.join(__dirname, '..', 'electron', 'mcp');
-  const needsElectron = fs
-    .readdirSync(dir)
-    .filter((n) => n.endsWith('.js'))
-    .filter((n) => /require\(\s*'electron'\s*\)/.test(fs.readFileSync(path.join(dir, n), 'utf8')));
+  const jsUnder = (from, prefix = '') => {
+    const out = [];
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) out.push(...jsUnder(path.join(from, entry.name), rel));
+      else if (entry.name.endsWith('.js')) out.push(rel);
+    }
+    return out;
+  };
+  const allJs = jsUnder(dir);
+  const needsElectron = allJs.filter((rel) => /require\(\s*'electron'\s*\)/.test(fs.readFileSync(path.join(dir, rel), 'utf8')));
+  // The walk has to actually reach the subtrees, or the check above is being
+  // satisfied by not looking.
+  check(
+    'the scan reaches every file under electron/mcp',
+    allJs.some((rel) => rel.startsWith('agent/')) && allJs.some((rel) => rel.startsWith('audit/')),
+    allJs.join(', ')
+  );
   check(
     'only the wiring file needs Electron',
     needsElectron.length === 1 && needsElectron[0] === 'index.js',
@@ -889,6 +918,73 @@ const rawPost = (hostHeader, body) =>
   const other = await fetch(`${BASE}/anything`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}` } });
   check('there is exactly one endpoint', other.status === 404, String(other.status));
   check('no CORS is granted to anybody', !noAuth.headers.get('access-control-allow-origin'));
+
+  // --- how big an ask may be, and whether the refusal survives being right ---
+  //
+  // The gate itself is easy; DELIVERING it is not. A refusal written while the
+  // client is still uploading is only useful if the client can read it, and the
+  // first version of this answered 413 and then called `req.destroy()` — which
+  // reset the socket mid-upload, so every real client saw `fetch failed`/EPIPE
+  // and could not tell a refusal from a dropped write. So every assertion here
+  // goes through `fetch` with the body ACTUALLY SENT, which is what a host
+  // does; a raw socket that stops after the headers sees a healthy 413 either
+  // way and proves nothing.
+  {
+    const jsonHeaders = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
+    const over = 'x'.repeat(MAX_BODY_BYTES + 1024);
+
+    const big = await fetch(`${BASE}/mcp`, { method: 'POST', headers: jsonHeaders, body: over });
+    const bigBody = await big.json().catch(() => null);
+    check('a body over the limit is refused', big.status === 413, String(big.status));
+    check('  and the refusal actually reaches the client', bigBody?.error === 'payload_too_large', JSON.stringify(bigBody));
+    check('  naming the limit and what was declared', /\d+/.test(String(bigBody?.message || '')), String(bigBody?.message));
+
+    // A BODY THAT WILL NOT SAY HOW LONG IT IS. The declared-length check is
+    // worth nothing on its own: chunked carries no Content-Length, and 32 MB
+    // went straight through the first version of this gate and came back 200.
+    const streamed = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('x'.repeat(200000)));
+        c.close();
+      },
+    });
+    const chunked = await fetch(`${BASE}/mcp`, { method: 'POST', headers: jsonHeaders, body: streamed, duplex: 'half' });
+    const chunkedBody = await chunked.json().catch(() => null);
+    check('a body with no declared length is refused', chunked.status === 411, String(chunked.status));
+    check('  as length_required, with a sentence', chunkedBody?.error === 'length_required', JSON.stringify(chunkedBody));
+
+    // ORDER: the size gate is not the first thing a wrong request meets. A
+    // huge POST to a route that does not exist is a 404, and one with no
+    // bearer is a 401 — otherwise the limit would be answering for mistakes
+    // that have nothing to do with it, and both of those refusals would have
+    // the same delivery problem.
+    const nowhere = await fetch(`${BASE}/nowhere`, { method: 'POST', headers: jsonHeaders, body: over });
+    check('an oversize body to a route that does not exist is still a 404', nowhere.status === 404, String(nowhere.status));
+    check('  and that refusal reaches the client too', (await nowhere.json().catch(() => null))?.error === 'not_found');
+    const unauthorized = await fetch(`${BASE}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: over });
+    check('an oversize body with no bearer is still a 401', unauthorized.status === 401, String(unauthorized.status));
+    check('  and that one reaches the client as well', (await unauthorized.json().catch(() => null))?.error === 'unauthorized');
+
+    // THE METHODS THAT CARRY NO BODY, which nothing asserted until the length
+    // requirement above was added and silently turned all of them into 411.
+    // A GET has no body; telling it to supply a Content-Length is nonsense, and
+    // this endpoint's answer to a GET has always been 405.
+    for (const method of ['GET', 'DELETE', 'OPTIONS']) {
+      const r = await fetch(`${BASE}/mcp`, { method, headers: { authorization: `Bearer ${TOKEN}` } });
+      check(`a ${method} is answered 405, not asked for a length`, r.status === 405, String(r.status));
+    }
+
+    // POSITIVE CONTROL. Every assertion above is a refusal, and a transport
+    // that refused everything would satisfy all of them.
+    const ordinary = await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    check('and an ordinary request is unaffected', ordinary.status === 200, String(ordinary.status));
+
+    // THE LIMIT IS ABOVE WHAT THE SCHEMAS PUBLISH AS VALID. It was 8 MB,
+    // reasoned from the wrong field: a schema-legal content.write_entry
+    // measures about 11 MB, so the transport would have refused calls this
+    // surface advertises.
+    check('the limit is larger than the largest schema-legal request', MAX_BODY_BYTES > 11 * 1024 * 1024, String(MAX_BODY_BYTES));
+  }
 
   // --- discovery ---
   const init = await post({
@@ -1423,7 +1519,19 @@ const rawPost = (hostHeader, body) =>
       check('a summary read of the same ledger stays small', JSON.stringify(slim).length < 200_000, `${Math.round(JSON.stringify(slim).length / 1024)}KB`);
 
       // Every key the implementation sends must be DECLARED.
-      check('the published get_comments schema is a closed one', published.get_comments?.additionalProperties === false);
+      //
+      // The tool publishes `anyOf: [payload, refusal]` rather than the payload
+      // alone: its refusal is `{ok:false, code, issues}`, which no payload shape
+      // can hold, and that answer used to be delivered only because the SDK
+      // skips output validation when `isError` is set. What must not slip is the
+      // PAYLOAD half — a union whose success branch had been loosened would
+      // satisfy the four validations below and declare nothing at all. So the
+      // closure is asserted on the branch that carries the keys.
+      const commentsBranches = published.get_comments?.anyOf || [published.get_comments];
+      const commentsPayload = commentsBranches.find((b) => b?.properties?.threads || b?.properties?.total);
+      check('the published get_comments schema still offers a payload shape', !!commentsPayload, JSON.stringify(commentsBranches.map((b) => Object.keys(b?.properties || {}))));
+      check('  and that payload shape is a closed one', commentsPayload?.additionalProperties === false);
+      check('  and the other branch is the refusal, so a refusal is inside the contract too', commentsBranches.length === 2 && commentsBranches.some((b) => b?.properties?.code && b?.properties?.ok), JSON.stringify(commentsBranches.map((b) => Object.keys(b?.properties || {}))));
       for (const shape of [
         ['a full read', { status: 'all', detail: 'full', limit: 3 }],
         ['a summary read', { status: 'open', detail: 'summary', limit: 50 }],

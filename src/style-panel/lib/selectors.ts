@@ -83,15 +83,98 @@ function isPseudoElement(value: string): boolean {
 }
 
 /** Parse a full selector list (comma-separated) into display + match info. */
-export function parseSelectorList(selectorText: string): SelectorInfo[] {
+/**
+ * How many of a selector's compounds Astro would attach its scope marker to.
+ *
+ * WHY THIS EXISTS. A `<style>` in an Astro file is scoped by default, and Astro
+ * does not scope it by wrapping it — it REWRITES EVERY COMPOUND, adding a
+ * marker derived from the file's hash. With the default `scopedStyleStrategy`
+ * of `attribute`, `.box` is served as `.box[data-astro-cid-xxxx]`, which is one
+ * class heavier than the author wrote.
+ *
+ * That is not cosmetic. Measured against @astrojs/compiler 4.0.0, with a global
+ * stylesheet saying `div.box { color: red }` and the page's own scoped block
+ * saying `.box { color: blue }`:
+ *
+ *   authored   div.box (0,1,1)  vs  .box (0,1,0)     -> red wins
+ *   served     div.box (0,1,1)  vs  .box[cid] (0,2,0) -> BLUE wins
+ *
+ * The browser paints blue. Stacki said red, `winning: true`, `problems: []` —
+ * a confidently wrong answer about the one thing a style read is for. A live
+ * dogfood filed it.
+ *
+ * WHICH COMPOUNDS, measured rather than assumed — every one, except:
+ *   - a compound whose element is the lowercase tag `html` or `body`, or the
+ *     pseudo `:root`. (`HTML` in capitals IS marked; the exemption is on the
+ *     lowercased tag, which is what the parser stores.)
+ *   - a compound written wholly as `:global(...)`, which Astro unwraps and
+ *     leaves alone.
+ * A bare universal `*` has the marker put in its PLACE rather than beside it,
+ * so it too gains one class.
+ *
+ * Verified against the compiler for `.box`, `div.box`, `.deep .inner`,
+ * `#id .box`, `html`, `body`, `:root`, `*`, `:global(.g)` and `.a:global(.b)`.
+ */
+function markedCompounds(sel: CompiledSelector): number {
+  let n = 0
+  for (const compound of sel.compounds) {
+    if (compound.tag === 'html' || compound.tag === 'body') continue
+    if (compound.pseudoClasses.includes(':root')) continue
+    // Written wholly as `:global(...)`: nothing else in the compound, so the
+    // marker has nowhere to go and Astro emits the inner selector bare.
+    // Computed rather than stored, because it is the only place that asks.
+    const whollyGlobal =
+      !compound.universal &&
+      !compound.tag &&
+      !compound.id &&
+      compound.classes.length === 0 &&
+      compound.attrs.length === 0 &&
+      compound.pseudoClasses.length === 1 &&
+      compound.pseudoClasses[0] === ':global'
+    if (whollyGlobal) continue
+    n += 1
+  }
+  return n
+}
+
+/**
+ * What the scope marker costs, per marked compound, under each strategy.
+ *
+ * `where` wraps the marker in `:where()`, which has no specificity at all — so
+ * a project configured that way has the authored specificity served, and adding
+ * anything would make Stacki wrong in the other direction.
+ */
+const MARKER_COST: Record<ScopedStyleStrategy, number> = {
+  attribute: 1,
+  class: 1,
+  where: 0,
+}
+
+export type ScopedStyleStrategy = 'attribute' | 'class' | 'where'
+
+export function parseSelectorList(
+  selectorText: string,
+  scope?: { scoped: boolean; strategy: ScopedStyleStrategy },
+): SelectorInfo[] {
   const compiled = compileSelectorList(selectorText)
-  return compiled.map((sel) => ({
-    text: sel.text,
-    specificity: sel.specificity,
-    hasPseudoClass: sel.hasPseudoClass,
-    pseudoElement: sel.pseudoElement,
-    approximate: false,
-  }))
+  const cost = scope?.scoped ? MARKER_COST[scope.strategy] : 0
+  return compiled.map((sel) => {
+    const marked = cost ? markedCompounds(sel) : 0
+    const [a, b, c] = sel.specificity
+    return {
+      text: sel.text,
+      // THE AUTHORED TEXT IS UNTOUCHED. `text` is the rule's identity
+      // everywhere else — labels, matchedSelectors, writes, refs — and moving a
+      // byte of it would make a correct answer unrecognisable. Only the score
+      // is corrected, because only the score decides the winner.
+      specificity: (marked ? [a, b + marked * cost, c] : sel.specificity) as Specificity,
+      hasPseudoClass: sel.hasPseudoClass,
+      pseudoElement: sel.pseudoElement,
+      approximate: false,
+      // What was assumed to produce that score, so a caller can say so.
+      scopeMarkers: marked,
+    }
+  })
 }
 
 /**

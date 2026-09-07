@@ -42,6 +42,17 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const H = require('./agent-harness.js');
 const { thrownFailure } = require('../electron/mcp/agent/domains.js');
+// The composer that turns zod's issues into the sentence an agent actually
+// reads. Held directly at the end of this file, for the shapes no fixture here
+// provokes — see THE COMPOSER, HANDED THE ISSUE SHAPES NO FIXTURE PROVOKES.
+const { badToolArguments } = require('../electron/mcp/agentTools.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// A HANG MUST NOT REPORT A PASS. This suite starts a real app and awaits real
+// IPC for every cause it provokes; node exits 0 on an empty event loop, so an
+// await that never settles prints nothing after the last line it reached and is
+// recorded as success. See test/support/suiteGuard.js.
+const suiteDone = guardSuite('named-causes');
 
 const failures = [];
 let checked = 0;
@@ -94,11 +105,14 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
         ['reading a file at a ref that is not there', ['file_at', { ref: 'no-such-ref', path: 'src/pages/index.astro' }], 'no_ref'],
         ['listing the files of a ref that is not there', ['commit_files', { ref: 'no-such-ref' }], 'no_ref'],
         ['restoring the project to a ref that is not there', ['restore_project', { ref: 'no-such-ref' }], 'no_ref'],
-        // resolve_merge re-runs the merge and then commits what it reconciled;
-        // with no such branch there is nothing to reconcile and git says so in
-        // the words the commit case above earns. What matters is that it is a
-        // code and not `failed`.
-        ['finishing a merge that never started', ['resolve_merge', { branch: 'no-such-branch' }], 'nothing_to_commit'],
+        // resolve_merge used to take the branch out of the call and re-run the
+        // merge against whatever it found, so this reached git and came back
+        // wearing the words the commit case above earns. The branch now comes
+        // out of the `mergeRef` git.merge hands back with a conflict, so a call
+        // with no handle never reaches git at all — and that is the answer, not
+        // a weaker one: an agent naming a branch it never merged has skipped
+        // the step that would have told it what there was to reconcile.
+        ['finishing a merge nothing said had started', ['resolve_merge', { branch: 'no-such-branch' }], 'guard_required'],
       ];
       for (const [what, [action, args], code] of cases) {
         const env = await run('git', action, args);
@@ -137,6 +151,266 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
       check('  with the bytes git has', at.text === git(root, 'show', 'HEAD:src/pages/about.astro') + '\n', short(at.text));
       const files = await run('git', 'commit_files', { ref: 'HEAD' });
       check('listing a real commit’s files still works', files.ok === true && (files.files || []).length > 0, short(files));
+    }
+
+    // ── THE TWO REAL ONES, PROVOKED RATHER THAN DESCRIBED ────────────────────
+    //
+    // Every case above is a name git does not recognise, which is easy to make
+    // and is not what the git domain actually spends its time refusing. These
+    // two are the commonest refusals in it, they both used to arrive as
+    // `failed`, and neither can be produced by passing a wrong string: the
+    // repository has to be put into the state, with real commits that really
+    // disagree and real work that would really be overwritten.
+    //
+    // Both are also the cases where a wrong answer costs something. An agent
+    // told `failed` retries; an agent told `merge_conflict` reconciles, and an
+    // agent told `working_tree_blocked` commits or parks first.
+    {
+      const before = state();
+
+      // A REAL MERGE CONFLICT: one file, two branches, two different edits to
+      // the same line.
+      const CONFLICTED = 'src/pages/about.astro';
+      const onMain = read(CONFLICTED);
+      // A BIG FILE WITH A SMALL DISAGREEMENT, so that "both whole versions" and
+      // "the conflicting hunks" are different sizes and different bytes. With a
+      // three-line fixture they are the same thing and the bound below would be
+      // satisfied by a surface that still sent everything.
+      const FILLER = Array.from({ length: 300 }, (_, i) => `<p>settled paragraph ${i} — BULK_MARKER</p>`).join('\n');
+      const page = (side) => `---\n---\n<p>${side}</p>\n${FILLER}\n`;
+      // THE BULK GOES IN THE BASE, so that both branches CHANGE one line rather
+      // than both ADDING three hundred. Otherwise git is right to call the whole
+      // file conflicted, and the fixture would be measuring a large conflict
+      // rather than a large file with a small conflict — which is the case that
+      // distinguishes "sent the hunks" from "sent both whole files".
+      fs.writeFileSync(path.join(root, CONFLICTED), page('base'), 'utf8');
+      await run('git', 'commit', { message: 'the settled part' });
+      await run('git', 'checkout', { branch: 'conflicting', create: true });
+      fs.writeFileSync(path.join(root, CONFLICTED), page('their side'), 'utf8');
+      await run('git', 'commit', { message: 'their edit' });
+      await run('git', 'checkout', { branch: 'main' });
+      fs.writeFileSync(path.join(root, CONFLICTED), page('our side'), 'utf8');
+      await run('git', 'commit', { message: 'our edit' });
+      const ourBytes = read(CONFLICTED);
+      const headBeforeMerge = git(root, 'rev-parse', 'HEAD');
+
+      const conflict = await run('git', 'merge', { branch: 'conflicting' });
+      check('a merge whose branches really disagree is refused', conflict.ok === false, short(conflict));
+      check('  as merge_conflict, not the code that means nobody knows', conflict.code === 'merge_conflict', short({ code: conflict.code }));
+      check('  with a sentence of its own rather than the envelope’s default',
+        typeof conflict.message === 'string' && /conflict/i.test(conflict.message) && !/That operation was refused/.test(conflict.message),
+        short(conflict.message));
+      check('  naming the branch that was merged', String(conflict.message || '').includes('conflicting'), short(conflict.message));
+      check('  and saying how many files clashed', conflict.conflictCount === 1, short({ conflictCount: conflict.conflictCount }));
+      check('  and naming the file', (conflict.files || []).some((f) => f && f.path === CONFLICTED), short(conflict.files));
+
+      // THE PAYLOAD IS BOUNDED. The handler hands the app BOTH complete
+      // versions of every conflicting file for its conflict UI; none of that
+      // may travel to an agent unbounded, and this used to.
+      const conflictBytes = Buffer.byteLength(JSON.stringify(conflict), 'utf8');
+      check('  and the answer is a size a host will deliver', conflictBytes < 30000, String(conflictBytes));
+      const carried = JSON.stringify(conflict.files || []);
+      // The bulk is 300 identical settled lines both sides agree on. A whole-file
+      // `ours`/`theirs` carries them twice; the conflicting hunks carry none of
+      // them. That is the discriminator.
+      check('  carrying none of the bulk both sides agreed on', !carried.includes('BULK_MARKER'), String(conflictBytes));
+      check('  and no whole-file side at all',
+        (conflict.files || []).every((f) => f && f.ours === undefined && f.theirs === undefined),
+        short(Object.keys((conflict.files || [])[0] || {})));
+      // But it DOES still say what actually clashed, or the bound would have
+      // been bought by answering nothing.
+      check('  while still naming both sides of what clashed',
+        carried.includes('our side') && carried.includes('their side'),
+        short(carried, 400));
+      check('  and saying where the full versions are instead', typeof conflict.note === 'string' && /source\.read/.test(conflict.note), short(conflict.note));
+
+      // AND THE REPOSITORY IS EXACTLY AS IT WAS. A refusal that left conflict
+      // markers in the working tree, or a half-merged index, would be a worse
+      // defect than the code it was answering with.
+      check('the merge was unwound', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+      check('  HEAD did not move', git(root, 'rev-parse', 'HEAD') === headBeforeMerge, git(root, 'rev-parse', 'HEAD'));
+      check('  the branch is unchanged', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main', git(root, 'rev-parse', '--abbrev-ref', 'HEAD'));
+      check('  and the file holds our bytes, with no conflict markers',
+        read(CONFLICTED) === ourBytes && !String(read(CONFLICTED)).includes('<<<<<<<'),
+        short(read(CONFLICTED), 120));
+
+      // A CHECKOUT THAT WOULD OVERWRITE UNCOMMITTED WORK.
+      //
+      // `parkFirst: false` deliberately: parking is what the app does for a
+      // person, and it makes the switch succeed. This asks for the bare switch,
+      // which is the one git refuses.
+      fs.writeFileSync(path.join(root, CONFLICTED), page('work in progress'), 'utf8');
+      const dirtyBytes = read(CONFLICTED);
+      const blocked = await run('git', 'checkout', { branch: 'conflicting', parkFirst: false });
+      check('a switch that would overwrite uncommitted work is refused', blocked.ok === false, short(blocked));
+      check('  as working_tree_blocked', blocked.code === 'working_tree_blocked', short({ code: blocked.code, message: blocked.message }));
+      check('  with a sentence that says what to do about it',
+        typeof blocked.message === 'string' && /commit|park|discard/i.test(blocked.message) && !/That operation was refused/.test(blocked.message),
+        short(blocked.message));
+      check('  and the work is still there, byte for byte', read(CONFLICTED) === dirtyBytes, short(read(CONFLICTED)));
+      check('  and the branch did not change', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main', git(root, 'rev-parse', '--abbrev-ref', 'HEAD'));
+      check('  without this machine in the message', !String(blocked.message || '').includes(root), short(blocked.message));
+
+      // POSITIVE CONTROL: the same switch, once the work is out of the way,
+      // still happens. Without this a checkout that refused everything would
+      // satisfy the block above.
+      fs.writeFileSync(path.join(root, CONFLICTED), ourBytes, 'utf8');
+      const went = await run('git', 'checkout', { branch: 'conflicting', parkFirst: false });
+      check('and the same switch with nothing in the way still happens', went.ok === true, short(went));
+      check('  and git agrees', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'conflicting', git(root, 'rev-parse', '--abbrev-ref', 'HEAD'));
+
+      // AND A CHOICE THE HANDLER CANNOT READ MUST NOT BE GUESSED AT.
+      //
+      // `resolveMerge` took anything that was not the string 'theirs' as "keep
+      // ours" and then COMMITTED it, answering `{ok:true, changed:true}` with
+      // `undoable:false` — so an agent that sent the choice in any shape but
+      // the one undocumented shape discarded the other branch's work silently
+      // and Stacki's own undo could not bring it back. The refusal above now
+      // routes agents here, which is exactly why this has to be safe.
+      // Back on main, where the two branches still disagree, so resolve_merge
+      // re-runs a merge that really does conflict.
+      await run('git', 'checkout', { branch: 'main', parkFirst: false });
+      // The conflict, and the handle that says which conflict it is. Both are
+      // needed now: the branch comes out of the handle, so every call below
+      // reaches the same merge the envelope described.
+      const conflictEnv = await run('git', 'merge', { branch: 'conflicting' });
+      check('the two branches really disagree about that file', conflictEnv.code === 'merge_conflict', short({ code: conflictEnv.code }));
+      check('  and the conflict hands back a handle for itself', typeof conflictEnv.mergeRef === 'string' && conflictEnv.mergeRef.startsWith('stacki:'), short(conflictEnv.mergeRef));
+      const mergeRef = conflictEnv.mergeRef;
+      const headBefore = git(root, 'rev-parse', 'HEAD');
+
+      const guessed = await run('git', 'resolve_merge', {
+        mergeRef,
+        choices: { [CONFLICTED]: { hunk0: 'theirs' } },
+      });
+      check('a choice the handler cannot read is refused', guessed.ok === false, short(guessed));
+      check('  as bad_choices', guessed.code === 'bad_choices', short({ code: guessed.code }));
+      check('  naming the vocabulary it should have used',
+        /"ours"/.test(String(guessed.message || '')) && /"both"/.test(String(guessed.message || '')),
+        short(guessed.message));
+      check('  and nothing was committed', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+      check('  and HEAD did not move', git(root, 'rev-parse', '--abbrev-ref', 'HEAD') === 'main');
+
+      // AND THE FIVE THAT USED TO BE SUCCESSES.
+      //
+      // Everything above is about a VALUE the handler could not read, on a path
+      // git had reported. The pre-flight only ever looked up choices under
+      // names git had already supplied, so none of these was ever enumerated:
+      // each one reached the apply loop, took the `--ours` default and was
+      // COMMITTED, with `{ok:true, changed:true, resolved:1}` over the top.
+      //
+      // The typo is the one that reads worst. The caller asked for THEIRS; the
+      // file it meant was committed as OURS and it was told the merge worked.
+      const typoKey = `${CONFLICTED.slice(0, -1)}`;
+      const notThere = [
+        ['a choice under a path git never reported', { [typoKey]: 'theirs' }, 'unknown_path'],
+        ['a choice for a path that is not in the repository at all', { 'src/pages/invented.astro': 'theirs' }, 'unknown_path'],
+        ['more answers than the file has disagreements', { [CONFLICTED]: ['theirs', 'ours', 'theirs', 'ours'] }, 'wrong_length'],
+        ['an empty list of answers', { [CONFLICTED]: [] }, 'empty'],
+        ['an explicit null for a whole file', { [CONFLICTED]: null }, 'null'],
+      ];
+      for (const [what, choices, reason] of notThere) {
+        const env = await run('git', 'resolve_merge', { mergeRef, choices });
+        check(`${what} is refused`, env.ok === false, short(env));
+        check(`  as bad_choices, not a success envelope`, env.code === 'bad_choices', short({ code: env.code, message: env.message }));
+        check(`  saying which one and why (${reason})`,
+          (env.badChoices || []).some((b) => b.reason === reason),
+          short(env.badChoices));
+        check('  in a sentence rather than only a field name',
+          typeof env.message === 'string' && env.message.length > 60 && /Nothing was merged/.test(env.message),
+          short(env.message));
+        check('  without this machine in the message', !String(env.message || '').includes(root), short(env.message));
+        check('  and nothing was committed', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+        check('  and HEAD did not move', git(root, 'rev-parse', 'HEAD') === headBefore, git(root, 'rev-parse', 'HEAD'));
+        check('  with no merge left in progress', !fs.existsSync(path.join(root, '.git', 'MERGE_HEAD')));
+      }
+
+      // AND THE CONFLICT MOVING UNDER THE ANSWERS.
+      //
+      // A commit landing on either branch while the caller was deciding used to
+      // commit work nobody had read, `ok: true`. The handle carries what the
+      // conflict was; this is the code that says it is not that any more.
+      {
+        git(root, 'checkout', '-q', 'conflicting');
+        fs.writeFileSync(path.join(root, 'public/arrived-later.txt'), 'after you looked\n', 'utf8');
+        git(root, 'add', '-A');
+        git(root, 'commit', '-q', '-m', 'the branch moved on');
+        git(root, 'checkout', '-q', 'main');
+        const stale = await run('git', 'resolve_merge', { mergeRef, choices: { [CONFLICTED]: 'theirs' } });
+        check('answers made against a conflict that has moved are refused', stale.ok === false, short(stale));
+        check('  as stale_merge', stale.code === 'stale_merge', short({ code: stale.code, message: stale.message }));
+        check('  naming both branches', /conflicting/.test(String(stale.message)) && /main/.test(String(stale.message)), short(stale.message));
+        check('  and saying to merge again rather than retry', /git\.merge/.test(String(stale.message)), short(stale.message));
+        check('  without this machine in the message', !String(stale.message || '').includes(root), short(stale.message));
+        check('  and HEAD did not move', git(root, 'rev-parse', 'HEAD') === headBefore, git(root, 'rev-parse', 'HEAD'));
+        check('  with a clean tree', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+        // Wound back, so the block below finds the repository as it expects.
+        git(root, 'checkout', '-q', 'conflicting');
+        git(root, 'reset', '-q', '--hard', 'HEAD~1');
+        git(root, 'checkout', '-q', 'main');
+      }
+
+      // THE POSITIVE CONTROL. Every check in this block is refusal-shaped, and
+      // a resolve_merge that refused everything would satisfy all of them.
+      {
+        const again = await run('git', 'merge', { branch: 'conflicting' });
+        const done = await run('git', 'resolve_merge', { mergeRef: again.mergeRef, choices: { [CONFLICTED]: 'theirs' } });
+        check('and the same call with a handle it was given still merges', done.ok === true, short(done));
+        check('  as a two-parent merge commit', git(root, 'log', '-1', '--format=%P').split(' ').length === 2, git(root, 'log', '-1', '--format=%P'));
+        check('  on a clean tree', git(root, 'status', '--porcelain') === '', git(root, 'status', '--porcelain'));
+      }
+
+      // Put the repository back where the rest of the suite expects it.
+      await run('git', 'checkout', { branch: 'main', parkFirst: false });
+      await run('git', 'delete_branch', { branch: 'conflicting', force: true });
+      fs.writeFileSync(path.join(root, CONFLICTED), onMain == null ? '' : onMain, 'utf8');
+      try {
+        await run('git', 'commit', { message: 'restore the fixture' });
+      } catch {
+        /* nothing to restore */
+      }
+      check('the branch list is back to where this block found it',
+        git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads') === before.branches,
+        short({ now: git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'), was: before.branches }));
+    }
+
+    // ── AND ONE THAT WAS NOT A REFUSAL AT ALL ────────────────────────────────
+    //
+    // Everything above is a refusal that carried the wrong CODE.
+    // `page.dynamic_paths` is worse than that: with no preview running it was
+    // not a refusal at all. Only the dev server can run `getStaticPaths`, so
+    // with nothing to ask it answered `{ok: true, paths: [], problem: null}` —
+    // byte for byte what a page with genuinely no dynamic routes returns.
+    //
+    // This harness has a project and no dev server, which is exactly that
+    // state. A real headless session in this state wrote a confident sentence
+    // about a project it had not measured: "getStaticPaths returned an empty
+    // list (no error reported), so /notes/* builds nothing at the moment",
+    // about a page declaring two routes. An agent cannot be blamed for
+    // believing an `ok: true`.
+    {
+      const dynamicPage = 'src/pages/notes/[slug].astro';
+      fs.mkdirSync(path.join(root, 'src/pages/notes'), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, dynamicPage),
+        '---\nexport function getStaticPaths() {\n  return [{ params: { slug: \'first\' } }, { params: { slug: \'second\' } }];\n}\n---\n<h1>note</h1>\n',
+        'utf8'
+      );
+      const asleep = await run('page', 'dynamic_paths', { path: dynamicPage });
+      check('with no preview, a dynamic route is not reported as standing for nothing', asleep.ok === false, short(asleep));
+      check('  it refuses as no_preview', asleep.code === 'no_preview', short({ code: asleep.code, message: asleep.message }));
+      check('  and says how to get a real answer', /dev_start/.test(String(asleep.message || '')), short(asleep.message));
+      check('  without claiming an empty list of paths', asleep.paths === undefined, short(asleep));
+
+      // POSITIVE CONTROL, and the distinction the fix turns on: a STATIC page
+      // really does stand for no dynamic routes, and that is an answer rather
+      // than a refusal. A change that refused both would pass every check
+      // above.
+      const staticPage = await run('page', 'dynamic_paths', { path: 'src/pages/about.astro' });
+      check('but a STATIC page still answers, because there is nothing to ask about', staticPage.ok === true, short(staticPage));
+      check('  with an empty list and no problem', Array.isArray(staticPage.paths) && staticPage.paths.length === 0 && staticPage.problem === null, short(staticPage));
+
+      fs.rmSync(path.join(root, 'src/pages/notes'), { recursive: true, force: true });
     }
 
     // ── THE ONE NON-GIT GENERIC ──────────────────────────────────────────────
@@ -196,18 +470,50 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' 
       check('a failure nothing here recognises is still failed', said('the preview server exited with code 137').code === 'failed', short(said('the preview server exited with code 137')));
       check('  and a repository that is not one is still no_repo', said('fatal: not a git repository (or any of the parent directories): .git').code === 'no_repo', short(said('fatal: not a git repository (or any of the parent directories): .git')));
     }
+
+    // ── THE COMPOSER, HANDED THE ISSUE SHAPES NO FIXTURE PROVOKES ────────────
+    //
+    // A named cause is only half of what reaches an agent; the other half is
+    // the sentence, and this is the seam where it was malformed. From the
+    // packaged app, during the native dogfood, for a call that left out one
+    // required argument:
+    //
+    //   asset.rename could not run — name: name is required.. asset.rename takes: path, name.
+    //
+    // Two full stops. `issuesOf` ends its own sentence and the composer ended
+    // it again, so every layer that thought it was last put one in. The same
+    // seam puts a stop in FRONT OF A SEMICOLON as soon as there are two issues,
+    // which no fixture in this file provokes and which is the identical mistake
+    // — hence handing the composer the issue lists directly, the way the block
+    // above hands the mapper git's own stderr.
+    {
+      const composed = (issues) => String(badToolArguments('capture', { issues }).message || '');
+      const absent = (field) => ({ path: [field], message: 'Invalid input: expected string, received undefined' });
+      const one = composed([absent('target')]);
+      check('one missing argument is one sentence, ended once', /— target: target is required\.$/.test(one), short(one));
+      const two = composed([absent('target'), absent('scope')]);
+      check('  two are joined by a semicolon, not by a full stop and a semicolon', /target: target is required; scope: scope is required\.$/.test(two), short(two));
+      check('  and neither sentence doubles a stop anywhere in it', !/\w\.\.(\s|$)/.test(one) && !/\w\.\.(\s|$)/.test(two), short(two));
+      // THE CONTROL, so the trim is a normalisation and not a deletion: an
+      // issue whose own text ends in no stop still gets one, and the text
+      // itself is passed through untouched.
+      const bare = composed([{ path: ['viewports'], message: 'Expected an array of viewports' }]);
+      check('  and an issue that ended in no stop is still ended, with its own words kept', /— viewports: Expected an array of viewports\.$/.test(bare), short(bare));
+    }
   } finally {
     await app.stop?.();
     H.removeProject(root);
   }
   check('the fixture is gone', !fs.existsSync(root), root);
 
+  suiteDone();
   if (failures.length) {
     console.error(`named-causes: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
     process.exit(1);
   }
   console.log(`named-causes: ${checked} passed  [a cause the code knows the name of is answered by name]`);
 })().catch((err) => {
+  suiteDone();
   console.error('named-causes: threw\n', err?.stack || err);
   process.exit(1);
 });

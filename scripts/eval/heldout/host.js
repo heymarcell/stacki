@@ -28,6 +28,276 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
+const os = require('node:os');
+const { makeFakeGh, shadowedPath } = require(path.join(__dirname, '..', '..', '..', 'test/support/fakeGh.js'));
+
+// WHAT A TRIAL'S CHILD IS NOT ALLOWED TO INHERIT.
+//
+// This harness spawns a real, autonomous agent host. It used to hand it
+// `{ ...process.env }`, which on a developer's machine means a real
+// `GITHUB_MCP_PAT` and a real `gh` on PATH — a live GitHub credential and a
+// working client for it, handed to a process whose entire job is to act on its
+// own initiative. That is not a hypothetical: the variable is set on the
+// machine this was written on, and an earlier campaign in this repository
+// created a real GitHub repository by exactly this route.
+//
+// So a trial gets neither. The credentials are removed by name, `gh` is
+// shadowed by the fail-closed fake from test/support/fakeGh.js, and
+// `GH_CONFIG_DIR` points at an empty directory the trial owns so a stored
+// login cannot stand in for the stripped variable.
+const CREDENTIAL_VARS = [
+  'GITHUB_MCP_PAT',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITHUB_ENTERPRISE_TOKEN',
+  'GH_ENTERPRISE_TOKEN',
+];
+
+// AND EVERYTHING ELSE SHAPED LIKE A CREDENTIAL.
+//
+// The five names above are the ones that reach GitHub, and stripping exactly
+// those was read — by two independent reviewers — as a claim that the child got
+// no credentials at all. It got every other one in the environment. A trial is
+// an autonomous agent with Bash; the names it might find are not a list anybody
+// can keep current, so the rule is a shape rather than an inventory.
+//
+// PATH, HOME and the rest of the ordinary environment are deliberately NOT
+// matched: the child needs a working shell, and `claude` needs its own login
+// under HOME. That is stated as a residual below rather than papered over.
+const CREDENTIAL_SHAPE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|_KEY$|^KEY$|AUTH)/i;
+
+// AND THE ONES THE HOST ITSELF LOGS IN WITH, WHICH ARE NOT THE TRIAL'S TO LOSE.
+//
+// The shape rule above matches ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+// ANTHROPIC_AUTH_TOKEN, AWS_BEARER_TOKEN_BEDROCK and
+// GOOGLE_APPLICATION_CREDENTIALS as readily as it matches a GitHub PAT — and
+// stripping those does not contain the trial, it stops `claude` starting at
+// all. Worse, it fails ASYMMETRICALLY: on a developer machine with an
+// interactive ~/.claude login every trial runs, and on a CI runner or an
+// API-key machine every trial dies at startup while the grader still scores it,
+// so a harness that cannot authenticate is recorded as a Stacki failure.
+// `containedEnv` also sets CI=1, which is exactly the environment where the
+// HOME login is not there.
+//
+// These are the host's own credentials for the model API. They reach Anthropic,
+// not GitHub, and GitHub is what this containment is about.
+const HOST_AUTH_KEEP = new Set([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'AWS_BEARER_TOKEN_BEDROCK',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  // AND THE ONES THAT SOURCE A CREDENTIAL RATHER THAN BEING ONE. Keeping
+  // AWS_ACCESS_KEY_ID while stripping AWS_WEB_IDENTITY_TOKEN_FILE keeps the
+  // login that a laptop uses and drops the one every containerised runner uses
+  // — IRSA on EKS, a task role on ECS, OIDC in GitHub Actions, a gcloud token
+  // on Vertex. The failure is invisible and asymmetric: trials pass here and
+  // die at startup there, and the grader scores them either way, so a runner
+  // that cannot authenticate is recorded as a Stacki failure.
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+  'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE',
+  'AWS_SHARED_CREDENTIALS_FILE',
+  'CLOUDSDK_AUTH_ACCESS_TOKEN',
+  'GOOGLE_OAUTH_ACCESS_TOKEN',
+]);
+const CREDENTIAL_SHAPE_KEEP = new Set(['SSH_AUTH_SOCK', 'GH_CONFIG_DIR', 'PATH', 'HOME', ...HOST_AUTH_KEEP]);
+
+// AND THE ONES THIS HARNESS MINTED FOR THE SANDBOX IT JUST BUILT.
+//
+// The shape rule matches `STACKI_MCP_TOKEN` — the bearer the trial hands the
+// agent host so it can authenticate TO the Stacki this harness just started on
+// a loopback port. Two callers pass exactly that through `runHost`'s documented
+// `env` channel (scripts/eval/blockers/native.js and
+// scripts/eval/heldout/config-smoke.js), and stripping it does not contain
+// anything: the host starts with an unresolvable `Bearer ${STACKI_MCP_TOKEN}`
+// in its MCP config, never connects, and EVERY TRIAL FAILS — recorded as a
+// Stacki failure, because the grader cannot tell "could not authenticate" from
+// "could not do the task".
+//
+// THE DISTINCTION THE RULE NEEDS is not "is this shaped like a credential" but
+// "does this credential reach the outside world". A name the CALLER passed
+// through `env` is a credential the caller minted for a sandbox it built one
+// line earlier; a name that was merely lying around in `process.env` is the
+// developer's, and the trial has no business with it. So the exemption is keyed
+// to `Object.keys(extra)` — read BEFORE the merge, so an ambient variable that
+// happens to share a spelling with a caller-supplied one is still stripped.
+//
+// WHY THAT ALONE IS NOT SAFE, and what closes it. If the `env` channel exempted
+// anything at all, it would be a documented bypass of the five names this whole
+// file exists to remove: `env: { GITHUB_TOKEN: … }` would hand a trial a live
+// GitHub credential with the harness's blessing. So the channel exempts a name
+// from the SHAPE rule — a heuristic, which must not veto a deliberate act — and
+// never from the NAMED list, which is the prohibition itself. Passing one of
+// those is refused rather than silently dropped: a caller that asked for it
+// wants to know it did not happen.
+const forbiddenThroughEnvChannel = (extra) => Object.keys(extra).filter((n) => CREDENTIAL_VARS.includes(n));
+
+/**
+ * The other way to GitHub, which no GITHUB_* variable is involved in.
+ *
+ * `git push` over https authenticates through the credential helper in the
+ * user's global config — on this machine `osxkeychain`, set in the system
+ * gitconfig — and over ssh through the keys in ~/.ssh. Neither reads an
+ * environment variable the strip above can see, so a trial that was handed a
+ * shell could reach a real remote without ever touching `gh`, which is the
+ * route the fake was built to close.
+ *
+ * These point git at a config the trial owns, holding an identity so commits
+ * still work and no helper so authentication cannot. `false` for the ssh
+ * command and the askpass hooks means a push that tries anyway fails closed
+ * instead of prompting a human who is not there.
+ */
+function gitContainment(dir) {
+  const config = path.join(dir, 'gitconfig');
+  fs.writeFileSync(
+    config,
+    '[user]\n\tname = Stacki Trial\n\temail = trial@stacki.invalid\n[credential]\n\thelper =\n',
+    'utf8'
+  );
+  return {
+    GIT_CONFIG_GLOBAL: config,
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '/usr/bin/false',
+    SSH_ASKPASS: '/usr/bin/false',
+    GIT_SSH_COMMAND: '/usr/bin/false',
+  };
+}
+
+/**
+ * The environment a trial's child actually gets, and the proof that it is safe.
+ *
+ * Returns `{ env, fake, assertions }`. `assertions` is what was CHECKED rather
+ * than what was intended — a caller records it, so a run that somehow reached
+ * the real thing is visible in the results file rather than only in a comment.
+ */
+function containedEnv(extra = {}, { siblingsContained = false } = {}) {
+  const fake = makeFakeGh();
+  let ghConfigDir = null;
+  try {
+    ghConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stacki-trial-ghconfig-'));
+    return build();
+  } catch (err) {
+    // EVERY REFUSAL BELOW LEAVES SOMETHING ON DISK OTHERWISE. `shadowedPath`
+    // throws when the shadow did not take, and the strip checks throw on a
+    // survivor — all of them after the fake gh directory exists, and one of
+    // them after the config directory does. test/support/fakeGh.js's own
+    // `withFakeGh` gets this right; this did not.
+    fake.cleanup();
+    if (ghConfigDir) fs.rmSync(ghConfigDir, { recursive: true, force: true });
+    throw err;
+  }
+
+  function build() {
+  // REFUSED HERE, not at the top of the function, so this travels the same
+  // teardown as every other refusal: there is one cleanup path and it is the
+  // one that gets exercised. An earlier round left the fake gh directory and
+  // the trial's GH_CONFIG_DIR behind on exactly these throws.
+  const forbidden = forbiddenThroughEnvChannel(extra);
+  if (forbidden.length) {
+    throw new Error(
+      `refusing to launch: ${forbidden.join(', ')} was passed through the env channel; ` +
+        'that channel exempts a name from the credential SHAPE rule, never from the GitHub list'
+    );
+  }
+  // The names the CALLER deliberately handed this child, read before the merge
+  // so an ambient variable of the same spelling is not mistaken for one.
+  const supplied = new Set(Object.keys(extra));
+  const keptFromShape = (n) => CREDENTIAL_SHAPE_KEEP.has(n) || supplied.has(n);
+
+  const env = { ...process.env, CI: '1', ...extra };
+  for (const name of CREDENTIAL_VARS) delete env[name];
+  const shaped = Object.keys(env).filter((n) => !keptFromShape(n) && CREDENTIAL_SHAPE.test(n));
+  for (const name of shaped) delete env[name];
+  Object.assign(env, gitContainment(ghConfigDir));
+  env.GH_CONFIG_DIR = ghConfigDir;
+  // Throws unless `command -v gh` under THIS env resolves to the fake.
+  env.PATH = shadowedPath(fake.dir, env.PATH);
+
+  const leaked = CREDENTIAL_VARS.filter((name) => env[name] !== undefined);
+  if (leaked.length) throw new Error(`refusing to launch: ${leaked.join(', ')} survived the strip`);
+  const leakedShape = Object.keys(env).filter((n) => !keptFromShape(n) && CREDENTIAL_SHAPE.test(n));
+  if (leakedShape.length) throw new Error(`refusing to launch: ${leakedShape.join(', ')} survived the strip`);
+  if (fake.calls().length) throw new Error('refusing to launch: the fake gh log was not empty before the trial started');
+
+  return {
+    env,
+    fake,
+    ghConfigDir,
+    assertions: {
+      credentialsStripped: CREDENTIAL_VARS.slice(),
+      // The names only. A test that printed the values it removed would be the
+      // leak it exists to prevent.
+      credentialsPresentAfter: leaked,
+      // The NAMES the shape rule caught, so a run can be read for what it
+      // actually removed rather than for what the list above intended.
+      credentialsStrippedByShape: shaped,
+      // AND THE NAMES THE SHAPE RULE WAS TOLD TO LET THROUGH. Names only. A
+      // reader who wants to know why a credential-shaped variable reached the
+      // child can see that the caller put it there on purpose — and can see
+      // when nothing was exempted, which is the ordinary case.
+      envChannelExempt: [...supplied].filter((n) => CREDENTIAL_SHAPE.test(n)),
+      ghResolvesTo: fake.bin,
+      ghConfigDir,
+      gitConfigGlobal: env.GIT_CONFIG_GLOBAL,
+      // ASKED OF GIT, NOT ASSERTED. This block is framed as what was CHECKED
+      // rather than what was intended, and a hardcoded `true` here was neither.
+      gitCredentialHelperDisabled: (() => {
+        try {
+          return execFileSync('git', ['config', '--get', 'credential.helper'], { env, encoding: 'utf8' }).trim() === '';
+        } catch {
+          // git exits 1 when the key is unset, which is the answer we want.
+          return true;
+        }
+      })(),
+      fakeGhLogEmptyAtStart: true,
+      // WHAT THIS DOES NOT CLOSE, recorded beside what it does, because a
+      // containment block that lists only its successes reads as a proof.
+      // `command -v gh` is the fake, and GH_CONFIG_DIR is the trial's — but a
+      // child that runs the real binary by absolute path, in a shell that
+      // unsets GH_CONFIG_DIR, is still running as a user whose HOME holds a gh
+      // login. HOME is not overridden because `claude` needs its own. The fake
+      // gh log therefore proves what went through `gh`, not that nothing else
+      // did; `ghCallsDuringTrial` should be read that way.
+      // WHETHER THE REST OF THE TRIAL WAS BUILT THIS WAY TOO, recorded as a
+      // field rather than assumed. `containedEnv` builds ONE process's
+      // environment. A trial is at least two: the agent host, and the packaged
+      // Stacki that actually runs `git.publish`. A caller says so here, and the
+      // default is `false` \u2014 so a runner that contains its host and forgets its
+      // app writes that omission into its own results file instead of
+      // publishing a containment claim it did not earn.
+      siblingsContained,
+      // NAMED IN FULL, because a residual listing one of three holes reads as a
+      // claim that there is one. Every part of this containment is an
+      // environment variable a child with a shell can unset for one command.
+      residual: [
+        ...(siblingsContained
+          ? []
+          : [
+              'OTHER PROCESSES IN THIS TRIAL WERE NOT BUILT WITH THIS ENVIRONMENT: the packaged app that runs git.publish still holds the developer\u2019s real gh and real token, so ghCallsDuringTrial says what went through THIS child\u2019s gh and nothing about the app\u2019s',
+            ]),
+        'gh by absolute path with GH_CONFIG_DIR unset reaches the login under HOME',
+        'env -u GIT_CONFIG_GLOBAL restores the user\u2019s real global config and its credential helper',
+        'GIT_SSH_COMMAND binds git only: ssh/scp run directly still read ~/.ssh',
+        'HOME is not overridden because the host binary needs its own login there',
+      ].join('; '),
+    },
+    cleanup: () => {
+      const calls = fake.calls();
+      fake.cleanup();
+      fs.rmSync(ghConfigDir, { recursive: true, force: true });
+      return calls;
+    },
+  };
+  }
+}
+
 
 /** Where the `claude` binary is, or null. Never installed by this file. */
 function claudeBinary() {
@@ -71,19 +341,54 @@ function writeConfig(workspace, { url, token, name = 'stacki' }) {
 // the MCP-only mode must include these two: they are MCP access, not filesystem
 // access, and excluding them would measure a Stacki whose entire Phase-B
 // resource surface had been switched off.
-const MCP_ACCESS_TOOLS = ['ListMcpResourcesTool', 'ReadMcpResourceTool'];
+// EVERY DOOR THE HOST OFFERS TO AN MCP RESOURCE, not the two that were
+// remembered. Claude Code exposes several spellings — the singular
+// `ReadMcpResourceTool`, the plural `ReadMcpResourcesTool`, and a directory
+// variant — and this list decides two things at once: what the `mcp-only` mode
+// is allowed to use, and what counts as escaping it.
+//
+// Missing one is a false alarm in the isolation oracle rather than a hole in
+// it. A held-out trial did exactly that: the model read `stacki://project/profile`
+// through `ReadMcpResourcesTool`, which is an MCP read and nothing else, and
+// the trial was recorded as `isolationHeld: false` — a purity violation that
+// never happened. An oracle that cries wolf is spent as surely as one that
+// stays quiet.
+const MCP_ACCESS_TOOLS = [
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'ReadMcpResourcesTool',
+  'ReadMcpResourceDirTool',
+];
+
+// AND THE ONE THAT MAKES THE CATALOGUE DEFERRABLE.
+//
+// `ToolSearch` is a built-in, so leaving it out of `--tools` does not merely
+// omit a tool — it turns MCP tool search off, because there is nothing to
+// search with. That is the DEFAULT regime for every real Claude Code user, and
+// a purity mode that silently disables it measures a Stacki nobody has.
+//
+// Measured, on the real host: first-turn context was 14,836 tokens without it
+// and 5,311 with it, and `ENABLE_TOOL_SEARCH=true|false|auto:0` made no
+// difference at all in the first case (14,832 / 14,848 / 14,836) because there
+// was no searcher to enable. So every context number this harness produced in
+// `mcp-only` was of the fully-inlined catalogue — about fifteen times the
+// marginal cost a real session pays.
+//
+// It reads and writes nothing, so it is not an escape from the sandbox; the
+// purity claim is unchanged and is still checked from the transcript.
+const TOOL_SEARCH = 'ToolSearch';
 
 // Structured answers come back through a tool as well. It writes nothing and
 // reads nothing; counting it as an escape from the sandbox would fail every
 // trial that was asked for a structured answer.
-const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, 'StructuredOutput']);
+const NOT_AN_ESCAPE = new Set([...MCP_ACCESS_TOOLS, TOOL_SEARCH, 'StructuredOutput']);
 
 /** The built-in tools a host may use, per mode. */
 const TOOLSET = {
   // Everything Stacki can be asked, and nothing else: no Bash, no Read, no
   // Write, no Glob, no Grep, no web. Whether that held is checked from the
   // transcript rather than trusted.
-  'mcp-only': MCP_ACCESS_TOOLS.join(','),
+  'mcp-only': [...MCP_ACCESS_TOOLS, TOOL_SEARCH].join(','),
   integrated: 'default',
 };
 
@@ -116,7 +421,19 @@ function runHost({
   configPath = null,
   // Extra environment for the child only. The whole point of the committable
   // recipe is that the token lives here instead of in the file.
+  //
+  // A credential-shaped name here is exempt from the shape strip — the caller
+  // minted it for the sandbox it just built — but the five GitHub names are
+  // refused through this channel as through any other. See `containedEnv`.
   env = {},
+  // WHETHER THE REST OF THIS TRIAL'S PROCESSES WERE BUILT WITH `containedEnv`.
+  //
+  // False by default, and recorded either way, because the honest answer for a
+  // caller that has not said otherwise is "no". A runner that also launches the
+  // packaged app with `containedEnv` — `startPackagedApp({ contained: true })`
+  // — passes true, and the recorded residual list drops the entry about the
+  // uncontained app because it is no longer true.
+  siblingsContained = false,
   log = () => {},
 }) {
   const config = configPath || writeConfig(workspace, { url, token });
@@ -132,8 +449,8 @@ function runHost({
     tools,
     '--allowedTools',
     mode === 'mcp-only'
-      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')}`
-      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},Bash,Read,Write,Edit,Glob,Grep`,
+      ? `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH}`
+      : `mcp__stacki,${MCP_ACCESS_TOOLS.join(',')},${TOOL_SEARCH},Bash,Read,Write,Edit,Glob,Grep`,
     '--permission-mode',
     'dontAsk',
     // No user, project or local settings file joins the run, so a hook or a
@@ -154,10 +471,12 @@ function runHost({
 
   return new Promise((resolve) => {
     const began = Date.now();
+    // A trial must not inherit an interactive terminal's idea of anything, and
+    // must not inherit its credentials at all. See `containedEnv` above.
+    const contained = containedEnv(env, { siblingsContained });
     const child = spawn('claude', args, {
       cwd: workspace,
-      // A trial must not inherit an interactive terminal's idea of anything.
-      env: { ...process.env, CI: '1', ...env },
+      env: contained.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -182,6 +501,56 @@ function runHost({
       }
     });
     child.stderr.on('data', (c) => stderr.push(String(c)));
+
+    // A SPAWN THAT NEVER STARTS STILL HAS TO SETTLE, AND STILL HAS TO CLEAN UP.
+    //
+    // `cleanup()` lived only inside the 'exit' handler, and 'exit' does not
+    // fire when the spawn itself fails — no `claude` on PATH, EACCES on the
+    // binary. The fake gh directory and the trial's GH_CONFIG_DIR were both
+    // left behind, and the promise never settled, so the runner hung instead of
+    // reporting. A host that is not installed is an ordinary outcome of this
+    // harness and has to arrive as a result.
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      let ghCalls = [];
+      try {
+        ghCalls = contained.cleanup();
+      } catch {
+        /* nothing to tear down */
+      }
+      // THE SAME SHAPE AS A RUN THAT HAPPENED, because run.js derives from these
+      // keys without asking whether the host started. `isolationHeld` was
+      // computed as `builtinToolCalls === 0`, and `undefined === 0` is false —
+      // so a trial whose `claude` could not be spawned at all was written into
+      // the results file as an isolation VIOLATION, a purity failure that never
+      // happened, sitting beside real ones. Every count is zero here and says
+      // so; `ok:false` with `error` is what distinguishes this from a real run.
+      resolve({
+        ok: false,
+        code: null,
+        error: String(err?.message || err),
+        ms: Date.now() - began,
+        events,
+        stderr: stderr.join(''),
+        result: null,
+        text: null,
+        structured: null,
+        turns: null,
+        usage: null,
+        costUsd: null,
+        permissionDenials: 0,
+        toolUse: {},
+        used: {},
+        mcpUsed: {},
+        resourceUsed: {},
+        escaped: {},
+        mcpToolCalls: 0,
+        resourceToolCalls: 0,
+        builtinToolCalls: 0,
+        builtinUsed: {},
+        containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
+      });
+    });
 
     const timer = setTimeout(() => {
       log(`host exceeded ${timeoutMs}ms; terminating`);
@@ -219,7 +588,14 @@ function runHost({
       // nor the structured-answer tool, is the model reaching outside Stacki.
       const escaped = Object.fromEntries(Object.entries(used).filter(([n]) => !n.startsWith('mcp__') && !NOT_AN_ESCAPE.has(n)));
 
+      // TORN DOWN HERE, and what it saw is part of the result. A trial that
+      // reached the boundary — anything at all in the fake gh's log — is a
+      // finding, not a footnote, so it travels with the run rather than being
+      // discarded with the directory.
+      const ghCalls = contained.cleanup();
+
       resolve({
+        containment: { ...contained.assertions, ghCallsDuringTrial: ghCalls },
         ok: code === 0 && !!result && result.is_error !== true,
         exitCode: code,
         timedOut: Date.now() - began >= timeoutMs,
@@ -263,4 +639,25 @@ function runHost({
   });
 }
 
-module.exports = { runHost, writeConfig, claudeBinary, claudeVersion, TOOLSET };
+// EXPORTED, because the containment protects more than the agent's child.
+//
+// `runHost` contains the process it spawns. It is not the only process in a
+// trial that can reach GitHub: `git.publish` runs inside the ELECTRON APP, and
+// test/support/packagedApp.js spawns that app with `{...process.env}`. A caller
+// that reuses only `runHost` therefore gets a contained agent talking to an
+// UNCONTAINED app holding the developer's real `gh` and real token — which is
+// the exact route that created a real repository in an earlier campaign, and
+// the reason the fake exists at all.
+//
+// So the environment builder is part of the public surface of this module: a
+// harness that launches anything else in a trial is expected to build that
+// process's environment with it too, not to approximate it.
+//
+// WIRED, not merely exported. `test/support/packagedApp.js` takes
+// `contained: true` and builds the app's environment with this, and
+// `scripts/eval/heldout/run.js` — the evaluation path — passes it. An export
+// with no callers is a claim, and it was read as one for a whole round: the
+// residual block listed four holes and not the largest, which was that the
+// process actually capable of `git.publish` had the developer's real `gh` and
+// real token the entire time.
+module.exports = { runHost, writeConfig, claudeBinary, claudeVersion, TOOLSET, containedEnv, CREDENTIAL_VARS };

@@ -237,6 +237,24 @@ export default function McpDialog({ status, onClose }) {
   const running = !!status?.running;
   const url = status?.url || '';
   const token = status?.token || '';
+  const build = status?.build || null;
+  const buildLabel = build?.gitHead
+    ? `${build.gitHead.slice(0, 7)}${build.dirty === true ? '+dirty' : ''}`
+    : build
+      ? 'unknown build'
+      : '';
+  const buildTitle = build
+    ? [
+        build.packageVersion ? `Stacki ${build.packageVersion}` : null,
+        build.gitHead ? `commit ${build.gitHead}` : 'commit unknown',
+        build.gitTree ? `tree ${build.gitTree}` : null,
+        build.dirty === true ? 'built from a tree with uncommitted changes' : build.dirty === false ? 'built from a clean tree' : 'cleanliness not established',
+        `${build.buildKind} build`,
+        build.builtAt ? `built ${build.builtAt}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : '';
   const chosen = CLIENTS.find((c) => c.key === client) || CLIENTS[0];
   const snippet = running ? chosen.text({ url, token }) : '';
 
@@ -258,6 +276,14 @@ export default function McpDialog({ status, onClose }) {
             ) : (
               <span>Not running</span>
             )}
+            {/* WHICH BUILD. A version number is the same string for every build
+                between two releases, which is every build anybody dogfoods — so
+                a report saying "Stacki 0.1.23 did this" names nothing. The
+                short SHA is here because this is the panel a person has open
+                when they connect an agent, and it is the one line they can read
+                off a screenshot. `+dirty` is part of it: a build made from an
+                uncommitted tree is not the commit it nearly was. */}
+            {buildLabel && <code className="mcp-build" title={buildTitle}>{buildLabel}</code>}
           </div>
 
           {!running && (

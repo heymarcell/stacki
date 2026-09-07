@@ -97,6 +97,7 @@ const { listEntries, planEntryWrite, countEntries, coveredPaths } = require('./c
 const { planRename, applyRename } = require('./contentRefs');
 const { resolveInProject } = require('./mcp/agent/paths');
 const { mergeBranch, deleteBranch, switchBranch, resolveMerge } = require('./gitBranches');
+const assetRefs = require('./assetRefs');
 const { probeUrl } = require('./devProbe')
 const { trustedPreviewUrl } = require('./projectOrigin.js');
 const { selectionTrail, formatTrail } = require('./selectionTrail');
@@ -429,10 +430,48 @@ let pendingProject = null;
 // takes one: a tool takes a domain and an action, and electron/mcp/agent's
 // registry is the only thing that maps those to a name in this table. A
 // channel missing from that registry is unreachable however it is spelled.
+// EVERY CHANNEL THAT CAN MOVE HEAD, IN ONE LIST.
+//
+// `forgetBranch()` could go at the end of each of these handlers, and the
+// eleventh one somebody adds would not have it. So the list is here, beside the
+// cache it protects, and the wrapper below applies it — a new git handler is
+// added to this array or it is not covered, which is a decision somebody makes
+// rather than a line they forget.
+//
+// `project:scan` is in it because it is what runs when a project is opened or
+// reopened, which is the other way the checkout changes underneath the app.
+const MOVES_HEAD = new Set([
+  'git:init',
+  'git:checkout',
+  'git:merge',
+  'git:resolveMerge',
+  'git:deleteBranch',
+  'git:restoreProject',
+  'git:restoreFile',
+  'git:commit',
+  'git:park',
+  'git:unpark',
+  'project:scan',
+]);
+
 const mainOps = new Map();
 const handle = (channel, fn) => {
-  mainOps.set(channel, fn);
-  ipcMain.handle(channel, fn);
+  // A channel that can move HEAD drops the cached branch name when it returns,
+  // whichever door called it — the panel over IPC or the Agent API through
+  // `callMainOp`. Both go through this wrapper, which is why it is here rather
+  // than at the end of ten handler bodies where the eleventh would miss it.
+  // See MOVES_HEAD and `branchNow`.
+  const wrapped = MOVES_HEAD.has(channel)
+    ? async (...args) => {
+        try {
+          return await fn(...args);
+        } finally {
+          forgetBranch();
+        }
+      }
+    : fn;
+  mainOps.set(channel, wrapped);
+  ipcMain.handle(channel, wrapped);
 };
 
 /** Call one by name, with no Electron event behind it. */
@@ -728,6 +767,11 @@ app.whenReady().then(() => {
     // thing that started it rather than from the renderer's last published
     // snapshot of it.
     getDevUrl: () => devServer?.url || null,
+    // The branch checked out NOW, not the one the renderer published when the
+    // project opened. A ref records the branch it was minted against and a
+    // write through it is refused when that has moved — which only works if
+    // the branch it records is the branch that was true.
+    getBranch: () => branchNow(openProjectRoot),
   });
   // Visual Review's ledger. Also for the app rather than for a project — the
   // door is registered once, and which project's reviews are behind it moves
@@ -2321,6 +2365,65 @@ function markSelfWrite(p) {
   notePageMayHaveChanged();
 }
 
+// What counts as a page file, in the one place the watcher and the mutations
+// below both read it from.
+const PAGE_FILE = /\.(astro|md|mdx|html)$/i;
+
+/**
+ * THE ONE PLACE A CHANGE TO WHICH PAGES EXIST IS ANNOUNCED.
+ *
+ * WHY THIS EXISTS. Two doors create, move and delete pages. The Pages panel
+ * calls these handlers over IPC and then rescans the project itself, so its
+ * list is fresh. The Agent API calls THE SAME handlers and does not — it has no
+ * renderer state of its own to refresh. So a page an agent created was on disk,
+ * was in `project:scan`, was in `page.list`, and was NOT in the page switcher
+ * the person was looking at until they closed and reopened the project. A live
+ * dogfood found it on `page.create` and it was true of every page and folder
+ * mutation.
+ *
+ * THE WATCHER CANNOT COVER IT, and that is deliberate rather than an oversight.
+ * `markSelfWrite` makes the app's own writes invisible to the watcher on
+ * purpose — otherwise every save would race its own event — which means the one
+ * signal that makes the renderer rescan is suppressed for exactly the writes
+ * that need it. The same reasoning already appears twice in this file for
+ * content writes ("our writes are invisible to the watcher, so say so
+ * directly"). This is that, said once, for the page surface, instead of six
+ * times or not at all.
+ *
+ * IT SENDS THE CHANNEL THE WATCHER SENDS. `fs:changed` is what App.jsx's
+ * listener rescans on, and it also decides whether the OPEN page was affected
+ * by looking for its path in `files` — so a folder rename lists the pages that
+ * moved rather than the folder, and an open page inside it is reloaded or
+ * closed exactly as it would be if somebody had moved that folder in Finder.
+ * One code path, one behaviour, whichever door the change came through.
+ */
+function notePagesChanged(files) {
+  const list = (Array.isArray(files) ? files : [files]).filter(Boolean).map((f) => path.resolve(f));
+  if (!list.length) return;
+  send('fs:changed', { files: list });
+}
+
+/** Every page file under `dir`, absolute. For folder operations. */
+function pageFilesUnder(dir) {
+  const out = [];
+  const walk = (at, depth) => {
+    if (depth > 24) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(at, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(at, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (PAGE_FILE.test(entry.name)) out.push(full);
+    }
+  };
+  walk(dir, 0);
+  return out;
+}
+
 handle('watch:start', async (_e, projectPath) => {
   openProjectRoot = path.resolve(projectPath); // scopes the asset protocol
   if (watcher) {
@@ -2379,7 +2482,7 @@ handle('watch:start', async (_e, projectPath) => {
       cssTimer = setTimeout(() => send('css:changed', {}), 200);
       return;
     }
-    if (!/\.(astro|md|mdx|html)$/i.test(name)) return;
+    if (!PAGE_FILE.test(name)) return;
     const full = path.join(srcDir, name);
     // Ignore events caused by the app's own recent writes.
     const wrote = selfWrites.get(path.resolve(full));
@@ -2595,10 +2698,56 @@ handle('assets:move', async (_e, { projectPath, fromRel, toDirRel }) => {
     throw refuse('bad_path', 'Cannot move a folder into itself.');
   }
   const dest = uniqueDest(toDir, path.basename(from));
+
+  // WHAT POINTS AT IT, BEFORE IT MOVES.
+  //
+  // A live dogfood moved public/images/hero.png and the page's
+  // `<img src="/images/hero.png">` and the stylesheet's `url(...)` stayed where
+  // they were — `{ok: true}`, no warning, a site broken in two places by an
+  // operation that reported success. The cross-root case above has always
+  // refused for exactly this reason; a move WITHIN a root breaks references
+  // just as thoroughly and was not checked at all.
+  //
+  // Planned before the file moves, so a reference this cannot rewrite is a
+  // refusal rather than a half-done move.
+  const movePlan = fs.statSync(from).isDirectory()
+    ? null
+    : assetRefs.plan(projectPath, toPosix(path.relative(projectPath, from)), toPosix(path.relative(projectPath, dest)));
+  if (movePlan?.dynamic?.length) {
+    throw refuse(
+      'unsupported',
+      `${movePlan.dynamic.length} reference${movePlan.dynamic.length === 1 ? '' : 's'} to this asset ` +
+        `${movePlan.dynamic.length === 1 ? 'is' : 'are'} built at runtime rather than written out — ` +
+        `${movePlan.dynamic.map((d) => `${d.file}:${d.line}`).slice(0, 5).join(', ')} — so moving the file would ` +
+        'break them and nothing here can rewrite them. Nothing was moved. Move it by hand, or change those ' +
+        'references to name the file directly first.'
+    );
+  }
+  if (movePlan?.truncated) {
+    throw refuse(
+      'unsupported',
+      'This project has more files than Stacki will scan for references to an asset, so it cannot establish that ' +
+        'moving this one is safe. Nothing was moved.'
+    );
+  }
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.mkdirSync(toDir, { recursive: true });
   fs.renameSync(from, dest);
+  // AND THE POINTERS GO WITH IT. All or nothing: `apply` puts back every file
+  // it had already written if one of them fails, because a project with three
+  // of five references rewritten is broken in a new way nobody asked for.
+  const moveRewrite = movePlan ? assetRefs.apply(movePlan, markSelfWrite) : { ok: true, rewritten: [] };
+  if (!moveRewrite.ok) {
+    // The references could not be updated, so the file goes back where it was
+    // and the caller is told nothing happened rather than being handed a broken
+    // site with an `ok`.
+    markSelfWrite(dest);
+    markSelfWrite(from);
+    fs.renameSync(dest, from);
+    throw refuse('write_failed', `The asset's references could not be updated (${moveRewrite.error}), so nothing was moved.`);
+  }
+  if (moveRewrite.rewritten.length) send('fs:changed', { files: moveRewrite.rewritten.map((r) => path.join(projectPath, r)) });
   send('assets:changed', {});
   // WHERE THE FILE ACTUALLY WENT. `uniqueDest` renames around a collision, so
   // the landing path is not `toDirRel/basename(fromRel)` and only this line
@@ -2614,16 +2763,43 @@ handle('assets:rename', async (_e, { projectPath, rel, newName }) => {
   const from = assetAbs(projectPath, rel);
   const dest = path.join(path.dirname(from), clean);
   const landed = () => toPosix(path.relative(projectPath, dest));
-  if (dest === from) return { ok: true, rel: landed() };
+  if (dest === from) return { ok: true, rel: landed(), rewroteReferences: [] };
   if (fs.existsSync(dest)) throw refuse('exists', 'Something with that name already exists.');
+  // Same reasoning as the move above: a rename changes the address, and an
+  // address nothing follows any more is a broken page.
+  const renamePlan = fs.statSync(from).isDirectory() ? null : assetRefs.plan(projectPath, toPosix(rel), landed());
+  if (renamePlan?.dynamic?.length) {
+    throw refuse(
+      'unsupported',
+      `${renamePlan.dynamic.length} reference${renamePlan.dynamic.length === 1 ? '' : 's'} to this asset ` +
+        `${renamePlan.dynamic.length === 1 ? 'is' : 'are'} built at runtime rather than written out — ` +
+        `${renamePlan.dynamic.map((d) => `${d.file}:${d.line}`).slice(0, 5).join(', ')} — so renaming the file ` +
+        'would break them and nothing here can rewrite them. Nothing was renamed.'
+    );
+  }
+  if (renamePlan?.truncated) {
+    throw refuse(
+      'unsupported',
+      'This project has more files than Stacki will scan for references to an asset, so it cannot establish that ' +
+        'renaming this one is safe. Nothing was renamed.'
+    );
+  }
   markSelfWrite(from);
   markSelfWrite(dest);
   fs.renameSync(from, dest);
+  const renameRewrite = renamePlan ? assetRefs.apply(renamePlan, markSelfWrite) : { ok: true, rewritten: [] };
+  if (!renameRewrite.ok) {
+    markSelfWrite(dest);
+    markSelfWrite(from);
+    fs.renameSync(dest, from);
+    throw refuse('write_failed', `The asset's references could not be updated (${renameRewrite.error}), so nothing was renamed.`);
+  }
+  if (renameRewrite.rewritten.length) send('fs:changed', { files: renameRewrite.rewritten.map((r) => path.join(projectPath, r)) });
   send('assets:changed', {});
   // The name the file is under, which is not the name that was asked for: `/`
   // and `\\` are stripped above, so 'sub/KEEP.svg' lands as 'subKEEP.svg'. The
   // caller that undoes this has to name the file that exists.
-  return { ok: true, rel: landed() };
+  return { ok: true, rel: landed(), rewroteReferences: renameRewrite.rewritten };
 });
 
 // To the system's bin, not to nothing. An asset is somebody's photograph as
@@ -3431,7 +3607,40 @@ handle('page:write', async (_e, { pagePath, model }) => {
   } catch {
     /* a page being created has nothing to preserve */
   }
-  const text = anchoredSerialize(before, model);
+  // AND THE ONE THING THE PARSER CANNOT ASK FOR ITSELF.
+  //
+  // `white-space: pre` from a STYLESHEET makes an element's leading spaces
+  // rendered content just as an inline style does, and the parser is a pure
+  // function of (source, model, options) with no idea what a project is. So the
+  // project side of that question is answered here -- the class, id and tag
+  // tokens of every rule in this project's CSS that could preserve whitespace,
+  // cached on the files' own mtimes -- and handed in. The scanner never throws
+  // and answers `'*'` for anything it could not read, list or reduce, so a
+  // broken stylesheet costs an element its reindentation rather than its bytes,
+  // and the writer is careful to read that answer as the admission it is rather
+  // than as a claim about how anything renders.
+  //
+  // Required at the call site because this is the only place that asks.
+  //
+  // AND THE CACHE THAT NEVER HIT, because the page being saved is itself one of
+  // the files the scan covers and this call happens BEFORE `writePageText`:
+  // save N moved the page's size and mtime, so save N+1 missed on the page's
+  // own stamp. Measured, files read during `preservingTokens` were 3, 3, 3, 3,
+  // 3 across five consecutive saves — a synchronous re-read and postcss
+  // re-parse of every stylesheet and every style-bearing component on the main
+  // process, on every save. Dropping the page out of the scan would be the
+  // wrong fix: its own `<style>` block styles its own elements, and losing
+  // those rules is the direction that costs bytes. So the bytes just read are
+  // handed in — the scanner uses them instead of reading the file again, and
+  // stamps that one file by the hash of its `<style>` blocks, which is the only
+  // part of it it reads. A save that leaves the style block alone therefore
+  // hits the cache; one that edits it still misses.
+  const { preservingTokens } = require('./whitespaceRules');
+  const text = anchoredSerialize(before, model, {
+    preservingTokens: preservingTokens(openProjectRoot, {
+      knownText: typeof before === 'string' ? { [pagePath]: before } : null,
+    }),
+  });
   writePageText(pagePath, text);
   writeChunks(model);
   // The bytes that are now on disk, so the renderer's copy of the source stays
@@ -3467,12 +3676,14 @@ handle('page:create', async (_e, { projectPath, name, layout }) => {
   }
   markSelfWrite(pagePath);
   fs.writeFileSync(pagePath, serializePage(model), 'utf8');
+  notePagesChanged([pagePath]);
   return { pagePath };
 });
 
 handle('page:delete', async (_e, pagePath) => {
   markSelfWrite(pagePath);
   fs.rmSync(pagePath);
+  notePagesChanged([pagePath]);
   return { ok: true };
 });
 
@@ -3506,6 +3717,10 @@ handle('page:move', async (_e, { projectPath, from, to }) => {
   markSelfWrite(dest);
   fs.writeFileSync(dest, source, 'utf8');
   fs.rmSync(from);
+  // BOTH ENDS. The renderer decides whether the OPEN page was affected by
+  // looking for its path in this list, and for a move that is the path it had
+  // before as much as the one it has now.
+  notePagesChanged([from, dest]);
   return { newPath: dest };
 });
 
@@ -3556,7 +3771,12 @@ function realpathOfNearest(abs) {
 }
 
 handle('pagefolder:create', async (_e, { projectPath, dir }) => {
-  fs.mkdirSync(resolvePagesDir(projectPath, dir), { recursive: true });
+  const full = resolvePagesDir(projectPath, dir);
+  fs.mkdirSync(full, { recursive: true });
+  // A new folder holds no pages, so there is no page path to name — but the
+  // folder itself is part of the structure the switcher draws, and a rescan is
+  // what puts it there.
+  notePagesChanged([full]);
   return { ok: true };
 });
 
@@ -3564,7 +3784,11 @@ handle('pagefolder:rename', async (_e, { projectPath, from, to }) => {
   const a = resolvePagesDir(projectPath, from);
   const b = resolvePagesDir(projectPath, to);
   if (fs.existsSync(b)) throw refuse('exists', 'A folder with that name already exists.');
+  // Listed BEFORE the rename, because afterwards those paths do not exist to be
+  // walked — and the page that was open is at one of them.
+  const moved = pageFilesUnder(a);
   fs.renameSync(a, b);
+  notePagesChanged([...moved, ...moved.map((f) => path.join(b, path.relative(a, f)))]);
   return { ok: true };
 });
 
@@ -3572,7 +3796,9 @@ handle('pagefolder:delete', async (_e, { projectPath, dir }) => {
   const full = resolvePagesDir(projectPath, dir);
   const pagesDir = path.join(projectPath, 'src', 'pages');
   if (full === pagesDir) throw new Error('Invalid folder.');
+  const gone = pageFilesUnder(full);
   fs.rmSync(full, { recursive: true, force: true });
+  notePagesChanged(gone.length ? gone : [full]);
   return { ok: true };
 });
 
@@ -3627,7 +3853,24 @@ async function fetchFromPreview(devUrl, pathAndQuery) {
 // page that can't answer is previewed at its own pattern, exactly as before.
 handle('page:dynamicPaths', async (_e, { projectPath, pagePath, devUrl }) => {
   const pattern = routeForPage(projectPath, pagePath);
-  if (!pattern.includes('[') || !devUrl) return { entries: [] };
+  // A STATIC PAGE HAS NO DYNAMIC ROUTES. That is an answer.
+  if (!pattern.includes('[')) return { entries: [] };
+  // NOT BEING ABLE TO ASK IS NOT AN ANSWER, and it used to be the same one.
+  //
+  // Only the dev server can run `getStaticPaths`, so with no preview there is
+  // nothing to ask. Both cases returned a bare `{ entries: [] }`, and the MCP
+  // envelope faithfully reported `{ ok: true, paths: [], problem: null }` for
+  // both — so a dynamic route whose preview happened to be off read as a route
+  // that stands for nothing. A real headless session turned exactly that into a
+  // confident sentence about the project: "getStaticPaths returned an empty
+  // list (no error reported), so /notes/* builds nothing at the moment", about
+  // a page that declares two.
+  //
+  // `asked` rather than `error`, deliberately: the Pages panel puts `error` in
+  // front of the person as a dynamic-route failure, and "the preview is off" is
+  // not one. The panel ignores a field it does not read; the agent envelope
+  // turns it into a refusal it can act on.
+  if (!devUrl) return { entries: [], asked: false };
   const rel = toPosix(path.relative(projectPath, pagePath));
   try {
     const res = await fetchFromPreview(devUrl, `/__avb/paths?p=${encodeURIComponent(rel)}`);
@@ -5153,7 +5396,36 @@ function astroStyleReachesPage(text) {
   return false;
 }
 
-function listAstroStyleFiles(root) {
+/** Whether this file has a `<style>` block at all. */
+function hasAstroStyleBlock(text) {
+  ASTRO_STYLE_BLOCK.lastIndex = 0;
+  return ASTRO_STYLE_BLOCK.test(text);
+}
+
+/**
+ * Every `.astro` file under src/ that has a `<style>` block, and whether that
+ * style reaches the whole page.
+ *
+ * REACH IS A FACT ON THE ROW, NOT WHETHER THE ROW EXISTS. This used to skip a
+ * component whose `<style>` was ordinary — scoped, the Astro default — because
+ * the panel that asked was asking "what could I write global CSS into?", and
+ * for that question a scoped block is not an answer.
+ *
+ * The project profile asks a different question, and got the first one's answer.
+ * It reads `@media` widths out of "the project's stylesheets" to report what
+ * breakpoints a project has, and a breakpoint authored in a component's own
+ * scoped `<style>` is as authored as any other — but the file holding it was
+ * never in the list, so the profile said the project had no such breakpoint
+ * rather than that it had not looked. A live dogfood found exactly that:
+ * a global `@media (max-width: 720px)` reported, a component's
+ * `@media (max-width: 1024px)` missing, and nothing in the answer to say which
+ * of the two it was.
+ *
+ * So the walk is the same walk and the predicate is the same predicate — every
+ * row now carries `reachesPage`, and the caller says which rows it wants.
+ * `reachingOnly` defaults to true so the three existing callers are unchanged.
+ */
+function listAstroStyleFiles(root, { reachingOnly = true } = {}) {
   const out = [];
   const walk = (dir, rel) => {
     let entries;
@@ -5175,8 +5447,13 @@ function listAstroStyleFiles(root) {
       try {
         const { size } = fs.statSync(full);
         if (size > ASTRO_SCAN_LIMIT) continue;
-        if (!astroStyleReachesPage(fs.readFileSync(full, 'utf8'))) continue;
-        out.push({ rel: toPosix(relPath), name: entry.name, path: full, size });
+        const text = fs.readFileSync(full, 'utf8');
+        // A file with no `<style>` at all is not a style source under either
+        // question, and skipping it here keeps the walk costing what it cost.
+        if (!hasAstroStyleBlock(text)) continue;
+        const reachesPage = astroStyleReachesPage(text);
+        if (reachingOnly && !reachesPage) continue;
+        out.push({ rel: toPosix(relPath), name: entry.name, path: full, size, reachesPage });
       } catch {
         /* unreadable — nothing to offer for it */
       }
@@ -5188,9 +5465,16 @@ function listAstroStyleFiles(root) {
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-handle('style:listAstroStyles', async (_e, projectPath) => {
+// ONE HANDLER, TWO QUESTIONS, because two inventories is the drift this exists
+// to prevent. A bare string is the old call and means "what can I write global
+// CSS into"; `{projectPath, all: true}` means "every authored style source in
+// this project", which is what the profile has to read to be able to say
+// whether it looked.
+handle('style:listAstroStyles', async (_e, arg) => {
+  const projectPath = typeof arg === 'string' ? arg : arg?.projectPath;
+  const all = typeof arg === 'object' && arg !== null && arg.all === true;
   if (!projectPath) return { files: [] };
-  return { files: listAstroStyleFiles(projectPath) };
+  return { files: listAstroStyleFiles(projectPath, { reachingOnly: !all }) };
 });
 
 // Which stylesheets this page actually pulls in.
@@ -5894,6 +6178,45 @@ async function currentBranch(projectPath) {
   }
 }
 
+// --- which branch is checked out, synchronously --------------------------------
+//
+// `currentBranch` above is async and every caller of it is too. The MCP context
+// is built synchronously, on the hot path of every operation, so it needs an
+// answer without an await — and it needs the RIGHT one, which is what this is
+// for: the branch a ref records is part of what makes that ref stale, and the
+// value it recorded came from the renderer's payload, which reads git once when
+// the project opens. Measured: a checkout through the Agent API's own git
+// surface, a ref minted two seconds later still carrying the old branch, and a
+// write through it succeeding.
+//
+// `branchOf` is the shipped reader — it already refuses to call a detached HEAD
+// a branch, which `rev-parse --abbrev-ref` would otherwise report as the branch
+// name "HEAD" — and it is already covered by test/review-provenance.js. One
+// reader, not a second spelling of the same question.
+//
+// CACHED FOR 1500 ms, which is the TTL electron/review/checkout.js already
+// chose for this exact question; two different answers to "how long is a branch
+// name good for" is a drift waiting to happen. The cache is dropped outright by
+// every handler that can move HEAD, so the TTL only ever covers a checkout made
+// outside Stacki — where a spawn per operation would be the wrong trade.
+const { branchOf: readBranchOf, git: syncGit } = require('./review/provenance');
+let branchCache = { root: null, at: 0, branch: null };
+const BRANCH_TTL_MS = 1500;
+
+function branchNow(root) {
+  if (!root) return null;
+  const now = Date.now();
+  if (branchCache.root === root && now - branchCache.at < BRANCH_TTL_MS) return branchCache.branch;
+  const branch = readBranchOf(root, syncGit);
+  branchCache = { root, at: now, branch };
+  return branch;
+}
+
+/** HEAD may have moved. The next read asks git rather than remembering. */
+function forgetBranch() {
+  branchCache = { root: null, at: 0, branch: null };
+}
+
 // --- Previewing an old version ---------------------------------------------
 //
 // A second, deliberately dumb dev server pointed at a checkout of an old
@@ -6121,8 +6444,15 @@ handle('git:merge', async (_e, { projectPath, branch }) =>
 
 // Finishing a merge the user has chosen their way through. The conflicting
 // files come back from git:merge with both versions; this applies the answers.
-handle('git:resolveMerge', async (_e, { projectPath, branch, choices }) =>
-  resolveMerge(git, { projectPath, branch, choices })
+//
+// `expect` is the `at` block git:merge handed back with the conflict — the two
+// commit SHAs and a digest of what git actually wrote. It is passed straight
+// through, unsigned and unwrapped: this is Stacki's own IPC, where the caller
+// is the panel that was shown the conflict. The MCP side wraps the same three
+// fields in a signed ref before an agent ever sees them, because there the
+// caller is not trusted to have read anything.
+handle('git:resolveMerge', async (_e, { projectPath, branch, choices, expect }) =>
+  resolveMerge(git, { projectPath, branch, choices, expect })
 );
 
 handle('git:deleteBranch', async (_e, { projectPath, branch, force }) =>

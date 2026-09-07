@@ -13,7 +13,29 @@
 // cannot understand must keep all of its lines rather than losing the parts it
 // failed to parse.
 
-const { parseConflict, renderResolved, clashCount, threeWay, mergeInline } = require('../electron/conflicts.js');
+const {
+  parseConflict,
+  renderResolved,
+  clashCount,
+  conflictAtEnd,
+  threeWay,
+  mergeInline,
+  unreadMarkers,
+  sidesHoldMarkers,
+  markerWidth,
+  MAX_MARKER_SIZE,
+  MARKER_CACHE_MAX,
+  markerCacheSize,
+} = require('../electron/conflicts.js');
+const { guardSuite } = require('./support/suiteGuard.js');
+
+// "THE PROCESS EXITED BEFORE THE SUITE FINISHED" IS A FAILURE, NOT A PASS.
+// Nothing in this file awaits anything today, so the guard cannot fire today —
+// it is here because that is not a property of the file, it is a property of
+// what is in it right now, and the day one of these checks grows an await is
+// the day a suite that prints nothing starts exiting 0. See
+// test/support/suiteGuard.js.
+const suiteDone = guardSuite('conflicts');
 
 const failures = [];
 let checked = 0;
@@ -129,8 +151,92 @@ const conflicted = [
   check('a one-sided change is still a choice', clashCount(addedParts) === 1);
   check('taking theirs adds the block', renderResolved(addedParts, ['theirs']) === 'a\nnew from them\nb', JSON.stringify(renderResolved(addedParts, ['theirs'])));
   // The empty side must not leave a blank line behind where nothing was.
-  check('taking ours leaves nothing behind', renderResolved(addedParts, ['ours']) === 'a\n\nb', JSON.stringify(renderResolved(addedParts, ['ours'])));
+  //
+  // THIS ASSERTION USED TO DEMAND THE DEFECT. It read `=== 'a\n\nb'` under a
+  // sentence saying a blank line must not be left behind, so the one check
+  // pointed at this failure was pinning it in place: the parts are runs of
+  // LINES and the join puts a newline between them, so a side with no lines in
+  // it still collected a separator on each side and the rebuilt file gained an
+  // empty line neither branch wrote.
+  check('taking ours leaves nothing behind', renderResolved(addedParts, ['ours']) === 'a\nb', JSON.stringify(renderResolved(addedParts, ['ours'])));
   check('both is just the one that exists', renderResolved(addedParts, ['both']) === 'a\nnew from them\nb', JSON.stringify(renderResolved(addedParts, ['both'])));
+}
+
+// --- No lines at all, against one blank line --------------------------------
+//
+// THE TWO SHAPES A JOIN CANNOT TELL APART, and the reason `parseConflict`
+// counts lines rather than letting the render ask whether a string is empty.
+//
+// Both of these were produced by REAL git from the ancestor "a\nX\nz\n" with
+// merge.conflictStyle=diff3 — one branch DELETING X, the other REPLACING it
+// with a blank line, both merged against a branch that changed X to "C". The
+// two conflicted files differ by one byte, the clash objects they parse to are
+// identical, and the file each one has to rebuild for `ours` differs by a line.
+{
+  const deleted = ['a', '<<<<<<< HEAD', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', 'z', ''].join('\n');
+  const blank = ['a', '<<<<<<< HEAD', '', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', 'z', ''].join('\n');
+  const deletedParts = parseConflict(deleted);
+  const blankParts = parseConflict(blank);
+
+  const clashOf = (parts) => parts.find((p) => p.kind === 'clash');
+  check(
+    'the deleted side and the blank-line side read as the same text',
+    clashOf(deletedParts).ours === '' && clashOf(blankParts).ours === '',
+    JSON.stringify([clashOf(deletedParts).ours, clashOf(blankParts).ours])
+  );
+  check(
+    '  and are told apart only by the line count the parse records',
+    clashOf(deletedParts).oursLines === 0 && clashOf(blankParts).oursLines === 1,
+    JSON.stringify([clashOf(deletedParts).oursLines, clashOf(blankParts).oursLines])
+  );
+
+  // The two files ours actually has. Neither is a guess: they are what the
+  // branch that produced each conflict has on disk.
+  check(
+    'a side that deleted the line rebuilds to the file it deleted it from',
+    renderResolved(deletedParts, ['ours']) === 'a\nz\n',
+    JSON.stringify(renderResolved(deletedParts, ['ours']))
+  );
+  check(
+    'and a side that is one blank line keeps the blank line',
+    renderResolved(blankParts, ['ours']) === 'a\n\nz\n',
+    JSON.stringify(renderResolved(blankParts, ['ours']))
+  );
+  // `both` has the same question to answer and must answer it the same way,
+  // or the two readings disagree about what a side is.
+  check(
+    'keeping both sides skips the one that has nothing',
+    renderResolved(deletedParts, ['both']) === 'a\nC\nz\n',
+    JSON.stringify(renderResolved(deletedParts, ['both']))
+  );
+  check(
+    'and keeps a blank line that is genuinely there',
+    renderResolved(blankParts, ['both']) === 'a\n\nC\nz\n',
+    JSON.stringify(renderResolved(blankParts, ['both']))
+  );
+  check(
+    'taking the other side is untouched by any of it',
+    renderResolved(deletedParts, ['theirs']) === 'a\nC\nz\n' && renderResolved(blankParts, ['theirs']) === 'a\nC\nz\n',
+    JSON.stringify([renderResolved(deletedParts, ['theirs']), renderResolved(blankParts, ['theirs'])])
+  );
+
+  // AND THE ONE PLACE THE EMPTY SIDE ALREADY MATTERED, asked at the end of the
+  // file where the terminator is git's invention. The two readings must not
+  // fight: the side the terminator is read off has to be the side that was
+  // actually written, and with `ours` contributing nothing that is what the
+  // whole `ours` file says, terminator and all.
+  const atEnd = parseConflict(['a', '<<<<<<< HEAD', '||||||| base', 'X', '=======', 'C', '>>>>>>> feat', ''].join('\n'));
+  check('a conflict at the end with an empty side is still one', conflictAtEnd(atEnd) === true, JSON.stringify(atEnd));
+  check(
+    'an ours that ends there and has no terminator does not gain one',
+    renderResolved(atEnd, ['ours'], { ours: 'a', theirs: 'a\nC\n' }) === 'a',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a', theirs: 'a\nC\n' }))
+  );
+  check(
+    '  and one that has a terminator keeps exactly one',
+    renderResolved(atEnd, ['ours'], { ours: 'a\n', theirs: 'a\nC\n' }) === 'a\n',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a\n', theirs: 'a\nC\n' }))
+  );
 }
 
 // --- diff3, which carries the common ancestor too ---------------------------
@@ -335,8 +441,933 @@ const conflicted = [
   );
 }
 
+// --- The newline the markers made up ----------------------------------------
+//
+// A marker sits on a line of its own, so when the conflict runs to the end of
+// the file git writes a newline after the chosen side's last line whether or
+// not that side had one. Rebuilding from the marked-up file alone cannot tell
+// an invented terminator from a real one — and that made the two ways of
+// phrasing the SAME decision produce different bytes: `'theirs'` for the whole
+// file is `git checkout --theirs`, which is the incoming file exactly, while
+// `['theirs']` came back with a terminator the incoming file did not have.
+{
+  const atEnd = parseConflict(
+    ['a', '<<<<<<< HEAD', 'main', '||||||| base', 'base', '=======', 'feat', '>>>>>>> f', ''].join('\n')
+  );
+  check('a conflict at the end of the file is recognised as one', conflictAtEnd(atEnd) === true, JSON.stringify(atEnd));
+  check(
+    'with no sides to consult, it renders as it always did',
+    renderResolved(atEnd, ['theirs']) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs']))
+  );
+  check(
+    'an incoming side with no terminator does not gain one',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }) === 'a\nfeat',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }))
+  );
+  check(
+    'and one that has a terminator keeps exactly one',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  // The ANSWER decides which side is consulted, not the other way round.
+  check(
+    'keeping this branch reads this branch’s terminator',
+    renderResolved(atEnd, ['ours'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nmain',
+    JSON.stringify(renderResolved(atEnd, ['ours'], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  check(
+    'and an answer nobody gave keeps this branch’s, like the render itself does',
+    renderResolved(atEnd, [], { ours: 'a\nmain', theirs: 'a\nfeat\n' }) === 'a\nmain',
+    JSON.stringify(renderResolved(atEnd, [], { ours: 'a\nmain', theirs: 'a\nfeat\n' }))
+  );
+  // 'both' ends on the incoming side, so that is the side to ask.
+  check(
+    '"both" ends on the incoming side, so it reads that terminator',
+    renderResolved(atEnd, ['both'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }) === 'a\nmain\nfeat',
+    JSON.stringify(renderResolved(atEnd, ['both'], { ours: 'a\nmain\n', theirs: 'a\nfeat' }))
+  );
+  // A side that DELETED the file has no version to take a terminator from, and
+  // must not be read as "a version with no terminator".
+  check(
+    'a deleted side leaves git’s own terminator alone',
+    renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: null }) === 'a\nfeat\n',
+    JSON.stringify(renderResolved(atEnd, ['theirs'], { ours: 'a\nmain\n', theirs: null }))
+  );
+
+  // --- 'BOTH' DOES NOT ALWAYS END ON THE INCOMING SIDE ----------------------
+  //
+  // The rule above — "'both' and 'merged' end on the incoming side" — is a
+  // rule about the WORD, and the renderer's rule is about the TEXT: 'both' is
+  // `[ours, theirs].filter(s => s !== '').join('\n')`, so when the incoming
+  // side of the last clash is EMPTY the file ends on ours while the terminator
+  // was still being read off `sides.theirs`.
+  //
+  // MEASURED, with ours `"head\nOURSLAST\n"` and theirs `"head"` — no
+  // terminator on the incoming side, which is the side that has nothing to
+  // contribute here: `['both']` wrote `"head\nOURSLAST"` to disk and `['ours']`
+  // wrote `"head\nOURSLAST\n"`. The same retained content, one byte apart,
+  // decided by which of two equivalent words the caller happened to use.
+  {
+    // git's own markup for "this branch added a line at the end, the incoming
+    // branch has nothing there".
+    const oursOnly = parseConflict(['head', '<<<<<<< HEAD', 'OURSLAST', '=======', '>>>>>>> f', ''].join('\n'));
+    check('a clash whose incoming side is empty is still at the end of the file', conflictAtEnd(oursOnly) === true, JSON.stringify(oursOnly));
+    const sides = { ours: 'head\nOURSLAST\n', theirs: 'head' };
+    check(
+      '"both" with an empty incoming side reads the terminator off ours, which is where the text ends',
+      renderResolved(oursOnly, ['both'], sides) === 'head\nOURSLAST\n',
+      JSON.stringify(renderResolved(oursOnly, ['both'], sides))
+    );
+    // The point of the pair: two words for the same retained content must not
+    // produce two different files.
+    check(
+      'so "both" and "ours" agree byte for byte when both keep the same text',
+      renderResolved(oursOnly, ['both'], sides) === renderResolved(oursOnly, ['ours'], sides),
+      `${JSON.stringify(renderResolved(oursOnly, ['both'], sides))} vs ${JSON.stringify(renderResolved(oursOnly, ['ours'], sides))}`
+    );
+    // AND THE OTHER WAY ROUND, so this is not "always read ours". With the
+    // incoming side present it is the one the text ends on, and its missing
+    // terminator is the one that counts.
+    const both = parseConflict(['head', '<<<<<<< HEAD', 'MINE', '=======', 'YOURS', '>>>>>>> f', ''].join('\n'));
+    const twoSided = { ours: 'head\nMINE\n', theirs: 'head\nYOURS' };
+    check(
+      '"both" with a real incoming side still reads the terminator off theirs',
+      renderResolved(both, ['both'], twoSided) === 'head\nMINE\nYOURS',
+      JSON.stringify(renderResolved(both, ['both'], twoSided))
+    );
+    // And the ours-side terminator is not consulted when the file does not end
+    // on ours: theirs ends with one, so the file keeps it.
+    check(
+      'and leaves the newline alone when the side it ends on has one',
+      renderResolved(both, ['both'], { ours: 'head\nMINE', theirs: 'head\nYOURS\n' }) === 'head\nMINE\nYOURS\n',
+      JSON.stringify(renderResolved(both, ['both'], { ours: 'head\nMINE', theirs: 'head\nYOURS\n' }))
+    );
+    // A clash where NEITHER side put anything at the end has no version's
+    // terminator to take, so git's own newline is the only one there is.
+    const neither = parseConflict(['head', '<<<<<<< HEAD', '=======', '>>>>>>> f', ''].join('\n'));
+    if (conflictAtEnd(neither)) {
+      check(
+        'a clash both sides emptied keeps git’s own terminator',
+        renderResolved(neither, ['both'], { ours: 'head', theirs: 'head' }).endsWith('\n'),
+        JSON.stringify(renderResolved(neither, ['both'], { ours: 'head', theirs: 'head' }))
+      );
+    }
+  }
+
+  // AND THE CASE THIS MUST NOT TOUCH. When the file ends with text both sides
+  // agree on, the terminator is ordinary content and came through the markers
+  // intact — trimming there would delete a real newline.
+  const inMiddle = parseConflict(
+    ['<<<<<<< HEAD', 'main', '||||||| base', 'base', '=======', 'feat', '>>>>>>> f', 'z', ''].join('\n')
+  );
+  check('a conflict with settled text after it is not at the end', conflictAtEnd(inMiddle) === false, JSON.stringify(inMiddle));
+  check(
+    'and its terminator is left exactly as the file had it',
+    renderResolved(inMiddle, ['theirs'], { ours: 'main\nz', theirs: 'feat\nz' }) === 'feat\nz\n',
+    JSON.stringify(renderResolved(inMiddle, ['theirs'], { ours: 'main\nz', theirs: 'feat\nz' }))
+  );
+  // A marked-up file with no final newline has no trailing empty part, so
+  // there is nothing to take off and nothing was invented to take off.
+  const noTerminator = parseConflict(
+    ['a', '<<<<<<< HEAD', 'main', '=======', 'feat', '>>>>>>> f'].join('\n')
+  );
+  check('a marked-up file with no final newline is not at the end either', conflictAtEnd(noTerminator) === false, JSON.stringify(noTerminator));
+  check(
+    'and renders without one',
+    renderResolved(noTerminator, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat' }) === 'a\nfeat',
+    JSON.stringify(renderResolved(noTerminator, ['theirs'], { ours: 'a\nmain', theirs: 'a\nfeat' }))
+  );
+}
+
+// --- a conflict that ends the file ON TEXT BOTH SIDES HAVE -------------------
+//
+// The split inside a block is the reason this shape exists: two sides that end
+// the same way come back as a clash and then the run they agree on, so the
+// trailing empty part is no longer preceded by the clash and `conflictAtEnd`
+// used to answer false. The terminator correction then never ran, and the
+// rebuilt file gained git's own newline over a side that had none.
+//
+// THE MARKED-UP TEXT HERE IS REAL GIT'S, not a hand-drawn approximation:
+// base "head\nBASE\ntail\n", ours "head\nOURS\ntail\n", theirs
+// "head\nTHEIRS\ntail" with no terminator, merged with
+// merge.conflictStyle=diff3 — the missing newline makes the last lines differ,
+// so git marks up the tail as well. Measured before the fix: `['theirs']`
+// committed "head\nTHEIRS\ntail\n" while `'theirs'` — the same decision, whole
+// file — committed the blob exactly, both answering ok.
+{
+  const sharedTail = parseConflict(
+    'head\n<<<<<<< HEAD\nOURS\ntail\n||||||| 40b9761\nBASE\ntail\n=======\nTHEIRS\ntail\n>>>>>>> feature\n'
+  );
+  check('the shared tail comes back as its own agreed run', clashCount(sharedTail) === 1, JSON.stringify(sharedTail));
+  check(
+    '  stamped as having come from inside the markers',
+    sharedTail[sharedTail.length - 2]?.kind === 'same' && sharedTail[sharedTail.length - 2]?.inClash === true,
+    JSON.stringify(sharedTail)
+  );
+  check('AND THE CONFLICT STILL ENDS THE FILE', conflictAtEnd(sharedTail) === true, JSON.stringify(sharedTail));
+  const bothSides = { ours: 'head\nOURS\ntail\n', theirs: 'head\nTHEIRS\ntail' };
+  check(
+    'the incoming side with no terminator does not gain one',
+    renderResolved(sharedTail, ['theirs'], bothSides) === 'head\nTHEIRS\ntail',
+    JSON.stringify(renderResolved(sharedTail, ['theirs'], bothSides))
+  );
+  check(
+    '  while this branch, which has one, keeps exactly one',
+    renderResolved(sharedTail, ['ours'], bothSides) === 'head\nOURS\ntail\n',
+    JSON.stringify(renderResolved(sharedTail, ['ours'], bothSides))
+  );
+  // The other way round, so the answer cannot be "always strip".
+  const mirrored = { ours: 'head\nOURS\ntail', theirs: 'head\nTHEIRS\ntail\n' };
+  check(
+    'and with the terminators swapped the answers swap with them',
+    renderResolved(sharedTail, ['ours'], mirrored) === 'head\nOURS\ntail' &&
+      renderResolved(sharedTail, ['theirs'], mirrored) === 'head\nTHEIRS\ntail\n',
+    JSON.stringify([renderResolved(sharedTail, ['ours'], mirrored), renderResolved(sharedTail, ['theirs'], mirrored)])
+  );
+  // 'both' has no line of its own at the end here — the last line is the one
+  // both versions carry — and reads the terminator the way it always has, off
+  // the side of the clash that was actually written. What must not happen is
+  // the shape going unrecognised again and git's own newline surviving.
+  check(
+    'keeping both is read off a version too, not left with git’s newline',
+    renderResolved(sharedTail, ['both'], bothSides) === 'head\nOURS\nTHEIRS\ntail' &&
+      renderResolved(sharedTail, ['both'], mirrored) === 'head\nOURS\nTHEIRS\ntail\n',
+    JSON.stringify([renderResolved(sharedTail, ['both'], bothSides), renderResolved(sharedTail, ['both'], mirrored)])
+  );
+}
+
+// --- A conflicted file that does not use LF ----------------------------------
+//
+// GIT WRITES ITS MARKERS WITH THE FILE'S OWN LINE ENDING, AND THE MARKER
+// PATTERNS COULD NOT SEE PAST A CARRIAGE RETURN.
+//
+// `<<<<<<< HEAD\r` is what a CRLF file gets — anything authored on Windows,
+// anything under core.autocrlf, anything a .gitattributes marks
+// `text eol=crlf`. In JavaScript `.` does not match '\r' and `$` without the
+// `m` flag matches only at the very end of the string, so `/^<<<<<<< ?(.*)$/`
+// matched no marker in such a file at all: the whole marked-up thing came back
+// as ONE agreed part, clashCount() was 0, and the panel then sent the
+// whole-file word "ours" for a file it had shown the user nothing about. The
+// bytes below are real git output, `merge.conflictStyle=diff3`, taken from a
+// repository with `*.txt text eol=crlf`.
+{
+  const marked =
+    'head\r\n<<<<<<< HEAD\r\nOURS\r\n||||||| 77ebd51\r\nBASE\r\n=======\r\nTHEIRS\r\n>>>>>>> feature\r\ntail\r\n';
+  const parts = parseConflict(marked);
+  check('a CRLF conflict is a disagreement, not one agreed file', clashCount(parts) === 1, JSON.stringify(parts));
+  check(
+    '  and not one marker is left in the text called agreed',
+    !parts.some((p) => p.kind === 'same' && /(?:^|\n)(?:<{7}|\|{7}|={7}|>{7})/.test(p.text)),
+    JSON.stringify(parts)
+  );
+  // THE ROUND TRIP, BYTE FOR BYTE. The two branch versions below are the files
+  // git checks out for `--ours` and `--theirs` in that repository, CRLF and
+  // all, so anything this rebuilds that is not one of them is a byte nobody
+  // wrote.
+  check(
+    'keeping this branch rebuilds its CRLF file exactly',
+    renderResolved(parts, ['ours']) === 'head\r\nOURS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['ours']))
+  );
+  check(
+    '  and keeping the incoming branch rebuilds its CRLF file exactly',
+    renderResolved(parts, ['theirs']) === 'head\r\nTHEIRS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['theirs']))
+  );
+  check(
+    '  and keeping both keeps CRLF between them',
+    renderResolved(parts, ['both']) === 'head\r\nOURS\r\nTHEIRS\r\ntail\r\n',
+    JSON.stringify(renderResolved(parts, ['both']))
+  );
+  // The same file with LF, so the CRLF answers above cannot be right by
+  // accident of some rule that ignores the ending altogether.
+  const lf = parseConflict('head\n<<<<<<< HEAD\nOURS\n||||||| 77ebd51\nBASE\n=======\nTHEIRS\n>>>>>>> feature\ntail\n');
+  check(
+    'CONTROL: the LF file of the same shape still rebuilds with LF',
+    renderResolved(lf, ['theirs']) === 'head\nTHEIRS\ntail\n' && clashCount(lf) === 1,
+    JSON.stringify(renderResolved(lf, ['theirs']))
+  );
+}
+
+// --- The final newline, in a file whose newline is two bytes -----------------
+//
+// THE CORRECTION TOOK OFF ONE CHARACTER, AND A CRLF TERMINATOR IS TWO.
+//
+// When the conflict runs to the end of the file git writes a terminator after
+// the chosen side whether or not that side had one, and renderResolved takes
+// it back off when the side it ends on has none. Slicing exactly one character
+// out of a CRLF file removes the '\n' and leaves the '\r' — a byte NEITHER
+// BRANCH WROTE, on the last line, invisible in every editor that draws it.
+// MEASURED with real git, ours "head\r\nOURS\r\n" and theirs
+// "head\r\nTHEIRS" with no terminator: `['theirs']` rendered
+// "head\r\nTHEIRS\r" and `['both']` rendered "head\r\nOURS\r\nTHEIRS\r",
+// both written, staged and committed as ok.
+{
+  const parts = parseConflict('head\r\n<<<<<<< HEAD\r\nOURS\r\n=======\r\nTHEIRS\r\n>>>>>>> feature\r\n');
+  check('the CRLF conflict that ends the file is recognised as one', conflictAtEnd(parts) === true, JSON.stringify(parts));
+  // Stages 2 and 3 as `git show` gives them — the index blob, which for an
+  // `eol=crlf` file is stored with LF. Whether it ends in a terminator is the
+  // only thing read off it, and normalisation does not change that.
+  const sides = { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' };
+  check(
+    'the incoming side with no terminator gains neither a newline nor a stray CR',
+    renderResolved(parts, ['theirs'], sides) === 'head\r\nTHEIRS',
+    JSON.stringify(renderResolved(parts, ['theirs'], sides))
+  );
+  check(
+    '  while this branch, which has one, keeps the whole CRLF pair',
+    renderResolved(parts, ['ours'], sides) === 'head\r\nOURS\r\n',
+    JSON.stringify(renderResolved(parts, ['ours'], sides))
+  );
+  check(
+    '  and keeping both ends on the incoming side, terminator and all',
+    renderResolved(parts, ['both'], sides) === 'head\r\nOURS\r\nTHEIRS',
+    JSON.stringify(renderResolved(parts, ['both'], sides))
+  );
+  // CONTROL, AND THE REASON THIS IS ASKED OF THE SIDE RATHER THAN OF THE TEXT.
+  // A '\r' at the end of the last line is not always part of a line ending: an
+  // LF-terminated file can carry one as content. The side git is holding says
+  // which this is, and stripping two bytes there would eat a byte the branch
+  // really wrote.
+  const carried = { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS\r' };
+  check(
+    'CONTROL: a CR the incoming side really ends on is not taken for a line ending',
+    renderResolved(parts, ['theirs'], carried) === 'head\r\nTHEIRS\r',
+    JSON.stringify(renderResolved(parts, ['theirs'], carried))
+  );
+  // And the LF file of the same shape is unmoved by any of it.
+  const lf = parseConflict('head\n<<<<<<< HEAD\nOURS\n=======\nTHEIRS\n>>>>>>> feature\n');
+  check(
+    'CONTROL: the LF file still loses exactly its one newline',
+    renderResolved(lf, ['theirs'], { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' }) === 'head\nTHEIRS',
+    JSON.stringify(renderResolved(lf, ['theirs'], { ours: 'head\nOURS\n', theirs: 'head\nTHEIRS' }))
+  );
+}
+
+// --- Markers that survived into the text this called agreed ------------------
+//
+// A MARKED-UP FILE THAT PARSES TO NOTHING LOOKS EXACTLY LIKE A FILE WITH
+// NOTHING TO CHOOSE, AND THE DIFFERENCE IS THE WHOLE MERGE.
+//
+// parseConflict keeps anything it cannot read as `same` text, which is right —
+// no line is ever dropped — but `same` means "both branches agree on this" and
+// a `<<<<<<<` line is git saying the opposite. Every caller reads
+// clashCount() === 0 as "no disagreements", so the shape has to be
+// recognisable on its own. The CRLF markers above were one way to reach it;
+// this is the shape rather than that cause.
+{
+  const readable = parseConflict('a\n<<<<<<< HEAD\nO\n=======\nT\n>>>>>>> f\nb\n');
+  check('a conflict that was read carries no unread markers', unreadMarkers(readable) === false, JSON.stringify(readable));
+  const crlf = parseConflict('a\r\n<<<<<<< HEAD\r\nO\r\n=======\r\nT\r\n>>>>>>> f\r\nb\r\n');
+  check('  nor does the CRLF one, now that it is read', unreadMarkers(crlf) === false, JSON.stringify(crlf));
+  const plain = parseConflict('a file with no markers in it at all\n');
+  check('  and a file with no markers has none unread either', unreadMarkers(plain) === false, JSON.stringify(plain));
+  // The two shapes that do reach it: a block nobody closed, and a marker whose
+  // opener this could not match at all. Both leave the opener in agreed text.
+  const unclosed = parseConflict('a\n<<<<<<< HEAD\nO\n=======\nT\n');
+  check('an unclosed block is nought hunks AND says its markers went unread', clashCount(unclosed) === 0 && unreadMarkers(unclosed) === true, JSON.stringify(unclosed));
+  check(
+    '  with every one of its lines still in the parse',
+    renderResolved(unclosed) === 'a\n<<<<<<< HEAD\nO\n=======\nT\n',
+    JSON.stringify(renderResolved(unclosed))
+  );
+  // Not a marker: a run of angle brackets with nothing after it is a rule
+  // somebody drew, not an opener. (It is NOT "seven is the only count git
+  // writes", which is what this used to say and is false — see the width block
+  // below.) What makes a marker is the shape of the whole line: the run, and
+  // then a space, a tab, a carriage return or the end of the text.
+  check('a run of the same character with nothing after it is not a marker', unreadMarkers(parseConflict('a\n<<<<<<<<\nb\n')) === false);
+}
+
+// --- the width git wrote them at ---------------------------------------------
+//
+// SEVEN IS GIT'S DEFAULT, NOT ITS ONLY WIDTH. `conflict-marker-size=<n>` in
+// .gitattributes is documented and obeyed for any positive integer — MEASURED
+// against git 2.50.1, sizes 1 to 200 all come out at the width asked for, and 0,
+// a negative and a non-integer fall back to seven. test/git-branches.js T32
+// takes the whole matrix through real repositories, including what the two
+// failures below did to real commits; this is the parse itself, where both of
+// them lived.
+{
+  const wide = (n, ch) => ch.repeat(n);
+  const marked = (n) =>
+    ['head', `${wide(n, '<')} HEAD`, 'OURS', `${wide(n, '|')} 1234567`, 'BASE', wide(n, '='), 'THEIRS', `${wide(n, '>')} feature`, 'tail', ''].join('\n');
+
+  for (const n of [1, 2, 3, 6, 7, 9, 32, 60, 200]) {
+    const parts = parseConflict(marked(n), n);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check(`a ${n}-character marker is one disagreement`, clashes.length === 1, JSON.stringify(parts).slice(0, 300));
+    check(`  with both sides read at width ${n}`, clashes[0]?.ours === 'OURS' && clashes[0]?.theirs === 'THEIRS', JSON.stringify(clashes[0]));
+    // The ancestor line matched too, which is the only reason `changedBy` can
+    // be a three-way answer. Both sides moved off BASE here.
+    check(`  and the ancestor line at width ${n} with it`, clashes[0]?.changedBy === 'both', JSON.stringify(clashes[0]));
+    check(`  rebuilding takes the side asked for at width ${n}`, renderResolved(parts, ['theirs']) === 'head\nTHEIRS\ntail\n', JSON.stringify(renderResolved(parts, ['theirs'])));
+    check(`  and no marker survives into the parse at width ${n}`, unreadMarkers(parts, n) === false, JSON.stringify(parts).slice(0, 200));
+  }
+
+  // WIDER THAN THE WIDTH ASKED FOR — the failure that committed bytes neither
+  // branch wrote. `^<<<<<<<` matched the first seven of a thirty-two-character
+  // opener and read the rest as the label; the ancestor line and the closer did
+  // the same; and only `/^=======\s*$/` did not, so the separator and the whole
+  // incoming side fell into the ancestor and `theirs` came out EMPTY. Now the
+  // markers are matched at exactly the width given, so a marker of another width
+  // is not a marker — it is text this did not read, and it says so.
+  {
+    const parts = parseConflict(marked(32), 7);
+    check('a 32-wide marker read at 7 is not half-read into a false hunk', clashCount(parts) === 0, JSON.stringify(parts).slice(0, 300));
+    check('  it is reported as markers that went unread', unreadMarkers(parts, 7) === true);
+    check('  with every line of the file kept', renderResolved(parts) === marked(32), JSON.stringify(renderResolved(parts)));
+  }
+  // NARROWER — nothing matched at all, and the exactly-seven backstop could not
+  // see it either. Both halves of that are closed: the block is unread, and the
+  // shape of a whole block at any width below seven is recognised even when the
+  // width this was given is wrong.
+  {
+    const parts = parseConflict(marked(3), 7);
+    check('a 3-wide marker read at 7 is nought hunks', clashCount(parts) === 0, JSON.stringify(parts).slice(0, 300));
+    check('  and STILL reported as markers that went unread', unreadMarkers(parts, 7) === true);
+    check('  with every line of the file kept', renderResolved(parts) === marked(3), JSON.stringify(renderResolved(parts)));
+  }
+  // The same file read at its own width is an ordinary conflict again.
+  check('and at its own width it is an ordinary conflict', clashCount(parseConflict(marked(3), 3)) === 1);
+
+  // A width git would not have used falls back to seven, exactly as git does
+  // with an unset, zero, negative or non-integer attribute — and, MEASURED, with
+  // one too big for it to parse: at 4294967296 and at twenty digits git says
+  // `warning: invalid marker-size ... expecting an integer` and writes SEVEN.
+  // check-attr reports the raw string either way, so a reading without that
+  // bound would build a pattern nothing can match and refuse an ordinary merge.
+  for (const bogus of [undefined, null, 0, -1, 2.5, '32', NaN, Infinity, MAX_MARKER_SIZE + 1, 4294967296, Number('9'.repeat(20))]) {
+    check(`a marker size of ${String(bogus)} reads as git's default of seven`, clashCount(parseConflict(marked(7), bogus)) === 1, String(bogus));
+  }
+  // The largest width git does accept is still a width, not a fallback.
+  check('and the largest width git takes is used as given', markerWidth(MAX_MARKER_SIZE) === MAX_MARKER_SIZE);
+
+  // A WIDTH BIG ENOUGH TO BE A LINE OF ITS OWN. Git honours five thousand and a
+  // hundred thousand — measured, it really writes markers that long — so the
+  // parse has to as well rather than treating "large" as "wrong".
+  {
+    const parts = parseConflict(marked(5000), 5000);
+    check('a five-thousand-character marker is one disagreement', clashCount(parts) === 1, JSON.stringify(parts).slice(0, 200));
+    check('  with both sides read', parts.find((p) => p.kind === 'clash')?.theirs === 'THEIRS');
+  }
+
+  // AND THE TEXT THAT MUST NOT BE MISTAKEN FOR ONE. The backstop looks for a
+  // whole block at the small widths rather than a bare opener, because a line
+  // beginning "< " is ordinary in diff output, in quoted mail and in
+  // documentation — refusing every conflicted file that holds one would be a
+  // false refusal invented rather than inherited.
+  const benign = [
+    ['diff output', 'Compare them:\n< the old line\n> the new line\ndone\n'],
+    ['a rule of equals signs', 'Title\n=====\nbody\n'],
+    ['a rule of angle brackets', 'a\n<<<<<<<<<<<<<<<<<<<<\nb\n'],
+    ['an HTML fragment', '<div>\n<span>x</span>\n</div>\n'],
+    ['a shell heredoc', 'cat <<EOF\nhello\nEOF\n'],
+  ];
+  for (const [what, text] of benign) {
+    check(`${what} is not read as a conflict`, clashCount(parseConflict(text)) === 0, JSON.stringify(parseConflict(text)).slice(0, 200));
+    check(`  nor called an unread marker`, unreadMarkers(parseConflict(text)) === false, JSON.stringify(text));
+    check(`  and rebuilds byte for byte`, renderResolved(parseConflict(text)) === text, JSON.stringify(renderResolved(parseConflict(text))));
+  }
+}
+
+// --- a marker is EXACTLY its width, not a prefix of a longer run -------------
+//
+// Matching `<{7}` without asking what comes next makes every marker a PREFIX
+// test: an eight-character run of the same character passes it, and so does a
+// thirty-two-character one. That is how a width-32 opener came to be read as a
+// width-7 marker with twenty-five more '<' in its label. The separator saves
+// most of those by refusing to match (nothing can eat the surplus '='), but not
+// all of them — a line of somebody's own text that starts with a run one longer
+// than the width in force can open, close, or split a block that was otherwise
+// read correctly, and the sides then belong to no branch.
+//
+// So each of the three markers that carry a label is checked against a run one
+// character too long sitting in ordinary text, with a real conflict beside it.
+{
+  const real = ['<<<<<<< HEAD', 'OURS', '=======', 'THEIRS', '>>>>>>> f'];
+
+  // An eight-character OPENER in the text before a real conflict. Read as a
+  // marker it swallows the real opener and the sides come back wrong; read as
+  // text it is left where it is, and says so.
+  {
+    const text = ['a', '<<<<<<<< not a marker', 'b', ...real, 'c', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long does not open a block', clashes.length === 1, JSON.stringify(parts));
+    check('  and the real conflict beside it is still read exactly', clashes[0]?.ours === 'OURS' && clashes[0]?.theirs === 'THEIRS', JSON.stringify(clashes[0]));
+    check('  with the over-long run reported as a marker that went unread', unreadMarkers(parts) === true, JSON.stringify(parts));
+  }
+
+  // An eight-character CLOSER inside the block. Read as a marker it ends the
+  // block early and `theirs` is never reached.
+  {
+    const text = ['a', '<<<<<<< HEAD', 'OURS', '>>>>>>>> quoted in the text', '=======', 'THEIRS', '>>>>>>> f', 'c', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long does not close a block', clashes.length === 1, JSON.stringify(parts));
+    check(
+      '  so both sides are the ones git wrote',
+      clashes[0]?.ours === 'OURS\n>>>>>>>> quoted in the text' && clashes[0]?.theirs === 'THEIRS',
+      JSON.stringify(clashes[0])
+    );
+  }
+
+  // An eight-character ANCESTOR line inside the block. Read as a marker every
+  // line after it stops being this branch's side and becomes the ancestor.
+  {
+    const text = ['a', '<<<<<<< HEAD', 'OURS', '|||||||| quoted in the text', 'MORE-OURS', '=======', 'THEIRS', '>>>>>>> f', ''].join('\n');
+    const parts = parseConflict(text);
+    const clashes = parts.filter((p) => p.kind === 'clash');
+    check('a run one character too long is not the ancestor line', clashes.length === 1, JSON.stringify(parts));
+    check(
+      '  so this branch keeps both of its lines',
+      clashes[0]?.ours === 'OURS\n|||||||| quoted in the text\nMORE-OURS',
+      JSON.stringify(clashes[0])
+    );
+  }
+}
+
+// --- the width matters to the BACKSTOP too, not only to the parse ------------
+//
+// Two of the three things `unreadMarkers` looks for need no width: a run of
+// seven or more, and a complete block at any of the widths below seven. The
+// third does, and it is the shape neither of the others can see — a marker
+// narrower than seven that is NOT part of a complete block, which is what a
+// person's own text or a half-edited file leaves behind in a repository that
+// sets a small conflict-marker-size. Asked at the wrong width it is invisible.
+{
+  const text = ['head', '<<< HEAD', 'OURS', '||| 1234567', 'BASE', '===', 'THEIRS', '>>> feature', 'tail', '<<< see the docs', 'end', ''].join('\n');
+  const parts = parseConflict(text, 3);
+  check('the real 3-wide conflict is still read', clashCount(parts) === 1, JSON.stringify(parts));
+  check('  and the lone 3-wide opener after it is reported unread', unreadMarkers(parts, 3) === true, JSON.stringify(parts));
+  check('  which asking at git’s default width cannot see', unreadMarkers(parts) === false);
+}
+
+// --- a real conflict is NEVER described as nothing to decide -----------------
+//
+// THE PROPERTY, not another example of it. Everything about the width exists to
+// stop one thing: a path git says is unmerged coming back with no hunks and no
+// complaint, because that is what makes the whole-file default reachable against
+// a description that is false. The examples above are the shapes that were
+// measured doing it; this asks the question over the space they came out of.
+//
+// Every real marker width crossed with every side that can be empty (git writes
+// a one-sided block whenever one branch deleted what the other changed), read at
+// every width Stacki might be handed. For each: if the parse finds no
+// disagreement, `unreadMarkers` must say so.
+{
+  const block = (width, oursEmpty, theirsEmpty, base) => {
+    const line = (ch, label) => ch.repeat(width) + (label ? ` ${label}` : '');
+    const out = ['head', line('<', 'HEAD')];
+    if (!oursEmpty) out.push('OURS');
+    if (base) out.push(line('|', '1234567'), 'BASE');
+    out.push(line('=', ''));
+    if (!theirsEmpty) out.push('THEIRS');
+    out.push(line('>', 'feature'), 'tail', '');
+    return out.join('\n');
+  };
+  let silent = 0;
+  let seen = 0;
+  let example = null;
+  for (const real of [1, 2, 3, 4, 5, 6, 7, 8, 12, 32]) {
+    for (const [oursEmpty, theirsEmpty] of [[false, false], [true, false], [false, true], [true, true]]) {
+      for (const base of [true, false]) {
+        const text = block(real, oursEmpty, theirsEmpty, base);
+        for (const read of [1, 3, 5, 7, 9, 32]) {
+          seen++;
+          const parts = parseConflict(text, read);
+          if (clashCount(parts) === 0 && !unreadMarkers(parts, read)) {
+            silent++;
+            if (!example) example = `real ${real}, read ${read}, oursEmpty ${oursEmpty}, theirsEmpty ${theirsEmpty}, diff3 ${base}`;
+          }
+        }
+      }
+    }
+  }
+  check(
+    `no width and no shape describes a real conflict as nothing to decide (${seen} combinations)`,
+    silent === 0 && seen > 400,
+    example || `${seen} combinations`
+  );
+}
+
+// --- the backstop's cost is the input's LENGTH, not its shape ----------------
+//
+// The first version of the small-width scan was six regexes of the form
+// `<{w}(?!<)[ \t][\s\S]*?\n={w}(?!=)[ \t\r]*\n[\s\S]*?\n>{w}(?!>)[ \t]`, run over
+// the agreed text of every conflicting file. Two unanchored lazy spans in one
+// pattern backtrack catastrophically, and the text they run over comes out of
+// the repository being merged — content somebody else chose. MEASURED on the
+// input below, ~700 KB of opener- and separator-shaped lines with no closer: the
+// line walk answers in 7ms and that pattern had not returned after FIVE MINUTES,
+// with the main process holding the whole time.
+//
+// A generous ceiling, because a shared machine is slow in ways that are nobody's
+// bug — the point is three orders of magnitude, not a stopwatch.
+{
+  const lines = [];
+  for (let i = 0; i < 20000; i++) lines.push('<<<<< a', '=====', `ordinary line ${i}`);
+  const parts = [{ kind: 'same', text: lines.join('\n') }];
+  const started = Date.now();
+  const answer = unreadMarkers(parts, 7);
+  const took = Date.now() - started;
+  check('an adversarial agreed text does not stall the backstop', took < 2000, `${took}ms over ${Buffer.byteLength(parts[0].text)} bytes`);
+  check('  and it answers correctly: no block, so no unread marker', answer === false);
+}
+
+// --- a marker carries its label, and a bare run is content -------------------
+{
+  // GIT ALWAYS WRITES THE SEPARATING SPACE. Measured across `merge` in all three
+  // conflict styles, on a detached HEAD, and `git merge-file --diff3` with no
+  // `-L` at all and with three EMPTY `-L` labels: the opener, the ancestor line
+  // and the closer always carry it — `<<<<<<< ` even when the label is the empty
+  // string — and only the SEPARATOR is bare.
+  //
+  // The parse used to take the space as optional while `unreadMarkers` took it
+  // as required, and the permissive half was the one that cost a commit: a page
+  // documenting conflict markers with UNLABELLED ones had its bare `<<<<<<<`
+  // read as structure, invisible to the backstop, and answering it committed a
+  // file equal to neither branch.
+  const doc = ['Conflict markers look like this:', '', '<<<<<<<', 'your side', '=======', 'their side', '>>>>>>>', '', 'tail', ''].join('\n');
+  check('a bare opener is content, not structure', clashCount(parseConflict(doc)) === 0, JSON.stringify(parseConflict(doc)));
+  check('  so nothing calls it an unread marker either', unreadMarkers(parseConflict(doc)) === false);
+  check('  and the page rebuilds byte for byte', renderResolved(parseConflict(doc)) === doc, JSON.stringify(renderResolved(parseConflict(doc))));
+
+  // AND THE ONE WHERE THE OPENER ALONE DECIDES IT. The block above is bare at
+  // both ends, so requiring the space at the CLOSER is enough to keep it out of
+  // the parse — which is not a check on the opener at all. This one is bare only
+  // where it begins, which is the shape a page mixing the two writes, and the
+  // opener is the only thing standing between it and being read as a conflict.
+  const halfBare = ['prose', '<<<<<<<', 'your side', '=======', 'their side', '>>>>>>> other-branch', 'tail', ''].join('\n');
+  check('a bare opener with a labelled closer is content too', clashCount(parseConflict(halfBare)) === 0, JSON.stringify(parseConflict(halfBare)));
+  check('  and that page rebuilds byte for byte as well', renderResolved(parseConflict(halfBare)) === halfBare, JSON.stringify(renderResolved(parseConflict(halfBare))));
+
+  // The mirror image: a bare closer inside a side used to end git's real block
+  // early and render the ANCESTOR section into the file.
+  const bareCloser = ['a', '<<<<<<< HEAD', 'OURS', '>>>>>>>', 'MORE', '||||||| 1234567', 'BASE', '=======', 'THEIRS', '>>>>>>> f', 'z', ''].join('\n');
+  const bareParts = parseConflict(bareCloser);
+  const bareClash = bareParts.find((part) => part.kind === 'clash');
+  check('a bare closer does not end a block', clashCount(bareParts) === 1, JSON.stringify(bareParts));
+  check('  so this branch keeps both of its lines and the ancestor stays out', bareClash?.ours === 'OURS\n>>>>>>>\nMORE' && bareClash?.theirs === 'THEIRS', JSON.stringify(bareClash));
+
+  // And git's own labelled markers are still markers, label or empty label.
+  check('a labelled marker is still a marker', clashCount(parseConflict(['a', '<<<<<<< HEAD', 'O', '||||||| b', 'B', '=======', 'T', '>>>>>>> f'].join('\n'))) === 1);
+  check(
+    '  including the empty label git merge-file writes',
+    clashCount(parseConflict(['a', '<<<<<<< ', 'O', '||||||| ', 'B', '=======', 'T', '>>>>>>> '].join('\n'))) === 1
+  );
+}
+
+// --- how wide an unconsumed marker has to be to mean anything ----------------
+{
+  // The OPENER is looked for at the width in force and at any width from seven
+  // up: a width this was not given leaves one behind, and an opener is what
+  // begins a block, so an unconsumed one is the evidence worth casting wide for.
+  const wideOpener = ['a', `${'<'.repeat(9)} HEAD`, 'b', ''].join('\n');
+  check('an unconsumed opener wider than the width in force is still a marker', unreadMarkers(parseConflict(wideOpener), 7) === true);
+
+  // The CLOSER is looked for only at the width in force. Casting it as wide was
+  // a false refusal with nothing to buy it: MEASURED, a README banner reading
+  // `>>>>>>>> WARNING <<<<<<<<`, in text both branches are identical on, refused
+  // an otherwise perfectly parsed merge outright.
+  const banner = ['>>>>>>>> WARNING <<<<<<<<', '', 'Do not edit.', '<<<<<<< HEAD', 'O', '||||||| 1234567', 'B', '=======', 'T', '>>>>>>> f', ''].join('\n');
+  const bannerParts = parseConflict(banner, 7, true);
+  check('a banner of eight closers does not refuse the file', unreadMarkers(bannerParts, 7) === false, JSON.stringify(bannerParts).slice(0, 240));
+  check('  and the conflict beside it is read exactly', clashCount(bannerParts) === 1 && bannerParts.find((x) => x.kind === 'clash')?.theirs === 'T', JSON.stringify(bannerParts));
+
+  // The shape that IS evidence: git's own closer, left in agreed text because a
+  // LABELLED closer in somebody's source ended the block early.
+  const early = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'BASE', '=======', 'THEIRS', '>>>>>>> quoted in the text', 'MORE', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('git’s own closer left behind is still found', unreadMarkers(parseConflict(early, 7, true), 7) === true, JSON.stringify(parseConflict(early, 7, true)).slice(0, 240));
+}
+
+// --- the question no rule about the SHAPE of the markup can answer ----------
+{
+  // Five rules now keep a line of somebody's source out of git's markup: exact
+  // width, one opener, one separator, at most one ancestor line before it, and
+  // — under diff3 — an ancestor line at all. Each closed the shape in front of
+  // it and the next review found another. The last was an authored example
+  // written in the DIFF3 spelling: opener, ancestor line, separator, closer, one
+  // of each, in order, at the width in force. It passes all five.
+  //
+  // What closes it is not the shape but the PROVENANCE, and git holds that: the
+  // markers git writes are in no blob. A marker line present in either side's
+  // committed version is not one git wrote — and a file holding one cannot have
+  // its own markers told from git's at all.
+  const withMarker = 'A conflict looks like this:\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nEnd\n';
+  const diff3Marker = 'A diff3 conflict:\n<<<<<<< HEAD\nours\n||||||| base\nancestor\n=======\ntheirs\n>>>>>>> feature\nEnd\n';
+  const ordinary = 'An ordinary page about nothing in particular.\nEnd\n';
+  check('a side holding a default-style marker is seen', sidesHoldMarkers(7, withMarker, ordinary) === true);
+  check('a side holding a diff3-style marker is seen too', sidesHoldMarkers(7, ordinary, diff3Marker) === true);
+  check('  which is the shape five structural rules cannot tell from git’s', clashCount(parseConflict(diff3Marker, 7, true)) === 1, JSON.stringify(parseConflict(diff3Marker, 7, true)));
+  check('two ordinary sides are not', sidesHoldMarkers(7, ordinary, ordinary) === false);
+  check('  nor is a missing side', sidesHoldMarkers(7, null, undefined) === false);
+  // THE WIDTH IN FORCE, AND — AT GIT'S DEFAULT — SEVEN AND UP.
+  //
+  // This asked for seven-and-up at EVERY width, which made the remedy this
+  // refusal offers useless: a project told to widen its markers got the
+  // identical refusal, because the authored seven-wide line still matched.
+  // MEASURED end to end, an authored `<<<<<<< HEAD` in prose: byte-identical
+  // refusals at 7, at 32 and at 64. Seven is git's default and so the width
+  // this falls back to when it was not told the real one; at an explicit width
+  // git writes exactly that width and nothing else is confusable with it.
+  check('a marker at the width in force is seen', sidesHoldMarkers(3, 'a\n<<< HEAD\nb\n') === true);
+  check('  and at seven or more when seven is what is in force', sidesHoldMarkers(7, `a\n${'<'.repeat(9)} HEAD\nb\n`) === true);
+  check('  but NOT at nine when three is in force — git writes three', sidesHoldMarkers(3, `a\n${'<'.repeat(9)} HEAD\nb\n`) === false);
+  check('  nor at seven when thirty-two is in force, which is the remedy working', sidesHoldMarkers(32, 'a\n<<<<<<< HEAD\nb\n') === false);
+  check('  while thirty-two at thirty-two still is', sidesHoldMarkers(32, `a\n${'<'.repeat(32)} HEAD\nb\n`) === true);
+  // And the shapes that are NOT markers stay content, so this does not refuse
+  // an ordinary file: a bare run, and a rule of angle brackets.
+  check('a bare run in a side is not a marker', sidesHoldMarkers(7, 'a\n<<<<<<<\nb\n') === false);
+  check('  nor is a rule of angle brackets', sidesHoldMarkers(7, `a\n${'<'.repeat(20)}\nb\n`) === false);
+}
+
+// --- one of each marker, and not two -----------------------------------------
+{
+  // A SECOND SEPARATOR, which an ordinary repository produces on its own: the
+  // COMMON ANCESTOR contains a `=======` line — a Markdown setext underline, a
+  // divider comment — and both branches change the lines around it. MEASURED,
+  // real git: `<<< HEAD / OURS / ||| sha / X / ======= / Y / ======= / THEIRS /
+  // >>> feature`, two separators in one block. Taking the FIRST bound the
+  // ancestor's own lines and a conflict separator to the incoming branch, and
+  // answering that committed "top\nY\n=======\nTHEIRS\nbottom\n" — equal to
+  // neither branch, with a marker written into the source, as ok:true.
+  const twoSeparators = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'Y', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('a block with two separators is not read', clashCount(parseConflict(twoSeparators)) === 0, JSON.stringify(parseConflict(twoSeparators)));
+  check('  and says so', unreadMarkers(parseConflict(twoSeparators)) === true);
+  check('  keeping every line', renderResolved(parseConflict(twoSeparators)) === twoSeparators, JSON.stringify(renderResolved(parseConflict(twoSeparators))));
+  // The control: exactly one separator in the same shape IS read, so the rule
+  // above is "not two" rather than "not any".
+  const one = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('  while one separator in the same shape is an ordinary conflict', clashCount(parseConflict(one)) === 1, JSON.stringify(parseConflict(one)));
+
+  // A SECOND OPENER. Git does not nest its blocks, so an opener inside one is
+  // the same evidence: this is not a block git wrote.
+  const nested = ['top', '<<<<<<< HEAD', '<<<<<<< quoted in the page', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  // The outer block is refused and its opener stays in the agreed text, where
+  // the backstop finds it; the parse then carries on from the line after, so
+  // the inner block — which IS the shape git writes — is read. The file is
+  // refused either way, which is the point: the opener that began the outer
+  // block was never asked whether it was git's, and now it is.
+  const nestedParts = parseConflict(nested);
+  check('a block with a second opener inside it is not read as that block', unreadMarkers(nestedParts) === true, JSON.stringify(nestedParts));
+  check(
+    '  with the opener that began it left in the agreed text',
+    nestedParts.some((part) => part.kind === 'same' && part.text.includes('<<<<<<< HEAD')),
+    JSON.stringify(nestedParts)
+  );
+  check(
+    '  and the hunk it did read is the inner one, not a fabricated outer one',
+    !nestedParts.some((part) => part.kind === 'clash' && part.ours.includes('<<<<<<<')),
+    JSON.stringify(nestedParts.filter((part) => part.kind === 'clash'))
+  );
+}
+
+// --- the ancestor line, where git puts it and where it never does ------------
+{
+  // UNDER diff3 THE ANCESTOR LINE IS NOT OPTIONAL, and that is what tells git's
+  // block from one somebody typed into the page. MEASURED over the six shapes
+  // that might plausibly lack one — an ordinary content clash, add/add with no
+  // common ancestor at all, both branches appending at end of file, one side
+  // deleting what the other changed, a criss-cross with two merge bases, and a
+  // region whose ancestor is empty — all six: one block, one `|||||||` line.
+  const authored = ['prose', '<<<<<<< HEAD', 'yours', '=======', 'theirs', '>>>>>>> other', 'more', ''].join('\n');
+  check('a default-style block is an ordinary conflict to a caller that did not merge', clashCount(parseConflict(authored)) === 1, JSON.stringify(parseConflict(authored)));
+  check('  and is NOT one in markup that came from a diff3 merge', clashCount(parseConflict(authored, 7, true)) === 0, JSON.stringify(parseConflict(authored, 7, true)));
+  check('  which says so rather than going quiet', unreadMarkers(parseConflict(authored, 7, true)) === true);
+  check('  with every line of it kept', renderResolved(parseConflict(authored, 7, true)) === authored, JSON.stringify(renderResolved(parseConflict(authored, 7, true))));
+  // And the block git DOES write is still read, from the same caller.
+  const real = ['a', '<<<<<<< HEAD', 'O', '||||||| 1234567', 'B', '=======', 'T', '>>>>>>> f', 'z', ''].join('\n');
+  check('git’s own diff3 block is read by that caller', clashCount(parseConflict(real, 7, true)) === 1, JSON.stringify(parseConflict(real, 7, true)));
+
+  // THE ANCESTOR LINE AFTER THE SEPARATOR. Git never writes that — its own
+  // order is opener, ancestor, separator, closer — so a block in that order is
+  // one this did not read. Reachable only from the ordinary `merge` style,
+  // which is why it is asked of the parser directly rather than through a merge.
+  const inverted = ['a', '<<<<<<< HEAD', 'O', '=======', 'T', '||||||| 1234567', 'B', '>>>>>>> f', 'z', ''].join('\n');
+  check('an ancestor line AFTER the separator is not a block git wrote', clashCount(parseConflict(inverted)) === 0, JSON.stringify(parseConflict(inverted)));
+  check('  and it says so', unreadMarkers(parseConflict(inverted)) === true);
+  check('  keeping every line', renderResolved(parseConflict(inverted)) === inverted, JSON.stringify(renderResolved(parseConflict(inverted))));
+}
+
+// --- the marker cache is a convenience, not a store --------------------------
+{
+  // The widths come from a file inside the repository being merged, and a
+  // .gitattributes can name a different one for every path in it. MARKER_CACHE_MAX
+  // is what keeps that from growing for as long as the app is open.
+  for (let width = 1; width <= MARKER_CACHE_MAX * 3; width++) parseConflict('x\n', width);
+  check(
+    `the marker cache stays inside its bound after ${MARKER_CACHE_MAX * 3} distinct widths`,
+    markerCacheSize() <= MARKER_CACHE_MAX,
+    `${markerCacheSize()} entries, bound ${MARKER_CACHE_MAX}`
+  );
+  // And it is still a cache: the width asked for is the width used.
+  check('and a width used after the reset still parses at that width', clashCount(parseConflict(['a', '<<< H', 'O', '||| b', 'B', '===', 'T', '>>> f'].join('\n'), 3)) === 1);
+}
+
+// --- blocks this could not read, and the lines it used to lose ---------------
+{
+  // A BLOCK WITH NO SEPARATOR IS NOT A ONE-SIDED CONFLICT. Everything from the
+  // opener to the closer used to go into `ours` and the incoming side came out
+  // empty — a hunk claiming the other branch deleted those lines, which is a
+  // claim and not a gap. It is the same shape a wider-than-seven marker produced,
+  // and git writes a separator into every conflict it makes.
+  const noMiddle = 'a\n<<<<<<< HEAD\nO\nT\n>>>>>>> f\nb\n';
+  const parts = parseConflict(noMiddle);
+  check('a block with no separator is not read as a hunk', clashCount(parts) === 0, JSON.stringify(parts));
+  check('  it says its markers went unread', unreadMarkers(parts) === true);
+  check('  and every line of it is still there', renderResolved(parts) === noMiddle, JSON.stringify(renderResolved(parts)));
+
+  // A BLOCK THAT SPLITS INTO NO DISAGREEMENT WAS SILENTLY DELETED. The flush
+  // ran, the empty split contributed nothing, and the opener, separator and
+  // closer left the parse entirely — three lines gone out of the one function
+  // whose comment promises nothing is ever dropped. Git does not write a
+  // conflict whose sides are identical, so this is a block nobody read.
+  const emptyBlock = 'head\n<<<<<<< HEAD\n=======\n>>>>>>> x\ntail\n';
+  const emptyParts = parseConflict(emptyBlock);
+  check('a block with nothing on either side is not read as a hunk', clashCount(emptyParts) === 0, JSON.stringify(emptyParts));
+  check('  it says its markers went unread', unreadMarkers(emptyParts) === true);
+  check('  AND NOT ONE OF ITS LINES IS LOST', renderResolved(emptyParts) === emptyBlock, JSON.stringify(renderResolved(emptyParts)));
+}
+
+// --- NOTHING IS EVER SILENTLY DROPPED, over rather more inputs than one ------
+//
+// That promise is in parseConflict's own comment and it was FALSE: a block
+// whose two sides split into no disagreement had its opener, separator and
+// closer deleted, three lines at a time, and the file came back shorter than it
+// went in. One example is checked above; this is the property.
+//
+// The claim: whenever the parse finds NO disagreement in a file, the file
+// rebuilds byte for byte. (Where it does find one, the markers are removed on
+// purpose, so there is nothing to compare against.) Anything the parse declines
+// to read has to survive it intact, because that text is what a person is being
+// sent back to the project to finish by hand.
+//
+// Deterministic: a fixed generator, a fixed seed, the same inputs on every
+// machine and every run. It is a fuzz in shape only.
+{
+  let seed = 20260906;
+  const next = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const MARKER_CHARS = ['<', '=', '|', '>'];
+  let broken = 0;
+  let tried = 0;
+  let withClashes = 0;
+  let firstBad = null;
+  for (let i = 0; i < 4000; i++) {
+    const lines = [];
+    const howMany = 1 + Math.floor(next() * 8);
+    for (let line = 0; line < howMany; line++) {
+      const roll = next();
+      if (roll < 0.45) {
+        // A run of a marker character, of any width, with or without a label
+        // and with or without the carriage return a CRLF file carries.
+        const ch = MARKER_CHARS[Math.floor(next() * MARKER_CHARS.length)];
+        lines.push(ch.repeat(1 + Math.floor(next() * 10)) + (next() < 0.5 ? ' label' : '') + (next() < 0.2 ? '\r' : ''));
+      } else if (roll < 0.6) lines.push('');
+      else lines.push(`text${line}${next() < 0.2 ? '\r' : ''}`);
+    }
+    // AND A WELL-FORMED BLOCK, OFTEN. Without one the generator could only
+    // produce files with no block in them at all, every parse came back as a
+    // single `same` part, and `renderResolved` of a single `same` part is its
+    // own text — so the assertion below was an IDENTITY and could not fail. It
+    // reported `broken: 0` over twelve thousand inputs with the dropped-block
+    // defect restored, which is the defect the property exists for.
+    if (next() < 0.55) {
+      const width = [1, 3, 7, 32][Math.floor(next() * 4)];
+      const at = Math.floor(next() * (lines.length + 1));
+      const body = [`${'<'.repeat(width)} HEAD`];
+      if (next() < 0.5) body.push(`OURS${next() < 0.3 ? '\r' : ''}`);
+      if (next() < 0.6) body.push(`${'|'.repeat(width)} 1234567`, 'BASE');
+      body.push('='.repeat(width));
+      if (next() < 0.5) body.push('THEIRS');
+      body.push(`${'>'.repeat(width)} feature`);
+      lines.splice(at, 0, ...body);
+    }
+    const text = lines.join('\n') + (next() < 0.5 ? '\n' : '');
+    for (const width of [3, 7, 32]) {
+      const parts = parseConflict(text, width);
+      if (clashCount(parts) !== 0) {
+        withClashes++;
+        continue;
+      }
+      tried++;
+      if (renderResolved(parts) !== text) {
+        broken++;
+        if (!firstBad) firstBad = `${JSON.stringify(text)} at width ${width} -> ${JSON.stringify(renderResolved(parts))}`;
+      }
+    }
+  }
+  check(
+    `a parse that finds no disagreement rebuilds the file byte for byte (${tried} generated inputs)`,
+    broken === 0 && tried > 1000,
+    firstBad || `only ${tried} inputs reached the check`
+  );
+  // THE CONTROL ON THE GENERATOR. Without this the check above passes over
+  // inputs the parse never found a block in, which is a tautology however many
+  // of them there are.
+  check(
+    `and the generator really does produce parseable conflicts (${withClashes} of them)`,
+    withClashes > 200,
+    `${withClashes} inputs parsed to a disagreement`
+  );
+}
+
+// TWO ANCESTOR LINES, WHICH THE COMMENT ENUMERATES AND NOTHING CHECKED.
+//
+// The refusal condition lists "a second opener, a second separator or a second
+// ancestor line inside it". Every other clause in it kills a suite when it is
+// deleted; `bases.length > 1` did not, because both product call sites pass
+// `fromDiff3 = true` and the later `bases.length !== 1` clause subsumes it for
+// them. The clause is what protects a caller that does NOT say the markup came
+// from a diff3 merge — the reading a `merge=<driver>` path now gets — so it is
+// pinned here rather than deleted, at the flag where it is the only rule that
+// applies. This is the mirror of `twoSeparators` above.
+{
+  const twoAncestors = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '||||||| 7654321', 'Y', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('a block with two ancestor lines is not read, at the forgiving flag', clashCount(parseConflict(twoAncestors, 7, false)) === 0, JSON.stringify(parseConflict(twoAncestors, 7, false)));
+  check('  and says so', unreadMarkers(parseConflict(twoAncestors, 7, false), 7) === true);
+  check('  and its bytes come back exactly', renderResolved(parseConflict(twoAncestors, 7, false), []) === twoAncestors);
+  // THE CONTROL: one ancestor line at the same flag IS read, so the assertion
+  // above is about the second one and not about the flag.
+  const oneAncestor = ['top', '<<<<<<< HEAD', 'OURS', '||||||| 1234567', 'X', '=======', 'THEIRS', '>>>>>>> feature', 'bottom', ''].join('\n');
+  check('  while one ancestor line at that flag still reads', clashCount(parseConflict(oneAncestor, 7, false)) === 1, JSON.stringify(parseConflict(oneAncestor, 7, false)));
+}
+
+// THE TERMINATOR ARM WITH NO ORACLE: neither side put anything at the end.
+//
+// renderResolved reads the final newline off the side the last clash was
+// answered with. When that answer contributes no lines at all there is no
+// version's terminator to take, and the rebuilt text is returned as it stands.
+// That arm was executed ZERO times by either suite, and a mutation dropping one
+// byte from it stayed green — in the one function whose whole promise is that
+// no byte changes that was not asked for.
+{
+  const bothEmpty = 'head\n<<<<<<< HEAD\n||||||| 123\nA\n=======\n>>>>>>> f\n';
+  const parts = parseConflict(bothEmpty, 7, true);
+  check('a clash where both sides are empty is read', clashCount(parts) === 1, JSON.stringify(parts));
+  check('  and it does run to the end of the file', conflictAtEnd(parts) === true);
+  // The arm is only REACHED when `sides` is given, which is what the product
+  // passes — so it is asked for the way the product asks. Both sides end
+  // without a terminator here, which is the only way to tell the arm apart from
+  // the ordinary reading: 'ours' and 'theirs' take that missing terminator and
+  // 'both', contributing neither side, has none to take and keeps git's.
+  const bare = { ours: 'head', theirs: 'head' };
+  check("  answering it 'both' keeps the newline git wrote", renderResolved(parts, ['both'], bare) === 'head\n', JSON.stringify(renderResolved(parts, ['both'], bare)));
+  check("  answering it 'ours' takes ours' missing terminator", renderResolved(parts, ['ours'], bare) === 'head', JSON.stringify(renderResolved(parts, ['ours'], bare)));
+  check("  answering it 'theirs' takes theirs'", renderResolved(parts, ['theirs'], bare) === 'head', JSON.stringify(renderResolved(parts, ['theirs'], bare)));
+  // AND THE CONTROL: with a terminator on both sides every answer keeps it, so
+  // the three assertions above are about the arm and not about the fixture.
+  const ended = { ours: 'head\n', theirs: 'head\n' };
+  for (const pick of ['both', 'ours', 'theirs']) {
+    check(`  with terminators on both sides, '${pick}' keeps one`, renderResolved(parts, [pick], ended) === 'head\n', JSON.stringify(renderResolved(parts, [pick], ended)));
+  }
+}
+
 if (failures.length) {
   console.error(`conflicts: ${failures.length} of ${checked} failed\n${failures.join('\n')}`);
   process.exit(1);
 }
 console.log(`conflicts: ${checked} passed`);
+suiteDone();

@@ -46,11 +46,28 @@ const check = (what, condition, detail) => {
 
 class Skip extends Error {}
 
+// EVERY SKIP IS WRITTEN DOWN, AND A SKIP IS A FAILURE.
+//
+// `section()` swallowed a `Skip` and returned, with no line and no counter. A
+// skip drops every remaining assertion in its section, and the run still
+// printed "N passed" and exited 0 — so a rename in src/ could turn a whole
+// section into a no-op instead of a failure, which is the exact shape of
+// wrongness this repository keeps finding in its own green runs.
+//
+// The predicates these guard are all "the thing this section is about exists":
+// an instance in the fixture, a bridge function, an export from the bundle. On
+// a healthy checkout every one of them is true, so a fired skip is news. It is
+// now named in the output and counted as a failure.
+const skipped = [];
+
 const section = async (fn) => {
   try {
     await fn();
   } catch (err) {
-    if (err instanceof Skip) return;
+    if (err instanceof Skip) {
+      skipped.push(String(err.message || 'no reason given'));
+      return;
+    }
     failures.push(`  a section threw before it could finish\n    ${err && err.stack ? err.stack.split('\n').slice(0, 4).join(' | ') : err}`);
   }
 };
@@ -405,7 +422,15 @@ const declFrom = (answer, file, prop) =>
     const instance = (page.target.children || []).find((c) => c.tag === 'Escaping');
     if (!instance) throw new Skip('no Escaping instance');
     const inside = await run('target', 'enter', { ref: instance.ref });
-    const span = (inside.target.children || []).find((c) => c.tag === 'span');
+    // ENTERING A COMPONENT LANDS ON ITS ROOT, and `Escaping.astro`'s root IS
+    // the span. This looked for the span among the entered node's CHILDREN,
+    // found only its text, and threw a Skip — so this whole section, the only
+    // one asserting what a style read says from INSIDE a component, never ran.
+    // It was invisible until `section()` started counting what it swallowed.
+    const span =
+      inside.target && inside.target.tag === 'span'
+        ? inside.target
+        : (inside.target?.children || []).find((c) => c.tag === 'span');
     if (!span) throw new Skip('no span inside Escaping');
     const styles = await run('style', 'read', { ref: span.ref, properties: ['color'] });
     check(
@@ -976,6 +1001,13 @@ const declFrom = (answer, file, prop) =>
   console.log(`\nstyle-reachability: ${checked} checks, ${failures.length} failed`);
   if (failures.length) {
     console.log(failures.join('\n'));
+    process.exit(1);
+  }
+  if (skipped.length) {
+    console.error(
+      `style-reachability: ${skipped.length} section(s) were abandoned and their assertions never ran\n` +
+        skipped.map((r) => `  skipped: ${r}`).join('\n')
+    );
     process.exit(1);
   }
   process.exit(0);

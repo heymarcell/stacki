@@ -495,11 +495,44 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
           onResolve={async (choices) => {
             const done = await act(
               async () => {
+                // WHICH CONFLICT THESE ANSWERS ARE ABOUT.
+                //
+                // The merge is re-run when the answers are applied, so a commit
+                // arriving on either branch while this dialog was open would
+                // have had the picks applied to a different conflict — measured
+                // to the point of committing the wrong half of a file with
+                // `ok: true`. `conflict.at` is what git:merge measured before it
+                // unwound, carried back unchanged. Plain IPC, and plain on
+                // purpose: this is the panel that was shown the conflict, and a
+                // signed handle is what the MCP boundary is for.
+                //
+                // AND WHICH BRANCH THIS WAS BEING MERGED INTO, which `at` did
+                // not used to carry. The two commits pin a COMMIT, and two
+                // branches at one commit are ordinary — a branch cut and not
+                // yet committed on is exactly that. So a branch switch while
+                // this dialog was open passed every staleness check there was:
+                // measured, the conflict taken on `main`, a checkout to a
+                // sibling `release` at the same tip, and the resolve answering
+                // `{ok: true, into: "release"}` over a two-parent merge commit
+                // on a branch nobody had chosen — with the toast below then
+                // announcing a merge the person never asked for. `at` names the
+                // branch now and gitBranches.js refuses the mismatch, so the
+                // `r.into` below can only be the branch this dialog was about.
                 const r = await window.avb.gitResolveMerge({
                   projectPath: project.path,
                   branch: conflict.branch,
                   choices,
+                  expect: conflict.at,
                 });
+                // A RETURNED REFUSAL IS STILL A REFUSAL. resolveMerge answers
+                // `{ok:false}` rather than throwing, so this used to fall
+                // straight through to "Merged x into undefined" over a merge
+                // that had not happened. Thrown here so it reaches the same
+                // error line every other git refusal in this panel does, and so
+                // the dialog stays open with the answers still in it.
+                if (r?.ok === false) {
+                  throw new Error(r.message || `Could not finish merging “${conflict.branch}”.`);
+                }
                 // The tidy-up was chosen back when the merge was started, before
                 // anyone knew it would clash. It still applies now it is settled.
                 if (conflict.deleteAfter) {
@@ -571,7 +604,12 @@ export default function GitChip({ project, showToast, flushSave, onWorktreeChang
 // same lines in different places — a class added here, the words rewritten
 // there — the two edits are combined. What is left in front of the user is the
 // small number of places the branches genuinely contradict each other.
-function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
+// Exported for test/git-branches.js, which renders THIS component against a
+// real conflict rather than re-implementing choicesForSend beside it — the
+// defect it is held to was a value this modal composed and sent on its own,
+// with nothing on screen showing it, so a copy of the function in a test would
+// have proved nothing about the panel.
+export function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
   const working = !!busy;
 
   const clashesOf = (f) => (f.parts || []).filter((p) => p.kind === 'clash');
@@ -579,8 +617,27 @@ function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
   // change, or both when they were found not to overlap.
   const defaultPick = (c) => (c.merged != null ? 'merged' : c.changedBy === 'theirs' ? 'theirs' : 'ours');
 
+  // A FILE WITH NOTHING TO ANSWER PER HUNK STILL HAS AN ANSWER, AND IT HAS TO
+  // BE A RECORDED ONE.
+  //
+  // Two different files arrive with no hunks: one git left no marked-up text in
+  // at all (binary, or one branch deleted it), and one whose markers this could
+  // not read — a CRLF file was exactly that until the marker regexes in
+  // electron/conflicts.js were fixed. Both took the same route out of
+  // choicesForSend below, which read `list[0]` of an EMPTY list and sent the
+  // whole-file word "ours" on the strength of `undefined !== 'theirs'`. Nobody
+  // chose it, nothing on screen showed it, and resolveMerge accepted it as
+  // legal vocabulary and committed a merge that discarded the whole incoming
+  // file. So the whole-file answer is seeded here, where every other decision
+  // in this modal is kept, and the chooser for it is shown below for both
+  // shapes rather than only for the binary one — where "All <branch>" used to
+  // be a button that mapped over an empty array and did nothing.
+  const wholeFileOnly = (f) => !f?.parts || clashesOf(f).length === 0;
+
   const [picks, setPicks] = useState(() =>
-    Object.fromEntries(conflict.files.map((f) => [f.path, clashesOf(f).map(defaultPick)]))
+    Object.fromEntries(
+      conflict.files.map((f) => [f.path, wholeFileOnly(f) ? ['ours'] : clashesOf(f).map(defaultPick)])
+    )
   );
   const [openPath, setOpenPath] = useState(conflict.files[0]?.path || null);
 
@@ -599,11 +656,15 @@ function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
 
   const sideOf = (c, pick) => (pick === 'theirs' ? 'theirs' : pick === 'merged' ? 'merged' : 'ours');
 
+  // What each file is answered with. A whole-file word for the files that can
+  // only take one, and one entry per disagreement for the rest — never a word
+  // derived from a list that is empty because the file could not be read. See
+  // wholeFileOnly.
   const choicesForSend = () =>
     Object.fromEntries(
       conflict.files.map((f) => {
         const list = picks[f.path] || [];
-        if (!f.parts || !list.length) return [f.path, list[0] === 'theirs' ? 'theirs' : 'ours'];
+        if (wholeFileOnly(f)) return [f.path, list[0] === 'theirs' ? 'theirs' : 'ours'];
         return [f.path, list];
       })
     );
@@ -674,9 +735,11 @@ function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
           </div>
 
           <div className="conflict-detail">
-            {!file?.parts && (
+            {file && wholeFileOnly(file) && (
               <div className="conflict-whole">
-                This one can only be taken whole — there’s no text in it to compare.
+                {file.parts
+                  ? 'This one has to be taken whole — git reported it as conflicting, but there are no differences in it to go through one at a time.'
+                  : 'This one can only be taken whole — there’s no text in it to compare.'}
                 <div className="conflict-choice" style={{ marginTop: 8 }}>
                   <button
                     className={picks[file?.path]?.[0] !== 'theirs' ? 'on' : ''}
@@ -694,7 +757,7 @@ function MergeConflictModal({ conflict, busy, onCancel, onResolve }) {
               </div>
             )}
 
-            {file?.parts && (
+            {file && !wholeFileOnly(file) && (
               <>
                 <div className="conflict-detail-head">
                   <span className="conflict-detail-path">{file.path}</span>

@@ -325,7 +325,15 @@ export function createAgentCommands(getApp) {
       const dry = applyOperations(model, operations, { insertables: a.insertables() });
       if (!dry.ok) return { ...dry, ok: false, document: doc };
 
-      const applied = await a.commit(operations, { label: args.label || 'agent edit' });
+      // The expectation travels WITH the write, so it is checked again once the
+      // write holds its turn. The checks above are not in the same queue as
+      // `commit`, and an undo running between them rewrites the whole document:
+      // measured, an undo and a ref-carrying set_text in one Promise.all both
+      // answered ok over a file that held neither change. See commitNow.
+      const applied = await a.commit(operations, {
+        label: args.label || 'agent edit',
+        expect: { revision: args.expectedRevision ?? null, digest: args.expectedDigest ?? null },
+      });
       if (!applied.ok) return { ...applied, document: doc };
       // What the document was before this edit, whether or not the caller
       // claimed to know. An agent that did not pass expectedRevision still
@@ -369,6 +377,41 @@ export function createAgentCommands(getApp) {
     if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
     if (action === 'list_sources') return { ok: true, ...(await styleAgent.listSources()) };
 
+    // ── THE THREE WRITES TAKE NO ELEMENT ─────────────────────────────────────
+    //
+    // A style write NAMES A RULE — a source and a selector, or the identity a
+    // read reported — and a rule is not an element. It sits in a stylesheet
+    // whether or not anything on the page matches it and whether or not
+    // anything is selected. `styleAgent.setProperty`, `removeProperty` and
+    // `setDeclarations` never read the node they were handed; it was a gate,
+    // not an input.
+    //
+    // It gated the wrong thing. The selection can go away through an ordinary
+    // agent edit — `source.write` removing the selected node makes the App's
+    // reload path set it to null — and after that a call carrying a complete
+    // explicit address was refused `no_selection`, with a workaround of
+    // selecting something irrelevant first so the gate would open. A live
+    // dogfood hit exactly that.
+    //
+    // So the selection is what it should always have been: a DEFAULT for
+    // arguments a caller did not supply. These three actions have no such
+    // argument, so they do not consult it.
+    if (action === 'set_property' || action === 'remove_property' || action === 'set_declarations') {
+      try {
+        const result =
+          action === 'set_property'
+            ? await styleAgent.setProperty(args)
+            : action === 'remove_property'
+              ? await styleAgent.removeProperty(args)
+              : await styleAgent.setDeclarations(args);
+        return result.ok ? { ...result, document: documentOf(a) } : result;
+      } catch (err) {
+        return fail('style_failed', String(err?.message || err));
+      }
+    }
+
+    // `style.read` DOES need one: it is a question about an element on the
+    // live page, and the canvas answers about the selected one.
     let id = a.selectedId();
     if (args.anchor) {
       const at = await locate(a, args.anchor, { navigate: true });
@@ -401,18 +444,6 @@ export function createAgentCommands(getApp) {
         });
         return { ok: true, ...styles, document: documentOf(a) };
       }
-      if (action === 'set_property') {
-        const result = await styleAgent.setProperty(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
-      }
-      if (action === 'remove_property') {
-        const result = await styleAgent.removeProperty(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
-      }
-      if (action === 'set_declarations') {
-        const result = await styleAgent.setDeclarations(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
-      }
     } catch (err) {
       return fail('style_failed', String(err?.message || err));
     }
@@ -430,22 +461,79 @@ export function createAgentCommands(getApp) {
     // open document is still worth reporting — a model undo IS about it — so it
     // stays, beside a `restored` that says what was actually put back.
     if (action === 'undo') {
-      const before = a.historyDepth();
       const restored = await a.undo();
+      // `undone` IS ABOUT THIS CALL, NOT ABOUT HOW DEEP THE STACK IS.
+      //
+      // Two defects, one after the other, both of them the same mistake — the
+      // stack read as a proxy for what happened.
+      //
+      // First: the entry was popped before its inverse ran, so a command whose
+      // inverse threw shortened the stack exactly like one that worked, and
+      // this answered `ok: true, undone: true` for an undo that had not
+      // happened. The renderer says so on the result now, and the refusal
+      // below carries the reason.
+      //
+      // Then the stack depth itself, which survived that fix: `undone` was
+      // `historyDepth().past < before.past` with `before` read SYNCHRONOUSLY,
+      // before `a.undo()` joined the renderer's queue. The queue is what makes
+      // the step run later, so `before` describes the stack in front of the
+      // whole in-flight batch rather than in front of this step. Measured on
+      // the shipped renderer:
+      //
+      //   two `project.undo` calls in one Promise.all against ONE entry — both
+      //   answered `ok: true, undone: true`, and the second's `restored` was
+      //   null, so it claimed to have undone nothing;
+      //
+      //   three at once against two entries — all three claimed `undone: true`;
+      //
+      //   an undo and a redo together at {past: 1, future: 1} — the redo put
+      //   its change back on disk and answered `redone: false`, because
+      //   `future` was 1 before the pair and 1 after it.
+      //
+      // Serialising the calls fixed the STACK. It cannot fix a flag that is
+      // read across the queue, because there is no depth reading that says
+      // what one step of a batch did. `restored` does: the renderer returns
+      // null when there was nothing for THIS call to take off the stack, the
+      // entry with a `failed` on it when the inverse refused, and the entry
+      // otherwise. So that is what the flag is now — the entry, not the depth.
+      if (restored && restored.failed) {
+        return {
+          ok: false,
+          code: 'undo_failed',
+          message: `That change could not be undone: ${restored.failed}`,
+          undone: false,
+          restored,
+          history: a.historyDepth(),
+          document: documentOf(a),
+        };
+      }
       return {
         ok: true,
-        undone: a.historyDepth().past < before.past,
+        undone: !!restored && !restored.failed,
         restored: restored || null,
         history: a.historyDepth(),
         document: documentOf(a),
       };
     }
     if (action === 'redo') {
-      const before = a.historyDepth();
       const restored = await a.redo();
+      // Same as undo, for both halves of it: the stack moves whatever the
+      // command did, and `future` read before the call is the depth in front
+      // of the whole queued batch rather than in front of this step.
+      if (restored && restored.failed) {
+        return {
+          ok: false,
+          code: 'redo_failed',
+          message: `That change could not be redone: ${restored.failed}`,
+          redone: false,
+          restored,
+          history: a.historyDepth(),
+          document: documentOf(a),
+        };
+      }
       return {
         ok: true,
-        redone: a.historyDepth().future < before.future,
+        redone: !!restored && !restored.failed,
         restored: restored || null,
         history: a.historyDepth(),
         document: documentOf(a),
@@ -515,6 +603,35 @@ export function createAgentCommands(getApp) {
   async function page(action, args) {
     const a = app();
     if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
+
+    // PUT A ROUTE ON THE CANVAS.
+    //
+    // THE LOOP THAT DID NOT CLOSE. An agent could create a page, list it, read
+    // it and edit it — and could not look at it. Of the operations this API
+    // had, only `project.probe` and the `audit` tool took a route at all, and
+    // both fetch a URL from a dev server without moving what the person is
+    // looking at. So "make the page and show me" needed a human in the middle.
+    //
+    // THROUGH `selectPage`, WHICH IS THE MENU ITEM — not a second idea of
+    // navigation. The edit stack is left, the file is opened, the panels
+    // follow, and the context an agent reads next is the context a person would
+    // see. Nothing on disk moves and no dev server is started, which is why the
+    // registry files it as `read`: `target.select` is the same shape and the
+    // same risk.
+    if (action === 'open') {
+      const moved = await a.openPage({ route: args.route ?? null, path: args.path ?? null });
+      if (!moved.ok) return moved;
+      // AND THE CONTEXT AFTER THE MOVE, so the next call does not have to ask.
+      // A navigation whose answer describes where you were is a navigation you
+      // have to follow with a read.
+      return {
+        ok: true,
+        moved: true,
+        injected: moved.injected === true,
+        page: moved.page,
+        document: documentOf(a),
+      };
+    }
 
     if (action === 'component_create') {
       const anchor = args.anchor || null;

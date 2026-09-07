@@ -370,14 +370,90 @@ function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES) {
   return [...first.out, ...second.out];
 }
 
-/** Reject rather than hang for ever on a page that never loads. */
-function withTimeout(promise, ms, what) {
+// WHAT A CANCELLED AWAIT REJECTS WITH.
+//
+// A module-private symbol rather than an Error, because it has to be
+// distinguishable from every failure a PAGE can cause, and a page can produce
+// an Error saying anything at all. Identity cannot be forged from inside a
+// renderer.
+const CANCELLED = Symbol('the audit was cancelled by its caller');
+
+/**
+ * WHY A CLEAR WAS LET GO OF, IN WORDS THE NEXT CALLER CAN USE.
+ *
+ * Two things end the awaits that `strand` is reached from, and only one of them
+ * is a budget. The other is the abort, which rejects with the symbol above --
+ * and `String(err?.message || err)` on a symbol is
+ * "Symbol(the audit was cancelled by its caller)", which is a module-private
+ * identity leaking on to the wire as if it were a reason. Named here so the
+ * refusal at the door can say what actually happened rather than assert a
+ * budget that was never reached.
+ */
+function strandReason(err) {
+  if (err === CANCELLED) return 'the audit that started it was cancelled while the clear was in flight';
+  return String(err?.message || err).slice(0, 200);
+}
+
+/**
+ * A promise that rejects with CANCELLED the moment the signal aborts.
+ *
+ * `off` is not optional politeness. One viewport awaits a dozen times, and a
+ * listener per await on a signal that lives as long as the request is a leak
+ * with a warning attached and then a leak without one. Every caller removes its
+ * own in a `finally`.
+ */
+function untilAborted(signal) {
+  let off = () => {};
+  const promise = new Promise((_res, rej) => {
+    // No signal at all: a promise that never settles, so racing on it is the
+    // same as not racing.
+    if (!signal) return;
+    if (signal.aborted) {
+      rej(CANCELLED);
+      return;
+    }
+    const onAbort = () => rej(CANCELLED);
+    signal.addEventListener('abort', onAbort, { once: true });
+    off = () => signal.removeEventListener('abort', onAbort);
+  });
+  // Racing is the whole point, and a race another entry wins leaves this one
+  // rejected with nobody looking -- which node reports as an unhandled
+  // rejection and this repository treats as a test failure.
+  promise.catch(() => {});
+  return { promise, off };
+}
+
+/**
+ * Reject rather than hang for ever on a page that never loads -- OR ON A CALLER
+ * WHO HAS ALREADY GONE.
+ *
+ * THE ABORT USED TO BE A CHECKPOINT, WHICH IS A THING THAT IS ONLY REACHED ONCE
+ * THE AWAIT IN FRONT OF IT FINISHES. Measured through a real MCP client, with
+ * the latency taken from the moment the engine's own signal fired: an abort
+ * during a hanging load left this engine working for 39,582ms -- two twenty
+ * second load budgets -- and then answered `audit_failed` with "loading
+ * /hang-load at 375px did not finish within 20000ms", a timeout the abandoned
+ * run had caused itself, never saying it had been cancelled at all.
+ *
+ * So the signal is a racer here, beside the timer, on every await that can
+ * block.
+ */
+function withTimeout(promise, ms, what, signal = null) {
   let timer = null;
+  const aborted = untilAborted(signal);
+  const done = () => {
+    clearTimeout(timer);
+    aborted.off();
+  };
   return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
+    promise.finally(done),
     new Promise((_res, rej) => {
-      timer = setTimeout(() => rej(new Error(`${what} did not finish within ${ms}ms`)), ms);
+      timer = setTimeout(() => {
+        done();
+        rej(new Error(`${what} did not finish within ${ms}ms`));
+      }, ms);
     }),
+    aborted.promise.finally(done),
   ]);
 }
 
@@ -630,6 +706,89 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
   // constraint of the design, not an oversight: the alternative is a session per
   // run, which is the unbounded thing being avoided.
   let queue = Promise.resolve();
+
+  // A CLEANUP THAT WAS ABANDONED IS STILL RUNNING.
+  //
+  // The reset on the way out is time-boxed, which stopped a wedged
+  // `clearStorageData` holding its caller and the queue behind it for ever. But
+  // a time box is not a cancellation: `withTimeout` stops WAITING for the clear,
+  // it cannot stop the clear. The IPC round trip is still outstanding against
+  // the network service on the one `stacki-audit` partition every audit shares,
+  // and it can land at any moment afterwards.
+  //
+  // Measured on the double, one engine, two runs: the first run's third clear
+  // hangs, the run answers `session_not_cleaned` after 30,254ms, the queue
+  // releases, the NEXT audit starts and loads its page -- and then `clear#3
+  // LANDED while liveRun=2`. That is the isolation claim broken in the other
+  // direction: not a partition left dirty for the next run, but one wiped
+  // underneath a run that is using it, whose cookies and localStorage vanish
+  // between one viewport and the next while it reports `ok: true`.
+  //
+  // WHY NOT HOLD THE QUEUE UNTIL THE CLEAR SETTLES. Because a clear that never
+  // settles is exactly the case the time box exists for, and chaining the queue
+  // onto it would reinstate the permanent shutdown the box removed -- every
+  // audit behind the wedged one waiting for ever, the cost written up in the
+  // `finally` below.
+  //
+  // So the partition is marked SUSPECT instead, and the next audit refuses at
+  // the door rather than measuring a page a stray clear may wipe. Nothing waits:
+  // the budget the abandoned clear has already overrun is not spent again on a
+  // caller who did not incur it. The mark is dropped by the abandoned clear
+  // itself when it finally settles, so the partition becomes usable again the
+  // moment it is provably quiet -- and a LATER successful clear does not drop
+  // it, because a clear that has not come back can still land after that one too.
+  //
+  // AND IT IS A SET, BECAUSE ONE SLOT LET THE SECOND ABANDONED CLEAR ERASE THE
+  // FIRST.
+  //
+  // This was a single `strandedCleanup` variable, and ONE RUN CAN STRAND TWICE:
+  // the opening reset is walked away from the moment its caller aborts, and the
+  // reset in that same run's `finally` then overruns its own budget on the way
+  // out. The second `strand` overwrote the first record, and because the mark
+  // was only dropped when it WAS the settling record, the second clear coming
+  // back cleared the mark while the FIRST was still loose on the partition. The
+  // next audit walked through a door that had been unlocked by the wrong key.
+  //
+  // Measured on the double, one engine, two runs, with the partition logging
+  // which run had a page on it: run 1 cancelled inside its opening clear, run
+  // 1's `finally` clear held until its 30,000ms box expired, that second clear
+  // then released -- and run 2 was NOT refused. It opened its window, answered
+  // `ok:true`, and run 1's opening clear landed in the middle of it:
+  //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},…,{clear:1,whileRun:2}]
+  //
+  // So every outstanding clear is held, and the partition is quiet only when the
+  // set is EMPTY. Each record removes itself, so nothing depends on the order
+  // they come back in -- which was the whole of the old bug.
+  const strandedCleanups = new Set();
+  const strand = (clearing, err) => {
+    const record = { reason: strandReason(err) };
+    strandedCleanups.add(record);
+    const settled = () => {
+      strandedCleanups.delete(record);
+    };
+    clearing.then(settled, settled);
+  };
+
+  /**
+   * What an audit answers when the caller stopped waiting.
+   *
+   * A refusal rather than a throw, in the vocabulary the rest of this surface
+   * uses, for two reasons that outlive the request: the queue behind it has to
+   * be released cleanly, and a cancel is not an error — nothing went wrong and
+   * nothing was changed. Nobody may ever read it, which is the point: the value
+   * of cancelling is the windows that were not opened and the audit behind this
+   * one that starts now.
+   */
+  const cancelled = (when, measured = 0) => ({
+    ok: false,
+    code: 'cancelled',
+    message:
+      `The audit was cancelled ${when}. ` +
+      (measured
+        ? `${measured} viewport${measured === 1 ? '' : 's'} had been measured and ${measured === 1 ? 'its result is' : 'those results are'} discarded; `
+        : 'Nothing was measured; ') +
+      'the project was not touched.',
+  });
   /**
    * @param {object} opts
    * @param {string=} opts.route          route to audit; defaults to the site root
@@ -637,14 +796,52 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
    * @param {Array=}  opts.rules          specific accessibility rule ids; defaults to WCAG A/AA
    * @param {boolean=} opts.capture       return a screenshot per viewport
    */
-  async function run(opts = {}) {
+  async function run(opts = {}, { signal = null } = {}) {
+    // GIVING UP WHILE STILL IN THE QUEUE COSTS NOTHING, AND USED TO COST A RUN.
+    //
+    // Audits are serialised, so a caller that has already gone away can be
+    // holding a place in front of one that has not. Checked here, before the
+    // chain, so an abandoned request never becomes work.
+    if (signal?.aborted) return cancelled('before it started');
+    // Whether this run's turn ever came. Read by the racer below, which must
+    // answer for a run that is still WAITING and must keep its hands off one
+    // that is running: the running one knows how many viewports it measured and
+    // says so, and a generic refusal thrown over the top of that would lose it.
+    let began = false;
     // Chain rather than reject: a second audit waits its turn.
-    const mine = queue.then(() => runExclusive(opts));
+    const mine = queue.then(() => {
+      if (signal?.aborted) return cancelled('while it was queued');
+      began = true;
+      return runExclusive(opts, signal);
+    });
     queue = mine.catch(() => {});
-    return mine;
+    if (!signal) return mine;
+    // AND A REFUSAL THE CALLER GETS WHEN IT ABANDONS, NOT WHEN ITS TURN COMES.
+    //
+    // Serialisation is the point of the chain and is unchanged -- `queue` still
+    // chains on `mine`, so the audit behind this one still waits for the audit
+    // in front. What was wrong is that the ANSWER waited too: a queued run that
+    // was abandoned did no work at all, correctly, and then held its caller for
+    // another 18.6 seconds until the run in front finished before saying so.
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let off = () => {};
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        off();
+        fn(value);
+      };
+      const onAbort = () => {
+        if (!began) finish(resolve, cancelled('while it was queued'));
+      };
+      signal.addEventListener('abort', onAbort);
+      off = () => signal.removeEventListener('abort', onAbort);
+      mine.then((res) => finish(resolve, res), (err) => finish(reject, err));
+    });
   }
 
-  async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}) {
+  async function runExclusive({ route = '/', viewports: wanted, rules = null, capture = false } = {}, signal = null) {
     // An empty list is a request for NO accessibility pass. See the engine block
     // below; `null` and `undefined` still mean the WCAG A/AA default.
     const skipAxe = Array.isArray(rules) && rules.length === 0;
@@ -723,6 +920,45 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
     // fifty violations reported twelve and called it the total.
     let detectedTotal = 0;
     const omittedBefore = { geometryCulprits: 0, axeNodes: 0 };
+    // How many viewports actually finished. Used by the refusal, which used to
+    // claim "nothing was measured" on a cancel that had measured half a page.
+    //
+    // DECLARED OUT HERE rather than inside the try, because the cancel that
+    // matters now arrives as a REJECTED AWAIT rather than as a boolean read at
+    // a checkpoint -- and the catch that turns it into a refusal has to be able
+    // to say how much of the page had been measured before the caller left.
+    let measured = 0;
+
+    // AND THE DOOR THE SUSPECT PARTITION IS REFUSED AT.
+    //
+    // Above `try` on purpose: a run that measures nothing has nothing to clean,
+    // and the `finally` would otherwise fire a fourth clear at a partition that
+    // has one outstanding already. It reuses `session_not_isolated` rather than
+    // inventing a code, because it is the same refusal for the same reason --
+    // this audit cannot show that what it is about to measure is only its own --
+    // and a client that already handles one handles this.
+    //
+    // AND IT ASKS THE SET, NOT A SLOT. The oldest record names the refusal --
+    // it is the clear that has been loose on the partition longest -- and any
+    // others are counted rather than dropped, because the caller is being told
+    // to wait for the partition to go quiet and "one of them settled" is not
+    // that.
+    if (strandedCleanups.size) {
+      const [oldest] = strandedCleanups;
+      const alsoOutstanding = strandedCleanups.size - 1;
+      return {
+        ok: false,
+        code: 'session_not_isolated',
+        message:
+          'The audit could not start from a clean browser session: the previous audit\'s cleanup was abandoned ' +
+          `(${oldest.reason}) and is still outstanding on the shared audit ` +
+          'partition, so it could wipe this page\'s cookies and storage part way through the measurement. Nothing ' +
+          `was measured.${alsoOutstanding ? ` ${alsoOutstanding} further cleanup${alsoOutstanding === 1 ? ' is' : 's are'} outstanding on the same partition.` : ''} ` +
+          `Try again once ${strandedCleanups.size === 1 ? 'it has' : 'they have'} settled.`,
+        route: safeRoute,
+        runId,
+      };
+    }
 
     try {
       // BEFORE: nothing this audit sees was put there by the last one -- and if
@@ -732,7 +968,35 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // could not be cleared still ran, still returned ok:true, and still carried
       // `sessionIsolated`. A result that cannot support its own isolation claim
       // is worse than no result.
-      sessionReset = await resetAuditSession(session);
+      //
+      // AND THE ABANDONED CLEAR THIS ONE USED TO DROP ON THE FLOOR.
+      //
+      // The reset on the way out hands its promise to `strand` when its budget
+      // expires, because a time box stops the WAITING and not the clear. These
+      // two awaits are the same round trip against the same shared partition,
+      // and they were letting go of it without a word. `resetAuditSession`
+      // NEVER rejects -- it answers {ok:false, reason} -- so the only ways out
+      // of this await are the timer and the abort, and both of them leave a
+      // live clearStorageData outstanding on `stacki-audit`.
+      //
+      // Reproduced on the double, one engine, two runs: run 1 is cancelled
+      // while its OPENING clear is in flight, run 1's own `finally` clear then
+      // succeeds so nothing is marked suspect, and run 2 is NOT refused -- it
+      // loads its page and answers `ok:true` with `sessionIsolated:true` while
+      // run 1's clear lands in the middle of it:
+      //   landed = [{clear:2,whileRun:1},{clear:3,whileRun:2},{clear:1,whileRun:2}]
+      //
+      // So the promise is kept and handed on, exactly as the `finally` does.
+      // WHAT THE CALLER IS TOLD DOES NOT CHANGE: the error is rethrown, so a
+      // cancelled run still answers `cancelled` and a timed-out one still
+      // answers `audit_failed`. It is the NEXT audit that reads the mark.
+      const clearing = resetAuditSession(session);
+      try {
+        sessionReset = await withTimeout(clearing, PROBE_TIMEOUT_MS, 'clearing the audit session', signal);
+      } catch (err) {
+        strand(clearing, err);
+        throw err;
+      }
       if (!sessionReset.ok) {
         return {
           ok: false,
@@ -746,6 +1010,14 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         };
       }
       for (const viewport of chosen.viewports) {
+        // BETWEEN VIEWPORTS, WHICH IS WHERE THE WORK IS.
+        //
+        // Six viewports is six page loads and six axe injections; stopping at a
+        // boundary is what makes cancelling worth anything. It is checked here
+        // rather than only at the top because the caller usually goes away part
+        // way through, and the outer `finally` still resets the session on the
+        // way out.
+        if (signal?.aborted) return cancelled('part way through', measured);
         const started = Date.now();
         let win = null;
         try {
@@ -755,7 +1027,25 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // as across two. Without this, a page that sets state on its first
           // visit shows the phone a first visit and the tablet a return visit,
           // and the two viewports are no longer measuring the same page.
-          const between = await resetAuditSession(session);
+          //
+          // AND THE SAME ABANDONED CLEAR, for the same reason as the reset at
+          // the top of the run: the timer and the abort both walk away from a
+          // round trip that is still live on the shared partition, and the next
+          // audit has to be told rather than left to measure a page this clear
+          // may wipe underneath it.
+          const clearingBetween = resetAuditSession(session);
+          let between;
+          try {
+            between = await withTimeout(
+              clearingBetween,
+              PROBE_TIMEOUT_MS,
+              `clearing the audit session before the ${viewport.key} viewport`,
+              signal
+            );
+          } catch (err) {
+            strand(clearingBetween, err);
+            throw err;
+          }
           if (!between.ok) {
             return {
               ok: false,
@@ -799,6 +1089,33 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
             },
           });
           liveWindows.set(`${runId}:${viewport.key}`, win);
+          // WHAT IS NOT HERE, AND WHY, BECAUSE IT IS THE FIRST THING ANYBODY
+          // WILL REACH FOR.
+          //
+          // The obvious way to interrupt a wedged audit is to destroy this
+          // window the moment the signal fires: a renderer spinning in a tight
+          // JavaScript loop cannot be interrupted by any timer in the browser
+          // process, so taking its frame away looks like the only lever there
+          // is. It was written, and then measured, and it does not work.
+          //
+          // Destroying the window does NOT reject the loadURL,
+          // executeJavaScript or capturePage already in flight on it. With the
+          // abort raced only through the window -- an `abort` listener calling
+          // win.destroy(), and no signal on the awaits -- an audit abandoned
+          // during a hanging load still answered 20,006ms after its own signal
+          // fired, and one abandoned inside a wedged renderer 29,467ms after.
+          // Those are LOAD_TIMEOUT_MS and PROBE_TIMEOUT_MS to the millisecond:
+          // the run was released by its ordinary budget expiring, exactly as it
+          // would have been with no abort handling at all.
+          //
+          // What releases it is the signal raced inside `withTimeout` on every
+          // await in this body, and once the body unwinds the `finally` below
+          // destroys the window on the same tick -- measured gone within 2,000ms
+          // of the signal in both cases, against 157 consecutive 250ms samples
+          // showing it alive before any of this existed. So there is one
+          // mechanism here rather than two, and the second one is absent rather
+          // than kept as a comfort: code no test can distinguish from its own
+          // removal is code nobody can maintain.
 
           // THE STATUS, NOT JUST THE LOAD.
           //
@@ -816,7 +1133,19 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
             win.webContents.once('did-fail-load', (_e, code, desc) => reject(new Error(`${desc || 'load failed'} (${code})`)));
           });
           loaded.catch(() => {});
-          await win.loadURL(url).catch(() => {});
+          // WRAPPED, like its four neighbours. `loadURL` settles when the load
+          // does, and a page that never finishes streaming never settles it --
+          // so the twenty-second budget that exists for exactly that sat on the
+          // NEXT line and was never reached. Rejection is swallowed here as
+          // before; the timeout's only job is to stop waiting for ever.
+          await withTimeout(win.loadURL(url), LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`, signal).catch((err) => {
+            // The load's OWN failures are still swallowed, exactly as before:
+            // the two event guards below are what decide what a failed load
+            // means. A cancel is not one of them, and swallowing it here is
+            // what let an abandoned run walk straight on into the next
+            // twenty-second budget on the line after this one.
+            if (err === CANCELLED) throw err;
+          });
           // A BLOCKED NAVIGATION LOOKS LIKE A FAILED LOAD, and it is not one.
           //
           // preventDefault on will-redirect aborts the load, so did-fail-load
@@ -825,8 +1154,12 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           // about why. The block is checked before the load result is believed.
           let loadError = null;
           try {
-            await withTimeout(Promise.race([loaded, blockedSignal]), LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`);
+            await withTimeout(Promise.race([loaded, blockedSignal]), LOAD_TIMEOUT_MS, `loading ${safeRoute} at ${viewport.width}px`, signal);
           } catch (err) {
+            // A cancel is not a load error, and recording it as one would have
+            // it reported as `route_outside_project` or `audit_failed` further
+            // down -- a page blamed for a caller leaving.
+            if (err === CANCELLED) throw err;
             loadError = err;
           }
           if (blocked) {
@@ -884,12 +1217,20 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           const landed = routeOf(finalUrl);
           if (landed && landed !== safeRoute) finalRoutes.add(landed);
 
-          await win.webContents.executeJavaScript(FREEZE, true).catch(() => {});
-          await withTimeout(win.webContents.executeJavaScript(SETTLE, true), PROBE_TIMEOUT_MS, 'settling the page');
-          await wait(SETTLE_MS);
+          // BOUNDED AT LAST. This probe had no budget of any kind -- not a
+          // timer and not a signal -- so a wedged JavaScript context left the
+          // audit here for ever with nothing to say. Its ordinary failures are
+          // still swallowed, so a page that will not take the freeze stylesheet
+          // is measured anyway as it always was; a cancel is not one of those
+          // and does not go in the same bin.
+          await withTimeout(win.webContents.executeJavaScript(FREEZE, true), PROBE_TIMEOUT_MS, 'freezing the page', signal).catch((err) => {
+            if (err === CANCELLED) throw err;
+          });
+          await withTimeout(win.webContents.executeJavaScript(SETTLE, true), PROBE_TIMEOUT_MS, 'settling the page', signal);
+          await withTimeout(wait(SETTLE_MS), PROBE_TIMEOUT_MS, 'waiting for the layout to settle', signal);
 
           // --- geometry
-          const geo = await withTimeout(win.webContents.executeJavaScript(OVERFLOW, true), PROBE_TIMEOUT_MS, 'measuring overflow');
+          const geo = await withTimeout(win.webContents.executeJavaScript(OVERFLOW, true), PROBE_TIMEOUT_MS, 'measuring overflow', signal);
           if (geo.overflows) {
             // Every qualifying culprit counts, including the ones the in-page cap
             // did not hand back.
@@ -935,8 +1276,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
           let axeResult = null;
           if (!skipAxe) {
             try {
-              await win.webContents.executeJavaScript(axeSource(), true);
-              axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine');
+              // The 580 KB injection, on a budget. A wedged JS context never
+              // returns from this, and the `withTimeout` that would have caught
+              // it was on the line below, guarding only the RUN.
+              await withTimeout(win.webContents.executeJavaScript(axeSource(), true), PROBE_TIMEOUT_MS, 'loading the accessibility engine', signal);
+              axeResult = await withTimeout(win.webContents.executeJavaScript(axeScript({ rules }), true), PROBE_TIMEOUT_MS, 'running the accessibility engine', signal);
               axeVersion = axeResult.version;
               // Named back rather than dropped. `rules` are the caller's
               // strings; `knownRuleIds` is the engine's own list, read from the
@@ -955,6 +1299,11 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
                 }
               }
             } catch (err) {
+              // A CANCEL IS NOT AN ENGINE ERROR. Filed as one it would be
+              // reported as something the PAGE did to the accessibility engine,
+              // and the run would carry on to the capture and the response
+              // budget for a caller who is not there.
+              if (err === CANCELLED) throw err;
               // A page that breaks the engine must not silently become a clean
               // page. The audit reports what it could not do.
               engineError = String(err?.message || err).slice(0, 200);
@@ -983,7 +1332,17 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
                 noPictureRow(viewport, 'no_encoder', 'This audit was built without an image encoder, so no picture was attempted for any viewport.')
               );
             } else if (taken < MAX_CAPTURES) {
-              const image = await win.webContents.capturePage();
+              // WITH A BUDGET AND A SIGNAL, like every other await in this
+              // body. Measured through a real client, the capture and the JPEG
+              // encode behind it still ran AFTER the abort -- one encode with a
+              // timestamp later than the signal -- which is compositor work and
+              // bytes produced for an answer nobody will read.
+              const image = await withTimeout(
+                win.webContents.capturePage(),
+                PROBE_TIMEOUT_MS,
+                `photographing the ${viewport.key} viewport`,
+                signal
+              );
               if (!image.isEmpty()) {
                 const { buffer, size } = encodeImage(image, 'jpeg');
                 captures.push({
@@ -1091,6 +1450,26 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
               : null,
             ms: Date.now() - started,
           });
+          measured += 1;
+          // AND AFTER, not only before. With one viewport the check at the top
+          // of the loop runs once, before any work, so an audit abandoned WHILE
+          // its only page was loading ran to completion and answered as though
+          // nobody had left. The window for this viewport is destroyed by the
+          // `finally` below either way; what this adds is not starting the next
+          // one, and not spending the response budget on an answer nobody is
+          // waiting for.
+          if (signal?.aborted) return cancelled('part way through', measured);
+        } catch (err) {
+          // THE CALLER LEFT, AND THAT IS NOT SOMETHING THE PAGE DID.
+          //
+          // Every await above can now reject with the cancel sentinel rather
+          // than run to its own budget, and the destroyed window a moment later
+          // makes anything still in flight reject with Electron's own words
+          // about a disposed frame. Both used to arrive at the outer catch as
+          // `audit_failed`, carrying a message about a timeout the abandoned
+          // run had caused itself.
+          if (err === CANCELLED || signal?.aborted) return cancelled('part way through', measured);
+          throw err;
         } finally {
           // DELETE ONLY IF IT ACTUALLY WENT. Removing the entry first and then
           // destroying meant a destroy that threw left a live window that the
@@ -1105,6 +1484,9 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         }
       }
     } catch (err) {
+      // The same question the loop's own catch asks, asked again for the awaits
+      // OUTSIDE it -- the session reset at the top of the run is one.
+      if (err === CANCELLED || signal?.aborted) return cancelled('part way through', measured);
       return { ok: false, code: 'audit_failed', message: String(err?.message || err).slice(0, 300), runId };
     } finally {
       // AFTER, on every path out including the ones that threw: nothing this
@@ -1113,7 +1495,48 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       // NOT `.catch(() => {})`. That swallowed exactly the failure the isolation
       // claim depends on -- an audit could leave a page's cookies behind for the
       // next one and still return an ordinary successful result.
-      cleanupReset = await resetAuditSession(session);
+      //
+      // AND THE ONE AWAIT ON THIS PATH THAT USED TO HAVE NO BOUND AT ALL.
+      //
+      // The reset at the top of the run is wrapped in `withTimeout`, and so is
+      // the one between viewports. This one -- reached on EVERY path out,
+      // including the cancel path the whole of this engine's abort machinery
+      // exists to make prompt -- was bare. `clearStorageData` is an IPC round
+      // trip to the network service on a partition every audit shares, and a
+      // round trip that does not come back left the audit with nothing to
+      // answer with and the queue behind it permanently shut: measured on a
+      // double whose third clear never settles, the run had not answered after
+      // 40,000ms, so an abandoned audit's caller waited for ever and every
+      // audit queued behind it waited with them.
+      //
+      // WITHOUT THE SIGNAL, DELIBERATELY. Everywhere else the signal is a racer
+      // beside the timer, because there is no point finishing work nobody wants.
+      // Here it would be the opposite: on the cancel path the signal is ALREADY
+      // aborted, so passing it would reject this await on its first tick and
+      // skip the cleanup exactly when the caller has walked away from a page
+      // that has already written to the shared partition. Cancelling an audit
+      // must not be a way of skipping its cleanup, so this one await races the
+      // clock only.
+      //
+      // A TIMEOUT IS REPORTED, NOT SWALLOWED. It lands in `cleanupReset` in the
+      // same shape a thrown `clearStorageData` does, which is what drives
+      // `sessionIsolated: false` and the `session_not_cleaned` verdict at the
+      // foot of this function -- the audit still hands back everything it
+      // measured and still refuses to call itself isolated. A run that returned
+      // earlier (cancelled, or failed) claims no isolation to withdraw, and the
+      // NEXT audit is covered by its own reset at the top of the run, which
+      // refuses with `session_not_isolated` rather than measuring a dirty page.
+      //
+      // AND THE TIMEOUT HANDS THE CLEAR ON RATHER THAN FORGETTING IT. A bound is
+      // not a cancellation: the round trip is still live against the shared
+      // partition when this await gives up on it, so the promise is passed to
+      // `strand` -- see the top of `createAudit` -- and the next audit refuses at
+      // its door instead of measuring a page this clear may wipe underneath it.
+      const clearing = resetAuditSession(session);
+      cleanupReset = await withTimeout(clearing, PROBE_TIMEOUT_MS, 'clearing the audit session on the way out').catch((err) => {
+        strand(clearing, err);
+        return { ok: false, reason: String(err?.message || err).slice(0, 200) };
+      });
     }
 
     const sorted = sortFindings(findings);

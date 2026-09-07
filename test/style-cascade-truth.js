@@ -234,13 +234,30 @@ import Base from '../layouts/Base.astro';
 
 class Skip extends Error {}
 
+// EVERY SKIP IS WRITTEN DOWN, AND A SKIP IS A FAILURE.
+//
+// `section()` swallowed a `Skip` and returned, with no line and no counter. A
+// skip drops every remaining assertion in its section, and the run still
+// printed "N passed" and exited 0 — so a rename in src/ could turn a whole
+// section into a no-op instead of a failure, which is the exact shape of
+// wrongness this repository keeps finding in its own green runs.
+//
+// The predicates these guard are all "the thing this section is about exists":
+// an instance in the fixture, a bridge function, an export from the bundle. On
+// a healthy checkout every one of them is true, so a fired skip is news. It is
+// now named in the output and counted as a failure.
+const skipped = [];
+
 // A section whose subject does not exist yet must report every OTHER section's
 // verdict rather than taking the run down with it.
 const section = async (fn) => {
   try {
     await fn();
   } catch (err) {
-    if (err instanceof Skip) return;
+    if (err instanceof Skip) {
+      skipped.push(String(err.message || 'no reason given'));
+      return;
+    }
     failures.push(`  a section threw before it could finish\n    ${err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err}`);
   }
 };
@@ -1291,6 +1308,13 @@ ul.grid { gap: 1rem; }
   console.log(`\nstyle-cascade-truth: ${checked} checks, ${failures.length} failed`);
   if (failures.length) {
     console.log(failures.join('\n'));
+    process.exit(1);
+  }
+  if (skipped.length) {
+    console.error(
+      `style-cascade-truth: ${skipped.length} section(s) were abandoned and their assertions never ran\n` +
+        skipped.map((r) => `  skipped: ${r}`).join('\n')
+    );
     process.exit(1);
   }
   process.exit(0);

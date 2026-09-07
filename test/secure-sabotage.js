@@ -436,9 +436,21 @@ const SABOTAGES = [
   },
 ];
 
-/** Run one npm suite, quietly. Answers whether it PASSED. */
-function runSuite(script, timeoutMs = 600000) {
-  const result = spawnSync('npm', ['run', '--silent', script], {
+/**
+ * ONE CHILD, ONE BOUND — and this is the only place in this file that spawns.
+ *
+ * Every sabotage below runs a real suite in a real child process, and several
+ * of them fail BY HANGING rather than by failing: 'the request deadline stops
+ * when the response headers arrive' is exactly that bug, and the suite that
+ * catches it catches it by never coming back. Without `timeout` the campaign
+ * would sit on that child until somebody noticed, having reported nothing about
+ * the thirty-odd cases queued behind it.
+ *
+ * The self-check under it drives THIS function, not a paraphrase of it, so the
+ * bound it proves is the bound the campaign runs on.
+ */
+function spawnBounded(command, args, timeoutMs) {
+  return spawnSync(command, args, {
     cwd: root,
     encoding: 'utf8',
     // One lifecycle pass is enough to see whether the accounting is wrong;
@@ -450,7 +462,64 @@ function runSuite(script, timeoutMs = 600000) {
     // ten times faster than waiting out the default.
     timeout: timeoutMs,
   });
+}
+
+/** Run one npm suite, quietly. Answers whether it PASSED. */
+function runSuite(script, timeoutMs = 600000) {
+  const result = spawnBounded('npm', ['run', '--silent', script], timeoutMs);
   return { passed: result.status === 0, output: `${result.stdout || ''}${result.stderr || ''}` };
+}
+
+// ── the bound itself, measured before anything is made to depend on it ───────
+//
+// THE PER-CASE TIMEOUT WAS A LINE OF CODE WITH NO REACHABLE FAILING BRANCH.
+//
+// `timeout: timeoutMs` could have been deleted — or misspelled, or moved out of
+// the options object by a refactor, or quietly defeated by a killSignal the
+// child ignores — and not one of the thirty-eight cases below would have gone
+// red. Every one of them either passes quickly or fails quickly, so the only
+// case that would ever have exercised the bound is a case that hangs, and a
+// campaign with a broken bound does not FAIL on such a case: it stops, mid-run,
+// with the guard still sabotaged on disk, and prints nothing at all.
+//
+// So the bound gets a case of its own that hangs on purpose. It is a child that
+// will sit for ten seconds if nothing stops it, given a bound of one and a half,
+// and the assertion is not "the child ended" — a child that ended because the
+// spawn failed ends too. It is all four of:
+//
+//   it was KILLED         — a signal, or spawnSync's own ETIMEDOUT
+//   it did not exit ok    — status 0 would mean it ran its ten seconds out
+//   it lived to its bound — under half the bound means the spawn failed and
+//                           this measured nothing about timeouts at all
+//   it died well before   — waiting the hang out is precisely the failure this
+//     the hang would have   case exists to detect
+//
+// and the killing is REPORTED, on its own line, next to the sabotages. A bound
+// that fires silently is indistinguishable from a case that passed.
+const HANG_MS = 10000;
+const HANG_BOUND_MS = 1500;
+
+/** Whether the per-case bound really ends a child. Reports either way. */
+function boundIsInForce() {
+  const started = Date.now();
+  const child = spawnBounded('node', ['-e', `setTimeout(() => {}, ${HANG_MS});`], HANG_BOUND_MS);
+  const elapsed = Date.now() - started;
+  const how = child.signal || child.error?.code || null;
+  const killed = child.signal != null || child.error?.code === 'ETIMEDOUT';
+  const ranOut = child.status === 0;
+  const tooFast = elapsed < HANG_BOUND_MS / 2;
+  const tooSlow = elapsed >= HANG_MS / 2;
+
+  if (killed && !ranOut && !tooFast && !tooSlow) {
+    say(`  killed      a case that hangs on purpose, at its ${HANG_BOUND_MS}ms bound\n              (${elapsed}ms, ${how}) — the per-case timeout is in force`);
+    return true;
+  }
+  shout('  NOT BOUNDED  a case that hangs on purpose was not killed at its bound');
+  shout(`              bound ${HANG_BOUND_MS}ms · the child sleeps ${HANG_MS}ms · it ended after ${elapsed}ms`);
+  shout(`              status ${String(child.status)} · signal ${String(child.signal)} · error ${String(child.error?.code || child.error?.message || 'none')}`);
+  if (ranOut || tooSlow) shout('              the child was waited out, not killed: runSuite is not bounding its children.');
+  if (tooFast) shout('              the child ended far too early to have been timed out — the spawn itself failed, so nothing was measured.');
+  return false;
 }
 
 /**
@@ -483,6 +552,19 @@ let gaps = 0;
 
 try {
   say('secure-sabotage: breaking each guard in turn\n');
+
+  // FIRST, AND BEFORE ANYTHING IS PATCHED.
+  //
+  // Everything after this line sabotages a real source file and depends on the
+  // per-case bound to get the child back. Carrying on with a broken bound means
+  // the first hanging case wedges the campaign with a guard removed from disk —
+  // the one outcome this file's restore machinery cannot report on, because it
+  // never reaches its own end. So this is a stop, not a counted gap: nothing has
+  // been patched yet, and the exit handler still puts everything back.
+  if (!boundIsInForce()) {
+    shout('\nsecure-sabotage: the per-case timeout does not bound its children, so no sabotage can be run safely.\n');
+    process.exit(1);
+  }
 
   for (const sabotage of SABOTAGES) {
     if (sabotage.skip) continue;

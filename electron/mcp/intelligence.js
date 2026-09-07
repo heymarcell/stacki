@@ -38,8 +38,31 @@ const z = require('zod');
 
 const { TOPICS, TOPIC_NAMES, uriFor } = require('./guide');
 const { buildProfile, MAX_PROFILE_BYTES } = require('./projectProfile');
+const { buildIdentity } = require('../buildInfo');
 
 const PROFILE_URI = 'stacki://project/profile';
+const BUILD_URI = 'stacki://build';
+
+// A GUIDE IS THE SAME BYTES ON EVERY MACHINE RUNNING THIS BUILD.
+//
+// The comment below has said since the day these were written that a client
+// caching them is doing the right thing; until the 2026-07-28 revision there
+// was no way to tell it so, and the SDK's conservative default said the exact
+// opposite on the wire (`ttlMs: 0, cacheScope: 'private'`).
+//
+// These bodies come out of ./guide.js, which is a frozen table compiled into
+// the app: no project is read to produce one, no permission level changes one,
+// and there is no state that could make two reads differ. `public` is
+// therefore safe in the strong sense — a shared cache holding a guide holds
+// nothing about anybody.
+//
+// The project profile pointedly does NOT get one. It is assembled out of
+// api.run() calls against the open project, gated on the level the person
+// granted, and it inherits the operation-level `{ttlMs: 0, cacheScope:
+// 'private'}` set in electron/mcp/server.js. That asymmetry is the point: a
+// resource has to say out loud that it is shareable, and only the five that
+// are do.
+const GUIDE_CACHE_HINT = Object.freeze({ ttlMs: 5 * 60 * 1000, cacheScope: 'public' });
 
 /** A resource body, as the SDK wants it. */
 const textContents = (uri, text, mimeType = 'text/markdown') => ({
@@ -64,8 +87,10 @@ function registerResources(server, { api = null } = {}) {
         description: t.description,
         mimeType: 'text/markdown',
         // Static product documentation: it cannot change between two reads on the
-        // same version, so a client that caches it is doing the right thing.
+        // same version, so a client that caches it is doing the right thing —
+        // and now it is told so rather than left to guess.
         annotations: { audience: ['assistant'] },
+        cacheHint: GUIDE_CACHE_HINT,
       },
       async (uri) => textContents(uri.href, t.body)
     );
@@ -138,6 +163,37 @@ function registerResources(server, { api = null } = {}) {
       }
       return textContents(uri.href, body, 'application/json');
     }
+  );
+
+  // WHICH BUILD IS ANSWERING, as a resource a client can read without spending
+  // a tool call or a permission.
+  //
+  // `get_context` carries the same object, and that is the road most agents
+  // will take. This exists for the road they take FIRST: a host that lists
+  // resources on connect can pin the session to a build before it has asked
+  // Stacki anything at all, and a person reading a transcript can see it
+  // without hunting for the first tool result.
+  //
+  // NOT `public`, despite being byte-identical on every machine running this
+  // build. The guides are public because they are a frozen table compiled into
+  // the app and hold nothing about anybody; this one is about the ARTEFACT, and
+  // a dev build's answer includes whether the developer's tree was dirty. That
+  // is not somebody else's business to hold in a shared cache. `{0, private}`
+  // is inherited from the operation-level default in electron/mcp/server.js.
+  server.registerResource(
+    'build-identity',
+    BUILD_URI,
+    {
+      title: 'Which Stacki this is',
+      description:
+        'The identity of the running build: package version, the commit and tree it was made from, whether ' +
+        'that tree was dirty, and whether this is a packaged or a development build. A version number alone ' +
+        'does not identify a build — every build between two releases carries the same one. Quote this in any ' +
+        'report about what Stacki did. Needs no permission.',
+      mimeType: 'application/json',
+      annotations: { audience: ['assistant'] },
+    },
+    async (uri) => textContents(uri.href, JSON.stringify(buildIdentity(), null, 1), 'application/json')
   );
 }
 
@@ -245,4 +301,4 @@ function registerPrompts(server) {
   }
 }
 
-module.exports = { registerResources, registerPrompts, PROFILE_URI, PROMPTS };
+module.exports = { registerResources, registerPrompts, PROFILE_URI, BUILD_URI, PROMPTS, GUIDE_CACHE_HINT };

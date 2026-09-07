@@ -555,10 +555,21 @@ const FIXTURE_IDENTIFIERS = [
       const first = (await buildProfile(app.api.run))?.profile;
       check('a project with no media queries reports none', first?.breakpoints?.total === 0, short(first?.breakpoints));
       check('and says how many stylesheets it read to find that out', first?.breakpoints?.stylesheetsRead >= 1, short(first?.breakpoints));
+      // "STYLE SOURCE", NOT "STYLESHEET", and the rename is the point rather
+      // than a tidy-up: the inventory this reads is every stylesheet AND every
+      // component `<style>` block, scoped or not, and a scoped block is not a
+      // stylesheet. It used to be only the ones that reach the page globally,
+      // which is why a breakpoint authored in a component's own scoped style
+      // was reported as a project with no such breakpoint.
       check(
         'and only then says the project has no authored breakpoints, counting what it read',
-        /no authored breakpoints/i.test(String(first?.breakpoints?.note)) && /stylesheets? read/i.test(String(first?.breakpoints?.note)),
+        /no authored breakpoints/i.test(String(first?.breakpoints?.note)) && /style sources? read/i.test(String(first?.breakpoints?.note)),
         short(first?.breakpoints?.note)
+      );
+      check(
+        'and it read every source it was offered, or it would not be entitled to say so',
+        first?.breakpoints?.stylesheetsRead === first?.breakpoints?.stylesheetsOffered && (first?.breakpoints?.stylesheetsUnread || []).length === 0,
+        short(first?.breakpoints)
       );
       check(
         'and a project with no CSS framework is not given one',
@@ -581,6 +592,33 @@ const FIXTURE_IDENTIFIERS = [
       H.removeProject(root);
     }
 
+    // A BREAKPOINT NOBODY WOULD HAVE FOUND. Authored in a component's own
+    // `<style>` — no `is:global`, no `:global()`, the Astro default — which is
+    // the case a live dogfood filed: the global one reported, this one missing,
+    // and the note saying the project had no such breakpoint rather than that
+    // this source had never been in any list to read.
+    {
+      const scoped = H.makeProject();
+      const scopedApp = await H.start(scoped, { agentMode: 'full' });
+      try {
+        scopedApp.write('src/styles/site.css', ':root{--a:1px}\n@media (max-width: 720px) { body { font-size: 14px } }\n');
+        scopedApp.write('src/components/Scoped.astro', '---\n---\n<div class="s">s</div>\n<style>\n@media (max-width: 1024px) { .s { color: blue } }\n</style>\n');
+        scopedApp.write('src/components/Reaching.astro', '---\n---\n<div class="g">g</div>\n<style is:global>\n@media (max-width: 1440px) { .g { color: green } }\n</style>\n');
+        await H.settle(400);
+        const bp = (await buildProfile(scopedApp.api.run))?.profile?.breakpoints;
+        const px = (bp?.items || []).map((b) => b.px).sort((a, b) => a - b);
+        check('a breakpoint in a plain stylesheet is found', px.includes(720), short(bp));
+        check('one in a component <style is:global> is found', px.includes(1440), short(bp));
+        check('and one in a component’s ORDINARY scoped <style> is found too', px.includes(1024), short(bp));
+        check('  and it is attributed to the component that authored it', (bp?.items || []).some((b) => b.px === 1024 && /Scoped\.astro$/.test(String(b.source))), short(bp?.items));
+        check('  and the count of what was read includes it', bp?.stylesheetsRead >= 3, short(bp));
+        check('  with nothing offered that could not be read', (bp?.stylesheetsUnread || []).length === 0, short(bp?.stylesheetsUnread));
+      } finally {
+        scopedApp.stop();
+        H.removeProject(scoped);
+      }
+    }
+
     // AND THE CASE THE WHOLE NOTE EXISTS FOR: nothing was read at all. Zero
     // breakpoints found among zero stylesheets inspected is not a statement
     // about the project, and the profile may not make one.
@@ -594,7 +632,7 @@ const FIXTURE_IDENTIFIERS = [
       check('with no stylesheet to read, none is claimed to have been read', p?.breakpoints?.stylesheetsRead === 0, short(p?.breakpoints));
       check(
         'and the profile does not say the project has no breakpoints',
-        !/no authored breakpoints/i.test(String(p?.breakpoints?.note)) && /no stylesheet could be read/i.test(String(p?.breakpoints?.note)),
+        !/no authored breakpoints/i.test(String(p?.breakpoints?.note)) && /no style source could be read/i.test(String(p?.breakpoints?.note)),
         short(p?.breakpoints?.note)
       );
     } finally {

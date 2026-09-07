@@ -10,6 +10,12 @@
 //
 // The panel is built with the project's own esbuild (Vite's) because it is JSX,
 // and rendered into jsdom because it is React.
+//
+// The project is the one test/support/contentFixture.js builds. It used to
+// default to a personal folder under ~/Downloads, so on every machine but one,
+// and on every CI runner, this printed "skipped" and asserted nothing — the
+// editor was never mounted anywhere. A path given as argv[2] or
+// STACKI_CONTENT_FIXTURE still wins.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,9 +24,7 @@ const os = require('os');
 const { readContentConfig, validateEntry, stopAllServices } = require('../electron/contentConfig.js');
 const { listEntries, writeEntry, countEntries, coveredPaths } = require('../electron/contentEntries.js');
 const frontmatter = require('../electron/formats/frontmatter.js');
-
-const DEFAULT_FIXTURE = path.join(os.homedir(), 'Downloads', 'awesome-client-main');
-const source = path.resolve(process.argv[2] || process.env.STACKI_CONTENT_FIXTURE || DEFAULT_FIXTURE);
+const { contentFixture } = require('./support/contentFixture.js');
 
 const failures = [];
 let checked = 0;
@@ -32,10 +36,18 @@ const check = (what, condition, detail) => {
 const settle = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 (async () => {
-  if (!fs.existsSync(path.join(source, 'src', 'content.config.ts'))) {
-    console.log(`content-view: skipped (no project at ${source})`);
+  let fixture;
+  try {
+    fixture = contentFixture('content-view', { log: (m) => console.log(`content-view: ${m}`) });
+  } catch (err) {
+    console.error(String(err?.message || err));
+    process.exit(1);
+  }
+  if (fixture.skip) {
+    console.log(fixture.skip);
     return;
   }
+  const source = fixture.source;
 
   const config = await readContentConfig(source, { force: true });
   if (config.error) {

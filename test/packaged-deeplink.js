@@ -41,9 +41,16 @@
 // which is the gate that has to pass before anything ships, and it runs there
 // on a real Mac every time. CI sets this variable so the log says what did not
 // run instead of reporting that everything passed.
+//
+// DECLARED rather than silent: skipSuite prints the same line and exits the
+// same way, but a caller that sets STACKI_NO_SKIPS turns it into a named
+// failure. That is why the CI step which sets STACKI_HOSTED_RUNNER for this
+// suite also sets STACKI_NO_SKIPS=0 — this skip is measured and deliberate,
+// unlike the packaged-* ones in the same job.
+const { skipSuite } = require('./support/suiteGuard.js');
 if (process.env.STACKI_HOSTED_RUNNER) {
-  process.stdout.write('packaged-deeplink: skipped (STACKI_HOSTED_RUNNER — Launch Services routing is a local gate)\n');
-  process.exit(0);
+  skipSuite('packaged-deeplink', 'STACKI_HOSTED_RUNNER — Launch Services routing is a local gate');
+  process.exit(process.exitCode ?? 0);
 }
 
 const fs = require('node:fs');
@@ -77,8 +84,8 @@ async function until(what, timeout, fn, every = 250) {
 }
 
 if (process.platform !== 'darwin') {
-  say('packaged-deeplink: skipped (this proof is the macOS Launch Services path)');
-  process.exit(0);
+  skipSuite('packaged-deeplink', 'this proof is the macOS Launch Services path');
+  process.exit(process.exitCode ?? 0);
 }
 if (!fs.existsSync(APP)) {
   shout(`packaged-deeplink: ${path.relative(root, APP)} is not built.`);

@@ -25,6 +25,7 @@ const { createAudit } = require('./audit');
 const { createStackiMcpServer, DEFAULT_PORT } = require('./server');
 const { createAgentApi } = require('./agent');
 const agentRefs = require('./agent/refs');
+const { buildIdentity } = require('../buildInfo');
 const { anchorFrom } = require('../review/anchor');
 const reviews = require('../review');
 
@@ -120,7 +121,10 @@ function selectionRef() {
   if (!api || !latestPayload) return null;
   const built = anchorFrom(latestPayload);
   if (!built.ok) return null;
-  return api.publishedNodeRef({ ...built.anchor, branch: latestPayload.project?.branch || null }, { writable: true });
+  // NO BRANCH OVERRIDE. `nodeRef` already fills one in from the context, which
+  // asks main what is checked out now; passing the payload's copy explicitly
+  // beat it to it with a value read when the project opened.
+  return api.publishedNodeRef(built.anchor, { writable: true });
 }
 
 // The last payload, at module scope so `selectionRef` can reach it. `startMcp`
@@ -134,7 +138,10 @@ function projectChanged() {
 
 /** What the settings/status surface shows. Includes the token, which the app's own window may display. */
 function status() {
-  return { ...state, token: state.running ? running?.token || null : null };
+  // `build` rides along so the panel a person opens to connect an agent can
+  // also tell them which Stacki that agent will be talking to. Same object
+  // get_context and stacki://build carry; one source, three surfaces.
+  return { ...state, token: state.running ? running?.token || null : null, build: buildIdentity() };
 }
 
 function resolvePort(settings) {
@@ -159,6 +166,7 @@ async function startMcp({
   getAgentMode = () => 'inspect',
   callMain = null,
   getDevUrl = () => null,
+  getBranch = () => null,
 } = {}) {
   store = store || createContextStore({ resolveTrail: (keys) => resolveTrail(keys) });
   let projectRoot = null;
@@ -237,6 +245,7 @@ async function startMcp({
     readPayload: () => lastPayload,
     resolveTrail: (keys) => resolveTrail(keys),
     getDevUrl,
+    getBranch,
     version,
   });
 
@@ -326,7 +335,7 @@ async function startMcp({
     getComments,
     comment,
     api,
-    audit: (args) => auditEngine.run(args),
+    audit: (args, opts) => auditEngine.run(args, opts),
     onError: (err) => console.warn('[stacki] MCP:', err?.message || err),
   });
   try {
