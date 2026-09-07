@@ -128,7 +128,7 @@ const short = (x, n = 300) => JSON.stringify(x ?? null).slice(0, n);
 
   {
     const before = app.mainEvents().length;
-    const moved = await run('page', 'move', { from: 'src/pages/contact.astro', to: 'reach-us.astro' });
+    const moved = await run('page', 'move', { from: 'src/pages/contact.astro', to: 'src/pages/reach-us.astro' });
     check('page.move answers ok', moved.ok === true, short(moved));
     await H.settle(600);
 
@@ -169,7 +169,7 @@ const short = (x, n = 300) => JSON.stringify(x ?? null).slice(0, n);
   // what the open-page check needs to hear about.
 
   {
-    const made = await run('page', 'folder_create', { dir: 'docs' });
+    const made = await run('page', 'folder_create', { dir: 'src/pages/docs' });
     check('folder_create answers ok', made.ok === true, short(made));
     await H.settle(400);
 
@@ -183,7 +183,7 @@ const short = (x, n = 300) => JSON.stringify(x ?? null).slice(0, n);
     check('and the switcher shows it', now.names.includes('docs/intro'), short(now.names));
 
     const before = app.mainEvents().length;
-    const renamed = await run('page', 'folder_rename', { from: 'docs', to: 'guides' });
+    const renamed = await run('page', 'folder_rename', { from: 'src/pages/docs', to: 'src/pages/guides' });
     check('folder_rename answers ok', renamed.ok === true, short(renamed));
     await H.settle(600);
 
@@ -201,7 +201,7 @@ const short = (x, n = 300) => JSON.stringify(x ?? null).slice(0, n);
     check('and no longer the old one', !now.routes.includes('/docs/intro'), short(now.routes));
     check('and not under the old folder name', !now.names.includes('docs/intro'), short(now.names));
 
-    const deleted = await run('page', 'folder_delete', { dir: 'guides' });
+    const deleted = await run('page', 'folder_delete', { dir: 'src/pages/guides' });
     check('folder_delete answers ok', deleted.ok === true, short(deleted));
     await H.settle(600);
     const gone = app.mainEvents().filter((e) => e.channel === 'fs:changed').flatMap((e) => e.payload?.files || []);

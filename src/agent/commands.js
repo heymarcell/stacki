@@ -377,6 +377,41 @@ export function createAgentCommands(getApp) {
     if (!a.project()) return fail('no_project', 'No project is open in Stacki.');
     if (action === 'list_sources') return { ok: true, ...(await styleAgent.listSources()) };
 
+    // ── THE THREE WRITES TAKE NO ELEMENT ─────────────────────────────────────
+    //
+    // A style write NAMES A RULE — a source and a selector, or the identity a
+    // read reported — and a rule is not an element. It sits in a stylesheet
+    // whether or not anything on the page matches it and whether or not
+    // anything is selected. `styleAgent.setProperty`, `removeProperty` and
+    // `setDeclarations` never read the node they were handed; it was a gate,
+    // not an input.
+    //
+    // It gated the wrong thing. The selection can go away through an ordinary
+    // agent edit — `source.write` removing the selected node makes the App's
+    // reload path set it to null — and after that a call carrying a complete
+    // explicit address was refused `no_selection`, with a workaround of
+    // selecting something irrelevant first so the gate would open. A live
+    // dogfood hit exactly that.
+    //
+    // So the selection is what it should always have been: a DEFAULT for
+    // arguments a caller did not supply. These three actions have no such
+    // argument, so they do not consult it.
+    if (action === 'set_property' || action === 'remove_property' || action === 'set_declarations') {
+      try {
+        const result =
+          action === 'set_property'
+            ? await styleAgent.setProperty(args)
+            : action === 'remove_property'
+              ? await styleAgent.removeProperty(args)
+              : await styleAgent.setDeclarations(args);
+        return result.ok ? { ...result, document: documentOf(a) } : result;
+      } catch (err) {
+        return fail('style_failed', String(err?.message || err));
+      }
+    }
+
+    // `style.read` DOES need one: it is a question about an element on the
+    // live page, and the canvas answers about the selected one.
     let id = a.selectedId();
     if (args.anchor) {
       const at = await locate(a, args.anchor, { navigate: true });
@@ -408,18 +443,6 @@ export function createAgentCommands(getApp) {
           viewport: a.canvas?.() || null,
         });
         return { ok: true, ...styles, document: documentOf(a) };
-      }
-      if (action === 'set_property') {
-        const result = await styleAgent.setProperty(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
-      }
-      if (action === 'remove_property') {
-        const result = await styleAgent.removeProperty(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
-      }
-      if (action === 'set_declarations') {
-        const result = await styleAgent.setDeclarations(node, args);
-        return result.ok ? { ...result, document: documentOf(a) } : result;
       }
     } catch (err) {
       return fail('style_failed', String(err?.message || err));

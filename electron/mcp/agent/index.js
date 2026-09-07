@@ -155,6 +155,22 @@ function createAgentApi({
   // preview. Main owns the process and knows the moment it binds, so it is
   // asked first and the payload is the fallback.
   getDevUrl = () => null,
+  // WHICH BRANCH IS CHECKED OUT, NOW.
+  //
+  // The same reasoning as `getDevUrl` above, for the same reason and with worse
+  // consequences. The payload is published from a React effect and carries the
+  // branch as of the last render — and App.jsx reads git once, when the project
+  // opens, so "as of the last render" is in practice "as of project open".
+  // Measured: a checkout through the Agent API's OWN git surface, then a ref
+  // minted 2.2 seconds later, still carrying the branch from before the switch;
+  // `git.info` answering `beta` and `project.info` answering `alpha` in
+  // consecutive calls; and a write through that ref succeeding, because the
+  // branch a ref records is part of what makes it stale and this one recorded
+  // the wrong branch.
+  //
+  // Main owns the checkout and knows the moment it moves, so it is asked first
+  // and the payload is the fallback.
+  getBranch = () => null,
   version = '0.0.0',
 } = {}) {
   const gate = permissions.createGate(getAgentMode);
@@ -168,7 +184,10 @@ function createAgentApi({
         return callMain(channel, args);
       },
       devUrl: getDevUrl() || payload?.preview?.url || null,
-      branch: payload?.project?.branch || null,
+      // `??`, not `||`: main answering `null` means "detached, or not a
+      // repository", which is an ANSWER, and falling through to a stale
+      // payload value there would be the whole defect wearing a different hat.
+      branch: getBranch() ?? payload?.project?.branch ?? null,
       payload,
       // The two things the domains need from the ref system: a ref to hand back
       // with a read, and the observation to check a write against.

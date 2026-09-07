@@ -205,6 +205,26 @@ const short = (x, n = 260) => JSON.stringify(x ?? null).slice(0, n);
     await run('page', 'folder_delete', { dir: 'src/pages/tükörfúró' });
   }
 
+  // ── page.delete only deletes pages ────────────────────────────────────────
+  //
+  // The guard that says so used to be a hand-written check one line below the
+  // resolver call. Moving it INTO the resolver is right; moving it without
+  // moving the call turns `page.delete` into "delete any file in the project",
+  // which is what happened while this was being written and what
+  // test/agent-acceptance.js caught. So it is asserted here too, on the three
+  // kinds of file somebody might plausibly pass.
+  {
+    for (const victim of ['src/components/Card.astro', 'package.json', 'src/styles/site.css']) {
+      const out = await run('page', 'delete', { path: victim });
+      check(`page.delete refuses ${victim}`, out.ok === false && out.code === 'bad_path', short(out));
+      check(`  and it is still on disk`, app.exists(victim), 'the file was deleted');
+    }
+    await run('page', 'create', { name: 'deletable' });
+    const gone = await run('page', 'delete', { path: 'src/pages/deletable.astro' });
+    check('and it still deletes an actual page', gone.ok === true, short(gone));
+    check('  which is really gone', !app.exists('src/pages/deletable.astro'));
+  }
+
   // ── src/pages itself ──────────────────────────────────────────────────────
 
   {

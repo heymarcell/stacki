@@ -283,10 +283,22 @@ function measuredViewport(given) {
  * `cascadeTiers` below). `target` comes back so it can, with its snapshot cache
  * and its primed DOM matches already warm.
  */
-async function readCascade(node, given) {
+/**
+ * Every style source the project offers, parsed. NO ELEMENT INVOLVED.
+ *
+ * The half of `readCascade` that a WRITE needs. A write names a rule — a
+ * source and a selector, or the identity a read reported — and a rule is not
+ * an element: it exists in a stylesheet whether or not anything on the page
+ * matches it, and whether or not anything is selected.
+ */
+async function readSources() {
   const scan = await scanPage(await ownStyleFiles());
   const { docs, errors } = await loadEmbedDocs(scan.pageEmbeds);
-  const rules = rebuildRules(docs);
+  return { scan, docs, errors, rules: rebuildRules(docs) };
+}
+
+async function readCascade(node, given) {
+  const { scan, docs, errors, rules } = await readSources();
   const asked = await askCanvasAbout(node.id, rules);
   const { target, rootSnapshot } = await resolveTarget(node, scan, asked);
   await primeDomMatches(target, rules, asked);
@@ -1647,13 +1659,13 @@ async function locateIdentity(docs, rules, identity) {
  *                                          design system gets a stray rule in
  *                                          a vendor file.
  */
-export async function setProperty(node, { identity, source, selector, property, value, important = false, live = false }) {
+export async function setProperty({ identity, source, selector, property, value, important = false, live = false }) {
   const prop = String(property || '').trim();
   const next = String(value ?? '').trim();
   if (!prop) return problem('bad_request', 'A CSS property is required.');
   if (!next) return problem('bad_request', 'A value is required — use remove_property to take a declaration out.');
 
-  const { docs, rules } = await readCascade(node);
+  const { docs, rules } = await readSources();
 
   if (identity) {
     // Three situations used to come back as one sentence — "the stylesheet
@@ -1731,11 +1743,11 @@ export async function setProperty(node, { identity, source, selector, property, 
 }
 
 /** Take one authored declaration out. An emptied rule goes with it. */
-export async function removeProperty(node, { identity, live = false }) {
+export async function removeProperty({ identity, live = false }) {
   if (!identity?.selector || !identity?.source || !identity?.property) {
     return problem('bad_request', 'Name the declaration to remove, as style.read reported it.');
   }
-  const { docs, rules } = await readCascade(node);
+  const { docs, rules } = await readSources();
   const refusal = await locateIdentity(docs, rules, identity);
   if (refusal) return refusal;
   const rule = findRule(rules, identity);
@@ -1755,7 +1767,7 @@ export async function removeProperty(node, { identity, live = false }) {
 }
 
 /** Several properties on one rule, in one write and one undo step. */
-export async function setDeclarations(node, { identity, source, selector, declarations, live = false }) {
+export async function setDeclarations({ identity, source, selector, declarations, live = false }) {
   const list = Array.isArray(declarations) ? declarations : [];
   if (!list.length) return problem('bad_request', 'declarations must name at least one property.');
   let result = null;
@@ -1764,7 +1776,7 @@ export async function setDeclarations(node, { identity, source, selector, declar
   // rather than scattering across a stylesheet.
   let where = identity || null;
   for (const [index, entry] of list.entries()) {
-    result = await setProperty(node, {
+    result = await setProperty({
       identity: where ? { ...where, property: entry.property } : null,
       source,
       selector,
@@ -1783,10 +1795,48 @@ export async function setDeclarations(node, { identity, source, selector, declar
   return { ok: true, applied: list.length, source: result?.source || null };
 }
 
+/**
+ * Every authored style source in the PROJECT, whether or not it reaches the
+ * open page.
+ *
+ * A DIFFERENT QUESTION FROM `sources` BELOW, and it needed asking separately.
+ * `sources` is the page's: which style blocks and stylesheets reach what is on
+ * screen, which is what the panel's "add custom styles in:" picker wants and
+ * what a cascade read is about. The project profile asks something else — what
+ * stylesheets does this PROJECT have — and it was being handed the page's
+ * answer.
+ *
+ * That mattered because of the other half: `listAstroStyleFiles` used to omit a
+ * component whose `<style>` is ordinary (scoped, the Astro default), since for
+ * "where can I write global CSS" a scoped block is not an answer. So a
+ * breakpoint authored in a component's own scoped `<style>` was in no list at
+ * all, and the profile reported that the project had no such breakpoint rather
+ * than that it had not looked. Reach is a fact on each row now (`reachesPage`)
+ * rather than the reason a row exists.
+ */
+async function projectStyleSources() {
+  const root = getHost().projectPath;
+  const avb = bridge();
+  if (!root || !avb?.listStyleFiles || !avb?.listAstroStyleFiles) return [];
+  const [css, astro] = await Promise.all([
+    Promise.resolve(avb.listStyleFiles(root)).catch(() => null),
+    // `all: true` — the inventory, not the write targets.
+    Promise.resolve(avb.listAstroStyleFiles({ projectPath: root, all: true })).catch(() => null),
+  ]);
+  return [
+    ...(css?.files || []).map((f) => ({ path: f.rel, kind: 'file', reachesPage: true })),
+    ...(astro?.files || []).map((f) => ({ path: f.rel, kind: 'astro', reachesPage: f.reachesPage !== false })),
+  ];
+}
+
 /** The style sources this page has, without parsing any of them. */
 export async function listSources() {
   const scan = await scanPage(await ownStyleFiles());
   return {
+    // The project's whole inventory, beside the page's own list. Named
+    // differently because they answer different questions and conflating them
+    // is what went wrong.
+    projectSources: await projectStyleSources(),
     sources: scan.pageEmbeds.map((s) => {
       const pub = publicKey(s.key);
       return {

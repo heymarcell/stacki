@@ -625,6 +625,7 @@ async function start(root, { agentMode = 'full', realDevServer = false, devUrl =
     });
 
   const { createAgentApi } = require('../electron/mcp/agent');
+  const { branchOf, git: syncGit } = require('../electron/review/provenance');
   const { selectionTrail } = require('../electron/selectionTrail');
   const { locateSelection } = require('../electron/astroParser');
   let mode = agentMode;
@@ -638,6 +639,13 @@ async function start(root, { agentMode = 'full', realDevServer = false, devUrl =
     // The same authority the app gives it: main's own dev server, asked
     // through the handler rather than read out of a closure.
     getDevUrl: () => devUrlNow,
+    // AND THE BRANCH, FROM GIT, NOT FROM THE PAYLOAD. electron/main.js passes
+    // `branchNow(openProjectRoot)` here, which is `branchOf` over the same
+    // synchronous runner; this is that, without main's cache, so a fixture that
+    // switches branch mid-test sees the switch on the very next call. A fixture
+    // that is not a repository answers null, which is what `branchOf` answers
+    // and costs one `git rev-parse` that fails immediately.
+    getBranch: () => branchOf(root, syncGit),
     resolveTrail: (keys) => selectionTrail({ projectPath: root, keys }, locateSelection),
     version: '0.0.0-test',
   });

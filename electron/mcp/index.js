@@ -121,7 +121,10 @@ function selectionRef() {
   if (!api || !latestPayload) return null;
   const built = anchorFrom(latestPayload);
   if (!built.ok) return null;
-  return api.publishedNodeRef({ ...built.anchor, branch: latestPayload.project?.branch || null }, { writable: true });
+  // NO BRANCH OVERRIDE. `nodeRef` already fills one in from the context, which
+  // asks main what is checked out now; passing the payload's copy explicitly
+  // beat it to it with a value read when the project opened.
+  return api.publishedNodeRef(built.anchor, { writable: true });
 }
 
 // The last payload, at module scope so `selectionRef` can reach it. `startMcp`
@@ -163,6 +166,7 @@ async function startMcp({
   getAgentMode = () => 'inspect',
   callMain = null,
   getDevUrl = () => null,
+  getBranch = () => null,
 } = {}) {
   store = store || createContextStore({ resolveTrail: (keys) => resolveTrail(keys) });
   let projectRoot = null;
@@ -241,6 +245,7 @@ async function startMcp({
     readPayload: () => lastPayload,
     resolveTrail: (keys) => resolveTrail(keys),
     getDevUrl,
+    getBranch,
     version,
   });
 

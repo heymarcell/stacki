@@ -589,7 +589,7 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     const listed = await run('page', 'list');
     check('and Stacki’s own project model catches up', listed.pages.some((p) => p.route === '/pricing'), short(listed.pages?.map((p) => p.route)));
 
-    const moved = await run('page', 'move', { from: 'src/pages/pricing.astro', to: 'plans/index.astro' });
+    const moved = await run('page', 'move', { from: 'src/pages/pricing.astro', to: 'src/pages/plans/index.astro' });
     check('a page can be moved', moved.ok && moved.path === 'src/pages/plans/index.astro', short(moved));
     check('and its imports were rebased for where it landed', /\.\.\/\.\.\/layouts\/Base\.astro/.test(app.read('src/pages/plans/index.astro')), app.read('src/pages/plans/index.astro'));
 
@@ -600,12 +600,17 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     check('and a page can be deleted', deleted.ok && !app.exists('src/pages/plans/index.astro'), short(deleted));
 
     const notAPage = await run('page', 'delete', { path: 'src/components/Card.astro' });
-    check('but only a page', notAPage.ok === false && notAPage.code === 'bad_request', short(notAPage));
+    // `bad_path`, not `bad_request`: "only a file under src/pages is a page" is
+    // the page domain's one path rule, and it now lives in the one resolver
+    // every path argument here goes through rather than in a hand-written check
+    // beside one of them. Same refusal, one place. See test/page-paths.js.
+    check('but only a page', notAPage.ok === false && notAPage.code === 'bad_path', short(notAPage));
+    check('and the refusal says where pages live', /src\/pages/.test(String(notAPage.message)), String(notAPage.message));
     check('and the component is still there', app.exists('src/components/Card.astro'));
 
-    const folder = await run('page', 'folder_create', { dir: 'docs' });
+    const folder = await run('page', 'folder_create', { dir: 'src/pages/docs' });
     check('a page folder can be made', folder.ok === true, short(folder));
-    check('and deleted', (await run('page', 'folder_delete', { dir: 'docs' })).ok === true);
+    check('and deleted', (await run('page', 'folder_delete', { dir: 'src/pages/docs' })).ok === true);
   }
 
   // ── K. Content ─────────────────────────────────────────────────────────────

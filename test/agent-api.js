@@ -598,7 +598,12 @@ const PINNED_RISK = {
   const huge = patchBetween('x\n'.repeat(500), 'y\n'.repeat(500));
   const text = huge.hunks.map((h) => h.text).join('\n');
   check('a whole-file rewrite does not become a whole-file patch', text.length < 4000, `${text.length} chars`);
-  check('and says how much it left out', /more removed line/.test(text) && /more added line/.test(text));
+  // ONE COUNT, NOT TWO. A hunk is rendered in FILE ORDER now rather than as
+  // every removal followed by every addition — which matters as soon as a hunk
+  // holds two changes, because the old order put the second change's removal
+  // above the first change's addition. So what is elided is elided from one
+  // sequence and said once. See test/patch-truth.js.
+  check('and says how much it left out', /more line(s)? in this hunk/.test(text), text.slice(-200));
 }
 
 // ── The API, with nothing behind it ──────────────────────────────────────────

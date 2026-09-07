@@ -590,10 +590,16 @@ const page = {
     result: (raw, _input, ctx) => ({ path: relativeTo(ctx.root, raw?.pagePath || raw?.path || '') }),
   },
 
+  // THROUGH `pagesRel`, WHICH IS WHERE "ONLY A FILE UNDER src/pages IS A PAGE"
+  // NOW LIVES. This used to be `rel` plus a hand-written check of the same
+  // thing one line below it, and moving the check into the resolver without
+  // moving the CALL would have turned `page.delete` into "delete any file in
+  // the project" — test/agent-acceptance.js caught exactly that, on a
+  // component, before this line was written the second time.
   delete: {
     channel: 'page:delete',
     args: (input, ctx) => {
-      const at = rel(ctx, input.path, 'page path');
+      const at = pagesRel(ctx, input.path, 'page path');
       if (at.error) return at;
       return at.abs;
     },

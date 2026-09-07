@@ -429,10 +429,48 @@ let pendingProject = null;
 // takes one: a tool takes a domain and an action, and electron/mcp/agent's
 // registry is the only thing that maps those to a name in this table. A
 // channel missing from that registry is unreachable however it is spelled.
+// EVERY CHANNEL THAT CAN MOVE HEAD, IN ONE LIST.
+//
+// `forgetBranch()` could go at the end of each of these handlers, and the
+// eleventh one somebody adds would not have it. So the list is here, beside the
+// cache it protects, and the wrapper below applies it — a new git handler is
+// added to this array or it is not covered, which is a decision somebody makes
+// rather than a line they forget.
+//
+// `project:scan` is in it because it is what runs when a project is opened or
+// reopened, which is the other way the checkout changes underneath the app.
+const MOVES_HEAD = new Set([
+  'git:init',
+  'git:checkout',
+  'git:merge',
+  'git:resolveMerge',
+  'git:deleteBranch',
+  'git:restoreProject',
+  'git:restoreFile',
+  'git:commit',
+  'git:park',
+  'git:unpark',
+  'project:scan',
+]);
+
 const mainOps = new Map();
 const handle = (channel, fn) => {
-  mainOps.set(channel, fn);
-  ipcMain.handle(channel, fn);
+  // A channel that can move HEAD drops the cached branch name when it returns,
+  // whichever door called it — the panel over IPC or the Agent API through
+  // `callMainOp`. Both go through this wrapper, which is why it is here rather
+  // than at the end of ten handler bodies where the eleventh would miss it.
+  // See MOVES_HEAD and `branchNow`.
+  const wrapped = MOVES_HEAD.has(channel)
+    ? async (...args) => {
+        try {
+          return await fn(...args);
+        } finally {
+          forgetBranch();
+        }
+      }
+    : fn;
+  mainOps.set(channel, wrapped);
+  ipcMain.handle(channel, wrapped);
 };
 
 /** Call one by name, with no Electron event behind it. */
@@ -728,6 +766,11 @@ app.whenReady().then(() => {
     // thing that started it rather than from the renderer's last published
     // snapshot of it.
     getDevUrl: () => devServer?.url || null,
+    // The branch checked out NOW, not the one the renderer published when the
+    // project opened. A ref records the branch it was minted against and a
+    // write through it is refused when that has moved — which only works if
+    // the branch it records is the branch that was true.
+    getBranch: () => branchNow(openProjectRoot),
   });
   // Visual Review's ledger. Also for the app rather than for a project — the
   // door is registered once, and which project's reviews are behind it moves
@@ -5279,7 +5322,36 @@ function astroStyleReachesPage(text) {
   return false;
 }
 
-function listAstroStyleFiles(root) {
+/** Whether this file has a `<style>` block at all. */
+function hasAstroStyleBlock(text) {
+  ASTRO_STYLE_BLOCK.lastIndex = 0;
+  return ASTRO_STYLE_BLOCK.test(text);
+}
+
+/**
+ * Every `.astro` file under src/ that has a `<style>` block, and whether that
+ * style reaches the whole page.
+ *
+ * REACH IS A FACT ON THE ROW, NOT WHETHER THE ROW EXISTS. This used to skip a
+ * component whose `<style>` was ordinary — scoped, the Astro default — because
+ * the panel that asked was asking "what could I write global CSS into?", and
+ * for that question a scoped block is not an answer.
+ *
+ * The project profile asks a different question, and got the first one's answer.
+ * It reads `@media` widths out of "the project's stylesheets" to report what
+ * breakpoints a project has, and a breakpoint authored in a component's own
+ * scoped `<style>` is as authored as any other — but the file holding it was
+ * never in the list, so the profile said the project had no such breakpoint
+ * rather than that it had not looked. A live dogfood found exactly that:
+ * a global `@media (max-width: 720px)` reported, a component's
+ * `@media (max-width: 1024px)` missing, and nothing in the answer to say which
+ * of the two it was.
+ *
+ * So the walk is the same walk and the predicate is the same predicate — every
+ * row now carries `reachesPage`, and the caller says which rows it wants.
+ * `reachingOnly` defaults to true so the three existing callers are unchanged.
+ */
+function listAstroStyleFiles(root, { reachingOnly = true } = {}) {
   const out = [];
   const walk = (dir, rel) => {
     let entries;
@@ -5301,8 +5373,13 @@ function listAstroStyleFiles(root) {
       try {
         const { size } = fs.statSync(full);
         if (size > ASTRO_SCAN_LIMIT) continue;
-        if (!astroStyleReachesPage(fs.readFileSync(full, 'utf8'))) continue;
-        out.push({ rel: toPosix(relPath), name: entry.name, path: full, size });
+        const text = fs.readFileSync(full, 'utf8');
+        // A file with no `<style>` at all is not a style source under either
+        // question, and skipping it here keeps the walk costing what it cost.
+        if (!hasAstroStyleBlock(text)) continue;
+        const reachesPage = astroStyleReachesPage(text);
+        if (reachingOnly && !reachesPage) continue;
+        out.push({ rel: toPosix(relPath), name: entry.name, path: full, size, reachesPage });
       } catch {
         /* unreadable — nothing to offer for it */
       }
@@ -5314,9 +5391,16 @@ function listAstroStyleFiles(root) {
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-handle('style:listAstroStyles', async (_e, projectPath) => {
+// ONE HANDLER, TWO QUESTIONS, because two inventories is the drift this exists
+// to prevent. A bare string is the old call and means "what can I write global
+// CSS into"; `{projectPath, all: true}` means "every authored style source in
+// this project", which is what the profile has to read to be able to say
+// whether it looked.
+handle('style:listAstroStyles', async (_e, arg) => {
+  const projectPath = typeof arg === 'string' ? arg : arg?.projectPath;
+  const all = typeof arg === 'object' && arg !== null && arg.all === true;
   if (!projectPath) return { files: [] };
-  return { files: listAstroStyleFiles(projectPath) };
+  return { files: listAstroStyleFiles(projectPath, { reachingOnly: !all }) };
 });
 
 // Which stylesheets this page actually pulls in.
@@ -6018,6 +6102,45 @@ async function currentBranch(projectPath) {
   } catch {
     return null;
   }
+}
+
+// --- which branch is checked out, synchronously --------------------------------
+//
+// `currentBranch` above is async and every caller of it is too. The MCP context
+// is built synchronously, on the hot path of every operation, so it needs an
+// answer without an await — and it needs the RIGHT one, which is what this is
+// for: the branch a ref records is part of what makes that ref stale, and the
+// value it recorded came from the renderer's payload, which reads git once when
+// the project opens. Measured: a checkout through the Agent API's own git
+// surface, a ref minted two seconds later still carrying the old branch, and a
+// write through it succeeding.
+//
+// `branchOf` is the shipped reader — it already refuses to call a detached HEAD
+// a branch, which `rev-parse --abbrev-ref` would otherwise report as the branch
+// name "HEAD" — and it is already covered by test/review-provenance.js. One
+// reader, not a second spelling of the same question.
+//
+// CACHED FOR 1500 ms, which is the TTL electron/review/checkout.js already
+// chose for this exact question; two different answers to "how long is a branch
+// name good for" is a drift waiting to happen. The cache is dropped outright by
+// every handler that can move HEAD, so the TTL only ever covers a checkout made
+// outside Stacki — where a spawn per operation would be the wrong trade.
+const { branchOf: readBranchOf, git: syncGit } = require('./review/provenance');
+let branchCache = { root: null, at: 0, branch: null };
+const BRANCH_TTL_MS = 1500;
+
+function branchNow(root) {
+  if (!root) return null;
+  const now = Date.now();
+  if (branchCache.root === root && now - branchCache.at < BRANCH_TTL_MS) return branchCache.branch;
+  const branch = readBranchOf(root, syncGit);
+  branchCache = { root, at: now, branch };
+  return branch;
+}
+
+/** HEAD may have moved. The next read asks git rather than remembering. */
+function forgetBranch() {
+  branchCache = { root: null, at: 0, branch: null };
 }
 
 // --- Previewing an old version ---------------------------------------------

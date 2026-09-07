@@ -887,7 +887,7 @@ fullScenario({ domain: 'page', action: 'create', run: async ({ call, fixture }) 
 fullScenario({ domain: 'page', action: 'move', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-made', layout: 'Base' });
   const before = fixture.read('src/pages/wire-made.astro');
-  const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'moved/index.astro' });
+  const { envelope } = await call('page', 'move', { from: 'src/pages/wire-made.astro', to: 'src/pages/moved/index.astro' });
   const after = fixture.exists('src/pages/moved/index.astro') ? fixture.read('src/pages/moved/index.astro') : '';
   const spec = (after.match(/import\s+Base\s+from\s+'([^']+)'/) || [])[1] || '';
   return { envelope, checks: [
@@ -914,7 +914,7 @@ fullScenario({ domain: 'page', action: 'delete', run: async ({ call, fixture }) 
 } });
 
 fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixture }) => {
-  const { envelope } = await call('page', 'folder_create', { dir: 'wire-docs' });
+  const { envelope } = await call('page', 'folder_create', { dir: 'src/pages/wire-docs' });
   return { envelope, checks: [['the folder exists under pages', fixture.exists('src/pages/wire-docs')]] };
 } });
 
@@ -925,7 +925,7 @@ fullScenario({ domain: 'page', action: 'folder_create', run: async ({ call, fixt
 fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-docs/inner', layout: 'Base' });
   const before = fixture.read('src/pages/wire-docs/inner.astro');
-  const { envelope } = await call('page', 'folder_rename', { from: 'wire-docs', to: 'wire-guide' });
+  const { envelope } = await call('page', 'folder_rename', { from: 'src/pages/wire-docs', to: 'src/pages/wire-guide' });
   const after = fixture.exists('src/pages/wire-guide/inner.astro') ? fixture.read('src/pages/wire-guide/inner.astro') : '';
   const spec = (after.match(/import\s+Base\s+from\s+'([^']+)'/) || [])[1] || '';
   return { envelope, checks: [
@@ -945,7 +945,7 @@ fullScenario({ domain: 'page', action: 'folder_rename', run: async ({ call, fixt
 fullScenario({ domain: 'page', action: 'folder_delete', run: async ({ call, fixture }) => {
   await call('page', 'create', { name: 'wire-guide/doomed', layout: 'Base' });
   const before = fixture.exists('src/pages/wire-guide/doomed.astro');
-  const { envelope } = await call('page', 'folder_delete', { dir: 'wire-guide' });
+  const { envelope } = await call('page', 'folder_delete', { dir: 'src/pages/wire-guide' });
   return { envelope, checks: [
     ['the folder and the page in it were there first', before],
     ['the folder is gone', !fixture.exists('src/pages/wire-guide')],
