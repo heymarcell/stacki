@@ -1747,6 +1747,14 @@ const git = {
             hunks: fits ? clashes : null,
             hunksOmitted: !fits,
             markersUnread: unread,
+            // WHY THIS ONE HAS NO HUNKS, WHEN THE REASON IS A PROGRAM.
+            //
+            // A path a custom merge driver merged comes through with `hunks: []`
+            // like any other unsplittable file, and without this a client is left
+            // to guess why a plainly textual file offers nothing to answer one
+            // hunk at a time. Present only where it applies, so no other file's
+            // shape changes. See mergeAttributes in gitBranches.js.
+            ...(f?.customDriver ? { customDriver: f.customDriver } : {}),
           };
         });
         // THE HANDLE THAT SAYS WHICH CONFLICT THIS IS.
@@ -1804,7 +1812,14 @@ const git = {
             '`choices` key; `sourcePath` is the same file relative to the open PROJECT, which is what source.read ' +
             'and the rest of this surface take. They differ whenever the project sits inside a larger repository, ' +
             'and `sourcePath` is null for a conflicting file outside the project altogether — that one can still ' +
-            'be answered in `choices`, but not read through this surface.',
+            'be answered in `choices`, but not read through this surface. ' +
+            'A file carrying `customDriver` is a fourth case: a merge driver of the project\'s own produced ' +
+            'that conflict, and what it wrote is that program\'s output rather than git\'s conflict markup. ' +
+            'A custom driver is handed the three versions and writes its result; nothing requires it to emit ' +
+            'markers, or to put this branch before the incoming one if it does. So Stacki does not read hunk ' +
+            'sides out of it and offers none — a per-hunk array for that path is refused. Its whole-file ' +
+            '"ours" and "theirs" are still exact, because those are answered from git\'s index rather than ' +
+            'from the driver\'s text.',
         };
       }
       if (raw?.ok === false && raw.dirty) {
@@ -1940,7 +1955,14 @@ const git = {
           no_merged: `"${first.path}" hunk ${first.hunk} has no combined version, so "merged" is not one of its answers`,
           empty: `"${first.path}" was given an empty list of answers, which answers none of its hunks`,
           null: `"${first.path}" was given null, which is neither an answer nor leaving the file out`,
-          not_splittable: `"${first.path}" has no hunks to answer one at a time \u2014 it takes "ours" or "theirs" for the whole file`,
+          not_splittable: first.customDriver
+            ? `"${first.path}" was merged by the custom merge driver "${first.customDriver}", so what is in the ` +
+              'working tree is that program\'s output and not git\'s conflict markup. A custom driver is not ' +
+              'required to write markers at all, nor to put this branch\'s side first if it does, so Stacki ' +
+              'will not read hunk sides out of it and offers none to answer. Send "ours" or "theirs" for the ' +
+              'whole file \u2014 those are taken from git\'s index and are exact \u2014 or reconcile the file in the ' +
+              'project by hand.'
+            : `"${first.path}" has no hunks to answer one at a time \u2014 it takes "ours" or "theirs" for the whole file`,
           // THE ONE REFUSAL THAT HAS NO ANSWER TO SUGGEST. The file still holds
           // conflict markers this could not read, so the hunk list it was
           // described with was empty for a file git says is conflicted — and

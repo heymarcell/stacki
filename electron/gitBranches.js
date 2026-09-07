@@ -559,6 +559,10 @@ async function mergeAttributes(git, root, files) {
   const sizes = new Map();
   // The paths git did NOT merge itself. See the `merge` branch below.
   const driven = new Set();
+  // The paths a program of the project's own merged, and which one. Its output
+  // is opaque: nothing here reads branch sides out of it. See the `merge`
+  // branch below, which is where the measurement lives.
+  const custom = new Map();
   // AND THE DRIVER NAMED IN CONFIG RATHER THAN IN AN ATTRIBUTE.
   //
   // `merge.default` names the low-level driver for every path that has no
@@ -579,7 +583,61 @@ async function mergeAttributes(git, root, files) {
     // Unset is exit 1, which is an answer: no default driver.
     byDefault = null;
   }
-  const isDriver = (value) => !!value && !['unspecified', 'unset', 'set', 'text'].includes(value);
+  // AND WHICH OF THOSE NAMES IS A DRIVER THAT EXISTS.
+  //
+  // `merge=<name>` does not mean a program ran. A name with no
+  // `merge.<name>.driver` behind it is not an error and is not a driver: git
+  // falls back to the built-in text driver and writes its ordinary diff3
+  // markup. MEASURED, git 2.50.1, `a.txt merge=reverse` with
+  // `merge.reverse.driver` defined and then not: defined, the worktree held the
+  // driver's own block; undefined, it held `<<<<<<< HEAD … ||||||| <base> …
+  // >>>>>>> feature` — git's, ancestor line and all. `merge.default=nosuch`
+  // behaves the same way.
+  //
+  // So the question is not "is this string one of git's words" but "does this
+  // name resolve to a program". One `--get-regexp` answers it for every name at
+  // once, and costs one process for the whole call.
+  const defined = new Set();
+  try {
+    const raw = String((await git(root, ['config', '-z', '--get-regexp', '^merge\\..*\\.driver$'])).stdout || '');
+    for (const entry of raw.split('\0')) {
+      if (!entry) continue;
+      // "<key>\n<value>" per entry with -z, and a value may hold anything —
+      // newlines included — so the key is everything before the FIRST one.
+      const nl = entry.indexOf('\n');
+      const key = nl === -1 ? entry : entry.slice(0, nl);
+      // `merge.` … `.driver`, and what is between them is the name. Sliced
+      // rather than split on dots: a subsection name may itself contain them
+      // (`[merge "my.driver"]`), and splitting would lose that.
+      if (key.startsWith('merge.') && key.endsWith('.driver')) defined.add(key.slice(6, -7));
+    }
+  } catch {
+    // Exit 1 is "no key matched", which is an answer: no driver is defined.
+  }
+  // GIT'S OWN BUILT-INS, AND WHAT ITS ATTRIBUTE WORDS MEAN.
+  //
+  // gitattributes(5), every row confirmed against git 2.50.1:
+  //
+  //   unspecified   no `merge` attribute — `merge.default` decides, and with
+  //                 none set that is the built-in text driver.
+  //   set           `a.txt merge` — the built-in text driver.
+  //   unset         `a.txt -merge` — BINARY semantics: this branch's version is
+  //                 left in the worktree verbatim and the path marked
+  //                 conflicted. No markers are written.
+  //   text          the built-in text driver, said out loud.
+  //   binary        as `unset`.
+  //   union         both sides concatenated. MEASURED: it does not conflict at
+  //                 all — the merge exits 0 with no unmerged stages — so it
+  //                 never reaches the conflict surfaces below.
+  //   anything else a driver name, and a program only if it is `defined`.
+  const BUILT_IN = new Set(['text', 'binary', 'union']);
+  const effective = (value) => {
+    // Only a path with no attribute of its own falls to `merge.default`.
+    if (value === 'unspecified') return byDefault || 'text';
+    if (value === 'set') return 'text';
+    if (value === 'unset') return 'binary';
+    return value;
+  };
   const list = (files || []).filter((file) => typeof file === 'string' && file);
   const ask = async (batch) => {
     // "<path>\0conflict-marker-size\0<value>\0" per path, and the value is
@@ -608,13 +666,46 @@ async function mergeAttributes(git, root, files) {
         // hunk. Git can be asked which paths those are, so it is asked, rather
         // than the assumption being loosened for every path to cover them.
         //
-        // The four values that are not a driver name are git's own words for
-        // "nothing was said" and for the two built-in settings; `union` and
-        // `binary` are drivers as much as a project's own script is, and
-        // neither writes diff3 markup.
-        // `unspecified` means the path has no attribute of its own, and then
-        // `merge.default` — if there is one — is what git used. See byDefault.
-        if (isDriver(value) || (value === 'unspecified' && byDefault)) driven.add(fields[at]);
+        // AND A PROGRAM'S OUTPUT IS NOT GIT'S GRAMMAR, WHICH IS A BIGGER THING
+        // THAN THE ANCESTOR LINE.
+        //
+        // Relaxing the ancestor-line rule was right and was not enough. It says
+        // only "do not require the `|||||||` line"; it does NOT say the block
+        // that is there uses git's meanings. A custom driver is handed %O, %A
+        // and %B and writes its result into %A. Nothing in the contract makes it
+        // emit markers at all, and nothing makes the text above `=======` this
+        // branch and the text below it the incoming one — that ordering is the
+        // BUILT-IN text driver's, not a property of conflict markup.
+        //
+        // MEASURED, git 2.50.1, a driver that writes a perfectly well-formed
+        // block with the sides REVERSED (`<<<<<<< custom` / %B / `=======` /
+        // %A / `>>>>>>> custom`, exit 1). The parse read one clash with
+        // `ours: "FEATURE-ONLY-BYTES"` and `theirs: "MAIN-ONLY-BYTES"` — the
+        // exact inverse of the index, whose stage 2 was MAIN and stage 3
+        // FEATURE. A caller answering `["theirs"]` had this branch's own bytes
+        // committed as the incoming side's, `{ok: true}`, two parents, clean
+        // tree. Nothing about the markup was malformed; the semantics were
+        // simply not git's to read.
+        //
+        // There is no reading of arbitrary output that fixes that, so the output
+        // is not read. A genuine custom driver's path is carried in `custom` and
+        // treated as opaque: no hunks are offered for it, a per-hunk answer is
+        // refused before anything is written, and the whole-file words keep
+        // working because they are answered from the index — stage 2 and stage 3
+        // are git's facts and owe the driver nothing.
+        //
+        // `driven` stays what it was: every path git did not merge with its
+        // built-in TEXT driver, which is the set for which the ancestor-line
+        // rule does not hold. `custom` is the subset whose markup is a
+        // program's. See BUILT_IN, effective and defined above for how each
+        // attribute word resolves.
+        const name = effective(value);
+        const builtIn = BUILT_IN.has(name);
+        // A name with no program behind it is git's text driver, so it is
+        // neither driven nor opaque. See `defined`.
+        const genuine = !builtIn && defined.has(name);
+        if (genuine || (builtIn && name !== 'text')) driven.add(fields[at]);
+        if (genuine) custom.set(fields[at], name);
         continue;
       }
       // AN ANSWER OF "SEVEN" IS STILL AN ANSWER, AND HAS TO BE TOLD APART FROM
@@ -660,7 +751,7 @@ async function mergeAttributes(git, root, files) {
       }
     }
   }
-  return { sizes, driven };
+  return { sizes, driven, custom };
 }
 
 /**
@@ -1044,7 +1135,7 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
     // directory levels it walks looking for a `.gitattributes`, not its size.
     return segments.length <= MAX_PATH_SEGMENTS && !segments.includes('..');
   });
-  const { sizes: namedSizes, driven: namedDriven } = await mergeAttributes(git, at, askable.slice(0, MARKER_SIZE_ASK_MAX));
+  const { sizes: namedSizes, driven: namedDriven, custom: namedCustom } = await mergeAttributes(git, at, askable.slice(0, MARKER_SIZE_ASK_MAX));
   try {
     // Same style as the trial merge above, or the markers this re-parses would
     // not be the ones the answers were given against.
@@ -1274,12 +1365,15 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
   const conflicted = new Set(left);
   // The widths, with the pre-merge reading preferred over the post-merge one
   // wherever there is one. See conflictMarkerSizes and `namedSizes` above.
-  const { sizes: markerSizes, driven } = await mergeAttributes(git, at, left.filter((file) => !namedSizes.has(file)));
+  const { sizes: markerSizes, driven, custom } = await mergeAttributes(git, at, left.filter((file) => !namedSizes.has(file)));
   for (const [file, width] of namedSizes) markerSizes.set(file, width);
   // The same pre-merge preference for `merge=<driver>`, and for the same
   // reason: the attribute git resolved this merge against is the one in the
   // tree BEFORE it, which is the tree the unwind restored. See mergeAttributes.
   for (const file of namedDriven) driven.add(file);
+  // And the same preference for WHICH driver, for the same reason: the
+  // attribute git resolved this merge against is the pre-merge one.
+  for (const [file, name] of namedCustom) custom.set(file, name);
   // Parsed once and kept. The apply loop below reads the same answer rather
   // than opening the file a second time — and, more to the point, rather than
   // deciding a length against one parse and applying it against another.
@@ -1296,7 +1390,20 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       // `!driven.has(file)`: the ancestor-line rule holds for markup GIT wrote,
       // and a `merge=<driver>` path's markup is the driver's. See
       // mergeAttributes.
-      parts = text === null ? null : parseConflict(text, markerSizes.get(file), !driven.has(file));
+      // A CUSTOM DRIVER'S OUTPUT IS NOT SPLIT AT ALL.
+      //
+      // `!driven.has(file)` only drops the ancestor-line requirement. It does
+      // not make the block that is there mean what git's means, and a driver is
+      // free to write the sides in either order — measured doing exactly that,
+      // and committing this branch's bytes for an answer of "theirs". So a path
+      // a program merged has no parts: `null` here is the same shape a binary
+      // file has, and it is what makes the array-choice branch below refuse with
+      // `not_splittable` before anything is written, while the whole-file words
+      // go on being answered from the index. See mergeAttributes.
+      parts =
+        text === null || custom.has(file)
+          ? null
+          : parseConflict(text, markerSizes.get(file), !driven.has(file));
     } catch {
       // Binary, or one side deleted it: there is no marked-up text to split,
       // so the only answer this file can take is a whole-file one.
@@ -1611,7 +1718,17 @@ async function resolveMerge(git, { projectPath, branch, choices, expect }) {
       }
       const parts = partsOf(file);
       if (parts === null) {
-        unusable.push({ path: file, given: 'an array', reason: 'not_splittable', expected: [...WHOLE_FILE] });
+        unusable.push({
+          path: file,
+          given: 'an array',
+          reason: 'not_splittable',
+          expected: [...WHOLE_FILE],
+          // WHICH program, when a program is why. The refusal reads the same for
+          // a binary file and for a custom-driven one, and those want different
+          // sentences: one has no text to split, the other has text nobody may
+          // read as git's. See mergeAttributes and the mapper in domains.js.
+          ...(custom.has(file) ? { customDriver: custom.get(file) } : {}),
+        });
         continue;
       }
       const hunks = clashCount(parts);
@@ -1921,7 +2038,7 @@ async function mergeBranch(git, { projectPath, branch }) {
       // adds, changes or conflicts in `.gitattributes` is asked about the
       // version git actually read rather than the one it just produced. See
       // conflictMarkerSizes, which has both measurements.
-      const { sizes: markerSizes, driven } = await mergeAttributes(git, root, files);
+      const { sizes: markerSizes, driven, custom } = await mergeAttributes(git, root, files);
       for (const clash of clashes) {
         // WHICH WIDTH `parts` WAS READ AT, carried with them. The MCP git domain
         // asks `unreadMarkers` about these same parts on the way out and cannot
@@ -1940,8 +2057,23 @@ async function mergeBranch(git, { projectPath, branch }) {
         // `!driven.has(...)`: true for the same reason resolveMerge passes it,
         // and false for the same paths — markup a `merge=<driver>` wrote is not
         // git's diff3 output and carries no ancestor line. See mergeAttributes.
+        // AND A PATH A PROGRAM MERGED HAS NO PARTS AT ALL.
+        //
+        // `!driven.has(...)` drops the ancestor-line requirement; it cannot make
+        // a custom driver's block carry git's meanings, and one measured writing
+        // the sides reversed had `["theirs"]` commit this branch's own bytes. So
+        // no hunks are offered for it. `null` here is the shape a binary file
+        // already has, and the envelope reads it the same way: both sides are on
+        // the clash, so it goes out as an empty hunk list — a whole-file "ours"
+        // or "theirs", answered from the index, and nothing per-hunk. See
+        // mergeAttributes and domains.js.
         clash.parts =
-          clash.text === null ? null : parseConflict(clash.text, clash.markerSize, !driven.has(clash.path));
+          clash.text === null || custom.has(clash.path)
+            ? null
+            : parseConflict(clash.text, clash.markerSize, !driven.has(clash.path));
+        // WHICH driver, so the envelope can say so rather than leaving a client
+        // to guess why a conflicting file offers no hunks.
+        if (custom.has(clash.path)) clash.customDriver = custom.get(clash.path);
         // The raw marked-up bytes were a working value, not something to put on
         // the wire: the panel reads `ours`/`theirs`, the MCP envelope reads
         // `parts`, and nothing wants a third copy of the file.

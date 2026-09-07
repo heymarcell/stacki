@@ -34,7 +34,7 @@ const { guardSuite } = require('./support/suiteGuard.js');
 // The one reading of a parsed conflict T31 needs: whether the clash runs to the
 // end of the file, which is the only place the final newline is not in the
 // marked-up text.
-const { conflictAtEnd, clashCount, unreadMarkers } = require('../electron/conflicts.js');
+const { conflictAtEnd, clashCount, unreadMarkers, parseConflict } = require('../electron/conflicts.js');
 // The project-relative resolver the rest of the MCP surface puts every path
 // through. T22 checks the git domain's `sourcePath` against IT rather than by
 // joining strings here: a spelling this file agrees with but resolveInProject
@@ -3620,6 +3620,27 @@ async function suite() {
     // agreed text; clashCount() is then 0; and the whole-file default "ours"
     // used to sail through the choices validator as legal vocabulary and commit
     // the incoming branch away.
+    //
+    // AND THE ANSWER TO IT CHANGED, BECAUSE THE DESCRIPTION DID.
+    //
+    // This fixture is a CUSTOM DRIVER, and a custom driver's output is no longer
+    // read at all — not for hunks, and so not for markers left in it either. The
+    // refusal that used to cover this path was `unreadable_conflict`, whose
+    // reason is that the caller would be answering a false description of the
+    // file; the file is now described truthfully (`hunks: []`, `customDriver`,
+    // and a note saying what that means), so that reason no longer applies.
+    //
+    // What replaces it is narrower and, on the one thing that can corrupt a
+    // tree, stronger: a PER-HUNK answer is refused outright — no hunk is
+    // countable out of a program's output — while the whole-file words are
+    // allowed BECAUSE THEY NEVER TOUCH THE DRIVER'S TEXT. `git checkout --ours`
+    // and `--theirs` read index stages 2 and 3, which are git's own facts. Both
+    // are asserted below to land the exact blob, so the incoming work is
+    // reachable rather than lost.
+    //
+    // The `unreadable_conflict` protection itself is unchanged and still under
+    // test, on the paths it is actually about — ones GIT marked up and this
+    // could not read. See the T36 control and the CRLF fixtures above.
     const dir = await repo('unreadable');
     cleanup.push(dir);
     await sh(dir, 'checkout', '-qb', 'feature');
@@ -3643,54 +3664,76 @@ async function suite() {
     const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
     check('T29: the fixture conflicts', clash.ok === false && clash.conflicted === true, JSON.stringify(clash).slice(0, 200));
     const file = (clash.files || [])[0] || {};
-    check('T29: and the parse finds no hunks in it', (file.parts || []).filter((p) => p.kind === 'clash').length === 0, JSON.stringify(file.parts));
-    check('T29:   with git’s marker still sitting in the text it calls agreed', (file.parts || []).some((p) => p.kind === 'same' && p.text.includes('<<<<<<<')), JSON.stringify(file.parts));
+    check('T29: nothing is read out of the driver`s output at all', file.parts === null, JSON.stringify(file.parts));
+    check('T29:   and the path is named as a driver`s', file.customDriver === 'unclosed', JSON.stringify(file.customDriver));
 
     const before = await repoState(dir);
-    const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+    const answer = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at }));
     check('T29: the resolve does not throw', answer.error === null, String(answer.error));
     await refusedCleanly(
-      'T29: a whole-file answer to a file whose markers went unread',
+      'T29: a per-hunk answer to a driver`s output',
       answer.value,
       dir,
       before,
       'bad_choices',
-      (r) => r?.badChoices?.[0]?.path === 'a.txt' && r?.badChoices?.[0]?.reason === 'unreadable_conflict'
+      (r) => r?.badChoices?.[0]?.path === 'a.txt' && r?.badChoices?.[0]?.reason === 'not_splittable'
     );
-    check('T29:   with nothing to suggest sending instead', JSON.stringify(answer.value?.badChoices?.[0]?.expected) === '[]', JSON.stringify(answer.value?.badChoices?.[0]));
-    check('T29:   and a sentence that says the markers could not be read', /could not read/.test(String(answer.value?.message || '')), String(answer.value?.message));
-    check('T29:   and sends the person to the project', /by hand/.test(String(answer.value?.message || '')), String(answer.value?.message));
+    check('T29:   naming the driver that produced it', answer.value?.badChoices?.[0]?.customDriver === 'unclosed', JSON.stringify(answer.value?.badChoices?.[0]));
+    check('T29:   and offering the two words that do answer it', JSON.stringify(answer.value?.badChoices?.[0]?.expected) === '["ours","theirs"]', JSON.stringify(answer.value?.badChoices?.[0]));
     check('T29: THE INCOMING WORK IS STILL ON ITS BRANCH', (await sh(dir, 'show', 'feature:a.txt')) === 'INCOMING-WORK', await sh(dir, 'show', 'feature:a.txt'));
     check('T29:   and nothing was merged into this one', (await sh(dir, 'log', '-1', '--format=%P')).split(' ').length === 1, await sh(dir, 'log', '-1', '--format=%P'));
 
-    // THE OTHER THREE WAYS OF ANSWERING IT, refused the same way — the
-    // deliberate "theirs" as much as the default nobody typed, because every
-    // one of them was decided against a description of the file that was false.
-    for (const [what, choices] of [
-      ['the incoming side named outright', { 'a.txt': 'theirs' }],
-      ['the documented default, left out entirely', {}],
-      ['a per-hunk list', { 'a.txt': ['ours'] }],
+    // AND THE INCOMING WORK IS REACHABLE, which is what makes the refusal above
+    // a narrowing rather than a wall. The driver here DISCARDS %B outright — it
+    // never looks at the incoming side — and "theirs" still lands the incoming
+    // blob exactly, because it is taken from index stage 3 and not from anything
+    // the driver wrote. Each side gets its own fixture: a resolve commits.
+    for (const [side, want] of [
+      ['ours', 'OURS'],
+      ['theirs', 'INCOMING-WORK'],
     ]) {
-      const also = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices, expect: clash.at }));
-      check(`T29: ${what} is refused too`, also.value?.ok === false && also.value?.badChoices?.[0]?.reason === 'unreadable_conflict', JSON.stringify(also.value?.badChoices || also.error));
+      const one = await repo(`unreadable-${side}`);
+      cleanup.push(one);
+      await sh(one, 'checkout', '-qb', 'feature');
+      fs.writeFileSync(path.join(one, 'a.txt'), 'INCOMING-WORK\n');
+      await sh(one, 'add', '-A');
+      await sh(one, 'commit', '-qm', 'incoming');
+      await sh(one, 'checkout', '-q', 'main');
+      fs.writeFileSync(path.join(one, 'a.txt'), 'OURS\n');
+      await sh(one, 'add', '-A');
+      await sh(one, 'commit', '-qm', 'ours');
+      const drv = path.join(one, '.git', 'unclosed.sh');
+      fs.writeFileSync(drv, '#!/bin/sh\nprintf "<<<<<<< HEAD\\nOURS\\n" > "$1"\nexit 1\n');
+      fs.chmodSync(drv, 0o755);
+      fs.writeFileSync(path.join(one, '.git', 'info', 'attributes'), '*.txt merge=unclosed\n');
+      await sh(one, 'config', 'merge.unclosed.driver', `${drv} %A`);
+      const c = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+      const done = await resolveMerge(git, { projectPath: one, branch: 'feature', choices: { 'a.txt': side }, expect: c.at });
+      check(`T29: whole-file ${side} on a driver-merged path merges`, done?.ok === true, JSON.stringify(done));
+      check(`T29:   into the index's own ${side} bytes`, (await sh(one, 'show', 'HEAD:a.txt')) === want, await sh(one, 'show', 'HEAD:a.txt'));
+      check(`T29:   as a two-parent merge commit`, (await sh(one, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(one, 'log', '-1', '--format=%P'));
+      check(`T29:   and none of the driver's markup reached the tree`, !(await sh(one, 'show', 'HEAD:a.txt')).includes('<<<<<<<'), await sh(one, 'show', 'HEAD:a.txt'));
     }
-    check('T29:   and after all of them the default answer was recorded', answer.value?.badChoices?.[0]?.given === 'ours', JSON.stringify(answer.value?.badChoices?.[0]));
 
     // WHAT AN AGENT IS TOLD ABOUT SUCH A FILE, on both surfaces.
     const { DOMAINS: MAPPERS } = require('../electron/mcp/agent/domains.js');
     const env = await MAPPERS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'ref' });
     const entry = (env?.files || [])[0] || {};
-    check('T29 MCP: the file is NOT described as having zero conflicting hunks', entry.hunks !== null ? false : true, JSON.stringify(entry));
+    // `[]` rather than `null`: this path HAS both sides in the index, so a
+    // whole-file word answers it. `null` would tell the agent nothing does.
+    check('T29 MCP: the file is offered no hunks', Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry));
     check('T29 MCP:   and is not passed off as omitted for size', entry.hunksOmitted === false, JSON.stringify(entry));
-    check('T29 MCP:   it says the markers went unread', entry.markersUnread === true, JSON.stringify(entry));
+    check('T29 MCP:   nor as markers that went unread, which is a different thing', entry.markersUnread === false, JSON.stringify(entry));
+    check('T29 MCP:   it names the driver that produced the conflict', entry.customDriver === 'unclosed', JSON.stringify(entry));
     // AND THE ENVELOPE SAYS WHAT THAT FIELD MEANS. The same envelope tells the
     // agent to send "exactly as many entries as the hunks listed here", and for
     // this file there are none to count — a field it has to guess the meaning
     // of would send it back to that instruction.
-    check('T29 MCP:   and the note explains what that means for the answer', /markersUnread/.test(String(env?.note || '')) && /by hand/.test(String(env?.note || '')), String(env?.note));
+    check('T29 MCP:   and the note still explains markersUnread for the files it applies to', /markersUnread/.test(String(env?.note || '')) && /by hand/.test(String(env?.note || '')), String(env?.note));
+    check('T29 MCP:   and explains customDriver too', /customDriver/.test(String(env?.note || '')) && /merge driver/.test(String(env?.note || '')), String(env?.note).slice(0, 400));
     const mapped = await MAPPERS.git.resolve_merge.result(answer.value, { branch: 'feature' }, { root: dir });
     check('T29 MCP: the refusal is still bad_choices', mapped?.code === 'bad_choices', JSON.stringify({ code: mapped?.code }));
-    check('T29 MCP:   naming the unread markers rather than the vocabulary', /markers Stacki could not read/.test(String(mapped?.message || '')), String(mapped?.message));
+    check('T29 MCP:   naming the driver rather than the vocabulary', /custom merge driver "unclosed"/.test(String(mapped?.message || '')), String(mapped?.message));
 
     // THE CONTROL: a file with no markers because there is genuinely nothing
     // marked up — a modify/delete — still takes a whole-file answer. The
@@ -5144,6 +5187,18 @@ async function suite() {
       await sh(second, 'add', '-A');
       await sh(second, 'commit', '-qm', 'ours');
       const inside = path.join(second, 'site');
+      // THE BYTES THIS BRANCH HELD BEFORE THE MERGE, CAPTURED BEFORE IT.
+      //
+      // The assertion below used to read `HEAD:… === main~0:…`, which after a
+      // merge committed ON main compares HEAD with itself: main has moved to the
+      // merge commit, and `main~0` is main. It could not fail, and its `||
+      // …includes('OURS')` arm could not either — every fixture body in this
+      // block contains the word. MEASURED: with the default side sabotaged to
+      // take `--theirs`, the old pair stayed green over a HEAD holding the
+      // INCOMING bytes. So the comparand is read now, while `main` still means
+      // the pre-merge commit, and the check below is an equality against it with
+      // no substring arm to fall back on.
+      const oursBefore = await blob(second, 'main:site/page.txt');
       const unnamedClash = await mergeBranch(git, { projectPath: inside, branch: 'feature' });
       // `choices: {}` — the path takes the documented default, so its width can
       // only have come from the post-merge read.
@@ -5151,7 +5206,23 @@ async function suite() {
       check('T33 subdirectory project: a path the call never named still merges', unnamed.value?.ok === true, JSON.stringify(unnamed.value || unnamed.error).slice(0, 260));
       check(
         'T33 subdirectory project:   keeping this branch, byte for byte',
-        (await blob(second, 'HEAD:site/page.txt')) === (await blob(second, 'main~0:site/page.txt')) ||
+        (await blob(second, 'HEAD:site/page.txt')) === oursBefore,
+        JSON.stringify({ head: await blob(second, 'HEAD:site/page.txt'), oursBefore })
+      );
+      // AND THE THREE THINGS THAT MAKE THAT EQUALITY MEAN SOMETHING.
+      //
+      // A byte equality alone would also hold if nothing had been merged at all,
+      // so the shape of the commit is asserted beside it: a real two-parent
+      // merge, with the incoming branch's distinctive line absent from the
+      // result and this branch's present.
+      check(
+        'T33 subdirectory project:   as a real two-parent merge commit',
+        (await sh(second, 'log', '-1', '--format=%P')).split(' ').length === 2,
+        await sh(second, 'log', '-1', '--format=%P')
+      );
+      check(
+        'T33 subdirectory project:   and the incoming line is not in it',
+        !(await blob(second, 'HEAD:site/page.txt')).includes('THEIRS') &&
           (await blob(second, 'HEAD:site/page.txt')).includes('OURS'),
         JSON.stringify(await blob(second, 'HEAD:site/page.txt'))
       );
@@ -5632,7 +5703,24 @@ async function suite() {
   }
 
   // T36 — MARKUP A `merge=<driver>` PATH CAME BACK WITH IS THE DRIVER'S, NOT
-  // GIT'S, AND THE ANCESTOR-LINE RULE DOES NOT HOLD FOR IT.
+  // GIT'S, AND NOTHING MAY BE READ OUT OF IT AS A SIDE.
+  //
+  // AND THAT IS BIGGER THAN THE ANCESTOR LINE, WHICH IS WHERE THIS BLOCK USED
+  // TO STOP. Dropping the `|||||||` requirement let the driver's block be read;
+  // it did not make the reading MEAN anything. A custom driver is handed %O, %A
+  // and %B and writes its result into %A, and nothing in git's contract makes
+  // the text above `=======` this branch and the text below it the incoming one
+  // — that ordering belongs to the BUILT-IN text driver.
+  //
+  // MEASURED, git 2.50.1, a driver writing a well-formed block with the sides
+  // reversed: the parse produced one clash whose `ours` was the INCOMING bytes
+  // and whose `theirs` was this branch's, the exact inverse of the index, and
+  // `["theirs"]` committed this branch's own work as the incoming side's under
+  // `{ok: true}` with two parents and a clean tree. So the assertions below no
+  // longer ask for a hunk out of a driver's output: they ask that none is
+  // offered, that a per-hunk answer is refused before anything is written, and
+  // that the whole-file words still work — because those are answered from the
+  // index, which owes the driver nothing.
   //
   // The diff3 reading is entitled to one thing: Stacki merges with
   // `-c merge.conflictStyle=diff3` and git writes the ancestor line into every
@@ -5687,19 +5775,23 @@ async function suite() {
       const dir = await driven('driver-reads', TWO_MARKER);
       const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
       const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
-      check('T36 driver: the two-marker block reads as one disagreement', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
-      check('T36 driver:   and is not reported as unreadable', unreadMarkers(file.parts || [], file.markerSize) === false);
+      check('T36 driver: no hunks are read out of the driver`s block', file.parts === null, JSON.stringify(file.parts));
+      check('T36 driver:   and the path is named as the driver`s', file.customDriver === 'twomark', JSON.stringify(file.customDriver));
       const mcp = DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' });
       const entry = (mcp?.files || []).find((f) => f.path === 'a.txt') || {};
-      check('T36 driver:   the agent is given the hunk', Array.isArray(entry.hunks) && entry.hunks.length === 1, JSON.stringify(entry).slice(0, 200));
-      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
-      check('T36 driver:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
-      // Against GIT'S OWN BLOB, with the untrimmed reader. `sh` trims, and what
-      // it trims is exactly the final newline renderResolved's terminator work
-      // is about — so this assertion also held for a rebuild that dropped it and
-      // for one that appended a stray CR. See blob().
-      check('T36 driver:   into the bytes it asked for', (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
-      check('T36 driver:   over a clean tree', (await sh(dir, 'status', '--porcelain')) === '', await sh(dir, 'status', '--porcelain'));
+      // `[]` and not `null`: both sides are in the index, so the file takes a
+      // whole-file word. `null` in this envelope means nothing answers it, which
+      // would be untrue here. See domains.js.
+      check('T36 driver:   the agent is offered no hunks but both sides', Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry).slice(0, 240));
+      check('T36 driver:   and is told a driver is why', entry.customDriver === 'twomark' && entry.markersUnread === false && entry.hunksOmitted === false, JSON.stringify(entry).slice(0, 240));
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      await refusedCleanly('T36 driver: a per-hunk answer to a driver`s output', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable' && b.customDriver === 'twomark')
+      );
+      const said = String((await DOMAINS.git.resolve_merge.result(out.value, { branch: 'feature' }, { root: dir }))?.message || '');
+      check('T36 driver:   and the sentence names the driver', said.includes('twomark'), said.slice(0, 300));
+      check('T36 driver:   and says the whole-file words are still exact', /"ours" or "theirs" for the\s+whole file|whole file/.test(said), said.slice(0, 400));
     }
 
     // THE WHOLE-FILE ANSWER TOO, both directions.
@@ -5718,11 +5810,14 @@ async function suite() {
       const dir = await driven('driver-silent', 'printf "head\\nBOTH\\ntail\\n" > %A; exit 1');
       const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
       const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
-      check('T36 driver: markup with no markers offers no hunks', clashCount(file.parts || []) === 0, String(clashCount(file.parts || [])));
+      check('T36 driver: markup with no markers offers no hunks', file.parts === null, JSON.stringify(file.parts));
       const before = await repoState(dir);
       const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['ours'] }, expect: clash.at }));
+      // `not_splittable` and no longer `wrong_length`: the answer is not the
+      // wrong LENGTH for this path, there is no length it could be. Nothing is
+      // counted out of a driver's output.
       await refusedCleanly('T36 driver: a per-hunk answer for it', out.value, dir, before, 'bad_choices', (a) =>
-        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'wrong_length')
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable')
       );
       const ok = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at });
       check('T36 driver:   and the whole-file answer merges', ok?.ok === true, JSON.stringify(ok));
@@ -6118,6 +6213,13 @@ async function suite() {
   // refused it, and every answer came back `unreadable_conflict`. That is
   // verbatim the failure the attribute lookup was added to close, one config
   // key over. See T36 for the attribute half.
+  //
+  // AND EVERY GUARANTEE T36 MAKES HAS TO HOLD HERE TOO, which is the point of
+  // keeping this block: a driver reached through config is as much a program as
+  // one named in an attribute, so its output is as opaque. The assertions below
+  // are T36's, one config key over — no hunks offered, a per-hunk answer refused
+  // before anything is written, and both whole-file words exact against the
+  // index.
   {
     const dir = await repo('driver-in-config');
     cleanup.push(dir);
@@ -6139,10 +6241,234 @@ async function suite() {
     check('T43 premise: the path has no merge attribute of its own', (await sh(dir, 'check-attr', 'merge', '--', 'a.txt')) === 'a.txt: merge: unspecified', await sh(dir, 'check-attr', 'merge', '--', 'a.txt'));
     const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
     const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
-    check('T43: the driver`s two-marker block reads as one disagreement', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
-    const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
-    check('T43:   and the per-hunk answer merges', out?.ok === true && out.resolved === 1, JSON.stringify(out));
-    check('T43:   into the bytes it asked for', (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
+    check('T43: no hunks are read out of the config-named driver`s block', file.parts === null, JSON.stringify(file.parts));
+    check('T43:   and the path is named as that driver`s', file.customDriver === 'twomark', JSON.stringify(file.customDriver));
+    const before = await repoState(dir);
+    const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+    await refusedCleanly('T43: a per-hunk answer to it', out.value, dir, before, 'bad_choices', (a) =>
+      (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable' && b.customDriver === 'twomark')
+    );
+    // AND THE WHOLE-FILE WORDS, WHICH ARE THE ANSWER THIS PATH DOES TAKE. Both
+    // directions, against git's own blobs: these come from the index and are
+    // exact however the driver wrote its output.
+    for (const side of ['ours', 'theirs']) {
+      const one = await repo(`driver-in-config-${side}`);
+      cleanup.push(one);
+      await sh(one, 'config', 'merge.twomark.driver', 'printf "head\n<<<<<<< ours\nOURS\n=======\nTHEIRS\n>>>>>>> theirs\ntail\n" > %A; exit 1');
+      await sh(one, 'config', 'merge.default', 'twomark');
+      fs.writeFileSync(path.join(one, 'a.txt'), 'head\nBASE\ntail\n');
+      await sh(one, 'add', '-A');
+      await sh(one, 'commit', '-qm', 'base');
+      await sh(one, 'branch', 'feature');
+      fs.writeFileSync(path.join(one, 'a.txt'), 'head\nOURS\ntail\n');
+      await sh(one, 'commit', '-qam', 'ours');
+      await sh(one, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(one, 'a.txt'), 'head\nTHEIRS\ntail\n');
+      await sh(one, 'commit', '-qam', 'theirs');
+      await sh(one, 'checkout', '-q', 'main');
+      const c = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+      const done = await resolveMerge(git, { projectPath: one, branch: 'feature', choices: { 'a.txt': side }, expect: c.at });
+      check(`T43: whole-file ${side} merges`, done?.ok === true, JSON.stringify(done));
+      check(
+        `T43:   into ${side}, byte for byte`,
+        (await blob(one, 'HEAD:a.txt')) === (await blob(one, side === 'ours' ? 'main~0^1:a.txt' : 'feature:a.txt')),
+        JSON.stringify(await blob(one, 'HEAD:a.txt'))
+      );
+      check(`T43:   as a two-parent merge commit`, (await sh(one, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(one, 'log', '-1', '--format=%P'));
+    }
+  }
+
+  // T44 — A CUSTOM DRIVER'S OUTPUT CARRIES NO BRANCH SIDES, AND THE PROOF IS A
+  // DRIVER THAT REVERSES THEM.
+  //
+  // T36 and T43 establish that a driver's markup is not read. This block is the
+  // reason: a driver is free to write a perfectly well-formed block that MEANS
+  // the opposite of what git's means, and no property of the markup can tell
+  // the two apart. Everything here is real git — a real `merge.<name>.driver`
+  // receiving %O, %A and %B and writing its result into %A, exactly as
+  // gitattributes(5) specifies.
+  //
+  // The oracle is bytes, not shape: the caller asks for the INCOMING side and
+  // the tree must end up holding index stage 3. Under the reading this replaces,
+  // the same call committed stage 2.
+  {
+    // %O %A %B, result into %A, non-zero to declare the conflict.
+    const REVERSED = '#!/bin/sh\nkeep=$(cat "$2")\n{ echo "<<<<<<< custom"; cat "$3"; echo "======="; printf "%s\\n" "$keep"; echo ">>>>>>> custom"; } > "$2"\nexit 1\n';
+    const CONVENTIONAL = '#!/bin/sh\nkeep=$(cat "$2")\n{ echo "<<<<<<< HEAD"; printf "%s\\n" "$keep"; echo "======="; cat "$3"; echo ">>>>>>> incoming"; } > "$2"\nexit 1\n';
+    const NOISE = '#!/bin/sh\nprintf "the driver could not merge this; see the build log\\n" > "$2"\nexit 1\n';
+
+    // OURS and THEIRS are one line each and distinct, so a byte comparison says
+    // which branch won and no substring can be true of both.
+    const OURS_B = 'MAIN-ONLY-BYTES\n';
+    const THEIRS_B = 'FEATURE-ONLY-BYTES\n';
+
+    const driven = async (name, { script = null, define = true, attr = null, byDefault = false } = {}) => {
+      const dir = await repo(name);
+      cleanup.push(dir);
+      if (script) {
+        const at = path.join(dir, '.git', 'drv.sh');
+        fs.writeFileSync(at, script, { mode: 0o755 });
+        if (define) await sh(dir, 'config', 'merge.mydrv.driver', `${at} %O %A %B`);
+      }
+      if (attr) fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), attr);
+      if (byDefault) await sh(dir, 'config', 'merge.default', 'mydrv');
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'BASE\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), OURS_B);
+      await sh(dir, 'commit', '-qam', 'ours');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS_B);
+      await sh(dir, 'commit', '-qam', 'theirs');
+      await sh(dir, 'checkout', '-q', 'main');
+      return dir;
+    };
+    const ATTR = 'a.txt merge=mydrv\n';
+
+    // --- THE PREMISE, MEASURED: the driver runs and really does invert -------
+    {
+      const dir = await driven('t44-premise', { script: REVERSED, attr: ATTR });
+      await git(dir, ['-c', 'merge.conflictStyle=diff3', 'merge', '--no-ff', '--no-commit', 'feature']).catch(() => {});
+      const wrote = fs.readFileSync(path.join(dir, 'a.txt'), 'utf8');
+      check('T44 premise: the driver ran and wrote its own block', wrote.startsWith('<<<<<<< custom') && !wrote.includes('|||||||'), JSON.stringify(wrote));
+      check('T44 premise:   with the INCOMING bytes above the separator', wrote.split('=======')[0].includes('FEATURE-ONLY-BYTES'), JSON.stringify(wrote));
+      // And git's own index says the opposite, which is the whole point.
+      check('T44 premise:   while the index says stage 2 is this branch', (await sh(dir, 'show', ':2:a.txt')) === 'MAIN-ONLY-BYTES', await sh(dir, 'show', ':2:a.txt'));
+      check('T44 premise:   and stage 3 is the incoming one', (await sh(dir, 'show', ':3:a.txt')) === 'FEATURE-ONLY-BYTES', await sh(dir, 'show', ':3:a.txt'));
+      // What a forgiving parse WOULD have made of it, stated so the inversion is
+      // on the record rather than implied: read as git's grammar, this block's
+      // "ours" is the incoming side.
+      const wouldBe = parseConflict(wrote, 7, false).filter((part) => part.kind === 'clash')[0] || {};
+      check('T44 premise:   so reading it as git`s grammar inverts the sides', String(wouldBe.ours).includes('FEATURE') && String(wouldBe.theirs).includes('MAIN'), JSON.stringify({ ours: wouldBe.ours, theirs: wouldBe.theirs }));
+      await sh(dir, 'merge', '--abort').catch(() => {});
+    }
+
+    // --- A: the built-in text driver is untouched ---------------------------
+    {
+      const dir = await driven('t44-A-builtin', {});
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T44 A: a built-in text conflict still offers its hunk', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
+      check('T44 A:   and is not marked as any driver`s', file.customDriver === undefined, JSON.stringify(file.customDriver));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
+      check('T44 A:   and the per-hunk answer still merges', out?.ok === true, JSON.stringify(out));
+      check('T44 A:   into the incoming bytes', (await blob(dir, 'HEAD:a.txt')) === (await blob(dir, 'feature:a.txt')), JSON.stringify(await blob(dir, 'HEAD:a.txt')));
+    }
+
+    // --- B / C / D / E: every driver shape is opaque, and by the same rule ---
+    for (const [label, opts] of [
+      ['B reversed order', { script: REVERSED, attr: ATTR }],
+      ['C conventional order', { script: CONVENTIONAL, attr: ATTR }],
+      ['D no markers at all', { script: NOISE, attr: ATTR }],
+      ['E named by merge.default', { script: REVERSED, byDefault: true }],
+    ]) {
+      const dir = await driven(`t44-${label.split(' ')[0]}`, opts);
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check(`T44 ${label}: no hunks are offered`, file.parts === null, JSON.stringify(file.parts));
+      check(`T44 ${label}:   and the driver is named`, file.customDriver === 'mydrv', JSON.stringify(file.customDriver));
+      const entry = ((DOMAINS.git.merge.result(clash, { branch: 'feature' }, { root: dir, mergeRef: () => 'REF' }) || {}).files || [])[0] || {};
+      check(`T44 ${label}:   the agent sees an empty hunk list, not a null one`, Array.isArray(entry.hunks) && entry.hunks.length === 0, JSON.stringify(entry).slice(0, 220));
+      check(`T44 ${label}:   with markersUnread and hunksOmitted both false`, entry.markersUnread === false && entry.hunksOmitted === false, JSON.stringify(entry).slice(0, 220));
+
+      // THE REFUSAL, BEFORE ANYTHING IS WRITTEN.
+      const before = await repoState(dir);
+      const per = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at }));
+      await refusedCleanly(`T44 ${label}: a per-hunk answer`, per.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && b.reason === 'not_splittable' && b.customDriver === 'mydrv')
+      );
+
+      // THE BYTE ORACLE, both directions, each on its own fixture because a
+      // resolve commits. "theirs" must be index stage 3 — which for the reversed
+      // driver is the OPPOSITE of what its own block puts in that position.
+      for (const [side, want] of [
+        ['ours', OURS_B],
+        ['theirs', THEIRS_B],
+      ]) {
+        const one = await driven(`t44-${label.split(' ')[0]}-${side}`, opts);
+        const c = await mergeBranch(git, { projectPath: one, branch: 'feature' });
+        const done = await resolveMerge(git, { projectPath: one, branch: 'feature', choices: { 'a.txt': side }, expect: c.at });
+        check(`T44 ${label}: whole-file ${side} merges`, done?.ok === true, JSON.stringify(done));
+        check(`T44 ${label}:   into the index`+"'"+`s exact ${side} blob`, (await blob(one, 'HEAD:a.txt')) === want, JSON.stringify(await blob(one, 'HEAD:a.txt')));
+        check(`T44 ${label}:   as a two-parent merge commit`, (await sh(one, 'log', '-1', '--format=%P')).split(' ').length === 2, await sh(one, 'log', '-1', '--format=%P'));
+        check(`T44 ${label}:   over a clean tree`, (await sh(one, 'status', '--porcelain')) === '', await sh(one, 'status', '--porcelain'));
+        check(`T44 ${label}:   with none of the driver`+"'"+`s markup in it`, !(await blob(one, 'HEAD:a.txt')).includes('<<<<<<<'), JSON.stringify(await blob(one, 'HEAD:a.txt')));
+      }
+    }
+
+    // --- F: the positive controls, so "call everything custom" cannot pass ---
+    {
+      // merge.default=text is git's BUILT-IN text driver and must stay readable.
+      const dir = await driven('t44-F-default-text', {});
+      await sh(dir, 'config', 'merge.default', 'text');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T44 F: merge.default=text is the built-in driver', file.customDriver === undefined, JSON.stringify(file.customDriver));
+      check('T44 F:   so its hunk is still offered', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
+      check('T44 F:   and the per-hunk answer merges', out?.ok === true, JSON.stringify(out));
+      check('T44 F:   into the incoming bytes', (await blob(dir, 'HEAD:a.txt')) === THEIRS_B, JSON.stringify(await blob(dir, 'HEAD:a.txt')));
+    }
+    {
+      // A NAME WITH NO PROGRAM BEHIND IT IS NOT A DRIVER. MEASURED: git falls
+      // back to the built-in text driver and writes its own diff3 markup, so
+      // treating the bare string as "custom" would refuse a perfectly ordinary
+      // merge. This is the check that keeps `defined` honest.
+      const dir = await driven('t44-F-undefined-name', { script: REVERSED, define: false, attr: ATTR });
+      check('T44 F: the attribute still names a driver', (await sh(dir, 'check-attr', 'merge', '--', 'a.txt')) === 'a.txt: merge: mydrv', await sh(dir, 'check-attr', 'merge', '--', 'a.txt'));
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T44 F:   but with no merge.mydrv.driver it is git`s own text driver', file.customDriver === undefined, JSON.stringify(file.customDriver));
+      check('T44 F:   so the hunk is offered', clashCount(file.parts || []) === 1, String(clashCount(file.parts || [])));
+      const out = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': ['theirs'] }, expect: clash.at });
+      check('T44 F:   and the per-hunk answer merges', out?.ok === true, JSON.stringify(out));
+      check('T44 F:   into the incoming bytes', (await blob(dir, 'HEAD:a.txt')) === THEIRS_B, JSON.stringify(await blob(dir, 'HEAD:a.txt')));
+    }
+
+    // --- G: the built-in non-text controls, unchanged ------------------------
+    {
+      // `-merge` is git's BINARY behaviour: this branch's version is left in the
+      // worktree and no markers are written. It is not a custom driver and must
+      // not be described as one, and it still takes a whole-file word.
+      const dir = await driven('t44-G-binary', { attr: 'a.txt -merge\n' });
+      check('T44 G: the attribute reads as unset', (await sh(dir, 'check-attr', 'merge', '--', 'a.txt')) === 'a.txt: merge: unset', await sh(dir, 'check-attr', 'merge', '--', 'a.txt'));
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const file = (clash.files || []).find((f) => f.path === 'a.txt') || {};
+      check('T44 G:   and is not called a custom driver', file.customDriver === undefined, JSON.stringify(file.customDriver));
+      check('T44 G:   the worktree holds this branch`s bytes, so there is no disagreement to split', clashCount(file.parts || []) === 0, String(clashCount(file.parts || [])));
+      const done = await resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'theirs' }, expect: clash.at });
+      check('T44 G:   and a whole-file answer still merges', done?.ok === true, JSON.stringify(done));
+      check('T44 G:   into the incoming blob exactly', (await blob(dir, 'HEAD:a.txt')) === THEIRS_B, JSON.stringify(await blob(dir, 'HEAD:a.txt')));
+    }
+    {
+      // A modify/delete on a driver's path: the side the caller asked for does
+      // not exist, and the no_such_side protection has to answer that rather
+      // than the driver rule.
+      const dir = await repo('t44-G-nosides');
+      cleanup.push(dir);
+      const at = path.join(dir, '.git', 'drv.sh');
+      fs.writeFileSync(at, REVERSED, { mode: 0o755 });
+      await sh(dir, 'config', 'merge.mydrv.driver', `${at} %O %A %B`);
+      fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), ATTR);
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'BASE\n');
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'base');
+      await sh(dir, 'branch', 'feature');
+      fs.rmSync(path.join(dir, 'a.txt'));
+      await sh(dir, 'add', '-A');
+      await sh(dir, 'commit', '-qm', 'ours deletes it');
+      await sh(dir, 'checkout', '-q', 'feature');
+      fs.writeFileSync(path.join(dir, 'a.txt'), THEIRS_B);
+      await sh(dir, 'commit', '-qam', 'theirs edits it');
+      await sh(dir, 'checkout', '-q', 'main');
+      const clash = await mergeBranch(git, { projectPath: dir, branch: 'feature' });
+      const before = await repoState(dir);
+      const out = await caught(() => resolveMerge(git, { projectPath: dir, branch: 'feature', choices: { 'a.txt': 'ours' }, expect: clash.at }));
+      await refusedCleanly('T44 G: a side that does not exist is still no_such_side', out.value, dir, before, 'bad_choices', (a) =>
+        (a.badChoices || []).some((b) => b.path === 'a.txt' && (b.reason === 'no_such_side' || b.reason === 'no_sides'))
+      );
+    }
   }
 }
 
