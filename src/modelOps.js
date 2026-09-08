@@ -104,6 +104,29 @@ export function findParentList(model, id) {
   return search(model.nodes);
 }
 
+// NOTHING GOES ABOVE THE DOCTYPE.
+//
+// A page's root is `<!doctype html>` (a raw-line) and then `<html>`. Markup
+// placed at root index 0 lands above the doctype, which is not a document any
+// more — the browser renders the stray node before <html> and drops into quirks
+// mode. A component file has no doctype and no such position, which is why this
+// asks the model rather than the file extension.
+//
+// Returns a refusal, or null when the placement is fine.
+const isDoctype = (node) => node?.kind === 'raw-line' && /^\s*<!\s*doctype/i.test(String(node.value || ''));
+const RENDERS_MARKUP = new Set(['element', 'component', 'raw']);
+
+export function rootPlacementProblem(model, node, index) {
+  if (!RENDERS_MARKUP.has(node?.kind)) return null;
+  const at = model.nodes.findIndex(isDoctype);
+  if (at === -1 || index > at) return null;
+  return fail(
+    'bad_request',
+    `<!doctype html> has to come first, so nothing can go above it — index ${index} of this document is before it. ` +
+      'Move the node inside the markup it belongs in (name the parent with parentRef), or place it after the doctype.'
+  );
+}
+
 export function isDescendantOf(candidateParent, id) {
   if (!Array.isArray(candidateParent.children)) return false;
   return !!findNodeById(candidateParent.children, id) || candidateParent.id === id;
@@ -1038,6 +1061,30 @@ export function moveNode(model, { nodeId, target }, { insertables = [] } = {}) {
   const found = findParentList(model, nodeId);
   if (!found) return fail('no_node', 'That node is not in the open file any more.');
   const node = found.list[found.index];
+
+  // "PUT IT AT INDEX 0" MEANS AMONG ITS OWN SIBLINGS.
+  //
+  // A move that names an index and no parent used to mean the DOCUMENT ROOT,
+  // so `move({ to: { index: 0 } })` on a card inside a grid did not reorder the
+  // grid — it lifted the card out of the page's markup entirely and inserted it
+  // at the top of the file, which in an Astro page is above `<!doctype html>`.
+  // The envelope said ok, and the card rendered outside <html>.
+  //
+  // Reordering among siblings is what an index alone reads as and what almost
+  // every move is, so it is what an unnamed parent means now. Reaching the root
+  // on purpose is still possible and now has to be said: the agent layer sends
+  // `keepParent: false` for an explicit `parentRef: null`.
+  if (target && target.keepParent) {
+    const parent = findParentNode(model.nodes, nodeId);
+    target = { parentId: parent ? parent.id : null, index: target.index };
+  }
+
+  // A root destination — asked for explicitly, or reached because the node is
+  // already at the root — still cannot put markup above the doctype.
+  if (target?.parentId == null) {
+    const problem = rootPlacementProblem(model, node, target?.index ?? model.nodes.length);
+    if (problem) return problem;
+  }
 
   if (target?.parentId) {
     if (target.parentId === nodeId) return fail('bad_request', 'A node cannot be moved into itself.');

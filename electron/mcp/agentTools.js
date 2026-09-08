@@ -173,7 +173,13 @@ const NodeSpec = z
 
 const MoveTarget = z
   .object({
-    parentRef: Ref.optional().describe('The node to move into. Omit for the document root.'),
+    parentRef: Ref.nullable()
+      .optional()
+      .describe(
+        'The node to move into. OMIT to keep the parent it already has and only change its position among its ' +
+          'siblings — which is what an index on its own means. Pass null for the document root: that is a real ' +
+          'destination in a component file, and in a page it puts the node above <!doctype html>.'
+      ),
     index: z.number().int().min(0).max(10000).describe('Position among that parent’s children.'),
   })
   .describe('Where the node should end up.');

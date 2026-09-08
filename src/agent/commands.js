@@ -317,7 +317,12 @@ export function createAgentCommands(getApp) {
             }
             parentId = found.id;
           }
-          operations.push({ nodeId: id, type: 'move', target: { parentId, index: op.to?.index ?? 0 } });
+          // No parent named: keep the one it has and just change its position.
+          // `keepParent` travels to moveNode, which resolves it against the
+          // tree — the parent id is not knowable here for a node the caller
+          // identified by ref alone.
+          const keepParent = !parentId && op.to?.keepParent === true;
+          operations.push({ nodeId: id, type: 'move', target: { parentId, keepParent, index: op.to?.index ?? 0 } });
           continue;
         }
         operations.push({ nodeId: id, ...op });

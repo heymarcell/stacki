@@ -839,7 +839,20 @@ function createAgentApi({
     for (const op of operations) {
       if (op?.type !== 'move' || !op.to) continue;
       if (!op.to.parentRef) {
-        op.to = { parent: null, parentKeys: null, index: op.to.index };
+        // OMITTED AND EXPLICIT null ARE DIFFERENT ANSWERS.
+        //
+        // Omitted used to mean the DOCUMENT ROOT, so `to: { index: 0 }` on a
+        // card inside a grid did not reorder the grid — it lifted the card out
+        // of the markup and inserted it at the top of the file, which in an
+        // Astro page is above `<!doctype html>`. ok:true, no note, and the card
+        // rendered outside <html>. Reproduced byte-identically twice.
+        //
+        // An index on its own reads as "put it at this position", and the
+        // position it can mean is among the siblings it already has. That is
+        // what an omitted parent means now. The root is still reachable for the
+        // component files where it is a real destination — it just has to be
+        // said, as `parentRef: null`.
+        op.to = { parent: null, parentKeys: null, keepParent: op.to.parentRef !== null, index: op.to.index };
         continue;
       }
       const parsed = readRef(op.to.parentRef, 'node');
