@@ -37,6 +37,7 @@ import {
   removeDeclaration,
   removeRuleIfEmpty,
   setDeclarationValue,
+  setDeclOnRule,
 } from '../style-panel/lib/css.ts';
 import { queryCanvas, hasCanvas } from '../canvasQuery.js';
 import { getHost } from '../style-panel/lib/host.ts';
@@ -1817,29 +1818,107 @@ export async function removeProperty({ identity, live = false }) {
 export async function setDeclarations({ identity, source, selector, declarations, live = false }) {
   const list = Array.isArray(declarations) ? declarations : [];
   if (!list.length) return problem('bad_request', 'declarations must name at least one property.');
-  let result = null;
-  // After the first write the rule certainly exists, so the rest address it by
-  // where the first one landed — which is what keeps them in the same rule
-  // rather than scattering across a stylesheet.
-  let where = identity || null;
-  for (const [index, entry] of list.entries()) {
-    result = await setProperty({
-      identity: where ? { ...where, property: entry.property } : null,
-      source,
-      selector,
-      property: entry.property,
-      value: entry.value,
-      important: !!entry.important,
-      // Every write but the last is a live one, so the burst coalesces into a
-      // single undo step the way a slider drag does.
-      live: index < list.length - 1,
-    });
-    if (!result.ok) return { ...result, applied: index };
-    if (!where && result.wrote) {
-      where = { source: result.wrote.source, atContext: result.wrote.atContext || [], selector: result.wrote.selector };
-    }
+
+  // ONE READ, EVERY DECLARATION, ONE WRITE.
+  //
+  // This used to call setProperty once per declaration, with `live: true` on
+  // all but the last so the burst coalesced into a single undo step. Every one
+  // of those calls did its own readSources() and then wrote the WHOLE document
+  // back — and a live write is deliberately not committed (writeEmbedDoc passes
+  // `!live` as `immediate`, and the page model applies it in 'live' mode). So
+  // the next call's read could still see the text from before its predecessor's
+  // write, serialize that, and write it back — silently dropping the earlier
+  // declaration while every call returned ok and `applied` counted them all.
+  //
+  // Measured on a four-declaration call into a page's scoped <style>: two
+  // landed, two vanished, `applied: 4`. The two that vanished were the ones
+  // whose successor re-read stale text. The result was `color: #fff` on a rule
+  // that had kept `background: #fff` — a CTA with white text on white, from a
+  // call that reported complete success.
+  //
+  // The loop cannot be made safe by ordering or by awaiting harder: it is N
+  // read-modify-write cycles against a store that updates asynchronously. So
+  // there is one cycle now. It is also what the tool always claimed to be —
+  // "several properties on one rule in a single step" — and `applied` is true
+  // by construction rather than by counting calls that each said ok.
+  // Every declaration must be expressible before anything is read or written,
+  // so a value this cannot author refuses the whole call rather than leaving a
+  // rule half-applied on disk.
+  const clean = [];
+  for (const entry of list) {
+    const property = String(entry?.property || '').trim();
+    const value = String(entry?.value ?? '').trim();
+    if (!property) return problem('bad_request', 'A CSS property is required.');
+    if (!value) return problem('bad_request', 'A value is required — use remove_property to take a declaration out.');
+    clean.push({ property, value, important: !!entry?.important });
   }
-  return { ok: true, applied: list.length, source: result?.source || null };
+
+  const { docs, rules } = await readSources();
+
+  // Resolve the destination ONCE: the rule an identity names, or the rule a
+  // selector+source pair asks for, created if it is not there yet.
+  let doc = null;
+  let rule = null;
+  let created = false;
+  let target = null;
+
+  if (identity) {
+    const refusal = await locateIdentity(docs, rules, identity);
+    if (refusal) return refusal;
+    rule = findRule(rules, identity);
+    doc = docFor(docs, rule.embedKey);
+    // The same merge createRuleAtRoot performs, against the rule already found.
+    for (const entry of clean) setDeclOnRule(rule.node, entry.property, entry.value, entry.important);
+  } else {
+    target = String(selector || '').trim();
+    if (!target) {
+      return problem(
+        'bad_request',
+        'Name either the declaration you read (identity) or a selector and the source to write it into. ' +
+          'Stacki will not guess which stylesheet a new rule belongs in.'
+      );
+    }
+    doc = source ? docFor(docs, internalKey(source)) : null;
+    if (!doc) {
+      return problem(
+        'no_source',
+        source
+          ? `There is no style source called ${source} on this page.`
+          : 'Name the source to write into — style.read lists them as writableSources.'
+      );
+    }
+    const writableRegions = doc.regions.filter((r) => !!r.root);
+    const region = writableRegions[writableRegions.length - 1];
+    if (!region) {
+      const failed = doc.regions.find((r) => r.parseError);
+      if (failed) return problem('unrepresentable', `Stacki could not parse ${doc.source.label}: ${failed.parseError}`);
+      return problem(
+        'read_only',
+        `${doc.source.label} has no style block Stacki will write into. A component's scoped <style> is read verbatim ` +
+          'and never edited — only an is:global block or a stylesheet is a destination. Nothing was written; ' +
+          'style.read marks which sources are writable.'
+      );
+    }
+    // createRuleAtRoot merges into an existing top-level rule for the selector
+    // and appends one otherwise, so calling it per declaration lands them all
+    // in the SAME rule. Every call here is an AST edit only — the single write
+    // is below, after the last of them.
+    for (const entry of clean) {
+      if (!createRuleAtRoot(region, target, entry.property, entry.value, entry.important)) {
+        return problem('bad_request', `Stacki could not write ${entry.property}: ${entry.value} for ${target}.`);
+      }
+    }
+    created = true;
+  }
+
+  const written = await writeEmbedDoc(doc, live);
+  if (!written.ok) return problem('write_failed', written.error);
+  return {
+    ok: true,
+    applied: list.length,
+    created: created || undefined,
+    source: { key: publicKey(doc.source.key), label: doc.source.label, kind: doc.source.origin.kind },
+  };
 }
 
 /**

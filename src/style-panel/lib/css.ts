@@ -24,7 +24,10 @@ function findChildRuleBySelector(container: Root | AtRule, selector: string): Ru
 }
 
 // Update the rule's existing declaration for `prop`, or append it — mirrors onSetProp.
-function setDeclOnRule(rule: Rule, prop: string, value: string, important: boolean) {
+// Exported because setDeclarations applies a whole batch into one already-resolved
+// rule node before a single write, and needs the same merge semantics
+// createRuleAtRoot gets rather than a second copy of them.
+export function setDeclOnRule(rule: Rule, prop: string, value: string, important: boolean) {
   let decl: Declaration | null = null
   rule.walkDecls(prop, (found) => { decl = found })
   if (decl) { (decl as Declaration).value = value; (decl as Declaration).important = important }
