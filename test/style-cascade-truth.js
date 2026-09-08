@@ -609,8 +609,16 @@ const declsOf = (answer, prop) =>
     // :global() wrapper never leaves the source, so the same rule has two
     // spellings. Comparing them raw would report an unaccounted rule on every
     // Astro page that has one scoped block.
+    // WHICH SPELLING BELONGS TO WHICH RULE MATTERS, so the sources say what
+    // they are: Astro marks a rule ONLY on its way out of a scoped block. A
+    // `:global()` rule is unwrapped and served bare, and a stylesheet is served
+    // exactly as written — so only a scoped source can be the authored side of
+    // a marked served selector.
     const spellings = reconcileComputed(
-      [{ selector: ':global(.pricing-grid)', matchedSelectors: ['.pricing-grid'], declarations: [] }, { selector: '.link', matchedSelectors: ['.link'], declarations: [] }],
+      [
+        { selector: ':global(.pricing-grid)', matchedSelectors: ['.pricing-grid'], declarations: [], source: { scope: 'global' } },
+        { selector: '.link', matchedSelectors: ['.link'], declarations: [], source: { scope: 'scoped' } },
+      ],
       null,
       [
         { selector: '.pricing-grid', cssText: 'outline: 2px dashed blue;' },
@@ -621,6 +629,46 @@ const declsOf = (answer, prop) =>
       'the same rule spelled two ways is one rule, not an unaccounted one',
       spellings.unaccountedRules.length === 0,
       short(spellings.unaccountedRules)
+    );
+
+    // AND THE SAME ELEVEN CHARACTERS IN A STYLESHEET ARE NOT THAT RULE.
+    //
+    // The marker is stripped before two selectors are compared, which is right
+    // when the authored rule is the one that was marked and wrong otherwise. A
+    // global `.card` and a component's scoped `.card` are different rules that
+    // normalise to the same string, and crediting one to the other is how a
+    // losing declaration came to be reported `winning: true`.
+    const impostor = reconcileComputed(
+      [
+        {
+          selector: '.card',
+          matchedSelectors: ['.card'],
+          source: { scope: 'global' },
+          declarations: [{ property: 'border-radius', value: '0px', winning: true }],
+        },
+      ],
+      { 'border-radius': '18px' },
+      [{ selector: '.card[data-astro-cid-o5hopgsc]', cssText: 'border-radius: 18px;', stylesheet: 'inline <style>' }]
+    );
+    check(
+      'a stylesheet rule does not account for a MARKED served rule of the same name',
+      impostor.unaccountedRules.some((r) => r.selector === '.card[data-astro-cid-o5hopgsc]'),
+      short(impostor.unaccountedRules)
+    );
+    check(
+      '  so the property it sets is reported unexplained',
+      impostor.unexplained.some((u) => u.property === 'border-radius'),
+      short(impostor.unexplained)
+    );
+    check(
+      '  and the answer does not claim to explain the computed value',
+      impostor.explainsComputed === false,
+      short({ explainsComputed: impostor.explainsComputed })
+    );
+    check(
+      '  and the contest is handed back so the declaration can be demoted',
+      impostor.contestedProperties.has('border-radius'),
+      short([...impostor.contestedProperties.keys()])
     );
   });
 
@@ -895,9 +943,9 @@ const declsOf = (answer, prop) =>
     // A served document. `.pricing-grid` is authored in site.css and the answer
     // will return it; `.text-red-500` and `.grid` are what a build step emits
     // and exist in no project file at all.
-    const serve = (css) =>
+    const serve = (css, attrs = '') =>
       new JSDOM(
-        `<!doctype html><html><head><style>${css}</style></head><body><div id="el" class="pricing-grid text-red-500 grid"></div></body></html>`
+        `<!doctype html><html><head><style>${css}</style></head><body><div id="el" class="pricing-grid text-red-500 grid"${attrs ? ' ' + attrs : ''}></div></body></html>`
       ).window.document;
 
     // The engine's own values are canned here — jsdom has no cascade — and that
@@ -939,9 +987,9 @@ const declsOf = (answer, prop) =>
       renderedClasses: [],
       pathOf: null,
     });
-    const readServed = async (css) => {
+    const readServed = async (css, attrs = '') => {
       mod.setHost(hostFor());
-      mod.setCanvasFrame(previewServing(serve(css)));
+      mod.setCanvasFrame(previewServing(serve(css, attrs)));
       const out = await mod.readStyles(gridNode, { pathOf: () => 'src/pages/index.astro#0.0.3' });
       mod.setCanvasFrame(null);
       return out;
@@ -987,12 +1035,84 @@ const declsOf = (answer, prop) =>
       (generated.coverage?.runtime?.unaccountedRules || []).some((r) => r.selector === '.text-red-500' && r.properties.includes('color')),
       short(generated.coverage?.runtime?.unaccountedRules)
     );
-    // The circularity, stated as an assertion: the old rule was
-    // `runtime.available && explainsComputed`, and both of those are TRUE here.
+    // The circularity, stated as an assertion. The old rule was
+    // `runtime.available && explainsComputed`, and this stood as the case where
+    // both were true while coverage was not complete.
+    //
+    // `explainsComputed` is false here NOW, and correctly: `.grid` and
+    // `.text-red-500` set `display` and `color` on this element and no authored
+    // source accounts for either, so the authored scan does not explain the
+    // computed value and no longer says it does. That is the fix, not a
+    // regression — but it costs this line its illustration, because the two are
+    // no longer independent in THIS document.
+    //
+    // The claim being defended is that `complete` is decided by the browser's
+    // rule list rather than by the reconciliation's own verdict. So it is
+    // asserted directly, and then shown on a document where the two genuinely
+    // disagree: unaccounted rules setting properties nobody asked about leave
+    // `explainsComputed` true and `complete` false.
     check(
-      '  and it is false for a reason the reconciliation could never have found',
-      generated.explainsComputed === true && generated.coverage.runtime.available === true,
-      short({ explains: generated.explainsComputed, available: generated.coverage.runtime.available })
+      '  because the browser named rules no authored source accounts for',
+      generated.coverage?.runtime?.unaccountedRules?.length > 0,
+      short(generated.coverage?.runtime)
+    );
+    const { reconcileComputed: reconcile } = await styleModule();
+    const unasked = reconcile(
+      [{ selector: '.card', matchedSelectors: ['.card'], source: { scope: 'global' }, declarations: [{ property: 'padding', winning: true }] }],
+      { padding: '16px' },
+      [{ selector: '.text-red-500', cssText: 'color: rgb(239 68 68);', stylesheet: 'generated' }]
+    );
+    check(
+      '  and the two verdicts are independent: an unaccounted rule nobody asked about leaves explainsComputed true',
+      unasked.explainsComputed === true && unasked.unaccountedRules.length === 1,
+      short({ explains: unasked.explainsComputed, unaccounted: unasked.unaccountedRules })
+    );
+
+    // 1b. THE DOGFOOD. A global stylesheet and a component's scoped block
+    //     saying different things about the same class.
+    //
+    //     `src/styles/site.css` authors `.pricing-grid { display: grid }`. The
+    //     served document also carries `.pricing-grid[data-astro-cid-abc]`,
+    //     which is what Astro emits for a scoped `.pricing-grid` in a
+    //     component — a DIFFERENT rule, one class heavier, that Stacki does not
+    //     parse (a component's scoped block is read verbatim, never offered for
+    //     another component's element).
+    //
+    //     Stripping the marker before comparing made the global rule account
+    //     for the served one, so the served rule vanished from
+    //     `unaccountedRules`, `unexplained` emptied, and the global declaration
+    //     was reported `winning: true`. In the packaged app that sentence was
+    //     printed beside a `computed` the declaration had plainly lost to, and
+    //     the pixels agreed with the browser.
+    // The element carries the scope marker, because that is what Astro puts on
+    // the elements a scoped block styles — without it the served rule would not
+    // match and there would be nothing to reconcile.
+    const shadowed = await readServed('.pricing-grid[data-astro-cid-abc] { display: flex; }', 'data-astro-cid-abc');
+    const authoredGrid = (shadowed.rules || []).find(
+      (r) => r.selector === '.pricing-grid' && r.source.file === 'src/styles/site.css'
+    );
+    check('the authored global rule is still returned', !!authoredGrid, short((shadowed.rules || []).map((r) => r.selector)));
+    check(
+      'the marked served rule is NOT accounted for by the global rule of the same name',
+      (shadowed.coverage?.runtime?.unaccountedRules || []).some((r) => r.selector === '.pricing-grid[data-astro-cid-abc]'),
+      short(shadowed.coverage?.runtime?.unaccountedRules)
+    );
+    const displayDecl = (authoredGrid?.declarations || []).find((d) => d.property === 'display');
+    check('the authored display declaration is there to grade', !!displayDecl, short(authoredGrid?.declarations));
+    check(
+      'and it does NOT claim to win a property the served page also sets',
+      displayDecl && displayDecl.winning !== true,
+      short(displayDecl)
+    );
+    check(
+      '  it is undecided, and says which rule contests it',
+      displayDecl && displayDecl.winning === null && (displayDecl.contestedBy || []).some((c) => c.selector === '.pricing-grid[data-astro-cid-abc]'),
+      short(displayDecl)
+    );
+    check(
+      '  and the answer does not claim to explain the computed value',
+      shadowed.explainsComputed === false && shadowed.unexplained.some((u) => u.property === 'display'),
+      short({ explains: shadowed.explainsComputed, unexplained: shadowed.unexplained })
     );
 
     // 2. THE POSITIVE CONTROL. Same element, same channel, a document that

@@ -425,6 +425,11 @@ const normalizeSelector = (sel) =>
     .replace(/\s*,\s*/g, ', ')
     .trim();
 
+// Astro's own marker, and the evidence a SERVED rule came out of a scoped
+// block: a stylesheet and an `is:global` block are served exactly as written,
+// so only a scoped source can be the authored side of a marked selector.
+const MARKED = /\[data-astro-cid-[^\]]*\]/;
+
 /** The property names a document rule's declaration block sets. */
 const propertiesIn = (cssText) =>
   String(cssText || '')
@@ -482,13 +487,78 @@ export function reconcileComputed(rules, computed, documentRules = null) {
       reason: 'no authored declaration Stacki can see sets this property on this element',
     }));
 
-  const authored = new Set(onThisPage.map((rule) => normalizeSelector(rule.selector)));
-  for (const rule of onThisPage) for (const sel of rule.matchedSelectors || []) authored.add(normalizeSelector(sel));
+  // A MARKED SERVED RULE CAN ONLY HAVE COME FROM A SCOPED BLOCK.
+  //
+  // normalizeSelector takes the Astro marker off before comparing, so
+  // `.card[data-astro-cid-h]` and `.card` compare equal — right when the
+  // authored rule IS the scoped one that was marked on its way out, and wrong
+  // otherwise. Astro marks a rule only when it comes from a component's scoped
+  // `<style>`; a stylesheet and an `is:global` block are served exactly as
+  // written. So a marked served rule matched against an unmarked authored one
+  // is two different rules sharing a class name.
+  //
+  // Measured: a global `.dogfood-card { border-radius: 0 }` and a component's
+  // scoped `.dogfood-card { border-radius: 18px }`. Stripping the marker made
+  // the global rule "account for" the served scoped one, so the served rule
+  // left `unaccountedRules`, `unexplained` emptied, `explainsComputed` went
+  // true — and the global declaration was reported `winning: true` beside a
+  // `computed` of 18px it plainly lost to. The browser painted 18px.
+  const scopedSelectors = new Set();
+  const anySelectors = new Set();
+  for (const rule of onThisPage) {
+    const target = rule.source?.scope === 'scoped' ? [scopedSelectors, anySelectors] : [anySelectors];
+    for (const set of target) {
+      set.add(normalizeSelector(rule.selector));
+      for (const sel of rule.matchedSelectors || []) set.add(normalizeSelector(sel));
+    }
+  }
+  const accountsFor = (selector) => {
+    const normalized = normalizeSelector(selector);
+    return MARKED.test(selector) ? scopedSelectors.has(normalized) : anySelectors.has(normalized);
+  };
   const unaccountedRules = (documentRules || [])
-    .filter((rule) => !authored.has(normalizeSelector(rule.selector)))
+    .filter((rule) => !accountsFor(rule.selector))
     .map((rule) => ({ selector: rule.selector, stylesheet: rule.stylesheet || null, properties: propertiesIn(rule.cssText) }));
 
-  return { explainsComputed: computed ? unexplained.length === 0 : null, unexplained, unaccountedRules };
+  // AND A PROPERTY AN UNACCOUNTED RULE SETS IS NOT EXPLAINED BY ANYTHING HERE.
+  //
+  // `unexplained` used to ask only "is there any authored declaration for this
+  // property at all", which is the right question for a Tailwind element and
+  // the wrong one the moment the browser reports a rule Stacki cannot place. If
+  // an unattributable rule sets `border-radius`, then whatever an authored rule
+  // says about `border-radius` is not the whole story, and neither `winning`
+  // nor `explainsComputed` may claim otherwise.
+  //
+  // Deciding WHICH of the two wins would need the served rule's specificity
+  // weighed against the authored one — a second cascade over text that has no
+  // authored home. The decidable, honest answer is that it is contested, which
+  // is a verdict this response already has words for.
+  const contestedProperties = new Map();
+  for (const rule of unaccountedRules) {
+    for (const property of rule.properties) {
+      if (!(property in (computed || {}))) continue;
+      if (!contestedProperties.has(property)) contestedProperties.set(property, []);
+      contestedProperties.get(property).push({ selector: rule.selector, stylesheet: rule.stylesheet });
+    }
+  }
+  for (const [property, by] of contestedProperties) {
+    const value = computed[property];
+    if (value === null || value === '') continue;
+    const already = unexplained.find((u) => u.property === property);
+    const reason =
+      `the served page has ${by.length === 1 ? 'a rule' : `${by.length} rules`} setting this that no authored source ` +
+      `Stacki scanned contains — ${by.map((b) => b.selector).join(', ')}. \`computed\` is what the element actually has.`;
+    if (already) already.reason = reason;
+    else unexplained.push({ property, computed: value, reason });
+  }
+
+  return {
+    explainsComputed: computed ? unexplained.length === 0 : null,
+    unexplained,
+    unaccountedRules,
+    // For the caller to demote any declaration that claimed to win one of these.
+    contestedProperties,
+  };
 }
 
 // What an authored-source scan cannot contain, said in the answer rather than
@@ -1443,7 +1513,36 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
     };
   });
 
-  const { explainsComputed, unexplained, unaccountedRules } = reconcileComputed(rules, computed, documentRules);
+  const { explainsComputed, unexplained, unaccountedRules, contestedProperties } = reconcileComputed(
+    rules,
+    computed,
+    documentRules
+  );
+
+  // NOTHING CLAIMS TO WIN A PROPERTY THE BROWSER SAYS SOMETHING ELSE ALSO SETS.
+  //
+  // `winning: true` is a claim about the painted box, and an unattributable
+  // served rule setting the same property is exactly the case where this cannot
+  // know. The response already has the vocabulary for it — `winning: null` with
+  // `contestedBy` and the `undecided` sentence, used where an unproven
+  // stylesheet or an unknown viewport makes the answer undecidable — so this is
+  // the same verdict reached from the browser's own rule list rather than from
+  // the authored scan.
+  for (const rule of rules) {
+    for (const declaration of rule.declarations || []) {
+      const by = contestedProperties.get(declaration.property);
+      if (!by || declaration.winning !== true) continue;
+      declaration.winning = null;
+      declaration.contestedBy = [
+        ...(declaration.contestedBy || []),
+        ...by.map((entry) => ({ selector: entry.selector, stylesheet: entry.stylesheet, origin: 'document' })),
+      ];
+      declaration.undecided =
+        'This wins among the authored rules Stacki can see. The served page also sets this property from a rule no ' +
+        'project file accounts for — `contestedBy` names it, `unaccountedRules` lists it, and `computed` is what the ' +
+        'element actually has.';
+    }
+  }
   const kinds = { stylesheet: 0, component: 0, block: 0 };
   for (const doc of docs) {
     const key = doc.source.origin.kind;
