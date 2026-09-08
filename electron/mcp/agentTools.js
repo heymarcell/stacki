@@ -798,12 +798,33 @@ const ContentInput = closed(z.discriminatedUnion('action', [
     // now, through the same listing `content.entries` answers from.
     collection: z.string().max(200).optional().describe('The collection the entry belongs to. Required unless `entry` identifies one on its own.'),
     id: z.string().max(300).optional().describe('The entry, by the id content.entries reported. Required unless `entry` carries one.'),
+    // A SELECTOR IS NOT A RECORD, AND DECLARING IT AS ONE SWALLOWED THE DATA.
+    //
+    // This was `z.record(z.string(), z.unknown())` — open by design, because a
+    // record's keys are the point. But `entry` stopped being the entry and
+    // became three fields that IDENTIFY one, and an open record then accepted
+    // anything at all and silently dropped it. Measured: a call carrying
+    // `entry: { title, description, pubDate }` alongside a `body` returned
+    // `ok: true, changed: true, validation: "checked"` and wrote only the body,
+    // leaving the frontmatter untouched — the caller's fields discarded with no
+    // note. The same call with `entry: { data: {...} }` and no body returned
+    // `changed: false`, asserting nothing needed writing about data that
+    // differed from the file.
+    //
+    // Named keys, so closeShape closes it and a data key comes back as
+    // `bad_arguments` with the key named — which is what `edits` already does
+    // and what the rest of this surface promises.
     entry: z
-      .record(z.string(), z.unknown())
+      .object({
+        id: z.string().max(300).optional().describe('The entry id, as content.entries reported it.'),
+        file: z.string().max(1000).optional().describe('The entry file, as content.entries reported it.'),
+        digest: Digest.optional().describe('The digest content.entries reported, used as the version guard.'),
+      })
       .optional()
       .describe(
         'Deprecated, and accepted for one release as a SELECTOR only: Stacki reads its id and file to pick the ' +
-          'entry out of the collection and takes nothing else from it. Send `collection` and `id` instead.'
+          'entry out of the collection and takes nothing else from it. It carries no field values — the fields to ' +
+          'change go in `edits`, and the markdown body in `body`. Send `collection` and `id` instead.'
       ),
     // A LIST, because that is what the implementation applies: contentEntries.js
     // `writeEntry` calls `edits.map(...)` over `{ path, value }` locators. This

@@ -435,9 +435,9 @@ const declaredDefaults = (json) => {
     // 158 -> 159 when the page domain gained `open`: one more branch on the
     // `page` union, and a branch is a closed object position. Written down,
     // which is the point of the number.
-    check('the input surface has 159 closed object positions', byKind('closed').length === 159, String(byKind('closed').length));
-    check('  9 record positions, where the caller chooses the keys', byKind('record').length === 9, String(byKind('record').length));
-    check('  6 shapeless values, where the caller chooses everything', byKind('any').length === 6, String(byKind('any').length));
+    check('the input surface has 160 closed object positions', byKind('closed').length === 160, String(byKind('closed').length));
+    check('  8 record positions, where the caller chooses the keys', byKind('record').length === 8, String(byKind('record').length));
+    check('  5 shapeless values, where the caller chooses everything', byKind('any').length === 5, String(byKind('any').length));
     check('  and no object with a shape and no fence', byKind('openObject').length === 0, byKind('openObject').map((l) => l.label).join(', '));
     check('the closed positions are most of the surface', byKind('closed').length > all.length * 0.85, `${byKind('closed').length} of ${all.length}`);
 
@@ -609,9 +609,12 @@ const declaredDefaults = (json) => {
     check(
       '  and every one of them either named the key or is a registered exception',
       // 151 -> 152 with `page.open`: one more closed branch, and its unknown
-      // key is nameable like every other branch's. The seven that cannot name
-      // one are unchanged and are listed below with the reason each is open.
-      named === 152 && unnameable === 7,
+      // key is nameable like every other branch's. 152 -> 153 when
+      // `content.write_entry.entry` stopped being an open record and became the
+      // three keys it actually reads — a field sent there is named now instead
+      // of being dropped in silence. The seven that cannot name one are
+      // unchanged and are listed below with the reason each is open.
+      named === 153 && unnameable === 7,
       `${named} named the key, ${unnameable} could not: ${byKind('closed').filter(cannotName).map((l) => l.label).join(', ')}`
     );
 
@@ -627,8 +630,15 @@ const declaredDefaults = (json) => {
       { tool: 'target', ends: 'node.props', why: 'an element’s attributes: the keys are HTML attribute and component prop names the author chooses.' },
       { tool: 'content', ends: 'fields', why: 'frontmatter fields: the keys are the collection’s own schema, defined in the project and not here.' },
       { tool: 'content', ends: 'fields.*', why: 'and their values are whatever that collection declares — a string, a date, a nested object.' },
-      { tool: 'content', ends: 'entry', why: 'an entry object handed straight back from a read, accepted as a selector; its keys are the collection’s.' },
-      { tool: 'content', ends: 'entry.*', why: 'and its values are the entry’s own data, which Stacki wrote and must be able to read back.' },
+      // `content.write_entry.entry` WAS HERE, and being here is what let it
+      // swallow a caller's fields. The justification was written when `entry`
+      // meant the whole entry a read handed back. It stopped meaning that —
+      // Stacki resolves the entry itself now and takes only `id`, `file` and
+      // `digest` off it — but the record stayed open, so
+      // `entry: { title, description }` was accepted, dropped, and answered
+      // `ok: true, changed: true`. It is three named keys now, and closed, so
+      // a field sent there comes back as `bad_arguments` naming it. Field
+      // values go in `edits`, which is where the open positions for them are.
       { tool: 'content', ends: 'data', why: 'a whole CMS document. Its shape is the project’s content schema; declaring one here would be a second copy of it.' },
       { tool: 'content', ends: 'edits.value', why: 'the new value for one field, which is whatever that field holds.' },
       { tool: 'git', ends: 'choices', why: 'a merge resolution keyed by project-relative path: the keys are the conflicting files git named.' },
@@ -1111,7 +1121,7 @@ const declaredDefaults = (json) => {
     // the rebuilt union above it): 1,101 -> 1,107 and 1,086 -> 1,092. The
     // numbers are here so that a bound going MISSING is loud; a bound arriving
     // on purpose is supposed to be argued for in this comment.
-    check('the rebuild replaced 197 nodes on the published surface, and each remembers its original', pairs.length === 197, `${pairs.length} rebuilt nodes`);
+    check('the rebuild replaced 199 nodes on the published surface, and each remembers its original', pairs.length === 199, `${pairs.length} rebuilt nodes`);
     check(
       '  including the eight domain unions themselves',
       ['target', 'style', 'source', 'page', 'content', 'asset', 'project', 'git'].every((n) => pairs.some((p) => p.at === n)),
@@ -1230,8 +1240,8 @@ const declaredDefaults = (json) => {
     // supposed to be argued for in this comment.
     check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
     check(
-      '  and compared real constraints: 1,107 bound keywords across the rebuilt nodes',
-      bounds === 1107,
+      '  and compared real constraints: 1,123 bound keywords across the rebuilt nodes',
+      bounds === 1123,
       `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
     );
 
@@ -1261,7 +1271,7 @@ const declaredDefaults = (json) => {
       for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
     }
     check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
-    check('  and the tally walked something: 1,092 checks across the rebuilt nodes', checksSeen === 1092, `${checksSeen} checks`);
+    check('  and the tally walked something: 1,108 checks across the rebuilt nodes', checksSeen === 1108, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────
