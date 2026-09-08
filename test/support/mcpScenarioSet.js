@@ -318,20 +318,23 @@ fullScenario({ domain: 'target', action: 'duplicate', run: async ({ call, ref, f
 } });
 
 fullScenario({ domain: 'target', action: 'move', run: async ({ call, fixture }) => {
-  // The document root, position 0 — which per src/modelOps.js moveNode puts the
-  // div BEFORE <Base>. "The source is not what it was" accepted a move of any
-  // node to anywhere, and a reserialization that moved nothing at all.
+  // With no parent named, index is a position among the node's CURRENT
+  // siblings. Explicit parentRef:null is the separate document-root move.
+  // Prove the div stayed in <Base> and moved to index 0 inside it.
   const { envelope } = await call('target', 'move', { ref: await nodeNamed(call, 'div'), to: { index: 0 } });
   const src = fixture.read(INDEX);
   const grid = src.indexOf('class="pricing-grid"');
   const base = src.indexOf('<Base>');
+  const hero = src.indexOf('<Hero');
+  const footer = src.indexOf('<footer>');
   const closeBase = src.indexOf('</Base>');
   const block = (src.match(/<div class="pricing-grid">[\s\S]*?<\/div>/) || [''])[0];
   return { envelope, checks: [
-    ['the div is now ahead of the layout it used to be inside', grid >= 0 && base >= 0 && grid < base],
+    ['the div stays inside the layout when no parent is named', grid >= 0 && base >= 0 && grid > base && grid < closeBase],
+    ['and moved to index 0 among that layout\'s children', hero >= 0 && grid < hero],
     ['and there is still exactly one of it', countOf(src, /pricing-grid/g) === 1],
     ['its children travelled with it', block.includes('{plans.map((plan) => (') && block.includes('<Card title={plan.title}')],
-    ['what it left behind stayed where it was', src.indexOf('<Hero') > base && src.indexOf('<Hero') < closeBase && src.indexOf('<footer>') > base && src.indexOf('<footer>') < closeBase],
+    ['what it was beside stayed in the same layout, after it', hero > grid && hero < closeBase && footer > hero && footer < closeBase],
     ['and the frontmatter the moved node reads came with it', src.includes('const plans = [')],
   ] };
 } });
