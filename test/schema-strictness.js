@@ -437,7 +437,7 @@ const declaredDefaults = (json) => {
     // which is the point of the number.
     check('the input surface has 160 closed object positions', byKind('closed').length === 160, String(byKind('closed').length));
     check('  8 record positions, where the caller chooses the keys', byKind('record').length === 8, String(byKind('record').length));
-    check('  5 shapeless values, where the caller chooses everything', byKind('any').length === 5, String(byKind('any').length));
+    check('  6 shapeless values, where the caller chooses everything', byKind('any').length === 6, String(byKind('any').length));
     check('  and no object with a shape and no fence', byKind('openObject').length === 0, byKind('openObject').map((l) => l.label).join(', '));
     check('the closed positions are most of the surface', byKind('closed').length > all.length * 0.85, `${byKind('closed').length} of ${all.length}`);
 
@@ -630,16 +630,15 @@ const declaredDefaults = (json) => {
       { tool: 'target', ends: 'node.props', why: 'an element’s attributes: the keys are HTML attribute and component prop names the author chooses.' },
       { tool: 'content', ends: 'fields', why: 'frontmatter fields: the keys are the collection’s own schema, defined in the project and not here.' },
       { tool: 'content', ends: 'fields.*', why: 'and their values are whatever that collection declares — a string, a date, a nested object.' },
-      // `content.write_entry.entry` WAS HERE, and being here is what let it
-      // swallow a caller's fields. The justification was written when `entry`
-      // meant the whole entry a read handed back. It stopped meaning that —
-      // Stacki resolves the entry itself now and takes only `id`, `file` and
-      // `digest` off it — but the record stayed open, so
-      // `entry: { title, description }` was accepted, dropped, and answered
-      // `ok: true, changed: true`. It is three named keys now, and closed, so
-      // a field sent there comes back as `bad_arguments` naming it. Field
-      // values go in `edits`, which is where the open positions for them are.
-      { tool: 'content', ends: 'data', why: 'a whole CMS document. Its shape is the project’s content schema; declaring one here would be a second copy of it.' },
+      // `content.write_entry.entry` USED TO BE OPEN AT ITS TOP LEVEL, and that
+      // is what let it swallow a caller's fields: `entry: { title, description }`
+      // was accepted, dropped, and answered `ok: true, changed: true`. The
+      // object is closed now and shaped as what `content.entries` hands back,
+      // so passing a read's entry straight back still works and an invented key
+      // is named. What stays open is the entry's own `data` — one level in,
+      // where the keys really are the collection's schema.
+
+      { tool: 'content', ends: 'data', why: 'a whole CMS document, and an entry’s own data handed back from a read. The shape is the project’s content schema; declaring one here would be a second copy of it.' },
       { tool: 'content', ends: 'edits.value', why: 'the new value for one field, which is whatever that field holds.' },
       { tool: 'git', ends: 'choices', why: 'a merge resolution keyed by project-relative path: the keys are the conflicting files git named.' },
       { tool: 'git', ends: 'choices.*', why: '"ours", "theirs", or one entry per hunk — a scalar or a list, per file.' },
@@ -749,7 +748,7 @@ const declaredDefaults = (json) => {
     // pass against a schema that refused every array.
     const bounded = [];
     for (const [name] of tools) bounded.push(...boundedArraysIn(name, delivered.get(name)));
-    check('the input surface publishes 17 bounded arrays', bounded.length === 17, `${bounded.length}: ${bounded.map((b) => `${b.label} ${b.min ?? ''}..${b.max ?? ''}`).join(', ')}`);
+    check('the input surface publishes 18 bounded arrays', bounded.length === 18, `${bounded.length}: ${bounded.map((b) => `${b.label} ${b.min ?? ''}..${b.max ?? ''}`).join(', ')}`);
     check(
       '  including the six the rebuild had emptied',
       ['target|4.operations', 'style|4.declarations', 'style|9.adds', 'style|10.renames', 'style|11.moves', 'content|11.edits'].every((l) => bounded.some((b) => b.label === l)),
@@ -1240,8 +1239,8 @@ const declaredDefaults = (json) => {
     // supposed to be argued for in this comment.
     check('  the comparison saw fences in quantity, which are the difference it forgives', fences > 400, `${fences} additionalProperties:false across the rebuilt nodes`);
     check(
-      '  and compared real constraints: 1,123 bound keywords across the rebuilt nodes',
-      bounds === 1123,
+      '  and compared real constraints: 1,151 bound keywords across the rebuilt nodes',
+      bounds === 1151,
       `${bounds} of ${BOUNDS.join('/')} — this number DROPS when a bound is dropped, which is what makes the check above load-bearing`
     );
 
@@ -1271,7 +1270,7 @@ const declaredDefaults = (json) => {
       for (const [kind, n] of after) if (!before.has(kind)) mismatched.push(`${at}: ${kind} invented ${n} times`);
     }
     check('every check on the open trees is still on the rebuilt ones, kind for kind', mismatched.length === 0, mismatched.slice(0, 20).join('; '));
-    check('  and the tally walked something: 1,108 checks across the rebuilt nodes', checksSeen === 1108, `${checksSeen} checks`);
+    check('  and the tally walked something: 1,132 checks across the rebuilt nodes', checksSeen === 1132, `${checksSeen} checks`);
   }
 
   // ── THE MECHANISM, DRIVEN WITH SCHEMAS THAT DO USE THOSE CONSTRUCTS ──────

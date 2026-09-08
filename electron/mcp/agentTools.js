@@ -814,10 +814,24 @@ const ContentInput = closed(z.discriminatedUnion('action', [
     // Named keys, so closeShape closes it and a data key comes back as
     // `bad_arguments` with the key named — which is what `edits` already does
     // and what the rest of this surface promises.
+    // Shaped as what `content.entries` HANDS BACK, so passing one straight back
+    // keeps working — that round-trip is the whole reason this field is still
+    // here, and closing it to three keys broke it. Every field a read reports is
+    // named; anything else is not part of an entry, and a caller putting field
+    // values here is the mistake that was being swallowed.
     entry: z
       .object({
-        id: z.string().max(300).optional().describe('The entry id, as content.entries reported it.'),
-        file: z.string().max(1000).optional().describe('The entry file, as content.entries reported it.'),
+        id: z.string().max(300).nullable().optional().describe('The entry, by the id content.entries reported.'),
+        slug: z.string().max(300).nullable().optional(),
+        file: z.string().max(1000).nullable().optional().describe('The entry file, as content.entries reported it.'),
+        locator: z.array(z.union([z.string().max(200), z.number().int()])).max(50).optional(),
+        format: z.string().max(50).nullable().optional(),
+        keyed: z.boolean().optional(),
+        // Carried so a read's entry round-trips. It is NOT how fields are
+        // written — `edits` is — and a call that sends data here and asks for
+        // nothing else is refused rather than answered `changed: false`.
+        data: z.unknown().optional(),
+        body: z.string().max(1_000_000).nullable().optional(),
         digest: Digest.optional().describe('The digest content.entries reported, used as the version guard.'),
       })
       .optional()

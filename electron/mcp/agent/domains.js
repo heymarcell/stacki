@@ -1061,6 +1061,26 @@ const content = {
       if (input.edits !== undefined && !Array.isArray(input.edits)) {
         return problem('bad_request', 'edits is a list of { path, value } — one per field to change.');
       }
+      // `entry` IS A SELECTOR, AND ITS `data` IS NOT AN INSTRUCTION.
+      //
+      // It is shaped as what a read hands back so one can be passed straight
+      // back, which means it carries the entry's own `data` and `body`. Stacki
+      // takes neither: fields are written through `edits` and the markdown
+      // through `body`. A call that puts values in `entry.data` and asks for
+      // nothing else can only have meant them to be written, and used to be
+      // answered `ok: true, changed: false` — Stacki asserting nothing needed
+      // writing about data that differed from the file. Say which argument
+      // carries a field instead.
+      const carriesData = input.entry && (input.entry.data != null || input.entry.body != null);
+      const asksForWork = Array.isArray(input.edits) ? input.edits.length > 0 : input.body !== undefined;
+      if (carriesData && !asksForWork) {
+        return problem(
+          'bad_request',
+          'entry identifies WHICH entry to write and nothing else — its `data` and `body` are ignored, and this call ' +
+            'asks for no other change, so it would write nothing. Put the fields to change in `edits` (each a ' +
+            '{ path, value }) and the markdown in the top-level `body`.'
+        );
+      }
       const found = await resolveContentEntry(input, ctx);
       if (found.error) return found;
       // THE VERSION GUARD, WITH NOTHING TO REMEMBER. content.entries already

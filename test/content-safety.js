@@ -471,6 +471,62 @@ Nothing declares a shape for this.
       check('  none of which is a bare string', Array.isArray(after) && after.every((r) => r && typeof r === 'object' && !Array.isArray(r)), short(after));
       check('  the record that was named is the one that changed', after?.[1]?.name === 'Robert' && after?.[1]?.id === 'bob', short(after?.[1]));
       check('  and the record beside it is untouched', JSON.stringify(after?.[0]) === JSON.stringify({ id: 'ada', name: 'Ada' }), short(after?.[0]));
+
+      // ── AND `entry` DOES NOT CARRY FIELD VALUES ──────────────────────────
+      //
+      // It identifies WHICH entry, and it is shaped as what a read hands back
+      // so the round-trip above works. It used to be an open record, so a
+      // caller who put the fields there instead of in `edits` was answered
+      // ok:true / changed:true — the body written, the frontmatter untouched,
+      // the fields discarded with no note. Two shapes of that mistake:
+      const invented = await rig.call('content', 'write_entry', {
+        collection: 'people',
+        id: 'bob',
+        entry: { id: 'bob', name: 'Bobby', title: 'Engineer' },
+        body: 'x',
+      });
+      check(
+        'a field invented inside `entry` is refused, not swallowed',
+        invented.envelope?.ok === false && invented.envelope?.code === 'bad_arguments',
+        short(invented.envelope)
+      );
+      check(
+        '  naming the keys that are not part of an entry',
+        JSON.stringify(invented.envelope?.issues || []).includes('name'),
+        short(invented.envelope?.issues)
+      );
+
+      // The other shape matches the entry's real form, so the schema accepts
+      // it — and it asks for no other change, so it would write nothing at all.
+      // That used to be `ok: true, changed: false`: Stacki asserting nothing
+      // needed writing about data that differs from the file.
+      const before = JSON.parse(rig.harness.read('src/data/people.json'));
+      // Re-read, so the digest is current: the point of this case is that the
+      // call would otherwise SUCCEED and report `changed: false`, and a stale
+      // guard firing first would hide that.
+      const fresh = ((await rig.call('content', 'entries', { collection: 'people' })).envelope?.entries || []).find(
+        (e) => e.id === 'bob'
+      );
+      const dataOnly = await rig.call('content', 'write_entry', {
+        collection: 'people',
+        id: 'bob',
+        entry: { ...fresh, data: { id: 'bob', name: 'Bobbie' } },
+      });
+      check(
+        'an entry carrying only data is refused rather than answered "changed: false"',
+        dataOnly.envelope?.ok === false,
+        short(dataOnly.envelope)
+      );
+      check(
+        '  and the refusal says which argument carries a field',
+        /edits/.test(dataOnly.envelope?.message || ''),
+        short(dataOnly.envelope?.message)
+      );
+      check(
+        '  and nothing was written',
+        JSON.stringify(JSON.parse(rig.harness.read('src/data/people.json'))) === JSON.stringify(before),
+        'the file changed on a refused write'
+      );
     }
 
     // ── F12: the schema, and the version ─────────────────────────────────────
