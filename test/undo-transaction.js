@@ -1037,6 +1037,68 @@ const UNCOALESCED = 900;
         }
       }
 
+
+      // ---- src/App.jsx: the restore oracle asks the FILE, not savedSource ----
+      //
+      // Required core CI caught a state the previous postcondition called
+      // impossible: a batched target.edit was physically undone byte-for-byte,
+      // while React had not yet committed the `savedSource` bookkeeping update.
+      // `settledSave` is allowed to keep that metadata stale on purpose, so it
+      // cannot also be the proof that the write reached disk.
+      {
+        const reachedText = lift(
+          'src/App.jsx',
+          'async function restoreReachedFile(file, source, readPage) {',
+          '\n}\n'
+        );
+        check(
+          'restoreReachedFile can be read out of src/App.jsx',
+          !!reachedText && /await readPage\(file\)/.test(String(reachedText)),
+          String(reachedText).slice(0, 120)
+        );
+        if (reachedText && /await readPage\(file\)/.test(reachedText)) {
+          // eslint-disable-next-line no-new-func
+          const restoreReachedFile = new Function(`${reachedText}\nreturn restoreReachedFile;`)();
+          let asked = null;
+          const staleSavedSource = 'THE EDIT, DELIBERATELY STALE';
+          const landed = await restoreReachedFile('src/pages/index.astro', 'THE SNAPSHOT', async (file) => {
+            asked = file;
+            return { source: 'THE SNAPSHOT' };
+          });
+          check(
+            'a restore that IS on disk is accepted even while savedSource is stale',
+            landed === true && staleSavedSource !== 'THE SNAPSHOT',
+            short({ landed, staleSavedSource })
+          );
+          check('  and it asked the exact file being restored', asked === 'src/pages/index.astro', String(asked));
+          check(
+            'a different file value does not pass for the snapshot',
+            (await restoreReachedFile('src/pages/index.astro', 'THE SNAPSHOT', async () => ({ source: 'SOMETHING ELSE' }))) === false,
+            'a mismatched file was accepted'
+          );
+          check(
+            'a file that cannot be read does not become a successful undo',
+            (await restoreReachedFile('src/pages/index.astro', 'THE SNAPSHOT', async () => {
+              throw new Error('EIO');
+            })) === false,
+            'a failed read was accepted'
+          );
+        }
+
+        const appSource = fs.readFileSync(path.join(__dirname, '..', 'src/App.jsx'), 'utf8');
+        const applyAt = appSource.indexOf('const applySnapshot = useCallback(async (entry) => {');
+        const flushAt = appSource.indexOf('await flushSave();', applyAt);
+        const diskAt = appSource.indexOf(
+          'await restoreReachedFile(entry.file, entry.source, window.avb.readPage)',
+          flushAt
+        );
+        check(
+          'applySnapshot verifies the file itself AFTER flushSave returns',
+          applyAt >= 0 && flushAt > applyAt && diskAt > flushAt && diskAt - flushAt < 3000,
+          short({ applyAt, flushAt, diskAt })
+        );
+      }
+
       // ---- src/panels/VariablesView.jsx: putFiles, the panel's own twin ----
       const panelText = lift('src/panels/VariablesView.jsx', '    async (texts) => {', '\n    }');
       check('putFiles can be read out of src/panels/VariablesView.jsx', !!panelText && /const written = \[\]/.test(panelText), String(panelText).slice(0, 80));

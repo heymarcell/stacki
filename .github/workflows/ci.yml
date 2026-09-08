@@ -112,7 +112,7 @@ jobs:
       # there, which is exactly the kind of thing CI is for.
       - run: npm run build
 
-      # The whole chain: 192 `npm run` entries, covering 194 files. The three
+      # The whole chain: 195 `npm run` entries, covering 197 files. The three
       # named above print a skip line and say why; everything else runs.
       #
       # THOSE TWO NUMBERS ARE CHECKED, because they had already drifted. This
