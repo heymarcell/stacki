@@ -741,6 +741,46 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     check('and selection.status is still one of the statuses', ['ready', 'no_project', 'no_page', 'no_selection', 'preview_not_ready'].includes(snapshot.selection.status), snapshot.selection.status);
     check('and none of the original fields went away', ['nodeKind', 'tag', 'occurrence', 'source', 'sourceTrail', 'componentChain', 'breadcrumbs', 'text', 'props', 'classes', 'hidden', 'inert', 'rect', 'spacing'].every((k) => k in snapshot.selection));
     check('and the store still counts changes rather than publishes', typeof createContextStore({ resolveTrail: () => null }).revision === 'number');
+
+    // AND `props` SAYS WHAT THE ATTRIBUTE SAYS.
+    //
+    // The parser stores every attribute as `{ type, value }` — 'string' for a
+    // literal, 'expr' for `{...}`. This snapshot flattens them to strings, and
+    // it flattened them with `String(raw)`, so EVERY prop of every element came
+    // back as the literal text "[object Object]": `lang`, `class`, a component's
+    // `title`, all of them. get_context is the first call an agent makes and the
+    // one that answers "what is selected", so it was the first thing it read.
+    //
+    // It was not only a display fault. review/anchor.js shares this helper, so
+    // "[object Object]" was written into a review's creationContext and kept
+    // there for the life of the thread.
+    //
+    // Graded against target.read, which reports the same props typed — the two
+    // describe one element and may not disagree about it.
+    for (const label of ['pricing-grid', 'Hero']) {
+      const node = (await topLevel()).target.children.find((c) => c.label === label || c.tag === label);
+      check(`[${label}] is there to read props from`, !!node);
+      if (!node) continue;
+      await run('target', 'select', { ref: node.ref });
+      await H.settle(200);
+      const read = await run('target', 'read', { ref: node.ref });
+      const snap = normalize(app.payload(), () => null);
+      const flat = snap.selection.props || {};
+      const typed = read.target.props || {};
+      check(`[${label}] the snapshot reports the props it has`, Object.keys(flat).length > 0, short({ flat, typed }));
+      check(
+        `[${label}] and not one of them is "[object Object]"`,
+        Object.values(flat).every((v) => v !== '[object Object]'),
+        short(flat)
+      );
+      // Each flattened value is the typed one, spelled the way the source
+      // spells it: a literal as itself, an expression in its braces.
+      for (const [name, value] of Object.entries(typed)) {
+        if (!(name in flat)) continue;
+        const expected = value?.type === 'expr' ? `{${value.value}}` : String(value?.value ?? '');
+        check(`  [${label}] ${name} agrees with target.read`, flat[name] === expected, short({ got: flat[name], expected }));
+      }
+    }
   }
 
   // ── P. What remote review text cannot do ───────────────────────────────────

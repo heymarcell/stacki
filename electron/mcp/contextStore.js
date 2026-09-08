@@ -88,18 +88,44 @@ const listOf = (v, max, cap = 120) => {
   return out.length ? out : null;
 };
 
+// A PROP VALUE IS A TYPED OBJECT, NOT A STRING.
+//
+// The parser stores every attribute as `{ type, value }` — 'string' for a
+// literal, 'expr' for `{...}`, 'spread' for `{...rest}`, 'bare' for a valueless
+// attribute. `String(raw)` on one of those is "[object Object]", and that is
+// what this answered for every prop an element had: `lang="en"` came back as
+// `lang: "[object Object]"`, and so did every component prop. Worse, review
+// anchoring shares this helper, so the placeholder was written into a
+// creationContext and kept there for the life of the thread.
+//
+// The shape stays flat strings — that is what this snapshot is for, and
+// target.read is where the typed form lives — but each type is rendered as
+// what it says, in the spelling it has in the source.
+const propValue = (raw) => {
+  if (raw === true) return 'true';
+  if (raw === false || raw === null || raw === undefined) return null;
+  if (typeof raw === 'number') return String(raw);
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object' && !Array.isArray(raw) && typeof raw.type === 'string') {
+    // `bare` carries no value at all: `<input disabled>` is the attribute
+    // being present, which is what 'true' says everywhere else here.
+    if (raw.type === 'bare') return 'true';
+    if (raw.type === 'expr') return `{${String(raw.value ?? '')}}`;
+    if (raw.type === 'spread') return `{...${String(raw.value ?? '')}}`;
+    if (raw.value === undefined || raw.value === null) return null;
+    return String(raw.value);
+  }
+  return null;
+};
+
 const propsOf = (v) => {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const out = {};
   for (const key of Object.keys(v).slice(0, MAX_PROPS)) {
-    const raw = v[key];
-    if (raw === true) out[key] = 'true';
-    else if (raw === false || raw === null || raw === undefined) continue;
-    else if (typeof raw === 'number') out[key] = String(raw);
-    else {
-      const text = str(String(raw), MAX_PROP_VALUE);
-      if (text) out[key] = text;
-    }
+    const rendered = propValue(v[key]);
+    if (rendered === null) continue;
+    const text = str(rendered, MAX_PROP_VALUE);
+    if (text) out[key] = text;
   }
   return Object.keys(out).length ? out : null;
 };
