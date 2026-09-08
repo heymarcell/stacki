@@ -268,6 +268,22 @@ function settledSave(now, written, source) {
   };
 }
 
+
+// `savedSource` is renderer bookkeeping, not a disk oracle. A write can
+// finish while React is still committing the state update that records
+// it, and `settledSave` deliberately leaves that metadata untouched if a
+// newer human edit arrived during the IPC. Undo/redo promises something
+// narrower and observable: when it says a snapshot was restored, those
+// snapshot bytes have reached the file. Ask the file for that fact.
+async function restoreReachedFile(file, source, readPage) {
+  try {
+    const current = await readPage(file);
+    return current?.source === source;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether two undo entries are about the same set of files.
  *
@@ -1460,27 +1476,23 @@ export default function App() {
     }
     // AND THE BYTES ARE THE SNAPSHOT'S BYTES.
     //
-    // `flushSave` writes nothing at all when it finds `dirty` already cleared,
-    // and returns exactly as it does after a write -- which is what happens
-    // when another save resolved between the `setPageState` above and here. It
-    // records what it wrote in `savedSource`, so that is the thing to read: a
-    // restore whose bytes are not the ones on disk did not happen, and the
-    // caller has to be told so rather than shown `undone: true`.
+    // `savedSource` cannot prove this. It is intentionally conservative
+    // renderer state: if the state object moves while the IPC write is in
+    // flight, `settledSave` leaves it stale so a newer human edit is not
+    // marked saved. The write may nevertheless have completed perfectly.
+    // The protected core suite caught exactly that state: disk was already
+    // byte-identical to the snapshot while `savedSource` still described
+    // the edit, so undo returned `undo_failed` about a restore that had
+    // physically happened and redo became unreachable.
     //
-    // Only for a snapshot that HAS bytes. A model whose source was never on
-    // disk (a UI typing burst -- see `snapshotOf`) has nothing to compare, and
-    // this claims nothing about it either way.
-    //
-    // And only while this is still the open document. `flushSave` read the file
-    // to write before its first await, so its bytes went to the right file
-    // whatever opened afterwards -- but `savedSource` is then the NEW
-    // document's, and reading it here would report a restore that landed as one
-    // that did not. Silence about a write that happened, rather than a wrong
-    // answer about it.
+    // The write IPC has returned before `flushSave` returns, so the file is
+    // the authoritative postcondition. Only ask while the same document is
+    // still open, for the same reason the old check was scoped that way.
+    // A snapshot with no source bytes has nothing physical to compare.
     if (
       entry.file === writesTo() &&
       typeof entry.source === 'string' &&
-      pageStateRef.current.pageState?.savedSource !== entry.source
+      !(await restoreReachedFile(entry.file, entry.source, window.avb.readPage))
     ) {
       throw new Error('The restore did not reach the file; Stacki has not changed it.');
     }
