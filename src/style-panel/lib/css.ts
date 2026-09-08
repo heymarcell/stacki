@@ -465,10 +465,44 @@ export function listAtRuleBlocks(region: StyleRegion): AtRuleBlock[] {
 // (empty) region has no sibling for postcss to infer spacing from, so it renders the
 // first child flush against the `<style>` tag (`<style>@media …`); force a leading
 // newline in that case. Non-empty roots already infer a `\n` before from siblings.
+// THE CLOSING BRACE HAS TO LAND WHERE THE OPENING ONE DID.
+//
+// postcss infers a new node's `before` from its siblings, so an appended rule
+// is indented correctly — but `raws.after`, the whitespace before its `}`, has
+// no sibling to copy and defaults to a bare newline. In a stylesheet, where
+// rules sit at column 0, that is right. Inside an Astro `<style>` block, where
+// every rule is indented, it produces:
+//
+//   \tselector {
+//   \t\tprop: value;
+//   }
+//
+// — a closing brace at column 0 under an indented rule. Harmless to a parser
+// and obvious in a diff of somebody's component, which is where a person meets
+// it. Reproduced exactly against postcss with a two-rule indented region.
+//
+// So the indent is taken from a sibling that has one, and failing that from the
+// node's own `before` — the two places the region's own shape is recorded.
+function indentAfter(root: Root, node: ChildNode): string | null {
+  for (const sibling of root.nodes || []) {
+    if (sibling === node) continue
+    const after = (sibling as ChildNode).raws?.after
+    if (typeof after === 'string' && after.includes('\n')) return after
+  }
+  const before = typeof node.raws.before === 'string' ? node.raws.before : ''
+  const indent = before.slice(before.lastIndexOf('\n') + 1)
+  return indent ? `\n${indent}` : null
+}
+
 function appendTopLevel(root: Root, node: ChildNode): void {
   const wasEmpty = !root.nodes || root.nodes.length === 0
   root.append(node)
   if (wasEmpty) node.raws.before = '\n'
+  // Only for nodes that HAVE a body to close. A declaration has no `after`.
+  if ((node.type === 'rule' || node.type === 'atrule') && node.raws.after == null) {
+    const after = indentAfter(root, node)
+    if (after) node.raws.after = after
+  }
 }
 
 /** Create `selector { prop: value }` inside an at-rule block. Returns false on empty input. */
