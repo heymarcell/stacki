@@ -191,12 +191,23 @@ export function createAgentCommands(getApp) {
 
     if (action === 'select') {
       a.select(id, args.occurrence);
+      // React selection state, the render that rebuilds the MCP payload, and
+      // the IPC publish are separate moments. `ok:true` must not get ahead of
+      // the last one, because the very next get_context must see this node.
+      await a.settle();
+      const keys = a.keysFor(id);
+      const published = await a.selectionPublished(keys);
+      if (!published) {
+        return fail('not_ready', 'Stacki selected that element, but its MCP context did not publish in time. Try again.', {
+          selected: true, navigated, note, confidence, writable, document: documentOf(a), keys,
+        });
+      }
       // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process
       // mints the ref for what is now selected, and without this it had nothing
       // but the caller's word: a node recovered on position alone across a
       // branch came back as a write handle, which is the one thing the evidence
       // rules exist to withhold.
-      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys: a.keysFor(id) };
+      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys };
     }
 
     // Going inside a component instance, and coming back out — the two

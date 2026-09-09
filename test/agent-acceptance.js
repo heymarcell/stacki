@@ -78,6 +78,42 @@ const short = (x, n = 200) => JSON.stringify(x ?? null).slice(0, n);
     check('and a component instance says it can be opened', hero.kindOfThing === 'component_instance');
     heroRef = hero.ref;
 
+    // A select is a synchronization boundary. Hold renderer -> main publish
+    // and prove the command stays pending until that context crosses it.
+    const gridForPublish = page.target.children.find((c) => c.label === 'pricing-grid');
+    check('the publication-race target exists', !!gridForPublish, short(page.target.children));
+    const firstSelection = await run('target', 'select', { ref: hero.ref });
+    await H.settle(200);
+    check(
+      'the control selection is already published',
+      firstSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(firstSelection.keys),
+      short({ returned: firstSelection.keys, published: app.payload()?.selection?.keys })
+    );
+
+    const realPublish = window.avb.mcpPublish;
+    let releasePublish = null;
+    window.avb.mcpPublish = (next) =>
+      new Promise((resolve, reject) => {
+        releasePublish = () => realPublish(next).then(resolve, reject);
+      });
+    let selectReturned = false;
+    const selecting = run('target', 'select', { ref: gridForPublish.ref });
+    selecting.then(() => { selectReturned = true; });
+    await H.settle(180);
+    check(
+      'target.select stays pending until its MCP context is published',
+      !!releasePublish && selectReturned === false,
+      short({ publishReached: !!releasePublish, selectReturned })
+    );
+    releasePublish?.();
+    const secondSelection = await selecting;
+    window.avb.mcpPublish = realPublish;
+    check(
+      'and returns only once that published context names the selected node',
+      secondSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(secondSelection.keys),
+      short({ returned: secondSelection.keys, published: app.payload()?.selection?.keys })
+    );
+
     const inside = await run('target', 'enter', { ref: hero.ref });
     check('entering a component opens its own file', inside.ok && inside.entered === 'Hero', short(inside));
     check('and answers about a node in THAT file', inside.target.source?.file === 'src/components/Hero.astro', short(inside.target.source));
