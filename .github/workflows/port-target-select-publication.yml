@@ -14,12 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Verify exact source base
+          fetch-depth: 4
+      - name: Verify source is still the qualified main tree
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "fd4e3cc9679005cff2ad38ae29c853e3fbed6ae7"
+          base=fd4e3cc9679005cff2ad38ae29c853e3fbed6ae7
+          git diff --quiet "$base" HEAD -- . ':(exclude).github/workflows/port-target-select-publication.yml'
       - uses: actions/setup-node@v4
         with:
           node-version: 24.20.0
@@ -31,175 +32,167 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
+          def lines(*items):
+              return "\n".join(items)
+
+          def replace_once(text, old, new, label):
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected 1 match, found {n}")
+              return text.replace(old, new)
+
           app = Path('src/App.jsx')
           s = app.read_text()
-          old = '''  const mcpSentRef = useRef(null);
-          useEffect(() => {
-            const key = JSON.stringify(mcpPayloadRef.current);
-            if (key === mcpSentRef.current) return;
-            mcpSentRef.current = key;
-            void window.avb.mcpPublish(mcpPayloadRef.current);
-          });
-          '''
-          new = '''  const mcpSentRef = useRef(null);
-          // The last snapshot MAIN has actually accepted, not merely the one this
-          // render intended to send. target.select promises that an immediate
-          // get_context describes the selection it just returned, so the command
-          // needs an acknowledgement from this publication boundary.
-          const mcpPublishedRef = useRef({ seq: 0, payload: null });
-          const mcpPublishSeqRef = useRef(0);
-          useEffect(() => {
-            const sending = mcpPayloadRef.current;
-            const key = JSON.stringify(sending);
-            if (key === mcpSentRef.current) return;
-            mcpSentRef.current = key;
-            const seq = ++mcpPublishSeqRef.current;
-            void window.avb.mcpPublish(sending).then(
-              () => {
-                // A slower older IPC completion must never move the confirmed
-                // snapshot backwards over a newer one.
-                if (seq >= mcpPublishedRef.current.seq) {
-                  mcpPublishedRef.current = { seq, payload: sending };
-                }
-              },
-              () => {
-                // A failed publish leaves the last confirmed snapshot in place.
-              }
-            );
-          });
-          '''
-          if s.count(old) != 1:
-              raise SystemExit('App.jsx MCP publish block was not unique')
-          s = s.replace(old, new)
+          old = lines(
+              "  const mcpSentRef = useRef(null);",
+              "  useEffect(() => {",
+              "    const key = JSON.stringify(mcpPayloadRef.current);",
+              "    if (key === mcpSentRef.current) return;",
+              "    mcpSentRef.current = key;",
+              "    void window.avb.mcpPublish(mcpPayloadRef.current);",
+              "  });",
+          )
+          new = lines(
+              "  const mcpSentRef = useRef(null);",
+              "  // The last snapshot main has actually accepted, not merely the one this",
+              "  // render intended to send. target.select is observable through the next",
+              "  // MCP read, so it needs an acknowledgement from this publication boundary.",
+              "  const mcpPublishedRef = useRef({ seq: 0, payload: null });",
+              "  const mcpPublishSeqRef = useRef(0);",
+              "  useEffect(() => {",
+              "    const sending = mcpPayloadRef.current;",
+              "    const key = JSON.stringify(sending);",
+              "    if (key === mcpSentRef.current) return;",
+              "    mcpSentRef.current = key;",
+              "    const seq = ++mcpPublishSeqRef.current;",
+              "    void window.avb.mcpPublish(sending).then(",
+              "      () => {",
+              "        // A slower old IPC completion must not move confirmation backwards.",
+              "        if (seq >= mcpPublishedRef.current.seq) {",
+              "          mcpPublishedRef.current = { seq, payload: sending };",
+              "        }",
+              "      },",
+              "      () => {",
+              "        // A failed publish leaves the last confirmed snapshot in place.",
+              "      }",
+              "    );",
+              "  });",
+          )
+          s = replace_once(s, old, new, 'App.jsx publish block')
 
-          old = '''    // A moment for the canvas to catch up, so a style read after a select is
-              // asking about the element that is now selected.
-              settle: () => new Promise((done) => setTimeout(done, 120)),
-              focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
-          '''
-          new = '''    // A moment for the canvas to catch up, so a style read after a select is
-              // asking about the element that is now selected.
-              settle: () => new Promise((done) => setTimeout(done, 120)),
-              // Resolve only when the MCP snapshot MAIN has acknowledged names the
-              // same source-backed node. A duration cannot prove that; the publish
-              // acknowledgement can. Keys are used rather than renderer ids because
-              // keys are exactly what the MCP payload and refs expose across the
-              // process boundary.
-              selectionPublished: async (keys, { timeout = 3000 } = {}) => {
-                const wanted = JSON.stringify(keys || []);
-                const stop = Date.now() + timeout;
-                for (;;) {
-                  const published = mcpPublishedRef.current.payload;
-                  if (JSON.stringify(published?.selection?.keys || []) === wanted) return true;
-                  if (Date.now() > stop) return false;
-                  await new Promise((done) => setTimeout(done, 15));
-                }
-              },
-              focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
-          '''
-          if s.count(old) != 1:
-              raise SystemExit('App.jsx agent settle block was not unique')
-          app.write_text(s.replace(old, new))
+          old = lines(
+              "    // A moment for the canvas to catch up, so a style read after a select is",
+              "    // asking about the element that is now selected.",
+              "    settle: () => new Promise((done) => setTimeout(done, 120)),",
+              "    focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),",
+          )
+          new = lines(
+              "    // A moment for the canvas to catch up, so a style read after a select is",
+              "    // asking about the element that is now selected.",
+              "    settle: () => new Promise((done) => setTimeout(done, 120)),",
+              "    // Wait for the snapshot main has acknowledged to name this exact node.",
+              "    // Keys cross the process boundary; renderer ids deliberately do not.",
+              "    selectionPublished: async (keys, { timeout = 3000 } = {}) => {",
+              "      const wanted = JSON.stringify(keys || []);",
+              "      const stop = Date.now() + timeout;",
+              "      for (;;) {",
+              "        const published = mcpPublishedRef.current.payload;",
+              "        if (JSON.stringify(published?.selection?.keys || []) === wanted) return true;",
+              "        if (Date.now() > stop) return false;",
+              "        await new Promise((done) => setTimeout(done, 15));",
+              "      }",
+              "    },",
+              "    focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),",
+          )
+          s = replace_once(s, old, new, 'App.jsx agent barrier block')
+          app.write_text(s)
 
           commands = Path('src/agent/commands.js')
           s = commands.read_text()
-          old = '''    if (action === 'select') {
-              a.select(id, args.occurrence);
-              // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process
-              // mints the ref for what is now selected, and without this it had nothing
-              // but the caller's word: a node recovered on position alone across a
-              // branch came back as a write handle, which is the one thing the evidence
-              // rules exist to withhold.
-              return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys: a.keysFor(id) };
-            }
-          '''
-          new = '''    if (action === 'select') {
-              a.select(id, args.occurrence);
-              // `ok:true` must be observable through the very next MCP read. React
-              // selection state, the render that rebuilds the payload, and the IPC
-              // publish are three different moments; a fixed sleep only guesses at
-              // the last one. First let the renderer advance, then wait for MAIN to
-              // acknowledge a payload naming the same source-backed node.
-              await a.settle();
-              const keys = a.keysFor(id);
-              const published = await a.selectionPublished(keys);
-              if (!published) {
-                return fail('not_ready', 'Stacki selected that element, but its MCP context did not publish in time. Try again.', {
-                  selected: true,
-                  navigated,
-                  note,
-                  confidence,
-                  writable,
-                  document: documentOf(a),
-                  keys,
-                });
-              }
-              // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process
-              // mints the ref for what is now selected, and without this it had nothing
-              // but the caller's word: a node recovered on position alone across a
-              // branch came back as a write handle, which is the one thing the evidence
-              // rules exist to withhold.
-              return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys };
-            }
-          '''
-          if s.count(old) != 1:
-              raise SystemExit('commands.js target.select block was not unique')
-          commands.write_text(s.replace(old, new))
+          old = lines(
+              "    if (action === 'select') {",
+              "      a.select(id, args.occurrence);",
+              "      // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process",
+              "      // mints the ref for what is now selected, and without this it had nothing",
+              "      // but the caller's word: a node recovered on position alone across a",
+              "      // branch came back as a write handle, which is the one thing the evidence",
+              "      // rules exist to withhold.",
+              "      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys: a.keysFor(id) };",
+              "    }",
+          )
+          new = lines(
+              "    if (action === 'select') {",
+              "      a.select(id, args.occurrence);",
+              "      // React selection state, the render that rebuilds the MCP payload, and",
+              "      // the IPC publish are separate moments. `ok:true` must not get ahead of",
+              "      // the last one, because the very next get_context must see this node.",
+              "      await a.settle();",
+              "      const keys = a.keysFor(id);",
+              "      const published = await a.selectionPublished(keys);",
+              "      if (!published) {",
+              "        return fail('not_ready', 'Stacki selected that element, but its MCP context did not publish in time. Try again.', {",
+              "          selected: true, navigated, note, confidence, writable, document: documentOf(a), keys,",
+              "        });",
+              "      }",
+              "      // HOW WELL THIS WAS IDENTIFIED, not merely that it was. The main process",
+              "      // mints the ref for what is now selected, and without this it had nothing",
+              "      // but the caller's word: a node recovered on position alone across a",
+              "      // branch came back as a write handle, which is the one thing the evidence",
+              "      // rules exist to withhold.",
+              "      return { ok: true, selected: true, navigated, note, confidence, writable, document: documentOf(a), keys };",
+              "    }",
+          )
+          commands.write_text(replace_once(s, old, new, 'commands.js target.select block'))
 
           acceptance = Path('test/agent-acceptance.js')
           s = acceptance.read_text()
-          marker = '''    heroRef = hero.ref;
-
-              const inside = await run('target', 'enter', { ref: hero.ref });
-          '''
-          insert = '''    heroRef = hero.ref;
-
-              // target.select is a synchronization boundary, not a request to make
-              // the selection true eventually. Hold the renderer -> main publish and
-              // prove the command itself stays pending until that exact context has
-              // crossed the process boundary. This is the race the old hardening
-              // branch found and the later suite accidentally hid behind H.settle().
-              const gridForPublish = page.target.children.find((c) => c.label === 'pricing-grid');
-              check('the publication-race target exists', !!gridForPublish, short(page.target.children));
-              const firstSelection = await run('target', 'select', { ref: hero.ref });
-              await H.settle(200);
-              check(
-                'the control selection is already published',
-                firstSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(firstSelection.keys),
-                short({ returned: firstSelection.keys, published: app.payload()?.selection?.keys })
-              );
-
-              const realPublish = window.avb.mcpPublish;
-              let releasePublish = null;
-              window.avb.mcpPublish = (next) =>
-                new Promise((resolve, reject) => {
-                  releasePublish = () => realPublish(next).then(resolve, reject);
-                });
-              let selectReturned = false;
-              const selecting = run('target', 'select', { ref: gridForPublish.ref });
-              selecting.then(() => {
-                selectReturned = true;
-              });
-              await H.settle(180);
-              check(
-                'target.select stays pending until its MCP context is published',
-                !!releasePublish && selectReturned === false,
-                short({ publishReached: !!releasePublish, selectReturned })
-              );
-              releasePublish?.();
-              const secondSelection = await selecting;
-              window.avb.mcpPublish = realPublish;
-              check(
-                'and returns only once that published context names the selected node',
-                secondSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(secondSelection.keys),
-                short({ returned: secondSelection.keys, published: app.payload()?.selection?.keys })
-              );
-
-              const inside = await run('target', 'enter', { ref: hero.ref });
-          '''
-          if s.count(marker) != 1:
-              raise SystemExit('agent-acceptance insertion marker was not unique')
-          acceptance.write_text(s.replace(marker, insert))
+          marker = lines(
+              "    heroRef = hero.ref;",
+              "",
+              "    const inside = await run('target', 'enter', { ref: hero.ref });",
+          )
+          insert = lines(
+              "    heroRef = hero.ref;",
+              "",
+              "    // A select is a synchronization boundary. Hold renderer -> main publish",
+              "    // and prove the command stays pending until that context crosses it.",
+              "    const gridForPublish = page.target.children.find((c) => c.label === 'pricing-grid');",
+              "    check('the publication-race target exists', !!gridForPublish, short(page.target.children));",
+              "    const firstSelection = await run('target', 'select', { ref: hero.ref });",
+              "    await H.settle(200);",
+              "    check(",
+              "      'the control selection is already published',",
+              "      firstSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(firstSelection.keys),",
+              "      short({ returned: firstSelection.keys, published: app.payload()?.selection?.keys })",
+              "    );",
+              "",
+              "    const realPublish = window.avb.mcpPublish;",
+              "    let releasePublish = null;",
+              "    window.avb.mcpPublish = (next) =>",
+              "      new Promise((resolve, reject) => {",
+              "        releasePublish = () => realPublish(next).then(resolve, reject);",
+              "      });",
+              "    let selectReturned = false;",
+              "    const selecting = run('target', 'select', { ref: gridForPublish.ref });",
+              "    selecting.then(() => { selectReturned = true; });",
+              "    await H.settle(180);",
+              "    check(",
+              "      'target.select stays pending until its MCP context is published',",
+              "      !!releasePublish && selectReturned === false,",
+              "      short({ publishReached: !!releasePublish, selectReturned })",
+              "    );",
+              "    releasePublish?.();",
+              "    const secondSelection = await selecting;",
+              "    window.avb.mcpPublish = realPublish;",
+              "    check(",
+              "      'and returns only once that published context names the selected node',",
+              "      secondSelection.ok && JSON.stringify(app.payload()?.selection?.keys || []) === JSON.stringify(secondSelection.keys),",
+              "      short({ returned: secondSelection.keys, published: app.payload()?.selection?.keys })",
+              "    );",
+              "",
+              "    const inside = await run('target', 'enter', { ref: hero.ref });",
+          )
+          acceptance.write_text(replace_once(s, marker, insert, 'agent-acceptance insertion point'))
           PY
           git diff --check
       - name: Install
