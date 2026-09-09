@@ -4383,11 +4383,28 @@ export default function App() {
   // Every render, deduped on what was last sent — the alternative is an IPC
   // call per keystroke.
   const mcpSentRef = useRef(null);
+  // The last snapshot main has actually accepted, not merely the one this
+  // render intended to send. target.select is observable through the next
+  // MCP read, so it needs an acknowledgement from this publication boundary.
+  const mcpPublishedRef = useRef({ seq: 0, payload: null });
+  const mcpPublishSeqRef = useRef(0);
   useEffect(() => {
-    const key = JSON.stringify(mcpPayloadRef.current);
+    const sending = mcpPayloadRef.current;
+    const key = JSON.stringify(sending);
     if (key === mcpSentRef.current) return;
     mcpSentRef.current = key;
-    void window.avb.mcpPublish(mcpPayloadRef.current);
+    const seq = ++mcpPublishSeqRef.current;
+    void window.avb.mcpPublish(sending).then(
+      () => {
+        // A slower old IPC completion must not move confirmation backwards.
+        if (seq >= mcpPublishedRef.current.seq) {
+          mcpPublishedRef.current = { seq, payload: sending };
+        }
+      },
+      () => {
+        // A failed publish leaves the last confirmed snapshot in place.
+      }
+    );
   });
 
   // Answered by the Visual Review section below; declared here because the
@@ -5407,6 +5424,18 @@ export default function App() {
     // A moment for the canvas to catch up, so a style read after a select is
     // asking about the element that is now selected.
     settle: () => new Promise((done) => setTimeout(done, 120)),
+    // Wait for the snapshot main has acknowledged to name this exact node.
+    // Keys cross the process boundary; renderer ids deliberately do not.
+    selectionPublished: async (keys, { timeout = 3000 } = {}) => {
+      const wanted = JSON.stringify(keys || []);
+      const stop = Date.now() + timeout;
+      for (;;) {
+        const published = mcpPublishedRef.current.payload;
+        if (JSON.stringify(published?.selection?.keys || []) === wanted) return true;
+        if (Date.now() > stop) return false;
+        await new Promise((done) => setTimeout(done, 15));
+      }
+    },
     focusAnchor: (anchor) => focusReview({ threadId: null, anchor }),
 
     /**
