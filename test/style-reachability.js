@@ -634,7 +634,7 @@ const declFrom = (answer, file, prop) =>
     check('and the cap the cascade trusts is the cap the preload enforces', mirrored === cap, `styleAgent ${mirrored} vs preload ${cap}`);
 
     const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
-    const reply = new Function('d', 'els', 'document', 'matchedRulesIn', 'MAX_DOCUMENT_RULES', `return ({ ${producer} });`);
+    const reply = new Function('d', 'els', 'document', 'matchedRulesIn', 'MAX_DOCUMENT_RULES', 'subject', `return ({ ${producer} });`);
 
     const eroot = H.makeProject(FIXTURE);
     const eapp = await H.start(eroot, { agentMode: 'full' });
@@ -663,7 +663,7 @@ const declFrom = (answer, file, prop) =>
               matched: {},
               computed: {},
               computedProps,
-              ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+              ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap, el),
             })
           );
         },
@@ -892,7 +892,7 @@ const declFrom = (answer, file, prop) =>
     const cap = Number((preloadSource.match(/const MAX_DOCUMENT_RULES = (\d+);/) || [])[1]);
     if (!collector || !producer) throw new Skip('preload');
     const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
-    const reply = new Function('d', 'els', 'document', 'matchedRulesIn', 'MAX_DOCUMENT_RULES', `return ({ ${producer} });`);
+    const reply = new Function('d', 'els', 'document', 'matchedRulesIn', 'MAX_DOCUMENT_RULES', 'subject', `return ({ ${producer} });`);
 
     const groot = H.makeProject(NARROW_FIXTURE);
     const gapp = await H.start(groot, { agentMode: 'full' });
@@ -916,7 +916,7 @@ const declFrom = (answer, file, prop) =>
               mod.receiveCanvasReply({
                 type: 'avb:query-result', id: message.id, ready: true, found: true,
                 identity: null, matched: {}, computed: {}, computedProps,
-                ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+                ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap, el),
               })
             );
           },

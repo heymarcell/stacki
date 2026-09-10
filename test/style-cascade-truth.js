@@ -917,6 +917,33 @@ const declsOf = (answer, prop) =>
   // authored rules explain the authored rules and a rule the scan never saw
   // could not possibly make the answer incomplete.
 
+  // WHICH COPY THE PAGE ANSWERS ABOUT.
+  //
+  // A node inside a `.map(` is one node and many elements. The query handler
+  // answered about `els[0]` whatever was selected, so a read of the third card
+  // came back with the first card's computed style and `:first-child` among its
+  // matched selectors. Measured on the Astro blog starter: get_context reported
+  // the selected <li> as 464px while style.read called the same selection 960px.
+  //
+  // The three lines that decide it are sliced out of the preload and RUN, so
+  // reverting them to `els[0]` fails here rather than passing quietly.
+  await section(async () => {
+    const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    const block = (preloadSource.match(/const wantOccurrence = [\s\S]*?const subject = [^;]+;/) || [])[0];
+    check('the preload still decides which copy it is answering about', !!block, short(block));
+    if (!block) throw new Skip('preload');
+    const pick = new Function('d', 'els', `${block}; return subject;`);
+
+    const els = ['first', 'second', 'third'];
+    check('a named occurrence gets that copy', pick({ occurrence: 2 }, els) === 'third', short(pick({ occurrence: 2 }, els)));
+    check('and occurrence 0 gets the first', pick({ occurrence: 0 }, els) === 'first', short(pick({ occurrence: 0 }, els)));
+    // The older reading, kept exactly: a caller that names none is answered
+    // about the first copy, as it always was.
+    check('no occurrence still answers about the first', pick({}, els) === 'first', short(pick({}, els)));
+    check('and an out-of-range one falls back rather than throwing', pick({ occurrence: 9 }, els) === 'first', short(pick({ occurrence: 9 }, els)));
+    check('and no elements at all is null, not undefined', pick({ occurrence: 0 }, []) === null, short(pick({ occurrence: 0 }, [])));
+  });
+
   await section(async () => {
     const mod = await styleModule();
     if (typeof mod.setCanvasFrame !== 'function') throw new Skip('canvas bridge');
@@ -931,12 +958,16 @@ const declsOf = (answer, prop) =>
     check('the preload still ships the collector and the line that calls it', !!collector && !!producer && cap > 0, short({ collector: !!collector, producer, cap }));
     if (!collector || !producer) throw new Skip('preload');
     const matchedRulesIn = new Function(`${collector}; return matchedRulesIn;`)();
+    // `subject` is the copy the handler decided to answer about — one
+    // parameter because the preload now picks it once and every read uses it.
+    // Passing the element here keeps the sliced line running verbatim.
     const reply = new Function(
       'd',
       'els',
       'document',
       'matchedRulesIn',
       'MAX_DOCUMENT_RULES',
+      'subject',
       `return ({ ${producer} });`
     );
 
@@ -970,7 +1001,7 @@ const declsOf = (answer, prop) =>
             matched: {},
             computed: {},
             computedProps,
-            ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap),
+            ...reply({ rules: message.rules }, [el], doc, matchedRulesIn, cap, el),
           })
         );
       },

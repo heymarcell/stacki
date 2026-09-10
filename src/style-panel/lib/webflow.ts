@@ -751,11 +751,11 @@ export type CanvasAsk = {
  * Returns null when there's nothing to ask (no path for the node, or no
  * canvas), which callers pass straight through so they don't ask again.
  */
-export async function askCanvasAbout(rootKey: string, rules: ParsedRule[]): Promise<CanvasAsk | null> {
+export async function askCanvasAbout(rootKey: string, rules: ParsedRule[], occurrence: number | null = null): Promise<CanvasAsk | null> {
   const path = getHost().pathOf?.(rootKey)
   if (!path || !hasCanvas()) return null
   const askedFor = askableSelectors(rules)
-  const answer = await queryCanvas(path, [...askedFor.keys()])
+  const answer = await queryCanvas(path, [...askedFor.keys()], [], [], { occurrence })
   return { answer, askedFor }
 }
 

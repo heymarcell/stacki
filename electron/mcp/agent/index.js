@@ -1464,6 +1464,19 @@ function createAgentApi({
       // touches; the variables read says which files those are.
       return VARIABLE_ACTIONS.has(action) ? styleVariableFiles(ctx) : [];
     }
+    // SAME SHAPE AS style.write_source, WHICH HAS ALWAYS BEEN UNDOABLE.
+    //
+    // Both replace a whole text file through main, and the bytes-inverse in
+    // `recordUndo` handles either without knowing which is which. Only this
+    // list decided the difference: a stylesheet named its file here and got an
+    // undo entry, while an asset named nothing, so `named` came back empty, the
+    // file was never snapshotted, and the write answered `undoable: false`.
+    //
+    // Measured: writing public/favicon.svg through the agent left the only way
+    // back a second write of the previous bytes, while `project.undo` — the
+    // thing an agent reaches for — would have stepped past it and reverted some
+    // earlier model change instead.
+    if (domain === 'asset' && action === 'write_text') return [args.path];
     if (domain === 'content' && action === 'cms_write') {
       const raw = String(args.path || '');
       return [raw.includes('#') ? raw.slice(0, raw.indexOf('#')) : raw];

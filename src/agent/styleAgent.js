@@ -298,9 +298,9 @@ async function readSources() {
   return { scan, docs, errors, rules: rebuildRules(docs) };
 }
 
-async function readCascade(node, given) {
+async function readCascade(node, given, occurrence = null) {
   const { scan, docs, errors, rules } = await readSources();
-  const asked = await askCanvasAbout(node.id, rules);
+  const asked = await askCanvasAbout(node.id, rules, occurrence);
   const { target, rootSnapshot } = await resolveTarget(node, scan, asked);
   await primeDomMatches(target, rules, asked);
   const viewport = measuredViewport(given);
@@ -310,7 +310,7 @@ async function readCascade(node, given) {
 
 /** What the engine says the element's properties actually resolve to, and the
  *  rules the served document says reach it. Both come from the same ask. */
-async function askDocument(node, properties, pathOf) {
+async function askDocument(node, properties, pathOf, occurrence = null) {
   const path = pathOf?.(node.id);
   if (!path || !hasCanvas()) {
     return {
@@ -324,7 +324,7 @@ async function askDocument(node, properties, pathOf) {
       },
     };
   }
-  const reply = await queryCanvas(path, [], [], properties, { rules: true });
+  const reply = await queryCanvas(path, [], [], properties, { rules: true, occurrence });
   if (!reply) {
     return {
       computed: null,
@@ -1395,8 +1395,12 @@ async function generatorNote() {
  * `explainsComputed` reconciles what came back against what the engine actually
  * resolved: a property nothing here can account for is named, not omitted.
  */
-export async function readStyles(node, { pathOf, properties = null, viewport: measuredAt = null } = {}) {
-  const { docs, rules: parsed, model, target, rootSnapshot, errors, asked, viewport } = await readCascade(node, measuredAt);
+export async function readStyles(node, { pathOf, properties = null, viewport: measuredAt = null, occurrence = null } = {}) {
+  // WHICH RENDERED COPY THE ANSWER IS ABOUT. A node inside a loop is one node
+  // and many boxes; `winning`, `computed` and `documentRules` are all
+  // statements about a BOX, so they have to name the same one get_context does.
+  const at = Number.isInteger(occurrence) ? occurrence : null;
+  const { docs, rules: parsed, model, target, rootSnapshot, errors, asked, viewport } = await readCascade(node, measuredAt, at);
   const all = [...model.base, ...model.conditional];
   const matched = all.slice(0, MAX_RULES);
 
@@ -1411,7 +1415,7 @@ export async function readStyles(node, { pathOf, properties = null, viewport: me
   for (const entry of matched)
     for (const decl of entry.rule.declarations.slice(0, MAX_DECLS_PER_RULE)) wanted.add(decl.prop);
 
-  const { computed, documentRules, runtime } = await askDocument(node, [...wanted].slice(0, 200), pathOf);
+  const { computed, documentRules, runtime } = await askDocument(node, [...wanted].slice(0, 200), pathOf, at);
 
   // WHO IS ON THIS PAGE — settled before the cascade, not annotated after it.
   const tiers = narrowByDocument(

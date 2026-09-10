@@ -457,6 +457,10 @@ export function createAgentCommands(getApp) {
           pathOf: a.pathFor,
           properties: args.properties || null,
           viewport: a.canvas?.() || null,
+          // The copy the person (or `a.select` above) actually has in hand.
+          // Without it the cascade was resolved against the first rendered
+          // copy while get_context described the selected one.
+          occurrence: a.canvas?.()?.occurrence ?? null,
         });
         return { ok: true, ...styles, document: documentOf(a) };
       }

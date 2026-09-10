@@ -149,6 +149,36 @@ const K = 'KEEP — the file that must not be touched\n';
       check('  with nothing left under the new name', read('public/renamed.svg') === null, at('public/renamed.svg'));
     }
 
+    // ── 4. A CONTENT WRITE, WHICH IS THE SAME SHAPE AS A STYLESHEET WRITE ────
+    //
+    // `style.write_source` replaces a whole text file through main and has
+    // always been undoable; `asset.write_text` replaces a whole text file
+    // through main and was not. Nothing about the inverse differed — the
+    // bytes-restore in `recordUndo` handles either — only whether the operation
+    // named its file for snapshotting. So the one way back from an asset write
+    // was a second write of the previous bytes, and `project.undo`, which is
+    // what an agent reaches for, would have stepped past it and reverted an
+    // earlier model change instead.
+    {
+      const was = read('public/robots.txt');
+      check('the fixture ships a text asset to write over', typeof was === 'string' && was.length > 0, short(was));
+      // Replacing a file that exists is guarded, so the write goes through the
+      // ref the read handed back — the same round trip an agent makes.
+      const before = await run('asset', 'read_text', { path: 'public/robots.txt' });
+      check('  and reading it hands back a ref to write through', typeof before.ref === 'string' && before.ref.length > 0, short(before.digest));
+      const wrote = await run('asset', 'write_text', { path: 'public/robots.txt', ref: before.ref, text: 'User-agent: *\nDisallow: /dogfood\n' });
+      check('an asset content write happens', wrote.ok === true, short(wrote));
+      check('  and the bytes are on disk', read('public/robots.txt') === 'User-agent: *\nDisallow: /dogfood\n', at('public/robots.txt'));
+      check('  and it is undoable, like the stylesheet write it mirrors', wrote.undoable === true, short({ undoable: wrote.undoable }));
+
+      const undone = await run('project', 'undo');
+      await H.settle(200);
+      check('project.undo takes the content back', undone.ok === true && undone.undone === true, short(undone));
+      check('  and the previous bytes are really there again', read('public/robots.txt') === was, at('public/robots.txt'));
+      // The whole point: undo reversed THIS write rather than stepping past it.
+      check('  and no other file moved to pay for it', read('public/KEEP.svg') === K, at('public/KEEP.svg'));
+    }
+
     // ── 4. AND THE FILES NOBODY NAMED ────────────────────────────────────────
     //
     // The defect's signature was a THIRD file changing, so the suite ends by

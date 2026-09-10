@@ -145,7 +145,9 @@ const plans = [
   </header>
   <div class="grid">
     {plans.map((plan) => (
-      <Card title={plan.title} body={plan.body} />
+      <div class="plan">
+        <Card title={plan.title} body={plan.body} />
+      </div>
     ))}
   </div>
 </section>
@@ -213,11 +215,15 @@ const plans = [
   const header = at([0, 0]);
   const beside = at([0, 0, 1]); // the <p> next to the <h3>
   const loop = at([0, 1, 0]);
-  const card = at([0, 1, 0, 0]);
+  // The wrapper the loop repeats, and the Card inside it. The wrapper carries
+  // no expression of its own — which is the case the list resolution missed.
+  const wrapper = at([0, 1, 0, 0]);
+  const card = at([0, 1, 0, 0, 0]);
   check('the fixture has the header', header?.props?.class?.value === 'section-header', short(header?.name));
   check('and the <p> beside the <h3>', beside?.name === 'p', short(beside?.name));
   check('and a real loop', loop?.kind === 'map', short(loop?.kind));
-  check('with a card inside it', card?.name === 'Card', short(card?.name));
+  check('with a wrapper inside it', wrapper?.name === 'div', short(wrapper?.name));
+  check('and a card inside that', card?.name === 'Card', short(card?.name));
 
   // The app bundle commands.js reads, cut to what a read needs. `canvas` is
   // handed out only for the selected node — src/agent/commands.js — which is
@@ -285,6 +291,23 @@ const plans = [
     check('which copy is in hand is still reported', occ?.index === 2, short(occ?.index));
     check('and how many places were measured', occ?.count === 3, short(occ?.count));
   }
+  // A WRAPPER INSIDE THE LOOP — the <div>, the <li>, the <a> that repeats but
+  // holds no expression of its own. It therefore has no `loop_item` binding,
+  // and the answer used to tell the agent "Stacki could not resolve which list
+  // it comes from" while the `.map(` ONE HOP UP had resolved it completely.
+  // Measured on the Astro blog starter: the <li> claimed ignorance while its
+  // parent named the `blog` collection. Telling an agent to give up on
+  // something already in hand is worse than saying nothing.
+  {
+    const occ = await readOf(wrapper, { occurrence: 1, occurrenceCount: 2, rect: null });
+    check('a wrapper inside a loop is repeated', occ?.repeated === true, short(occ));
+    check('and has no data item of its own', occ?.perOccurrence == null, short(occ?.perOccurrence));
+    check('but the list it repeats over is still named', !!occ?.list, short(occ?.list));
+    check('and it is the list the loop iterates', occ?.list?.declaration?.name === 'plans', short(occ?.list));
+    check('so nothing claims the list is unresolvable', !/could not resolve which list/.test(occ?.note || ''), short(occ?.note));
+    check('and the note says what it is one item of', /one item of/.test(occ?.note || ''), short(occ?.note));
+  }
+
   // The same loop child with NO canvas at all — no preview running. The warning
   // is a fact about the source, so it does not wait for a measurement.
   {

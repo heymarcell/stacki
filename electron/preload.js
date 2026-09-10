@@ -1730,6 +1730,23 @@ if (!process.isMainFrame) {
     const d = e.data;
     if (d?.type === 'avb:query' && typeof d.id === 'number') {
       const els = typeof d.path === 'string' ? elementsForPath(d.path) : [];
+      // WHICH RENDERED COPY THIS ANSWER IS ABOUT.
+      //
+      // `elementsForPath` returns every copy a loop produced, and this answered
+      // about `els[0]` for all of them. So a read of the THIRD card came back
+      // with the first card's computed style and `ul li:first-child` among its
+      // matched selectors — for an element that is not a first child. The
+      // caller had already selected the right occurrence; the question simply
+      // did not carry which one, and get_context and style.read then described
+      // two different boxes as one selection (measured on the Astro blog
+      // starter: 464px reported as 960px).
+      //
+      // Absent or out of range, `subject` stays `els[0]` and `matched` keeps
+      // its any-copy reading, so a caller that names no occurrence sees exactly
+      // what it saw before.
+      const wantOccurrence = Number.isInteger(d.occurrence) ? d.occurrence : null;
+      const one = wantOccurrence !== null && wantOccurrence >= 0 && wantOccurrence < els.length ? els[wantOccurrence] : null;
+      const subject = one || els[0] || null;
       const matched = {};
       // What a value actually resolves to ON THIS ELEMENT. `var(--background)`
       // means nothing in the app's own document — the panel painted it there
@@ -1746,7 +1763,7 @@ if (!process.isMainFrame) {
       // leans on are declared on :root, which is this element. Only `compute`
       // takes this: the reads below are ABOUT a node, and answering them from
       // the root would be answering a different question.
-      const host = els[0] || document.documentElement;
+      const host = subject || document.documentElement;
       if (wanted.length && host) {
         const probe = document.createElement('span');
         probe.setAttribute('style', 'position:absolute;width:0;height:0;visibility:hidden');
@@ -1772,7 +1789,7 @@ if (!process.isMainFrame) {
       // value in its dropdowns so an unset control still shows what's on the page.
       const computedProps = {};
       const props = Array.isArray(d.props) ? d.props : [];
-      if (props.length && els[0]) {
+      if (props.length && subject) {
         // Design mode paints `cursor: default !important` over everything (see the
         // top of this file), so the page's own cursor is hidden behind it. Lift that
         // sheet for the read and put it straight back — nothing paints in between,
@@ -1780,7 +1797,7 @@ if (!process.isMainFrame) {
         const designStyle = document.getElementById('avb-design-style');
         try {
           if (designStyle) designStyle.disabled = true;
-          const cs = getComputedStyle(els[0]);
+          const cs = getComputedStyle(subject);
           for (const prop of props) {
             if (typeof prop !== 'string') continue;
             computedProps[prop] = cs.getPropertyValue(prop) || null;
@@ -1794,9 +1811,9 @@ if (!process.isMainFrame) {
       }
       for (const sel of d.selectors || []) {
         try {
-          // Any of the element's occurrences matching counts — a loop child is
-          // one node in the tree and many elements on the page.
-          matched[sel] = els.some((el) => el.matches(sel));
+          // The copy in hand when one was named; otherwise any of them, which
+          // is the older reading and the right one when nothing said which.
+          matched[sel] = one ? one.matches(sel) : els.some((el) => el.matches(sel));
         } catch {
           matched[sel] = null; // not a selector this engine accepts
         }
@@ -1809,9 +1826,9 @@ if (!process.isMainFrame) {
           found: els.length > 0,
           computed,
           computedProps,
-          identity: els[0] ? identityOf(els[0]) : null,
+          identity: subject ? identityOf(subject) : null,
           matched,
-          documentRules: d.rules && els[0] ? matchedRulesIn(document, els[0], MAX_DOCUMENT_RULES) : null,
+          documentRules: d.rules && subject ? matchedRulesIn(document, subject, MAX_DOCUMENT_RULES) : null,
         },
         '*'
       );

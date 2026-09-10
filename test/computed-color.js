@@ -63,10 +63,22 @@ const check = (what, condition, detail) => {
   // whole situation.
   {
     const preload = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+    // SLICED AND RUN, not matched as a string. The guarantee is that a question
+    // naming no element is answered about the document — and that is true however
+    // the line is written. As a literal /const host = els\[0\]/ match it failed the
+    // moment the handler learned to answer about a named copy, reporting a
+    // regression in behaviour that had not changed at all.
+    const hostLine = (preload.match(/const host = [^;]+;/) || [])[0];
+    const pickHost = hostLine ? new Function('subject', 'document', `${hostLine}; return host;`) : null;
     check(
       'with no element named, the page answers about itself',
-      /const host = els\[0\] \|\| document\.documentElement;/.test(preload),
+      !!pickHost && pickHost(null, { documentElement: 'ROOT' }) === 'ROOT',
       'a value with nothing selected gets no answer at all'
+    );
+    check(
+      'and about the element when one was found',
+      !!pickHost && pickHost('EL', { documentElement: 'ROOT' }) === 'EL',
+      'a value with a selection is answered against the document instead'
     );
     const lib = fs.readFileSync(
       path.join(__dirname, '..', 'src', 'style-panel', 'lib', 'computed-color.ts'),

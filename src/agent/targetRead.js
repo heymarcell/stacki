@@ -218,6 +218,34 @@ function bindingsOf(node, { model, ancestors, keys }) {
 }
 
 /**
+ * The list a repeated node is one item of, read off the `map` that repeats it.
+ *
+ * `bindingsOf` is given the ancestors ABOVE that map rather than this node's,
+ * so the loop expression resolves in the scope it was actually written in.
+ */
+function listOfNearestMap(ancestors, { model, keys }) {
+  const chain = Array.isArray(ancestors) ? ancestors : [];
+  let at = -1;
+  for (let i = chain.length - 1; i >= 0; i -= 1) {
+    if (chain[i]?.kind === 'map') {
+      at = i;
+      break;
+    }
+  }
+  if (at < 0) return null;
+  return bindingsOf(chain[at], { model, ancestors: chain.slice(0, at), keys }).find((b) => b.where === 'loop')?.source || null;
+}
+
+/** How to name that list in one clause, or null when there is nothing true to say. */
+function listLabel(list) {
+  if (!list) return null;
+  if (list.collection) return `the "${list.collection}" collection`;
+  if (list.declaration?.name) return `\`${list.declaration.name}\``;
+  if (list.expression) return `\`${list.expression}\``;
+  return null;
+}
+
+/**
  * How many of this node the page is rendering, and which one is in hand.
  *
  * A node inside a loop is one node in source. Which is exactly why this has to
@@ -225,7 +253,7 @@ function bindingsOf(node, { model, ancestors, keys }) {
  * offer "change the third card" is to point at the data behind the third card
  * instead.
  */
-function occurrenceOf(node, { canvas, bindings, ancestors }) {
+function occurrenceOf(node, { canvas, bindings, ancestors, model, keys }) {
   // WHAT THIS NUMBER IS. Not renders — PLACES THE CANVAS MEASURED. It reaches
   // here from `rectsForPath` in electron/preload.js by way of the canvas
   // report, and that returns one entry per marker RUN, or, where no marker pair
@@ -270,6 +298,22 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
   // The list behind the repetition, when a binding names one. That ref is the
   // difference between changing one card and changing the template.
   const item = bindings.find((b) => b.source?.kind === 'loop_item')?.source || null;
+  // THE LIST IS ONE HOP UP, AND SAYING OTHERWISE WAS WORSE THAN SAYING NOTHING.
+  //
+  // A wrapper inside a `.map(` — the <li>, the <a> around it — carries no
+  // expression of its own, so it has no `loop_item` binding. Reading `item`
+  // from this node alone therefore answered "Stacki could not resolve which
+  // list it comes from" for every such node, while the `map` one level up had
+  // already resolved it completely: same read, same tree, one hop. Measured on
+  // the Astro blog starter, the <li> claimed ignorance while its parent named
+  // the `blog` collection and quoted the `const posts = await getCollection(...)`
+  // that declares it.
+  //
+  // An agent told to give up goes hunting for a data item it was holding, or
+  // edits the template and hopes — which is the exact outcome the sentence
+  // exists to prevent. `perOccurrence` stays the node's OWN binding, because
+  // only that identifies WHICH copy; `list` is the weaker, always-true fact.
+  const list = item?.list || listOfNearestMap(ancestors, { model, keys });
   // How many copies, in the only two forms that are true. A measured count is
   // worth quoting once repetition is established — but it is the number of
   // places, so it may be 1 for a one-item list, and "rendered 1 times" is both
@@ -286,9 +330,14 @@ function occurrenceOf(node, { canvas, bindings, ancestors }) {
     note: repeated
       ? `This is one source node rendered ${many}. ` +
         'Editing it here changes every copy. To change one copy, change the data item behind it — ' +
-        (item ? `follow perOccurrence.` : 'Stacki could not resolve which list it comes from, so say so rather than editing one and hoping.')
+        (item
+          ? `follow perOccurrence.`
+          : listLabel(list)
+            ? `it is one item of ${listLabel(list)}; occurrence.list says where that is declared.`
+            : 'Stacki could not resolve which list it comes from, so say so rather than editing one and hoping.')
       : null,
     perOccurrence: item,
+    list: repeated ? list : null,
   };
 }
 
@@ -378,7 +427,7 @@ export function readTarget({
         : null,
     bound: isDataBound(node),
     bindings,
-    occurrence: occurrenceOf(node, { canvas, bindings, ancestors }),
+    occurrence: occurrenceOf(node, { canvas, bindings, ancestors, model, keys }),
     parent: summarize(parent, crumbLabel, keysOf, crumbsFor, peersOf),
     children: Array.isArray(node.children)
       ? node.children

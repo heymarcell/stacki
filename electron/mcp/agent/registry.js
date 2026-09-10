@@ -171,7 +171,7 @@ const OPERATIONS = {
     list: { risk: 'read', via: 'main', channel: 'assets:list', summary: 'Files under public/ and src/.', reuses: 'electron/main.js assets:list' },
     dimensions: { risk: 'read', via: 'main', channel: 'assets:dimensions', summary: 'Pixel size of an image.', reuses: 'electron/main.js assets:dimensions' },
     read_text: { risk: 'read', via: 'main', channel: 'assets:readText', summary: 'A text asset.', reuses: 'electron/main.js assets:readText' },
-    write_text: { risk: 'write', via: 'main', channel: 'assets:writeText', summary: 'Replace a text asset.', reuses: 'electron/main.js assets:writeText' },
+    write_text: { risk: 'write', via: 'main', channel: 'assets:writeText', undoable: true, summary: 'Replace a text asset.', reuses: 'electron/main.js assets:writeText' },
     mkdir: { risk: 'write', via: 'main', channel: 'assets:mkdir', summary: 'Create an asset folder.', reuses: 'electron/main.js assets:mkdir' },
     move: { risk: 'write', via: 'main', channel: 'assets:move', undoable: true, summary: 'Move an asset into another folder.', reuses: 'electron/main.js assets:move' },
     rename: { risk: 'write', via: 'main', channel: 'assets:rename', undoable: true, summary: 'Rename an asset.', reuses: 'electron/main.js assets:rename' },

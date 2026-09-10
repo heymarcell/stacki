@@ -60,7 +60,7 @@ export function tellCanvas(message) {
 // anything else generated at build time).
 // Resolves null when the canvas can't answer — the caller then falls back rather
 // than treating silence as "no".
-export function queryCanvas(path, selectors = [], compute = [], props = [], { rules = false } = {}) {
+export function queryCanvas(path, selectors = [], compute = [], props = [], { rules = false, occurrence = null } = {}) {
   if (!frame || typeof path !== 'string') return Promise.resolve(null);
   const id = nextId++;
   return new Promise((resolve) => {
@@ -71,7 +71,9 @@ export function queryCanvas(path, selectors = [], compute = [], props = [], { ru
     const entry = {
       resolve,
       timer,
-      message: { type: 'avb:query', id, path, selectors, compute, props, rules },
+      // WHICH COPY. A path names one node, and a node inside a loop is many
+      // elements; without this the page always answered about the first.
+      message: { type: 'avb:query', id, path, selectors, compute, props, rules, occurrence },
       held: false,
     };
     pending.set(id, entry);

@@ -42,7 +42,7 @@ const check = (what, condition, detail) => {
 
 const { startWireRig } = require('./support/mcpWireRig.js');
 const { TOPICS, TOPIC_NAMES, uriFor, MAX_TOPIC_BYTES } = require('../electron/mcp/guide.js');
-const { PROMPTS, PROFILE_URI } = require('../electron/mcp/intelligence.js');
+const { PROMPTS, PROFILE_URI, BUILD_URI } = require('../electron/mcp/intelligence.js');
 const { INSTRUCTIONS } = require('../electron/mcp/tools.js');
 const { MAX_PROFILE_BYTES } = require('../electron/mcp/projectProfile.js');
 
@@ -229,6 +229,13 @@ const FIXTURE_IDENTIFIERS = [
       listedPerMode[mode] = uris;
       check(`[${mode}] every guide topic is advertised`, TOPIC_NAMES.every((t) => uris.includes(uriFor(t))), uris.join(', '));
       check(`[${mode}] the project profile is advertised`, uris.includes(PROFILE_URI));
+      // THE ONE RESOURCE A REPORT ABOUT STACKI STARTS FROM, and until now the
+      // only one nothing checked was discoverable. It reads correctly at every
+      // level, so a read-only assertion would have stayed green while the
+      // catalogue omitted it — and a host that finds resources by listing them
+      // would never reach it. It needs no permission, so it is advertised at
+      // every level, `visual` included.
+      check(`[${mode}] the build identity is advertised`, uris.includes(BUILD_URI), uris.join(', '));
 
       const prompts = await client.listPrompts();
       const names = (prompts.prompts || []).map((p) => p.name).sort();
