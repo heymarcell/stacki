@@ -4,5 +4,8 @@
       "Bash(npm --version)",
       "Bash(git --version)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "pencil"
+  ]
 }

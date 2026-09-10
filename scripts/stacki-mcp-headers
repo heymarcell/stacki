@@ -1,0 +1,14 @@
+#!/bin/zsh
+
+# Codex GUI processes do not reliably inherit STACKI_MCP_TOKEN. Resolve the
+# local-only bearer token at request time instead, without copying it into the
+# Codex config file or printing it anywhere except the helper's JSON response.
+token_file="$HOME/Library/Application Support/Stacki/mcp-token.json"
+
+if [[ ! -r "$token_file" ]]; then
+  print -u2 "Stacki MCP token not found. Start Stacki once before connecting Codex."
+  exit 1
+fi
+
+token=$(/usr/bin/plutil -extract token raw -expect string -o - "$token_file") || exit 1
+printf '{"Authorization":"Bearer %s"}' "$token"

@@ -27,3 +27,8 @@ release/
 # untracked, so that stamping a build cannot make the tree it was built from
 # report itself dirty.
 /electron/build-info.json
+
+# Local state written by MCP servers that are not Stacki (a Zulip client's
+# cache, and whatever else gets pointed at this directory). Machine-local, and
+# in at least one case a database of somebody's messages — never this repo's.
+/.mcp/
