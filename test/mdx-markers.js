@@ -136,6 +136,12 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
 const SHARED = { gfm: true, smartypants: true, syntaxHighlight: 'shiki', shikiConfig: {} };
 
+// What was actually exercised, printed on the way out. A suite that says only
+// "10 passed" cannot tell you it ran against an Astro too old to have the thing
+// under test — which is exactly how this suite first went red on CI and green on
+// every desk.
+let exercised = '';
+
 const main = async () => {
   const { writeMarkerConfig, logs } = loadWriteMarkerConfig();
   const root = makeCanvasProject({
@@ -156,6 +162,7 @@ const main = async () => {
       return;
     }
 
+    const require_ = createRequire(path.join(root, 'package.json'));
     const cfg = (await import(pathToFileURL(cfgPath).href)).default;
     const processor = cfg && cfg.markdown && cfg.markdown.processor;
     if (
@@ -167,54 +174,87 @@ const main = async () => {
     ) {
       return;
     }
-    check(
-      'that processor has an MDX pipeline to give markers to',
-      typeof processor.createMdxRenderer === 'function',
-      typeof processor.createMdxRenderer
-    );
+    // WHETHER THE REGRESSION IS REACHABLE ON THIS ASTRO AT ALL.
+    //
+    // satteri grew `createMdxRenderer` at some point; before it, Astro had no
+    // MDX pipeline for a processor to poison and @astrojs/mdx said so plainly.
+    // A stale never-invalidated CI cache key served exactly such an Astro, and
+    // this suite failed there while passing on every desk. That is a fact about
+    // the fixture's Astro, not a defect in the app, so it is reported as what it
+    // is — and it is an ERROR where a skip would be a lie (STACKI_NO_SKIPS).
+    // Walked up from the resolved entry rather than resolved as a subpath:
+    // satteri's `exports` map publishes "." and nothing else, so asking for
+    // `@astrojs/markdown-satteri/package.json` throws and the version silently
+    // read "unknown" — a detail line that cannot be wrong is worth more.
+    const satteriVersion = (() => {
+      try {
+        let dir = path.dirname(require_.resolve('@astrojs/markdown-satteri'));
+        for (let up = 0; up < 5; up++) {
+          const manifest = path.join(dir, 'package.json');
+          if (fs.existsSync(manifest)) return JSON.parse(fs.readFileSync(manifest, 'utf8')).version;
+          dir = path.dirname(dir);
+        }
+      } catch {
+        /* reported as unknown below */
+      }
+      return 'unknown';
+    })();
+    const hasMdxPipeline = typeof processor.createMdxRenderer === 'function';
+    exercised = `satteri ${satteriVersion}, MDX pipeline ${hasMdxPipeline ? 'exercised' : 'ABSENT'}`;
+    if (!hasMdxPipeline) {
+      const reason = `satteri ${satteriVersion} has no createMdxRenderer, so the raw-HTML regression is not reachable on this Astro`;
+      const forbidding = process.env.STACKI_NO_SKIPS;
+      if (forbidding && forbidding !== '0') {
+        check('the MDX half of this suite could run at all', false, reason);
+      } else {
+        console.log(`mdx-markers: MDX half not run  [${reason}]`);
+      }
+    }
 
     const mdxId = path.join(root, 'src', 'content', 'posts', 'using-mdx.mdx');
     const mdId = path.join(root, 'src', 'content', 'posts', 'plain.md');
 
-    // ── MDX COMPILES, AND KEEPS ITS MARKERS ───────────────────────────────
-    let compiled = null;
-    let mdxError = null;
-    try {
-      const renderer = await processor.createMdxRenderer(SHARED, {
-        srcDir: pathToFileURL(path.join(root, 'src') + path.sep),
-        sourcemap: false,
-      });
-      compiled = await renderer.process(MDX_BODY, mdxId, { title: 'Using MDX' });
-    } catch (err) {
-      mdxError = err;
-    }
+    if (hasMdxPipeline) {
+      // ── MDX COMPILES, AND KEEPS ITS MARKERS ───────────────────────────────
+      let compiled = null;
+      let mdxError = null;
+      try {
+        const renderer = await processor.createMdxRenderer(SHARED, {
+          srcDir: pathToFileURL(path.join(root, 'src') + path.sep),
+          sourcemap: false,
+        });
+        compiled = await renderer.process(MDX_BODY, mdxId, { title: 'Using MDX' });
+      } catch (err) {
+        mdxError = err;
+      }
 
-    // THE REGRESSION. Before the fix this threw mdxjs-rs:raw-html, the route
-    // 500'd, and no amount of reading the project explained why.
-    check(
-      'an .mdx document compiles through the preview processor',
-      !mdxError,
-      mdxError && String(mdxError.message || mdxError).replace(/\s+/g, ' ').slice(0, 300)
-    );
+      // THE REGRESSION. Before the fix this threw mdxjs-rs:raw-html, the route
+      // 500'd, and no amount of reading the project explained why.
+      check(
+        'an .mdx document compiles through the preview processor',
+        !mdxError,
+        mdxError && String(mdxError.message || mdxError).replace(/\s+/g, ' ').slice(0, 300)
+      );
 
-    if (!mdxError) {
-      const code = String(compiled.code || '');
-      const starts = (code.match(/data-avb-s/g) || []).length;
-      const ends = (code.match(/data-avb-e/g) || []).length;
-      // Compiling is half of it. A fix that made MDX compile by dropping the
-      // markers would leave every .mdx page with no outlines and nothing
-      // saying so, which is the same defect wearing a green tick.
-      check('the compiled MDX carries start markers', starts > 0, `starts=${starts}`);
-      check(
-        'every start marker is matched by an end marker',
-        starts === ends,
-        `starts=${starts} ends=${ends}`
-      );
-      check(
-        'the markers are template elements, as the collector and AVB_CLEANUP expect',
-        /template/.test(code),
-        code.slice(0, 200)
-      );
+      if (!mdxError) {
+        const code = String(compiled.code || '');
+        const starts = (code.match(/data-avb-s/g) || []).length;
+        const ends = (code.match(/data-avb-e/g) || []).length;
+        // Compiling is half of it. A fix that made MDX compile by dropping the
+        // markers would leave every .mdx page with no outlines and nothing
+        // saying so, which is the same defect wearing a green tick.
+        check('the compiled MDX carries start markers', starts > 0, `starts=${starts}`);
+        check(
+          'every start marker is matched by an end marker',
+          starts === ends,
+          `starts=${starts} ends=${ends}`
+        );
+        check(
+          'the markers are template elements, as the collector and AVB_CLEANUP expect',
+          /template/.test(code),
+          code.slice(0, 200)
+        );
+      }
     }
 
     // ── MARKDOWN IS UNCHANGED ─────────────────────────────────────────────
@@ -245,38 +285,40 @@ const main = async () => {
       );
     }
 
-    // ── THE HAZARD IS STILL A HAZARD ──────────────────────────────────────
-    // A control, so that the assertion above cannot pass for the wrong reason.
-    // If satteri ever starts accepting a raw-HTML node in an MDX document, the
-    // regression this file guards stops being reachable, and this says so out
-    // loud rather than leaving a test that proves nothing.
-    const require_ = createRequire(path.join(root, 'package.json'));
-    const { satteri } = await import(pathToFileURL(require_.resolve('@astrojs/markdown-satteri')).href);
-    const rawMarkerPlugin = () => ({
-      name: 'raw-html-marker',
-      paragraph: (node, ctx) => {
-        const parent = ctx.parent(node);
-        if (!parent || parent.type !== 'root') return;
-        ctx.insertBefore(node, { type: 'html', value: '<template data-avb-s="0"></template>' });
-      },
-    });
-    let controlError = null;
-    try {
-      const renderer = await satteri({ mdastPlugins: [rawMarkerPlugin] }).createMdxRenderer(SHARED, {
-        srcDir: pathToFileURL(path.join(root, 'src') + path.sep),
-        sourcemap: false,
+    if (hasMdxPipeline) {
+      // ── THE HAZARD IS STILL A HAZARD ──────────────────────────────────────
+      // A control, so that the assertion above cannot pass for the wrong reason.
+      // If satteri ever starts accepting a raw-HTML node in an MDX document, the
+      // regression this file guards stops being reachable, and this says so out
+      // loud rather than leaving a test that proves nothing.
+      const { satteri } = await import(pathToFileURL(require_.resolve('@astrojs/markdown-satteri')).href);
+      const rawMarkerPlugin = () => ({
+        name: 'raw-html-marker',
+        paragraph: (node, ctx) => {
+          const parent = ctx.parent(node);
+          if (!parent || parent.type !== 'root') return;
+          ctx.insertBefore(node, { type: 'html', value: '<template data-avb-s="0"></template>' });
+        },
       });
-      await renderer.process(MDX_BODY, mdxId, { title: 'Using MDX' });
-    } catch (err) {
-      controlError = err;
+      let controlError = null;
+      try {
+        const renderer = await satteri({ mdastPlugins: [rawMarkerPlugin] }).createMdxRenderer(SHARED, {
+          srcDir: pathToFileURL(path.join(root, 'src') + path.sep),
+          sourcemap: false,
+        });
+        await renderer.process(MDX_BODY, mdxId, { title: 'Using MDX' });
+      } catch (err) {
+        controlError = err;
+      }
+      check(
+        'a raw-HTML marker in the MDX pipeline is still refused, so the fix is still load-bearing',
+        controlError && /raw/i.test(String(controlError.message || controlError)),
+        controlError
+          ? String(controlError.message || controlError).replace(/\s+/g, ' ').slice(0, 200)
+          : 'it compiled — satteri now accepts raw HTML in MDX; this control needs rewriting'
+      );
     }
-    check(
-      'a raw-HTML marker in the MDX pipeline is still refused, so the fix is still load-bearing',
-      controlError && /raw/i.test(String(controlError.message || controlError)),
-      controlError
-        ? String(controlError.message || controlError).replace(/\s+/g, ' ').slice(0, 200)
-        : 'it compiled — satteri now accepts raw HTML in MDX; this control needs rewriting'
-    );
+
   } finally {
     // Cleanup failure is test failure, not a warning.
     try {
@@ -295,7 +337,7 @@ main()
       console.error(failures.join('\n') + '\n');
       process.exit(1);
     }
-    console.log(`mdx-markers: ${checked} passed`);
+    console.log(`mdx-markers: ${checked} passed${exercised ? `  [${exercised}]` : ''}`);
     process.exit(0);
   })
   .catch((err) => {

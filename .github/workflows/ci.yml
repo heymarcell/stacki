@@ -95,7 +95,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.astro-cache
-          key: ${{ runner.os }}-astro-fixture-v2
+          # v3, NOT v2. This key has no hashFiles() in it and no restore-keys,
+          # so it is frozen by design — and it froze an Astro from whenever v2 was
+          # first populated. test/mdx-markers.js is the first suite to need
+          # something that old Astro's satteri does not have (createMdxRenderer),
+          # and it failed here while passing on every developer's machine. The
+          # canvas fixture says in its own comment that it installs "current
+          # Astro, not a pinned old major", because a fixture on an older major
+          # tests a combination nobody has; a never-invalidated key had quietly
+          # made CI exactly that. Bump this when the fixture needs newer Astro.
+          key: ${{ runner.os }}-astro-fixture-v3
       - run: npm ci
       # Stacki's "start a new site" flow makes the first commit for you, and
       # `git commit` refuses without an identity. A developer's machine has
@@ -260,7 +269,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.astro-cache
-          key: ${{ runner.os }}-astro-fixture-v2
+          # v3, NOT v2. This key has no hashFiles() in it and no restore-keys,
+          # so it is frozen by design — and it froze an Astro from whenever v2 was
+          # first populated. test/mdx-markers.js is the first suite to need
+          # something that old Astro's satteri does not have (createMdxRenderer),
+          # and it failed here while passing on every developer's machine. The
+          # canvas fixture says in its own comment that it installs "current
+          # Astro, not a pinned old major", because a fixture on an older major
+          # tests a combination nobody has; a never-invalidated key had quietly
+          # made CI exactly that. Bump this when the fixture needs newer Astro.
+          key: ${{ runner.os }}-astro-fixture-v3
       - run: npm ci
       - name: Give git an identity to commit as
         run: |
