@@ -77,6 +77,16 @@ function fingerprintOf(sel) {
     nodeKind: str(sel?.nodeKind, 32),
     tag: str(sel?.tag, 64),
     text: str(sel?.text, MAX_FINGERPRINT_TEXT),
+    // THE MARK THE CLIP ABOVE CANNOT BE.
+    //
+    // `str` appends an ellipsis past its limit, so a node with more than 160
+    // characters of text got a `text` that LOOKS like a word mark and can
+    // never equal any node's words -- the check silently did nothing, on
+    // exactly the wordy nodes a positional guess is least likely to land on.
+    // This is computed over the whole of them and is fixed-width, so it is
+    // never clipped. src/reviewAnchor.js prefers it and falls back to `text`
+    // for every review written before it existed.
+    textDigest: str(sel?.textDigest, 64),
     componentChain: listOf(sel?.componentChain, MAX_CHAIN),
     breadcrumbs: listOf(sel?.breadcrumbs, MAX_CHAIN),
     // The sibling run at each level down to the node. This is the evidence

@@ -26,6 +26,7 @@
 //   all six" without anybody noticing.
 
 import { textOf, tagOf } from '../mcpContext.js';
+import { digestOfText } from './digest.js';
 import { namesIn } from '../classAttr.js';
 import { isDataBound } from '../bindings.js';
 import { ancestorChain, findParentNode, pathOfNode, textNature, VOID_ELEMENTS } from '../modelOps.js';
@@ -99,6 +100,9 @@ function summarize(node, crumbLabel, keysFor, crumbsFor = null, peersFor = null)
     tag: tagOf(node),
     label: labelOf(node, crumbLabel),
     text: clip(words, PREVIEW_TEXT),
+    // The WHOLE words as a mark, beside the clipped reading of them. The
+    // clip is presentation; this is identity, and it survives being long.
+    textDigest: digestOfText(words),
     // WHETHER THOSE WORDS ARE THE WHOLE OF THEM.
     //
     // The caller mints a ref from this summary, and src/reviewAnchor.js matches
@@ -399,6 +403,9 @@ export function readTarget({
       // What the node reads as, however deep the words are — the same reading
       // get_context reports and a review fingerprints against.
       value: clip(ownWords, MAX_TEXT),
+      // And the whole of them as a mark. `value` above may be a preview;
+      // this never is, so a fingerprint built from it always matches.
+      digest: digestOfText(ownWords),
       // And whether that reading is the whole of it. Same reason as
       // `summarize`'s `textClipped`: a clipped value is a preview, and a
       // fingerprint built from one names words no node will ever have.

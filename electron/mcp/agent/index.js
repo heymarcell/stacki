@@ -961,12 +961,23 @@ function createAgentApi({
   const fingerprintOf = (t) => ({
     nodeKind: t.kind || null,
     tag: t.tag || null,
-    // The words, but only when they are ALL the words. A clipped reading is a
-    // preview; the resolver compares a fingerprint's text against a node's full
-    // text, so recording a preview records something no node can equal. The
-    // breadcrumbs and the peer runs are what identify it in that case, and they
-    // are evidence rather than a string that cannot match.
-    text: t.text?.truncated ? null : t.text?.value || null,
+    // THE WORDS AS A MARK, AND THE WORDS THEMSELVES ONLY WHEN THERE IS NO MARK.
+    //
+    // This used to record `text` and nothing else, and could only do it
+    // honestly when the reading was complete: the resolver compares a
+    // fingerprint's text against a node's FULL text, so a clipped preview
+    // records something no node can ever equal. The clipped ones were therefore
+    // nulled -- which left the wordiest nodes, the ones a positional guess is
+    // least likely to land on, with no word mark at all.
+    //
+    // `textDigest` is computed in the renderer over the whole words, so it is
+    // fixed-width and never clipped. When it is here, it is the mark and `text`
+    // is not carried -- it would be a second copy of the same fact, and on a
+    // body node it was 44% of the ref. When it is NOT here -- an anchor stored
+    // before this existed -- `text` is carried exactly as it always was, and
+    // src/reviewAnchor.js reads it exactly as it always did. Degrading rather
+    // than stripping is what keeps every review already on disk resolvable.
+    ...(t.text?.digest ? { textDigest: t.text.digest } : { text: t.text?.truncated ? null : t.text?.value || null }),
     breadcrumbs: t.breadcrumbs || null,
     peers: t.peers || null,
   });
@@ -1021,11 +1032,15 @@ function createAgentApi({
               fingerprint: {
                 nodeKind: summary.kind || null,
                 tag: summary.tag || null,
-                // The preview only when it is the whole reading — see
-                // fingerprintOf. A child with more than a summary's worth of
-                // words and a same-tag sibling was unresolvable on the very
-                // next call because this stored the ellipsised version.
-                text: summary.textClipped ? null : summary.text || null,
+                // The mark when there is one, the preview only when it is the
+                // whole reading — see fingerprintOf for both halves. A child
+                // with more than a summary's worth of words and a same-tag
+                // sibling was unresolvable on the very next call, because this
+                // stored the ellipsised version; now it stores a digest of all
+                // of them.
+                ...(summary.textDigest
+                  ? { textDigest: summary.textDigest }
+                  : { text: summary.textClipped ? null : summary.text || null }),
                 // Without these the ref is only about the slot, and a sibling
                 // inserted above it turns "this node" into "whatever is here
                 // now" — which the resolver correctly refuses, leaving an

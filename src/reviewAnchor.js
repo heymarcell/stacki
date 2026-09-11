@@ -38,6 +38,7 @@
 //   candidates that already agree on kind, tag and ancestry — never a search.
 
 import { tagOf, textOf } from './mcpContext.js';
+import { digestOfText } from './agent/digest.js';
 
 /** `file#indexPath` split into its halves. Null for anything that isn't a key. */
 export function keyParts(key) {
@@ -75,6 +76,9 @@ const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 /** The visible words of a node, as the fingerprint recorded them. */
 const wordsOf = (node) => norm(textOf(node).join(' '));
+
+/** The same words as a fixed-width mark. See digestOfText for why one exists. */
+const wordsDigestOf = (node) => digestOfText(textOf(node).join(' '));
 
 /**
  * Whether a node is still the same SORT of thing the review was left on.
@@ -251,7 +255,22 @@ export function resolveNode(nodes, indexPath, fingerprint, { labelOf } = {}) {
   const fp = fingerprint || {};
   const at = trail ? nodeAt(list, trail) : null;
   const atMatches = !!at && sameSort(at, fp);
-  const fpText = norm(fp.text);
+  // THE WORD MARK, DIGEST FIRST AND THE LITERAL WORDS AS THE FALLBACK.
+  //
+  // A fingerprint minted since the digest landed carries `textDigest`, computed
+  // over the node's FULL words. One minted before it -- every review already on
+  // disk -- carries `text`, and is read exactly as it always was. So there is
+  // no migration, and nothing already written loses the protection it had.
+  //
+  // The digest is preferred where both exist because `text` is the half that
+  // could not be carried honestly: it arrived here clipped-and-ellipsised from
+  // electron/review/anchor.js, or nulled outright by the MCP fingerprint, so a
+  // long node had either a mark that could never match or no mark at all.
+  const fpDigest = typeof fp.textDigest === 'string' && fp.textDigest ? fp.textDigest : null;
+  const fpText = fpDigest ? null : norm(fp.text);
+  // Whichever mark this fingerprint has, asked of a candidate the same way.
+  const marks = fpDigest || fpText;
+  const carriesMark = (node) => (fpDigest ? wordsDigestOf(node) === fpDigest : wordsOf(node) === fpText);
 
   const wanted = ancestorsOf(fp);
   // Everything this could be: same kind, same tag, same ancestry. Without
@@ -264,9 +283,9 @@ export function resolveNode(nodes, indexPath, fingerprint, { labelOf } = {}) {
   // Where the recorded words are NOW. Needed before rung 1, not after: a
   // structural proof about a slot is only a proof about the slot, and the
   // words can say the target left it.
-  const marked = fpText ? peers.filter((e) => wordsOf(e.node) === fpText) : peers;
-  const atSays = !fpText || wordsOf(at) === fpText;
-  const claimedElsewhere = !!fpText && marked.some((e) => e.node !== at);
+  const marked = marks ? peers.filter((e) => carriesMark(e.node)) : peers;
+  const atSays = !marks || carriesMark(at);
+  const claimedElsewhere = !!marks && marked.some((e) => e.node !== at);
 
   // 1 — is the slot provably the same slot?
   const now = trail ? peerPath(list, trail) : null;
