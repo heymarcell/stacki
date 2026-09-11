@@ -67,11 +67,22 @@ const { answer, publishChecked } = require('./agentTools');
 const AUDIT_OPERATION = 'audit.run';
 const AUDIT_RISK = 'read';
 
-const Viewport = z.object({
-  key: z.string(),
-  width: z.number().int(),
-  height: z.number().int(),
-  device: z.string().nullable(),
+// WHAT EVERY FINDING OF ONE RULE SHARES, SAID ONCE.
+//
+// `category`, `standard` and `help` come off the rule, never off the element it
+// fired on, so thirty findings of one rule used to carry thirty identical
+// copies. `message` joins them only when it really is the rule's -- an axe
+// message is, and the two overflow messages are composed per finding out of
+// that culprit's own numbers, so for those this is absent and the finding keeps
+// its own. See electron/mcp/audit/findings.js.
+const RuleEntry = z.object({
+  category: z.string(),
+  standard: z.string().nullable().describe('The WCAG criterion this rule names when it is broken. Null for measurements.'),
+  help: z.string().nullable(),
+  message: z
+    .string()
+    .optional()
+    .describe('The message every finding of this rule carries. Absent when they differ; then each finding has its own.'),
 });
 
 const Target = z.object({
@@ -101,21 +112,20 @@ const Target = z.object({
 
 const Finding = z.object({
   id: z.string(),
-  ruleId: z.string(),
-  category: z.string(),
+  ruleId: z.string().describe('The key into `rules`, which carries this rule\u2019s category, criterion, help URL and shared message.'),
   kind: z.enum(['mechanical', 'standard', 'advisory', 'incomplete']),
   severity: z.enum(['critical', 'serious', 'moderate', 'minor', 'info']),
-  // A named rule that HAS BEEN BROKEN. Null for measurements.
-  standard: z.string().nullable(),
   // A criterion this measurement RELATES to without establishing a violation of
   // it -- horizontal overflow at 320px and WCAG 2.2 SC 1.4.10, whose
   // two-dimensional-layout exception a geometry probe cannot evaluate.
   relatedStandard: z.string().nullable().optional(),
-  viewport: Viewport,
-  message: z.string(),
+  viewport: z.object({ key: z.string() }).describe('The key into `viewports[]`, which carries the width and height it stands for.'),
+  message: z
+    .string()
+    .optional()
+    .describe('This finding\u2019s own message. Absent when every finding of its rule shares one \u2014 read `rules[ruleId].message`.'),
   target: Target,
   evidence: z.record(z.string(), z.unknown()),
-  help: z.string().nullable(),
   // Named when a field on THIS finding was shortened to keep the answer inside
   // the response budget. Present only when something was: a clipped selector
   // still looks like a selector, and a reader who is not told cannot know the
@@ -224,6 +234,12 @@ const AuditOutput = z.object({
     .optional(),
   viewports: z.array(z.unknown()).optional(),
   findings: z.array(Finding).optional(),
+  // Optional for the same reason `captures` is: a refusal answer carries no
+  // findings and therefore no rules, and the root requires only `ok`.
+  rules: z
+    .record(z.string(), RuleEntry)
+    .optional()
+    .describe('Keyed by ruleId. Exactly the rules named by `findings` \u2014 nothing unreachable, nothing unresolvable.'),
   // findingCount is the TRUE number detected, before any cap. returnedFindingCount
   // is what `findings` holds. See electron/mcp/audit/index.js.
   findingCount: z.number().int().optional(),
@@ -356,7 +372,9 @@ const DESCRIPTION = [
   '`findingCount` is the TRUE number detected;',
   '`returnedFindingCount` is how many came back, and `truncation` says where the rest went — including',
   '`omittedByByteBudget`, findings dropped because the answer would not have fitted through the host. A finding',
-  'whose own fields were shortened to fit names them in `truncatedFields`. `truncation.scored` is what the page ' +
+  'whose own fields were shortened to fit names them in `truncatedFields`. ' +
+  'A finding names its rule and viewport by key: `rules[ruleId]` and `viewports[]` carry what they share. ' +
+  '`truncation.scored` is what the page ' +
   'handed Stacki after its own caps, and `counts` breaks THAT number down by kind — not `findingCount` and not ' +
   '`returnedFindingCount`. Needs `inspect`.',
 ].join(' ');

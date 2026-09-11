@@ -36,7 +36,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { FREEZE, SETTLE, OVERFLOW } = require('./probe');
-const { overflowFinding, unattributedOverflowFinding, axeFinding, sortFindings } = require('./findings');
+const {
+  overflowFinding,
+  unattributedOverflowFinding,
+  axeFinding,
+  sortFindings,
+  ruleShapesOf,
+  referenceFinding,
+} = require('./findings');
 const { resolveViewports } = require('../viewports');
 
 const LOAD_TIMEOUT_MS = 20000;
@@ -342,19 +349,45 @@ function clipFinding(finding) {
  * everything in the result that is not a finding, so the budget is spent on the
  * answer rather than on an estimate of it.
  */
-function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES) {
+// THE FINDINGS ARE SIZED AS THEY WILL BE SENT, AND A RULE IS CHARGED ONCE.
+//
+// Each finding is sized in its REFERENCE form -- the shape ./findings.js
+// projects once its rule's constants are named in the `rules` dictionary -- and
+// the dictionary entry is charged to the first finding of that rule that gets
+// in, not to every one of them. That is the whole point of the change: the
+// second finding of a rule now costs only what is unique to it, so the same
+// budget admits more of them. Measured on a real color-contrast run, a finding
+// goes from 952 serialised bytes to 637, against a one-off entry of ~293.
+//
+// The charge is deliberately made at ADMISSION rather than up front, because a
+// rule whose findings all lose is a rule with no entry, and charging for an
+// entry nobody can read would shrink the answer to buy nothing.
+function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES, shapes = new Map()) {
   const room = Math.max(0, budget - overhead);
-  const sized = sorted.map((f) => ({ finding: f, bytes: jsonBytes(f) + 1 }));
+  // `"ruleId":{...},` -- the entry, its key, the colon and the comma.
+  const entryBytes = (ruleId) => {
+    const shape = shapes.get(ruleId);
+    return shape ? jsonBytes(shape.entry) + jsonBytes(ruleId) + 2 : 0;
+  };
+  const sized = sorted.map((f) => {
+    const projected = referenceFinding(f, shapes.get(f.ruleId));
+    return { finding: projected, ruleId: f.ruleId, bytes: jsonBytes(projected) + 1 };
+  });
   const undecided = sized.filter((s) => s.finding.kind === 'incomplete');
   const decided = sized.filter((s) => s.finding.kind !== 'incomplete');
 
+  // Charged across BOTH fills, so a rule shared by a decided and an undecided
+  // finding pays for its entry once, as it is sent once.
+  const charged = new Set();
   const fill = (list, allowance) => {
     const out = [];
     let used = 0;
     for (const item of list) {
-      if (used + item.bytes > allowance) break;
+      const entry = charged.has(item.ruleId) ? 0 : entryBytes(item.ruleId);
+      if (used + item.bytes + entry > allowance) break;
       out.push(item.finding);
-      used += item.bytes;
+      if (entry) charged.add(item.ruleId);
+      used += item.bytes + entry;
     }
     return { out, used };
   };
@@ -362,12 +395,22 @@ function fitToBytes(sorted, overhead, budget = MAX_RESPONSE_BYTES) {
   // What the undecided bucket would actually use, capped at its share. Taking
   // the smaller of the two is what makes this a floor: a page with two
   // incomplete findings does not reserve a quarter of the budget for them.
-  const wanted = undecided.reduce((n, s) => n + s.bytes, 0);
+  // Their entries are counted here too -- over-counting a rule the decided fill
+  // will also charge, which makes the reserve slightly generous rather than
+  // slightly short, and short is the direction that breaks the floor.
+  const wanted =
+    undecided.reduce((n, s) => n + s.bytes, 0) +
+    [...new Set(undecided.map((s) => s.ruleId))].reduce((n, id) => n + entryBytes(id), 0);
   const reserve = Math.min(wanted, Math.floor(room * INCOMPLETE_BYTE_SHARE));
 
   const first = fill(decided, room - reserve);
   const second = fill(undecided, room - first.used);
-  return [...first.out, ...second.out];
+  const kept = [...first.out, ...second.out];
+  // Only the rules that actually have a finding in the answer, so nothing in
+  // `rules` is unreachable and nothing in `findings` is unresolvable.
+  const rules = {};
+  for (const id of charged) rules[id] = shapes.get(id).entry;
+  return { kept, rules };
 }
 
 // WHAT A CANCELLED AWAIT REJECTS WITH.
@@ -1640,6 +1683,9 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         ...(subframes.length ? { blockedSubframeOrigins: subframes } : {}),
         engine: { accessibility: axeVersion ? `axe-core ${axeVersion}` : null, error: engineError, sessionIsolated: true, unknownRules: axeUnknownRules },
         viewports: perViewport,
+        // The dictionary key itself; its entries are charged per rule inside
+        // fitToBytes, to the first finding of that rule that gets in.
+        rules: {},
         // Counted, not assumed: a row carries a sentence about what the picture
         // is of, and three of those are 600 bytes the findings must not be
         // charged for twice.
@@ -1647,7 +1693,12 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
         ...(nextCall ? { next: nextCall } : {}),
         limits: LIMITS_SENTENCE,
       }) + OVERHEAD_SLACK;
-    const kept = fitToBytes(clipped, overhead, findingsBudget);
+    const ruleShapes = ruleShapesOf(clipped);
+    // `ruleDict` rather than `rules`: the audit's own `rules` argument is the
+    // list of accessibility rule ids to RUN, and it is in scope here. The two
+    // are different things at different ends of the call, and only one of them
+    // is a variable.
+    const { kept, rules: ruleDict } = fitToBytes(clipped, overhead, findingsBudget, ruleShapes);
     const omittedByBytes = clipped.length - kept.length;
 
     // ONE RESULT, BUILT ONCE.
@@ -1686,6 +1737,12 @@ function createAudit({ BrowserWindow, getPreviewUrl, encodeImage = null, session
       },
       viewports: perViewport,
       findings: kept,
+      // WHAT THE FINDINGS NAME. `rules[ruleId]` carries the category, the WCAG
+      // criterion and the help URL for every rule in `findings`, and the message
+      // too when that rule's message is the same for every finding of it.
+      // Always emitted on an answer that ran, `{}` when nothing was found, so no
+      // client has to branch on its absence.
+      rules: ruleDict,
       // THE TRUE TOTAL, counted before any cap discarded anything.
       //
       // `findingCount` is what the engine DETECTED. `returnedFindingCount` is

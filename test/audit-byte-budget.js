@@ -43,6 +43,20 @@ const check = (what, condition, detail) => {
 };
 const short = (v, n = 260) => JSON.stringify(v ?? null).slice(0, n);
 
+// A FINDING AS IT READS ONCE ITS RULE IS REJOINED.
+//
+// `category`, `standard` and `help` -- and `message`, when every finding of the
+// rule shares one -- live in `res.rules[ruleId]` now rather than being copied
+// into every finding. These assertions are about whether the information is
+// THERE, not about which half of the answer carries it, so they rejoin the two
+// and ask what they always asked. Rejoining also means a BROKEN join fails
+// them, which is more than they proved before.
+const rejoin = (res) =>
+  (res.findings || []).map((f) => {
+    const rule = (res.rules || {})[f.ruleId] || {};
+    return { ...rule, ...f, message: f.message ?? rule.message };
+  });
+
 // The smallest result this host was measured to REFUSE, in the native dogfood.
 // Everything here is required to stay a long way under it.
 const SMALLEST_REFUSED_BY_HOST = 52640;
@@ -283,7 +297,7 @@ const envelopeOf = (res) => {
     // the evidence bought room under the cap.
     check(
       '  each of which is a whole finding',
-      (res.findings || []).every((f) => f.id && f.ruleId && f.kind && f.severity && f.target && f.message && f.evidence && f.help),
+      rejoin(res).every((f) => f.id && f.ruleId && f.kind && f.severity && f.target && f.message && f.evidence && f.help),
       short((res.findings || [])[0])
     );
     check(
@@ -423,7 +437,7 @@ const envelopeOf = (res) => {
     check('  reports nothing dropped', res.truncated === false && res.truncation.omittedByByteBudget === 0, short(res.truncation));
     check('  and is comfortably inside the budget', size.textBytes < HARD_CEILING, short(size));
     check('  with its evidence intact rather than clipped', (res.findings || []).every((f) => !f.truncatedFields), short((res.findings || [])[0]?.truncatedFields));
-    check('  and none of it missing', (res.findings || []).every((f) => f.message && f.evidence && f.help), short((res.findings || [])[0]));
+    check('  and none of it missing', rejoin(res).every((f) => f.message && f.evidence && f.help), short(rejoin(res)[0]));
     check('  and the answer says no field was shortened', res.truncation.findingsWithShortenedFields === 0, short(res.truncation));
   }
 
@@ -788,7 +802,7 @@ const envelopeOf = (res) => {
         short(ran)
       );
       check('  which the answer says, rather than reporting a clean page', res.engine.accessibility === null && res.engine.error === null, short(res.engine));
-      check('  with no accessibility findings at all', (res.findings || []).every((f) => f.category !== 'accessibility'), short((res.findings || []).map((f) => f.category)));
+      check('  with no accessibility findings at all', rejoin(res).every((f) => f.category !== 'accessibility'), short(rejoin(res).map((f) => f.category)));
       check('  and no accessibility numbers on the viewport record', res.viewports[0].accessibility === null, short(res.viewports[0]));
       // THE HALF THAT MAKES IT USEFUL: the measurement still happened.
       check(
@@ -804,7 +818,7 @@ const envelopeOf = (res) => {
       const res = await withRules(undefined, ran);
       check('omitting rules still runs the whole WCAG set', res.engine.accessibility === 'axe-core 4.13.0', short(res.engine));
       check('  which really was sent to the page, bundle and all', ran.includes('engine-bundle') && ran.includes('engine-script'), short(ran));
-      check('  and produces accessibility findings', (res.findings || []).some((f) => f.category === 'accessibility'), short((res.findings || []).map((f) => f.category)));
+      check('  and produces accessibility findings', rejoin(res).some((f) => f.category === 'accessibility'), short(rejoin(res).map((f) => f.category)));
     }
 
     // --- A NAMED RULE SCOPES THE ENGINE, AND ONLY THE ENGINE.
@@ -831,7 +845,7 @@ const envelopeOf = (res) => {
         Array.isArray(res.engine.unknownRules) && res.engine.unknownRules.join(',') === 'colour-contrast,no-such-rule',
         short(res.engine.unknownRules)
       );
-      check('  and the ones it does have still ran', res.engine.accessibility === 'axe-core 4.13.0' && (res.findings || []).some((f) => f.category === 'accessibility'), short(res.engine));
+      check('  and the ones it does have still ran', res.engine.accessibility === 'axe-core 4.13.0' && rejoin(res).some((f) => f.category === 'accessibility'), short(res.engine));
     }
 
     // --- AND A PICTURE AT A WIDTH NOBODY HAS A BREAKPOINT FOR.
