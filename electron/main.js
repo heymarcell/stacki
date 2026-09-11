@@ -4887,7 +4887,34 @@ const AVB_BLOCK_TYPES = [
   'definition', 'footnoteDefinition', 'table', 'math', 'containerDirective',
   'leafDirective', 'mdxJsxFlowElement', 'mdxFlowExpression',
 ];
-const avbSatteriMarkers = () => {
+// A RAW-HTML MARKER CANNOT BE COMPILED TO JSX, AND MDX IS COMPILED TO JSX.
+//
+// The markers below are mdast nodes, and Stacki hands ONE processor to Astro,
+// which uses it for both pipelines: markdown renders to an HTML string, where
+// \`{type:'html'}\` is exactly right, and MDX compiles to JSX, where it is not
+// representable at all. mdxjs-rs refuses it outright:
+//
+//   MDXError: Cannot compile a \`raw\` node (raw HTML) to MDX/JSX output.
+//   A plugin returned an \`html\` node (\`{ type: "html", value: ... }\`)
+//   ... (mdxjs-rs:raw-html)
+//
+// So every .mdx route answered HTTP 500 the moment Stacki opened the project —
+// including \`using-mdx.mdx\`, which ships in the official Astro blog starter, so
+// this was the default first-run experience on the template Astro recommends.
+// The project's own \`astro dev\` was fine; only the previewed copy broke, which
+// is the worst shape for this bug: it reads as the project's fault.
+//
+// The marker a pipeline gets is therefore chosen per pipeline. Both spell the
+// same \`<template data-avb-s="N">\` the collector and AVB_CLEANUP already look
+// for, so nothing downstream changes and .mdx gains the outlines it never had.
+const avbRawMarker = (attr, id) => ({ type: 'html', value: '<template ' + attr + '="' + id + '"></template>' });
+const avbJsxMarker = (attr, id) => ({
+  type: 'mdxJsxFlowElement',
+  name: 'template',
+  attributes: [{ type: 'mdxJsxAttribute', name: attr, value: id }],
+  children: [],
+});
+const avbSatteriMarkers = (marker) => () => {
   const plugin = { name: 'avb-node-markers' };
   const visit = (node, ctx) => {
     const parent = ctx.parent(node);
@@ -4902,8 +4929,8 @@ const avbSatteriMarkers = () => {
       if (children[i] && (children[i].type === 'yaml' || children[i].type === 'toml')) offset++;
     }
     const path = String(raw - offset);
-    ctx.insertBefore(node, { type: 'html', value: '<template data-avb-s="' + path + '"></template>' });
-    ctx.insertAfter(node, { type: 'html', value: '<template data-avb-e="' + path + '"></template>' });
+    ctx.insertBefore(node, marker('data-avb-s', path));
+    ctx.insertAfter(node, marker('data-avb-e', path));
   };
   for (const type of AVB_BLOCK_TYPES) plugin[type] = visit;
   return plugin;
@@ -4918,7 +4945,16 @@ const avbSatteriMarkers = () => {
 let avbMarkdownProcessor = null;
 try {
   const { satteri } = await import('@astrojs/markdown-satteri');
-  avbMarkdownProcessor = satteri({ mdastPlugins: [avbSatteriMarkers] });
+  const processor = satteri({ mdastPlugins: [avbSatteriMarkers(avbRawMarker)] });
+  // Only when this satteri has an MDX pipeline at all. Defining the method
+  // ourselves on one that does not would turn @astrojs/mdx's clear "this
+  // processor does not support MDX" into a TypeError from inside our own
+  // override, which is a worse answer than the one it already gives.
+  if (typeof processor.createMdxRenderer === 'function') {
+    const mdxProcessor = satteri({ mdastPlugins: [avbSatteriMarkers(avbJsxMarker)] });
+    processor.createMdxRenderer = (shared, mdx) => mdxProcessor.createMdxRenderer(shared, mdx);
+  }
+  avbMarkdownProcessor = processor;
 } catch {
   /* different Astro, different processor — skip the markers */
 }
