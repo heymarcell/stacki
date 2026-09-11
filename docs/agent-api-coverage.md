@@ -116,7 +116,7 @@ says so.
 | `list` | Inspect | main | — | electron/main.js assets:list | Files under public/ and src/. |
 | `dimensions` | Inspect | main | — | electron/main.js assets:dimensions | Pixel size of an image. |
 | `read_text` | Inspect | main | — | electron/main.js assets:readText | A text asset. |
-| `write_text` | Edit project | main | — | electron/main.js assets:writeText | Replace a text asset. |
+| `write_text` | Edit project | main | ⌘Z | electron/main.js assets:writeText | Replace a text asset. |
 | `mkdir` | Edit project | main | — | electron/main.js assets:mkdir | Create an asset folder. |
 | `move` | Edit project | main | ⌘Z | electron/main.js assets:move | Move an asset into another folder. |
 | `rename` | Edit project | main | ⌘Z | electron/main.js assets:rename | Rename an asset. |
@@ -200,5 +200,5 @@ says so.
 
 - 8 domains, 112 operations.
 - 49 readable in Inspect, 46 more in Edit project, 17 more in Full control.
-- 32 land on Stacki's own undo stack.
+- 33 land on Stacki's own undo stack.
 - 57 capabilities deliberately kept out.
