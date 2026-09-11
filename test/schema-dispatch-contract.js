@@ -808,6 +808,9 @@ function productToolNames() {
           action: 'write_text',
           args: async () => {
             const read = await mutating.call('asset', 'read_text', { path: 'public/robots.txt' });
+            // What this write replaces, so the undo below can be graded against
+            // the bytes that were actually there rather than a constant.
+            state.robotsBeforeWrite = H.read('public/robots.txt');
             return { path: 'public/robots.txt', text: ROBOTS, ref: read.envelope?.ref };
           },
           evidence: 'the file is exactly the text that was sent',
@@ -817,11 +820,28 @@ function productToolNames() {
           domain: 'project',
           action: 'undo',
           args: async () => ({}),
-          // cms_write is the last UNDOABLE step above — the asset write answers
-          // `undoable:false` and says why — so this is one step off the top of
-          // Stacki's own stack, and the field it added is the thing that goes.
+          // ONE STEP OFF THE TOP, AND WHICH STEP THAT IS CHANGED.
+          //
+          // This used to read: cms_write is the last UNDOABLE step above, the
+          // asset write answers `undoable: false`, so the field cms_write added
+          // is the thing that goes. That was true until 861d319, which found
+          // that an asset write "named nothing, so `named` came back empty, the
+          // file was never snapshotted, and the write answered undoable: false"
+          // -- a real defect -- and set `write_text` to `undoable: true` in the
+          // registry. The asset write is now the top of the stack, and this
+          // sweep kept grading against the old one.
+          //
+          // The PROPERTY is unchanged and is what matters: exactly one edit
+          // comes off, and the ones beneath it stay. So the asset write must be
+          // reverted to the bytes it replaced, and cms_write's field must still
+          // be there -- asserting it is GONE would now be asserting that undo
+          // took two steps.
           evidence: 'the last undoable edit came back off, and the ones under it did not',
-          landed: () => json(SITE)?.wireGraded === undefined && typeof json(SITE)?.tagline === 'string' && H.read(INDEX).includes(TEXT),
+          landed: () =>
+            H.read('public/robots.txt') === state.robotsBeforeWrite &&
+            json(SITE)?.wireGraded === true &&
+            typeof json(SITE)?.tagline === 'string' &&
+            H.read(INDEX).includes(TEXT),
         },
         {
           domain: 'git',
@@ -849,12 +869,20 @@ function productToolNames() {
           action: 'restore_project',
           args: async () => {
             const read = await mutating.call('asset', 'read_text', { path: 'public/robots.txt' });
+            // WHAT THE COMMIT ACTUALLY HOLDS, read here rather than assumed to
+            // be ROBOTS. The undo above reverts the asset write before this
+            // section commits, so the committed bytes are the ones that write
+            // replaced -- and a constant here would be grading the restore
+            // against a file state that no longer exists by the time git sees
+            // it. This is also the literal wording of the evidence: the file
+            // that was dirtied after the commit is the COMMITTED one again.
+            state.robotsAtCommit = H.read('public/robots.txt');
             await mutating.call('asset', 'write_text', { path: 'public/robots.txt', text: 'dirtied after the commit\n', ref: read.envelope?.ref });
-            if (H.read('public/robots.txt') === ROBOTS) throw new Error('the tree was not dirtied, so a restore would restore nothing');
+            if (H.read('public/robots.txt') === state.robotsAtCommit) throw new Error('the tree was not dirtied, so a restore would restore nothing');
             return { ref: state.head };
           },
           evidence: 'the file that was dirtied after the commit is the committed one again',
-          landed: () => H.read('public/robots.txt') === ROBOTS,
+          landed: () => H.read('public/robots.txt') === state.robotsAtCommit,
         },
       ];
 
