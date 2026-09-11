@@ -126,8 +126,12 @@ the shared Agent envelope is serialised once per domain tool — **36,968 bytes,
 **It is not deduplicated, deliberately.** Each tool's schema is its own root in
 `tools/list`; a `$ref` that crossed from one tool's document into another's is
 not resolvable by a client and would trade a real property (a schema a client
-can validate against standalone) for a byte count. Within one schema, `$defs`
-is already used where it applies.
+can validate against standalone) for a byte count. Nor is `$defs` used within a
+single schema: the delivered catalogue contains zero `$defs` and zero `$ref`,
+measured. The four `orRefusal` documents do repeat their payload's property
+block at the root, and that repetition is deliberate — it is what makes
+`outputSchema.properties` legible to a client that does not resolve `anyOf`,
+and test/schema-strictness.js fails any attempt to `$ref` it away.
 
 **And both hosts that have been measured defer it.** Claude Code has MCP tool
 search on by default and gives the model tool names, fetching a schema when one
