@@ -106,7 +106,22 @@ function schemaViolations(value, schema, at = '') {
     if (!Object.prototype.hasOwnProperty.call(value, key)) out.push(`${at}/${key} is required and absent`);
   }
   const props = schema.properties;
-  if (!props) return out;
+  if (!props) {
+    // A RECORD IS STILL A SHAPE.
+    //
+    // This returned here unwalked, which is fine for a bag of unknowns
+    // (`evidence`) and is not fine for a record whose VALUES are declared. When
+    // `rules` arrived -- keyed by ruleId, each value a real RuleEntry -- every
+    // entry in it was waved through by the one oracle whose entire job is that
+    // nothing is. Found by planting a bad entry and watching this report zero
+    // violations. Walk the values against the subschema.
+    if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+      for (const key of Object.keys(value)) {
+        out.push(...schemaViolations(value[key], schema.additionalProperties, `${at}/${key}`));
+      }
+    }
+    return out;
+  }
   for (const key of Object.keys(value)) {
     if (Object.prototype.hasOwnProperty.call(props, key)) {
       out.push(...schemaViolations(value[key], props[key], `${at}/${key}`));
@@ -346,15 +361,21 @@ const unattributedGeometry = {
 const FINDING_SHELL = {
   id: 'f_0000000000000000',
   ruleId: 'image-alt',
-  category: 'accessibility',
   kind: 'standard',
   severity: 'critical',
-  standard: 'wcag2a, wcag111',
   relatedStandard: null,
-  viewport: { key: 'phone', width: 375, height: 812, device: 'phone' },
+  // Named by key. The width and height it stands for are in `viewports[]`, and
+  // its category, criterion, help URL and shared message are in `rules`.
+  viewport: { key: 'phone' },
   message: 'Images must have alternative text',
   target: { selector: 'img', tag: 'img', modelPath: null, exact: false, note: 'no marker' },
   evidence: { impact: 'critical', html: '<img>' },
+};
+
+// The other half of a finding, and where the nullable fields moved to.
+const RULE_SHELL = {
+  category: 'accessibility',
+  standard: 'wcag2a, wcag111',
   help: 'https://dequeuniversity.com/rules/axe/4.13/image-alt',
 };
 
@@ -415,10 +436,20 @@ const auditWith = ({ axe = axeAnswer(), geometry = quietGeometry, session = clea
     plant({ ok: true, findings: [{ ...FINDING_SHELL, target: { selector: null, tag: null, exact: true, note: null } }] }).length === 1,
     short(plant({ ok: true, findings: [{ ...FINDING_SHELL, target: { selector: null, tag: null, exact: true, note: null } }] }))
   );
+  // `standard` and `help` are still the nullable pair this control exists for --
+  // they moved from the finding onto its rule entry, and a geometry rule really
+  // does publish both as null.
+  const nullableRule = { ok: true, findings: [FINDING_SHELL], rules: { 'image-alt': { ...RULE_SHELL, standard: null, help: null } } };
   check(
     'and a nullable field is not mistaken for one of them',
-    plant({ ok: true, findings: [{ ...FINDING_SHELL, standard: null, help: null }] }).length === 0,
-    short(plant({ ok: true, findings: [{ ...FINDING_SHELL, standard: null, help: null }] }))
+    plant(nullableRule).length === 0,
+    short(plant(nullableRule))
+  );
+  const badRule = { ok: true, findings: [FINDING_SHELL], rules: { 'image-alt': { ...RULE_SHELL, category: 7 } } };
+  check(
+    '  and a rule entry is validated like anything else',
+    plant(badRule).length === 1,
+    short(plant(badRule))
   );
 
   // --- 1. EVERY BRANCH THE ENGINE HAS, WALKED AGAINST THE PUBLISHED SCHEMA.

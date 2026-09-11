@@ -21,6 +21,7 @@ import * as styleAgent from './styleAgent.js';
 import { applyOperations, findNodeById } from '../modelOps.js';
 import { resolveNode, anchorSteps } from '../reviewAnchor.js';
 import { textOf } from '../mcpContext.js';
+import { digestOfText } from './digest.js';
 
 const fail = (code, message, extra = {}) => ({ ok: false, code, message, ...extra });
 
@@ -375,6 +376,7 @@ export function createAgentCommands(getApp) {
               nodeKind: after.kind || null,
               tag: after.name || null,
               text: textOf(after).join(' ').trim() || null,
+              textDigest: digestOfText(textOf(after).join(' ')),
               breadcrumbs: a.crumbsFor(landed),
               peers: a.peersFor(landed),
             }

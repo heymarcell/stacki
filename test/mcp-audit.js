@@ -40,6 +40,15 @@ const check = (what, condition, detail) => {
 };
 const short = (v) => JSON.stringify(v ?? null).slice(0, 220);
 
+// A FINDING'S RULE. `category`, `standard` and `help` -- and `message`, when
+// every finding of the rule shares one -- are carried once in `res.rules`
+// rather than copied into every finding. These checks are about what the answer
+// SAYS, not about which half of it carries the words, so they read the joined
+// view. A broken join fails them, which is more than reading the finding alone
+// ever proved.
+const ruleOf = (res, f) => (res && res.rules ? res.rules[f.ruleId] || {} : {});
+const msgOf = (res, f) => f.message ?? ruleOf(res, f).message;
+
 process.env.STACKI_NO_DIALOGS = '1';
 
 // WHAT THE CLIENT WOULD HAVE REFUSED.
@@ -423,7 +432,7 @@ let stopPreview = null;
       const hit = incomplete.find((f) => f.ruleId === seed.ruleId);
       check(`seeded: ${seed.ruleId} comes back as incomplete, not as a violation`, !!hit, short(incomplete.map((f) => f.ruleId)));
       if (hit) {
-        check(`  and ${seed.ruleId} says a person has to look`, /could not decide/.test(hit.message), short(hit.message));
+        check(`  and ${seed.ruleId} says a person has to look`, /could not decide/.test(msgOf(audit, hit)), short(msgOf(audit, hit)));
         check(`  and ${seed.ruleId} is not counted as a standard`, hit.kind !== 'standard');
       }
     }
@@ -521,7 +530,7 @@ let stopPreview = null;
     );
     check(
       '  and anything undecided there is reported as undecided, not as clean',
-      undecided.every((f) => f.kind === 'incomplete' && /could not decide/.test(f.message)),
+      undecided.every((f) => f.kind === 'incomplete' && /could not decide/.test(msgOf(clean, f))),
       short(undecided.map((f) => `${f.ruleId}/${f.kind}`))
     );
   }
@@ -779,10 +788,14 @@ let stopPreview = null;
     const o = (reflow.findings || []).filter((f) => f.ruleId === 'horizontal-overflow');
     check('overflow at 320 is still detected', o.length > 0, short((reflow.findings || []).map((f) => f.ruleId)));
     check('  and it is a MEASUREMENT, not a standards verdict', o.every((f) => f.kind === 'mechanical'), short(o.map((f) => f.kind)));
-    check('  and it claims no broken rule', o.every((f) => f.standard === null), short(o.map((f) => f.standard)));
+    check('  and it claims no broken rule', o.every((f) => ruleOf(reflow, f).standard === null), short(o.map((f) => ruleOf(reflow, f).standard)));
     check('  while still naming the criterion it relates to', o.length > 0 && /1\.4\.10/.test(String(o[0].relatedStandard)), short(o[0]?.relatedStandard));
-    check('  and saying the exception exists', o.length > 0 && /two-dimensional layout/.test(String(o[0].message)), short(o[0]?.message));
-    check('  and never asserting compliance either way', o.every((f) => !/violates|non-compliant|fails WCAG/i.test(String(f.message))));
+    // Through the join: a rule with exactly ONE finding hoists its message
+    // trivially -- every finding of it does carry that message -- so reading
+    // `o[0].message` alone finds undefined here and would have gone red for a
+    // reason that has nothing to do with the exception being named.
+    check('  and saying the exception exists', o.length > 0 && /two-dimensional layout/.test(String(msgOf(reflow, o[0]))), short(msgOf(reflow, o[0])));
+    check('  and never asserting compliance either way', o.every((f) => !/violates|non-compliant|fails WCAG/i.test(String(msgOf(reflow, f)))));
 
     // THE EXCEPTION IN THE FLESH, on a route of its own.
     //
@@ -794,7 +807,7 @@ let stopPreview = null;
     check('the exception route audits at 320', tableRun.ok === true, short(tableRun));
     const table = (tableRun.findings || []).filter((f) => f.ruleId === 'horizontal-overflow');
     check('  a wide data table at 320 is still measured', table.length > 0, short((tableRun.findings || []).map((f) => f.ruleId)));
-    check('  but reported as measurement only', table.every((f) => f.kind === 'mechanical' && f.standard === null), short(table.map((f) => `${f.kind}/${f.standard}`)));
+    check('  but reported as measurement only', table.every((f) => f.kind === 'mechanical' && ruleOf(tableRun, f).standard === null), short(table.map((f) => `${f.kind}/${ruleOf(tableRun, f).standard}`)));
     check('  with the criterion named as related, not broken', table.every((f) => /1\.4\.10/.test(String(f.relatedStandard))), short(table.map((f) => f.relatedStandard)));
   }
 

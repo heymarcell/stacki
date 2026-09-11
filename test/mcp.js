@@ -1041,7 +1041,20 @@ const rawPost = (hostHeader, body) =>
   check('get_context answers with the selection', ctx.result?.structuredContent?.selection?.tag === 'section');
   check('get_context includes essential styles by default', !!ctx.result?.structuredContent?.selection?.essentialComputedStyles);
   check('get_context does not dump every property by default', !ctx.result?.structuredContent?.selection?.computedStyles);
-  check('get_context also answers as text, for clients that read content', /"tag": "section"/.test(ctx.result?.content?.[0]?.text || ''));
+  // BY PARSING IT, not by matching its whitespace. This read `/"tag": "section"/`
+  // — a space that exists only in indented JSON — so it asserted the
+  // serializer's formatting while claiming to assert that the text block
+  // carries the selection. Parsing tests the actual claim, and tests it harder:
+  // a copy that is not valid JSON, or that lost the selection, fails here
+  // whatever it is indented at.
+  const asText = (() => {
+    try {
+      return JSON.parse(ctx.result?.content?.[0]?.text || 'null');
+    } catch {
+      return null;
+    }
+  })();
+  check('get_context also answers as text, for clients that read content', asText?.selection?.tag === 'section', JSON.stringify(ctx.result?.content?.[0]?.text || '').slice(0, 160));
 
   const full = await readBody(await post({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'get_context', arguments: { styleDetail: 'full' } } }));
   check('styleDetail full returns the whole set', !!full.result?.structuredContent?.selection?.computedStyles);

@@ -63,6 +63,20 @@ const dec = (ref) => {
   return JSON.parse(Buffer.from(rest.slice(0, rest.lastIndexOf('.')), 'base64url').toString('utf8'));
 };
 
+// A FINGERPRINT WHOSE WORDS BELONG TO ANOTHER TREE.
+//
+// Which key carries the words depends on when the ref was minted: a fingerprint
+// made since src/agent/digest.js gained `digestOfText` carries `textDigest` and
+// no `text`, and one made before it carries `text`. Overriding only `text` left
+// the REAL digest in place through the spread, so the forgery stopped being one
+// -- and a move that MUST be refused was allowed. Both are overridden here.
+//
+// `0-0-0` cannot be produced by digestOfText: its third field is the words'
+// length in base 36, and a fingerprint is only ever built from non-empty words,
+// so that field is never `0`.
+const FOREIGN_WORDS = 'WORDS THAT ARE NOT IN THIS TREE';
+const foreignWords = (fp) => ({ ...fp, text: FOREIGN_WORDS, textDigest: '0-0-0' });
+
 // A paragraph longer than the 120-character preview cap in src/agent/targetRead.js,
 // with two same-tag siblings after it — the pair of conditions that made a
 // child ref unresolvable on the very next call.
@@ -429,9 +443,21 @@ async function open(extra = {}) {
     // below stays green if only one of them is reverted. Together they identify
     // the NODE; the slot alone is what a sibling inserted above it takes over.
     const kidFingerprint = dec(kids[0].ref).d.fingerprint;
-    check('its ref records no words rather than a preview of them', kidFingerprint.text === null, short(kidFingerprint.text));
+    // IT RECORDS A MARK FOR ALL OF THEM, which is the repair. This used to
+    // assert `text === null`: a clipped reading can never equal a node's full
+    // words, so the preview was thrown away and the wordiest children -- the
+    // ones position is least likely to find -- carried no word mark at all.
+    // A digest is fixed-width, so being long no longer costs the mark.
+    check('its ref records a mark for the whole of its words, not a preview', typeof kidFingerprint.textDigest === 'string' && kidFingerprint.textDigest.length > 0, short(kidFingerprint));
+    check('  and does not also carry the words themselves', kidFingerprint.text === undefined, short(kidFingerprint.text));
     check('and records the sibling run at every level instead', Array.isArray(kidFingerprint.peers) && kidFingerprint.peers.length > 0, short(kidFingerprint.peers));
-    check('while a child whose words fit still records them', dec(kids[1].ref).d.fingerprint.text === 'Short one.', short(dec(kids[1].ref).d.fingerprint.text));
+    // AND THE MARK IS OF THOSE WORDS. Checked against the reading the product
+    // itself reports for the node, rather than against a hash recomputed here
+    // -- a second implementation would agree with itself and prove nothing.
+    const shortKid = await run('target', 'read', { ref: kids[1].ref });
+    check('while a child whose words fit records one too', typeof dec(kids[1].ref).d.fingerprint.textDigest === 'string', short(dec(kids[1].ref).d.fingerprint));
+    check('  which is the mark the product reports for that node', shortKid.ok === true && dec(kids[1].ref).d.fingerprint.textDigest === shortKid.target.text.digest, short({ ref: dec(kids[1].ref).d.fingerprint.textDigest, read: shortKid.target?.text?.digest }));
+    check('  and differs from the long sibling\u2019s', dec(kids[1].ref).d.fingerprint.textDigest !== kidFingerprint.textDigest, short([kidFingerprint.textDigest, dec(kids[1].ref).d.fingerprint.textDigest]));
 
     const first = await run('target', 'read', { ref: kids[0].ref });
     check('a child ref for a long paragraph resolves', first.ok === true, short(first));
@@ -771,7 +797,7 @@ async function open(extra = {}) {
     const heroFinal = settled.target.children.find((c) => c.tag === 'Hero');
     const gridMarks = dec(gridFinal.ref);
     const otherTree = api.nodeRef(
-      { ...gridMarks.d, branch: 'feature/elsewhere', fingerprint: { ...gridMarks.d.fingerprint, text: 'WORDS THAT ARE NOT IN THIS TREE' } },
+      { ...gridMarks.d, branch: 'feature/elsewhere', fingerprint: foreignWords(gridMarks.d.fingerprint) },
       { writable: true, observed: gridMarks.o }
     );
     check('that destination ref is writable', dec(otherTree).w !== false, short(dec(otherTree).w));
@@ -834,7 +860,7 @@ async function open(extra = {}) {
     const hero = pg.target.children.find((c) => c.tag === 'Hero');
     const marks = dec(hero.ref);
     const divergent = api.nodeRef(
-      { ...marks.d, branch: 'feature/elsewhere', fingerprint: { ...marks.d.fingerprint, text: 'WORDS THAT ARE NOT IN THIS TREE' } },
+      { ...marks.d, branch: 'feature/elsewhere', fingerprint: foreignWords(marks.d.fingerprint) },
       { writable: true, observed: marks.o }
     );
     check('the ref this starts from was minted writable', dec(divergent).w !== false, short(dec(divergent).w));
@@ -924,9 +950,15 @@ async function open(extra = {}) {
     const readNav = await run('target', 'read', { ref: nav.ref });
     const links = readNav.target.children.filter((c) => c.tag === 'a');
     check('the nav has two links whose words are routes', links.length === 2 && links.map((l) => l.text).join(',') === '/docs,/blog', short(links.map((l) => l.text)));
-    check('and a ref for one of them keeps its words', dec(links[0].ref).d.fingerprint.text === '/docs', short(dec(links[0].ref).d.fingerprint.text));
-    check('and for the other', dec(links[1].ref).d.fingerprint.text === '/blog', short(dec(links[1].ref).d.fingerprint.text));
-    check('while the control with ordinary words is unchanged', dec(pg.target.children.find((c) => c.tag === 'p').ref).d.fingerprint.text === 'ordinary words', short(dec(pg.target.children.find((c) => c.tag === 'p').ref).d.fingerprint.text));
+    // THE WORDS ARE STILL WHAT TELLS THEM APART -- carried as a mark now, so
+    // what is asserted is that the three marks are three, not what they spell.
+    // The section below proves they still FIND the right node after an insert,
+    // which is the behaviour these three lines exist to set up.
+    const markOf = (ref) => dec(ref).d.fingerprint.textDigest;
+    check('and a ref for one of them carries a mark for its words', typeof markOf(links[0].ref) === 'string', short(dec(links[0].ref).d.fingerprint));
+    check('and for the other', typeof markOf(links[1].ref) === 'string' && markOf(links[1].ref) !== markOf(links[0].ref), short([markOf(links[0].ref), markOf(links[1].ref)]));
+    const control = pg.target.children.find((c) => c.tag === 'p').ref;
+    check('while the control with ordinary words has a third, different one', typeof markOf(control) === 'string' && markOf(control) !== markOf(links[0].ref) && markOf(control) !== markOf(links[1].ref), short([markOf(links[0].ref), markOf(links[1].ref), markOf(control)]));
     check('and the breadcrumb labels survive too', (dec(links[1].ref).d.fingerprint.breadcrumbs || []).every((label) => typeof label === 'string' && label.length > 0), short(dec(links[1].ref).d.fingerprint.breadcrumbs));
 
     // AND THE WORDS ARE WHAT FINDS IT AGAIN. Insert a third link above both, so

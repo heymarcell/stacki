@@ -39,7 +39,14 @@ function stats(samples) {
 }
 
 (async () => {
-  const rig = await startWireRig();
+  // An `audit` stub, so the benchmark measures the FOURTEEN-tool surface users
+  // get rather than a thirteen-tool one that exists only in this harness. The
+  // stub never runs -- no probe calls it -- but its schema is the real one, and
+  // the schema is what tools/list costs. scripts/bench-agent.js has done this
+  // since the same correction was made there; this file was missed, and every
+  // catalogue figure printed here and copied into docs/ has been short by one
+  // tool's schema ever since.
+  const rig = await startWireRig({ audit: async () => ({ ok: true }) });
   const rows = [];
 
   // A ref, taken once: re-reading it inside the timed section would measure

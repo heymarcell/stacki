@@ -22,6 +22,8 @@
 // Exported because Visual Review's anchor resolver compares a node's words
 // against the ones a review recorded, and two ways of reading the same node
 // would disagree exactly where it matters.
+import { digestOfText } from './agent/digest.js';
+
 export function textOf(node, depth = 0, out = []) {
   if (!node || depth > 4 || out.join(' ').length > 400) return out;
   if (node.kind === 'text' && typeof node.value === 'string') {
@@ -135,6 +137,9 @@ export function buildMcpPayload({
     componentChain: (editStack || []).map((e) => e?.name).filter(Boolean),
     breadcrumbs: (crumbs || []).map((c) => c?.label).filter(Boolean),
     text: textOf(selectedNode).join(' ').trim() || null,
+    // The same words as a fixed-width mark, so a node whose text is too long
+    // to carry still has one to be identified by. See src/agent/digest.js.
+    textDigest: digestOfText(textOf(selectedNode).join(' ')),
     props: selectedNode.props || null,
     // What the element actually carries on the page. A class written as an
     // expression has no text in the source, so this is the only place the

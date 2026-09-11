@@ -292,6 +292,26 @@ large and the whole answer is capped in bytes, so a row can say
 \`included: false\`, meaning that viewport was rendered and its image was not
 sent. No row ever implies an image that is not there.
 
+## Seeing one route at a width of your own
+
+That is this tool's job, not an outside browser's.
+
+  audit({route, viewports:[{width,height}], rules:[], capture:true})
+
+loads that route at that exact width, offscreen, in a window of the audit's own.
+It never moves the person's window and never changes their breakpoint, and
+\`rules:[]\` skips the accessibility pass, so you pay for the geometry and the
+picture only.
+
+Do not point a browser of your own at the preview to do this. It starts no
+second dev server, so the rule about dev servers does not catch it -- but it is a
+second renderer of that origin, outside Stacki: what it does is invisible to the
+canvas and to undo, it does not start from the wiped session an audit does, and
+what it measures carries no route, viewport or source trail anybody can check
+afterwards. The one thing it is for is interaction this tool deliberately
+refuses -- clicking, typing, submitting. Anything you would learn by LOOKING, ask
+for here.
+
 ## What it does not claim
 
 No violations does NOT mean accessible, and it does not mean WCAG compliant.
@@ -303,13 +323,9 @@ The horizontal-overflow check is about the DOCUMENT scrolling sideways. A page
 that clips its own content does not scroll, so this does not report it — and
 that is correct rather than a miss: with html and body both clipping, or the
 wide content inside a clipping wrapper, the document really does not scroll.
-It is a blind spot, and it is not closeable by a heuristic. Measured on a page
-built from ordinary idioms, a "this box clips its own content" rule fired three
-times with no real defect among them — an ellipsised heading, a decorative panel
-and a marquee — and did not rank a genuine 1625px overflow above a deliberate
-one. An advisory that fires on every ellipsis is not a finding. Take a capture
-instead, or remove the overflow-x: hidden and audit again; that is the
-measurement, and it is one line.
+It is a blind spot, and it is not closeable by a heuristic: an advisory that
+fires on every ellipsis is not a finding. Take a capture instead, or remove the
+overflow-x: hidden and audit again; that is the measurement, and it is one line.
 
 Note that overflow: hidden is a scroll container: clipped content is still
 reachable by keyboard and still in the accessibility tree. "Clipped" and

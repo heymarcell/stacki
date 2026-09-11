@@ -351,6 +351,65 @@ function sortFindings(list) {
   return [...list].sort((a, b) => rank(a) - rank(b) || a.ruleId.localeCompare(b.ruleId) || a.id.localeCompare(b.id));
 }
 
+// --- what belongs to the rule rather than to the finding ---------------------
+
+// A RULE'S CONSTANTS, HOISTED OUT OF EVERY FINDING THAT NAMES IT.
+//
+// `category`, `standard` and `help` are properties of the RULE, not of the
+// element it fired on. axeFinding reads all three off the axe rule object; both
+// overflow builders hard-code them. So thirty findings of one rule carried
+// thirty identical copies of the same three strings -- and the byte budget is
+// charged on the SERIALISED finding (see fitToBytes in ./index.js), so those
+// copies were not merely verbose, they were displacing findings that then came
+// back counted in `omittedByByteBudget`. Measured on a real run: 42 of 72
+// findings dropped on one route, 312 of 340 on another.
+//
+// `message` IS THE EXCEPTION, and it is why this is computed rather than
+// tabulated. For an axe rule the message is constant -- `rule.help` plus a fixed
+// suffix. For the two overflow builders it is composed per finding out of
+// `documentOverflowBy`, the viewport width and that culprit's own edge, so a
+// hoisted `horizontal-overflow` message would be a sentence about one element
+// published as a fact about the rule. That would be a lie in the answer, which
+// is worth more than the bytes.
+//
+// So invariance is DECIDED OVER EVERY DETECTED FINDING of the rule, before any
+// selection happens. Deciding it over the admitted ones instead would make the
+// wire shape depend on which findings the budget happened to fit, and two runs
+// of the same page could then disagree about what the rule's message is.
+function ruleShapesOf(findings) {
+  const shapes = new Map();
+  for (const f of findings) {
+    const seen = shapes.get(f.ruleId);
+    if (!seen) {
+      shapes.set(f.ruleId, {
+        entry: { category: f.category, standard: f.standard ?? null, help: f.help ?? null, message: f.message },
+        hoistMessage: true,
+      });
+      continue;
+    }
+    if (seen.hoistMessage && f.message !== seen.entry.message) {
+      seen.hoistMessage = false;
+      delete seen.entry.message;
+    }
+  }
+  return shapes;
+}
+
+// What is left of a finding once its rule's constants are named elsewhere. The
+// key ORDER of everything that survives is untouched, so a finding still reads
+// the way it always did -- with three fields fewer and a viewport named by key.
+// The width and height that key stands for are already in `viewports[]`, which
+// every answer carries whether or not it has findings.
+function referenceFinding(f, shape) {
+  const out = { ...f };
+  delete out.category;
+  delete out.standard;
+  delete out.help;
+  out.viewport = { key: f.viewport.key };
+  if (shape && shape.hoistMessage) delete out.message;
+  return out;
+}
+
 module.exports = {
   KINDS,
   REFLOW_CRITERION,
@@ -363,5 +422,7 @@ module.exports = {
   unattributedOverflowFinding,
   axeFinding,
   sortFindings,
+  ruleShapesOf,
+  referenceFinding,
   IMPACT_TO_SEVERITY,
 };

@@ -79,4 +79,40 @@ export function digestOfModel(model) {
   return `${fnv1a(text)}-${text.length.toString(36)}`;
 }
 
+/**
+ * The word mark of a node's visible text.
+ *
+ * WHY A DIGEST AND NOT THE WORDS. A fingerprint used to carry the text itself,
+ * and three producers could not carry it honestly:
+ *
+ *   - electron/mcp/agent/index.js dropped it to `null` whenever it was clipped,
+ *     because a preview can never equal a node's full text;
+ *   - electron/review/anchor.js clipped it to 160 characters through `str()`,
+ *     which appends an ellipsis -- so a long node got a mark that LOOKS like a
+ *     word mark and can never match one, silently disabling the check it exists
+ *     to be;
+ *   - src/agent/targetRead.js clipped it for the same reason and said so.
+ *
+ * So the nodes with the most words -- the ones a positional guess is least
+ * likely to land on -- were exactly the ones with no word mark at all. A digest
+ * of the FULL words is fixed-width, so every node gets one.
+ *
+ * NORMALISED THE WAY THE RESOLVER COMPARES, which is src/reviewAnchor.js's
+ * `norm`: whitespace collapsed, trimmed, lowercased. A mark computed any other
+ * way would not match the node it came from.
+ *
+ * TWO LANES, because unlike the document digest this one can grant a WRITE:
+ * src/reviewCheckout.js pins on the strength of a resolved node. One 32-bit
+ * lane over a few dozen candidate siblings is comfortably safe on paper and it
+ * replaces exact string equality, which had no false positives at all. The
+ * second lane and the length cost about six characters and put the collision
+ * probability somewhere nobody has to think about again.
+ */
+export function digestOfText(text) {
+  if (typeof text !== 'string') return null;
+  const words = text.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!words) return null;
+  return `${fnv1a(words)}-${fnv1a(`\u0001${words}`)}-${words.length.toString(36)}`;
+}
+
 export default digestOfModel;

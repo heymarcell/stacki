@@ -1005,7 +1005,7 @@ const DESCRIPTIONS = {
     '`coverage` says what the scan could not contain, `documentRules` is what the SERVED PAGE reports matching ' +
     'the element, and `coverage.complete` is true only when nothing reaching it is unaccounted for. A rule from ' +
     'the served page carries no file and no identity, because there is nothing in the project to edit. Writes go ' +
-    'through the Style panel’s own code, so they are one undo step. Also the project’s CSS custom properties.',
+    'through the Style panel’s own code, so they are one undo step. variables lists the project’s design tokens — every CSS custom property, its value, and the file it is defined in — and set_variable changes one: that is the answer to "what tokens does this project have?" and "what does that token resolve to?", without opening a stylesheet.',
   source:
     'Project files as text, and the LAST resort rather than the first. It is the fallback for code Stacki cannot ' +
     'model as a tree — a .ts or .js module, a config, a framework component — and the honest route when target ' +
@@ -1072,7 +1072,11 @@ const DESCRIPTIONS = {
  * permission gate, the refs and the dispatch all live behind it, so this file
  * describes the surface and nothing else.
  */
-function registerAgentTools(server, { api }) {
+// Which risk flag on `access` answers for a given risk. The gate has already
+// decided all three; nothing here re-decides one.
+const RISK_FLAG = { read: 'canRead', write: 'canEdit', high: 'canDoHighRisk' };
+
+function registerAgentTools(server, { api, directTools = [] }) {
   publishChecked(
     server,
     'get_capabilities',
@@ -1099,7 +1103,27 @@ function registerAgentTools(server, { api }) {
     // instructions promise it this. It is the same string the resource serves,
     // read from the same module, so the two cannot drift into disagreeing.
     async ({ topic } = {}) => {
-      if (!topic) return answer({ ...api.capabilities(), guideTopics: GUIDE_TOPICS });
+      if (!topic) {
+        const caps = api.capabilities();
+        return answer({
+          ...caps,
+          // EVERY TOOL, NOT EVERY REGISTRY OPERATION. `domains` is generated
+          // from the registry and covers eight of them; `direct` is the rest,
+          // handed in by tools.js from the same conditions that registered
+          // them. `allowed` reads the gate's own answer rather than asking a
+          // second time -- one door, as everywhere else.
+          tools: {
+            domain: (caps.domains || []).map((d) => d.domain),
+            direct: directTools.map(({ tool, risk = null, what }) => ({
+              tool,
+              what,
+              allowed: risk === null ? true : !!caps.access?.[RISK_FLAG[risk]],
+              needs: risk === null ? null : caps.access?.needs?.[risk] || null,
+            })),
+          },
+          guideTopics: GUIDE_TOPICS,
+        });
+      }
       const t = TOPICS[topic];
       if (!t) {
         return answer({
@@ -1869,7 +1893,7 @@ function textlessSetText(action, shaped) {
  * so a client that reads only that still knows, but the sentence is the part
  * an agent can act on.
  */
-function answer(result, { spaces = 2, images = [] } = {}) {
+function answer(result, { spaces = 0, images = [] } = {}) {
   const body = result && typeof result === 'object' ? result : { ok: false, code: 'failed', message: 'Stacki gave no answer.' };
   // A SECOND CHANNEL, FOR THE ANSWERS THAT ARE PARTLY A PICTURE.
   //
@@ -1883,11 +1907,24 @@ function answer(result, { spaces = 2, images = [] } = {}) {
     .filter((i) => i && typeof i.data === 'string' && i.data)
     .map((i) => ({ type: 'image', data: i.data, mimeType: i.mimeType || 'image/png' }));
   return {
-    // `spaces` exists for one caller and one reason: the text block is a second
-    // copy of the same payload, and an audit's payload is findings. Indenting it
-    // costs a third again in bytes on the largest answer this endpoint sends, on
-    // a wire where the catalogue already costs 140 KB a session. The envelope
-    // answers stay indented, because they are small and a person reads them.
+    // COMPACT, BECAUSE NOTHING READS THIS BY HAND.
+    //
+    // The text block is a second copy of `structuredContent`, kept because the
+    // spec says a tool returning structured content SHOULD also serialise it
+    // for clients older than the field. It is read by a model, not a person,
+    // and indentation carries no information to either.
+    //
+    // This defaulted to two spaces, on the reasoning that envelope answers are
+    // small and a person reads them. Measured across ten operations through the
+    // real client, indentation is 44% of the text block — and the LARGEST
+    // answers pay the most, which is the opposite of the assumption that
+    // licensed it: get_capabilities 14,659 → 7,903 bytes (46%),
+    // style.variables 2,238 → 909 (59%), project.scan 946 → 614 (35%).
+    // get_capabilities is the call the instructions tell every client to make
+    // first, so the worst case was also the most certain one to be paid.
+    //
+    // `spaces` stays a parameter so a caller that genuinely wants indentation
+    // can ask for it. Nothing in this repository does.
     content: [...pictures, { type: 'text', text: JSON.stringify(body, null, spaces) }],
     structuredContent: body,
     ...(body.ok === false ? { isError: true } : {}),
